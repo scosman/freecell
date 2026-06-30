@@ -49,19 +49,19 @@ This is a hard constraint that shapes every sub-project.
 |-----------|---------------|------------|
 | All research / writing | Anywhere | Agent |
 | UI-less Rust (engine, file, perf, memory benchmarks) | Headless Linux / CI / container | Agent, autonomously |
-| GPUI proof-of-concept — real GPU + visual/feel check | **macOS (Metal)** | **Human (you) runs locally**; agent provides build scripts + asks for pull/feedback |
-| GPUI proof-of-concept — automated perf loops | **Linux software rendering** (e.g. llvmpipe / lavapipe) | Agent, autonomously |
+| GPUI proof-of-concept (the macOS app, both purposes) | **macOS (Metal)** | Agent writes it + build scripts; **human (you) runs it locally** and reports the logged results |
 
 Rules baked into the spec:
 - **Every sub-project except the UI Technical Test is pure, UI-less Rust** that
   the agent can build and run headlessly.
-- The **UI Technical Test needs both sides**: macOS build/run scripts for the
-  human-in-the-loop check, and a Linux software-rendered path so the agent can
-  run automated perf loops.
-- **Software-rendered Linux frame rates are NOT representative of real GPU
-  performance.** The Linux loop validates correctness, virtualization logic, and
-  CPU-side cost. **Authoritative fps/feel numbers come from the macOS run.** Every
-  reported number must state which environment produced it.
+- **The UI Technical Test is a single macOS (Metal) app** serving two purposes
+  (Sub-project E): (1) an **interactive scrolling app** for the human visual/feel
+  test, and (2) a **"Run Test" menu item** that runs scripted scroll / fast-scroll
+  / jump-to-cell sequences, **measures** frame timings and cell-load latencies,
+  logs the results, and **applies measured pass/fail gates** — numbers, not vibes.
+- There is **no software-rendering path.** All authoritative UI performance comes
+  from the real-GPU macOS run; the agent builds the app and its measurement
+  harness, the human runs it and reports the logged pass/fail output.
 
 ## 4. Gating & Sequencing
 
@@ -101,8 +101,8 @@ experiments/
     findings.md
     raw-gpui/                    # PoC variant on raw gpui
     gpui-component/              # PoC variant on gpui-component
-    scripts/                     # macOS build/run + Linux software-render
-    results/
+    scripts/                     # macOS build/run (one command)
+    results/                     # logged pass/fail from the app's "Run Test"
   05-round-2-proposal/
     round_2_explorations.md
   SYNTHESIS.md                   # go/no-go + Round 2 pointer
@@ -137,12 +137,20 @@ establish a credible, evidenced path to them — not necessarily on first try.
 | Dimension | Target |
 |-----------|--------|
 | Grid size (PoC + benchmarks) | Excel max: **1,048,576 rows × 16,384 cols** |
-| Scroll smoothness (macOS/Metal, authoritative) | Sustain **120 fps** (~8.3 ms/frame); never worse than 60 fps under fast scroll/jump |
-| Viewport read (scrolling proxy) | Pull all visible cells (~viewport + overscan, order 10³–10⁴ cells) in **< ~2 ms**, repeatedly, while panning |
-| Dependency cascade | **1,000,000-cell** linear chain (`=PREV+1`); edit head → recompute in **< 100 ms**; report incremental update latency p50/p99 |
+| Scroll *render* frame (macOS/Metal, authoritative) | Sustain **120 fps** (~8.3 ms/frame) while scrolling; never worse than 60 fps under fast scroll/jump |
+| Load newly-visible cells (while scrolling) | Pull values+formatting for cells entering the viewport (~viewport + overscan, order 10³–10⁴ cells) in **< ~2 ms**, repeatedly, while panning (must fit inside a frame) |
+| Dependency cascade recompute (engine, **not** a frame rate) | **1,000,000-cell** linear chain (`=PREV+1`); edit the head cell → full recompute in **< 100 ms**; report recalc latency p50/p99 |
 | "Change cascade → visible update" | Edit a cell that cascades (incl. cross-sheet / offscreen) → visible-cell values refreshed within one frame budget |
 | File load | Open a **100 MB+** `.xlsx`; record load time and peak memory (target: seconds, not minutes; memory a sane multiple of file size) |
 | Memory | Load a large workbook (order 10⁷ populated cells) + edit; stays within a reasonable RAM envelope (measure & report; flag if it balloons) |
+
+> **On the numbers (the three are independent budgets):** the **120 fps / ~8.3 ms**
+> figure is the *render frame* target while scrolling. The **< ~2 ms** figure is the
+> cost of *loading the values + formatting for cells newly entering the viewport* as
+> you scroll — it must fit comfortably inside one frame. The **< 100 ms** figure is a
+> *one-off engine recalculation* triggered by an edit: a 1M-cell dependency chain must
+> recompute fast after you change its head. **< 100 ms is a recalc latency, not a frame
+> rate** (it is not "10 fps").
 
 Numbers that are "measure and report" (file load time, memory envelope) are
 **discovery metrics**: we record them and judge reasonableness, rather than
@@ -253,30 +261,44 @@ credible, evidenced design for FreeCell's formatting model and its persistence.
 
 ### E. UI Technical Test — GPUI Proof-of-Concept  *(only UI sub-project)*
 **Questions.** Can GPUI render a giant spreadsheet grid crazy fast? How does raw
-`gpui` compare to `gpui-component` for this? Does it hit the perf bar?
+`gpui` compare to `gpui-component` for this? Does it hit the perf bar — *measured*?
+
+**It's a single macOS app serving two purposes:**
+1. **Interactive scrolling app** — you scroll/jump around to judge speed and feel
+   (the visual test).
+2. **"Run Test" menu item** — runs scripted scroll / fast-scroll / jump-to-cell
+   sequences, **measures** per-frame render timings and newly-visible-cell load
+   latency, **logs results to a file**, and **reports measured pass/fail** against
+   the Section 5.4 targets. Measured, not vibes.
+
+**Look & feel (deliberately minimal — it's a PoC).** White background, grey
+gridlines; cells show text with borders, plus highlighting (fills), bold, and
+italic; column/row headers; **variable row/column widths**. Make it look enough
+like a spreadsheet to get a real feel — don't sweat minor details. The agent
+drives the remaining visual choices.
 
 **Approach.**
-- Build a **basic but not-ugly** spreadsheet grid: column/row headers, a big grid,
-  a **static datamodel provider** (code returning values per cell — a reasonable
-  proxy for a big, difficult sheet; **no real engine connected**), and a variety
-  of formatting to stress rendering: cell highlighting, **variable row/col
-  widths**, bold, italic.
+- **Static datamodel provider**: code returning values + formatting per cell — a
+  reasonable proxy for a big, difficult sheet; **no real engine connected**.
 - Size: target the Excel-max grid (Section 5.4).
 - Build **two variants — raw `gpui` and `gpui-component` — and compare** perf &
   ergonomics.
-- **macOS scripts** for the human-in-the-loop check (you pull, run, give feedback
-  on speed/feel). **Linux software-render path** for automated perf loops the
-  agent runs: scroll, scroll-fast, jump-to-cell, etc.
-- Optional: render-correctness sanity via screenshots/known-good PNGs (a foretaste
-  of the product's rendering-test strategy).
+- The **"Run Test" harness lives in the app**; pass/fail gates derive from measured
+  numbers (frame time vs the 120 fps budget; cell-load latency vs the ~2 ms target).
+- **macOS build/run scripts** so you can pull and run with one command, then report
+  the logged results.
+- Optional: render-correctness sanity via screenshots / known-good PNGs (a
+  foretaste of the product's rendering-test strategy).
 - Iterate on perf in a research loop.
 
-**Deliverables.** `04-ui-poc/` with both variants, `scripts/`, recorded
-`results/`, and `findings.md` comparing the two + verdict against the perf bar.
+**Deliverables.** `04-ui-poc/` with both variants, macOS `scripts/`, logged
+`results/`, and `findings.md` comparing the two + the **measured** verdict against
+the perf bar.
 
-**Pass criteria.** A grid that demonstrably scrolls/jumps smoothly at the target
-scale on macOS/Metal (human-confirmed), with the agent's Linux perf loop showing
-sound CPU-side/virtualization behavior; a clear raw-vs-component recommendation.
+**Pass criteria.** The in-app "Run Test" reports **measured pass** against the
+Section 5.4 frame-time and cell-load targets at the target scale on macOS/Metal,
+the human confirms it scrolls and feels smooth, and there's a clear
+raw-vs-`gpui-component` recommendation.
 
 ### F. Round-2 Technical Exploration Proposal
 **Questions.** Given Phase 1 findings, what should we de-risk next?
@@ -304,8 +326,9 @@ that feeds the Stage 3 decision.
 - **GPUI as a dependency.** Coupled to Zed, sparse docs, moving target, primarily
   macOS/Linux. The raw-vs-`gpui-component` comparison (E) and the stack research
   (A) probe this.
-- **Software-render perf is not GPU perf.** Linux automated numbers validate
-  logic/CPU cost, not frame rate; macOS is authoritative (Section 3).
+- **UI perf is measured on a real GPU, by you.** There is no software-render proxy;
+  the PoC's in-app "Run Test" harness produces the authoritative pass/fail numbers
+  on macOS/Metal, and the agent depends on you to run it and report the log.
 - **Network/build friction in-container.** Egress is policy-restricted and there's
   no GPU/display here; if a dependency can't be fetched/built headlessly, that's a
   finding to record, and the work routes to the macOS side or is flagged blocked.
@@ -315,7 +338,13 @@ that feeds the Stage 3 decision.
 - **Scope creep.** The temptation is to start building FreeCell. Phase 1 stops at
   validation + recommendation.
 
-## 8. Open Question (for the architecture step)
-- The only "UI" in Phase 1 is the throwaway perf-test grid, fully specified inline
-  in Sub-project E. **Proposal: skip the formal UI Design step** (no product UI is
-  being designed). Confirm during review.
+## 8. Resolved Decisions
+- **No formal UI Design step** (confirmed — it's a PoC). The only "UI" is the
+  throwaway perf-test grid; its look is specified inline in Sub-project E (white
+  background, grey gridlines; cells with text, borders, highlighting, bold, italic;
+  variable row/col widths). The agent drives the remaining visual details.
+- **Stack decision gates first; then sub-projects B–F run in parallel**, each in its
+  own `experiments/` subfolder (Sections 4–5).
+- **Implementation uses agent-swarm (nested sub-agents)** — verified available — so
+  the parallel sub-projects can be driven concurrently. (If that capability were
+  unavailable, the sub-projects would run serially instead.)

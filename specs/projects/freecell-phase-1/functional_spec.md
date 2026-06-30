@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: FreeCell — Phase 1 (Technical De-risking)

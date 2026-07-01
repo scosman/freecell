@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase SP1: Non-blocking recompute & the engine↔render interop seam

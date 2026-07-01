@@ -84,17 +84,17 @@ fn read_tail(model: &Model<'static>, built: &BuiltShape) -> f64 {
 ///
 /// - **Deterministic shapes** (sparse/chain/fanout/cross-sheet): after a monotonic seed
 ///   re-arm the tail MUST take a new, predictable value — a strict `before != after`.
-/// - **Volatile** (`=RAND()`): the deterministic part is the **range** — a genuine
-///   `RAND()` result is a fresh draw in `[0,1)`, so asserting `after ∈ [0,1)` proves the
-///   eval actually re-rolled the cell (not that it was skipped or left stale). We *also*
-///   check `before != after` as a sanity signal, but the range check — not the
-///   probabilistic `RAND ≠ RAND` — is what makes the force+assert deterministic.
+/// - **Volatile** (`=RAND()`): two complementary checks. The **range** check
+///   (`after ∈ [0,1)`) proves the tail holds a **well-formed `RAND()` result** — but note
+///   it does NOT by itself prove a re-roll (a skipped/no-op eval would leave the previous
+///   RAND value, also in `[0,1)`). The **re-roll witness** is `before != after`: two
+///   independent `RAND()` draws collide with probability ~2⁻⁵², so a change is
+///   overwhelming evidence the eval actually re-evaluated the cell. Both asserts are kept.
 fn assert_tail_changed(built: &BuiltShape, before: f64, after: f64) {
     if built.changes_without_rearm {
         assert!(
             (0.0..1.0).contains(&after),
-            "volatile tail must be a fresh RAND() result in [0,1) after eval (got {after}) \
-             — proves the eval re-rolled the cell"
+            "volatile tail must be a well-formed RAND() result in [0,1) after eval (got {after})"
         );
         assert_ne!(
             before, after,

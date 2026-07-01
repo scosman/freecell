@@ -26,7 +26,7 @@ cohort (SP4, SP5) → synthesis.
 
 *After scaffolding, the engine-risk cohort runs in parallel (own worktree/folder):*
 
-- [ ] **Phase SP1 — Non-blocking recompute & engine↔render interop seam** *(parallel;
+- [x] **Phase SP1 — Non-blocking recompute & engine↔render interop seam** *(parallel;
   own review + sign-off — THE key experiment)* → `round-2/01-async-interop/`.
   Investigate IronCalc's eval lifecycle / `Send`-ability / read-during-eval /
   changed-cells-stream; measure `evaluate()` across sizes × DAG shapes; build a

@@ -187,13 +187,17 @@ that testable:
     meaningless. So the gate confirms a blocking design is **detected and rejected**, and
     the pass is a property of the worker-thread ownership discipline, not of the cheap
     slot-read alone.
-- **GATE 2 (coalescing): PASS.** The worker drains all queued edits before evaluating, so
-  30 rapid edits collapse to **1** eval. The binary exercises the "edits arrive, then one
-  eval" bound-of-1 path (edits land while the worker is parked). The tighter **in-flight**
-  case — edits arriving *while an eval is already running*, bounded to ≤2 (one in-flight +
-  one coalesced) — is covered by the `rapid_edits_coalesce_to_few_evals` **unit test**
-  (`seam.rs`), which fires 30 edits behind an already-running 50k-cell eval and asserts the
-  eval count stays small.
+- **GATE 2 (coalescing): PASS.** The worker drains the *whole* command channel before it
+  runs a single `evaluate()`, so 30 rapid edits collapse to **1** eval in the measured
+  runs. The **≤2 bound holds by construction, not by a mid-eval-injection test**: while an
+  eval is running, further edits queue on the channel; the worker cannot start a second
+  eval until the current one returns, and it then drains everything queued into one
+  coalesced batch. So at any moment there is **at most one in-flight eval + one pending
+  coalesced batch** — ≤2 — regardless of edit timing. Both the binary and the
+  `rapid_edits_coalesce_to_few_evals` unit test (`seam.rs`) exercise the **bound-of-1**
+  path (edits arrive while the worker is parked between evals); neither forces edits to
+  land *mid-eval*, because the ≤2 ceiling is a structural property of the drain-then-eval
+  loop rather than something a race-timed test would need to catch.
 - **Staleness = one eval duration** (~1.3 s @10⁶, ~6 s @10⁷): the time from an edit to the
   edited/visible cells showing fresh values, because the only fidelity route is re-pull on
   eval completion. This is a discovery number, not a frame gate; during it the UI shows

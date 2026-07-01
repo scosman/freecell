@@ -44,7 +44,7 @@ cohort (SP4, SP5) → synthesis.
   canonical Excel list + golden-file correctness harness (≥~100 cases; typed error
   semantics). (functional_spec SP3)
 
-- [ ] **⛳ OFF-RAMP CHECKPOINT (human review)**: present SP1–SP3 findings against the
+- [x] **⛳ OFF-RAMP CHECKPOINT (human review)** — CLEARED (2026-07-01): none of the three off-ramp conditions fired; human approved proceeding. Carry-forwards: recompute staleness (no change stream), single-threaded ~18s file-open parse, dynamic arrays 0/17. present SP1–SP3 findings against the
   overview §2 off-ramp. Clean → proceed; triggered → surface for a human engine
   decision before further investment. (architecture §2.4)
 

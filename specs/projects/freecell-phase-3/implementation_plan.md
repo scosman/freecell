@@ -41,7 +41,7 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
   coverage; validated cache-sync design agreeing with IronCalc at acceptable cost.
   (functional_spec A; architecture §4)
 
-- [ ] **Phase B — Needed-API audit** *(parallel; batched review)* →
+- [x] **Phase B — Needed-API audit** *(parallel; batched review)* →
   `round-3/B-api-audit/`. Probe IronCalc 0.7.1's public API against the checklist
   (display formatting **[headline — who owns number-format rendering]**, diff-list shape,
   sheet ops, defined names, view state, cell extras, tokenizer; re-confirm merges/CF and

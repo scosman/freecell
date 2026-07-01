@@ -48,8 +48,6 @@ name = "api_audit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bench_util",
- "datagen",
  "ironcalc",
  "ironcalc_base",
  "round2_harness",

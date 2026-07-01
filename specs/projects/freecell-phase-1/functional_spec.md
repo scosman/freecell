@@ -87,25 +87,28 @@ experiments/
   00-stack-decision/
     findings.md
     smoke/                       # minimal hands-on Formualizer smoke test (Cargo crate)
-  01-file-support/
-    findings.md
-    <crate(s)>
-  02-datamodel-binding-perf/
-    findings.md
-    <bench crate(s)>
+  01-file-support/               # Sub-project B — BOTH ENGINES
+    findings.md                  # head-to-head comparison
+    formualizer/  ironcalc/      # per-engine crates (isolated subfolders)
+  02-datamodel-binding-perf/     # Sub-project C — BOTH ENGINES
+    findings.md                  # head-to-head comparison
+    common/                      # shared engine-abstraction trait + scenarios
+    formualizer/  ironcalc/      # per-engine bench crates
     results/                     # recorded benchmark output (committed)
-  03-formatting/
+  03-formatting/                 # Sub-project D — BOTH ENGINES
     findings.md
-    <crate(s)>
-  04-ui-poc/
+    formualizer/  ironcalc/
+  04-ui-poc/                     # Sub-project E — GPUI only (engine-neutral)
     findings.md
     raw-gpui/                    # PoC variant on raw gpui
     gpui-component/              # PoC variant on gpui-component
     scripts/                     # macOS build/run (one command)
     results/                     # logged pass/fail from the app's "Run Test"
-  05-round-2-proposal/
+  05-round-2-proposal/           # Sub-project F
     round_2_explorations.md
-  SYNTHESIS.md                   # go/no-go + Round 2 pointer
+  06-engine-bakeoff/             # Sub-project G (NEW) — engine decision
+    decision.md                  # case for Formualizer + case for IronCalc + pick
+  SYNTHESIS.md                   # Sub-project H: overall go/no-go + Round 2 pointer
 ```
 (Exact crate names/structure are an architecture-step detail; this is the shape.)
 
@@ -165,6 +168,19 @@ not a finished app. A well-evidenced "no" or "pivot" is a successful Phase 1.
 
 Each sub-project below lists its **Questions**, **Approach**, **Deliverables**,
 and **Pass criteria**.
+
+> **Post-gate update (2026-07-01) — Engine bake-off.** At the Phase 1 gate the human
+> decided: **proceed; UI = GPUI (settled — no UI competitor); engine = undecided.**
+> So the engine-dependent sub-projects **B (file), C (binding/perf), and D
+> (formatting)** are now run as a **two-engine bake-off**: each evaluates **both
+> Formualizer and IronCalc** head-to-head, using the same `datagen`/`bench_util`
+> harness and identical scenarios (per-engine work in isolated `formualizer/` and
+> `ironcalc/` subfolders), and emits a comparison covering **API suitability,
+> missing/needed features, perf, and fidelity**. C additionally captures IronCalc's
+> API surface (mirroring the Phase 1 Formualizer smoke). A new **Sub-project G —
+> Engine Bake-off Decision** aggregates B/C/D (+ A) into a case for each engine and a
+> recommendation, with a **human sign-off on the engine choice**; the final synthesis
+> is now **Sub-project H**. Sub-project **E (UI PoC) is unchanged** — GPUI only.
 
 ### A. Stack Decision — "Challenge the design direction"  *(GATING)*
 **Questions.** Is Formualizer + GPUI a great base stack? What alternatives exist
@@ -311,11 +327,28 @@ with rationale per item.
 
 **Pass criteria.** An actionable Round-2 list grounded in Phase 1 evidence.
 
-### G. Phase 1 Synthesis  *(final)*
+### G. Engine Bake-off Decision  *(NEW; before synthesis)*
+**Questions.** Formualizer or IronCalc — which engine should FreeCell build on?
+
+**Approach.** Pull the head-to-head data from B (file), C (binding/perf), and D
+(formatting), plus A (stack research), into `06-engine-bakeoff/decision.md`. Make an
+explicit **case for Formualizer** and **case for IronCalc** across: API suitability
+for our binding layer, missing/needed features (function coverage, dynamic arrays,
+etc.), measured perf (cascade, viewport read, memory), file fidelity, formatting
+exposure, and maturity / bus-factor / license. Give a **recommendation** with the
+key trade-off (Formualizer's Arrow-columnar huge-sheet fit vs IronCalc's
+maturity/adoption + non-columnar `HashMap` storage).
+
+**Deliverables.** `06-engine-bakeoff/decision.md` — the two cases + recommendation.
+
+**Pass criteria.** A defensible, evidence-backed engine recommendation the human can
+sign off on. **→ Human sign-off on the engine choice.**
+
+### H. Phase 1 Synthesis  *(final)*
 **Deliverable.** `experiments/SYNTHESIS.md`: a go / go-with-changes / no-go /
-pivot recommendation for building FreeCell on the chosen stack, citing the
-evidence from A–E, plus a pointer to the Round-2 list (F). This is the artifact
-that feeds the Stage 3 decision.
+pivot recommendation for building FreeCell on the chosen stack (incorporating the
+**engine decision from G** and UI = GPUI), citing evidence from A–E, plus a pointer
+to the Round-2 list (F). This is the artifact that feeds the Stage 3 decision.
 
 ## 7. Edge Cases, Risks & What Could Invalidate the Approach
 

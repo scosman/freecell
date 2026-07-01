@@ -60,7 +60,8 @@ experiments/
     results/         # logged pass/fail from in-app "Run Test"
   05-round-2-proposal/           # Sub-project F
     round_2_explorations.md
-  SYNTHESIS.md                   # Sub-project G: go/no-go + Round-2 pointer
+  06-engine-bakeoff/             # Sub-project G (NEW) — engine decision (decision.md)
+  SYNTHESIS.md                   # Sub-project H: overall go/no-go + Round-2 pointer
 ```
 
 `shared/datagen` and `shared/bench_util` are tiny library crates that the
@@ -68,6 +69,26 @@ engine sub-projects depend on by **relative path**. They are created and frozen 
 scaffolding time so parallel phases only *consume* them (read-only), never edit
 them. If a phase needs a change there, it escalates (a shared edit breaks the
 parallel-editor invariant).
+
+## 1.1 Engine bake-off (post-gate revision, 2026-07-01)
+
+The Phase 1 gate settled **UI = GPUI** but left the **engine undecided**, so the
+engine-dependent experiments are now a **two-engine bake-off** (Formualizer vs
+IronCalc):
+
+- `01-file-support/`, `02-datamodel-binding-perf/`, `03-formatting/` each gain
+  isolated per-engine subfolders **`formualizer/`** and **`ironcalc/`** (perf also
+  gets a `common/` holding the shared engine-abstraction trait + scenario
+  definitions). Both engines run against the **same `datagen` inputs, `bench_util`
+  metrics, and identical scenarios**, so numbers are directly comparable; each
+  folder's `findings.md` is a **head-to-head comparison** (API suitability,
+  missing/needed features, perf, fidelity).
+- IronCalc gets its own **smoke / API-surface capture** (mirroring Phase 1's
+  Formualizer smoke), as the first step of the perf phase.
+- New **`06-engine-bakeoff/decision.md`** (Sub-project G) aggregates B/C/D (+ A) into
+  a case for each engine + a recommendation → **human engine sign-off**. The final
+  synthesis becomes **Sub-project H** (`SYNTHESIS.md`).
+- **UI is settled (GPUI, no competitor);** `04-ui-poc/` is unchanged, engine-neutral.
 
 ## 2. Agent-Swarm Orchestration
 
@@ -79,24 +100,27 @@ per-phase managers run **in parallel**.
 ### 2.1 Topology
 ```
 Phase-1 Coordinator (top manager)
-├─ Phase 0: Scaffolding            (serial; one coding agent) ── builds experiments/ skeleton + shared/, commits
-├─ Phase 1: GATE = Sub-project A   (serial; manager→coding→CR) ── ranked stack recommendation + smoke test
-│            └─►  HUMAN SIGN-OFF (go / pivot)   ◄── hard gate; nothing parallel starts before this
-└─ After sign-off, launch in PARALLEL:
-   ├─ Phase C (datamodel/perf)     manager→coding→CR  ── own review + sign-off (risky)
-   ├─ Phase E (UI PoC, macOS)      manager→coding→CR  ── own review + UI sign-off on Mac (risky)
-   └─ Phase BDF (file/format/r2)   manager→coding→CR  ── ONE batched review + sign-off (hybrid decision)
-        ├─ editor: 01-file-support
-        ├─ editor: 03-formatting
+├─ Phase 0: Scaffolding            (serial) ── DONE
+├─ Phase 1: GATE = Sub-project A   (serial; manager→coding→CR) ── DONE → proceed; UI=GPUI; engine=bake-off
+│            └─►  HUMAN SIGN-OFF (cleared)
+└─ After the gate, launch in PARALLEL (each engine-dependent phase runs BOTH engines):
+   ├─ Phase C (02 binding/perf)    manager→coding→CR  ── own review (risky); Formualizer + IronCalc, shared harness
+   ├─ Phase E (04 UI PoC, macOS)   manager→coding→CR  ── own review + Mac UI sign-off; GPUI only (engine-neutral)
+   └─ Phase BDF (batched review):
+        ├─ editor: 01-file-support   (both engines)
+        ├─ editor: 03-formatting     (both engines)
         └─ editor: 05-round-2-proposal
+   ── then (after B/C/D land) ──
+   Phase G: 06-engine-bakeoff      manager→coding→CR  ── own review + HUMAN engine sign-off ── decision.md
    ── then ──
-   Phase G: Synthesis              (serial; after C/E/BDF land) ── SYNTHESIS.md
+   Phase H: Synthesis              (serial; last) ── SYNTHESIS.md
 ```
-This realizes the **hybrid review-gate** decision: **C** and **E** are gated
-individually; **B/D/F** batch into one review. Each lead manager may spawn its own
-**helper sub-agents** (web research, benchmark iteration) — bounded depth
-(coordinator → lead → helpers). Research loops **iterate until targets are met or
-~2–3 rounds pass with no improvement**, then report.
+This realizes the **hybrid review-gate** decision: **C**, **E**, and the **engine
+decision (G)** are gated individually (G with a human engine sign-off); **B/D/F**
+batch into one review. Each lead manager may spawn its own **helper sub-agents** (web
+research, per-engine adapters, benchmark iteration) — bounded depth (coordinator →
+lead → helpers). Research loops **iterate until targets are met or ~2–3 rounds pass
+with no improvement**, then report.
 
 ### 2.2 Parallel-editor isolation (REQUIRED — inject into every parallel manager/coding/CR prompt)
 Because parallel phases share one branch and working tree, every parallel manager

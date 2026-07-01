@@ -9,7 +9,8 @@
 > Environment for all in-container work: Rust 1.94.1, 4 cores / ~15 GB RAM, no GPU,
 > no display. Date: 2026-07-01. Formualizer version probed: **0.7.0** (sub-crates
 > `formualizer-eval 0.7.0`, `formualizer-workbook 0.7.0`, `formualizer-parse 2.0.0`,
-> `formualizer-common 2.0.0`, `formualizer-sheetport 0.7.0`).
+> `formualizer-common 2.0.0`; `formualizer-sheetport 0.7.0` is pulled in
+> transitively but not exercised by the probes).
 
 ## Questions
 
@@ -95,7 +96,7 @@ from `formualizer-workbook`).
   order preserved; `evaluate_cells_cancellable(targets, Arc<AtomicBool>)` for a
   cancel flag.
 - `evaluate_all() -> Result<EvalResult>`; `build_recalc_plan()` + `evaluate_with_plan()`;
-  `get_eval_plan(targets) -> EvalPlan` for inspecting/reusing a recompute plan.
+  `get_eval_plan(targets) -> Result<EvalPlan, IoError>` for inspecting/reusing a recompute plan.
 - (Probe `range_bulk_read_returns_grid`: `read_range(A1:A3)` → `[[1],[2],[3]]`;
   `evaluate_cells` returns the batch in order.)
 

@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 1: Stack Decision (GATE — Sub-project A)

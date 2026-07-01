@@ -82,6 +82,35 @@ fn styles_survive_xlsx_roundtrip() {
     );
 }
 
+/// Alignment and borders are read back after being set AND survive a real `.xlsx`
+/// round-trip — so the matrix's `borders`/`alignment` rows are probe-backed, not merely
+/// inferred from the `Style` shape. This is a representative probe (right-align + a thin
+/// left border), not an exhaustive border/alignment sweep (that stays deferred to
+/// Round 2).
+#[test]
+fn borders_and_alignment_read_and_survive_roundtrip() {
+    let model = styled_model();
+
+    // Read back directly.
+    let a1 = read_format(&model, SHEET, 1, 1);
+    assert_eq!(a1.h_align.as_deref(), Some("right"), "A1 right-aligned");
+    assert_eq!(a1.left_border.as_deref(), Some("thin"), "A1 thin left border");
+
+    // ...and after an xlsx round-trip.
+    let reloaded = roundtrip_via_xlsx(&model);
+    let a1r = read_format(&reloaded, SHEET, 1, 1);
+    assert_eq!(
+        a1r.h_align.as_deref(),
+        Some("right"),
+        "alignment survived xlsx round-trip"
+    );
+    assert_eq!(
+        a1r.left_border.as_deref(),
+        Some("thin"),
+        "left border survived xlsx round-trip"
+    );
+}
+
 /// Editing a style after load also survives a further round-trip: read A1's style, flip
 /// bold off + change the fill, save, reload, confirm the edit stuck.
 #[test]

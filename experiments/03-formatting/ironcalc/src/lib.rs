@@ -325,5 +325,26 @@ mod tests {
         let json = serde_json::to_string(&capability_matrix()).expect("serialize matrix");
         assert!(json.contains("ironcalc"));
         assert!(json.contains("conditional_formatting"));
+        assert!(json.contains("ProbeBacked"));
+        assert!(json.contains("Inferred"));
+    }
+
+    #[test]
+    fn only_themes_is_inferred() {
+        // Every attribute except "themes / named styles" is now probe-backed. Guard
+        // against a future edit adding an unprobed row without marking it Inferred.
+        let m = capability_matrix();
+        for row in &m.rows {
+            if row.attribute == "themes / named styles" {
+                assert_eq!(row.provenance, Provenance::Inferred);
+            } else {
+                assert_eq!(
+                    row.provenance,
+                    Provenance::ProbeBacked,
+                    "{} must be probe-backed",
+                    row.attribute
+                );
+            }
+        }
     }
 }

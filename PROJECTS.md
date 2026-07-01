@@ -11,6 +11,13 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 ## Backlog
 
+- **Global Row/Column Size Cache (grid geometry)** — *Future (likely near-MVP).*
+  A resident, always-readable cache of **all** row heights + column widths (not
+  viewport-based) — needed to lay out / virtualize the grid, including *during* a
+  recompute, when the model's own size getters are blocked. Could generalize to a full
+  always-resident style cache (sizes + fills/lines/bold/number-format).
+  → [`projects/grid-size-cache.md`](projects/grid-size-cache.md)
+
 - **Viewport Value/Style Cache** — *Future, if we want to push scrolling perf.*
   A frontend cache of visible cells (value + style) so scrolling fetches only the
   *delta* cells instead of re-reading the whole viewport each move, keeps scrolling

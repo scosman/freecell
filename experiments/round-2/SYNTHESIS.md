@@ -35,6 +35,22 @@ caveat**: no incremental recalc + no change stream (SP1), single-threaded parse 
 no dynamic arrays (SP3), per-cell style resolution cost (SP4). These are consistent
 and understood, and each has a FreeCell-side or upstream path.
 
+## Adopted baseline decisions (plan of record)
+
+Decided for the real build — **not** "maybe later" (distinct from the Round-3 agenda
+below):
+
+- **Formatting = IronCalc-native styles**, no FreeCell side-table (SP4 confirmed the
+  public style API covers per-cell + row/column band + empty-cell resolution).
+- **Recompute seam = worker-owned (`Send`) model + coalesced edits + publish-on-
+  completion** (SP1); the render loop watches a **generation counter** for cheap,
+  on-demand viewport re-pulls (not per-frame full reads).
+- **~3× overscan published viewport** so scrolling stays live *during* a multi-second
+  recompute — **free** (zero extra memory; it just widens the published window) and the
+  SP1 scroll-during-eval probe's measured recommendation over a `to_bytes()` snapshot
+  (whose ~3.2s build @1M *exceeds* the eval). Build a snapshot only **on-demand** if the
+  user scrolls past the overscan margin mid-eval.
+
 ## Round-3 / real-build agenda (ranked — this is the real output)
 
 1. **Recompute UX + FreeCell-owned dirty tracking.** The highest-leverage item.

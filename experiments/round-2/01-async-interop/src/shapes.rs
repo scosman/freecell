@@ -10,12 +10,20 @@
 //! Coordinates are datagen 0-based; IronCalc is 1-based `i32` (+ a `u32` sheet), so the
 //! builders add `+1` on write, matching `round2_harness::ironcalc`.
 
-use datagen::{linear_chain, wide_fanout, CellAddress};
+use datagen::{linear_chain, wide_fanout, CellAddress, EXCEL_MAX_ROWS};
 use ironcalc_base::cell::CellValue;
 use ironcalc_base::Model;
 
 /// The primary sheet all single-sheet shapes populate.
 const SHEET: u32 = 0;
+
+/// Maps a 0-based linear cell index to a `(row, col)` that wraps into the next column
+/// every `EXCEL_MAX_ROWS` cells, so shapes can reach 10⁷ populated cells without
+/// exceeding Excel's 1,048,576-row limit (which IronCalc enforces — a single column
+/// would panic past the limit; that ceiling is itself an SP1 finding).
+fn wrapped(index: u32) -> (u32, u32) {
+    (index % EXCEL_MAX_ROWS, index / EXCEL_MAX_ROWS)
+}
 
 /// The five DAG shapes the SP1 matrix measures (functional_spec SP1 "DAG shapes").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +170,8 @@ fn build_sparse(n: u64) -> BuiltShape {
                 break;
             }
             // ~1% of the non-seed cells are formulas.
-            let is_formula = ((r as u64).wrapping_mul(side as u64) + c as u64) % 100 == 0 && r > 0;
+            let is_formula =
+                ((r as u64).wrapping_mul(side as u64) + c as u64).is_multiple_of(100) && r > 0;
             if is_formula {
                 let up = CellAddress::new(r - 1, c).a1();
                 put(&mut model, SHEET, r, c, &format!("={up}+1"));
@@ -255,47 +264,53 @@ fn build_cross_sheet(n: u64) -> BuiltShape {
     // Model starts with one sheet ("Sheet1", index 0). Add a second ("Sheet2", index 1).
     let (name2, sheet2) = model.new_sheet();
 
-    // Literals down column 0 of sheet 2.
-    for r in 0..per {
-        put(&mut model, sheet2, r, 0, &format!("{}", r + 1));
+    // Literals on sheet 2, wrapped into columns at the Excel row limit.
+    for i in 0..per {
+        let (r, c) = wrapped(i);
+        put(&mut model, sheet2, r, c, &format!("{}", i + 1));
     }
-    // Formulas down column 0 of sheet 0 referencing sheet 2.
-    for r in 0..per {
-        let ref_cell = CellAddress::new(r, 0).a1();
-        put(&mut model, SHEET, r, 0, &format!("={name2}!{ref_cell}+1"));
+    // Formulas on sheet 0, each referencing the matching wrapped sheet-2 cell.
+    for i in 0..per {
+        let (r, c) = wrapped(i);
+        let ref_cell = CellAddress::new(r, c).a1();
+        put(&mut model, SHEET, r, c, &format!("={name2}!{ref_cell}+1"));
     }
-    let tail_addr = CellAddress::new(per - 1, 0);
+    let (tail_row, tail_col) = wrapped(per - 1);
+    let tail_addr = CellAddress::new(tail_row, tail_col);
     BuiltShape {
         shape: Shape::CrossSheet,
         model,
         populated_cells: (per as u64) * 2,
-        tail: (SHEET, tail_addr.row, tail_addr.col),
+        tail: (SHEET, tail_row, tail_col),
         tail_a1: tail_addr.a1(),
-        // Bump the referenced sheet-2 literal (Sheet2!A1) → its sheet-0 dependent moves.
+        // The tail references Sheet2!<same cell>, so re-arm that exact precedent literal
+        // — bumping it changes the tail's cross-sheet dependent.
         rearm: ReArm::BumpSeed {
             sheet: sheet2,
-            row: 0,
-            col: 0,
+            row: tail_row,
+            col: tail_col,
         },
         changes_without_rearm: false,
     }
 }
 
-/// Volatile: `n` `=RAND()` cells down column 0. Every `evaluate()` re-rolls them, so
-/// the tail changes value with no re-arm edit needed.
+/// Volatile: `n` `=RAND()` cells, wrapped into columns at the Excel row limit. Every
+/// `evaluate()` re-rolls them, so the tail changes value with no re-arm edit needed.
 fn build_volatile(n: u64) -> BuiltShape {
     let len = n.min(u32::MAX as u64) as u32;
     let len = len.max(2);
     let mut model = new_model();
-    for r in 0..len {
-        put(&mut model, SHEET, r, 0, "=RAND()");
+    for i in 0..len {
+        let (r, c) = wrapped(i);
+        put(&mut model, SHEET, r, c, "=RAND()");
     }
-    let tail_addr = CellAddress::new(len - 1, 0);
+    let (tail_row, tail_col) = wrapped(len - 1);
+    let tail_addr = CellAddress::new(tail_row, tail_col);
     BuiltShape {
         shape: Shape::Volatile,
         model,
         populated_cells: len as u64,
-        tail: (SHEET, tail_addr.row, tail_addr.col),
+        tail: (SHEET, tail_row, tail_col),
         tail_a1: tail_addr.a1(),
         rearm: ReArm::None,
         changes_without_rearm: true,
@@ -308,8 +323,10 @@ pub fn rearm(model: &mut Model<'static>, rearm: ReArm, sample: u64) -> f64 {
     match rearm {
         ReArm::None => 0.0,
         ReArm::BumpSeed { sheet, row, col } => {
-            // Set the seed to a fresh value each sample so the cascade re-derives.
-            let v = (sample % 1000) as f64 + 1.0;
+            // Set the seed to a fresh value each sample so the cascade re-derives. Start
+            // at 2 and step monotonically so it never collides with the warm-up seed
+            // (=1) nor with the previous sample's value — guaranteeing the tail changes.
+            let v = (sample % 1_000_000) as f64 + 2.0;
             put(model, sheet, row, col, &format!("{v}"));
             v
         }
@@ -378,10 +395,11 @@ mod tests {
         let mut built = build(Shape::DeepSerial, 10);
         let before = eval_tail(&mut built).unwrap();
         assert_eq!(before, 10.0);
-        rearm(&mut built.model, built.rearm, 4); // seed -> 5
+        let seed = rearm(&mut built.model, built.rearm, 4); // seed = 4 + 2 = 6
+        assert_eq!(seed, 6.0);
         let after = eval_tail(&mut built).unwrap();
-        // Head became 5, chain of length 10 -> tail = 5 + 9 = 14.
-        assert_eq!(after, 14.0);
+        // Head became 6, chain of length 10 -> tail = 6 + 9 = 15.
+        assert_eq!(after, 15.0);
         assert_ne!(before, after);
     }
 

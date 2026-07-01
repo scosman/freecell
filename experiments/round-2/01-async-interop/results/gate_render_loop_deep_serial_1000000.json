@@ -1,0 +1,43 @@
+{
+  "name": "render_loop_nonblocking",
+  "input_size": 1000000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "HEAD"
+  },
+  "stats": {
+    "count": 600,
+    "min_ns": 200,
+    "max_ns": 52177,
+    "mean_ns": 1783,
+    "p50_ns": 839,
+    "p99_ns": 26208
+  },
+  "gates": [
+    {
+      "name": "render_tick_p99_during_eval",
+      "measured_ns": 3110,
+      "target_ns": 8300000,
+      "verdict": "PASS"
+    }
+  ],
+  "extra": {
+    "build_secs": 3.46915553,
+    "frame_budget_ns": 8300000,
+    "frames": 600,
+    "gate1_hardfail": false,
+    "hard_fail_ns": 16600000,
+    "model_shape": "deep_serial",
+    "populated_cells": 1000000,
+    "ticks_during_eval": {
+      "count": 77,
+      "max_ns": 3110,
+      "p50_ns": 919,
+      "p99_ns": 3110
+    }
+  }
+}

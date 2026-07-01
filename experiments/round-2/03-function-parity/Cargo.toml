@@ -1,0 +1,39 @@
+[package]
+name = "function_parity"
+version = "0.1.0"
+edition = "2021"
+description = "SP3 -- IronCalc vs Excel function-parity audit: a reproducible coverage diff (registered builtins vs a committed canonical Excel list) plus a data-driven golden-file correctness harness that compares errors as typed errors, not strings."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Independent Cargo project (NOT a workspace member), depending read-only by relative
+# path on the frozen round-2 harness (IronCalc adapter + SpreadsheetEngine trait,
+# pinned IronCalc 0.7.1). Mirrors architecture §1's per-experiment isolation.
+
+[lib]
+name = "function_parity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coverage"
+path = "src/bin/coverage.rs"
+
+[[bin]]
+name = "golden"
+path = "src/bin/golden.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+# Frozen, read-only. Gives the IronCalcEngine adapter (pinned IronCalc 0.7.1) + trait.
+round2_harness = { path = "../harness" }
+# Frozen, read-only. Environment stamp (Environment::detect) for results provenance.
+bench_util = { path = "../../shared/bench_util" }
+# Same IronCalc pin, for the typed-error enum + direct evaluation probes.
+ironcalc_base = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1"
+anyhow = "1"

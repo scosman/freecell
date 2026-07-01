@@ -87,7 +87,8 @@ fn assert_tail_changed(built: &BuiltShape, before: f64, after: f64) {
         assert_ne!(before, after, "volatile tail must change every eval");
     } else {
         assert_ne!(
-            before, after,
+            before,
+            after,
             "re-armed eval must change the tail (shape={}, tail={})",
             built.shape.id(),
             built.tail_a1

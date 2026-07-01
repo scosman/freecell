@@ -1,0 +1,44 @@
+{
+  "engine": "ironcalc 0.7.1 (frozen round-2 harness adapter)",
+  "environment": {
+    "arch": "x86_64",
+    "commit": "d644aac",
+    "cores": 4,
+    "cpu": "",
+    "os": "linux"
+  },
+  "failed": 5,
+  "gate_met": true,
+  "gate_min_cases": 100,
+  "generated_utc": "2026-07-01",
+  "pass_rate": 96.3768115942029,
+  "passed": 133,
+  "per_category": {
+    "array-spill": {
+      "pass_rate": 87.5,
+      "passed": 7,
+      "total": 8
+    },
+    "coercion": {
+      "pass_rate": 96.42857142857143,
+      "passed": 27,
+      "total": 28
+    },
+    "common": {
+      "pass_rate": 98.03921568627452,
+      "passed": 50,
+      "total": 51
+    },
+    "dates": {
+      "pass_rate": 90.0,
+      "passed": 18,
+      "total": 20
+    },
+    "error-propagation": {
+      "pass_rate": 100.0,
+      "passed": 31,
+      "total": 31
+    }
+  },
+  "total_cases": 138
+}

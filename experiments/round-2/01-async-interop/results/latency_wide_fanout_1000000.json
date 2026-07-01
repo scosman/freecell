@@ -1,0 +1,30 @@
+{
+  "name": "evaluate_wide_fanout_1000000",
+  "input_size": 2000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "HEAD"
+  },
+  "stats": {
+    "count": 7,
+    "min_ns": 63630498,
+    "max_ns": 64689547,
+    "mean_ns": 64315946,
+    "p50_ns": 64539827,
+    "p99_ns": 64689547
+  },
+  "extra": {
+    "build_secs": 0.008389321,
+    "populated_cells": 2000,
+    "requested_size": 1000000,
+    "samples": 7,
+    "shape": "wide_fanout",
+    "tail_a1": "ALM1000",
+    "tail_after": 500507.0,
+    "tail_before": 500506.0
+  }
+}

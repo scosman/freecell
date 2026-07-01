@@ -229,12 +229,12 @@ impl Drop for EvalWorker {
 fn read_viewport(model: &Model<'static>, viewport: Viewport) -> Vec<CellSnapshot> {
     viewport
         .addresses()
-        .map(|(r, c)| {
-            match model.get_cell_value_by_index(0, (r + 1) as i32, (c + 1) as i32) {
+        .map(
+            |(r, c)| match model.get_cell_value_by_index(0, (r + 1) as i32, (c + 1) as i32) {
                 Ok(v) => CellSnapshot::from_cell_value(v),
                 Err(_) => CellSnapshot::Empty,
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -260,20 +260,16 @@ fn worker_loop(
     // Initial eval + publish so the render loop paints last-known values immediately.
     run_eval_and_publish(&mut model, viewport, &shared);
 
-    loop {
-        // Block for the next command (idle worker parks; no busy-wait).
-        let first = match rx.recv() {
-            Ok(cmd) => cmd,
-            Err(_) => break, // all senders dropped
-        };
-
+    // Block for the next command (idle worker parks; no busy-wait). Loop ends when all
+    // senders drop (`recv` errors) or a `Shutdown` is processed.
+    while let Ok(first) = rx.recv() {
         let mut had_edit = false;
         let mut shutdown = false;
-        let mut apply = |cmd: Command,
-                         model: &mut Model<'static>,
-                         viewport: &mut Viewport,
-                         had_edit: &mut bool,
-                         shutdown: &mut bool| {
+        let apply = |cmd: Command,
+                     model: &mut Model<'static>,
+                     viewport: &mut Viewport,
+                     had_edit: &mut bool,
+                     shutdown: &mut bool| {
             match cmd {
                 Command::Edit(edit) => {
                     let _ = model.set_user_input(
@@ -289,7 +285,13 @@ fn worker_loop(
             }
         };
 
-        apply(first, &mut model, &mut viewport, &mut had_edit, &mut shutdown);
+        apply(
+            first,
+            &mut model,
+            &mut viewport,
+            &mut had_edit,
+            &mut shutdown,
+        );
 
         // COALESCE: drain everything else already queued before evaluating, so a burst
         // of N rapid edits collapses into a single eval (GATE 2).
@@ -329,14 +331,20 @@ fn worker_loop(
     model
 }
 
-/// Runs one full eval (setting/clearing the `evaluating` flag around it), bumps the
-/// generation, and publishes the visible viewport.
+/// Runs one full eval (setting/clearing the `evaluating` flag around it), publishes the
+/// visible viewport, and only THEN bumps the generation counter.
+///
+/// Ordering matters: the published slot is written **before** `eval_count` is
+/// incremented, so any reader that observes `eval_count >= N` is guaranteed to also see
+/// the published viewport for generation N (no "counter advanced but values not yet
+/// published" race).
 fn run_eval_and_publish(model: &mut Model<'static>, viewport: Viewport, shared: &Shared) {
     shared.evaluating.store(true, Ordering::SeqCst);
     model.evaluate();
-    let gen = shared.eval_count.fetch_add(1, Ordering::SeqCst) + 1;
-    shared.evaluating.store(false, Ordering::SeqCst);
+    let gen = shared.eval_count.load(Ordering::SeqCst) + 1;
     publish(model, viewport, gen, shared);
+    shared.eval_count.store(gen, Ordering::SeqCst);
+    shared.evaluating.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -381,7 +389,10 @@ mod tests {
         let built = build(Shape::DeepSerial, 10);
         let vp = Viewport::new(9, 0, 1, 1);
         let worker = EvalWorker::spawn(built.model, vp);
-        assert!(wait_until(|| worker.eval_count() >= 1, Duration::from_secs(5)));
+        assert!(wait_until(
+            || worker.eval_count() >= 1,
+            Duration::from_secs(5)
+        ));
 
         // Bump the head A1 (=1) to =5: tail A10 should become 5 + 9 = 14.
         worker.enqueue_edit(Edit {
@@ -410,7 +421,10 @@ mod tests {
         let built = build(Shape::DeepSerial, 50_000);
         let vp = Viewport::new(49_999, 0, 1, 1);
         let worker = EvalWorker::spawn(built.model, vp);
-        assert!(wait_until(|| worker.eval_count() >= 1, Duration::from_secs(10)));
+        assert!(wait_until(
+            || worker.eval_count() >= 1,
+            Duration::from_secs(10)
+        ));
         let base = worker.eval_count();
 
         // Fire 30 rapid edits.
@@ -447,7 +461,10 @@ mod tests {
         let built = build(Shape::Sparse, 100);
         let vp = Viewport::new(0, 0, 2, 2);
         let worker = EvalWorker::spawn(built.model, vp);
-        assert!(wait_until(|| worker.eval_count() >= 1, Duration::from_secs(5)));
+        assert!(wait_until(
+            || worker.eval_count() >= 1,
+            Duration::from_secs(5)
+        ));
         let model = worker.shutdown();
         // The returned model is usable: to_bytes works (snapshot route).
         assert!(!model.to_bytes().is_empty());

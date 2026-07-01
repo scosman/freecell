@@ -56,7 +56,7 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
   GATE: circular refs error without hanging; malformed → error not panic. DELIVERABLE:
   worker-robustness recommendation. (functional_spec D; architecture §5)
 
-- [ ] **Phase C — CI snapshot rendering** *(in-container investigation + macOS human-run)*
+- [x] **Phase C — CI snapshot rendering** *(in-container investigation + macOS human-run)*
   → `round-3/C-ci-rendering/`. In-container: investigate GPUI's offscreen/headless
   capture surface and attempt it (expected fail, no GPU — the failure mode is the
   finding). Author the **render→PNG→perceptual-diff** harness (evolves Phase-1

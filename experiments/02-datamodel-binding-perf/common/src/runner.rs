@@ -12,13 +12,21 @@ use crate::engine::SpreadsheetEngine;
 use crate::report::ScenarioResult;
 use crate::scenario::{self, targets, Profile};
 
-/// How many repetitions of the (expensive) cascade scenarios to time. Kept modest
-/// because on a non-incremental engine each rep is a full 1M-cell re-evaluate (~2 s);
-/// a dozen reps still give an informative p50/p99 within one process while bounding
-/// the total run.
-const CASCADE_REPS: usize = 12;
-/// Edits to time for the change→visible scenario (same rationale as CASCADE_REPS).
-const VISIBLE_EDITS: usize = 12;
+/// How many repetitions of the (expensive) 1M-cell cascade recompute to time. Each rep
+/// is a full 1M-deep recompute (~2–3 s per engine on the 4-core target), so we keep the
+/// count small: the recompute is deterministic, so a handful of reps already give a
+/// stable p50/p99 while bounding the total wall-clock (build ~6–27 s + reps × ~2–3 s).
+const CASCADE_REPS: usize = 5;
+/// Edits to time for the change→visible scenario (rebuilt once per design, ×3).
+const VISIBLE_EDITS: usize = 5;
+/// Reps for the (cheaper) fan-out recompute — a 1,000×1,000 shape recomputes in tens of
+/// ms (IronCalc) to a few seconds (Formualizer); a few reps bound Formualizer's cost.
+const FANOUT_REPS: usize = 5;
+/// Wall-clock budget for the memory-load scenario. If an engine can't reach the target
+/// cell count within this budget the load steps down and records the ceiling it reached
+/// (Formualizer's `write_range` load is super-linear and can't hit 10⁷ in-budget; see
+/// findings). ~90 s keeps the whole suite bounded while letting IronCalc reach 10⁷.
+const MEMORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Runs the whole scenario suite against a fresh engine per scenario (built by
 /// `make`), returning one [`ScenarioResult`] per (scenario, design). `env`/`date`
@@ -120,13 +128,14 @@ where
             &engine_name,
             "cascade-visible",
             Some(design.label()),
-            profile.chain_len as u64,
+            profile.visible_chain_len as u64,
             date,
             env.clone(),
             stats,
             gate,
             json!({
-                "chain_len": profile.chain_len,
+                "chain_len": profile.visible_chain_len,
+                "build_ms": run.build_time.as_millis() as u64,
                 "verified_visible": run.tail_value.as_number(),
                 "expected_visible": run.expected_tail,
                 "cascade_verified": run.is_correct(),
@@ -163,6 +172,7 @@ where
             gate,
             json!({
                 "chain_len": profile.chain_len,
+                "build_ms": run.build_time.as_millis() as u64,
                 "verified_tail": run.tail_value.as_number(),
                 "expected_tail": run.expected_tail,
                 "recompute_verified": run.is_correct(),
@@ -177,7 +187,7 @@ where
             &mut engine,
             profile.fanout_sources,
             profile.fanout_dependents,
-            CASCADE_REPS,
+            FANOUT_REPS,
         );
         assert!(
             run.is_correct(),
@@ -200,6 +210,7 @@ where
             json!({
                 "sources": profile.fanout_sources,
                 "dependents": profile.fanout_dependents,
+                "build_ms": run.build_time.as_millis() as u64,
                 "verified_dependent": run.tail_value.as_number(),
                 "expected_dependent": run.expected_tail,
                 "recompute_verified": run.is_correct(),
@@ -236,20 +247,22 @@ where
         ));
     }
 
-    // --- Scenario 5: memory load + edit (discovery: peak RSS) ---
+    // --- Scenario 5: memory load + edit (discovery: peak RSS, wall-clock-budgeted) ---
     {
         let rss_before = peak_rss();
         let mut engine = make();
-        let mem = scenario::memory_load_and_edit(&mut engine, profile.memory_cells);
+        let mem = scenario::memory_load_and_edit(&mut engine, profile.memory_cells, MEMORY_BUDGET);
         let rss_after = peak_rss();
         // Keep the engine alive across the RSS read.
         std::hint::black_box(&engine);
-        // CREDIBILITY GUARD: the far-corner cell proves the full region was populated,
-        // so the recorded RSS is for a genuinely loaded ~10^7-cell workbook.
+        // CREDIBILITY GUARD: the far-corner cell proves the LOADED region was populated
+        // (whatever scale the budget allowed), so the recorded RSS is for a genuinely
+        // loaded workbook — not an empty grid — even when the load stepped down.
         assert!(
             mem.is_correct(),
-            "{engine_name} memory scenario did NOT populate the region: requested {} cells, \
+            "{engine_name} memory scenario did NOT populate the region: loaded {} of {} cells, \
              far corner={:?}, expected {}",
+            mem.loaded,
             mem.requested,
             mem.far_corner,
             mem.expected_far_corner,
@@ -258,7 +271,7 @@ where
             &engine_name,
             "memory",
             None,
-            profile.memory_cells as u64,
+            mem.loaded as u64,
             date,
             env.clone(),
             None,
@@ -267,7 +280,10 @@ where
                 "peak_rss_bytes_before": rss_before,
                 "peak_rss_bytes_after": rss_after,
                 "delta_bytes": rss_after.saturating_sub(rss_before),
-                "cells": profile.memory_cells,
+                "requested_cells": profile.memory_cells,
+                "loaded_cells": mem.loaded,
+                "load_capped_by_budget": mem.capped,
+                "load_time_ms": mem.load_time.as_millis() as u64,
                 "far_corner_verified": mem.far_corner.as_number(),
                 "populated_verified": mem.is_correct(),
             }),

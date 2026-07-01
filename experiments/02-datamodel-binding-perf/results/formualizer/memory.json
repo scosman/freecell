@@ -1,0 +1,28 @@
+{
+  "name": "formualizer/memory",
+  "input_size": 4200000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "extra": {
+    "design": null,
+    "engine": "formualizer",
+    "metrics": {
+      "delta_bytes": 1738563584,
+      "far_corner_verified": 4199999.0,
+      "load_capped_by_budget": true,
+      "load_time_ms": 93156,
+      "loaded_cells": 4200000,
+      "peak_rss_bytes_after": 3882000384,
+      "peak_rss_bytes_before": 2143436800,
+      "populated_verified": true,
+      "requested_cells": 10000000
+    },
+    "scenario": "memory"
+  }
+}

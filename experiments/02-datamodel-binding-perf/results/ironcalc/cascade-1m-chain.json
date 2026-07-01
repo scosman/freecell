@@ -1,0 +1,40 @@
+{
+  "name": "ironcalc/cascade-1m-chain",
+  "input_size": 1000000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 5,
+    "min_ns": 1984840666,
+    "max_ns": 2119195621,
+    "mean_ns": 2038808730,
+    "p50_ns": 2024714845,
+    "p99_ns": 2119195621
+  },
+  "gates": [
+    {
+      "name": "cascade-1m-chain",
+      "measured_ns": 2024714845,
+      "target_ns": 100000000,
+      "verdict": "FAIL"
+    }
+  ],
+  "extra": {
+    "design": null,
+    "engine": "ironcalc",
+    "metrics": {
+      "build_ms": 5911,
+      "chain_len": 1000000,
+      "expected_tail": 1000005.0,
+      "recompute_verified": true,
+      "verified_tail": 1000005.0
+    },
+    "scenario": "cascade-1m-chain"
+  }
+}

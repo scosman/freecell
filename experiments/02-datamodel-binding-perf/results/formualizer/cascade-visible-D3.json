@@ -1,0 +1,40 @@
+{
+  "name": "formualizer/cascade-visible/D3",
+  "input_size": 100000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 5,
+    "min_ns": 116887477,
+    "max_ns": 183056947,
+    "mean_ns": 131497933,
+    "p50_ns": 119862139,
+    "p99_ns": 183056947
+  },
+  "gates": [
+    {
+      "name": "cascade-visible/D3",
+      "measured_ns": 183056947,
+      "target_ns": 16666666,
+      "verdict": "FAIL"
+    }
+  ],
+  "extra": {
+    "design": "D3",
+    "engine": "formualizer",
+    "metrics": {
+      "build_ms": 1937,
+      "cascade_verified": true,
+      "chain_len": 100000,
+      "expected_visible": 99945.0,
+      "verified_visible": 99945.0
+    },
+    "scenario": "cascade-visible"
+  }
+}

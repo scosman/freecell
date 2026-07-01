@@ -44,8 +44,15 @@ pub struct Profile {
     pub viewport_cols: u32,
     /// Number of viewport pan steps to time (scrolling read).
     pub pan_steps: usize,
-    /// Length of the linear `=PREV+1` chain (cascade scenarios).
+    /// Length of the linear `=PREV+1` chain for the headline 1M cascade-recompute
+    /// benchmark (§5.4 target).
     pub chain_len: u32,
+    /// Length of the linear chain for the change→visible-update scenario (Scenario 2).
+    /// Kept smaller than [`Profile::chain_len`] because that scenario rebuilds the chain
+    /// **once per design** (×3) and edits it repeatedly — a full 1M rebuild+recompute per
+    /// design would dominate the run without changing the verdict (one recompute already
+    /// blows the frame budget). Still large enough to be a genuine offscreen cascade.
+    pub visible_chain_len: u32,
     /// Number of `set_value`s to time in the write scenario.
     pub write_count: u32,
     /// Number of populated cells for the memory scenario.
@@ -66,6 +73,7 @@ impl Profile {
             viewport_cols: 20,
             pan_steps: 8,
             chain_len: 500,
+            visible_chain_len: 500,
             write_count: 200,
             memory_cells: 5_000,
             fanout_sources: 64,
@@ -75,25 +83,36 @@ impl Profile {
 
     /// The spec-scale profile for recorded runs (functional_spec §5.4).
     ///
-    /// The scrolling region is a **2,000,000-cell** block (25,000 rows × 80 cols):
-    /// large enough that the pan path visits many distinct windows across a huge sheet
-    /// (both axes), while keeping the (repeated, per-design) seeding cost bounded on the
-    /// non-incremental engine. The viewport is ~1,800 cells (order 10^3, per §5.4).
+    /// The scrolling region is a **200,000-cell** block (2,500 rows × 80 cols): large
+    /// enough that the 300-step pan path visits many distinct windows across a sheet far
+    /// bigger than the ~1,800-cell viewport (both axes), while staying within the size
+    /// Formualizer's super-linear `write_range` bulk-seed can load in-budget (~11 s; a
+    /// 2M-cell single seed does NOT complete in-budget — a recorded API finding). The
+    /// viewport read itself (the thing measured) is unaffected by the region size.
+    ///
+    /// Heavy-scenario scales are chosen from measured single-shot costs on the 4-core
+    /// target so the whole suite completes inside a bounded wall-clock budget (see the
+    /// probe findings): the **1M** headline cascade (Scenario 3a) is kept at spec scale;
+    /// the change→visible chain (Scenario 2, rebuilt ×3) is 100k; the fan-out is
+    /// 1,000×1,000 (a 5,000×5,000 shape costs ~100 s/recompute on Formualizer — recorded
+    /// as a ceiling finding, not a per-run gate); the memory load targets 10⁷ cells but
+    /// is **wall-clock-budgeted** so each engine records the ceiling it actually reaches.
     pub const fn full() -> Self {
         Self {
-            region_rows: 25_000,
+            region_rows: 2_500,
             region_cols: 80,
             viewport_rows: 60,
             viewport_cols: 30, // ~1,800 cells/viewport (order 10^3, per §5.4)
             pan_steps: 300,
             chain_len: 1_000_000,
-            // 2,000 single edits, each with a per-edit recompute, keeps the
+            visible_chain_len: 100_000,
+            // 1,000 single edits, each with a per-edit recompute, keeps the
             // non-incremental engine's single-write path bounded while the single-vs-
             // batched contrast stays clear.
-            write_count: 2_000,
+            write_count: 1_000,
             memory_cells: 10_000_000,
-            fanout_sources: 5_000,
-            fanout_dependents: 5_000,
+            fanout_sources: 1_000,
+            fanout_dependents: 1_000,
         }
     }
 }
@@ -102,24 +121,38 @@ impl Profile {
 pub const SEED: u64 = 0xF2EE_CE11;
 
 /// Seeds `engine` with a `rows × cols` block of synthetic literal values (numbers
-/// and text) from a deterministic [`SyntheticSheet`]. Uses a single batch so
-/// non-incremental engines pay one recompute, not one per cell.
+/// and text) from a deterministic [`SyntheticSheet`], loading in **row chunks**.
+///
+/// Chunking (rather than one giant batch) is deliberate: it mirrors how a real binding
+/// layer streams a bulk load, keeps each per-batch temporary bounded, and — critically —
+/// avoids Formualizer's super-linear single-`write_range` cost (one 2M-cell `write_range`
+/// does not complete in-budget; see findings). Each chunk is one `set_batch`, so a
+/// non-incremental engine still pays only one recompute per chunk of literals (and, since
+/// these are pure literals, both adapters skip the recompute entirely).
 pub fn seed_region(engine: &mut impl SpreadsheetEngine, rows: u32, cols: u32) {
     let sheet = SyntheticSheet::new(SEED, rows, cols);
-    let mut batch = Vec::with_capacity((rows as usize) * (cols as usize));
-    for r in 0..rows {
-        for c in 0..cols {
-            let v = match sheet.cell(r, c).value {
-                datagen::CellValue::Empty => EngineValue::Empty,
-                datagen::CellValue::Number(n) => EngineValue::Number(n),
-                datagen::CellValue::Text(t) => EngineValue::Text(t),
-            };
-            if v != EngineValue::Empty {
-                batch.push((r, c, CellInput::Value(v)));
+    // ~40k cells/chunk keeps each write_range small enough to stay on the linear part of
+    // Formualizer's bulk-write curve while remaining a realistic streamed load.
+    let chunk_rows: u32 = (40_000 / cols.max(1)).max(1);
+    let mut r0 = 0;
+    while r0 < rows {
+        let r1 = (r0 + chunk_rows).min(rows);
+        let mut batch = Vec::with_capacity(((r1 - r0) as usize) * (cols as usize));
+        for r in r0..r1 {
+            for c in 0..cols {
+                let v = match sheet.cell(r, c).value {
+                    datagen::CellValue::Empty => EngineValue::Empty,
+                    datagen::CellValue::Number(n) => EngineValue::Number(n),
+                    datagen::CellValue::Text(t) => EngineValue::Text(t),
+                };
+                if v != EngineValue::Empty {
+                    batch.push((r, c, CellInput::Value(v)));
+                }
             }
         }
+        engine.set_batch(&batch);
+        r0 = r1;
     }
-    engine.set_batch(&batch);
 }
 
 /// A deterministic pan path across the region: steps down and right in a sweep so we
@@ -197,16 +230,14 @@ pub fn cascade_to_visible_update(
     design: Design,
     edits: usize,
 ) -> CascadeRun {
-    build_linear_chain(engine, profile.chain_len);
+    let chain_len = profile.visible_chain_len;
+    let (_, build_time) = bench_util::time_once(|| build_linear_chain(engine, chain_len));
     engine.enable_change_tracking();
     let _ = engine.drain_dirty();
 
     // Visible viewport sits near the tail of the chain (offscreen from the head at
     // row 0): a change at the head must cascade all the way to here.
-    let tail = profile
-        .chain_len
-        .saturating_sub(profile.viewport_rows)
-        .max(1);
+    let tail = chain_len.saturating_sub(profile.viewport_rows).max(1);
     let vp = Viewport::new(tail, 0, profile.viewport_rows, profile.viewport_cols.min(4));
     let mut cache = BindingCache::new();
     cache.prime(engine, vp);
@@ -242,7 +273,8 @@ pub fn cascade_to_visible_update(
         tail_value: last_visible,
         expected_tail: final_head + tail as f64,
         final_head,
-        verified_len: profile.chain_len,
+        verified_len: chain_len,
+        build_time,
     }
 }
 
@@ -259,6 +291,9 @@ pub struct CascadeRun {
     pub final_head: f64,
     /// The chain length actually built (echoed back for the record).
     pub verified_len: u32,
+    /// Wall-clock time to BUILD the shape (via the engine's batched write path) — a real,
+    /// interesting number kept separate from the measured recompute samples.
+    pub build_time: Duration,
 }
 
 impl CascadeRun {
@@ -279,7 +314,7 @@ pub fn cascade_recompute_chain(
     chain_len: u32,
     reps: usize,
 ) -> CascadeRun {
-    build_linear_chain(engine, chain_len);
+    let (_, build_time) = bench_util::time_once(|| build_linear_chain(engine, chain_len));
     // Sanity: the freshly-built chain tail must be head(=1) + (len-1).
     let tail_row = chain_len.saturating_sub(1);
     let mut samples = Vec::with_capacity(reps);
@@ -300,6 +335,7 @@ pub fn cascade_recompute_chain(
         expected_tail: final_head + tail_row as f64,
         final_head,
         verified_len: chain_len,
+        build_time,
     }
 }
 
@@ -326,7 +362,7 @@ pub fn cascade_recompute_fanout(
             )
         })
         .collect();
-    engine.set_batch(&batch);
+    let (_, build_time) = bench_util::time_once(|| engine.set_batch(&batch));
     let mut samples = Vec::with_capacity(reps);
     let mut final_head = 0.0;
     for i in 0..reps {
@@ -350,6 +386,7 @@ pub fn cascade_recompute_fanout(
         expected_tail: expected,
         final_head,
         verified_len: sources + dependents,
+        build_time,
     }
 }
 
@@ -384,38 +421,55 @@ pub fn writes_single_vs_batched(
 }
 
 /// The verified outcome of the memory scenario: how many cells were actually loaded
-/// (spot-checked, not just requested) so the runner can prove ~10⁷ cells were populated.
+/// (spot-checked, not just requested) so the runner can prove the region was populated,
+/// plus the wall-clock load time and how far the load got before the time budget hit.
 #[derive(Debug)]
 pub struct MemoryRun {
-    /// Cells requested to load.
+    /// Cells requested to load (the target scale, e.g. 10⁷).
     pub requested: u32,
-    /// A far-corner cell's value after load — proves the tail of the region was written.
+    /// Cells actually loaded — equals `requested` unless the time budget capped the run.
+    pub loaded: u32,
+    /// A far-corner (last-loaded) cell's value — proves the tail of the region was written.
     pub far_corner: EngineValue,
     /// The expected far-corner value.
     pub expected_far_corner: f64,
+    /// Wall-clock time to load `loaded` cells (chunked bulk writes).
+    pub load_time: Duration,
+    /// `true` if the load was stopped early by the time budget (a per-engine ceiling).
+    pub capped: bool,
 }
 
 impl MemoryRun {
     /// `true` iff the far-corner cell holds the value it was loaded with — proof the
-    /// full region (not just the first rows) was populated.
+    /// loaded region (not just the first rows) was populated.
     pub fn is_correct(&self) -> bool {
         self.far_corner.as_number() == Some(self.expected_far_corner)
     }
 }
 
-/// **Scenario 5 — memory load + edit.** Populates `cells` literal values in **chunked
-/// batches** (a realistic bulk-load shape, and it keeps any per-batch temporary — e.g.
-/// a large `BTreeMap` in the Formualizer adapter — bounded rather than materializing all
-/// 10⁷ at once), then performs one edit + recompute. Returns a [`MemoryRun`] that
-/// spot-checks a far-corner cell so the caller can prove the region was fully populated;
-/// the caller samples peak RSS around this call (a platform read the bench binary owns).
-pub fn memory_load_and_edit(engine: &mut impl SpreadsheetEngine, cells: u32) -> MemoryRun {
+/// **Scenario 5 — memory load + edit (time-budgeted, step-down).** Populates up to
+/// `cells` literal values in **chunked batches** (a realistic bulk-load shape that keeps
+/// each per-batch temporary bounded rather than materializing all 10⁷ at once), then
+/// performs one edit + recompute. The load **stops early** once `budget` wall-clock time
+/// elapses, so an engine that can't reach the target scale in the budget records the
+/// ceiling it *did* reach instead of hanging (per the phase's step-down guardrail).
+/// Returns a [`MemoryRun`] that spot-checks the last-loaded far-corner cell so the caller
+/// can prove the region was genuinely populated; the caller samples peak RSS around this
+/// call (a platform read the bench binary owns).
+pub fn memory_load_and_edit(
+    engine: &mut impl SpreadsheetEngine,
+    cells: u32,
+    budget: Duration,
+) -> MemoryRun {
     // Lay the cells out as a wide-ish rectangle to avoid a single 10^7-long column, and
     // load in chunks of whole rows so each batch is bounded.
     let cols: u32 = 1_000;
     let chunk_rows: u32 = 100; // 100k cells per batch
     let total_rows = cells.div_ceil(cols);
+    let start = std::time::Instant::now();
     let mut row = 0;
+    let mut loaded = 0u32;
+    let mut capped = false;
     while row < total_rows {
         let end_row = (row + chunk_rows).min(total_rows);
         let mut batch: Vec<(u32, u32, CellInput)> =
@@ -427,13 +481,21 @@ pub fn memory_load_and_edit(engine: &mut impl SpreadsheetEngine, cells: u32) -> 
                     break;
                 }
                 batch.push((r, c, CellInput::Value(EngineValue::Number(i as f64))));
+                loaded = i + 1;
             }
         }
         engine.set_batch(&batch);
         row = end_row;
+        // Step-down: if we've blown the wall-clock budget, stop and record the ceiling.
+        if start.elapsed() >= budget && row < total_rows {
+            capped = true;
+            break;
+        }
     }
+    let load_time = start.elapsed();
+
     // Spot-check the LAST loaded cell (far corner) before the edit overwrites (0,0).
-    let last_i = cells.saturating_sub(1);
+    let last_i = loaded.saturating_sub(1);
     let far_row = last_i / cols;
     let far_col = last_i % cols;
     let far_corner = engine.get_value(far_row, far_col);
@@ -444,8 +506,11 @@ pub fn memory_load_and_edit(engine: &mut impl SpreadsheetEngine, cells: u32) -> 
 
     MemoryRun {
         requested: cells,
+        loaded,
         far_corner,
         expected_far_corner: last_i as f64,
+        load_time,
+        capped,
     }
 }
 
@@ -494,7 +559,7 @@ mod tests {
         let mut e = FakeEngine::new_blank();
         // Small chain so the visible tail cascades from the head.
         let p = Profile {
-            chain_len: 20,
+            visible_chain_len: 20,
             viewport_rows: 4,
             viewport_cols: 1,
             ..dev()
@@ -504,7 +569,7 @@ mod tests {
         // The visible cell reflects the cascade: its verification must hold.
         assert!(run.is_correct(), "visible cascade not reflected: {run:?}");
         // After the last edit (head = 3.0), the chain tail reflects it too.
-        let tail = p.chain_len - 1;
+        let tail = p.visible_chain_len - 1;
         let expected = 3.0 + (tail as f64);
         assert_eq!(e.get_value(tail, 0), EngineValue::Number(expected));
     }
@@ -548,9 +613,11 @@ mod tests {
     #[test]
     fn scenario_memory_load_populates_and_verifies() {
         let mut e = FakeEngine::new_blank();
-        let mem = memory_load_and_edit(&mut e, 2_000);
+        let mem = memory_load_and_edit(&mut e, 2_000, Duration::from_secs(60));
         // The far-corner spot-check proves the whole region was populated.
         assert!(mem.is_correct(), "memory region not populated: {mem:?}");
         assert_eq!(mem.requested, 2_000);
+        assert_eq!(mem.loaded, 2_000);
+        assert!(!mem.capped, "a tiny load should never hit the budget");
     }
 }

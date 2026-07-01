@@ -57,7 +57,7 @@ fidelity**. Engine work lives in per-engine subfolders (`.../formualizer/`,
   gpui-component grid variants over the static datamodel provider; in-app "Run Test"
   measured PASS/FAIL harness; macOS build scripts. Authoritative on macOS (you run it).
 
-- [ ] **Phase 6 — Round-2 Proposal (Sub-project F → `05-round-2-proposal/`)**
+- [x] **Phase 6 — Round-2 Proposal (Sub-project F → `05-round-2-proposal/`)**
   *(parallel; batched review)*: ranked follow-up explorations (incl. the captured
   style read→write roundtrip item).
 

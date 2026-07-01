@@ -1,0 +1,11 @@
+[package]
+name = "datagen"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic synthetic-sheet and sample-file generators for FreeCell Phase 1 experiments. Engine-neutral; consumed read-only by later sub-projects."
+license = "Apache-2.0"
+
+# Intentionally dependency-light and engine-agnostic: the spreadsheet engine and
+# xlsx-writer choices are gated (Sub-project A), so this crate must not couple to
+# them. See src/lib.rs for rationale.
+[dependencies]

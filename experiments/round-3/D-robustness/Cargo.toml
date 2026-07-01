@@ -6,18 +6,24 @@ description = "FreeCell Round-3 D (cheap robustness) -- engine-robustness probe.
 license = "MIT OR Apache-2.0"
 publish = false
 
+[lib]
+name = "robustness"
+path = "src/lib.rs"
+
 [[bin]]
 name = "robustness"
 path = "src/main.rs"
 
 [dependencies]
-# Frozen, read-only shared harness. D reuses the IronCalc `Model` adapter (robustness is
-# a Model-level property) + the SpreadsheetEngine trait. Same IronCalc 0.7.1 pin.
+# Frozen, read-only shared harness. D reuses it for env stamping (`cpu_model`). Robustness
+# is a `Model`-level property; the probe drives `ironcalc_base::Model` directly (the
+# harness adapter hides `get_cell_type`, which is the typed-error assertion we need).
 round2_harness = { path = "../../round-2/harness" }
-# Frozen shared crates (datagen for pathological-input content, bench_util for env stamp).
+# Frozen shared crates (bench_util for the env-stamped results record + p50/p99 stats).
 datagen = { path = "../../shared/datagen" }
 bench_util = { path = "../../shared/bench_util" }
 # Same IronCalc pin as the harness (Cargo.lock -> 0.7.1): the typed-error enum + direct
 # evaluation probes for the circular-ref / malformed-input assertions (matches SP1/SP3).
 ironcalc_base = "0.7"
 anyhow = "1"
+serde_json = "1"

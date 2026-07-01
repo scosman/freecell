@@ -49,7 +49,7 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
   probe- or source-cited, with a plan per gap. GATE (judgment): no surprise load-bearing
   gap buried. (functional_spec B; architecture §5)
 
-- [ ] **Phase D — Engine robustness** *(parallel; batched review; cheap)* →
+- [x] **Phase D — Engine robustness** *(parallel; batched review; cheap)* →
   `round-3/D-robustness/`. Feed circular refs (`A1=A1`; `A1=B1,B1=A1`) + malformed/
   pathological formulas; assert typed errors, **no hang** (foreground `timeout`), **no
   panic**; test worker-panic-recovery (catch_unwind / restart) for the SP1-style worker.

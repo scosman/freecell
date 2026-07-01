@@ -695,6 +695,7 @@ dependencies = [
  "datagen",
  "ironcalc_base",
  "round2_harness",
+ "serde_json",
 ]
 
 [[package]]

@@ -63,12 +63,21 @@ Created and **frozen** at scaffolding (Phase 0); later phases consume them by
   serializable `BenchResult` (env-stamped; **date passed in**, no wall-clock in
   recording code) written as JSON to a phase's `results/`.
 
-Depend on them from a sub-project's `Cargo.toml` by relative path, e.g.:
+Depend on them from a sub-project's `Cargo.toml` by relative path. The example
+below is for a crate **one level** under `experiments/` (e.g.
+`01-file-support/`); **adjust the number of `..` segments to your crate's depth**
+under `experiments/`. For a crate two levels down — e.g. Sub-project A's smoke
+crate at `experiments/00-stack-decision/smoke/` — use `../../shared/datagen`.
 
 ```toml
 [dependencies]
+# from experiments/01-file-support/ (one level down):
 datagen = { path = "../shared/datagen" }
 bench_util = { path = "../shared/bench_util" }
+
+# from experiments/00-stack-decision/smoke/ (two levels down):
+# datagen    = { path = "../../shared/datagen" }
+# bench_util = { path = "../../shared/bench_util" }
 ```
 
 ## How to run everything

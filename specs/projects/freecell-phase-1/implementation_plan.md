@@ -12,7 +12,7 @@ architecture §2. **Parallel phases run in their own git worktrees** and merge b
 
 ## Phases
 
-- [ ] **Phase 0 — Scaffolding** *(serial)*: create `experiments/` skeleton,
+- [x] **Phase 0 — Scaffolding** *(serial)*: create `experiments/` skeleton,
   `shared/datagen` + `shared/bench_util` lib crates, and `README.md`. Freeze
   `shared/` (read-only to later phases). Commit once.
 

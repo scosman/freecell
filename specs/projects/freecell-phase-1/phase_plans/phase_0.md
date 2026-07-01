@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 0: Scaffolding
@@ -70,7 +70,7 @@ a Cargo workspace and that crates are built independently from their own dirs.
 
 ### 3. `experiments/shared/datagen` (lib crate)
 
-`cargo new --lib`, edition 2021. Dependency-light (no engine, no xlsx writer).
+`cargo new --lib`, edition 2024. Dependency-light (no engine, no xlsx writer).
 
 Public API (engine-neutral, deterministic):
 
@@ -120,7 +120,7 @@ CellData/CellSource), `synthetic.rs` (SyntheticSheet + sizing), `formula.rs`
 
 ### 4. `experiments/shared/bench_util` (lib crate)
 
-`cargo new --lib`, edition 2021. Deps: `serde` (derive), `serde_json`. No wall-clock
+`cargo new --lib`, edition 2024. Deps: `serde` (derive), `serde_json`. No wall-clock
 calls inside deterministic recording paths (architecture §3: relative date passed
 in).
 

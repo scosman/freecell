@@ -65,10 +65,23 @@ No app exists yet; all work so far is experiments.
   runtime no-op with a trivial fix (swap `ztracing::instrument` → `tracing::instrument`
   in `sum_tree`), **still open upstream** — must be removed/patched + legal-signed-off
   before distributing a proprietary binary. Not a blocker for experiments.
-- **Formatting model = engine-neutral FreeCell-owned `FormatStore`** side-table
-  (interned `StyleId`; sparse `(row,col)→StyleId`; row/col band maps; merges list),
-  persisted via the engine's file I/O. It's the render source of truth regardless of
-  engine; IronCalc's native styles are leaned on for file-I/O fidelity.
+- **Formatting = IronCalc's native style storage is the source of truth.** IronCalc
+  reads / writes / round-trips per-cell styles (bold/italic/underline, font
+  size/color/name, fill, border, alignment, number format) + row/col sizing natively
+  through `.xlsx` (probe-backed, Phase-1 Sub-project D). Save/load is the engine's own
+  API — **no FreeCell `FormatStore` side-table, and no style-adapter layer.** (Don't
+  build indirection for 0.x `Style` churn that may never happen; add a thin adapter
+  only if/when IronCalc actually breaks us.) *This reverses the Phase-1 Sub-project-D
+  recommendation, which proposed an engine-neutral side-table **"regardless of which
+  engine wins"** — that hedge was load-bearing only while the engine was undecided and
+  because Formualizer surfaced no styles at all; both premises died when IronCalc was
+  chosen, and a duplicate authoritative store just buys sync-on-edit + flush-on-save
+  complexity and extra memory for no remaining benefit.*
+  **The one gap: merged cells + conditional formatting have no public IronCalc API.**
+  These are **major features, left OPEN — not designed here.** If pursued, each needs
+  its own technical design. ⚠️ **Scope trap:** persisting either almost certainly means
+  FreeCell taking over `.xlsx` **writing** entirely (IronCalc's saver won't emit what
+  its API can't model), which ~10×'s scope — gate hard before committing to either.
 
 ## 3. Phase-1 outcome & the evidence you inherit
 
@@ -133,17 +146,24 @@ Detailed approaches are in that doc — read it. In priority order:
    IronCalc's 345 registered builtins vs Excel ~500: coverage diff + a golden-file
    Excel-correctness harness (edge cases, `#DIV/0!`/`#N/A` error semantics, locale/date,
    array/spill). Could reopen the engine choice.
-4. **IronCalc-specific binding layer at scale.** Confirm the per-cell viewport loop holds
-   <2 ms under **real formatting** at scale; design cache invalidation against IronCalc's
-   `UserModel` diff-list (edit-sites-only, no downstream-dirty).
-5. **FreeCell `FormatStore` prototype** + the unsolved **row/col insert-delete shift**
-   (keeping style bands aligned when rows/cols move).
-6. **Long-tail style-roundtrip fidelity** + a **merges / conditional-formatting
-   side-store** (IronCalc has no API for either).
-7. **GPUI grid maturation:** inline cell editing, selection ranges, frozen panes; **record
+4. **IronCalc binding layer + native style read at scale.** Confirm the per-cell
+   viewport loop holds <2 ms with **real formatting**: **add `get_style_for_cell` to the
+   viewport benchmark** and confirm reading value + style per visible cell in the loop
+   stays under budget at scale (styles are now read straight from IronCalc — §2). **Also
+   validate IronCalc's style API actually exposes what FreeCell needs** — per-cell
+   attributes, row/col **band** styles, and **empty-cell** styling (verify, don't assume;
+   if band/empty-cell styling is thin, that's a finding that reopens the formatting
+   design). Design cache invalidation against IronCalc's `UserModel` diff-list
+   (edit-sites-only, no downstream-dirty).
+5. **Long-tail style-roundtrip fidelity** — exact colors / border styles / number-format
+   codes / rich text across `.xlsx` round-trips (Phase-1 probed representative attributes
+   only). **Merges + conditional formatting stay OPEN** (see §2): no IronCalc API — each
+   is a major feature needing its own technical design **and** the "take over `.xlsx`
+   writing" scope gate; **not designed in Phase 2.**
+6. **GPUI grid maturation:** inline cell editing, selection ranges, frozen panes; **record
    the still-pending §5.4 "Run Test" numbers on a Mac** (frame p50/p99 + PASS/FAIL);
    rendering-correctness **PNG baseline** tests; **resolve GPL #55470**.
-8. **Residual gaps:** CSV hardening, IronCalc load-API friction, untested recompute
+7. **Residual gaps:** CSV hardening, IronCalc load-API friction, untested recompute
    shapes, storage-density extrapolation to true Excel-max.
 
 ## 6. Where everything lives (file map)

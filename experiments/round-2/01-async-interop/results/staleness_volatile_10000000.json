@@ -3,9 +3,9 @@
   "experiment": "SP1 staleness window + snapshot cost",
   "model_shape": "volatile",
   "populated_cells": 10000000,
-  "snapshot_to_bytes": "911.79 ms",
+  "snapshot_to_bytes": "2.04 s",
   "snapshot_to_bytes_bytes": 96825658,
-  "snapshot_to_bytes_ns": 911791333,
-  "staleness_window": "7.10s",
-  "staleness_window_ns": 7099621895
+  "snapshot_to_bytes_ns": 2039526746,
+  "staleness_window": "6.11s",
+  "staleness_window_ns": 6105483790
 }

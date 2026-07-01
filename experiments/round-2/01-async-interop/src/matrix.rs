@@ -80,11 +80,26 @@ fn read_tail(model: &Model<'static>, built: &BuiltShape) -> f64 {
         .expect("tail cell must be numeric")
 }
 
-/// Force+assert the eval did real work: the tail changed (deterministic shapes after a
-/// re-arm; volatile every eval).
+/// Force+assert the eval did real work.
+///
+/// - **Deterministic shapes** (sparse/chain/fanout/cross-sheet): after a monotonic seed
+///   re-arm the tail MUST take a new, predictable value — a strict `before != after`.
+/// - **Volatile** (`=RAND()`): the deterministic part is the **range** — a genuine
+///   `RAND()` result is a fresh draw in `[0,1)`, so asserting `after ∈ [0,1)` proves the
+///   eval actually re-rolled the cell (not that it was skipped or left stale). We *also*
+///   check `before != after` as a sanity signal, but the range check — not the
+///   probabilistic `RAND ≠ RAND` — is what makes the force+assert deterministic.
 fn assert_tail_changed(built: &BuiltShape, before: f64, after: f64) {
     if built.changes_without_rearm {
-        assert_ne!(before, after, "volatile tail must change every eval");
+        assert!(
+            (0.0..1.0).contains(&after),
+            "volatile tail must be a fresh RAND() result in [0,1) after eval (got {after}) \
+             — proves the eval re-rolled the cell"
+        );
+        assert_ne!(
+            before, after,
+            "volatile tail should differ across consecutive RAND() evals"
+        );
     } else {
         assert_ne!(
             before,

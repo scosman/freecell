@@ -33,8 +33,12 @@ Three deliverables, all in this independent Cargo project (`sp1_async_interop`),
 - **Non-blocking harness + GATES** — `src/bin/nonblocking.rs`: a headless render loop
   (driver ticking at 60 fps; **NO GPUI**) driving an `EvalWorker` that owns the model on
   a worker thread. It fires a burst of rapid edits mid-run so an eval is in flight, and
-  measures the render tick's synchronous work, the coalesced eval count, and the
-  staleness window. The seam itself lives in `src/seam.rs`.
+  measures the render tick's synchronous work, the coalesced eval count, and the staleness
+  window. **GATE 1 uses two controls**: a *positive* run (the seam — eval on the worker)
+  that must pass, and a *negative control* (`run_negative_control`) that runs the same tick
+  loop with `evaluate()` **inline on the render thread** and must **fail** the frame budget
+  — so the gate discriminates a blocking design from the seam. The seam itself lives in
+  `src/seam.rs`.
 
 ### Reproduce
 
@@ -153,31 +157,60 @@ The render loop drives an `EvalWorker` (model on a worker thread) and fires 30 r
 mid-run so a full eval is in flight. Two runs: deep_serial @10⁶ (~1.2 s eval) and volatile
 @10⁷ (~7 s eval).
 
+**GATE 1 is discriminating — it uses two controls on the *same* tick-measurement loop.**
+The point is *not* "the slot-read is cheap" (it always is, ~1 µs, blocking or not); the
+point is that non-blocking is a property of **ownership discipline** — the worker owns
+`&mut Model`, and the render side holds nothing `evaluate()` touches. The two controls make
+that testable:
+
 | metric | deep_serial 10⁶ | volatile 10⁷ | GATE |
 |---|---|---|---|
-| render tick p99 **while eval in flight** | **3.11 µs** | **3.68 µs** | **< 8.3 ms ✓ (hard-fail > 16.6 ms)** |
-| render tick max (all 600 ticks) | 52 µs | 25 µs | — |
-| ticks sampled *during* the eval | 77 | 422 | (proves it overlapped) |
+| **POSITIVE (seam):** render tick p99 **while eval in flight** | **2.51 µs** | **3.93 µs** | **< 8.3 ms ✓ (hard-fail > 16.6 ms)** |
+| — during-eval ticks actually sampled | 76 | 361 | (proves the read overlapped a real in-flight eval) |
+| render tick max (all 600 ticks) | 82 µs | 36 µs | — |
+| **NEGATIVE (inline-eval blocking design):** during-eval tick p99 | **1.24 s** | **1.12 s** | **MUST fail; > 16.6 ms ✓** |
 | 30 rapid edits ⇒ full `evaluate()` runs | **1** | **1** | **≤ 2 ✓ (coalesce)** |
-| staleness window (edit → visible fresh) | 1.31 s | 7.10 s | DISCOVERY (≈ one eval) |
-| snapshot `to_bytes` cost | 13.0 MB / 203 ms | 96.8 MB / 912 ms | DISCOVERY (clone cost) |
+| staleness window (edit → visible fresh) | 1.29 s | 6.11 s | DISCOVERY (≈ one eval) |
+| snapshot `to_bytes` cost | 13.0 MB / 193 ms | 96.8 MB / 2.04 s | DISCOVERY (clone cost) |
 
-- **GATE 1 (render non-blocking): PASS.** Per-tick synchronous work stays ~**3 µs** (p99)
-  even while a 10⁶- and a 10⁷-cell eval runs — **~2700× under** the 8.3 ms frame budget.
-  The tick only reads the small published viewport (O(viewport), a short-held lock); it
-  never calls `evaluate()` and never blocks on the worker.
+- **GATE 1 (render non-blocking): PASS — and discriminating.**
+  - *Positive control (the seam):* with eval on the worker thread, the render tick only
+    reads the small published viewport (O(viewport), a short-held lock) and never calls
+    `evaluate()`. Its during-eval p99 is ~2.5–3.9 µs — well inside the 8.3 ms budget — and
+    the fallback that would use all-ticks p99 when no during-eval tick is sampled **did not
+    fire**: 76 (10⁶) / 361 (10⁷) ticks were genuinely sampled *while the eval was in
+    flight*, so the number is measured under the exact condition the gate tests.
+  - *Negative control (the deliberately-blocking design):* the **same** tick loop but with
+    `evaluate()` invoked **inline on the render thread** (a 10⁶-cell model) pays the full
+    ~1.1–1.2 s recompute per tick — its during-eval p99 **blows past the 16.6 ms hard-fail
+    by ~70×**. The harness asserts this control *fails*; if it didn't, GATE 1 would be
+    meaningless. So the gate confirms a blocking design is **detected and rejected**, and
+    the pass is a property of the worker-thread ownership discipline, not of the cheap
+    slot-read alone.
 - **GATE 2 (coalescing): PASS.** The worker drains all queued edits before evaluating, so
-  30 rapid edits collapse to **1** eval.
-- **Staleness = one eval duration** (~1.3 s @10⁶, ~7 s @10⁷): the time from an edit to the
+  30 rapid edits collapse to **1** eval. The binary exercises the "edits arrive, then one
+  eval" bound-of-1 path (edits land while the worker is parked). The tighter **in-flight**
+  case — edits arriving *while an eval is already running*, bounded to ≤2 (one in-flight +
+  one coalesced) — is covered by the `rapid_edits_coalesce_to_few_evals` **unit test**
+  (`seam.rs`), which fires 30 edits behind an already-running 50k-cell eval and asserts the
+  eval count stays small.
+- **Staleness = one eval duration** (~1.3 s @10⁶, ~6 s @10⁷): the time from an edit to the
   edited/visible cells showing fresh values, because the only fidelity route is re-pull on
   eval completion. This is a discovery number, not a frame gate; during it the UI shows
-  last-known cached values + a "recalculating…" flag (both provided by the seam).
+  last-known cached values + a "recalculating…" flag (both provided by the seam). It is
+  slightly fuzzy at burst boundaries (a burst coalesces into one eval and only the last
+  edit's timestamp is tracked), which is immaterial at its ~1 s scale.
 
 ## Conclusion (direct answers)
 
-- **Non-blocking is achievable with a clean seam.** `Model` is `Send`, so eval runs on a
-  worker thread; the render loop holds nothing eval touches and stays at frame rate
-  (measured ~3 µs/tick during a 7 s eval). **GATE 1 and GATE 2 both PASS at 10⁶ and 10⁷.**
+- **Non-blocking is achievable with a clean seam, and the guarantee is real (not a
+  tautology).** Non-blocking is a property of the **ownership discipline**: the worker owns
+  `&mut Model`; the render side holds nothing `evaluate()` touches. GATE 1 proves this
+  *discriminatingly* — the seam's during-eval tick p99 (~2.5–3.9 µs, genuinely sampled
+  while the eval ran) passes, and the **negative control** (inline `evaluate()` on the
+  render thread) **fails** the hard-fail budget by ~70× (~1.1–1.2 s/tick). So the pass is
+  attributable to the design, not to a cheap slot-read. **GATE 1 (positive PASS + negative
+  FAIL) and GATE 2 both hold at 10⁶ and 10⁷.**
 - **Evals must be serialized** (one at a time; `&mut self`, non-reentrant, non-interruptible,
   no lifecycle signals) and **reads cannot overlap an eval of the same model**.
 - **There is no live change-stream and no post-eval evaluated-cell diff.** The `UserModel`

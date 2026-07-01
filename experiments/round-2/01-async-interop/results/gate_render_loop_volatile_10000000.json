@@ -11,33 +11,45 @@
   },
   "stats": {
     "count": 600,
-    "min_ns": 207,
-    "max_ns": 25441,
-    "mean_ns": 1503,
-    "p50_ns": 1116,
-    "p99_ns": 20387
+    "min_ns": 200,
+    "max_ns": 36306,
+    "mean_ns": 1270,
+    "p50_ns": 798,
+    "p99_ns": 21977
   },
   "gates": [
     {
       "name": "render_tick_p99_during_eval",
-      "measured_ns": 3680,
+      "measured_ns": 3931,
       "target_ns": 8300000,
       "verdict": "PASS"
     }
   ],
   "extra": {
-    "build_secs": 14.693958605,
+    "build_secs": 14.229615777,
     "frame_budget_ns": 8300000,
     "frames": 600,
-    "gate1_hardfail": false,
     "hard_fail_ns": 16600000,
     "model_shape": "volatile",
+    "negative_control": {
+      "blocking_tick_max_ns": 1124653230,
+      "blocking_tick_p99_ns": 1124653230,
+      "blocking_ticks_sampled": 5,
+      "description": "deliberately-blocking design: evaluate() inline on the render thread (10^6-cell model)",
+      "fails_gate": true,
+      "note": "MUST exceed the hard-fail budget for GATE 1 to be discriminating."
+    },
     "populated_cells": 10000000,
-    "ticks_during_eval": {
-      "count": 422,
-      "max_ns": 24157,
-      "p50_ns": 1201,
-      "p99_ns": 3680
+    "positive_control": {
+      "description": "seam: eval on worker thread; render tick reads the published slot",
+      "gate1_hardfail": false,
+      "ticks_during_eval": {
+        "count": 361,
+        "max_ns": 21655,
+        "p50_ns": 726,
+        "p99_ns": 3931
+      },
+      "verdict": "PASS"
     }
   }
 }

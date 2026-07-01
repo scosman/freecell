@@ -8,7 +8,17 @@
 //!
 //! Measures + asserts:
 //! - **GATE 1 (render non-blocking):** per-tick synchronous work p99 < one frame
-//!   (< 8.3 ms; hard-fail > 16.6 ms) even during the eval.
+//!   (< 8.3 ms; hard-fail > 16.6 ms) even during the eval. **Discriminating**, via two
+//!   controls on the *same* tick-measurement loop:
+//!   - **Positive control (the seam):** eval runs on the worker thread; the render tick
+//!     only reads the small published slot → asserted to **PASS** the frame budget,
+//!     with during-eval ticks actually sampled (proving the slot-read overlaps a real
+//!     in-flight eval).
+//!   - **Negative control (the deliberately-blocking design):** the same loop, but
+//!     `evaluate()` is invoked **inline on the render thread** → asserted to **FAIL**
+//!     (blow past the 16.6 ms hard-fail). This is what makes GATE 1 meaningful: it shows
+//!     a blocking design is *detected and rejected*, so passing is a property of the
+//!     worker-thread ownership discipline, not of the cheap slot-read alone.
 //! - **GATE 2 (coalescing):** a burst of N rapid edits ⇒ ≤ a small bounded number of
 //!   `evaluate()` runs.
 //! - **DISCOVERY:** staleness window (edit → first tick showing the fresh visible
@@ -73,6 +83,74 @@ fn parse_shape() -> Shape {
         }
     }
     shape
+}
+
+/// Outcome of the negative control: the during-eval tick stats of the deliberately
+/// **blocking** design (inline `evaluate()` on the render thread).
+struct NegativeControl {
+    /// p99 of the ticks that ran inline `evaluate()` (the blocking work).
+    blocking_p99_ns: u64,
+    /// max of the same.
+    blocking_max_ns: u64,
+    /// Number of blocking ticks sampled.
+    count: u64,
+    /// True iff the blocking design blew past the hard-fail budget (what we want: the
+    /// negative control MUST fail the gate, proving the gate discriminates).
+    fails_gate: bool,
+}
+
+/// **Negative control (CR-mandated): the deliberately-blocking design must FAIL GATE 1.**
+///
+/// Runs the *same* per-tick measurement as the positive path, but every few frames the
+/// render thread calls `evaluate()` **inline** (the naive design where recompute is on
+/// the render path). On a 10⁶-cell model each such tick pays the full ~1 s recompute, so
+/// its during-eval tick p99/max must blow past the 16.6 ms hard-fail. If it *didn't*, the
+/// gate would be meaningless — so we assert it fails.
+///
+/// This isolates what makes the positive path pass: not "the slot-read is cheap" (it
+/// always is), but the **ownership discipline** that keeps `evaluate()` off this thread.
+fn run_negative_control() -> NegativeControl {
+    // A 10^6 deep-serial chain: one inline evaluate() is ~1 s (see the latency matrix).
+    let mut built = shapes::build(Shape::DeepSerial, 1_000_000);
+    let (tail_sheet, tail_row, tail_col) = built.tail;
+    // Warm one eval so the first inline eval isn't paying one-time setup.
+    built.model.evaluate();
+
+    let mut blocking_ticks: Vec<Duration> = Vec::new();
+    let mut seed: f64 = 2.0;
+    // A short loop — each blocking tick is ~1 s, so a handful is plenty for a p99.
+    const BLOCKING_FRAMES: usize = 5;
+    for _ in 0..BLOCKING_FRAMES {
+        // The tick's synchronous work, THE BLOCKING WAY: run evaluate() inline. First
+        // re-arm the head so the eval does real work and we can force+assert the tail
+        // changed (same discipline as the matrix).
+        let before = shapes::read_number(&built.model, tail_sheet, tail_row, tail_col);
+        built
+            .model
+            .set_user_input(tail_sheet, 1, 1, format!("{seed}"))
+            .ok();
+        seed += 1.0;
+
+        let tick_start = Instant::now();
+        built.model.evaluate(); // <-- the deliberately-blocking call on the render thread
+        let tick_cost = tick_start.elapsed();
+        blocking_ticks.push(tick_cost);
+
+        // Force+assert the inline eval actually recomputed the visible tail.
+        let after = shapes::read_number(&built.model, tail_sheet, tail_row, tail_col);
+        assert_ne!(
+            before, after,
+            "negative-control inline eval must change the tail (else it measured a no-op)"
+        );
+    }
+
+    let stats = LatencyStats::from_durations(&blocking_ticks).expect("blocking ticks");
+    NegativeControl {
+        blocking_p99_ns: stats.p99_ns,
+        blocking_max_ns: stats.max_ns,
+        count: stats.count,
+        fails_gate: stats.p99_ns > HARD_FAIL_NS,
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -140,7 +218,12 @@ fn main() -> anyhow::Result<()> {
         let frame_start = Instant::now();
 
         // Fire the edit burst around frame 60 (~1 s in), while the initial state is
-        // painted; these rapid edits must coalesce.
+        // painted; these rapid edits must coalesce. NOTE: by frame 60 the worker is
+        // parked (initial eval done), so this exercises the "N edits arrive, then one
+        // eval" bound-of-1 path. The tighter "edits arrive WHILE an eval is in flight →
+        // ≤2 evals (one in-flight + one coalesced)" path is exercised by the
+        // `rapid_edits_coalesce_to_few_evals` unit test in seam.rs (edits fired behind an
+        // already-running eval); see findings.md.
         if frame == 60 && !burst_fired {
             let now = Instant::now();
             for i in 0..BURST_EDITS {
@@ -228,9 +311,11 @@ fn main() -> anyhow::Result<()> {
     let all_stats = LatencyStats::from_durations(&tick_durations).expect("ticks");
     let eval_tick_stats = LatencyStats::from_durations(&ticks_during_eval);
 
-    // GATE 1: the strict test is per-tick work WHILE an eval is in flight. If (on a fast
-    // box) the eval finished before any tick sampled it, fall back to the all-ticks p99
-    // (which is an upper bound on the during-eval cost anyway).
+    // GATE 1 — POSITIVE control (the seam): per-tick work WHILE an eval is in flight.
+    // If (on a fast box) the eval finished before any tick sampled it, fall back to the
+    // all-ticks p99 — an upper bound on the during-eval cost. Here that fallback did NOT
+    // fire: `eval_tick_stats` is `Some` (tens–hundreds of during-eval ticks were
+    // sampled), so the number below is genuinely measured while the eval was in flight.
     let gate1_measured = match eval_tick_stats {
         Some(s) => s.p99_ns,
         None => all_stats.p99_ns,
@@ -241,6 +326,21 @@ fn main() -> anyhow::Result<()> {
         FRAME_BUDGET_NS,
     );
     let gate1_hardfail = gate1_measured > HARD_FAIL_NS;
+
+    // GATE 1 — NEGATIVE control (CR-mandated): the deliberately-blocking design (inline
+    // evaluate() on the render thread) MUST fail the same budget. This makes GATE 1
+    // discriminating: passing is a property of the worker-thread ownership discipline,
+    // not of the cheap slot-read. Run it on its own fresh 10^6 model.
+    println!("NEG-CONTROL: running the deliberately-blocking (inline-eval) design...");
+    let neg = run_negative_control();
+    println!(
+        "  blocking-design during-eval tick p99={} max={} (n={}) -> {} the {} hard-fail budget",
+        fmt_ns(neg.blocking_p99_ns),
+        fmt_ns(neg.blocking_max_ns),
+        neg.count,
+        if neg.fails_gate { "EXCEEDS" } else { "under" },
+        fmt_ns(HARD_FAIL_NS),
+    );
 
     // GATE 2: N rapid edits => <= a small bounded number of evals. Bound = 2 (at most
     // one already in-flight + one coalesced settle).
@@ -271,10 +371,19 @@ fn main() -> anyhow::Result<()> {
         None => println!("ticks DURING eval: none sampled (eval finished between ticks); using all-ticks p99 as upper bound"),
     }
     println!(
-        "GATE1 {} (hardfail>{}): {}",
+        "GATE1 POSITIVE (seam) {} (hardfail>{}): {}",
         gate1.summary(),
         fmt_ns(HARD_FAIL_NS),
         if gate1_hardfail { "HARD FAIL" } else { "ok" }
+    );
+    println!(
+        "GATE1 NEGATIVE (inline-eval) p99={} -> {} (blocking design MUST fail the budget)",
+        fmt_ns(neg.blocking_p99_ns),
+        if neg.fails_gate {
+            "FAILS as required (gate is discriminating)"
+        } else {
+            "DID NOT FAIL -> gate is NOT discriminating!"
+        }
     );
     println!(
         "GATE2 {} ({} rapid edits -> {} evals)",
@@ -306,10 +415,22 @@ fn main() -> anyhow::Result<()> {
         "frames": FRAMES,
         "frame_budget_ns": FRAME_BUDGET_NS,
         "hard_fail_ns": HARD_FAIL_NS,
-        "ticks_during_eval": eval_tick_stats.map(|s| json!({
-            "count": s.count, "p50_ns": s.p50_ns, "p99_ns": s.p99_ns, "max_ns": s.max_ns
-        })),
-        "gate1_hardfail": gate1_hardfail,
+        "positive_control": {
+            "description": "seam: eval on worker thread; render tick reads the published slot",
+            "ticks_during_eval": eval_tick_stats.map(|s| json!({
+                "count": s.count, "p50_ns": s.p50_ns, "p99_ns": s.p99_ns, "max_ns": s.max_ns
+            })),
+            "gate1_hardfail": gate1_hardfail,
+            "verdict": gate1.verdict,
+        },
+        "negative_control": {
+            "description": "deliberately-blocking design: evaluate() inline on the render thread (10^6-cell model)",
+            "blocking_tick_p99_ns": neg.blocking_p99_ns,
+            "blocking_tick_max_ns": neg.blocking_max_ns,
+            "blocking_ticks_sampled": neg.count,
+            "fails_gate": neg.fails_gate,
+            "note": "MUST exceed the hard-fail budget for GATE 1 to be discriminating."
+        },
         "build_secs": build_secs,
     }));
     render_result.write_json(dir.join(format!("gate_render_loop_{tag}.json")))?;
@@ -368,6 +489,17 @@ fn main() -> anyhow::Result<()> {
     }
     if !gate1.is_pass() {
         eprintln!("GATE1 FAIL: render tick p99 exceeded frame budget");
+        failed = true;
+    }
+    if !neg.fails_gate {
+        // The negative control MUST fail the budget; if it doesn't, GATE 1 isn't
+        // discriminating and its PASS is meaningless.
+        eprintln!(
+            "GATE1 NEGATIVE-CONTROL FAIL: the inline-eval blocking design did NOT exceed \
+             the {} hard-fail budget (p99={}) — gate is not discriminating",
+            fmt_ns(HARD_FAIL_NS),
+            fmt_ns(neg.blocking_p99_ns)
+        );
         failed = true;
     }
     if !gate2.is_pass() {

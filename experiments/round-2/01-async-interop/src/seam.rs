@@ -165,7 +165,12 @@ impl EvalWorker {
     /// Enqueues an edit (non-blocking send). The worker coalesces it with any other
     /// queued edits before running a single eval.
     pub fn enqueue_edit(&self, edit: Edit) {
-        // Track the latest edit for the staleness window.
+        // Track the latest edit for the staleness window. Each edit resets the "visible
+        // generation" to 0 (pending) and overwrites `last_edit_at`. NOTE: for a *burst*
+        // of edits, only the last enqueue's timestamp survives, and it may coalesce with
+        // earlier ones into a single eval — so the staleness figure is slightly fuzzy at
+        // burst boundaries. That's fine: staleness is a DISCOVERY number (≈ one eval
+        // duration), not a gate, and the fuzz is far below its ~1 s scale.
         *self.shared.last_edit_at.lock().unwrap() = Some(edit.enqueued_at);
         self.shared.last_edit_visible_gen.store(0, Ordering::SeqCst);
         let _ = self.tx.send(Command::Edit(edit));

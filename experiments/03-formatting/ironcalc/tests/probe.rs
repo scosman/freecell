@@ -94,7 +94,11 @@ fn borders_and_alignment_read_and_survive_roundtrip() {
     // Read back directly.
     let a1 = read_format(&model, SHEET, 1, 1);
     assert_eq!(a1.h_align.as_deref(), Some("right"), "A1 right-aligned");
-    assert_eq!(a1.left_border.as_deref(), Some("thin"), "A1 thin left border");
+    assert_eq!(
+        a1.left_border.as_deref(),
+        Some("thin"),
+        "A1 thin left border"
+    );
 
     // ...and after an xlsx round-trip.
     let reloaded = roundtrip_via_xlsx(&model);

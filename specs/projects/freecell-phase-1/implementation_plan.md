@@ -42,11 +42,11 @@ fidelity**. Engine work lives in per-engine subfolders (`.../formualizer/`,
   (IronCalc mirrors the Phase 1 Formualizer smoke). Output: per-engine numbers +
   head-to-head comparison + recommended binding design. In-container authoritative.
 
-- [ ] **Phase 3 — Engine bake-off: File Support (Sub-project B → `01-file-support/`)**
+- [x] **Phase 3 — Engine bake-off: File Support (Sub-project B → `01-file-support/`)**
   *(parallel; batched review)*: **both engines** — xlsx/CSV load→edit→save round-trip,
   fidelity, missing features, API. Head-to-head comparison + recommendation.
 
-- [ ] **Phase 4 — Engine bake-off: Formatting (Sub-project D → `03-formatting/`)**
+- [x] **Phase 4 — Engine bake-off: Formatting (Sub-project D → `03-formatting/`)**
   *(parallel; batched review)*: **both engines** — styles/metadata exposure
   (read + write + roundtrip) and storage-model design. A key differentiator
   (Formualizer's `CellData` styles gap vs IronCalc's styled xlsx r/w). Head-to-head

@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 4: Sub-project D — Formatting Bake-off (Formualizer vs IronCalc)

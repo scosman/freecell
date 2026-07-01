@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 3: Sub-project B — File Support (Formualizer vs IronCalc bake-off)

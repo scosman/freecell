@@ -170,11 +170,7 @@ pub fn read_format(model: &Model, sheet: u32, row: i32, col: i32) -> NeutralForm
         .as_ref()
         .map(|a| a.horizontal.to_string())
         .filter(|s| s != "general");
-    let left_border = style
-        .border
-        .left
-        .as_ref()
-        .map(|b| b.style.to_string());
+    let left_border = style.border.left.as_ref().map(|b| b.style.to_string());
     NeutralFormat {
         bold: style.font.b,
         italic: style.font.i,

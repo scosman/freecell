@@ -6,6 +6,10 @@ description = "FreeCell Round-3 A (the crux) -- style/geometry cache sync + stru
 license = "MIT OR Apache-2.0"
 publish = false
 
+[lib]
+name = "cache_sync"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cache_sync"
 path = "src/main.rs"
@@ -23,3 +27,6 @@ bench_util = { path = "../../shared/bench_util" }
 ironcalc = "0.7"
 ironcalc_base = "0.7"
 anyhow = "1"
+# For a stable byte identity of `Style` in the cache interner (Style is Serialize but not
+# Hash) and for writing env-stamped result JSON.
+serde_json = "1"

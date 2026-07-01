@@ -30,7 +30,7 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
 
 *After scaffolding, the in-container cohort runs in parallel (own worktree/folder):*
 
-- [ ] **Phase A — Style/geometry cache sync + structural editing** *(parallel; own
+- [x] **Phase A — Style/geometry cache sync + structural editing** *(parallel; own
   review — THE key investigation)* → `round-3/A-cache-sync/`. Probe `UserModel`
   (insert/delete rows/cols, undo/redo, copy/paste, diff-list, `Send`-ness, does the SP1
   seam hold); correctness harness asserting insert/delete row/col shift references + band

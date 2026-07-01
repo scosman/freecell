@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase SP3: Function-parity audit (coverage + correctness vs Excel)

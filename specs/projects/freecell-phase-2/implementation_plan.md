@@ -39,7 +39,7 @@ cohort (SP4, SP5) → synthesis.
   peak RSS + stage breakdown; time-to-first-paint. GATE: seconds, sane memory.
   (functional_spec SP2)
 
-- [ ] **Phase SP3 — Function-parity audit** *(parallel; own review — could reopen
+- [x] **Phase SP3 — Function-parity audit** *(parallel; own review — could reopen
   engine choice)* → `round-2/03-function-parity/`. Coverage diff vs a committed
   canonical Excel list + golden-file correctness harness (≥~100 cases; typed error
   semantics). (functional_spec SP3)

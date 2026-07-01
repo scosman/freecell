@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 2: Sub-project C — Datamodel Binding & Engine Perf (two-engine bake-off)

@@ -34,7 +34,7 @@ engine-dependent phase evaluates **both engines** head-to-head using the shared
 fidelity**. Engine work lives in per-engine subfolders (`.../formualizer/`,
 `.../ironcalc/`) so parallel editors stay isolated.*
 
-- [ ] **Phase 2 — Engine bake-off: Datamodel Binding & Perf (Sub-project C →
+- [x] **Phase 2 — Engine bake-off: Datamodel Binding & Perf (Sub-project C →
   `02-datamodel-binding-perf/`)** *(parallel; own review + sign-off — risky)*: shared
   engine-abstraction + benchmark harness; run **Formualizer and IronCalc** through
   binding designs D1/D2/D3 and the scrolling-read, cascade→visible, 1M-cell cascade,

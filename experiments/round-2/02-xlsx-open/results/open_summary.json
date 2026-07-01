@@ -1,0 +1,27 @@
+{
+  "dominant_stage": "parse+build (unzip/XML/shared-strings/styles/graph) (18.090s)",
+  "environment": {
+    "arch": "x86_64",
+    "commit": "5e9c3a3",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux"
+  },
+  "experiment": "SP2 -- large styled .xlsx open",
+  "file_mb": 104.86365699768066,
+  "first_eval_median_s": 3.82291923,
+  "gate_rss_sane_multiple": true,
+  "gate_time_seconds_not_minutes": true,
+  "off_ramp_triggered": false,
+  "open_to_recompute_ready_median_s": 21.981362288,
+  "peak_rss_mb": 2520.23828125,
+  "rss_multiple_of_compressed_file": 24.033476930007712,
+  "rss_multiple_of_uncompressed_payload": 4.962723780926137,
+  "thresholds": {
+    "off_ramp_uncompressed_multiple": 10.0,
+    "open_seconds_ceiling": 60.0,
+    "rss_uncompressed_multiple_ceiling": 8.0
+  },
+  "time_to_first_paint_median_s": 18.158443058,
+  "uncompressed_mb": 507.83368015289307
+}

@@ -1,0 +1,55 @@
+{
+  "name": "sp2-xlsx-open",
+  "input_size": 12740000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "5e9c3a3"
+  },
+  "extra": {
+    "cols": 12,
+    "file_bytes": 109957514,
+    "median": {
+      "first_eval_s": 3.82291923,
+      "first_paint_s": 18.158443058,
+      "parse_build_s": 18.089695946,
+      "read_s": 0.06178969,
+      "total_max_s": 22.102199261,
+      "total_min_s": 21.784337166,
+      "total_s": 21.981362288
+    },
+    "per_run": [
+      {
+        "first_eval_s": 3.82291923,
+        "first_paint_s": 18.158443058,
+        "parse_build_s": 18.089695946,
+        "peak_rss_bytes": 2642591744,
+        "read_s": 0.068747112,
+        "total_s": 21.981362288
+      },
+      {
+        "first_eval_s": 3.870210073,
+        "first_paint_s": 18.231989188,
+        "parse_build_s": 18.179426479,
+        "peak_rss_bytes": 2642661376,
+        "read_s": 0.052562709,
+        "total_s": 22.102199261
+      },
+      {
+        "first_eval_s": 3.779290163,
+        "first_paint_s": 18.005047003,
+        "parse_build_s": 17.943257313,
+        "peak_rss_bytes": 2642624512,
+        "read_s": 0.06178969,
+        "total_s": 21.784337166
+      }
+    ],
+    "rows": 245000,
+    "seed": 20260701,
+    "sheets": 4,
+    "uncompressed_bytes": 532502209
+  }
+}

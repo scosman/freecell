@@ -34,7 +34,7 @@ cohort (SP4, SP5) → synthesis.
   never blocks on recompute (per-tick < frame budget during a 10⁶–10⁷ eval);
   debounce/coalesce bounds eval count. (functional_spec SP1; architecture §4)
 
-- [ ] **Phase SP2 — Large styled `.xlsx` open** *(parallel; batched review)* →
+- [x] **Phase SP2 — Large styled `.xlsx` open** *(parallel; batched review)* →
   `round-2/02-xlsx-open/`. ≥100 MB styled-file generator; fresh-process open time +
   peak RSS + stage breakdown; time-to-first-paint. GATE: seconds, sane memory.
   (functional_spec SP2)

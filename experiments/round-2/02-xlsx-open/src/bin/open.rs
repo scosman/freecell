@@ -18,13 +18,16 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use xlsx_open::{open_stages, sentinel, GenSpec, OpenStages};
+use xlsx_open::{open_stages, sentinel, uncompressed_bytes, GenSpec, OpenStages};
 
 /// The single JSON line this child emits. Field units are nanoseconds for stages and
 /// bytes for sizes, matching the parent's expectations.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChildReport {
+    /// Compressed on-disk size of the `.xlsx`.
     pub file_bytes: u64,
+    /// Sum of uncompressed zip-entry sizes (the OOXML payload IronCalc parses).
+    pub uncompressed_bytes: u64,
     pub peak_rss_bytes: u64,
     pub stages: OpenStages,
 }
@@ -56,6 +59,10 @@ fn main() -> Result<()> {
     let file_bytes = std::fs::metadata(&path)
         .with_context(|| format!("stat {}", path.display()))?
         .len();
+    // Sum uncompressed zip-entry sizes BEFORE the measured open, so the tiny read does
+    // not perturb the open's peak-RSS high-water mark (this only reads the zip central
+    // directory, allocating a few KB).
+    let uncompressed = uncompressed_bytes(&path)?;
 
     // The one measured op. open_stages force+asserts the sentinel internally.
     let stages = open_stages(&path, sentinel(&spec))?;
@@ -65,6 +72,7 @@ fn main() -> Result<()> {
 
     let report = ChildReport {
         file_bytes,
+        uncompressed_bytes: uncompressed,
         peak_rss_bytes,
         stages,
     };

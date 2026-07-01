@@ -41,3 +41,7 @@ ironcalc_base = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Read-only: sum the uncompressed sizes of the .xlsx zip entries so peak RSS can be
+# reported as a multiple of the UNCOMPRESSED payload (the off-ramp criterion), not just
+# the compressed on-disk size. Pinned to IronCalc's own zip version for lockfile unity.
+zip = "0.6"

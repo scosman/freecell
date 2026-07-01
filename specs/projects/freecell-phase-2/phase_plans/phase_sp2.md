@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase SP2: End-to-end large styled `.xlsx` open (time + peak memory)

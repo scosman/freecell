@@ -47,14 +47,7 @@ pub const LANGUAGE: &str = "en";
 /// A small pool of number-format codes rotated across styled numeric cells so that
 /// `styles.xml` carries several distinct `numFmt`s (a realistic styled sheet, not one
 /// format). These are standard Excel custom-format strings.
-const NUM_FMTS: &[&str] = &[
-    "general",
-    "#,##0.00",
-    "0.0%",
-    "$#,##0.00",
-    "#,##0",
-    "0.000",
-];
+const NUM_FMTS: &[&str] = &["general", "#,##0.00", "0.0%", "$#,##0.00", "#,##0", "0.000"];
 
 /// Parameters describing the workbook to generate. Deterministic in every field, so the
 /// exact same `.xlsx` bytes are reproducible from committed code.
@@ -83,12 +76,14 @@ impl GenSpec {
     }
 
     /// The default large spec (~≥100 MB when written). `rows` is the size driver; the
-    /// `gen` binary grows it until the on-disk file crosses the requested target.
+    /// `gen`/`measure` binaries grow it until the on-disk file crosses the requested
+    /// target. Sized empirically: ~0.43 MB per 1k rows at 4 sheets × 12 cols, so 245k
+    /// rows lands ~105 MB in a single generate attempt (avoids a costly second pass).
     pub fn large() -> Self {
         Self {
             seed: 20260701,
             sheets: 4,
-            rows: 200_000,
+            rows: 245_000,
             cols: 12,
         }
     }
@@ -181,7 +176,11 @@ pub fn generate(spec: &GenSpec) -> Result<Model<'static>> {
     let fcol = formula_col(spec);
     for sheet in 0..spec.sheets {
         // Vary the seed per sheet so sheets differ but stay deterministic.
-        let source = SyntheticSheet::new(spec.seed ^ (sheet as u64).wrapping_mul(0x9E37), spec.rows, spec.cols);
+        let source = SyntheticSheet::new(
+            spec.seed ^ (sheet as u64).wrapping_mul(0x9E37),
+            spec.rows,
+            spec.cols,
+        );
         write_sheet(&mut model, sheet, spec, &source, fcol)?;
     }
 
@@ -228,16 +227,15 @@ fn write_sheet(
                 .map_err(|e| anyhow!("set_cell_style ({r},{c}): {e}"))?;
         }
 
-        // Formula column: sum the first two literal columns of the row (A+B) when the
-        // sheet is wide enough; otherwise reference A of this row. Deterministic and
-        // known, so the OPEN path can force+assert a sentinel.
-        let formula = if spec.cols >= 2 {
-            format!("=A{row}+B{row}", row = r + 1)
-        } else {
-            format!("=A{row}", row = r + 1)
-        };
+        // Formula column: SUM over this row's literal columns. SUM ignores text/empty
+        // operands (matching Excel), so it is well-defined for the mixed content datagen
+        // produces — no #VALUE! from a stray text cell. Deterministic and known, so the
+        // OPEN path can force+assert a sentinel (`row_numeric_sum`).
+        let excel_row = r + 1;
+        let last_col_label = datagen::column_label(spec.cols - 1);
+        let formula = format!("=SUM(A{excel_row}:{last_col_label}{excel_row})");
         model
-            .set_user_input(sheet, (r + 1) as i32, (fcol + 1) as i32, formula)
+            .set_user_input(sheet, excel_row as i32, (fcol + 1) as i32, formula)
             .map_err(|e| anyhow!("set formula ({r},{fcol}): {e}"))?;
     }
 
@@ -249,8 +247,7 @@ fn write_sheet(
 /// on-disk file size in bytes.
 pub fn write_xlsx(model: &Model, path: &Path) -> Result<u64> {
     if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("removing stale {}", path.display()))?;
+        std::fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
     }
     let path_str = path
         .to_str()
@@ -330,34 +327,24 @@ pub fn generate_until_target(
 
 /// The known, deterministic sentinel used to **force + assert** the measured open op:
 /// the value of the formula cell at `(row 0, formula_col)` on sheet 0 for the given
-/// spec. It equals `A1 + B1` (or `A1`) of the generated content, so we can assert both
-/// the cached read (first paint) and the post-eval read return this exact number.
+/// spec. That cell is `=SUM(A1:…1)` over sheet 0's row-0 literals, and `SUM` totals only
+/// the numeric operands (ignoring text/empty, matching Excel), so the expectation is the
+/// sum of the numeric literals in row 0. We assert both the cached read (first paint) and
+/// the post-eval read return this exact number.
 pub fn sentinel(spec: &GenSpec) -> SentinelExpectation {
-    let source = SyntheticSheet::new(spec.seed ^ 0u64, spec.rows, spec.cols);
-    let a = numeric_or_zero(&source.cell(0, 0).value);
-    let expected = if spec.cols >= 2 {
-        let b = numeric_or_zero(&source.cell(0, 1).value);
-        a + b
-    } else {
-        a
-    };
+    // Sheet 0's content source: write_sheet uses seed ^ (0 * 0x9E37) == seed for sheet 0.
+    let source = SyntheticSheet::new(spec.seed, spec.rows, spec.cols);
+    let expected: f64 = (0..spec.cols)
+        .filter_map(|c| match source.cell(0, c).value {
+            CellValue::Number(n) => Some(n),
+            _ => None,
+        })
+        .sum();
     SentinelExpectation {
         sheet: 0,
         row: 1,
         col: (formula_col(spec) + 1) as i32,
         expected,
-    }
-}
-
-/// A number cell's value, or 0.0 for text/empty (IronCalc coerces text/empty operands to
-/// 0 in `+`, matching Excel's numeric-context coercion of blanks; text becomes an error
-/// in Excel, but `datagen`'s A/B for row 0 seed choose a numeric-friendly path — the
-/// sentinel asserts the *cached equals post-eval* invariant regardless of the exact
-/// number, which is the real correctness check).
-fn numeric_or_zero(v: &CellValue) -> f64 {
-    match v {
-        CellValue::Number(n) => *n,
-        _ => 0.0,
     }
 }
 
@@ -447,6 +434,21 @@ pub fn open_stages(path: &Path, expect: SentinelExpectation) -> Result<OpenStage
     })
 }
 
+/// Sum of the **uncompressed** sizes of every entry in the `.xlsx` zip, in bytes. This
+/// is the OOXML payload IronCalc must parse in memory; peak RSS is most meaningfully a
+/// multiple of *this* (the off-ramp criterion is "≫10× uncompressed"), not of the
+/// compressed on-disk size.
+pub fn uncompressed_bytes(path: &Path) -> Result<u64> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("reading .xlsx as zip")?;
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).context("zip entry")?;
+        total += entry.size();
+    }
+    Ok(total)
+}
+
 /// Reads the sentinel formula cell's numeric value from a loaded model.
 fn read_number(model: &Model, at: SentinelExpectation) -> Result<f64> {
     use ironcalc::base::cell::CellValue as IcCellValue;
@@ -479,11 +481,7 @@ mod tests {
 
     /// A unique temp path per test invocation (no external tempfile dep).
     fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "sp2_{tag}_{}_{}.xlsx",
-            std::process::id(),
-            tag
-        ))
+        std::env::temp_dir().join(format!("sp2_{tag}_{}_{}.xlsx", std::process::id(), tag))
     }
 
     #[test]
@@ -528,13 +526,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         write_xlsx(&model, &path).unwrap();
 
-        let reloaded = load_from_xlsx(
-            path.to_str().unwrap(),
-            LOCALE,
-            TIMEZONE,
-            LANGUAGE,
-        )
-        .unwrap();
+        let reloaded = load_from_xlsx(path.to_str().unwrap(), LOCALE, TIMEZONE, LANGUAGE).unwrap();
         let got = reloaded.get_style_for_cell(0, 1, 1).unwrap();
         assert!(got.font.b, "bold did not survive save/reload");
         assert_eq!(
@@ -563,7 +555,10 @@ mod tests {
 
         // first paint (cached queryable) is reachable using only read+parse — strictly
         // before the total that also pays the first eval.
-        assert_eq!(stages.first_paint_ns, stages.read_ns + stages.parse_build_ns);
+        assert_eq!(
+            stages.first_paint_ns,
+            stages.read_ns + stages.parse_build_ns
+        );
         assert!(
             stages.total_ns >= stages.first_paint_ns,
             "total must include first paint plus eval"
@@ -582,17 +577,28 @@ mod tests {
         generate_to_file(&spec, &path).unwrap();
 
         let expect = sentinel(&spec);
-        let model = load_from_xlsx(
-            path.to_str().unwrap(),
-            LOCALE,
-            TIMEZONE,
-            LANGUAGE,
-        )
-        .unwrap();
+        let model = load_from_xlsx(path.to_str().unwrap(), LOCALE, TIMEZONE, LANGUAGE).unwrap();
         // No model.evaluate() here — this is the whole point.
         let cached = read_number(&model, expect).unwrap();
         assert_close(cached, expect.expected, "cached without eval").unwrap();
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn uncompressed_exceeds_compressed() {
+        // A styled xlsx is highly compressible; the uncompressed payload must exceed the
+        // on-disk size, and the helper must read it without error.
+        let spec = GenSpec::tiny();
+        let path = temp_path("uncomp");
+        let _ = std::fs::remove_file(&path);
+        let report = generate_to_file(&spec, &path).unwrap();
+        let uncompressed = uncompressed_bytes(&path).unwrap();
+        assert!(
+            uncompressed >= report.file_bytes,
+            "uncompressed {uncompressed} < compressed {}",
+            report.file_bytes
+        );
         let _ = std::fs::remove_file(&path);
     }
 

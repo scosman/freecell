@@ -45,15 +45,24 @@ separately because they invalidate on completely different events:
   are the ~10× read (SP4), this is the biggest win: the expensive half almost never
   invalidates.
 - **Scroll-during-recompute:** the frontend serves the cached overlap instantly (no
-  worker needed); genuinely-new cells show a placeholder (or a stale-snapshot value)
-  until the next publish. This keeps scrolling live while the worker is busy evaluating.
+  worker needed). For cells *outside* the cache, a **~3× overscan** published window
+  (the SP1 probe's recommended default) absorbs normal interactive scrolling during an
+  eval for free; only a scroll past that margin needs an on-demand snapshot read or a
+  placeholder until the next publish. This keeps scrolling live while the worker is
+  busy evaluating.
 - **Pruning:** bound the cache with an LRU / distance-from-viewport threshold so it
   doesn't grow unbounded as the user roams a huge sheet.
 
-The exact mechanism for reading genuinely-new cells *during* an eval (a `to_bytes()`
-snapshot the frontend can read, vs. simply a large ~3× overscan so small scrolls stay
-within already-published data) is the subject of the SP1 scroll-during-eval probe;
-fold its result in here before implementing.
+**Reading genuinely-new cells *during* an eval — RESOLVED** (SP1 scroll-during-eval
+probe, `experiments/round-2/01-async-interop/`): a read on the *live* model is blocked
+for the whole eval (`evaluate(&mut self)`'s exclusive borrow excludes any concurrent
+`get_cell_value_by_index(&self)`; a scroll issued mid-eval only lands after it, ~1.4s
+@1M). Two fixes were measured: (a) a `to_bytes()` **snapshot** serves stale reads
+concurrently (p99 ~3µs) but costs **~3.2s to build @1M — worse than the eval it would
+paint over**, so it must never be built per-eval; (b) a **~3× overscan** published
+window gives ±(k−1)/2·V free scroll headroom (±40 rows / ±12 cols for a 40×12
+screenful) at **zero extra memory**. **Decision: default to ~3× overscan; build a
+snapshot only on-demand if the user scrolls past the overscan margin mid-eval.**
 
 ## Is it worth it? (why this is "future", not "now")
 

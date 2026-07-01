@@ -67,7 +67,7 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
 
 *After the cohort lands (C folded in when the human reports the macOS run):*
 
-- [ ] **⛳ BUILD-READINESS CHECKPOINT (human review)** — present A–D findings against each
+- [x] **⛳ BUILD-READINESS CHECKPOINT (human review)** — present A–D findings against each
   investigation's pass criteria. Any GATE fail or off-ramp (structural edits broken/slow,
   undo/redo missing, cache-shift intractable, surprise load-bearing API gap, no viable
   CI-snapshot mechanism, circular-ref hang) → surface for a human "change-first vs accept"
@@ -75,7 +75,7 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
 
 *After the checkpoint:*
 
-- [ ] **Phase Synthesis — Stage-3 "clear to build" recommendation** *(serial; last)* →
+- [x] **Phase Synthesis — Stage-3 "clear to build" recommendation** *(serial; last)* →
   `experiments/round-3/SYNTHESIS.md`. Cite A–D; state whether any off-ramp fired; give
   the **"clear to build"** verdict or the precise **must-change-first** list, with
   build-time carry-forward. (functional_spec §6 Synthesis)

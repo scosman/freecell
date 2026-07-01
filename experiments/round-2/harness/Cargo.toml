@@ -1,0 +1,26 @@
+[package]
+name = "round2_harness"
+version = "0.1.0"
+edition = "2021"
+description = "FROZEN shared harness for FreeCell Round-2 (Phase 2) experiments: the SpreadsheetEngine trait + benchmark scenarios copied verbatim from Phase-1 `02/common`, the IronCalc adapter copied verbatim from Phase-1 `02/ironcalc` (same IronCalc 0.7.x pin), and a fresh-process peak_rss() helper. Read-only downstream: SP1-SP5 consume it, never edit it."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "round2_harness"
+path = "src/lib.rs"
+
+[dependencies]
+# Frozen, read-only Phase-1 shared crates by relative path (this crate sits at
+# experiments/round-2/harness/, so ../../shared/...). Engine-neutral by construction.
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# IronCalc engine, pinned to the SAME version Phase-1 used (see
+# experiments/02-datamodel-binding-perf/ironcalc/Cargo.toml). Note the UNDERSCORE:
+# `ironcalc-base` does not resolve on crates.io. Both are 0.7.x (locked to 0.7.1).
+ironcalc = "0.7"
+ironcalc_base = "0.7"
+# `getrusage` fallback path for peak_rss() (Linux VmHWM is primary).
+libc = "0.2"

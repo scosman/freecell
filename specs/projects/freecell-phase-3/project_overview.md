@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # FreeCell — Phase 3 (Pre-Build De-risking / "Round 3")

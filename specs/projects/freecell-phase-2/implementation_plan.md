@@ -61,7 +61,7 @@ cohort (SP4, SP5) → synthesis.
 
 *After everything lands:*
 
-- [ ] **Phase Synthesis — Stage-3 recommendation** *(serial; last)* →
+- [x] **Phase Synthesis — Stage-3 recommendation** *(serial; last)* →
   `experiments/round-2/SYNTHESIS.md`. Build / adjust / pivot for FreeCell citing
   SP1–SP5; state whether the off-ramp triggered; list Round-3 carry-forward.
   (functional_spec §6 Synthesis)

@@ -30,9 +30,7 @@ pub mod layout;
 pub mod report;
 pub mod style;
 
-pub use config::{
-    PocConfig, CELL_LOAD_TARGET_NS, FRAME_TARGET_NS, FRAME_WORST_NS,
-};
+pub use config::{PocConfig, CELL_LOAD_TARGET_NS, FRAME_TARGET_NS, FRAME_WORST_NS};
 pub use harness::{newly_visible, FrameSample, Harness, Move, Viewport};
 pub use layout::Axis;
 pub use report::{build_report, finalize, RunReport};
@@ -41,6 +39,5 @@ pub use style::{rgb_hex, Align, RenderCell};
 // Re-export the provider surface the shells render against, so a shell can depend on
 // just poc_core for the whole engine-neutral model.
 pub use datagen::{
-    CellData, CellSource, CellValue, HAlign, Rgb, SyntheticSheet, EXCEL_MAX_COLS,
-    EXCEL_MAX_ROWS,
+    CellData, CellSource, CellValue, HAlign, Rgb, SyntheticSheet, EXCEL_MAX_COLS, EXCEL_MAX_ROWS,
 };

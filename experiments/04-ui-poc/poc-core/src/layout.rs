@@ -154,7 +154,7 @@ mod tests {
     /// A deterministic, varied sizer: base 20 px plus a small index-derived wiggle, with
     /// every 7th track "wide". Mirrors the shape of the real synthetic sizers.
     fn varied_sizer(i: u32) -> f32 {
-        if i % 7 == 0 {
+        if i.is_multiple_of(7) {
             100.0 + (i % 13) as f32
         } else {
             20.0 + (i % 5) as f32
@@ -211,8 +211,14 @@ mod tests {
         // the range, and the track covering `scroll + extent` is inside too.
         let first_visible = axis.index_at(scroll);
         let last_visible = axis.index_at(scroll + extent);
-        assert!(range.start <= first_visible, "range must start at/before first visible");
-        assert!(range.end > last_visible, "range must extend past last visible");
+        assert!(
+            range.start <= first_visible,
+            "range must start at/before first visible"
+        );
+        assert!(
+            range.end > last_visible,
+            "range must extend past last visible"
+        );
 
         // Overscan applied on the leading side (300 - 3 = 297).
         assert_eq!(range.start, first_visible - overscan);
@@ -258,6 +264,9 @@ mod tests {
         assert_eq!(axis.index_at(off), near_end);
         // A visible range deep in the grid is small (viewport-sized), not millions.
         let range = axis.visible_range(off, 900.0, 8);
-        assert!(range.end - range.start < 100, "visible range must be viewport-sized");
+        assert!(
+            range.end - range.start < 100,
+            "visible range must be viewport-sized"
+        );
     }
 }

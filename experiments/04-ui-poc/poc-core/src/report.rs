@@ -36,10 +36,7 @@ impl RunReport {
     pub fn summary(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("=== Run Test: {} ===\n", self.variant));
-        out.push_str(&format!(
-            "frames measured: {}\n",
-            self.result.input_size
-        ));
+        out.push_str(&format!("frames measured: {}\n", self.result.input_size));
         out.push_str(&format!(
             "frame render  p50={} p99={} max={}\n",
             bench_util::fmt_ns(self.frame_stats.p50_ns),
@@ -74,12 +71,7 @@ impl RunReport {
 /// - `frame-p99` ≤ 8.33 ms (sustained 120 fps),
 /// - `frame-max` ≤ 16.67 ms (never worse than 60 fps under fast scroll / jump),
 /// - `cell-load-p99` ≤ 2 ms.
-pub fn build_report(
-    variant: &str,
-    date: &str,
-    commit: &str,
-    samples: &[FrameSample],
-) -> RunReport {
+pub fn build_report(variant: &str, date: &str, commit: &str, samples: &[FrameSample]) -> RunReport {
     let frame_ns: Vec<u64> = samples.iter().map(|s| s.frame_render_ns).collect();
     let cell_ns: Vec<u64> = samples.iter().map(|s| s.cell_load_ns).collect();
 
@@ -98,7 +90,7 @@ pub fn build_report(
         date,
         Environment::detect(commit),
     )
-    .with_stats(frame_stats.clone())
+    .with_stats(frame_stats)
     .with_extra(json!({
         "variant": variant,
         "frame_render": stats_json(&frame_stats),
@@ -133,9 +125,7 @@ pub fn finalize(
     out_dir: impl AsRef<Path>,
 ) -> std::io::Result<(RunReport, std::path::PathBuf)> {
     let report = build_report(variant, date, commit, samples);
-    let path = out_dir
-        .as_ref()
-        .join(format!("{variant}-runtest.json"));
+    let path = out_dir.as_ref().join(format!("{variant}-runtest.json"));
     report.result.write_json(&path)?;
     Ok((report, path))
 }
@@ -182,7 +172,11 @@ mod tests {
         // 5 ms frame, 0.5 ms cell-load: comfortably under every target.
         let samples = samples_at(5_000_000, 500_000, 200);
         let report = build_report("raw-gpui", "2026-07-01", "deadbeef", &samples);
-        assert!(report.passed(), "under-target run should PASS: {}", report.summary());
+        assert!(
+            report.passed(),
+            "under-target run should PASS: {}",
+            report.summary()
+        );
         assert!(report.gates.iter().all(|g| g.is_pass()));
     }
 
@@ -214,10 +208,7 @@ mod tests {
 
     #[test]
     fn finalize_writes_wellformed_json() {
-        let dir = std::env::temp_dir().join(format!(
-            "poc-core-report-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("poc-core-report-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let samples = samples_at(4_000_000, 400_000, 50);
         let (report, path) =

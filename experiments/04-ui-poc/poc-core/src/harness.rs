@@ -269,7 +269,10 @@ mod tests {
             Move::JumpToCell,
             Move::RandomJump,
         ] {
-            assert!(moves.contains(&expected), "script missing move {expected:?}");
+            assert!(
+                moves.contains(&expected),
+                "script missing move {expected:?}"
+            );
         }
     }
 
@@ -298,7 +301,10 @@ mod tests {
         let cfg = PocConfig::default();
         let mut h = Harness::scripted(&cfg);
         while let Some(vp) = h.next_viewport() {
-            assert!(vp.scroll_x >= 0.0 && vp.scroll_y >= 0.0, "viewport went negative: {vp:?}");
+            assert!(
+                vp.scroll_x >= 0.0 && vp.scroll_y >= 0.0,
+                "viewport went negative: {vp:?}"
+            );
         }
     }
 

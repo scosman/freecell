@@ -1,0 +1,31 @@
+[package]
+name = "formualizer_formatting"
+version = "0.1.0"
+edition = "2021"
+description = "Formualizer 0.7 formatting/metadata exposure probe for the FreeCell Phase 1 engine bake-off (Sub-project D). Confirms the CellData styles gap and probes the umya-direct style path."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "formualizer_formatting"
+path = "src/lib.rs"
+
+[dependencies]
+datagen = { path = "../../shared/datagen" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# DIRECT umya dependency — this is the crux of the finding. Formualizer's `Workbook`
+# does not retain the underlying umya `Spreadsheet` after load, and its `UmyaAdapter`
+# has a private inner workbook with no accessor, so the ONLY way to read/preserve
+# styles alongside a Formualizer workbook is to own a umya `Spreadsheet` ourselves.
+# Pinned to =2.3.2 to match the exact version Formualizer's `umya` feature links,
+# so both link the identical crate (no duplicate-umya build).
+umya-spreadsheet = "=2.3.2"
+
+# The calc engine + both file backends. `umya` enables the engine's own
+# `to_xlsx_bytes` write path; `calamine` is the xlsx read path.
+[dependencies.formualizer]
+version = "0.7"
+default-features = false
+features = ["eval", "parse", "workbook", "calamine", "umya"]

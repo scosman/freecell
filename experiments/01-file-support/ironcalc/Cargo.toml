@@ -1,0 +1,21 @@
+[package]
+name = "ironcalc_file"
+version = "0.1.0"
+edition = "2021"
+description = "IronCalc 0.7 file-I/O round-trip crate for the FreeCell Phase 1 engine bake-off (Sub-project B). Loads/edits/saves .xlsx (native import/export) and CSV (hand-rolled bridge — IronCalc ships no CSV), and documents what survives a load->edit->save->reload round-trip."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "ironcalc_file"
+path = "src/lib.rs"
+
+[dependencies]
+# Frozen, engine-neutral synthetic-data + CSV generators (read-only): inputs are
+# produced by committed code, never hand-made binaries (functional_spec §5.3).
+datagen = { path = "../../shared/datagen" }
+anyhow = "1"
+# `ironcalc` (facade + xlsx import/export) and `ironcalc_base` (engine). Note the
+# UNDERSCORE in `ironcalc_base` — `ironcalc-base` does not resolve on crates.io.
+ironcalc = "0.7"
+ironcalc_base = "0.7"

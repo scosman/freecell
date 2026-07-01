@@ -1,0 +1,92 @@
+{
+  "engine": "ironcalc",
+  "engine_version": "0.7.1",
+  "rustc": "1.94.1",
+  "date": "2026-07-01",
+  "rows": [
+    {
+      "attribute": "bold",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Style.font.b via get_style_for_cell / set_cell_style; survives xlsx round-trip."
+    },
+    {
+      "attribute": "italic",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Style.font.i."
+    },
+    {
+      "attribute": "font_size",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Style.font.sz (i32 points)."
+    },
+    {
+      "attribute": "fill_color",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Style.fill.fg_color (hex); requires pattern_type = \"solid\"."
+    },
+    {
+      "attribute": "number_format",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Style.num_fmt (format code string)."
+    },
+    {
+      "attribute": "borders",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Style.border (per-side BorderItem); not probed exhaustively (Round 2)."
+    },
+    {
+      "attribute": "alignment",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Style.alignment (Horizontal/VerticalAlignment enums)."
+    },
+    {
+      "attribute": "row_height",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Model::get/set_row_height (f64)."
+    },
+    {
+      "attribute": "col_width",
+      "read": "Native",
+      "write": "Native",
+      "roundtrip": "Native",
+      "note": "Model::get/set_column_width (f64)."
+    },
+    {
+      "attribute": "merges",
+      "read": "None",
+      "write": "None",
+      "roundtrip": "None",
+      "note": "No public merged-cells API on Model in 0.7 (internal Worksheet.merge_cells field is not exposed)."
+    },
+    {
+      "attribute": "conditional_formatting",
+      "read": "None",
+      "write": "None",
+      "roundtrip": "None",
+      "note": "No conditional-formatting API in the public crate interface."
+    },
+    {
+      "attribute": "themes / named styles",
+      "read": "Unverified",
+      "write": "Native",
+      "roundtrip": "Unverified",
+      "note": "set_cell_style_by_name / set_sheet_style exist; no general theme read API. Not probed."
+    }
+  ]
+}

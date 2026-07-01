@@ -1,0 +1,86 @@
+{
+  "engine": "formualizer",
+  "engine_version": "0.7.0",
+  "umya_version": "2.3.2",
+  "rustc": "1.94.1",
+  "date": "2026-07-01",
+  "rows": [
+    {
+      "attribute": "bold",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "Formualizer CellData.style == None; readable/writable only via a directly-owned umya workbook."
+    },
+    {
+      "attribute": "italic",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "As bold."
+    },
+    {
+      "attribute": "font_size",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "umya Font::get_size / set_size."
+    },
+    {
+      "attribute": "fill_color",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "umya Style::set_background_color_solid / get_background_color -> ARGB."
+    },
+    {
+      "attribute": "number_format",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "umya NumberingFormat::get/set_format_code."
+    },
+    {
+      "attribute": "borders",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "umya Style::get_borders per-side; not probed exhaustively (Round 2)."
+    },
+    {
+      "attribute": "row_height",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "umya Row::get/set_height."
+    },
+    {
+      "attribute": "col_width",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "umya Column::get/set_width."
+    },
+    {
+      "attribute": "merges",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "note": "umya Worksheet::get_merge_cells / add_merge_cells."
+    },
+    {
+      "attribute": "conditional_formatting",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "None",
+      "note": "umya exposes get/add_conditional_formatting_collection, but write-back fidelity is Unverified (deferred to Round 2)."
+    },
+    {
+      "attribute": "to_xlsx_bytes(engine) preserves styles",
+      "read": "None",
+      "write": "None",
+      "roundtrip": "None",
+      "note": "Workbook::to_xlsx_bytes builds a fresh umya file from values/formulas only; ALL styles are dropped."
+    }
+  ]
+}

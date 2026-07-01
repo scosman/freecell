@@ -18,6 +18,43 @@
 
 ---
 
+## ✅ HUMAN DECISION (2026-07-01): **IronCalc**
+
+The human signed off on **IronCalc**, *overriding* this document's soft
+"go-with-conditions" lean toward Formualizer. The lean was explicitly conditional,
+and review discussion surfaced that two of its load-bearing points were weaker than
+written:
+
+- **Formatting / file-I/O is a real IronCalc edge, not "neutral."** IronCalc reads/
+  writes styles natively through its own `.xlsx` path. Formualizer forces a **parallel
+  umya workbook** held in lockstep with the Arrow engine just to preserve styles on
+  save — added sync complexity *and* a memory cost that itself threatens Formualizer's
+  ~9× density win (the unmeasured "umya double-load"). The earlier "engine-neutral
+  either way" framing under-weighted this.
+- **The huge-sheet load lead was measured on Arrow *ingest*, not end-to-end `.xlsx`
+  *open*.** The fast columnar path IS used by the calamine reader (source-confirmed:
+  `backends/calamine.rs` streams into `IngestBuilder`), but the actual open cost
+  (OOXML unzip + XML + shared-strings parse, and parse-time peak RSS) was never
+  benchmarked at scale for **either** engine — so Formualizer's headline lead is
+  unproven on the real file-open scenario.
+- **Delivery risk** is the decider: IronCalc is a funded team (~4k stars, 29
+  contributors) vs Formualizer's effective single-author 0.x.
+
+**Design consequences carried into SYNTHESIS + Round-2 (IronCalc-specific):** no
+native range read (per-cell viewport loop — still met <2 ms in Phase 2); **no
+incremental recalc** (every edit = full-workbook `evaluate()` → the binding layer
+MUST batch edits and run recompute **off the UI thread**); no merges/conditional-
+formatting API (FreeCell side-store required). The engine-neutral **`FormatStore`**
+stays the render model; IronCalc's native styles are leaned on for file-I/O fidelity.
+**Validations deferred to Round 2:** end-to-end large-`.xlsx` open (time + peak RSS,
+with styles), IronCalc full-`evaluate()` cost at Excel-max scale, and a
+function-parity audit (IronCalc 345 registered builtins).
+
+*(The comparison and both engine cases below are preserved as the evidence base for
+this decision.)*
+
+---
+
 ## The question
 
 **Formualizer or IronCalc — which engine should FreeCell build on?**

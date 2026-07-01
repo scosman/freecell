@@ -52,7 +52,7 @@ fidelity**. Engine work lives in per-engine subfolders (`.../formualizer/`,
   (Formualizer's `CellData` styles gap vs IronCalc's styled xlsx r/w). Head-to-head
   comparison + recommendation.
 
-- [ ] **Phase 5 — UI PoC (Sub-project E → `04-ui-poc/`)** *(parallel; own review +
+- [x] **Phase 5 — UI PoC (Sub-project E → `04-ui-poc/`)** *(parallel; own review +
   Mac UI sign-off)*: **engine-neutral, GPUI only** (no engine). raw-gpui vs
   gpui-component grid variants over the static datamodel provider; in-app "Run Test"
   measured PASS/FAIL harness; macOS build scripts. Authoritative on macOS (you run it).
@@ -63,7 +63,7 @@ fidelity**. Engine work lives in per-engine subfolders (`.../formualizer/`,
 
 *After the engine-dependent phases (2–4) land:*
 
-- [ ] **Phase 7 — Engine Bake-off Decision (Sub-project G → `06-engine-bakeoff/`)**
+- [x] **Phase 7 — Engine Bake-off Decision (Sub-project G → `06-engine-bakeoff/`)** — **DECIDED (2026-07-01): IronCalc.** (UI grid also decided: raw-gpui, with gpui-component for app chrome.)
   *(own review + HUMAN engine sign-off)*: pull data from Phases 2–4 (+ Phase 1) into
   `06-engine-bakeoff/decision.md`; make the **case for Formualizer** and the **case
   for IronCalc** across API suitability, missing features, perf, file fidelity,

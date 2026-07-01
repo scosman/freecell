@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 5: UI PoC — GPUI Proof-of-Concept (Sub-project E)

@@ -21,7 +21,7 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
 
 ## Phases
 
-- [ ] **Phase 3.0 — Scaffolding** *(serial)*: create `experiments/round-3/` with
+- [x] **Phase 3.0 — Scaffolding** *(serial)*: create `experiments/round-3/` with
   `{A-cache-sync, B-api-audit, C-ci-rendering, D-robustness}/` skeletons as **independent
   Cargo projects**; wire each by relative path, **read-only**, to `../../round-2/harness`
   and `../../shared/*`; pin `ironcalc`/`ironcalc_base` to **0.7.1**. **No new frozen

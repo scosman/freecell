@@ -1,0 +1,25 @@
+[package]
+name = "api_audit"
+version = "0.1.0"
+edition = "2021"
+description = "FreeCell Round-3 B (breadth) -- needed-API audit. Independent Cargo project; depends read-only by relative path on ../../round-2/harness and ../../shared/*. Walks a checklist against IronCalc 0.7.1's public API (headline: display formatting -- who owns number-format rendering; plus diff-list shape, sheet ops, defined names, view state, cell extras, tokenizer) and marks each present / absent / workaround, probe- or source-cited, with a plan per gap. Scaffolding stub only -- the investigation is implemented in Phase B."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "api_audit"
+path = "src/main.rs"
+
+[dependencies]
+# Frozen, read-only shared harness (the IronCalc adapter + SpreadsheetEngine trait).
+# Same IronCalc 0.7.1 pin, for provenance / the shared engine seam.
+round2_harness = { path = "../../round-2/harness" }
+# Frozen shared crates (datagen for probe content, bench_util for env stamp).
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }
+# Direct IronCalc access for the UserModel / Model public-API probes the audit asserts
+# against (display formatting, diff-list, sheet ops, defined names, tokenizer, ...).
+# Same 0.7 pin as the harness (Cargo.lock -> 0.7.1).
+ironcalc = "0.7"
+ironcalc_base = "0.7"
+anyhow = "1"

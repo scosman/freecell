@@ -127,44 +127,48 @@ Success = each agenda item (§5) answered with committed benchmarks/tests + a fi
 doc, and a firmed-up recommendation for Stage 3 (proceed to real-app build / adjust /
 pivot per the off-ramp). A well-evidenced "this doesn't hold" is a successful Phase 2.
 
-## 5. The Round-2 agenda (ranked; source: `05-round-2-proposal/round_2_explorations.md`)
+## 5. The Phase-2 experiments (scoped)
 
-Detailed approaches are in that doc — read it. In priority order:
+> **`functional_spec.md` is authoritative** for scope + pass criteria; this is the
+> summary. The governing filter: **real technical unknowns that could kill or pivot
+> the project** — *not* "start building the app in `experiments/`." Five experiments,
+> all **in-container / autonomous** (the GPUI experiment was dropped — GPUI is
+> validated — so there is no macOS dependency this round).
 
-1. **IronCalc full-`evaluate()` cost at Excel-max + the async-recompute UX** *(highest —
-   the chosen engine's core weakness).* Every edit fires a full-workbook `evaluate()`
-   (O(all cells); 1M cascade ~2.11 s, FAIL). Sweep edit→recompute latency by **sheet
-   size (10⁴→10⁷) × formula density / DAG shape** (literal, sparse, wide fan-out,
-   deep-serial, cross-sheet, volatile). Prototype **off-thread + debounced + cancellable
-   recompute** against a `Model` snapshot, with a "recalculating" UX that keeps
-   IronCalc's persisted cached values painted. Confirm the UI thread never blocks.
-2. **End-to-end large styled `.xlsx` open** *(closes §5.4's one un-run target).* Generate
-   a real 100 MB+ styled `.xlsx` from committed code; measure open time + **peak RSS from
-   a fresh process**, broken out (unzip / XML parse / shared-strings / style ingest /
-   graph build / first eval). Measure time-to-first-paint (cached values) separately.
-3. **Function-parity audit** *(Excel-compat is the headline promise, least-proven).*
-   IronCalc's 345 registered builtins vs Excel ~500: coverage diff + a golden-file
-   Excel-correctness harness (edge cases, `#DIV/0!`/`#N/A` error semantics, locale/date,
-   array/spill). Could reopen the engine choice.
-4. **IronCalc binding layer + native style read at scale.** Confirm the per-cell
-   viewport loop holds <2 ms with **real formatting**: **add `get_style_for_cell` to the
-   viewport benchmark** and confirm reading value + style per visible cell in the loop
-   stays under budget at scale (styles are now read straight from IronCalc — §2). **Also
-   validate IronCalc's style API actually exposes what FreeCell needs** — per-cell
-   attributes, row/col **band** styles, and **empty-cell** styling (verify, don't assume;
-   if band/empty-cell styling is thin, that's a finding that reopens the formatting
-   design). Design cache invalidation against IronCalc's `UserModel` diff-list
-   (edit-sites-only, no downstream-dirty).
-5. **Long-tail style-roundtrip fidelity** — exact colors / border styles / number-format
-   codes / rich text across `.xlsx` round-trips (Phase-1 probed representative attributes
-   only). **Merges + conditional formatting stay OPEN** (see §2): no IronCalc API — each
-   is a major feature needing its own technical design **and** the "take over `.xlsx`
-   writing" scope gate; **not designed in Phase 2.**
-6. **GPUI grid maturation:** inline cell editing, selection ranges, frozen panes; **record
-   the still-pending §5.4 "Run Test" numbers on a Mac** (frame p50/p99 + PASS/FAIL);
-   rendering-correctness **PNG baseline** tests; **resolve GPL #55470**.
-7. **Residual gaps:** CSV hardening, IronCalc load-API friction, untested recompute
-   shapes, storage-density extrapolation to true Excel-max.
+1. **SP1 — Non-blocking recompute & the engine↔render interop seam** *(THE key
+   experiment).* IronCalc has no incremental recalc: every edit runs a full-workbook
+   `evaluate()` (O(all cells); ~2 s at 1M) that mutates the model. Deliver a **clean
+   seam** where recompute is **non-blocking** (render loop never stalls) and both
+   halves stay their best. Discover from IronCalc's API — *don't pre-decide the Rust
+   mechanism* — whether the model is readable during an eval / movable / clone-only;
+   whether evals must be serialized; and whether it emits a **changed-cells stream**
+   (so a 1M cascade with ~30 visible cells paints those live). If no stream, **lock a
+   fallback** (poll the visible read every ~100 ms during eval, or wait-then-repull —
+   none is a dealbreaker). Sweep `evaluate()` latency by size (10⁴→10⁷) × DAG shape.
+2. **SP2 — End-to-end large styled `.xlsx` open** *(closes §5.4's one un-run target).*
+   Generate a real 100 MB+ styled `.xlsx`; measure open time + **peak RSS from a fresh
+   process**, staged (unzip / parse / shared-strings / style ingest / graph / first
+   eval). Time-to-first-paint (cached values) measured separately.
+3. **SP3 — Function-parity audit** *(Excel-compat is the headline promise; least-
+   proven).* IronCalc's ~345 builtins vs Excel ~500: coverage diff + a golden-file
+   correctness harness (error semantics, coercion, dates/locale, arrays/spill). Could
+   reopen the engine choice.
+4. **SP4 — Styled viewport read at scale + style-API coverage.** Confirm the per-cell
+   viewport read holds **p99 < 2 ms** when it also reads the style
+   (`get_style_for_cell`) per visible cell at Excel-max (styles are read straight from
+   IronCalc — §2). **Validate the style API exposes what we need** — per-cell + row/col
+   **band** + **empty-cell** styling; a miss reopens the §2 formatting decision.
+5. **SP5 — Long-tail style-roundtrip fidelity** *(a check on IronCalc file I/O).* Exact
+   colors / all border styles / number-format codes / alignment / rich text across an
+   `.xlsx` round-trip (Phase-1 probed representative attributes only). **Merges + CF
+   stay OPEN** (see §2) — no API; not designed in Phase 2.
+
+**Cut from Phase 2 (building or already-settled → the real build, not de-risking):**
+GPUI grid features (selection / inline edit / frozen panes) + perf re-measurement
+(**GPUI is validated**); CSV hardening + an IronCalc load-API wrapper (building);
+storage-density/memory-ceiling extrapolation (**Phase-1's 10M memory test was
+sufficient**); **GPL #55470** (a pre-distribution packaging/legal task — tracked, not
+a technical unknown); the merges/CF side-store (OPEN, §2).
 
 ## 6. Where everything lives (file map)
 

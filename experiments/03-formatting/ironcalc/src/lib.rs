@@ -47,6 +47,12 @@ pub struct NeutralFormat {
     pub fill_argb: Option<String>,
     /// Number-format code (e.g. `"0.00"`), if any.
     pub number_format: Option<String>,
+    /// Horizontal alignment as IronCalc's lower-case token (e.g. `"right"`), if a
+    /// non-default alignment is set.
+    pub h_align: Option<String>,
+    /// The left-border style token (e.g. `"thin"`), if a left border is set — a small
+    /// representative probe of the border surface (exhaustive border fidelity is Round 2).
+    pub left_border: Option<String>,
 }
 
 /// The three axes each formatting attribute is scored on (IronCalc variant).
@@ -111,14 +117,28 @@ pub fn styled_model() -> Model<'static> {
         .set_user_input(SHEET, 2, 2, "hello".to_string())
         .expect("set B2");
 
-    // A1: bold, 16pt, yellow fill, 2-decimal number format.
+    // A1: bold, 16pt, yellow fill, 2-decimal number format, right-aligned, thin left
+    // border. Alignment + border are set here so the matrix rows for them are probe-backed
+    // (representative, not an exhaustive border sweep — that is deferred to Round 2).
     {
+        use ironcalc_base::types::{
+            Alignment, BorderItem, BorderStyle, HorizontalAlignment, VerticalAlignment,
+        };
         let mut s = model.get_style_for_cell(SHEET, 1, 1).expect("A1 style");
         s.font.b = true;
         s.font.sz = 16;
         s.fill.pattern_type = "solid".to_string();
         s.fill.fg_color = Some("#FFFF00".to_string());
         s.num_fmt = "0.00".to_string();
+        s.alignment = Some(Alignment {
+            horizontal: HorizontalAlignment::Right,
+            vertical: VerticalAlignment::default(),
+            wrap_text: false,
+        });
+        s.border.left = Some(BorderItem {
+            style: BorderStyle::Thin,
+            color: Some("#000000".to_string()),
+        });
         model.set_cell_style(SHEET, 1, 1, &s).expect("set A1 style");
     }
     // B2: italic.
@@ -144,12 +164,25 @@ pub fn read_format(model: &Model, sheet: u32, row: i32, col: i32) -> NeutralForm
     } else {
         Some(style.num_fmt.clone())
     };
+    // Only surface a non-default horizontal alignment (General is the default).
+    let h_align = style
+        .alignment
+        .as_ref()
+        .map(|a| a.horizontal.to_string())
+        .filter(|s| s != "general");
+    let left_border = style
+        .border
+        .left
+        .as_ref()
+        .map(|b| b.style.to_string());
     NeutralFormat {
         bold: style.font.b,
         italic: style.font.i,
         font_size: Some(style.font.sz as f64),
         fill_argb: style.fill.fg_color.clone(),
         number_format,
+        h_align,
+        left_border,
     }
 }
 
@@ -167,6 +200,7 @@ pub fn roundtrip_via_xlsx(model: &Model) -> Model<'static> {
 
 /// Builds the IronCalc capability matrix (statuses backed by the passing probes).
 pub fn capability_matrix() -> CapabilityMatrix {
+    use Provenance::*;
     use Support::*;
     let rows = vec![
         CapabilityRow {
@@ -174,84 +208,96 @@ pub fn capability_matrix() -> CapabilityMatrix {
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Style.font.b via get_style_for_cell / set_cell_style; survives xlsx round-trip.",
+            provenance: ProbeBacked,
+            note: "Style.font.b via get_style_for_cell / set_cell_style; round-trip re-read by styles_survive_xlsx_roundtrip.",
         },
         CapabilityRow {
             attribute: "italic",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Style.font.i.",
+            provenance: ProbeBacked,
+            note: "Style.font.i; round-trip re-read by styles_survive_xlsx_roundtrip.",
         },
         CapabilityRow {
             attribute: "font_size",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Style.font.sz (i32 points).",
+            provenance: ProbeBacked,
+            note: "Style.font.sz (i32 points); round-trip re-read by styles_survive_xlsx_roundtrip.",
         },
         CapabilityRow {
             attribute: "fill_color",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Style.fill.fg_color (hex); requires pattern_type = \"solid\".",
+            provenance: ProbeBacked,
+            note: "Style.fill.fg_color (hex); requires pattern_type = \"solid\"; round-trip re-read by styles_survive_xlsx_roundtrip.",
         },
         CapabilityRow {
             attribute: "number_format",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Style.num_fmt (format code string).",
+            provenance: ProbeBacked,
+            note: "Style.num_fmt (format code string); round-trip re-read by styles_survive_xlsx_roundtrip.",
         },
         CapabilityRow {
             attribute: "borders",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Style.border (per-side BorderItem); not probed exhaustively (Round 2).",
+            provenance: ProbeBacked,
+            note: "Style.border per-side BorderItem; a representative thin left border is set+read+round-tripped (borders_and_alignment_read_and_survive_roundtrip). Exhaustive border fidelity deferred to Round 2.",
         },
         CapabilityRow {
             attribute: "alignment",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Style.alignment (Horizontal/VerticalAlignment enums).",
+            provenance: ProbeBacked,
+            note: "Style.alignment (Horizontal/VerticalAlignment); right-align set+read+round-tripped (borders_and_alignment_read_and_survive_roundtrip).",
         },
         CapabilityRow {
             attribute: "row_height",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Model::get/set_row_height (f64).",
+            provenance: ProbeBacked,
+            note: "Model::get/set_row_height (f64); read back by row_col_sizes_settable and round-trip by styles_survive_xlsx_roundtrip.",
         },
         CapabilityRow {
             attribute: "col_width",
             read: Native,
             write: Native,
             roundtrip: Native,
-            note: "Model::get/set_column_width (f64).",
+            provenance: ProbeBacked,
+            note: "Model::get/set_column_width (f64); read back by row_col_sizes_settable.",
         },
         CapabilityRow {
             attribute: "merges",
             read: None,
             write: None,
             roundtrip: None,
-            note: "No public merged-cells API on Model in 0.7 (internal Worksheet.merge_cells field is not exposed).",
+            provenance: ProbeBacked,
+            note: "No public merged-cells API on Model in 0.7 (absence documented by merges_and_conditional_formatting_absent_from_public_api; a call would not compile).",
         },
         CapabilityRow {
             attribute: "conditional_formatting",
             read: None,
             write: None,
             roundtrip: None,
-            note: "No conditional-formatting API in the public crate interface.",
+            provenance: ProbeBacked,
+            note: "No conditional-formatting API in the public crate interface (absence documented by merges_and_conditional_formatting_absent_from_public_api).",
         },
         CapabilityRow {
             attribute: "themes / named styles",
             read: Unverified,
             write: Native,
             roundtrip: Unverified,
-            note: "set_cell_style_by_name / set_sheet_style exist; no general theme read API. Not probed.",
+            provenance: Inferred,
+            note: "INFERRED (not probed): set_cell_style_by_name / set_sheet_style exist; no general theme read API.",
         },
     ];
     CapabilityMatrix {

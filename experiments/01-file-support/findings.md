@@ -56,12 +56,15 @@ so there are **no hand-made binary fixtures** (functional_spec §5.3).
 ```sh
 cd experiments/01-file-support/formualizer
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test
+# Print the .xlsx byte sizes quoted below (regenerable per functional_spec §5.3):
+cargo test --test roundtrip records_xlsx_byte_sizes -- --nocapture
 
 cd ../ironcalc
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo test --test roundtrip records_xlsx_byte_sizes -- --nocapture
 ```
 
-All checks pass; **7 tests** (6 round-trip + 1 unit) for Formualizer, **8 tests** (6
+All checks pass; **8 tests** (7 round-trip + 1 unit) for Formualizer, **9 tests** (7
 round-trip + 2 unit) for IronCalc, all green.
 
 ## Results / evidence
@@ -102,10 +105,11 @@ Backed by the `tests/roundtrip.rs` assertions in each crate.
 **File sizes (regenerable from committed code — the `records_xlsx_byte_sizes` test
 in each crate prints these; run `cargo test --test roundtrip records_xlsx_byte_sizes
 -- --nocapture`).** Sizes observed on the probed engine versions (illustrative, not a
-pass/fail gate — they are engine-version-dependent): feature workbook → Formualizer
-6,121 bytes / IronCalc 4,407 bytes; a 100×20 synthetic sheet → Formualizer 20,317
-bytes / IronCalc 18,535 bytes. Both writers produce valid ZIP/OOXML (`PK` magic +
-successful reload, asserted by the test).
+pass/fail gate — they are engine-version-dependent, and IronCalc's writer embeds a
+timestamp in `docProps/core.xml` so its size can vary by a byte or two per run):
+feature workbook → Formualizer ~6,121 bytes / IronCalc ~4,406 bytes; a 100×20
+synthetic sheet → Formualizer ~20,317 bytes / IronCalc ~18,534 bytes. Both writers
+produce valid ZIP/OOXML (`PK` magic + successful reload, asserted by the test).
 
 ### Headline structural differences
 

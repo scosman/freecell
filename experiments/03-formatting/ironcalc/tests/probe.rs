@@ -25,6 +25,8 @@ fn styles_read_and_write_natively() {
             font_size: Some(16.0),
             fill_argb: Some("#FFFF00".to_string()),
             number_format: Some("0.00".to_string()),
+            h_align: Some("right".to_string()),
+            left_border: Some("thin".to_string()),
         },
         "A1 style read back exactly as written"
     );

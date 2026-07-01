@@ -199,5 +199,8 @@ fn records_xlsx_byte_sizes() {
     assert_eq!(&feature_bytes[0..2], b"PK", "feature file is a ZIP");
     assert_eq!(&synthetic_bytes[0..2], b"PK", "synthetic file is a ZIP");
     assert!(feature_bytes.len() > 1_000, "feature file is non-trivial");
-    assert!(synthetic_bytes.len() > 1_000, "synthetic file is non-trivial");
+    assert!(
+        synthetic_bytes.len() > 1_000,
+        "synthetic file is non-trivial"
+    );
 }

@@ -11,16 +11,16 @@
   },
   "stats": {
     "count": 5,
-    "min_ns": 118676403,
-    "max_ns": 174681519,
-    "mean_ns": 134028957,
-    "p50_ns": 122329865,
-    "p99_ns": 174681519
+    "min_ns": 121133939,
+    "max_ns": 196625829,
+    "mean_ns": 143709120,
+    "p50_ns": 132387852,
+    "p99_ns": 196625829
   },
   "gates": [
     {
       "name": "cascade-visible/D1",
-      "measured_ns": 174681519,
+      "measured_ns": 196625829,
       "target_ns": 16666666,
       "verdict": "FAIL"
     }
@@ -29,7 +29,7 @@
     "design": "D1",
     "engine": "formualizer",
     "metrics": {
-      "build_ms": 1956,
+      "build_ms": 2155,
       "cascade_verified": true,
       "chain_len": 100000,
       "expected_visible": 99945.0,

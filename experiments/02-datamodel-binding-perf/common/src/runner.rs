@@ -247,50 +247,93 @@ where
         ));
     }
 
-    // --- Scenario 5: memory load + edit (discovery: peak RSS, wall-clock-budgeted) ---
-    {
-        let rss_before = peak_rss();
-        let mut engine = make();
-        let mem = scenario::memory_load_and_edit(&mut engine, profile.memory_cells, MEMORY_BUDGET);
-        let rss_after = peak_rss();
-        // Keep the engine alive across the RSS read.
-        std::hint::black_box(&engine);
-        // CREDIBILITY GUARD: the far-corner cell proves the LOADED region was populated
-        // (whatever scale the budget allowed), so the recorded RSS is for a genuinely
-        // loaded workbook — not an empty grid — even when the load stepped down.
-        assert!(
-            mem.is_correct(),
-            "{engine_name} memory scenario did NOT populate the region: loaded {} of {} cells, \
-             far corner={:?}, expected {}",
-            mem.loaded,
-            mem.requested,
-            mem.far_corner,
-            mem.expected_far_corner,
-        );
-        out.push(ScenarioResult::from_stats(
-            &engine_name,
-            "memory",
-            None,
-            mem.loaded as u64,
-            date,
-            env.clone(),
-            None,
-            None,
-            json!({
-                "peak_rss_bytes_before": rss_before,
-                "peak_rss_bytes_after": rss_after,
-                "delta_bytes": rss_after.saturating_sub(rss_before),
-                "requested_cells": profile.memory_cells,
-                "loaded_cells": mem.loaded,
-                "load_capped_by_budget": mem.capped,
-                "load_time_ms": mem.load_time.as_millis() as u64,
-                "far_corner_verified": mem.far_corner.as_number(),
-                "populated_verified": mem.is_correct(),
-            }),
-        ));
-    }
+    // --- Scenario 5: memory load + edit (discovery: peak RSS) ---
+    // NOTE: run in-process here for a complete suite, but the AUTHORITATIVE peak-RSS
+    // number comes from `run_memory_only` in a FRESH process (see the `mem` mode of each
+    // engine's `scenarios` bin) — whole-process `VmHWM` is polluted by earlier scenarios'
+    // residual (e.g. the 1M-chain build), so the in-suite `peak_rss_bytes_after` is not a
+    // clean density figure. `delta_bytes` (load-attributable) is the honest in-suite
+    // number; the fresh-process run is what findings.md quotes for peak.
+    out.push(memory_result(&make, profile, env, date, peak_rss, false));
 
     out
+}
+
+/// Runs **only** the memory scenario against a fresh engine and returns its
+/// [`ScenarioResult`]. Intended to be invoked in its **own process** so the recorded
+/// `peak_rss_bytes` (`VmHWM`) reflects *only* this load — no residual from other
+/// scenarios. `authoritative=true` marks the record as the clean fresh-process figure.
+pub fn run_memory_only<E, F>(
+    make: F,
+    profile: &Profile,
+    env: &Environment,
+    date: &str,
+    peak_rss: fn() -> u64,
+) -> ScenarioResult
+where
+    E: SpreadsheetEngine,
+    F: Fn() -> E,
+{
+    memory_result(&make, profile, env, date, peak_rss, true)
+}
+
+/// Shared memory-scenario body: load the block via each engine's native bulk-ingest,
+/// sample peak RSS, verify the region populated, and build the record.
+fn memory_result<E, F>(
+    make: &F,
+    profile: &Profile,
+    env: &Environment,
+    date: &str,
+    peak_rss: fn() -> u64,
+    authoritative: bool,
+) -> ScenarioResult
+where
+    E: SpreadsheetEngine,
+    F: Fn() -> E,
+{
+    let engine_name = make().name().to_string();
+    let rss_before = peak_rss();
+    let mut engine = make();
+    let mem = scenario::memory_load_and_edit(&mut engine, profile.memory_cells, MEMORY_BUDGET);
+    let rss_after = peak_rss();
+    // Keep the engine alive across the RSS read.
+    std::hint::black_box(&engine);
+    // CREDIBILITY GUARD: the far-corner cell proves the LOADED region was populated, so
+    // the recorded RSS is for a genuinely loaded workbook — not an empty grid.
+    assert!(
+        mem.is_correct(),
+        "{engine_name} memory scenario did NOT populate the region: loaded {} of {} cells, \
+         far corner={:?}, expected {}",
+        mem.loaded,
+        mem.requested,
+        mem.far_corner,
+        mem.expected_far_corner,
+    );
+    ScenarioResult::from_stats(
+        &engine_name,
+        "memory",
+        None,
+        mem.loaded as u64,
+        date,
+        env.clone(),
+        None,
+        None,
+        json!({
+            "authoritative_fresh_process": authoritative,
+            "peak_rss_bytes_before": rss_before,
+            "peak_rss_bytes_after": rss_after,
+            "delta_bytes": rss_after.saturating_sub(rss_before),
+            "bytes_per_cell": if mem.loaded > 0 {
+                rss_after.saturating_sub(rss_before) as f64 / mem.loaded as f64
+            } else { 0.0 },
+            "requested_cells": profile.memory_cells,
+            "loaded_cells": mem.loaded,
+            "load_capped_by_budget": mem.capped,
+            "load_time_ms": mem.load_time.as_millis() as u64,
+            "far_corner_verified": mem.far_corner.as_number(),
+            "populated_verified": mem.is_correct(),
+        }),
+    )
 }
 
 #[cfg(test)]

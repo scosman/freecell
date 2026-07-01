@@ -11,16 +11,16 @@
   },
   "stats": {
     "count": 5,
-    "min_ns": 102757633,
-    "max_ns": 115523556,
-    "mean_ns": 107337968,
-    "p50_ns": 106204606,
-    "p99_ns": 115523556
+    "min_ns": 96937888,
+    "max_ns": 112694516,
+    "mean_ns": 104418093,
+    "p50_ns": 104080141,
+    "p99_ns": 112694516
   },
   "gates": [
     {
       "name": "cascade-visible/D3",
-      "measured_ns": 115523556,
+      "measured_ns": 112694516,
       "target_ns": 16666666,
       "verdict": "FAIL"
     }
@@ -29,7 +29,7 @@
     "design": "D3",
     "engine": "ironcalc",
     "metrics": {
-      "build_ms": 475,
+      "build_ms": 445,
       "cascade_verified": true,
       "chain_len": 100000,
       "expected_visible": 99945.0,

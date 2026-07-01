@@ -129,6 +129,38 @@ pub trait SpreadsheetEngine {
     /// write path — challenges the per-edit recompute cost).
     fn set_batch(&mut self, cells: &[(u32, u32, CellInput)]);
 
+    /// Loads a **dense `rows × cols` rectangle of literal values** produced by `cell`,
+    /// using the engine's **fastest native bulk-ingest path** for base values.
+    ///
+    /// This is the fair way to benchmark a large literal load: it lets each engine use
+    /// its optimal loader — Formualizer's columnar Arrow bulk-ingest
+    /// (`begin_bulk_ingest_arrow`, ~O(cells), no graph vertices / no overlay / no chunk
+    /// rebuilds), IronCalc's direct `set_user_input` into its `HashMap` — instead of
+    /// Formualizer's slow interactive `write_range` overlay path (which is super-linear
+    /// and was the source of an earlier unfair measurement). The block occupies rows
+    /// `0..rows` and cols `0..cols`; `cell(r, c)` yields each literal.
+    ///
+    /// The default implementation falls back to chunked [`SpreadsheetEngine::set_batch`]
+    /// for engines (and the test `FakeEngine`) that have no special path.
+    fn bulk_load_block(&mut self, rows: u32, cols: u32, cell: &dyn Fn(u32, u32) -> EngineValue) {
+        let chunk_rows: u32 = (40_000 / cols.max(1)).max(1);
+        let mut r0 = 0;
+        while r0 < rows {
+            let r1 = (r0 + chunk_rows).min(rows);
+            let mut batch = Vec::with_capacity(((r1 - r0) as usize) * (cols as usize));
+            for r in r0..r1 {
+                for c in 0..cols {
+                    let v = cell(r, c);
+                    if v != EngineValue::Empty {
+                        batch.push((r, c, CellInput::Value(v)));
+                    }
+                }
+            }
+            self.set_batch(&batch);
+            r0 = r1;
+        }
+    }
+
     /// Reads the stored/cached value at `(row, col)` (no recompute).
     fn get_value(&self, row: u32, col: u32) -> EngineValue;
 

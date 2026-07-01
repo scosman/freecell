@@ -33,5 +33,5 @@ pub mod sysinfo;
 pub use binding::{BindingCache, Design};
 pub use engine::{CellInput, EngineCaps, EngineValue, SpreadsheetEngine, Viewport};
 pub use report::{rebuild_summary, write_all, ScenarioResult};
-pub use runner::run_suite;
+pub use runner::{run_memory_only, run_suite};
 pub use scenario::{targets, Profile};

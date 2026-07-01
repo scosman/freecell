@@ -147,6 +147,22 @@ impl SpreadsheetEngine for IronCalcEngine {
         }
     }
 
+    fn bulk_load_block(&mut self, rows: u32, cols: u32, cell: &dyn Fn(u32, u32) -> EngineValue) {
+        // IronCalc's fastest base-value load: direct `set_user_input` into the row→col
+        // `HashMap`, with NO `evaluate()` — literals need no compute (its `evaluate()` is
+        // O(all cells), so skipping it is the honest fast path). This is the fair
+        // counterpart to Formualizer's Arrow ingest: each engine loads via its optimal
+        // native path, so the recorded build/memory numbers compare like for like.
+        for r in 0..rows {
+            for c in 0..cols {
+                let v = cell(r, c);
+                if v != EngineValue::Empty {
+                    self.put(r, c, value_to_input(&v));
+                }
+            }
+        }
+    }
+
     fn get_value(&self, row: u32, col: u32) -> EngineValue {
         match self
             .model

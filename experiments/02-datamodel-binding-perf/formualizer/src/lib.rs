@@ -137,6 +137,35 @@ impl SpreadsheetEngine for FormualizerEngine {
         }
     }
 
+    fn bulk_load_block(&mut self, rows: u32, cols: u32, cell: &dyn Fn(u32, u32) -> EngineValue) {
+        // Formualizer's fastest base-value loader: the columnar Arrow BULK-INGEST path.
+        // `engine_mut().begin_bulk_ingest_arrow()` builds ArrowSheets row-by-row into
+        // per-column typed lanes and installs them directly into the store on `finish`
+        // — no graph vertices, no delta/computed overlay, no per-chunk rebuilds. This is
+        // ~O(cells) (~9 bytes/cell for f64) versus the SUPER-LINEAR interactive
+        // `write_range` overlay path in `set_batch` (per-cell vertex +
+        // `maybe_compact_chunk` rebuilding whole 32K-row chunks). Reads (`get_value`,
+        // `read_range`) see these values because both read straight from the Arrow store.
+        //
+        // NOTE: `add_sheet` + `finish` *replaces* the sheet, so the whole block is
+        // ingested in one session (no per-chunk finish); we buffer a single row at a time.
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let eng = self.wb.engine_mut();
+        let mut ab = eng.begin_bulk_ingest_arrow();
+        // 32,768-row chunks matches the engine's default Arrow chunk size.
+        ab.add_sheet(SHEET, cols as usize, 32_768);
+        let mut rowbuf: Vec<LiteralValue> = vec![LiteralValue::Empty; cols as usize];
+        for r in 0..rows {
+            for c in 0..cols {
+                rowbuf[c as usize] = to_literal(&cell(r, c));
+            }
+            ab.append_row(SHEET, &rowbuf).expect("arrow append_row");
+        }
+        ab.finish().expect("arrow bulk-ingest finish");
+    }
+
     fn get_value(&self, row: u32, col: u32) -> EngineValue {
         match self.wb.get_value(SHEET, row + 1, col + 1) {
             Some(v) => from_literal(v),

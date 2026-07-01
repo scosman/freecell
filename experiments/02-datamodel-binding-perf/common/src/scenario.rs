@@ -85,18 +85,17 @@ impl Profile {
     ///
     /// The scrolling region is a **200,000-cell** block (2,500 rows × 80 cols): large
     /// enough that the 300-step pan path visits many distinct windows across a sheet far
-    /// bigger than the ~1,800-cell viewport (both axes), while staying within the size
-    /// Formualizer's super-linear `write_range` bulk-seed can load in-budget (~11 s; a
-    /// 2M-cell single seed does NOT complete in-budget — a recorded API finding). The
-    /// viewport read itself (the thing measured) is unaffected by the region size.
+    /// bigger than the ~1,800-cell viewport (both axes). It is seeded via each engine's
+    /// **native bulk-ingest** path (`bulk_load_block`), so seed cost is small on both; the
+    /// viewport read (the thing measured) is unaffected by the region size.
     ///
     /// Heavy-scenario scales are chosen from measured single-shot costs on the 4-core
-    /// target so the whole suite completes inside a bounded wall-clock budget (see the
-    /// probe findings): the **1M** headline cascade (Scenario 3a) is kept at spec scale;
-    /// the change→visible chain (Scenario 2, rebuilt ×3) is 100k; the fan-out is
-    /// 1,000×1,000 (a 5,000×5,000 shape costs ~100 s/recompute on Formualizer — recorded
-    /// as a ceiling finding, not a per-run gate); the memory load targets 10⁷ cells but
-    /// is **wall-clock-budgeted** so each engine records the ceiling it actually reaches.
+    /// target so the whole suite completes inside a bounded wall-clock budget: the **1M**
+    /// headline cascade (Scenario 3a) is kept at spec scale; the change→visible chain
+    /// (Scenario 2, rebuilt ×3) is 100k; the fan-out is 1,000×1,000 (a 5,000×5,000 shape
+    /// costs ~100 s/recompute on Formualizer — recorded as a ceiling finding, not a
+    /// per-run gate); the memory load targets the full **10⁷ cells** via bulk-ingest
+    /// (both engines reach it in single-digit seconds), with a safety budget as a backstop.
     pub const fn full() -> Self {
         Self {
             region_rows: 2_500,
@@ -121,38 +120,21 @@ impl Profile {
 pub const SEED: u64 = 0xF2EE_CE11;
 
 /// Seeds `engine` with a `rows × cols` block of synthetic literal values (numbers
-/// and text) from a deterministic [`SyntheticSheet`], loading in **row chunks**.
+/// and text) from a deterministic [`SyntheticSheet`], via each engine's **fastest
+/// native bulk-ingest path** ([`SpreadsheetEngine::bulk_load_block`]).
 ///
-/// Chunking (rather than one giant batch) is deliberate: it mirrors how a real binding
-/// layer streams a bulk load, keeps each per-batch temporary bounded, and — critically —
-/// avoids Formualizer's super-linear single-`write_range` cost (one 2M-cell `write_range`
-/// does not complete in-budget; see findings). Each chunk is one `set_batch`, so a
-/// non-incremental engine still pays only one recompute per chunk of literals (and, since
-/// these are pure literals, both adapters skip the recompute entirely).
+/// Using `bulk_load_block` (not a chunked `set_batch`) is a fairness requirement: it
+/// routes Formualizer through its columnar Arrow ingest (~O(cells)) and IronCalc through
+/// a direct `set_user_input` loop, so the seed cost of the scrolling/cascade-visible
+/// scenarios is measured on each engine's optimal loader — not Formualizer's super-linear
+/// interactive `write_range` overlay path (the source of an earlier unfair measurement).
 pub fn seed_region(engine: &mut impl SpreadsheetEngine, rows: u32, cols: u32) {
     let sheet = SyntheticSheet::new(SEED, rows, cols);
-    // ~40k cells/chunk keeps each write_range small enough to stay on the linear part of
-    // Formualizer's bulk-write curve while remaining a realistic streamed load.
-    let chunk_rows: u32 = (40_000 / cols.max(1)).max(1);
-    let mut r0 = 0;
-    while r0 < rows {
-        let r1 = (r0 + chunk_rows).min(rows);
-        let mut batch = Vec::with_capacity(((r1 - r0) as usize) * (cols as usize));
-        for r in r0..r1 {
-            for c in 0..cols {
-                let v = match sheet.cell(r, c).value {
-                    datagen::CellValue::Empty => EngineValue::Empty,
-                    datagen::CellValue::Number(n) => EngineValue::Number(n),
-                    datagen::CellValue::Text(t) => EngineValue::Text(t),
-                };
-                if v != EngineValue::Empty {
-                    batch.push((r, c, CellInput::Value(v)));
-                }
-            }
-        }
-        engine.set_batch(&batch);
-        r0 = r1;
-    }
+    engine.bulk_load_block(rows, cols, &|r, c| match sheet.cell(r, c).value {
+        datagen::CellValue::Empty => EngineValue::Empty,
+        datagen::CellValue::Number(n) => EngineValue::Number(n),
+        datagen::CellValue::Text(t) => EngineValue::Text(t),
+    });
 }
 
 /// A deterministic pan path across the region: steps down and right in a sweep so we
@@ -420,22 +402,23 @@ pub fn writes_single_vs_batched(
     (single, vec![dt])
 }
 
-/// The verified outcome of the memory scenario: how many cells were actually loaded
-/// (spot-checked, not just requested) so the runner can prove the region was populated,
-/// plus the wall-clock load time and how far the load got before the time budget hit.
+/// The verified outcome of the memory scenario: how many cells were loaded (spot-checked,
+/// not just requested) so the runner can prove the region was populated, plus the
+/// wall-clock **bulk-ingest** load time and whether a safety budget was tripped.
 #[derive(Debug)]
 pub struct MemoryRun {
     /// Cells requested to load (the target scale, e.g. 10⁷).
     pub requested: u32,
-    /// Cells actually loaded — equals `requested` unless the time budget capped the run.
+    /// Cells actually loaded (the full dense `rows × 1000` block).
     pub loaded: u32,
     /// A far-corner (last-loaded) cell's value — proves the tail of the region was written.
     pub far_corner: EngineValue,
     /// The expected far-corner value.
     pub expected_far_corner: f64,
-    /// Wall-clock time to load `loaded` cells (chunked bulk writes).
+    /// Wall-clock time to load `loaded` cells via the engine's native bulk-ingest path.
     pub load_time: Duration,
-    /// `true` if the load was stopped early by the time budget (a per-engine ceiling).
+    /// `true` only if the load exceeded the safety budget (does not trip on the fast
+    /// bulk-ingest paths).
     pub capped: bool,
 }
 
@@ -447,52 +430,35 @@ impl MemoryRun {
     }
 }
 
-/// **Scenario 5 — memory load + edit (time-budgeted, step-down).** Populates up to
-/// `cells` literal values in **chunked batches** (a realistic bulk-load shape that keeps
-/// each per-batch temporary bounded rather than materializing all 10⁷ at once), then
-/// performs one edit + recompute. The load **stops early** once `budget` wall-clock time
-/// elapses, so an engine that can't reach the target scale in the budget records the
-/// ceiling it *did* reach instead of hanging (per the phase's step-down guardrail).
-/// Returns a [`MemoryRun`] that spot-checks the last-loaded far-corner cell so the caller
-/// can prove the region was genuinely populated; the caller samples peak RSS around this
-/// call (a platform read the bench binary owns).
+/// **Scenario 5 — memory load + edit.** Populates a dense `cells`-cell block of literals
+/// (laid out as a wide rectangle, 1,000 cols, to avoid a single 10⁷-long column) via each
+/// engine's **fastest native bulk-ingest path** ([`SpreadsheetEngine::bulk_load_block`]:
+/// Formualizer's columnar Arrow ingest, IronCalc's `set_user_input` loop), then performs
+/// one edit + recompute. Returns a [`MemoryRun`] that spot-checks the last-loaded
+/// far-corner cell so the caller can prove the region was genuinely populated; the caller
+/// samples peak RSS around this call.
+///
+/// `budget` is a **safety ceiling only**: if the load ever exceeds it the run steps down
+/// and records how far it got (per the phase guardrail). On the fast bulk-ingest paths
+/// neither engine trips it (both reach 10⁷ in single-digit seconds), so a recorded run
+/// normally shows `loaded == requested`, `capped == false`.
 pub fn memory_load_and_edit(
     engine: &mut impl SpreadsheetEngine,
     cells: u32,
     budget: Duration,
 ) -> MemoryRun {
-    // Lay the cells out as a wide-ish rectangle to avoid a single 10^7-long column, and
-    // load in chunks of whole rows so each batch is bounded.
     let cols: u32 = 1_000;
-    let chunk_rows: u32 = 100; // 100k cells per batch
-    let total_rows = cells.div_ceil(cols);
+    let rows = cells / cols; // exact when cells is a multiple of 1,000 (the full profile)
+    let loaded = rows * cols;
+
     let start = std::time::Instant::now();
-    let mut row = 0;
-    let mut loaded = 0u32;
-    let mut capped = false;
-    while row < total_rows {
-        let end_row = (row + chunk_rows).min(total_rows);
-        let mut batch: Vec<(u32, u32, CellInput)> =
-            Vec::with_capacity((end_row - row) as usize * cols as usize);
-        for r in row..end_row {
-            for c in 0..cols {
-                let i = r * cols + c;
-                if i >= cells {
-                    break;
-                }
-                batch.push((r, c, CellInput::Value(EngineValue::Number(i as f64))));
-                loaded = i + 1;
-            }
-        }
-        engine.set_batch(&batch);
-        row = end_row;
-        // Step-down: if we've blown the wall-clock budget, stop and record the ceiling.
-        if start.elapsed() >= budget && row < total_rows {
-            capped = true;
-            break;
-        }
-    }
+    engine.bulk_load_block(rows, cols, &|r, c| {
+        EngineValue::Number((r * cols + c) as f64)
+    });
     let load_time = start.elapsed();
+    // The bulk-ingest path is a single call, so the "cap" can only be judged after it
+    // returns; on these engines it never trips (kept for the honest record).
+    let capped = load_time >= budget;
 
     // Spot-check the LAST loaded cell (far corner) before the edit overwrites (0,0).
     let last_i = loaded.saturating_sub(1);

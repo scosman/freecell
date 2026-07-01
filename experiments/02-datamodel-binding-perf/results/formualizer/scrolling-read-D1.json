@@ -11,16 +11,16 @@
   },
   "stats": {
     "count": 300,
-    "min_ns": 242196,
-    "max_ns": 562350,
-    "mean_ns": 304542,
-    "p50_ns": 289604,
-    "p99_ns": 481311
+    "min_ns": 162930,
+    "max_ns": 394981,
+    "mean_ns": 195532,
+    "p50_ns": 190023,
+    "p99_ns": 310218
   },
   "gates": [
     {
       "name": "scrolling-read/D1",
-      "measured_ns": 481311,
+      "measured_ns": 310218,
       "target_ns": 2000000,
       "verdict": "PASS"
     }

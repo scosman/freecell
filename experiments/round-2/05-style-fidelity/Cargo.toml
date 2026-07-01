@@ -1,0 +1,33 @@
+[package]
+name = "style_fidelity"
+version = "0.1.0"
+edition = "2021"
+description = "SP5 -- Long-tail style-roundtrip fidelity: a committed, code-generated styled Model that is round-tripped through IronCalc's native .xlsx writer/reader (build -> save -> reload -> read-back), probe-asserting each long-tail style attribute (exact fill/font/border colors, all border styles, every number-format family, full alignment matrix, font long tail, quote_prefix) and classifying it {survives / lossy / dropped / not-representable} with observed-vs-expected evidence. Merges + conditional formatting are recorded as a known OPEN gap (no IronCalc public API)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Independent Cargo project (NOT a workspace member), depending read-only by relative
+# path on the frozen round-2 harness (for the IronCalc 0.7.1 version-pin provenance /
+# same engine seam as every other SP experiment) and the frozen shared bench_util (env
+# stamp). Mirrors architecture Section 1's per-experiment isolation. Extends the FROZEN
+# experiments/03-formatting/ironcalc probe BY COPY -- it is never modified.
+
+[lib]
+name = "style_fidelity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "emit"
+path = "src/bin/emit.rs"
+
+[dependencies]
+# Frozen, read-only. Carried for the IronCalc 0.7.1 pin provenance (the shared engine
+# seam every SP experiment shares) so SP5's fidelity numbers stay comparable.
+round2_harness = { path = "../harness" }
+# Frozen, read-only. Env stamp (Environment::detect) for results provenance.
+bench_util = { path = "../../shared/bench_util" }
+# Same IronCalc pin as the harness: native styled .xlsx writer/reader + Style types.
+ironcalc = "0.7"
+ironcalc_base = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

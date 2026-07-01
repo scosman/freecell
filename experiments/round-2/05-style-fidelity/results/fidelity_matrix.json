@@ -1,0 +1,539 @@
+{
+  "engine": "ironcalc",
+  "engine_version": "0.7.1",
+  "rustc": "1.94.1",
+  "date": "2026-07-01",
+  "rows": [
+    {
+      "attribute": "fill fg_color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#FF0000",
+      "observed": "#FF0000",
+      "fidelity": "Survives",
+      "probe": "fill_colors_survive_roundtrip",
+      "note": "Style.fill.fg_color, pattern_type=solid; export writes rgb=FF{hex}, import strips alpha to #RRGGBB. Exact."
+    },
+    {
+      "attribute": "fill fg_color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#00ff00",
+      "observed": "#00ff00",
+      "fidelity": "Survives",
+      "probe": "fill_colors_survive_roundtrip",
+      "note": "Style.fill.fg_color, pattern_type=solid; export writes rgb=FF{hex}, import strips alpha to #RRGGBB. Exact."
+    },
+    {
+      "attribute": "fill fg_color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#0000FF",
+      "observed": "#0000FF",
+      "fidelity": "Survives",
+      "probe": "fill_colors_survive_roundtrip",
+      "note": "Style.fill.fg_color, pattern_type=solid; export writes rgb=FF{hex}, import strips alpha to #RRGGBB. Exact."
+    },
+    {
+      "attribute": "fill fg_color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#000000",
+      "observed": "#000000",
+      "fidelity": "Survives",
+      "probe": "fill_colors_survive_roundtrip",
+      "note": "Style.fill.fg_color, pattern_type=solid; export writes rgb=FF{hex}, import strips alpha to #RRGGBB. Exact."
+    },
+    {
+      "attribute": "fill fg_color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#FFFFFF",
+      "observed": "#FFFFFF",
+      "fidelity": "Survives",
+      "probe": "fill_colors_survive_roundtrip",
+      "note": "Style.fill.fg_color, pattern_type=solid; export writes rgb=FF{hex}, import strips alpha to #RRGGBB. Exact."
+    },
+    {
+      "attribute": "fill fg_color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#1A2B3C",
+      "observed": "#1A2B3C",
+      "fidelity": "Survives",
+      "probe": "fill_colors_survive_roundtrip",
+      "note": "Style.fill.fg_color, pattern_type=solid; export writes rgb=FF{hex}, import strips alpha to #RRGGBB. Exact."
+    },
+    {
+      "attribute": "fill bg_color (#RRGGBB, gray125 pattern)",
+      "family": "colors",
+      "expected": "#ABCDEF",
+      "observed": "#ABCDEF",
+      "fidelity": "Survives",
+      "probe": "bg_color_with_pattern_survives",
+      "note": "Style.fill.bg_color under a non-solid pattern_type round-trips exactly."
+    },
+    {
+      "attribute": "font color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#123456",
+      "observed": "#123456",
+      "fidelity": "Survives",
+      "probe": "font_colors_survive_roundtrip",
+      "note": "Style.font.color round-trips exactly (same rgb=FF{hex} path as fills)."
+    },
+    {
+      "attribute": "font color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#abcdef",
+      "observed": "#abcdef",
+      "fidelity": "Survives",
+      "probe": "font_colors_survive_roundtrip",
+      "note": "Style.font.color round-trips exactly (same rgb=FF{hex} path as fills)."
+    },
+    {
+      "attribute": "font color (#RRGGBB)",
+      "family": "colors",
+      "expected": "#000000",
+      "observed": "#000000",
+      "fidelity": "Survives",
+      "probe": "font_colors_survive_roundtrip",
+      "note": "Style.font.color round-trips exactly (same rgb=FF{hex} path as fills)."
+    },
+    {
+      "attribute": "theme / indexed color reference",
+      "family": "colors",
+      "expected": "theme=n / indexed=n reference",
+      "observed": "resolved #RRGGBB (reference discarded)",
+      "fidelity": "Dropped",
+      "probe": "theme_indexed_colors_flatten_to_rgb",
+      "note": "Style has NO theme/indexed field: a reference cannot be WRITTEN via the public API. On IMPORT ironcalc::import::colors resolves theme=/indexed= (+tint) to a concrete #RRGGBB via built-in palette/theme tables. Net: resolved color kept, reference lost. Low severity (visually identical)."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "thin",
+      "observed": "thin",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "medium",
+      "observed": "medium",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "thick",
+      "observed": "thick",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "double",
+      "observed": "double",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "dotted",
+      "observed": "thin",
+      "fidelity": "Lossy",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "LOSSY: xlsx import parser (ironcalc::import::styles) has no arm for this token; falls back Some(_) => Thin. 'dotted' degrades to 'thin'. Severity low (uncommon style; workaround = medium/dashed)."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "slantdashdot",
+      "observed": "slantdashdot",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "mediumdashed",
+      "observed": "mediumdashed",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "mediumdashdotdot",
+      "observed": "mediumdashdotdot",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border style",
+      "family": "borders",
+      "expected": "mediumdashdot",
+      "observed": "mediumdashdot",
+      "fidelity": "Survives",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle variant round-trips exactly."
+    },
+    {
+      "attribute": "border styles: hair / dashed / dashDot / dashDotDot",
+      "family": "borders",
+      "expected": "Excel line styles",
+      "observed": "no BorderStyle variant",
+      "fidelity": "NotRepresentable",
+      "probe": "all_border_styles_roundtrip_classified",
+      "note": "BorderStyle enum has 9 variants; Excel's hair/dashed/dashDot/dashDotDot have no variant, so they cannot be expressed at all. Severity low-medium (dashed is somewhat common; nearest = mediumdashed)."
+    },
+    {
+      "attribute": "border color (#RRGGBB)",
+      "family": "borders",
+      "expected": "#1A2B3C",
+      "observed": "#1A2B3C",
+      "fidelity": "Survives",
+      "probe": "border_color_and_diagonal_classified",
+      "note": "Per-side BorderItem.color round-trips as #RRGGBB."
+    },
+    {
+      "attribute": "border diagonal_up / diagonal_down flags",
+      "family": "borders",
+      "expected": "diagonal_up=true, diagonal_down=true",
+      "observed": "diagonal_up=false, diagonal_down=false",
+      "fidelity": "Dropped",
+      "probe": "border_color_and_diagonal_classified",
+      "note": "Measured, not assumed: the exporter (ironcalc::export::styles) carries a 'TODO: diagonal_up/down?' and does not emit the flags; observed value is the ground truth recorded here."
+    },
+    {
+      "attribute": "border diagonal line (BorderItem)",
+      "family": "borders",
+      "expected": "diagonal thin #445566",
+      "observed": "present",
+      "fidelity": "Survives",
+      "probe": "border_color_and_diagonal_classified",
+      "note": "The diagonal BorderItem itself (separate from the up/down direction flags); observed value recorded from the real round-trip."
+    },
+    {
+      "attribute": "number format: currency",
+      "family": "number_formats",
+      "expected": "$#,##0.00",
+      "observed": "$#,##0.00",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: percent",
+      "family": "number_formats",
+      "expected": "0.00%",
+      "observed": "0.00%",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: thousands",
+      "family": "number_formats",
+      "expected": "#,##0",
+      "observed": "#,##0",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: scientific",
+      "family": "number_formats",
+      "expected": "0.00E+00",
+      "observed": "0.00E+00",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: date",
+      "family": "number_formats",
+      "expected": "yyyy-mm-dd",
+      "observed": "yyyy-mm-dd",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: time",
+      "family": "number_formats",
+      "expected": "hh:mm:ss",
+      "observed": "hh:mm:ss",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: datetime",
+      "family": "number_formats",
+      "expected": "yyyy-mm-dd hh:mm",
+      "observed": "yyyy-mm-dd hh:mm",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: fraction",
+      "family": "number_formats",
+      "expected": "# ?/?",
+      "observed": "# ?/?",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: text",
+      "family": "number_formats",
+      "expected": "@",
+      "observed": "@",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "number format: custom conditional-color",
+      "family": "number_formats",
+      "expected": "[Red]-0.00;[Blue]0.00",
+      "observed": "[Red]-0.00;[Blue]0.00",
+      "fidelity": "Survives",
+      "probe": "number_formats_all_families_survive",
+      "note": "Style.num_fmt (raw format-code string) is preserved verbatim across the round-trip."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "general",
+      "observed": "general",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "left",
+      "observed": "left",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "center",
+      "observed": "center",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "right",
+      "observed": "right",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "fill",
+      "observed": "fill",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "justify",
+      "observed": "justify",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "centerContinuous",
+      "observed": "centerContinuous",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "horizontal alignment",
+      "family": "alignment",
+      "expected": "distributed",
+      "observed": "distributed",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.horizontal round-trips (all 8 variants)."
+    },
+    {
+      "attribute": "vertical alignment",
+      "family": "alignment",
+      "expected": "top",
+      "observed": "top",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.vertical round-trips (all 5 variants)."
+    },
+    {
+      "attribute": "vertical alignment",
+      "family": "alignment",
+      "expected": "center",
+      "observed": "center",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.vertical round-trips (all 5 variants)."
+    },
+    {
+      "attribute": "vertical alignment",
+      "family": "alignment",
+      "expected": "bottom",
+      "observed": "bottom",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.vertical round-trips (all 5 variants)."
+    },
+    {
+      "attribute": "vertical alignment",
+      "family": "alignment",
+      "expected": "justify",
+      "observed": "justify",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.vertical round-trips (all 5 variants)."
+    },
+    {
+      "attribute": "vertical alignment",
+      "family": "alignment",
+      "expected": "distributed",
+      "observed": "distributed",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.vertical round-trips (all 5 variants)."
+    },
+    {
+      "attribute": "wrap_text",
+      "family": "alignment",
+      "expected": "true",
+      "observed": "true",
+      "fidelity": "Survives",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Style.alignment.wrap_text round-trips."
+    },
+    {
+      "attribute": "indent",
+      "family": "alignment",
+      "expected": "cell indent level",
+      "observed": "no Alignment.indent field",
+      "fidelity": "NotRepresentable",
+      "probe": "alignment_full_matrix_survives",
+      "note": "Alignment has {horizontal, vertical, wrap_text} only — no indent field, so Excel indent cannot be expressed. Severity low-medium."
+    },
+    {
+      "attribute": "font strike",
+      "family": "font",
+      "expected": "true",
+      "observed": "true",
+      "fidelity": "Survives",
+      "probe": "font_longtail_survives",
+      "note": "Style.font attribute round-trips."
+    },
+    {
+      "attribute": "font underline (bool)",
+      "family": "font",
+      "expected": "true",
+      "observed": "true",
+      "fidelity": "Survives",
+      "probe": "font_longtail_survives",
+      "note": "Style.font attribute round-trips."
+    },
+    {
+      "attribute": "font name",
+      "family": "font",
+      "expected": "Times New Roman",
+      "observed": "Times New Roman",
+      "fidelity": "Survives",
+      "probe": "font_longtail_survives",
+      "note": "Style.font attribute round-trips."
+    },
+    {
+      "attribute": "font family",
+      "family": "font",
+      "expected": "1",
+      "observed": "1",
+      "fidelity": "Survives",
+      "probe": "font_longtail_survives",
+      "note": "Style.font attribute round-trips."
+    },
+    {
+      "attribute": "font size",
+      "family": "font",
+      "expected": "22",
+      "observed": "22",
+      "fidelity": "Survives",
+      "probe": "font_longtail_survives",
+      "note": "Style.font attribute round-trips."
+    },
+    {
+      "attribute": "font underline: double / accounting",
+      "family": "font",
+      "expected": "distinct underline kinds",
+      "observed": "single bool (on/off only)",
+      "fidelity": "NotRepresentable",
+      "probe": "font_longtail_survives",
+      "note": "Font.u is a bool; double/accounting/single-accounting underline distinctions collapse to on/off. Low severity."
+    },
+    {
+      "attribute": "quote_prefix",
+      "family": "font",
+      "expected": "true",
+      "observed": "true",
+      "fidelity": "Survives",
+      "probe": "quote_prefix_survives",
+      "note": "Style.quote_prefix (leading-apostrophe / force-text flag) round-trips."
+    },
+    {
+      "attribute": "rich text (mixed runs in one cell)",
+      "family": "rich_text",
+      "expected": "per-run fonts within a cell",
+      "observed": "one Style/font per cell",
+      "fidelity": "NotRepresentable",
+      "probe": "merges_and_cf_absent_from_public_api",
+      "note": "IronCalc models one Style (hence one font) per cell; cell content is a single string / shared string. Mixed-run formatting inside one cell has no API. Medium severity for import fidelity of rich-text-heavy files."
+    },
+    {
+      "attribute": "merged cells",
+      "family": "open_gap",
+      "expected": "merge ranges",
+      "observed": "no public API",
+      "fidelity": "NotRepresentable",
+      "probe": "merges_and_cf_absent_from_public_api",
+      "note": "OUT OF SCOPE per functional_spec SP5 / overview §2: no public merged-cells API on Model in 0.7 (the internal Worksheet.merge_cells field has no getter/setter). OPEN gap — supporting it would force FreeCell to take over .xlsx writing (a side-store IronCalc's writer would ignore). Not designed here."
+    },
+    {
+      "attribute": "conditional formatting",
+      "family": "open_gap",
+      "expected": "CF rules",
+      "observed": "no public API",
+      "fidelity": "NotRepresentable",
+      "probe": "merges_and_cf_absent_from_public_api",
+      "note": "OUT OF SCOPE per functional_spec SP5 / overview §2: no conditional-formatting API in the public crate interface. OPEN gap — same 'would force taking over .xlsx writing' scope note as merges."
+    }
+  ]
+}

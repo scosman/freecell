@@ -55,7 +55,7 @@ cohort (SP4, SP5) → synthesis.
   p99 < 2 ms (GATE); style-API exposure probe (band/empty-cell — a miss reopens the
   overview §2 formatting decision). (functional_spec SP4)
 
-- [ ] **Phase SP5 — Long-tail style-roundtrip fidelity** *(parallel; batched review)*
+- [x] **Phase SP5 — Long-tail style-roundtrip fidelity** *(parallel; batched review)*
   → `round-2/05-style-fidelity/`. Comprehensive attribute matrix over an `.xlsx`
   round-trip; merges/CF recorded OPEN (not designed). (functional_spec SP5)
 

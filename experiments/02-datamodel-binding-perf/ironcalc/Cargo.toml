@@ -1,0 +1,32 @@
+[package]
+name = "ironcalc_bench"
+version = "0.1.0"
+edition = "2021"
+description = "IronCalc 0.7 smoke/API-surface capture + adapter (impl binding_common::SpreadsheetEngine) + benchmark crate for the FreeCell Phase 1 engine bake-off (Sub-project C)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "ironcalc_bench"
+path = "src/lib.rs"
+
+[dependencies]
+binding_common = { path = "../common" }
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }
+serde_json = "1"
+# The crates are `ironcalc` (facade + xlsx I/O) and `ironcalc_base` (engine). Note
+# the UNDERSCORE — `ironcalc-base` does not resolve on crates.io. Both are 0.7.x.
+ironcalc = "0.7"
+ironcalc_base = "0.7"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bin]]
+name = "scenarios"
+path = "src/bin/scenarios.rs"
+
+[[bench]]
+name = "perf"
+harness = false

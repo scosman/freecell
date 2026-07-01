@@ -1,0 +1,36 @@
+{
+  "name": "ironcalc/cascade-visible/D1",
+  "input_size": 500,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 20,
+    "min_ns": 217527,
+    "max_ns": 258120,
+    "mean_ns": 227877,
+    "p50_ns": 221357,
+    "p99_ns": 258120
+  },
+  "gates": [
+    {
+      "name": "cascade-visible/D1",
+      "measured_ns": 258120,
+      "target_ns": 16666666,
+      "verdict": "PASS"
+    }
+  ],
+  "extra": {
+    "design": "D1",
+    "engine": "ironcalc",
+    "metrics": {
+      "chain_len": 500
+    },
+    "scenario": "cascade-visible"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "ironcalc/memory",
+  "input_size": 5000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "extra": {
+    "design": null,
+    "engine": "ironcalc",
+    "metrics": {
+      "cells": 5000,
+      "delta_bytes": 0,
+      "peak_rss_bytes_after": 8896512,
+      "peak_rss_bytes_before": 8896512
+    },
+    "scenario": "memory"
+  }
+}

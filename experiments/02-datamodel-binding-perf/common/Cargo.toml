@@ -1,0 +1,19 @@
+[package]
+name = "binding_common"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-neutral binding-abstraction trait + benchmark scenarios for the FreeCell Phase 1 engine bake-off (Sub-project C). Both Formualizer and IronCalc adapters implement this trait so identical scenarios run against both."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "binding_common"
+path = "src/lib.rs"
+
+[dependencies]
+# Frozen, read-only shared crates (relative path; one level under experiments/,
+# so ../shared/...). This crate is engine-neutral: it never depends on an engine.
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

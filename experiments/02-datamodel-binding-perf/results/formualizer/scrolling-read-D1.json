@@ -1,0 +1,36 @@
+{
+  "name": "formualizer/scrolling-read/D1",
+  "input_size": 10000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 8,
+    "min_ns": 109135,
+    "max_ns": 275797,
+    "mean_ns": 165920,
+    "p50_ns": 162729,
+    "p99_ns": 275797
+  },
+  "gates": [
+    {
+      "name": "scrolling-read/D1",
+      "measured_ns": 275797,
+      "target_ns": 2000000,
+      "verdict": "PASS"
+    }
+  ],
+  "extra": {
+    "design": "D1",
+    "engine": "formualizer",
+    "metrics": {
+      "viewport_cells": 800
+    },
+    "scenario": "scrolling-read"
+  }
+}

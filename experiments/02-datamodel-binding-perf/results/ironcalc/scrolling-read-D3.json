@@ -1,0 +1,36 @@
+{
+  "name": "ironcalc/scrolling-read/D3",
+  "input_size": 10000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 8,
+    "min_ns": 152217,
+    "max_ns": 192313,
+    "mean_ns": 167350,
+    "p50_ns": 154495,
+    "p99_ns": 192313
+  },
+  "gates": [
+    {
+      "name": "scrolling-read/D3",
+      "measured_ns": 192313,
+      "target_ns": 2000000,
+      "verdict": "PASS"
+    }
+  ],
+  "extra": {
+    "design": "D3",
+    "engine": "ironcalc",
+    "metrics": {
+      "viewport_cells": 800
+    },
+    "scenario": "scrolling-read"
+  }
+}

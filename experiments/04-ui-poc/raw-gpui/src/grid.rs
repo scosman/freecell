@@ -155,21 +155,23 @@ impl Grid {
 impl gpui::Render for Grid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // If the harness is active, advance to this frame's scripted viewport BEFORE we
-        // compute what's visible, so the measured render reflects the new position.
-        let running = matches!(self.mode, Mode::RunTest { .. });
-        if running {
-            if let Mode::RunTest { harness, .. } = &mut self.mode {
-                match harness.next_viewport() {
-                    Some(Viewport { scroll_x, scroll_y }) => {
-                        let (x, y) = self.clamp_scroll(scroll_x, scroll_y);
-                        self.scroll_x = x;
-                        self.scroll_y = y;
-                    }
-                    None => {
-                        // Script exhausted: finalize once.
-                        self.finish_run_test(cx);
-                        // Fall through to render the final frame.
-                    }
+        // compute what's visible, so the measured render reflects the new position. Pull
+        // the next viewport under a short borrow, then release it before touching self.
+        let next_viewport = match &mut self.mode {
+            Mode::RunTest { harness, .. } => Some(harness.next_viewport()),
+            Mode::Interactive => None,
+        };
+        if let Some(step) = next_viewport {
+            match step {
+                Some(Viewport { scroll_x, scroll_y }) => {
+                    let (x, y) = self.clamp_scroll(scroll_x, scroll_y);
+                    self.scroll_x = x;
+                    self.scroll_y = y;
+                }
+                None => {
+                    // Script exhausted: finalize once (writes results + quits).
+                    self.finish_run_test(cx);
+                    // Fall through to render the final frame.
                 }
             }
         }

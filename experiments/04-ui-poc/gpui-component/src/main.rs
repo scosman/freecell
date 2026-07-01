@@ -15,10 +15,9 @@ mod table;
 
 use std::time::Instant;
 
-use gpui::{
-    App, Context, Entity, IntoElement, ParentElement, Styled, Window, WindowOptions, actions, div,
-    prelude::*,
-};
+// `prelude::*` brings the chainable UI traits (Styled, ParentElement, InteractiveElement,
+// IntoElement, Render); concrete types are named explicitly.
+use gpui::{App, Context, Entity, Window, WindowOptions, actions, div, prelude::*, rgb};
 use gpui_component::{
     Root,
     table::{DataTable, TableState},
@@ -135,78 +134,92 @@ impl SheetView {
     }
 }
 
-impl Render for SheetView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Advance + measure the scripted run, if active.
-        if let Some(run) = self.run.as_mut() {
-            if run.finished {
+impl SheetView {
+    /// Advances the scripted run by one frame (if active): pull the next viewport, time
+    /// the newly-visible provider loads + the component scroll, and record the sample.
+    /// Kept out of `render`'s body so borrows don't overlap (`self.run` vs `self.table`
+    /// / `self.provider`). Returns `true` if the run just finished this frame.
+    fn drive_scripted_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Pull the next viewport (short borrow of self.run), then release it.
+        let next = match self.run.as_mut() {
+            None => return,
+            Some(run) if run.finished => {
                 self.finish_run_test(cx);
-            } else {
-                match run.harness.next_viewport() {
-                    Some(vp) => {
-                        let (row, col) = self.viewport_to_indices(vp);
-                        // The visible span is viewport-sized; approximate for the
-                        // newly-visible count and for timing the provider pulls.
-                        let vis_rows = (self.cfg.content_height()
-                            / table::UNIFORM_ROW_HEIGHT)
-                            .ceil() as u32
-                            + self.cfg.overscan_rows;
-                        let vis_cols = (self.cfg.content_width() / 110.0).ceil() as u32
-                            + self.cfg.overscan_cols;
-                        let cur_rows = row as u32..(row as u32 + vis_rows).min(self.cfg.rows);
-                        let cur_cols = col as u32..(col as u32 + vis_cols).min(self.cfg.cols);
+                return;
+            }
+            Some(run) => run.harness.next_viewport(),
+        };
 
-                        // Time the newly-visible provider pulls (the §5.4 cell-load
-                        // budget), mirroring the raw-gpui measurement.
-                        let load_start = Instant::now();
-                        let mut newly_visible = 0u32;
-                        for r in cur_rows.clone() {
-                            let row_new = !run.prev_rows.contains(&r);
-                            for c in cur_cols.clone() {
-                                if row_new || !run.prev_cols.contains(&c) {
-                                    newly_visible += 1;
-                                    let _ = self.provider.cell(r, c);
-                                }
-                            }
-                        }
-                        let cell_load_ns = load_start.elapsed().as_nanos() as u64;
+        let Some(vp) = next else {
+            // Script exhausted: mark finished; next frame writes results and quits.
+            if let Some(run) = self.run.as_mut() {
+                run.finished = true;
+            }
+            window.request_animation_frame();
+            return;
+        };
 
-                        // Programmatically scroll the component, then measure the render
-                        // by timing the state update it triggers.
-                        let render_start = Instant::now();
-                        self.table.update(cx, |state, cx| {
-                            state.scroll_to_row(row, cx);
-                            state.scroll_to_col(col, cx);
-                        });
-                        let frame_render_ns = render_start.elapsed().as_nanos() as u64;
+        let (row, col) = self.viewport_to_indices(vp);
+        // Viewport-sized visible span (uniform rows; average col width for the estimate).
+        let vis_rows =
+            (self.cfg.content_height() / table::UNIFORM_ROW_HEIGHT).ceil() as u32
+                + self.cfg.overscan_rows;
+        let vis_cols =
+            (self.cfg.content_width() / 110.0).ceil() as u32 + self.cfg.overscan_cols;
+        let cur_rows = row as u32..(row as u32 + vis_rows).min(self.cfg.rows);
+        let cur_cols = col as u32..(col as u32 + vis_cols).min(self.cfg.cols);
 
-                        run.harness.record(FrameSample {
-                            frame_render_ns,
-                            cell_load_ns,
-                            newly_visible,
-                        });
-                        run.prev_rows = cur_rows;
-                        run.prev_cols = cur_cols;
-                        window.request_animation_frame();
-                    }
-                    None => {
-                        // Mark finished; next frame writes results and quits.
-                        run.finished = true;
-                        window.request_animation_frame();
-                    }
+        // Snapshot the previous ranges, then release the self.run borrow before touching
+        // self.provider / self.table.
+        let (prev_rows, prev_cols) = {
+            let run = self.run.as_ref().expect("run active");
+            (run.prev_rows.clone(), run.prev_cols.clone())
+        };
+
+        // Time the newly-visible provider pulls (the §5.4 cell-load budget).
+        let load_start = Instant::now();
+        let mut newly_visible = 0u32;
+        for r in cur_rows.clone() {
+            let row_new = !prev_rows.contains(&r);
+            for c in cur_cols.clone() {
+                if row_new || !prev_cols.contains(&c) {
+                    newly_visible += 1;
+                    let _ = self.provider.cell(r, c);
                 }
             }
         }
+        let cell_load_ns = load_start.elapsed().as_nanos() as u64;
 
-        div()
-            .size_full()
-            .bg(rgb_white())
-            .child(DataTable::new(&self.table).bordered(true))
+        // Programmatically scroll the component; time the state update it triggers.
+        let render_start = Instant::now();
+        self.table.update(cx, |state, cx| {
+            state.scroll_to_row(row, cx);
+            state.scroll_to_col(col, cx);
+        });
+        let frame_render_ns = render_start.elapsed().as_nanos() as u64;
+
+        if let Some(run) = self.run.as_mut() {
+            run.harness.record(FrameSample {
+                frame_render_ns,
+                cell_load_ns,
+                newly_visible,
+            });
+            run.prev_rows = cur_rows;
+            run.prev_cols = cur_cols;
+        }
+        window.request_animation_frame();
     }
 }
 
-fn rgb_white() -> gpui::Rgba {
-    gpui::rgb(0xFFFFFF)
+impl Render for SheetView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drive_scripted_frame(window, cx);
+
+        div()
+            .size_full()
+            .bg(rgb(0xFFFFFF))
+            .child(DataTable::new(&self.table).bordered(true))
+    }
 }
 
 fn main() {

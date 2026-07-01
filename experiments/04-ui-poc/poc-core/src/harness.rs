@@ -44,7 +44,7 @@ pub struct FrameSample {
 
 /// The named phases of the canonical script, so results can attribute frames to a move
 /// type if desired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Move {
     ScrollDown,
     FastScroll,
@@ -94,9 +94,8 @@ impl Harness {
 
         // 4) Deterministic jump-to-cell: land on a spread of far-flung cells.
         let jump_targets = deterministic_jumps(cfg, 24);
-        for (i, vp) in jump_targets.iter().enumerate() {
-            let _ = i;
-            steps.push((Move::JumpToCell, *vp));
+        for vp in jump_targets {
+            steps.push((Move::JumpToCell, vp));
         }
 
         // 5) Seeded random jumps across the full grid.
@@ -105,10 +104,11 @@ impl Harness {
             steps.push((Move::RandomJump, vp));
         }
 
+        let frame_count = steps.len();
         Self {
             steps,
             cursor: 0,
-            samples: Vec::with_capacity(steps_len(&steps)),
+            samples: Vec::with_capacity(frame_count),
         }
     }
 
@@ -165,10 +165,6 @@ pub fn newly_visible(prev: &Range<u32>, cur: &Range<u32>) -> u32 {
 }
 
 // --- script construction helpers -------------------------------------------------
-
-fn steps_len(steps: &[(Move, Viewport)]) -> usize {
-    steps.len()
-}
 
 fn push_linear(
     steps: &mut Vec<(Move, Viewport)>,

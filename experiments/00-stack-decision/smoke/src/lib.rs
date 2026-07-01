@@ -158,8 +158,8 @@ pub fn load_xlsx_bytes(bytes: &[u8]) -> Result<Workbook> {
 /// Demonstrates the CSV-load path: [`CsvAdapter::open_bytes`] +
 /// [`Workbook::from_reader`]. CSV imports as a single sheet of literal values.
 pub fn load_csv_str(csv: &str) -> Result<Workbook> {
-    let adapter =
-        CsvAdapter::open_bytes(csv.as_bytes().to_vec()).context("open CSV bytes with csv adapter")?;
+    let adapter = CsvAdapter::open_bytes(csv.as_bytes().to_vec())
+        .context("open CSV bytes with csv adapter")?;
     Workbook::from_reader(adapter, LoadStrategy::EagerAll, WorkbookConfig::ephemeral())
         .map_err(|e| anyhow::anyhow!("from_reader (csv): {e}"))
         .context("load workbook from csv adapter")

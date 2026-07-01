@@ -74,13 +74,23 @@ fn range_bulk_read_returns_grid() {
     assert_eq!(as_f64(&batch[1]), Some(3.0));
 }
 
-/// PROBE: `.xlsx` write + read round trip. Build a workbook, serialize to `.xlsx`
-/// bytes via umya, reload via calamine, confirm values survive. No committed
-/// binary fixture — the file is produced by committed code (functional_spec §5.3).
+/// PROBE: `.xlsx` write + read round trip, and its DOCUMENTED fidelity behavior.
+/// Build a workbook, serialize to `.xlsx` bytes via umya, reload via calamine. No
+/// committed binary fixture — the file is produced by committed code
+/// (functional_spec §5.3).
+///
+/// Observed round-trip fidelity in 0.7.0 (recorded in findings.md):
+/// - Literal cells survive as **values** (A1, A2 -> Number).
+/// - A formula cell survives as its **formula text**, NOT its cached value:
+///   `to_xlsx_bytes()` writes the formula and calamine reads it back with
+///   `value = None`, `formula = Some("=A1 + A2")`. The cached result is dropped by
+///   this write path.
+/// - After reload + `prepare_graph_all()`, the formula **re-evaluates correctly**.
+///
+/// This is a real file-fidelity input for Sub-projects B/D.
 #[test]
 fn xlsx_roundtrip_via_umya_and_calamine() {
     let mut wb = build_sum_workbook().expect("build workbook");
-    // Materialize the formula's value so it is written into the .xlsx.
     wb.evaluate_all().expect("evaluate all");
 
     let bytes = xlsx_bytes_from(&wb).expect("serialize to .xlsx bytes");
@@ -89,19 +99,40 @@ fn xlsx_roundtrip_via_umya_and_calamine() {
     assert_eq!(&bytes[0..2], b"PK", ".xlsx should be a ZIP (PK header)");
 
     let reloaded = load_xlsx_bytes(&bytes).expect("reload .xlsx via calamine");
-    // Literal values survive the round trip.
+
+    // Literal values survive the round trip as values.
     let a1 = reloaded
         .get_value(DEFAULT_SHEET, 1, 1)
         .expect("A1 present after reload");
-    assert_eq!(as_f64(&a1), Some(1.0), "A1 literal survives .xlsx round trip");
-    // The evaluated formula result was written as a cached value and survives.
+    assert_eq!(
+        as_f64(&a1),
+        Some(1.0),
+        "A1 literal survives .xlsx round trip"
+    );
+
+    // The formula cell survives as a FORMULA (not a cached value) through this path.
+    assert!(
+        reloaded.get_value(DEFAULT_SHEET, 3, 1).is_none(),
+        "A3 has no cached value after round trip (cached result is dropped)"
+    );
+    let a3_formula = reloaded
+        .get_formula(DEFAULT_SHEET, 3, 1)
+        .expect("A3 formula survives round trip");
+    assert!(
+        a3_formula.replace(' ', "").eq_ignore_ascii_case("=A1+A2"),
+        "A3 formula text survives round trip, got {a3_formula:?}"
+    );
+
+    // And it re-evaluates correctly after rebuilding the graph.
+    let mut reloaded = reloaded;
+    reloaded.prepare_graph_all().expect("prepare graph");
     let a3 = reloaded
-        .get_value(DEFAULT_SHEET, 3, 1)
-        .expect("A3 present after reload");
+        .evaluate_cell(DEFAULT_SHEET, 3, 1)
+        .expect("re-eval A3 after reload");
     assert_eq!(
         as_f64(&a3),
         Some(3.0),
-        "A3 cached formula result survives .xlsx round trip"
+        "A3 re-evaluates to 3 after reloading the .xlsx and rebuilding the graph"
     );
 }
 
@@ -116,7 +147,10 @@ fn csv_load_reads_values() {
 
     let wb = load_csv_str(&csv).expect("load CSV");
     let names = wb.sheet_names();
-    assert!(!names.is_empty(), "CSV import should yield at least one sheet");
+    assert!(
+        !names.is_empty(),
+        "CSV import should yield at least one sheet"
+    );
 
     // The imported sheet should have 3 rows x 2 cols of data (1-based dims).
     let dims = wb
@@ -162,7 +196,10 @@ fn changelog_tracks_edits() {
     let saw_set_value = wb.changelog().events().iter().any(|e| {
         matches!(
             e,
-            ChangeEvent::SetValue { new: LiteralValue::Int(42), .. }
+            ChangeEvent::SetValue {
+                new: LiteralValue::Int(42),
+                ..
+            }
         )
     });
     assert!(

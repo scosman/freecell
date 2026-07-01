@@ -72,6 +72,6 @@ fidelity**. Engine work lives in per-engine subfolders (`.../formualizer/`,
 
 *After everything lands:*
 
-- [ ] **Phase 8 — Final Synthesis (Sub-project H → `experiments/SYNTHESIS.md`)**
+- [x] **Phase 8 — Final Synthesis (Sub-project H → `experiments/SYNTHESIS.md`)**
   *(serial; last)*: overall go / go-with-changes / no-go / pivot for FreeCell
   (incorporating the engine decision) + Round-2 pointer. Feeds the Stage 3 decision.

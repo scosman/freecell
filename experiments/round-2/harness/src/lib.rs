@@ -24,7 +24,7 @@
 //!   copied verbatim from `02/ironcalc/src/lib.rs`, pinned to the same IronCalc 0.7.x
 //!   version. The one mechanical change is its import path (the trait now lives in this
 //!   same crate).
-//! - [`peak_rss`] — **new here** (not in the frozen `shared/bench_util`): a
+//! - [`mod@peak_rss`] — **new here** (not in the frozen `shared/bench_util`): a
 //!   fresh-process peak-RSS helper ([`peak_rss::peak_rss`], VmHWM with a `getrusage`
 //!   fallback, returns bytes) for SP2's child-process peak-memory measurement.
 //!
@@ -49,4 +49,7 @@ pub use peak_rss::peak_rss;
 pub use report::{rebuild_summary, write_all, ScenarioResult};
 pub use runner::{run_memory_only, run_suite};
 pub use scenario::{targets, Profile};
+// `peak_rss::peak_rss` (re-exported above) is the CANONICAL Round-2 peak-RSS entry
+// point. `sysinfo::peak_rss_bytes` is the copied Phase-1 variant kept for provenance;
+// it returns `0` off-Linux / on `/proc` failure, so prefer `peak_rss` for SP2.
 pub use sysinfo::{cpu_model, peak_rss_bytes};

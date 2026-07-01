@@ -18,7 +18,7 @@ cohort (SP4, SP5) → synthesis.
 
 ## Phases
 
-- [ ] **Phase 2.0 — Scaffolding** *(serial)*: create `experiments/round-2/`; build
+- [x] **Phase 2.0 — Scaffolding** *(serial)*: create `experiments/round-2/`; build
   `round-2/harness/` = verbatim copy of `02/common` (SpreadsheetEngine trait +
   scenarios) + `02/ironcalc` (IronCalc adapter) as a **lib crate**, pinned to the
   Phase-1 IronCalc version; add the `peak_rss()` child-process helper. **Freeze

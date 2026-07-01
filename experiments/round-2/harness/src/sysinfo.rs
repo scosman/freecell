@@ -6,6 +6,11 @@
 /// Peak resident set size in bytes (`VmHWM` from `/proc/self/status` on Linux). The
 /// "high-water mark" is exactly what the §5.4 memory metric wants: the largest RSS
 /// the process reached, unaffected by later frees. Returns `0` if unavailable.
+///
+/// **Round-2 callers: prefer [`crate::peak_rss::peak_rss`].** This copied Phase-1
+/// variant silently returns `0` off-Linux / on a `/proc` read failure; the canonical
+/// Round-2 entry point ([`crate::peak_rss::peak_rss`]) adds a `getrusage` fallback so a
+/// missing figure never masquerades as `0` in SP2's memory numbers.
 pub fn peak_rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {

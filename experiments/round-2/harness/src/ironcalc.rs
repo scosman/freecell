@@ -1,6 +1,7 @@
 //! # ironcalc_bench — IronCalc 0.7 adapter for the engine bake-off
 //!
-//! Implements [`binding_common::SpreadsheetEngine`] on top of an IronCalc
+//! Implements [`crate::engine::SpreadsheetEngine`] (was `binding_common::SpreadsheetEngine`
+//! in the Phase-1 source this was copied from) on top of an IronCalc
 //! [`ironcalc_base::Model`], so the shared D1/D2/D3 binding designs and the five
 //! benchmark scenarios run against IronCalc with directly-comparable numbers
 //! (Sub-project C, functional_spec §6.C, architecture §5). See `tests/smoke.rs` for

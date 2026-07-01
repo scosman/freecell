@@ -50,7 +50,7 @@ cohort (SP4, SP5) → synthesis.
 
 *After the checkpoint, the build-out cohort runs in parallel:*
 
-- [ ] **Phase SP4 — Styled viewport read at scale + style-API coverage** *(parallel;
+- [x] **Phase SP4 — Styled viewport read at scale + style-API coverage** *(parallel;
   batched review)* → `round-2/04-styled-read/`. Viewport read of **value + style**
   p99 < 2 ms (GATE); style-API exposure probe (band/empty-cell — a miss reopens the
   overview §2 formatting decision). (functional_spec SP4)

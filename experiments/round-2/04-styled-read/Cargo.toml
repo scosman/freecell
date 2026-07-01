@@ -1,0 +1,40 @@
+[package]
+name = "styled_read"
+version = "0.1.0"
+edition = "2021"
+description = "SP4 -- Styled viewport read at scale + style-API coverage: extends the frozen round-2 viewport-read benchmark to fetch VALUE + STYLE (get_style_for_cell) per visible cell over a viewport+overscan window at Excel-max positions (GATE p99 < 2 ms, compared to Phase-1's value-only 392 us baseline), plus an assertion-backed probe of IronCalc's public style API (per-cell / row+column band / empty-cell styling) that reopens the overview 2 formatting decision if band or empty-cell styling is missing."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Independent Cargo project (NOT a workspace member), depending read-only by relative
+# path on the frozen round-2 harness (IronCalcEngine adapter + SpreadsheetEngine trait +
+# Viewport/Profile/seed_region/pan_path, pinned IronCalc 0.7.1) and bench_util (env stamp
+# + LatencyStats/GateResult). Mirrors architecture Section 1's per-experiment isolation.
+# The harness read_viewport is value-ONLY; SP4 adds its own value+style read path here
+# (via the adapter's .model() -> &Model), leaving the harness untouched.
+
+[lib]
+name = "styled_read"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+# Frozen, read-only. IronCalcEngine adapter (pinned IronCalc 0.7.1) + the neutral
+# SpreadsheetEngine trait, Viewport, Profile, seed_region, pan_path, SEED, targets.
+round2_harness = { path = "../harness" }
+# Frozen, read-only. Env stamp (Environment::detect) + LatencyStats/GateResult/BenchResult.
+bench_util = { path = "../../shared/bench_util" }
+# Same IronCalc pin as the harness: the Style/Font/Fill types the style probe builds and
+# reads back, and the Model methods (get_style_for_cell / set_row_style / set_column_style
+# / get_row_style / get_column_style) the coverage probe asserts against.
+ironcalc_base = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

@@ -40,14 +40,16 @@ so there are **no hand-made binary fixtures** (functional_spec §5.3).
   - `formualizer/src/lib.rs` — documented file-I/O helpers (`write_synthetic_xlsx`,
     `build_feature_workbook`, `xlsx_bytes`, `load_xlsx`, `load_csv`,
     `workbook_to_csv`).
-  - `formualizer/tests/roundtrip.rs` — 6 round-trip probes.
+  - `formualizer/tests/roundtrip.rs` — 7 round-trip probes (incl. a byte-size
+    recorder).
 - **`ironcalc/`** — read `.xlsx` via `ironcalc::import::load_from_xlsx_bytes` +
   `Model::from_workbook`; write via `ironcalc::export::save_xlsx_to_writer` into an
   in-memory `Cursor`; **CSV is hand-rolled** (IronCalc ships none).
   - `ironcalc/src/lib.rs` — helpers (`write_synthetic_xlsx`, `build_feature_model`,
     `xlsx_bytes`, `load_xlsx`, `sheet_names`, `load_csv_into_model`, `model_to_csv`,
     `is_bold`) plus a minimal RFC-4180 CSV parser/escaper.
-  - `ironcalc/tests/roundtrip.rs` — 6 round-trip probes.
+  - `ironcalc/tests/roundtrip.rs` — 7 round-trip probes (incl. a byte-size
+    recorder).
 
 ### Reproduce
 
@@ -88,7 +90,7 @@ Backed by the `tests/roundtrip.rs` assertions in each crate.
 | **Int vs float** | `Int(1)` reads back as **`Number(1.0)`** (calamine normalizes to f64) | Numbers are f64 throughout (`CellValue::Number`) |
 | **Booleans** | Survive as `Boolean(true)` | Survive as `Boolean(true)` |
 | **Formula text** | Survives (`get_formula` → `"=A1+A2"`) | Survives (`get_cell_formula` → `"=A1+A2"`) |
-| **Cached formula result** | **DROPPED** — after reload `get_value` is `None`; needs `prepare_graph_all()` + eval to restore | Not surfaced as a stored cache, but a single `evaluate()` after reload yields the value (full recompute) |
+| **Cached formula result** | **DROPPED** — after reload `get_value` is `None` (asserted pre-eval); needs `prepare_graph_all()` + eval to restore | **PERSISTED** — after reload `get_cell_value_by_index` is already `3.5` **before any `evaluate()`** (asserted pre-eval); IronCalc's native writer stores the cached result |
 | **Recompute after reload** | Correct after `prepare_graph_all()` + `evaluate_cell` (→ 3.5) | Correct after `evaluate()` (→ 3.5) |
 | **Multiple sheets** | Survive (`sheet_names()` has Sheet1+Sheet2) | Survive (`get_worksheets_properties()` has Sheet1+Sheet2) |
 | **Cross-sheet formula** | Survives as text; recomputes (`=Sheet1!A1*10` → 10) | Survives; recomputes (→ 10) |
@@ -97,20 +99,25 @@ Backed by the `tests/roundtrip.rs` assertions in each crate.
 | **Shared strings** | Handled transparently (text values survive) | Handled transparently (text values survive) |
 | **Styles (shallow: 1 bold cell)** | **Not surfaced on the read path** (Sub-project A finding; not readable via `CellData` in 0.7.0) | **Survives** the native writer: `get_style_for_cell(..).font.b == true` after reload |
 
-**File sizes (evidence the writers produce real, small OOXML):** feature workbook →
-Formualizer 6,121 bytes / IronCalc 4,407 bytes; a 100×20 synthetic sheet →
-Formualizer 20,317 bytes / IronCalc 18,535 bytes. Both are valid ZIP/OOXML (verified
-`PK` magic + successful reload).
+**File sizes (regenerable from committed code — the `records_xlsx_byte_sizes` test
+in each crate prints these; run `cargo test --test roundtrip records_xlsx_byte_sizes
+-- --nocapture`).** Sizes observed on the probed engine versions (illustrative, not a
+pass/fail gate — they are engine-version-dependent): feature workbook → Formualizer
+6,121 bytes / IronCalc 4,407 bytes; a 100×20 synthetic sheet → Formualizer 20,317
+bytes / IronCalc 18,535 bytes. Both writers produce valid ZIP/OOXML (`PK` magic +
+successful reload, asserted by the test).
 
 ### Headline structural differences
 
-- **Formualizer drops cached formula values on write** (umya path): the reloaded
-  file carries formula *text* only, so opening a workbook requires a graph rebuild +
-  recompute before dependent cells show values. IronCalc's importer yields a model
-  that produces correct values after a single `evaluate()`. Both need a recompute on
-  open; the difference is that Formualizer's `get_value` is `None` until you do so,
-  whereas IronCalc's evaluate is a **full-workbook** recompute (no incremental path —
-  the Sub-project C perf lens; heavier on huge files).
+- **Formualizer drops cached formula values on write; IronCalc persists them.**
+  Probed symmetrically (both tests read the reloaded formula cell *before* any
+  evaluate): Formualizer's reloaded file carries formula *text* only — `get_value`
+  is `None` until a graph rebuild + recompute; IronCalc's native writer stores the
+  cached result, so `get_cell_value_by_index` is already `3.5` on reload. So on
+  Formualizer a recompute-on-open is **mandatory** just to show values; on IronCalc
+  values display immediately, and a recompute is only needed if precedents changed.
+  Note that IronCalc's `evaluate()` is a **full-workbook** recompute (no incremental
+  path — the Sub-project C perf lens; heavier on huge files).
 - **IronCalc carries styles + number formats through its native writer** (bold, date
   format survive); **Formualizer's read path does not surface styles at all** in
   0.7.0 (calamine `styles=false`, `CellData.style=None`). Formatting on the
@@ -188,10 +195,12 @@ Formualizer's Arrow huge-sheet perf fit vs IronCalc's `HashMap` storage.
    (Formualizer: calamine + `to_xlsx_bytes`; IronCalc: `load_from_xlsx_bytes` +
    `save_xlsx_to_writer`), always on **in-memory bytes** so FreeCell owns temp-file
    and atomic-save policy.
-2. **Recompute on open.** Both engines require a post-load evaluate to materialize
-   formula results; make "open → build/prepare graph → evaluate → render" the load
-   pipeline. On Formualizer this is mandatory (values are `None` otherwise); on
-   IronCalc budget for its full-workbook `evaluate()` cost on large files.
+2. **Recompute on open — mandatory only on Formualizer.** Formualizer's reload has
+   `None` formula values until you `prepare_graph_all()` + evaluate, so "open →
+   build/prepare graph → evaluate → render" is required just to show values. IronCalc
+   ships the cached results in the file, so values display immediately; a recompute is
+   only needed to re-validate, and budget for its full-workbook `evaluate()` cost on
+   large files.
 3. **A FreeCell-side formatting store** keyed by cell, populated on load and written
    on save, is the safe design **regardless of engine** — it removes the dependency
    on whether the engine surfaces styles on read (Formualizer does not in 0.7.0) and

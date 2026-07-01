@@ -178,3 +178,26 @@ fn csv_export_roundtrips_values() {
         }
     }
 }
+
+/// Records the produced `.xlsx` byte sizes so the figures quoted in `../findings.md`
+/// are regenerable from committed code (functional_spec §5.3). Run with
+/// `cargo test --test roundtrip records_xlsx_byte_sizes -- --nocapture` to print
+/// them. Asserts only that the writer produced a non-trivial, valid OOXML file
+/// (exact sizes are engine-version-dependent, so we don't hard-code them here).
+#[test]
+fn records_xlsx_byte_sizes() {
+    let feature_bytes = xlsx_bytes(&build_feature_workbook().expect("feature workbook"))
+        .expect("serialize feature workbook");
+    let synthetic_bytes = write_synthetic_xlsx(7, 100, 20).expect("synthetic 100x20 .xlsx");
+
+    println!("formualizer feature .xlsx bytes = {}", feature_bytes.len());
+    println!(
+        "formualizer synthetic 100x20 .xlsx bytes = {}",
+        synthetic_bytes.len()
+    );
+
+    assert_eq!(&feature_bytes[0..2], b"PK", "feature file is a ZIP");
+    assert_eq!(&synthetic_bytes[0..2], b"PK", "synthetic file is a ZIP");
+    assert!(feature_bytes.len() > 1_000, "feature file is non-trivial");
+    assert!(synthetic_bytes.len() > 1_000, "synthetic file is non-trivial");
+}

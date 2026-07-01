@@ -60,6 +60,19 @@ pub enum Support {
     Unverified,
 }
 
+/// Whether a matrix row is backed by an executed probe or reasoned from the API surface.
+/// Lets a reader of the Phase-7 engine decision distinguish "we ran a test that reads
+/// this back" from "the method exists but we did not exercise it" — the latter must not
+/// be over-trusted (the exhaustive fidelity sweep is deferred to Round 2).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum Provenance {
+    /// A passing probe in `tests/probe.rs` reads this attribute back (named in `note`).
+    ProbeBacked,
+    /// Reasoned from the IronCalc `Style` API; no executed assertion. Treat as plausible,
+    /// not proven.
+    Inferred,
+}
+
 /// One row of the capability matrix.
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilityRow {
@@ -67,6 +80,8 @@ pub struct CapabilityRow {
     pub read: Support,
     pub write: Support,
     pub roundtrip: Support,
+    /// Whether this row is probe-backed or inferred from the API (see [`Provenance`]).
+    pub provenance: Provenance,
     pub note: &'static str,
 }
 

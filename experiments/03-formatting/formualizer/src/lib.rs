@@ -61,18 +61,35 @@ pub enum Support {
     Native,
     /// Reachable only by owning a `umya_spreadsheet` workbook alongside the engine.
     ViaUmya,
+    /// The API surface exists but this axis was not exercised / its fidelity is unproven.
+    Unverified,
     /// Not reachable at all through this engine's ecosystem in 0.7.0.
     None,
 }
 
-/// One row of the capability matrix: an attribute and its read / write / round-trip
-/// support, plus a short note.
+/// Whether a matrix row is backed by an executed probe or reasoned from the API surface.
+/// Lets a reader of the Phase-7 engine decision distinguish "we ran a test that reads
+/// this back" from "the method exists but we did not exercise it" — the latter must not
+/// be over-trusted (the exhaustive fidelity sweep is deferred to Round 2).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum Provenance {
+    /// A passing probe in `tests/probe.rs` reads this attribute back (named in `note`).
+    ProbeBacked,
+    /// Reasoned from the umya API surface; no executed assertion. Treat as plausible,
+    /// not proven.
+    Inferred,
+}
+
+/// One row of the capability matrix: an attribute, its read / write / round-trip
+/// support, a provenance marker, and a short note.
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilityRow {
     pub attribute: &'static str,
     pub read: Support,
     pub write: Support,
     pub roundtrip: Support,
+    /// Whether this row is probe-backed or inferred from the API (see [`Provenance`]).
+    pub provenance: Provenance,
     pub note: &'static str,
 }
 
@@ -223,6 +240,7 @@ pub fn read_merges_via_umya(book: &Spreadsheet) -> Vec<String> {
 /// Builds the Formualizer capability matrix (the numbers/statuses below are all backed
 /// by the passing probes in `tests/probe.rs`).
 pub fn capability_matrix() -> CapabilityMatrix {
+    use Provenance::*;
     use Support::*;
     let rows = vec![
         CapabilityRow {
@@ -230,77 +248,88 @@ pub fn capability_matrix() -> CapabilityMatrix {
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "Formualizer CellData.style == None; readable/writable only via a directly-owned umya workbook.",
+            provenance: ProbeBacked,
+            note: "CellData.style == None; via a directly-owned umya workbook. Round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "italic",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "As bold.",
+            provenance: ProbeBacked,
+            note: "As bold; round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "font_size",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "umya Font::get_size / set_size.",
+            provenance: ProbeBacked,
+            note: "umya Font::get_size / set_size; round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "fill_color",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "umya Style::set_background_color_solid / get_background_color -> ARGB.",
+            provenance: ProbeBacked,
+            note: "umya Style::set_background_color_solid / get_background_color -> ARGB; round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "number_format",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "umya NumberingFormat::get/set_format_code.",
+            provenance: ProbeBacked,
+            note: "umya NumberingFormat::get/set_format_code; round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "borders",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "umya Style::get_borders per-side; not probed exhaustively (Round 2).",
+            provenance: Inferred,
+            note: "INFERRED (not probed): umya Style::get_borders per-side exists; no executed assertion. Exhaustive fidelity deferred to Round 2.",
         },
         CapabilityRow {
             attribute: "row_height",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "umya Row::get/set_height.",
+            provenance: ProbeBacked,
+            note: "umya Row::get/set_height; round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "col_width",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "umya Column::get/set_width.",
+            provenance: ProbeBacked,
+            note: "umya Column::get/set_width; round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "merges",
             read: ViaUmya,
             write: ViaUmya,
             roundtrip: ViaUmya,
-            note: "umya Worksheet::get_merge_cells / add_merge_cells.",
+            provenance: ProbeBacked,
+            note: "umya Worksheet::get_merge_cells / add_merge_cells; round-trip re-read by umya_style_edit_survives_roundtrip.",
         },
         CapabilityRow {
             attribute: "conditional_formatting",
             read: ViaUmya,
             write: ViaUmya,
-            roundtrip: None,
-            note: "umya exposes get/add_conditional_formatting_collection, but write-back fidelity is Unverified (deferred to Round 2).",
+            roundtrip: Unverified,
+            provenance: Inferred,
+            note: "INFERRED (not probed): umya exposes get/add_conditional_formatting_collection; read plausible, write-back fidelity unverified. Deferred to Round 2.",
         },
         CapabilityRow {
             attribute: "to_xlsx_bytes(engine) preserves styles",
             read: None,
             write: None,
             roundtrip: None,
-            note: "Workbook::to_xlsx_bytes builds a fresh umya file from values/formulas only; ALL styles are dropped.",
+            provenance: ProbeBacked,
+            note: "Workbook::to_xlsx_bytes builds a fresh umya file from values/formulas only; ALL styles dropped (values_survive_but_styles_dropped_through_to_xlsx_bytes).",
         },
     ];
     CapabilityMatrix {
@@ -330,5 +359,22 @@ mod tests {
         let json = serde_json::to_string(&capability_matrix()).expect("serialize matrix");
         assert!(json.contains("formualizer"));
         assert!(json.contains("to_xlsx_bytes"));
+        // The provenance marker is present so readers can tell probed from inferred rows.
+        assert!(json.contains("ProbeBacked"));
+        assert!(json.contains("Inferred"));
+    }
+
+    #[test]
+    fn borders_and_conditional_formatting_are_marked_inferred() {
+        // Guard against a future edit silently upgrading these unprobed rows.
+        let m = capability_matrix();
+        for attr in ["borders", "conditional_formatting"] {
+            let row = m.rows.iter().find(|r| r.attribute == attr).expect(attr);
+            assert_eq!(
+                row.provenance,
+                Provenance::Inferred,
+                "{attr} has no executed probe and must stay Inferred"
+            );
+        }
     }
 }

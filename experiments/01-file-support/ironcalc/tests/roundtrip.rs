@@ -43,9 +43,12 @@ fn xlsx_literals_survive() {
     assert!(checked_number && checked_text, "sample covered both kinds");
 }
 
-/// A formula survives as its formula text and, after IronCalc's full `evaluate()`,
-/// yields the correct value. (Unlike Formualizer's write path, IronCalc's importer
-/// gives an evaluatable model directly — recorded as a difference in `findings.md`.)
+/// A formula survives as its formula text, and — unlike Formualizer's write path —
+/// IronCalc's native writer **persists the cached result**: the reloaded formula
+/// value is already correct *before* any `evaluate()`. This is the symmetric
+/// counterpart to the Formualizer test, which asserts a `None` value pre-eval, so
+/// the "cached formula result" row of the findings table is test-backed on both
+/// engines. A subsequent `evaluate()` (IronCalc's only recalc) keeps it correct.
 #[test]
 fn xlsx_formula_survives_and_recomputes() {
     let model = build_feature_model().expect("feature model");
@@ -62,13 +65,24 @@ fn xlsx_formula_survives_and_recomputes() {
         "formula text survives, got {f:?}"
     );
 
+    // Symmetric to the Formualizer probe: read the cached result BEFORE evaluate().
+    // IronCalc's writer stores it, so it is already A1+A2 = 3.5 (Formualizer: None).
+    assert_eq!(
+        reloaded
+            .get_cell_value_by_index(SHEET0, r, c)
+            .expect("read formula value pre-eval"),
+        CellValue::Number(3.5),
+        "IronCalc persists the cached formula result across the round trip (pre-eval)"
+    );
+
+    // And a full evaluate() keeps it correct.
     reloaded.evaluate();
     assert_eq!(
         reloaded
             .get_cell_value_by_index(SHEET0, r, c)
             .expect("read formula value"),
         CellValue::Number(3.5),
-        "formula recomputes to A1+A2 after reload"
+        "formula still correct after IronCalc's full evaluate()"
     );
 }
 
@@ -177,4 +191,27 @@ fn csv_bridge_roundtrips_values() {
     }
     // And the exported CSV is non-empty / has the right number of rows.
     assert_eq!(csv_out.lines().count(), 4, "exported CSV has 4 rows");
+}
+
+/// Records the produced `.xlsx` byte sizes so the figures quoted in `../findings.md`
+/// are regenerable from committed code (functional_spec §5.3). Run with
+/// `cargo test --test roundtrip records_xlsx_byte_sizes -- --nocapture` to print
+/// them. Asserts only that the writer produced a non-trivial, valid OOXML file
+/// (exact sizes are engine-version-dependent, so we don't hard-code them here).
+#[test]
+fn records_xlsx_byte_sizes() {
+    let feature_bytes =
+        xlsx_bytes(&build_feature_model().expect("feature model")).expect("serialize feature");
+    let synthetic_bytes = write_synthetic_xlsx(7, 100, 20).expect("synthetic 100x20 .xlsx");
+
+    println!("ironcalc feature .xlsx bytes = {}", feature_bytes.len());
+    println!(
+        "ironcalc synthetic 100x20 .xlsx bytes = {}",
+        synthetic_bytes.len()
+    );
+
+    assert_eq!(&feature_bytes[0..2], b"PK", "feature file is a ZIP");
+    assert_eq!(&synthetic_bytes[0..2], b"PK", "synthetic file is a ZIP");
+    assert!(feature_bytes.len() > 1_000, "feature file is non-trivial");
+    assert!(synthetic_bytes.len() > 1_000, "synthetic file is non-trivial");
 }

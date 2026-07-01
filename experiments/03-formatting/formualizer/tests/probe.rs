@@ -119,7 +119,10 @@ fn styles_readable_via_umya_directly() {
 }
 
 /// The load → edit → save → reload verdict for the umya-direct path: format edits
-/// survive. Load the styled file, flip B2 bold + give it a fill, save, reload, confirm.
+/// survive AND the pre-existing attributes are re-read *after* the round-trip (not just
+/// off the original fixture), so the matrix's "round-trip = ViaUmya" cells for
+/// bold/italic/fill/font_size/number_format/row_height/col_width/merges are all
+/// genuinely probe-backed, not merely inferred.
 #[test]
 fn umya_style_edit_survives_roundtrip() {
     let bytes = build_styled_xlsx_bytes();
@@ -135,13 +138,48 @@ fn umya_style_edit_survives_roundtrip() {
 
     let saved = save_umya(&book);
     let reloaded = load_into_umya(&saved);
-    let b2 = read_format_via_umya(&reloaded, "B2");
 
+    // The edited cell.
+    let b2 = read_format_via_umya(&reloaded, "B2");
     assert!(b2.bold, "edited bold survived the round-trip");
     assert!(b2.italic, "pre-existing italic still present");
     assert_eq!(
         b2.fill_argb.as_deref(),
         Some("FF00FFFF"),
         "edited fill survived the round-trip"
+    );
+
+    // Re-read the full A1 attribute set AFTER save+reload — this is what makes
+    // font_size / number_format (and, with the metadata below, row/col size + merges)
+    // true round-trip evidence rather than a read off the original in-memory fixture.
+    let a1 = read_format_via_umya(&reloaded, "A1");
+    assert!(a1.bold, "A1 bold survived round-trip");
+    assert_eq!(a1.font_size, Some(16.0), "A1 font size survived round-trip");
+    assert_eq!(
+        a1.fill_argb.as_deref(),
+        Some("FFFFFF00"),
+        "A1 fill survived round-trip"
+    );
+    assert_eq!(
+        a1.number_format.as_deref(),
+        Some("0.00"),
+        "A1 number format survived round-trip"
+    );
+
+    // Metadata survives the round-trip too.
+    assert_eq!(
+        read_row_height_via_umya(&reloaded, 1),
+        Some(40.0),
+        "row 1 height survived round-trip"
+    );
+    assert_eq!(
+        read_col_width_via_umya(&reloaded, "A"),
+        Some(30.0),
+        "col A width survived round-trip"
+    );
+    assert_eq!(
+        read_merges_via_umya(&reloaded),
+        vec!["C3:D3".to_string()],
+        "merge survived round-trip"
     );
 }

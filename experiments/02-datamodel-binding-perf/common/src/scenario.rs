@@ -196,7 +196,7 @@ pub fn cascade_to_visible_update(
     profile: &Profile,
     design: Design,
     edits: usize,
-) -> Vec<Duration> {
+) -> CascadeRun {
     build_linear_chain(engine, profile.chain_len);
     engine.enable_change_tracking();
     let _ = engine.drain_dirty();
@@ -212,9 +212,12 @@ pub fn cascade_to_visible_update(
     cache.prime(engine, vp);
 
     let mut samples = Vec::with_capacity(edits);
+    let mut final_head = 0.0;
+    let mut last_visible = EngineValue::Empty;
     for i in 0..edits {
         let new_head = (i as f64) + 1.0;
-        let (_, dt) = bench_util::time_once(|| {
+        final_head = new_head;
+        let (view, dt) = bench_util::time_once(|| {
             engine.set_value(0, 0, EngineValue::Number(new_head));
             engine.recompute();
             match design {
@@ -229,41 +232,89 @@ pub fn cascade_to_visible_update(
                 other => read_under(other, engine, vp),
             }
         });
+        // The first visible cell is at row `tail`: its value must be head + tail after
+        // the cascade reaches it — proving the read reflects the edit, not stale cache.
+        last_visible = view.first().cloned().unwrap_or(EngineValue::Empty);
         samples.push(dt);
     }
-    samples
+    CascadeRun {
+        samples,
+        tail_value: last_visible,
+        expected_tail: final_head + tail as f64,
+        final_head,
+        verified_len: profile.chain_len,
+    }
+}
+
+/// The verified outcome of a cascade run: the timing samples plus a **correctness
+/// proof** — the tail value after the final edit, and what it must equal for a real
+/// full recompute to have happened. The runner asserts `tail == expected_tail` so the
+/// benchmark can never silently measure a no-op / cached read (credibility guard).
+#[derive(Debug)]
+pub struct CascadeRun {
+    pub samples: Vec<Duration>,
+    pub tail_value: EngineValue,
+    pub expected_tail: f64,
+    /// The head value that produced `expected_tail` (for diagnostics).
+    pub final_head: f64,
+    /// The chain length actually built (echoed back for the record).
+    pub verified_len: u32,
+}
+
+impl CascadeRun {
+    /// `true` iff the observed tail equals the value a real `=PREV+1` cascade must
+    /// produce for the final head edit — i.e. the recompute genuinely happened.
+    pub fn is_correct(&self) -> bool {
+        self.tail_value.as_number() == Some(self.expected_tail)
+    }
 }
 
 /// **Scenario 3a — 1,000,000-cell `=PREV+1` cascade recompute.** Builds the chain,
-/// then times a single head edit + full recompute. Returns one [`Duration`] per
-/// repetition. Gate against [`targets::CASCADE_1M_NS`].
+/// then times a head edit + full recompute per rep. **Verifies** that after the last
+/// edit the chain tail equals `head + (len-1)` — a real cascade cannot fake this, so a
+/// passing assertion proves the timed work was a genuine full recompute. Returns a
+/// [`CascadeRun`]; gate against [`targets::CASCADE_1M_NS`].
 pub fn cascade_recompute_chain(
     engine: &mut impl SpreadsheetEngine,
     chain_len: u32,
     reps: usize,
-) -> Vec<Duration> {
+) -> CascadeRun {
     build_linear_chain(engine, chain_len);
+    // Sanity: the freshly-built chain tail must be head(=1) + (len-1).
+    let tail_row = chain_len.saturating_sub(1);
     let mut samples = Vec::with_capacity(reps);
+    let mut final_head = 0.0;
     for i in 0..reps {
         let new_head = (i as f64) + 2.0;
+        final_head = new_head;
         let (_, dt) = bench_util::time_once(|| {
             engine.set_value(0, 0, EngineValue::Number(new_head));
             engine.recompute();
         });
         samples.push(dt);
     }
-    samples
+    let tail_value = engine.get_value(tail_row, 0);
+    CascadeRun {
+        samples,
+        tail_value,
+        expected_tail: final_head + tail_row as f64,
+        final_head,
+        verified_len: chain_len,
+    }
 }
 
-/// **Scenario 3b — wide fan-out recompute.** Builds a `wide_fanout` shape (many
-/// dependents summing the same source block), edits one source, recomputes. Returns
-/// one [`Duration`] per repetition; reported (discovery) against the frame budget.
+/// **Scenario 3b — wide fan-out recompute.** Builds a `wide_fanout` shape (`dependents`
+/// cells each `=SUM(A1:<lastSource>1)` over `sources` source cells), edits source A1,
+/// recomputes. **Verifies** a dependent equals the sum a real recompute must produce
+/// (source A1 = `new`, sources 2..=`sources` hold `2..=sources`), so a passing check
+/// proves the fan-out genuinely recomputed. Returns a [`CascadeRun`]; reported
+/// (discovery) against the frame budget.
 pub fn cascade_recompute_fanout(
     engine: &mut impl SpreadsheetEngine,
     sources: u32,
     dependents: u32,
     reps: usize,
-) -> Vec<Duration> {
+) -> CascadeRun {
     let cells = wide_fanout(sources, dependents);
     let batch: Vec<(u32, u32, CellInput)> = cells
         .iter()
@@ -277,15 +328,29 @@ pub fn cascade_recompute_fanout(
         .collect();
     engine.set_batch(&batch);
     let mut samples = Vec::with_capacity(reps);
+    let mut final_head = 0.0;
     for i in 0..reps {
         let new_source = (i as f64) + 3.0;
+        final_head = new_source;
         let (_, dt) = bench_util::time_once(|| {
             engine.set_value(0, 0, EngineValue::Number(new_source));
             engine.recompute();
         });
         samples.push(dt);
     }
-    samples
+    // Sources are laid out across row 0: col 0 = A1 (edited to final_head), col c holds
+    // (c+1) for c in 1..sources. A dependent sums them all.
+    let others_sum: f64 = (1..sources).map(|c| (c + 1) as f64).sum();
+    let expected = final_head + others_sum;
+    // Dependents live down column `sources`, starting at row 0.
+    let tail_value = engine.get_value(0, sources);
+    CascadeRun {
+        samples,
+        tail_value,
+        expected_tail: expected,
+        final_head,
+        verified_len: sources + dependents,
+    }
 }
 
 /// **Scenario 4 — writes: single vs batched.** Times `write_count` individual
@@ -318,13 +383,33 @@ pub fn writes_single_vs_batched(
     (single, vec![dt])
 }
 
+/// The verified outcome of the memory scenario: how many cells were actually loaded
+/// (spot-checked, not just requested) so the runner can prove ~10⁷ cells were populated.
+#[derive(Debug)]
+pub struct MemoryRun {
+    /// Cells requested to load.
+    pub requested: u32,
+    /// A far-corner cell's value after load — proves the tail of the region was written.
+    pub far_corner: EngineValue,
+    /// The expected far-corner value.
+    pub expected_far_corner: f64,
+}
+
+impl MemoryRun {
+    /// `true` iff the far-corner cell holds the value it was loaded with — proof the
+    /// full region (not just the first rows) was populated.
+    pub fn is_correct(&self) -> bool {
+        self.far_corner.as_number() == Some(self.expected_far_corner)
+    }
+}
+
 /// **Scenario 5 — memory load + edit.** Populates `cells` literal values in **chunked
 /// batches** (a realistic bulk-load shape, and it keeps any per-batch temporary — e.g.
 /// a large `BTreeMap` in the Formualizer adapter — bounded rather than materializing all
-/// 10⁷ at once), then performs one edit + recompute. Returns nothing measurable here
-/// beyond the side effect of a fully-loaded workbook; the *caller* samples peak RSS
-/// around this call (peak RSS is a platform read the bench binary owns, not this crate).
-pub fn memory_load_and_edit(engine: &mut impl SpreadsheetEngine, cells: u32) {
+/// 10⁷ at once), then performs one edit + recompute. Returns a [`MemoryRun`] that
+/// spot-checks a far-corner cell so the caller can prove the region was fully populated;
+/// the caller samples peak RSS around this call (a platform read the bench binary owns).
+pub fn memory_load_and_edit(engine: &mut impl SpreadsheetEngine, cells: u32) -> MemoryRun {
     // Lay the cells out as a wide-ish rectangle to avoid a single 10^7-long column, and
     // load in chunks of whole rows so each batch is bounded.
     let cols: u32 = 1_000;
@@ -347,9 +432,21 @@ pub fn memory_load_and_edit(engine: &mut impl SpreadsheetEngine, cells: u32) {
         engine.set_batch(&batch);
         row = end_row;
     }
+    // Spot-check the LAST loaded cell (far corner) before the edit overwrites (0,0).
+    let last_i = cells.saturating_sub(1);
+    let far_row = last_i / cols;
+    let far_col = last_i % cols;
+    let far_corner = engine.get_value(far_row, far_col);
+
     // One edit + recompute, to exercise the post-load edit path.
     engine.set_value(0, 0, EngineValue::Number(-1.0));
     engine.recompute();
+
+    MemoryRun {
+        requested: cells,
+        far_corner,
+        expected_far_corner: last_i as f64,
+    }
 }
 
 /// Builds a `len`-cell `=PREV+1` linear chain down column 0 via a single batch (one
@@ -402,10 +499,11 @@ mod tests {
             viewport_cols: 1,
             ..dev()
         };
-        let samples = cascade_to_visible_update(&mut e, &p, Design::CachedChangelog, 3);
-        assert_eq!(samples.len(), 3);
-        // After the last edit (head = 3.0), the chain tail should reflect it:
-        // cell (chain_len-1) == head + (chain_len-1).
+        let run = cascade_to_visible_update(&mut e, &p, Design::CachedChangelog, 3);
+        assert_eq!(run.samples.len(), 3);
+        // The visible cell reflects the cascade: its verification must hold.
+        assert!(run.is_correct(), "visible cascade not reflected: {run:?}");
+        // After the last edit (head = 3.0), the chain tail reflects it too.
         let tail = p.chain_len - 1;
         let expected = 3.0 + (tail as f64);
         assert_eq!(e.get_value(tail, 0), EngineValue::Number(expected));
@@ -421,21 +519,21 @@ mod tests {
     }
 
     #[test]
-    fn scenario_cascade_recompute_chain_runs() {
+    fn scenario_cascade_recompute_chain_runs_and_verifies() {
         let mut e = FakeEngine::new_blank();
-        let samples = cascade_recompute_chain(&mut e, 50, 4);
-        assert_eq!(samples.len(), 4);
+        let run = cascade_recompute_chain(&mut e, 50, 4);
+        assert_eq!(run.samples.len(), 4);
+        // The verification proves a real recompute happened: tail == head + (len-1).
+        assert!(run.is_correct(), "chain recompute not verified: {run:?}");
     }
 
     #[test]
-    fn scenario_fanout_runs_and_sums() {
+    fn scenario_fanout_runs_and_verifies() {
         let mut e = FakeEngine::new_blank();
-        let samples = cascade_recompute_fanout(&mut e, 8, 4, 2);
-        assert_eq!(samples.len(), 2);
-        // A dependent sums sources; after editing source A1 the sum reflects it.
-        // Sources are 1..=8 except A1 which we last set to 3.0+? -> just check a number.
-        let dep = e.get_value(0, 8);
-        assert!(dep.as_number().is_some());
+        let run = cascade_recompute_fanout(&mut e, 8, 4, 2);
+        assert_eq!(run.samples.len(), 2);
+        // A dependent sums sources; the verification proves the fan-out recomputed.
+        assert!(run.is_correct(), "fanout recompute not verified: {run:?}");
     }
 
     #[test]
@@ -448,10 +546,11 @@ mod tests {
     }
 
     #[test]
-    fn scenario_memory_load_populates() {
+    fn scenario_memory_load_populates_and_verifies() {
         let mut e = FakeEngine::new_blank();
-        memory_load_and_edit(&mut e, 2_000);
-        // A late cell exists.
-        assert!(e.get_value(1, 999).as_number().is_some());
+        let mem = memory_load_and_edit(&mut e, 2_000);
+        // The far-corner spot-check proves the whole region was populated.
+        assert!(mem.is_correct(), "memory region not populated: {mem:?}");
+        assert_eq!(mem.requested, 2_000);
     }
 }

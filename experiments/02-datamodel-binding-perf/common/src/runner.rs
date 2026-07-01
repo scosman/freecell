@@ -47,6 +47,29 @@ where
         scenario::seed_region(&mut e, profile.region_rows, profile.region_cols);
         e
     };
+    // CREDIBILITY GUARD: confirm the region really holds populated cells across a huge
+    // sheet — read a far-corner viewport and require some non-empty values, so we can't
+    // be "fast" by reading an empty grid.
+    {
+        let far = crate::Viewport::new(
+            profile.region_rows.saturating_sub(5).max(1),
+            profile.region_cols.saturating_sub(5).max(1),
+            5,
+            5,
+        );
+        let far_vals = scrolling_engine.read_viewport(far);
+        let non_empty = far_vals
+            .iter()
+            .filter(|v| !matches!(v, crate::EngineValue::Empty))
+            .count();
+        assert!(
+            non_empty > 0,
+            "{engine_name} scrolling region is empty at the far corner (rows={}, cols={}) — \
+             the read benchmark would be measuring an empty grid",
+            profile.region_rows,
+            profile.region_cols,
+        );
+    }
     for design in Design::ALL {
         let samples = scenario::scrolling_viewport_read_seeded(&scrolling_engine, profile, design);
         let stats = LatencyStats::from_durations(&samples);
@@ -73,9 +96,19 @@ where
     // --- Scenario 2: change-cascade -> visible update (D1/D2/D3), gate p99 <= 16.6 ms ---
     for design in Design::ALL {
         let mut engine = make();
-        let samples =
-            scenario::cascade_to_visible_update(&mut engine, profile, design, VISIBLE_EDITS);
-        let stats = LatencyStats::from_durations(&samples);
+        let run = scenario::cascade_to_visible_update(&mut engine, profile, design, VISIBLE_EDITS);
+        // CREDIBILITY GUARD: the visible (offscreen-from-head) cell must reflect the
+        // cascade from the head edit — proves the read is fresh, not stale cache.
+        assert!(
+            run.is_correct(),
+            "{engine_name} cascade-visible/{} did NOT reflect the cascade: visible={:?}, expected {} (head={}, chain_len={})",
+            design.label(),
+            run.tail_value,
+            run.expected_tail,
+            run.final_head,
+            run.verified_len,
+        );
+        let stats = LatencyStats::from_durations(&run.samples);
         let gate = stats.map(|s| {
             GateResult::max(
                 format!("cascade-visible/{}", design.label()),
@@ -92,16 +125,31 @@ where
             env.clone(),
             stats,
             gate,
-            json!({ "chain_len": profile.chain_len }),
+            json!({
+                "chain_len": profile.chain_len,
+                "verified_visible": run.tail_value.as_number(),
+                "expected_visible": run.expected_tail,
+                "cascade_verified": run.is_correct(),
+            }),
         ));
     }
 
     // --- Scenario 3a: 1M =PREV+1 cascade recompute, gate <= 100 ms ---
     {
         let mut engine = make();
-        let samples =
-            scenario::cascade_recompute_chain(&mut engine, profile.chain_len, CASCADE_REPS);
-        let stats = LatencyStats::from_durations(&samples);
+        let run = scenario::cascade_recompute_chain(&mut engine, profile.chain_len, CASCADE_REPS);
+        // CREDIBILITY GUARD: the timed work must be a genuine full recompute. A real
+        // =PREV+1 cascade forces tail == head + (len-1); a no-op / cached read cannot.
+        assert!(
+            run.is_correct(),
+            "{engine_name} cascade-1m-chain did NOT recompute: chain_len={}, tail={:?}, expected {} (head={}). \
+             The benchmark would be measuring nothing — refusing to record a bogus number.",
+            run.verified_len,
+            run.tail_value,
+            run.expected_tail,
+            run.final_head,
+        );
+        let stats = LatencyStats::from_durations(&run.samples);
         let gate =
             stats.map(|s| GateResult::max("cascade-1m-chain", s.p50_ns, targets::CASCADE_1M_NS));
         out.push(ScenarioResult::from_stats(
@@ -113,20 +161,32 @@ where
             env.clone(),
             stats,
             gate,
-            json!({ "chain_len": profile.chain_len }),
+            json!({
+                "chain_len": profile.chain_len,
+                "verified_tail": run.tail_value.as_number(),
+                "expected_tail": run.expected_tail,
+                "recompute_verified": run.is_correct(),
+            }),
         ));
     }
 
     // --- Scenario 3b: wide fan-out recompute (discovery, gate at frame budget) ---
     {
         let mut engine = make();
-        let samples = scenario::cascade_recompute_fanout(
+        let run = scenario::cascade_recompute_fanout(
             &mut engine,
             profile.fanout_sources,
             profile.fanout_dependents,
             CASCADE_REPS,
         );
-        let stats = LatencyStats::from_durations(&samples);
+        assert!(
+            run.is_correct(),
+            "{engine_name} cascade-fanout did NOT recompute: dependent={:?}, expected {} (edited source={})",
+            run.tail_value,
+            run.expected_tail,
+            run.final_head,
+        );
+        let stats = LatencyStats::from_durations(&run.samples);
         let gate = stats.map(|s| GateResult::max("cascade-fanout", s.p50_ns, targets::FRAME_60_NS));
         out.push(ScenarioResult::from_stats(
             &engine_name,
@@ -140,6 +200,9 @@ where
             json!({
                 "sources": profile.fanout_sources,
                 "dependents": profile.fanout_dependents,
+                "verified_dependent": run.tail_value.as_number(),
+                "expected_dependent": run.expected_tail,
+                "recompute_verified": run.is_correct(),
             }),
         ));
     }
@@ -177,10 +240,20 @@ where
     {
         let rss_before = peak_rss();
         let mut engine = make();
-        scenario::memory_load_and_edit(&mut engine, profile.memory_cells);
+        let mem = scenario::memory_load_and_edit(&mut engine, profile.memory_cells);
         let rss_after = peak_rss();
         // Keep the engine alive across the RSS read.
         std::hint::black_box(&engine);
+        // CREDIBILITY GUARD: the far-corner cell proves the full region was populated,
+        // so the recorded RSS is for a genuinely loaded ~10^7-cell workbook.
+        assert!(
+            mem.is_correct(),
+            "{engine_name} memory scenario did NOT populate the region: requested {} cells, \
+             far corner={:?}, expected {}",
+            mem.requested,
+            mem.far_corner,
+            mem.expected_far_corner,
+        );
         out.push(ScenarioResult::from_stats(
             &engine_name,
             "memory",
@@ -195,6 +268,8 @@ where
                 "peak_rss_bytes_after": rss_after,
                 "delta_bytes": rss_after.saturating_sub(rss_before),
                 "cells": profile.memory_cells,
+                "far_corner_verified": mem.far_corner.as_number(),
+                "populated_verified": mem.is_correct(),
             }),
         ));
     }

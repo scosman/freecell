@@ -223,6 +223,84 @@ that testable:
 - **The 1M cascade recompute stays ~1.2 s** (known-FAIL vs <100 ms) — expected, recorded,
   and the reason non-blocking matters.
 
+## Scroll-during-eval (follow-on probe — is a newly-scrolled cell readable mid-eval?)
+
+A design claim was made that *"while the worker is inside `evaluate()` (1–7 s on a huge
+edit), it cannot service a scroll (`SetViewport`), so newly-scrolled-in cells can't be read
+until the eval finishes."* This was **empirically checked** (not assumed) by
+`src/bin/scroll_during_eval.rs` → `results/scroll_during_eval_*.json`, at 10⁵ (fast) and
+10⁶ (the ~1.2–1.5 s motivating eval). Every read is force+asserted real; env-stamped;
+foreground.
+
+**Reproduce** (from `experiments/round-2/01-async-interop/`, foreground, with `timeout`):
+```sh
+cargo run --release --bin scroll_during_eval -- --size 100000     # fast smoke
+cargo run --release --bin scroll_during_eval -- --size 1000000    # ~1.4 s eval scale
+```
+
+| metric | deep_serial 10⁵ | deep_serial 10⁶ |
+|---|---|---|
+| warm `evaluate()` | 78.6 ms | 1.45 s |
+| **Q1 live scroll issued mid-eval → new region published after** | **99.4 ms** | **1.39 s** (≈ one eval) |
+| Q2 snapshot read during eval — p50 / p99 / max | 787 ns / 2.01 µs / 30.7 µs | 1.63 µs / 2.92 µs / 53.9 µs |
+| — reads sampled while eval genuinely in flight | 2000 / 2000 | 2000 / 2000 |
+| Q2 snapshot BUILD (`to_bytes`+`from_bytes`) | 49.9 ms (1.2 MB payload) | 3.23 s (12.4 MB payload) |
+| Q2 second-model peak-RSS delta (high-water; overstated¹) | +36.8 MB | +400 MB |
+
+1. **Is the live model readable during an in-flight eval? NO — blocked ≈ one eval.**
+   A `SetViewport` issued *while the worker is mid-`evaluate()`* (asserted: `mid-eval=true`)
+   published the newly-scrolled region only after **≈ the whole eval duration** (99 ms @10⁵
+   ≈ its 79 ms eval; **1.39 s @10⁶ ≈ its 1.45 s eval**). The newly-published tail was the
+   **fresh post-edit value** (e.g. 1 012 340, not the stale 1 000 000), proving the scroll
+   was serviced by a *real re-pull only after the eval returned*, not by a stale echo. **The
+   claim is confirmed.** *Mechanism (Rust/IronCalc):* `Model::evaluate(&mut self)` holds an
+   **exclusive borrow**, which by Rust aliasing **excludes** any concurrent
+   `get_cell_value_by_index(&self)` of the *same* model — so the live model is unreadable for
+   the eval's whole duration. On top of that, in the seam `SetViewport` rides the *same*
+   command channel as edits, and the worker only drains that channel **between** evals (it is
+   inside `evaluate()`, not calling `rx.recv()`). Both effects point the same way: a mid-eval
+   scroll of the live model waits one eval.
+
+2. **Can a separate SNAPSHOT serve arbitrary scrolled reads concurrently? YES — not
+   blocked.** A second `Model` built at the last settle (`to_bytes()` → `from_bytes()`) was
+   read from another thread **while the real model was mid-`evaluate()`** (asserted: all 2000
+   reads sampled with the eval in flight). Arbitrary (Knuth-hash-spread) scrolled-cell reads
+   returned in **p50 ≈ 0.8–1.6 µs, p99 ≲ 3 µs, max ≲ 54 µs** — no aliasing with the worker's
+   `&mut Model`, so nothing blocks. The reads return **stale, pre-eval** values (asserted:
+   the snapshot tail stayed at its settled value while the real model recomputed to a
+   different one) — which is exactly fine for scrolling. **Cost:** the snapshot BUILD is the
+   expensive part — **~50 ms @10⁵ but ~3.2 s @10⁶** (dominated by `from_bytes`: 3.04 s;
+   `to_bytes` is only 185 ms), plus a **second resident model** (~the size of the first;
+   payload 12.4 MB @10⁶, and the measured peak-RSS high-water rose ~400 MB during the build¹).
+   ¹ The RSS delta is a high-water mark that also captures the transient encode buffer and
+   `from_bytes` scratch, so it **overstates** the steady-state second-model footprint (the
+   ~162 B/cell storage ⇒ order ~160 MB for a 10⁶ live model; the 12.4 MB `to_bytes` payload is
+   the compact figure). Either way a snapshot is a **whole-workbook** operation with no partial
+   route.
+
+3. **Overscan headroom — the cheap alternative.** If the published viewport is a symmetric
+   `k×` overscan window around a visible `V_rows × V_cols` viewport, the user can scroll
+   **±(k−1)/2 · V** in each dimension while staying inside already-published cells (**no
+   worker read at all**). For a screenful of `40×12` visible cells: **k=2 → ±20 rows / ±6
+   cols**, **k=3 → ±40 rows / ±12 cols**, **k=5 → ±80 rows / ±24 cols**. The published buffer
+   is only `k²·V` cells (e.g. k=3 → 4 320 cells), so overscan is essentially free to build and
+   costs no extra model. A force-asserted demo confirms an in-window scroll is served from the
+   published buffer alone (`in_window_read_served_from_buffer=true`).
+
+**Recommendation: overscan as the default; snapshot only if the app must scroll *beyond* the
+overscan window mid-eval — not both by default.** Overscan (a 3× window ≈ ±40 rows / ±12
+cols of free headroom) absorbs virtually all *interactive* scrolling during an eval at zero
+extra memory and a trivial per-publish read, and it is already compatible with the locked
+seam (just widen the published viewport). The snapshot fully solves *arbitrary* mid-eval
+scrolling — its concurrent reads are ~1–3 µs and correctly stale — **but its build is the
+catch: ~3.2 s at 10⁶ (worse than the ~1.4 s eval it is meant to paint over) plus a second
+resident model**, so building it *per eval* would widen staleness more than the eval itself.
+Practical policy: **ship overscan; reach for a snapshot only on demand** — i.e. if/when the
+user scrolls past the overscan margin *during* a long eval, build a one-off snapshot (bounded,
+off the render loop) to serve stale values until the eval settles. For the common case (short
+evals, or scrolling within a screen or two) overscan alone is sufficient and the snapshot is
+never paid.
+
 ## Recommended (locked) engine↔render interop-seam design
 
 The seam implemented in `src/seam.rs` and validated by the GATES. It is the

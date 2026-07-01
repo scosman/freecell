@@ -21,6 +21,13 @@ path = "src/bin/latency_matrix.rs"
 name = "nonblocking"
 path = "src/bin/nonblocking.rs"
 
+# SP1 follow-on probe: is a newly-scrolled cell readable during an in-flight eval?
+# Measures the live-model scroll-service latency (~one eval), concurrent snapshot reads
+# (+ snapshot build cost / extra RSS), and overscan headroom.
+[[bin]]
+name = "scroll_during_eval"
+path = "src/bin/scroll_during_eval.rs"
+
 [dependencies]
 # Frozen, read-only shared harness (the IronCalc adapter + SpreadsheetEngine trait +
 # scenarios + peak_rss). Same IronCalc 0.7.1 pin, so SP1 numbers stay comparable.

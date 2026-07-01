@@ -19,6 +19,7 @@ Independent Cargo project; depends **read-only** by relative path on the frozen
 | `src/probes.rs` | Runtime API findings: the `UserModel` diff-list is edit-sites-only (no evaluated-cell stream); `to_bytes` snapshot round-trips. |
 | `src/bin/latency_matrix.rs` | The `evaluate()` latency-matrix runner (sizes × shapes → `results/latency_*.json`). |
 | `src/bin/nonblocking.rs` | The non-blocking render-loop harness + GATES (render-tick budget, coalescing, staleness, snapshot cost → `results/gate_*`, `staleness_*`). |
+| `src/bin/scroll_during_eval.rs` | Follow-on probe: is a newly-scrolled cell readable **mid-eval**? Measures the live-model scroll-service latency (≈ one eval), concurrent snapshot reads (+ build cost / extra RSS), and overscan headroom → `results/scroll_during_eval_*.json`. See findings.md "Scroll-during-eval". |
 | `tests/seam.rs` | Integration tests for the seam + findings at fast sizes. |
 | `results/` | Committed, env-stamped JSON. |
 | `findings.md` | The write-up + the **locked interop-seam design** (the key output). |
@@ -31,6 +32,8 @@ cargo run --release --bin latency_matrix -- --max-size 1000000        # 10^4..10
 cargo run --release --bin latency_matrix -- --shape volatile --size 10000000   # heavy: run alone
 cargo run --release --bin nonblocking -- --shape deep_serial --size 1000000    # GATEs @10^6
 cargo run --release --bin nonblocking -- --shape volatile    --size 10000000   # GATEs @10^7
+cargo run --release --bin scroll_during_eval -- --size 100000     # scroll-mid-eval probe (fast)
+cargo run --release --bin scroll_during_eval -- --size 1000000    # scroll-mid-eval probe @10^6
 ```
 
 Heavy scales (10⁶/10⁷) run **one at a time**; `deep_serial` 10⁷ is capped (Excel's

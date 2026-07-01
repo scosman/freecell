@@ -50,20 +50,23 @@ below):
   SP1 scroll-during-eval probe's measured recommendation over a `to_bytes()` snapshot
   (whose ~3.2s build @1M *exceeds* the eval). Build a snapshot only **on-demand** if the
   user scrolls past the overscan margin mid-eval.
+- **An always-resident full style + geometry cache** (all row/col sizes + fills/borders/
+  fonts/number-format for the sheet, held in the frontend, invalidated only on style
+  edits — never on recompute). **Near-MVP:** grid layout needs all row/col sizes; it
+  takes the ~10× style read (SP4) off the scroll path; and because styles/sizes don't
+  change during a recompute and the cache is frontend-resident, **the grid renders
+  fully-styled during an eval — only cell values lag.** See `projects/style-cache.md`.
 
 ## Round-3 / real-build agenda (ranked — this is the real output)
 
-1. **Recompute UX + FreeCell-owned dirty tracking.** The highest-leverage item.
-   Because IronCalc gives no downstream-dirty signal, build FreeCell's own dependency/
-   dirty tracking to (a) shrink SP1's repaint from "whole viewport on every eval" to
-   "only actually-changed cells," and (b) enable a **generation-keyed viewport cache**:
-   on scroll, fetch only the *delta* cells, not the whole window (SP1 currently
-   re-reads the full viewport per scroll). Split the cache **value vs style** — styles
-   are the ~10× read (SP4) *and* don't change on recompute, so cache them across
-   generations and invalidate only on style edits (whose edit-sites IronCalc *does*
-   report). A frontend cache additionally keeps scrolling live *during* a multi-second
-   eval. *(Cheap to measure first: delta-read vs full-read on scroll + a
-   scroll-during-eval responsiveness check.)*
+1. **FreeCell-owned dirty-tracking + a viewport value cache.** Because IronCalc gives no
+   downstream-dirty signal, build FreeCell's own dependency/dirty tracking to shrink
+   SP1's post-eval repaint from "whole viewport" to "only actually-changed cells." Pair
+   it with an **optional viewport value-delta cache** — on scroll, fetch only
+   newly-exposed cells' *values* (invalidate on generation++). Values are now the *only*
+   eval-dependent render input; **styles + geometry are handled by the always-resident
+   style cache (adopted, above).** Optional because SP4 showed uncached value reads are
+   ~1× and cheap — measure delta-vs-full first. See `projects/viewport-cache.md`.
 2. **Dynamic arrays / spilling (0/17).** The biggest perceived-compat risk for
    modern-Excel users (FILTER/SORT/UNIQUE are everyday). **Explicit decision needed:**
    accept absence for v1, build spill support, or contribute upstream. Not a

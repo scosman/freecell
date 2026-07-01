@@ -11,15 +11,15 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 ## Backlog
 
-- **Global Row/Column Size Cache (grid geometry)** — *Future (likely near-MVP).*
-  A resident, always-readable cache of **all** row heights + column widths (not
-  viewport-based) — needed to lay out / virtualize the grid, including *during* a
-  recompute, when the model's own size getters are blocked. Could generalize to a full
-  always-resident style cache (sizes + fills/lines/bold/number-format).
-  → [`projects/grid-size-cache.md`](projects/grid-size-cache.md)
+- **All-Styles Resident Cache (grid geometry + styling)** — *Near-MVP.*
+  An always-resident cache of the full resolved style for the sheet — **all** row/col
+  sizes (geometry) + fills/lines/bold/number-format — **not** viewport-based. Needed to
+  render the grid at all (geometry), takes the ~10× style read (SP4) off the scroll path,
+  and — since styles/sizes don't change during a recompute and it's frontend-resident —
+  lets the grid render **fully-styled during an eval** (only cell values lag).
+  → [`projects/style-cache.md`](projects/style-cache.md)
 
-- **Viewport Value/Style Cache** — *Future, if we want to push scrolling perf.*
-  A frontend cache of visible cells (value + style) so scrolling fetches only the
-  *delta* cells instead of re-reading the whole viewport each move, keeps scrolling
-  live during a recompute, and caches the expensive style reads across recomputes.
-  → [`projects/viewport-cache.md`](projects/viewport-cache.md)
+- **Viewport Value Cache** — *Future, optional scroll-perf push.*
+  Delta-load only newly-exposed cells' *values* on scroll (styles/geometry come from the
+  resident style cache above); invalidate on recompute. Optional — SP4 showed uncached
+  value reads are cheap. → [`projects/viewport-cache.md`](projects/viewport-cache.md)

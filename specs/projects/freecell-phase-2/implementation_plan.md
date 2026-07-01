@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Implementation Plan: FreeCell — Phase 2 (Round-2 Technical De-risking)

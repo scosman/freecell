@@ -1,9 +1,16 @@
 # Project: `.xlsx` Preservation on Save (don't destroy what we don't model)
 
-**Status:** **Pre-build decision.** Flagged by the 2026-07-02 pre-build spec review
+**Status:** **Future (post-MVP by product call, 2026-07-02, MVP planning Round 1).**
+The decision was made during MVP spec planning (`specs/projects/mvp/`): the MVP ships
+IronCalc's writer behavior as-is — unmodeled content is silently dropped on save,
+**no warning dialog**. This project is the post-MVP follow-up: first step is the
+**warn-and-strip UX** (detect unmodeled parts, warn before destructive save), then
+evaluate the deeper preservation options below.
+
+Originally flagged by the 2026-07-02 pre-build spec review
 (`specs/pre-build-spec-review-2026-07-02.md` §2, blind spot 2) as make-or-break for
-trust: the policy call (and a cheap de-risk) should land before the build commits,
-even if the implementation lands later.
+trust; the policy call has now been made (accept for MVP), the implementation is
+deferred here.
 
 **Relates to:** round-3 B needed-API audit (`experiments/round-3/B-api-audit/`,
 comments dropped on export; merges/CF have no API), SP2 large-open

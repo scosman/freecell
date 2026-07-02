@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: FreeCell MVP
@@ -25,7 +25,8 @@ there: CLEAR TO BUILD. This spec builds exactly what those syntheses adopted.
 | Structure | Multiple sheets: add / rename / delete / switch | Insert/delete rows & cols UI, row/col resize (P2), hide, freeze, zoom, sort/filter |
 | Selection | Single cell + rectangular range; keyboard + mouse | Row/col-header select-all, multi-range (Cmd+click), named ranges |
 | Grid scale | Full Excel max: 1,048,576 rows × 16,384 cols, 120 fps scroll budget | — |
-| Windows | Welcome window + one window per workbook, standard macOS menus | Tabs-in-window, session restore |
+| Windows | Welcome window at launch + one window per workbook, standard macOS menus; app quits when last window closes | Tabs-in-window, session restore |
+| Formulas | Full IronCalc formula support: entry, recalc, cross-sheet refs, error values | Dynamic arrays/spill (accepted absent for v1), autocomplete |
 
 "Near parity with the big-name spreadsheets" is the **product trajectory**, not the MVP
 bar. The MVP bar: a person can open a real Excel file, look around a million-row sheet
@@ -62,9 +63,9 @@ Small, fixed-size, non-resizable window, centered:
   document-edited indicator (dot in close button) reflects the dirty flag; if GPUI
   doesn't expose it at our pinned rev, suffix the title with `— Edited` instead.
 - Closing a window with unsaved changes prompts: **Save / Don't Save / Cancel**.
-- When the last spreadsheet window closes, the Welcome window reappears (the app keeps
-  running, per macOS convention). Quit is via menu/Cmd+Q, prompting per-window for
-  unsaved changes.
+- When the last window closes (spreadsheet or Welcome), **the app quits** (product
+  call, planning Round 1). Quit via menu/Cmd+Q behaves the same: prompts per-window
+  for unsaved changes, any Cancel aborts the quit.
 
 ### 2.4 Menus (macOS menu bar)
 
@@ -138,7 +139,24 @@ Vertical stack (details in `ui_design.md`):
   focus in the data row and shows an inline error ("Formula too long / too deeply
   nested"); the cell is not modified.
 
-### 3.4 Formatting actions
+### 3.4 Formulas (explicit — this is the point of a spreadsheet)
+
+- Input starting with `=` is a formula; the engine parses and evaluates it. The full
+  IronCalc function set applies (345 built-ins, 96.4% golden-correctness per SP3) —
+  FreeCell adds no formula logic of its own and imposes no allowlist.
+- References work as the engine defines them: relative/absolute (`A1`, `$A$1`),
+  ranges (`A1:B9`), cross-sheet (`Sheet2!A1`), defined-name references resolve if
+  present in the file (no UI to create them in MVP).
+- Editing any cell triggers the evaluate loop (§4): the whole workbook recomputes
+  (IronCalc is non-incremental) and dependent cells update on publish.
+- Error results (`#DIV/0!`, `#NAME?`, `#VALUE!`, `#CIRC!`, …) are values, rendered
+  in-cell as the engine's display text. Circular references resolve to `#CIRC!` in
+  milliseconds (validated) — never a hang.
+- Known absence: dynamic arrays/spill (FILTER/SORT/UNIQUE) — accepted for v1
+  (planning Round 1); such formulas surface whatever error the engine returns.
+- A cell's formula text (not its result) is what the data row shows and edits.
+
+### 3.5 Formatting actions
 
 - **Bold / Italic / Underline** toggle buttons. Multi-cell toggle semantics (Excel):
   if any selected cell lacks the attribute → set it on all; if all have it → clear it
@@ -152,7 +170,7 @@ Vertical stack (details in `ui_design.md`):
 - Action-row button state reflects the **active cell** (pressed = attribute set). For
   multi selections, state still reflects the anchor/active cell (cheap, predictable).
 
-### 3.5 Cell rendering (what the grid can draw in MVP)
+### 3.6 Cell rendering (what the grid can draw in MVP)
 
 - Text runs with **bold / italic / underline** (and their combinations) in the app's
   single default font family/size.
@@ -169,7 +187,7 @@ Vertical stack (details in `ui_design.md`):
 - Not rendered in MVP (silently ignored on screen, preserved in the engine and saved):
   borders, font family/size/color overrides, strikethrough, wrap, indent, rotation.
 
-### 3.6 Sheets & tab bar
+### 3.7 Sheets & tab bar
 
 - One tab per sheet, in workbook order; the active tab is visually distinct. Click to
   switch. Each sheet keeps its own scroll position + selection in-session.
@@ -199,8 +217,10 @@ worker seam):
   values may lag by **at most one evaluation** (~1.3 s at 1M cells on the container
   floor; faster on real hardware). Styles, geometry, selection, and scrolling are
   **never** stale or blocked — only values can lag.
-- The UI shows a subtle "calculating" indicator while an evaluation is in flight (so a
-  multi-second eval on a huge sheet reads as working, not broken). No modal blocking.
+- **Evaluating spinner** (product call, planning Round 1): a small spinner in the
+  **top-right of the action row** that appears only when an evaluation has been in
+  flight for **> 250 ms**, and stays until it completes. Small sheets never see it;
+  huge sheets read as working, not broken. No modal blocking, no other progress UI.
 - Edits made **during** an eval are accepted (optimistic UI: the edited cell shows its
   new raw input immediately as pending) and evaluated in the next cycle.
 
@@ -228,14 +248,12 @@ worker seam):
 - Writes are **atomic**: write to a temp file in the destination directory, then rename
   over the target. A failed write never destroys the existing file. Errors (permissions,
   disk full) surface in a dialog; the document stays dirty.
-- **Fidelity warning (v1 policy = warn-and-strip):** IronCalc's writer only persists
-  what it models — merges, conditional formatting, comments, validation, hyperlinks,
-  charts, pivots, drawings, VBA are silently dropped. MVP policy: the **first** Save
-  over a file that was opened from disk shows a one-time-per-document warning dialog —
-  "FreeCell doesn't yet support every Excel feature. Unsupported features in this file
-  (e.g. charts, comments, merged cells) will be removed on save." with **Save Anyway /
-  Cancel**. New (FreeCell-born) workbooks never warn. This is the cheap v1 answer to
-  `projects/xlsx-preservation.md`; smarter detection/pass-through is future work.
+- **Save fidelity (product call, planning Round 1): out of MVP scope.** IronCalc's
+  writer only persists what it models — merges, conditional formatting, comments,
+  validation, hyperlinks, charts, pivots, drawings, VBA are silently dropped on save.
+  The MVP ships this behavior as-is, with **no warning dialog**. The warn-and-strip
+  UX (and any smarter preservation) is a tracked post-MVP project:
+  `projects/xlsx-preservation.md` / `PROJECTS.md`.
 - Save clears the dirty flag; any edit (data, style, structure, rename) sets it.
 
 ## 6. Errors, robustness & edge cases
@@ -252,7 +270,7 @@ worker seam):
 - **Worker death** (should be unreachable): the window shows a non-dismissable error
   bar offering Save As (from the last good model state if reachable) — never silent
   data loss.
-- Sheet-name validation per §3.6; formula-bar junk input is engine-handled (becomes
+- Sheet-name validation per §3.7; formula-bar junk input is engine-handled (becomes
   text or a typed error — validated in round-3 D, never a panic).
 - Opening read-only locations works; Save then fails with a clear dialog → user Save-As
   elsewhere.
@@ -293,7 +311,8 @@ or an already-tracked project (`PROJECTS.md`):
   DECISIONS_TO_REVIEW.md.
 - **Merged cells, conditional formatting, comments, validation, hyperlinks**: no
   IronCalc public API; files containing them open but these features don't render and
-  are stripped on save (with the §5.2 warning).
+  are silently stripped on save (§5.2). The warn-and-strip dialog + preservation
+  options are the post-MVP `projects/xlsx-preservation.md` project.
 - CSV import/export; recent-files; printing; find/replace; sort/filter; freeze panes;
   hide rows/cols; zoom; charts/images; named-range UI; multi-range selection;
   row/col-header selection; fill handle; window session restore; autosave;

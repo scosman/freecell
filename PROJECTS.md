@@ -19,12 +19,13 @@ registry: each entry is a short description plus a pointer to a design note unde
   lets the grid render **fully-styled during an eval** (only cell values lag).
   → [`projects/style-cache.md`](projects/style-cache.md)
 
-- **`.xlsx` Preservation on Save** — *Pre-build decision.*
+- **`.xlsx` Preservation on Save** — *Future (post-MVP by product call, 2026-07-02).*
   IronCalc's writer silently drops everything it doesn't model (comments, validation,
   hyperlinks, merges, CF — and charts/pivots/drawings/VBA were never examined), so
-  "open a colleague's file, fix one cell, save" is destructive. Decide the v1 policy
-  (warn-and-strip vs zip-level unknown-part pass-through vs own the writer) + run the
-  real-file-corpus de-risk before the build.
+  "open a colleague's file, fix one cell, save" is destructive. MVP ships this
+  behavior with no warning (decided in MVP planning Round 1); this project adds the
+  warn-and-strip UX first, then weighs zip-level unknown-part pass-through vs owning
+  the writer, plus the real-file-corpus de-risk.
   → [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md)
 
 - **IME / International Text Input** — *Future (post-MVP by product call, 2026-07-02).*

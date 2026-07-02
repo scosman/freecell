@@ -134,7 +134,7 @@ enum Command {
 enum WorkerEvent {
     Loaded { sheets: Vec<SheetMeta>, .. } | LoadFailed { reason },
     Published,                       // new generation available
-    EvalStarted | EvalFinished,      // drives the "calculating" indicator
+    EvalStarted | EvalFinished,      // drives the evaluating spinner (UI shows after 250 ms)
     CellContent { req_id, raw: String },
     Saved { req_id, ops_seen: u64 } | SaveFailed { req_id, reason },
     EditRejected { reason },         // catch_unwind recovery path
@@ -247,8 +247,8 @@ Full design in `components/style_cache.md`. Locked by round-3 A; MVP subset:
 Full design in `components/app_shell.md`:
 
 - `gpui_platform::application().run(...)`; a `FreeCellApp` global holds the window
-  registry. Welcome window at launch; opening/creating a document closes it; closing
-  the last document window reopens it. Quit prompts per dirty window.
+  registry. Welcome window at launch; opening/creating a document closes it; when the
+  last window closes, the app quits. Quit prompts per dirty window.
 - macOS menu bar via GPUI's menu/action API; menu actions dispatch to the focused
   window's entity. Keyboard shortcuts are GPUI key bindings bound to the same actions
   (single source of truth).
@@ -257,7 +257,7 @@ Full design in `components/app_shell.md`:
 - Finder "open with" events: wire GPUI's open-files/urls handler if present at the
   pinned rev; otherwise document as a known gap (best-effort feature,
   DECISIONS_TO_REVIEW.md).
-- All dialogs (unsaved changes, fidelity warning, errors, delete-sheet confirm) are
+- All dialogs (unsaved changes, errors, delete-sheet confirm) are
   gpui-component modals owned by the window entity; async flows (close-with-prompt →
   save → close) are small state machines on the entity, no blocking.
 

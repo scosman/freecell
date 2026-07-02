@@ -50,9 +50,9 @@ Vertical flex, full-window:
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  [B][I][U] │ [Fill ▾]                        (action row)  │  ~36 px, grey bg
+│  [B][I][U] │ [Fill ▾]                    (action row) (⟳)  │  ~36 px, grey bg
 ├────────────────────────────────────────────────────────────┤
-│  [ B7 ]  │ [ =SUM(A1:A5)                        ] (⟳)      │  ~32 px, grey bg
+│  [ B7 ]  │ [ =SUM(A1:A5)                             ]     │  ~32 px, grey bg
 ├────────────────────────────────────────────────────────────┤
 │    │  A   │  B   │  C   │  D   │  E   │  F   │  G   │ ...  │ ┐
 │  1 │      │      │      │      │      │      │      │      │ │
@@ -84,6 +84,10 @@ separating each from the grid. The grid is the only white, full-bleed surface.
 - Buttons disabled when a data-row edit is mid-flight? No — formatting commits the
   pending edit first (same rule as clicking another cell), keeping behavior uniform.
 - Tooltips on all four ("Bold ⌘B" etc. — see §6 shortcuts).
+- **Evaluating spinner**: right-aligned at the far end of the action row (top-right of
+  the chrome). Hidden by default; appears when an evaluation has been in flight
+  > 250 ms and stays until completion (`functional_spec.md §4`). Stock gpui-component
+  spinner, small, no label.
 
 ### 3.2 Data row (formula bar)
 
@@ -92,9 +96,6 @@ separating each from the grid. The grid is the only white, full-bleed surface.
 - Thin divider, then the **content field**: single-line stock gpui-component text
   input, stretching to fill the row. Monospace-leaning is unnecessary; default UI font.
 - Multi-cell selection: content field disabled + empty (greyed background).
-- While an engine evaluation is in flight, a small **spinner / "calculating"
-  indicator** sits at the right end of the data row (subtle; per
-  `functional_spec.md §4`).
 - Inline error state (input-cap rejection): field border switches to the theme's
   danger color, error text appears in a tooltip-style popover below; clears on edit.
 
@@ -118,7 +119,7 @@ The one custom-built component (raw GPUI, per the adopted architecture — match
 - White background; **gridlines** as 1 px light grey (`#E2E2E2`-class) lines. Gridlines
   render *under* cell fills (a filled cell paints over its gridlines, like Excel).
 - Default cell: 13 px system font, dark-grey/near-black text, vertically centered,
-  4 px horizontal padding, text clipped at the cell edge (`functional_spec.md §3.5`).
+  4 px horizontal padding, text clipped at the cell edge (`functional_spec.md §3.6`).
 - Alignment, bold/italic/underline, fill color, number-format text/color per the
   functional spec.
 - Default geometry: column width 100 px, row height 24 px (file overrides honored;
@@ -159,7 +160,7 @@ The one custom-built component (raw GPUI, per the adopted architecture — match
 - `+` button at the end of the tabs (ghost icon button).
 - Double-click a tab → the label swaps to an inline text input (same footprint);
   Enter/blur commits, Esc cancels, invalid names shake/danger-border and revert
-  (validation per `functional_spec.md §3.6`).
+  (validation per `functional_spec.md §3.7`).
 - Right-click → stock context menu: **Rename**, **Delete** (disabled when it's the
   last sheet).
 - Overflow (many sheets): tabs scroll horizontally within the bar (wheel/trackpad);
@@ -174,7 +175,6 @@ All stock gpui-component modal/dialog components or native macOS panels:
 | Open file | **Native** NSOpenPanel | `.xlsx` filter |
 | Save As | **Native** NSSavePanel | enforces `.xlsx` |
 | Unsaved changes on close | gpui-component modal | Save / Don't Save / Cancel; Save routes through Save/Save As |
-| Fidelity warning on first save | gpui-component modal | Save Anyway / Cancel (`functional_spec.md §5.2`) |
 | Open/Save failure | gpui-component modal | file name + reason, single OK |
 | Delete sheet confirmation | gpui-component modal | only when sheet has content |
 | About FreeCell | gpui-component modal | name, version, one-liner |
@@ -184,8 +184,9 @@ dialogs are an acceptable fallback — native preferred.
 
 ## 5. Navigation model
 
-- **Welcome ↔ documents**: Welcome opens at launch / when the last document window
-  closes; any document window opening closes Welcome. No other global navigation.
+- **Welcome → documents**: Welcome opens at launch only; any document window opening
+  closes it. Closing the last window (Welcome or document) quits the app. No other
+  global navigation.
 - **Within a document**: single screen; sheet tabs are the only intra-document
   navigation. No panels, sidebars, or settings surfaces in MVP.
 - **Focus model**: exactly one of {grid, data-row field, tab-rename field} holds

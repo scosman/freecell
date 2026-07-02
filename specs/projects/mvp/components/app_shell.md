@@ -38,19 +38,21 @@ struct WorkbookWindow {                  // root Entity per document window
     chrome: ChromeState,                 // action-row toggle states, data-row editor state,
                                          // sheet tabs (mirrored SheetMeta), rename-in-flight
     doc: DocState,                       // path, dirty (op accounting), loading, degraded,
-                                         // eval_in_flight, fidelity_warning_pending: bool
+                                         // eval_in_flight (+ spinner-delay timer state)
     modal: Option<ActiveModal>,          // one modal at a time, owned here
 }
 ```
 
 ### Lifecycle rules (functional_spec §2)
 
-- `show_welcome` only when no workbook windows exist. Any workbook window opening
-  closes welcome; last workbook window closing (post-prompt) reopens it.
+- Welcome shows at launch only. Any workbook window opening closes it. When the last
+  window closes (workbook post-prompt, or Welcome itself), **the app quits** — the
+  registry quits the app when its window count reaches zero.
 - **Open**: dedupe by canonical path — if already open, activate that window.
   Otherwise create the window immediately in loading state and `DocumentClient::spawn
-  (OpenFile)`; `Loaded` → populate tabs + grid; `LoadFailed` → close window (or if it
-  was the only pending one, return to welcome) + error dialog.
+  (OpenFile)`; `Loaded` → populate tabs + grid; `LoadFailed` → error dialog, then
+  close the window (if it was the last window this quits the app, unless the open
+  came from Welcome — then Welcome simply stays).
 - **Close (Cmd+W / traffic light)**: if dirty → modal Save / Don't Save / Cancel;
   Save routes through the save flow and closes on `Saved`. GPUI window-close
   interception at the pinned rev: use the `on_should_close`-style hook if present;
@@ -97,8 +99,11 @@ welcome window because it registers no handlers.
     down; Shift+Enter/Tab variants per keymap; Escape = revert to raw_content, back
     to Idle, grid regains focus.
   - **Cap-rejected**: danger border + message popover; stays Editing.
-- Eval spinner at the row's right end while `eval_in_flight` (from
-  `EvalStarted/Finished` events).
+- **Evaluating spinner** lives at the action row's right end (`ui_design.md §3.1`),
+  not here. Logic: on `EvalStarted`, arm a 250 ms one-shot timer (gpui delayed task);
+  if `EvalFinished` arrives first, cancel — spinner never shows; otherwise show until
+  `EvalFinished`. Coalesced back-to-back evals keep it shown (re-arm only from
+  not-in-flight → in-flight).
 
 ### Sheet tab bar
 
@@ -116,19 +121,19 @@ welcome window because it registers no handlers.
 
 All gpui-component modals rendered by `WorkbookWindow` (or a bare dialog window for
 app-level errors), one at a time via `modal: Option<ActiveModal>`:
-`UnsavedChanges{then: CloseWindow|Quit}`, `FidelityWarning{then_save_to: PathBuf}`,
-`ErrorInfo{title, detail}`, `ConfirmDeleteSheet{idx}`, `About`. Each is a small enum
+`UnsavedChanges{then: CloseWindow|Quit}`, `ErrorInfo{title, detail}`,
+`ConfirmDeleteSheet{idx}`, `About`. Each is a small enum
 variant + handler — no dialog framework. Native `NSOpenPanel`/`NSSavePanel` via
 GPUI's path-prompt API (confirmed pattern in zed at the rev; gpui-component fallback
 if broken).
 
 ### Save flow (ties together §5.2 of the functional spec)
 
-`Save` action → if no path → SavePanel → path. If document was opened from disk and
-`fidelity_warning_pending` (set true on Loaded, cleared after first accepted warning)
-→ FidelityWarning modal → on Save Anyway proceed. Send `Command::Save{path}`;
+`Save` action → if no path → SavePanel → path. Send `Command::Save{path}`;
 `Saved{ops_seen}` clears dirty (op accounting per architecture §2) and updates
-title/path (Save As); `SaveFailed` → ErrorInfo, stay dirty.
+title/path (Save As); `SaveFailed` → ErrorInfo, stay dirty. No fidelity warning in
+MVP — saves write IronCalc-native content as-is (warn-and-strip is the post-MVP
+`projects/xlsx-preservation.md` project).
 
 ## Dependencies
 
@@ -145,8 +150,9 @@ matrix), `to_a1_*`, palette constants sanity, data-row state machine as a pure
 
 macOS (gpui test context, as far as its APIs allow — anything not drivable is listed
 in the phase plan explicitly): `welcome_to_workbook_lifecycle`,
-`open_dedupes_same_path`, `close_dirty_prompts_and_cancel_keeps_window`,
-`save_as_sets_title`, `fidelity_warning_once_per_document`,
+`last_window_close_quits_app`, `open_dedupes_same_path`,
+`close_dirty_prompts_and_cancel_keeps_window`, `save_as_sets_title`,
+`eval_spinner_only_after_250ms` (short eval never shows it; long eval shows + hides),
 `menu_actions_disabled_on_welcome`. Manual smoke checklist (documented in the phase
 plan, not a substitute for the above): traffic-light close prompt, Finder open, panel
 filters.

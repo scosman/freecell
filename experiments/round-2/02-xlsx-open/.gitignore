@@ -1,0 +1,4 @@
+/target
+# Generated .xlsx files are large binaries reproduced from committed code
+# (`cargo run --release --bin gen`); never commit them.
+*.xlsx

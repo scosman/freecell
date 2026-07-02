@@ -1,0 +1,29 @@
+{
+  "name": "formualizer/writes-single",
+  "input_size": 1000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 1000,
+    "min_ns": 6319,
+    "max_ns": 415392,
+    "mean_ns": 159439,
+    "p50_ns": 148527,
+    "p99_ns": 365197
+  },
+  "extra": {
+    "design": null,
+    "engine": "formualizer",
+    "metrics": {
+      "batched_ns": 190808047,
+      "single_total_vs_batched_ratio": 0.8355989304790694
+    },
+    "scenario": "writes-single"
+  }
+}

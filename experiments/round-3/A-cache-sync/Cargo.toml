@@ -1,0 +1,32 @@
+[package]
+name = "cache_sync"
+version = "0.1.0"
+edition = "2021"
+description = "FreeCell Round-3 A (the crux) -- style/geometry cache sync + structural editing. Independent Cargo project; depends read-only by relative path on ../../round-2/harness and ../../shared/*. Probes IronCalc 0.7.1's interactive UserModel (insert/delete rows/cols, undo/redo, copy/paste, diff-list, Send-ness -- does the SP1 seam hold?), asserts structural edits shift references + band styles + sizes, and builds a resident-cache-shift prototype that provably agrees with IronCalc. Scaffolding stub only -- the investigation is implemented in Phase A."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "cache_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cache_sync"
+path = "src/main.rs"
+
+[dependencies]
+# Frozen, read-only shared harness (the IronCalc adapter + SpreadsheetEngine trait +
+# scenarios + peak_rss). Same IronCalc 0.7.1 pin, so A's numbers stay comparable.
+round2_harness = { path = "../../round-2/harness" }
+# Frozen shared crates (datagen for shape generation, bench_util for stats/gating/env).
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }
+# Direct IronCalc access for the interactive UserModel API (insert/delete rows/cols,
+# undo/redo, diff-list) that the neutral harness trait does not expose. Same 0.7 pin as
+# the harness (Cargo.lock -> 0.7.1).
+ironcalc = "0.7"
+ironcalc_base = "0.7"
+anyhow = "1"
+# For a stable byte identity of `Style` in the cache interner (Style is Serialize but not
+# Hash) and for writing env-stamped result JSON.
+serde_json = "1"

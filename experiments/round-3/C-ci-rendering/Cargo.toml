@@ -1,0 +1,20 @@
+[package]
+name = "ci_rendering"
+version = "0.1.0"
+edition = "2021"
+description = "FreeCell Round-3 C -- CI snapshot rendering (in-container, authoritative half): a pure-Rust, tested perceptual-diff harness (load two PNGs, tolerance-based difference, pass/fail) used to compare a rendered grid snapshot against a committed baseline. GPUI-INDEPENDENT: builds + tests cleanly in the headless Linux container (no GPU/display). The macOS render->PNG harness (which needs a real GPU/Metal and is macOS-only in the pinned Zed rev) is a SEPARATE nested package `render-grid/` so this crate's dependency graph never references the GPUI git dep -- keeping the in-container deliverable buildable behind the container proxy. See README.md, findings.md."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The perceptual-diff harness is a library so the macOS `render-grid` package can reuse it.
+[lib]
+name = "ci_rendering"
+path = "src/lib.rs"
+
+[dependencies]
+# Pure-Rust image I/O + diff. Builds + runs in the headless Linux container.
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

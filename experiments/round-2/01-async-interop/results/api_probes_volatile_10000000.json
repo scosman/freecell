@@ -1,0 +1,17 @@
+{
+  "date": "2026-07-01",
+  "diff_list_edit_sites_only": {
+    "chain_10": {
+      "cascaded_cells": 9,
+      "one_edit_diff_bytes": 28
+    },
+    "chain_1000": {
+      "cascaded_cells": 999,
+      "one_edit_diff_bytes": 28
+    },
+    "finding": "UserModel diff-list records only edit-sites; one-edit diff size does NOT scale with cascade -> IronCalc exposes no evaluated-cell change stream."
+  },
+  "experiment": "SP1 API probes",
+  "model_is_send": "asserted at compile time (seam::assert_model_send)",
+  "snapshot_roundtrips": true
+}

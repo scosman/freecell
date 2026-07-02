@@ -1,0 +1,30 @@
+[package]
+name = "raw_gpui_poc"
+version = "0.1.0"
+edition = "2024"
+description = "FreeCell UI PoC — raw-gpui variant: a custom virtualized spreadsheet grid built on raw gpui primitives (absolute-positioned cells, own visible-range math via poc_core::Axis). One of the two Sub-project E variants. macOS/Metal only."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "raw_gpui_poc"
+path = "src/main.rs"
+
+# ---------------------------------------------------------------------------------
+# macOS/Metal ONLY. This crate depends on `gpui`, which does not build in the headless
+# Linux CI container (no GPU/display, heavy system deps). Do NOT `cargo build` this on
+# Linux — build/run it on a Mac via ../scripts/. The engine-neutral, testable logic
+# lives in ../poc-core (which builds anywhere and is CI-checked).
+#
+# The gpui pins below mirror gpui-component's own workspace Cargo.toml so the two
+# variants agree on the gpui/zed revision (post Window/App split; bootstrap is
+# `gpui_platform::application().run(...)`). If `git ls-remote` shows a newer known-good
+# pairing, bump both revs together. See ../findings.md "Cargo pinning" / HUMAN RUN.
+# ---------------------------------------------------------------------------------
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
+
+poc_core = { path = "../poc-core" }
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }

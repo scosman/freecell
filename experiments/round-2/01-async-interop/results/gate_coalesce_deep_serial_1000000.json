@@ -1,0 +1,25 @@
+{
+  "name": "coalesce",
+  "input_size": 1000000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "HEAD"
+  },
+  "gates": [
+    {
+      "name": "coalesce_eval_count",
+      "measured_ns": 1,
+      "target_ns": 2,
+      "verdict": "PASS"
+    }
+  ],
+  "extra": {
+    "burst_edits": 30,
+    "coalesce_bound": 2,
+    "evals_for_burst": 1
+  }
+}

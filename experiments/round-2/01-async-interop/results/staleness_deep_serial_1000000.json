@@ -1,0 +1,11 @@
+{
+  "date": "2026-07-01",
+  "experiment": "SP1 staleness window + snapshot cost",
+  "model_shape": "deep_serial",
+  "populated_cells": 1000000,
+  "snapshot_to_bytes": "192.71 ms",
+  "snapshot_to_bytes_bytes": 13000288,
+  "snapshot_to_bytes_ns": 192709636,
+  "staleness_window": "1.29s",
+  "staleness_window_ns": 1291809603
+}

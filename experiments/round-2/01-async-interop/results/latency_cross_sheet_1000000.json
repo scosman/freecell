@@ -1,0 +1,30 @@
+{
+  "name": "evaluate_cross_sheet_1000000",
+  "input_size": 1000000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "HEAD"
+  },
+  "stats": {
+    "count": 7,
+    "min_ns": 1015437208,
+    "max_ns": 1120301032,
+    "mean_ns": 1052217805,
+    "p50_ns": 1034178195,
+    "p99_ns": 1120301032
+  },
+  "extra": {
+    "build_secs": 1.9673892899999998,
+    "populated_cells": 1000000,
+    "requested_size": 1000000,
+    "samples": 7,
+    "shape": "cross_sheet",
+    "tail_a1": "A500000",
+    "tail_after": 9.0,
+    "tail_before": 8.0
+  }
+}

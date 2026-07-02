@@ -1,0 +1,15 @@
+{
+  "canonical_total": 506,
+  "disagreement_names": [],
+  "disagreements": 0,
+  "environment": {
+    "arch": "x86_64",
+    "commit": "d644aac",
+    "cores": 4,
+    "cpu": "",
+    "os": "linux"
+  },
+  "generated_utc": "2026-07-01",
+  "probe_recognized": 345,
+  "static_supported": 345
+}

@@ -1,0 +1,11 @@
+{
+  "date": "2026-07-01",
+  "experiment": "SP1 staleness window + snapshot cost",
+  "model_shape": "volatile",
+  "populated_cells": 10000000,
+  "snapshot_to_bytes": "2.04 s",
+  "snapshot_to_bytes_bytes": 96825658,
+  "snapshot_to_bytes_ns": 2039526746,
+  "staleness_window": "6.11s",
+  "staleness_window_ns": 6105483790
+}

@@ -1,0 +1,25 @@
+[package]
+name = "render_grid"
+version = "0.1.0"
+edition = "2021"
+description = "FreeCell Round-3 C -- the MACOS/HUMAN-RUN half of CI snapshot rendering. Renders a minimal FreeCell grid OFFSCREEN via GPUI's headless capture surface (VisualTestAppContext + gpui_platform::current_headless_renderer -> Window::render_to_image) and writes a PNG, then perceptual-diffs it against a baseline using the parent `ci_rendering` crate's tolerance-based diff. GPUI's headless renderer is macOS/Metal-only in the pinned Zed rev, so this package is a SEPARATE crate from the in-container `ci_rendering` lib: its GPUI git dependency is only ever resolved/built here, on macOS. Do NOT `cargo build` this in the headless Linux container (no GPU/display + the git dep is behind the container proxy) -- that is expected; see ../findings.md and ../scripts/render_and_diff.sh."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "render_grid"
+path = "src/main.rs"
+
+[dependencies]
+# The GPUI-independent perceptual-diff harness, reused so render + diff live in one binary.
+ci_rendering = { path = ".." }
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"
+
+# GPUI pins mirror ../../../04-ui-poc/raw-gpui/Cargo.toml (same Zed rev as the validated
+# raw-gpui grid PoC), so the offscreen render path matches the human-validated grid.
+# `gpui_platform` adds `test-support` to expose the headless capture surface
+# (`current_platform`, `current_headless_renderer`, `VisualTestAppContext`,
+# `Window::render_to_image`). These build ONLY on macOS.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "test-support"] }

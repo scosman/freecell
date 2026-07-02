@@ -1,0 +1,37 @@
+[package]
+name = "formualizer_file"
+version = "0.1.0"
+edition = "2021"
+description = "Formualizer 0.7 file-I/O round-trip crate for the FreeCell Phase 1 engine bake-off (Sub-project B). Loads/edits/saves .xlsx (calamine read + umya write) and CSV, and documents what survives a load->edit->save->reload round-trip."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "formualizer_file"
+path = "src/lib.rs"
+
+[dependencies]
+# Frozen, engine-neutral synthetic-data + CSV generators (read-only): inputs are
+# produced by committed code, never hand-made binaries (functional_spec §5.3).
+datagen = { path = "../../shared/datagen" }
+anyhow = "1"
+
+# Formualizer meta-crate. File-I/O feature set mirrors the Sub-project A smoke crate:
+# - eval/parse/workbook: the calc engine + Workbook API (needed to build + reload)
+# - calamine: read .xlsx
+# - umya: write .xlsx (Workbook::to_xlsx_bytes)
+# - csv: read/write CSV
+# - json + system-clock: kept explicit (as in the smoke crate)
+[dependencies.formualizer]
+version = "0.7"
+default-features = false
+features = [
+    "eval",
+    "parse",
+    "workbook",
+    "calamine",
+    "csv",
+    "umya",
+    "json",
+    "system-clock",
+]

@@ -1,0 +1,96 @@
+{
+  "date": "2026-07-01",
+  "environment": {
+    "arch": "x86_64",
+    "commit": "HEAD",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux"
+  },
+  "experiment": "SP1 follow-on — scroll-read during an in-flight eval",
+  "model_shape": "deep_serial",
+  "populated_cells": 1000000,
+  "q1_live_scroll_during_eval": {
+    "description": "SetViewport to a new region issued mid-eval; time until that region is published",
+    "issued_mid_eval": true,
+    "service_latency": "1.39 s",
+    "service_latency_ns": 1391802842,
+    "verdict": "BLOCKED ~one eval duration — the live model cannot be read while evaluate() holds &mut self, and SetViewport is only drained between evals",
+    "warm_eval_ns": 1454821473
+  },
+  "q2_snapshot_concurrent_read": {
+    "description": "arbitrary snapshot-Model reads while the real model is mid-evaluate()",
+    "from_bytes_ns": 3042034419,
+    "read_max_ns": 53876,
+    "read_p50_ns": 1628,
+    "read_p99_ns": 2916,
+    "reads_during_eval": 2000,
+    "reads_total": 2000,
+    "snapshot_build_total": "3.23 s",
+    "snapshot_build_total_ns": 3227464066,
+    "snapshot_bytes": 13000285,
+    "snapshot_peak_rss_delta": "399.9 MB",
+    "snapshot_peak_rss_delta_bytes": 419352576,
+    "to_bytes_ns": 185429647,
+    "verdict": "NOT blocked — a separate Model has no aliasing with the worker's &mut Model; reads return stale (pre-eval) values, fine for scrolling"
+  },
+  "q3_overscan_headroom": {
+    "by_factor": [
+      {
+        "col_headroom_each_side": 0,
+        "overscan_factor": 1,
+        "published_cell_count": 480,
+        "published_cols": 12,
+        "published_rows": 40,
+        "row_headroom_each_side": 0,
+        "visible_cols": 12,
+        "visible_rows": 40
+      },
+      {
+        "col_headroom_each_side": 6,
+        "overscan_factor": 2,
+        "published_cell_count": 1920,
+        "published_cols": 24,
+        "published_rows": 80,
+        "row_headroom_each_side": 20,
+        "visible_cols": 12,
+        "visible_rows": 40
+      },
+      {
+        "col_headroom_each_side": 12,
+        "overscan_factor": 3,
+        "published_cell_count": 4320,
+        "published_cols": 36,
+        "published_rows": 120,
+        "row_headroom_each_side": 40,
+        "visible_cols": 12,
+        "visible_rows": 40
+      },
+      {
+        "col_headroom_each_side": 18,
+        "overscan_factor": 4,
+        "published_cell_count": 7680,
+        "published_cols": 48,
+        "published_rows": 160,
+        "row_headroom_each_side": 60,
+        "visible_cols": 12,
+        "visible_rows": 40
+      },
+      {
+        "col_headroom_each_side": 24,
+        "overscan_factor": 5,
+        "published_cell_count": 12000,
+        "published_cols": 60,
+        "published_rows": 200,
+        "row_headroom_each_side": 80,
+        "visible_cols": 12,
+        "visible_rows": 40
+      }
+    ],
+    "description": "scroll headroom inside a k× published overscan window (no worker read needed)",
+    "in_window_read_served_from_buffer": true,
+    "visible_cols": 12,
+    "visible_rows": 40
+  },
+  "warm_eval_ns": 1454821473
+}

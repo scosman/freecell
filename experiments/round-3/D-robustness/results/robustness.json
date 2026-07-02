@@ -1,0 +1,174 @@
+{
+  "date": "2026-07-01",
+  "discovery_deep_recursion_overflow_is_abort": true,
+  "environment": {
+    "arch": "x86_64",
+    "commit": "local",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux"
+  },
+  "gate_circular_refs_error_no_hang": true,
+  "gate_malformed_error_no_panic": true,
+  "investigation": "D-robustness",
+  "ironcalc": "0.7.1",
+  "probes": [
+    {
+      "case": "A1=A1 (self)",
+      "class": "circular_ref",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#CIRC!",
+      "wall_ms": 0.717824
+    },
+    {
+      "case": "A1=B1,B1=A1 (mutual)",
+      "class": "circular_ref",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#CIRC!",
+      "wall_ms": 0.20434699999999997
+    },
+    {
+      "case": "ring N=1000",
+      "class": "circular_ref",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#CIRC!",
+      "wall_ms": 4.53071
+    },
+    {
+      "case": "=1+",
+      "class": "malformed",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#ERROR!",
+      "wall_ms": 0.20258099999999998
+    },
+    {
+      "case": "=SUM(",
+      "class": "malformed",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#ERROR!",
+      "wall_ms": 0.140562
+    },
+    {
+      "case": "=@#$%",
+      "class": "malformed",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#ERROR!",
+      "wall_ms": 0.092857
+    },
+    {
+      "case": "=)(",
+      "class": "malformed",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#ERROR!",
+      "wall_ms": 0.076732
+    },
+    {
+      "case": "=(",
+      "class": "malformed",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#ERROR!",
+      "wall_ms": 0.08180599999999999
+    },
+    {
+      "case": "=A1:",
+      "class": "malformed",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#ERROR!",
+      "wall_ms": 0.07567399999999999
+    },
+    {
+      "case": "=IF(",
+      "class": "malformed",
+      "is_error": true,
+      "status": "COMPLETED",
+      "value": "#ERROR!",
+      "wall_ms": 0.09135499999999999
+    },
+    {
+      "case": "=\"unterminated",
+      "class": "malformed",
+      "is_error": false,
+      "status": "COMPLETED",
+      "value": "unterminated",
+      "wall_ms": 0.082556
+    },
+    {
+      "class": "giant_flat",
+      "is_error": false,
+      "status": "COMPLETED",
+      "terms": 1000,
+      "value": "1000",
+      "wall_ms": 2.015682
+    },
+    {
+      "class": "giant_flat",
+      "is_error": false,
+      "status": "COMPLETED",
+      "terms": 5000,
+      "value": "5000",
+      "wall_ms": 11.748243
+    },
+    {
+      "class": "giant_flat",
+      "is_error": false,
+      "status": "COMPLETED",
+      "terms": 8000,
+      "value": "8000",
+      "wall_ms": 19.919781
+    },
+    {
+      "aborts_by": 2755,
+      "class": "recursion_overflow",
+      "note": "abort, not catch_unwind-able; mitigation = pre-eval input cap / bigger worker stack",
+      "ok_upto": 2726,
+      "shape": "NestedParens",
+      "stack": "default"
+    },
+    {
+      "aborts_by": 11897,
+      "class": "recursion_overflow",
+      "note": "abort, not catch_unwind-able; mitigation = pre-eval input cap / bigger worker stack",
+      "ok_upto": 11870,
+      "shape": "WideFlat",
+      "stack": "default"
+    },
+    {
+      "adversarial": "=A1",
+      "adversarial_panicked": false,
+      "class": "worker_recovery",
+      "post_recovery_value": "5",
+      "recovered": true
+    },
+    {
+      "adversarial": "=1+",
+      "adversarial_panicked": false,
+      "class": "worker_recovery",
+      "post_recovery_value": "5",
+      "recovered": true
+    },
+    {
+      "adversarial": "=SUM(",
+      "adversarial_panicked": false,
+      "class": "worker_recovery",
+      "post_recovery_value": "5",
+      "recovered": true
+    },
+    {
+      "adversarial": "=1+1+1+1+1+1+1+1+1+1… (10000 chars)",
+      "adversarial_panicked": false,
+      "class": "worker_recovery",
+      "post_recovery_value": "5",
+      "recovered": true
+    }
+  ],
+  "worker_recommendation": "wrap evaluate() in catch_unwind (defense-in-depth) AND cap formula length/nesting before eval; the only crash mode (deep-recursion stack overflow, from nested parens OR long flat operator chains) is an ABORT that catch_unwind cannot catch, so a pre-eval input cap (and/or a larger worker stack) is the real mitigation."
+}

@@ -1,0 +1,6 @@
+{
+  "reason": "deep-serial 10^7 capped: 10M-deep recursion risks stack overflow / OOM on the 4c/15GB box; 10^6 (~2s) is the recorded known-FAIL ceiling",
+  "requested_size": 10000000,
+  "shape": "deep_serial",
+  "status": "capped"
+}

@@ -1,0 +1,133 @@
+{
+  "all_windows_gate_pass": false,
+  "crossover_sweep": {
+    "first_fail_cells": 4800,
+    "largest_pass_cells": 3500,
+    "note": "largest window whose value+style p99 stays under 2 ms, at Excel-max",
+    "points": [
+      {
+        "cells": 1200,
+        "p99_ns": 512385,
+        "pass": true
+      },
+      {
+        "cells": 2000,
+        "p99_ns": 914594,
+        "pass": true
+      },
+      {
+        "cells": 2475,
+        "p99_ns": 1078726,
+        "pass": true
+      },
+      {
+        "cells": 2750,
+        "p99_ns": 1566155,
+        "pass": true
+      },
+      {
+        "cells": 3000,
+        "p99_ns": 1288135,
+        "pass": true
+      },
+      {
+        "cells": 3500,
+        "p99_ns": 1508775,
+        "pass": true
+      },
+      {
+        "cells": 4800,
+        "p99_ns": 2119869,
+        "pass": false
+      },
+      {
+        "cells": 7000,
+        "p99_ns": 3208972,
+        "pass": false
+      }
+    ]
+  },
+  "date": "2026-07-01",
+  "engine": "ironcalc",
+  "engine_version": "0.7.1",
+  "environment": {
+    "arch": "x86_64",
+    "commit": "unknown",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux"
+  },
+  "excel_max": {
+    "cols": 16384,
+    "rows": 1048576
+  },
+  "experiment": "SP4 -- styled viewport read at scale",
+  "gate_target_ns": 2000000,
+  "pan_steps": 300,
+  "phase1_value_only_baseline_p99_ns": 392422,
+  "read": "value + get_style_for_cell per visible cell (per-cell loop; no native bulk style read)",
+  "windows": [
+    {
+      "added_style_cost_p99_ns": 1060438,
+      "cells": 1800,
+      "excel_max_far_corner": {
+        "col": 16383,
+        "row": 1048575
+      },
+      "excel_max_origin": {
+        "col0": 16154,
+        "row0": 1048116
+      },
+      "gate_p99_under_2ms": true,
+      "gate_summary": "PASS styled-read/viewport: measured 1.20 ms <= target 2.00 ms",
+      "gate_target_ns": 2000000,
+      "value_only_control": {
+        "p50_ns": 89733,
+        "p99_ns": 135799
+      },
+      "value_plus_style": {
+        "count": 300,
+        "max_ns": 1363778,
+        "mean_ns": 728871,
+        "p50_ns": 711242,
+        "p99_ns": 1196237
+      },
+      "verified_real": {
+        "non_empty_values": 450,
+        "styled_cells": 1800
+      },
+      "window": "viewport"
+    },
+    {
+      "added_style_cost_p99_ns": 6408836,
+      "cells": 10000,
+      "excel_max_far_corner": {
+        "col": 16383,
+        "row": 1048575
+      },
+      "excel_max_origin": {
+        "col0": 16084,
+        "row0": 1048076
+      },
+      "gate_p99_under_2ms": false,
+      "gate_summary": "FAIL styled-read/overscan: measured 6.97 ms > target 2.00 ms",
+      "gate_target_ns": 2000000,
+      "value_only_control": {
+        "p50_ns": 483737,
+        "p99_ns": 558090
+      },
+      "value_plus_style": {
+        "count": 300,
+        "max_ns": 7757687,
+        "mean_ns": 3873705,
+        "p50_ns": 3804797,
+        "p99_ns": 6966926
+      },
+      "verified_real": {
+        "non_empty_values": 2500,
+        "styled_cells": 10000
+      },
+      "window": "overscan"
+    }
+  ]
+}

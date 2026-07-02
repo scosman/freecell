@@ -1,0 +1,38 @@
+[package]
+name = "gpui_component_poc"
+version = "0.1.0"
+edition = "2024"
+description = "FreeCell UI PoC — gpui-component variant: a spreadsheet grid on gpui-component's virtualized DataTable/TableDelegate. One of the two Sub-project E variants. macOS/Metal only."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "gpui_component_poc"
+path = "src/main.rs"
+
+# ---------------------------------------------------------------------------------
+# macOS/Metal ONLY — see ../raw-gpui/Cargo.toml for the same caveat. Do NOT build on
+# Linux; use ../scripts/ on a Mac. Testable logic is in ../poc-core (CI-checked).
+#
+# Pins mirror gpui-component's own workspace Cargo.toml (post Window/App split;
+# `gpui_platform::application().run(...)`, top-level element is `gpui_component::Root`).
+# The gpui/zed rev is the one gpui-component's workspace pins:
+#   1d217ee39d381ac101b7cf49d3d22451ac1093fe
+# gpui-component itself is pinned to a main SHA; fill it in from
+#   git ls-remote https://github.com/longbridge/gpui-component refs/heads/main
+# (the container proxy blocked resolving it). Keep the gpui rev and the gpui-component
+# SHA a KNOWN-GOOD PAIR — see ../findings.md "Cargo pinning" / HUMAN RUN REQUIRED.
+# ---------------------------------------------------------------------------------
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
+
+# Pin to a known-good main SHA on the Mac (see the comment above); the plain git dep
+# below floats HEAD, which the human should lock with `rev = "<sha>"` before recording
+# numbers so the run is reproducible.
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+
+poc_core = { path = "../poc-core" }
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }

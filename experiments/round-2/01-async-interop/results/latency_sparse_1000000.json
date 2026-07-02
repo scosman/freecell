@@ -1,0 +1,30 @@
+{
+  "name": "evaluate_sparse_1000000",
+  "input_size": 1000000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "HEAD"
+  },
+  "stats": {
+    "count": 7,
+    "min_ns": 152042717,
+    "max_ns": 159431997,
+    "mean_ns": 155275119,
+    "p50_ns": 155629256,
+    "p99_ns": 159431997
+  },
+  "extra": {
+    "build_secs": 0.488872257,
+    "populated_cells": 1000000,
+    "requested_size": 1000000,
+    "samples": 7,
+    "shape": "sparse",
+    "tail_a1": "A1000",
+    "tail_after": 1007.0,
+    "tail_before": 1006.0
+  }
+}

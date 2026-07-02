@@ -1,0 +1,104 @@
+{
+  "canonical_source": "Microsoft 'Excel functions (alphabetical)' catalog (Excel for Microsoft 365); committed data/excel_functions_canonical.csv",
+  "environment": {
+    "arch": "x86_64",
+    "commit": "d644aac",
+    "cores": 4,
+    "cpu": "",
+    "os": "linux"
+  },
+  "generated_utc": "2026-07-01",
+  "ironcalc_source": "ironcalc_base 0.7.1 src/functions/mod.rs Function enum (345 registered); committed data/ironcalc_functions.csv",
+  "summary": {
+    "by_category": {
+      "compatibility": {
+        "pct": 0.0,
+        "supported": 0,
+        "total": 38
+      },
+      "cube": {
+        "pct": 0.0,
+        "supported": 0,
+        "total": 7
+      },
+      "database": {
+        "pct": 100.0,
+        "supported": 12,
+        "total": 12
+      },
+      "datetime": {
+        "pct": 100.0,
+        "supported": 25,
+        "total": 25
+      },
+      "dynamic-array": {
+        "pct": 0.0,
+        "supported": 0,
+        "total": 17
+      },
+      "engineering": {
+        "pct": 100.0,
+        "supported": 54,
+        "total": 54
+      },
+      "financial": {
+        "pct": 50.90909090909091,
+        "supported": 28,
+        "total": 55
+      },
+      "information": {
+        "pct": 95.23809523809524,
+        "supported": 20,
+        "total": 21
+      },
+      "logical": {
+        "pct": 57.89473684210526,
+        "supported": 11,
+        "total": 19
+      },
+      "lookup": {
+        "pct": 63.63636363636363,
+        "supported": 14,
+        "total": 22
+      },
+      "math": {
+        "pct": 89.87341772151899,
+        "supported": 71,
+        "total": 79
+      },
+      "stat": {
+        "pct": 79.27927927927928,
+        "supported": 88,
+        "total": 111
+      },
+      "text": {
+        "pct": 51.16279069767442,
+        "supported": 22,
+        "total": 43
+      },
+      "web": {
+        "pct": 0.0,
+        "supported": 0,
+        "total": 3
+      }
+    },
+    "by_importance": {
+      "common": {
+        "pct": 81.48148148148148,
+        "supported": 154,
+        "total": 189
+      },
+      "obscure": {
+        "pct": 60.25236593059937,
+        "supported": 191,
+        "total": 317
+      }
+    },
+    "canonical_total": 506,
+    "extra_in_ironcalc": 0,
+    "ironcalc_registered": 345,
+    "missing": 161,
+    "overall_pct": 68.18181818181819,
+    "supported": 345
+  }
+}

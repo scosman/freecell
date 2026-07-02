@@ -1,0 +1,36 @@
+{
+  "name": "formualizer/scrolling-read/D3",
+  "input_size": 200000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 300,
+    "min_ns": 318636,
+    "max_ns": 540803,
+    "mean_ns": 359025,
+    "p50_ns": 354523,
+    "p99_ns": 434320
+  },
+  "gates": [
+    {
+      "name": "scrolling-read/D3",
+      "measured_ns": 434320,
+      "target_ns": 2000000,
+      "verdict": "PASS"
+    }
+  ],
+  "extra": {
+    "design": "D3",
+    "engine": "formualizer",
+    "metrics": {
+      "viewport_cells": 1800
+    },
+    "scenario": "scrolling-read"
+  }
+}

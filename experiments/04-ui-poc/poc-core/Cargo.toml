@@ -1,0 +1,21 @@
+[package]
+name = "poc_core"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-neutral, GPUI-free core for the FreeCell Sub-project E UI PoC: variable-size axis virtualization (prefix-sum + binary search), render-ready cell styling, the scripted Run Test viewport harness, and results recording. Both the raw-gpui and gpui-component variants render against this so their look and measurement path are identical. This crate has NO gpui dependency and is cargo-check/test-able on Linux (architecture §7)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "poc_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Frozen, read-only shared crates (relative path; two levels up to experiments/shared).
+# poc_core is engine-neutral and, deliberately, GPUI-free — the two rendering shells
+# (raw-gpui/, gpui-component/) depend on this crate plus gpui, but this crate never
+# pulls gpui so it stays buildable in the headless Linux container.
+datagen = { path = "../../shared/datagen" }
+bench_util = { path = "../../shared/bench_util" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

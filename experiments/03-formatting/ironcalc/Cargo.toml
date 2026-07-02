@@ -1,0 +1,20 @@
+[package]
+name = "ironcalc_formatting"
+version = "0.1.0"
+edition = "2021"
+description = "IronCalc 0.7 formatting/metadata exposure probe for the FreeCell Phase 1 engine bake-off (Sub-project D). Probes native Style read/write and xlsx style round-trip."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "ironcalc_formatting"
+path = "src/lib.rs"
+
+[dependencies]
+datagen = { path = "../../shared/datagen" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The crates are `ironcalc` (facade + xlsx I/O) and `ironcalc_base` (engine + Style
+# types). Note the UNDERSCORE — `ironcalc-base` does not resolve on crates.io. Both 0.7.x.
+ironcalc = "0.7"
+ironcalc_base = "0.7"

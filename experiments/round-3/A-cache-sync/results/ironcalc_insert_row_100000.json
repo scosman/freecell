@@ -1,0 +1,20 @@
+{
+  "name": "ironcalc_insert_row",
+  "input_size": 100000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "round-3-phase-A"
+  },
+  "stats": {
+    "count": 200,
+    "min_ns": 328967236,
+    "max_ns": 449999877,
+    "mean_ns": 388079479,
+    "p50_ns": 389320334,
+    "p99_ns": 431109496
+  }
+}

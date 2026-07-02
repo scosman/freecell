@@ -1,0 +1,47 @@
+[package]
+name = "xlsx_open"
+version = "0.1.0"
+edition = "2021"
+description = "SP2 -- End-to-end large styled .xlsx open: a committed, reproducible >=100 MB styled-.xlsx generator (values + formulas + styles + multiple sheets + shared strings, written via IronCalc's native styled writer) and a fresh-child-process open harness that measures open wall-clock, peak RSS (canonical VmHWM), a coarse honest stage breakdown, and time-to-first-paint (cached values queryable) vs full-recompute-ready."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Independent Cargo project (NOT a workspace member), depending read-only by relative
+# path on the frozen round-2 harness (canonical peak_rss() + IronCalc 0.7.1 pin), the
+# frozen shared datagen (cell/format content, read-only), and bench_util (env-stamped
+# results). Mirrors architecture Section 1's per-experiment isolation. The .xlsx WRITER
+# lives here, not in the frozen datagen.
+
+[lib]
+name = "xlsx_open"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gen"
+path = "src/bin/gen.rs"
+
+[[bin]]
+name = "open"
+path = "src/bin/open.rs"
+
+[[bin]]
+name = "measure"
+path = "src/bin/measure.rs"
+
+[dependencies]
+# Frozen, read-only. Canonical fresh-process peak_rss() (VmHWM) + the IronCalc pin.
+round2_harness = { path = "../harness" }
+# Frozen, read-only. Deterministic cell/format CONTENT (SyntheticSheet). No writer here.
+datagen = { path = "../../shared/datagen" }
+# Frozen, read-only. Env stamp (Environment::detect) + BenchResult JSON for provenance.
+bench_util = { path = "../../shared/bench_util" }
+# Same IronCalc pin as the harness: native styled .xlsx writer/reader + Style types.
+ironcalc = "0.7"
+ironcalc_base = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# Read-only: sum the uncompressed sizes of the .xlsx zip entries so peak RSS can be
+# reported as a multiple of the UNCOMPRESSED payload (the off-ramp criterion), not just
+# the compressed on-disk size. Pinned to IronCalc's own zip version for lockfile unity.
+zip = "0.6"

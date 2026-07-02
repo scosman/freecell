@@ -1,0 +1,20 @@
+{
+  "name": "ironcalc_delete_row",
+  "input_size": 100000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "round-3-phase-A"
+  },
+  "stats": {
+    "count": 200,
+    "min_ns": 291432998,
+    "max_ns": 367181373,
+    "mean_ns": 320776675,
+    "p50_ns": 318076797,
+    "p99_ns": 356967950
+  }
+}

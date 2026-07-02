@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+r"""Build the committed golden-case table (data/golden_cases.csv).
+
+The cases are held here as structured Python tuples and emitted with proper CSV
+quoting, because formulas and inputs contain commas that would otherwise corrupt a
+hand-edited CSV. Edit THIS file to grow the suite, then re-run it.
+
+Columns: id,category,formula,inputs,expected_kind,expected,tol
+  - inputs: ';'-separated Cell=literal seeds (a literal beginning with '=' is a formula
+    seed, e.g. to seed a date or a precedent error). Text literals are double-quoted.
+  - expected_kind: number | text | bool | error | empty
+  - expected: known-correct Excel result (error tokens are Excel spellings).
+  - tol: numeric tolerance (blank => 0).
+
+Every expected value is the KNOWN-CORRECT EXCEL output (Excel for Microsoft 365 / the
+long-standing desktop semantics), not IronCalc's — this table is the oracle the harness
+grades IronCalc against.
+
+Run: python3 scripts/build_golden_cases.py
+"""
+import csv
+import os
+
+# (id, category, formula, inputs, expected_kind, expected, tol)
+CASES = [
+    # ---------------- Error semantics / propagation ----------------
+    ("err-div0-literal", "error-propagation", "=1/0", "", "error", "#DIV/0!", ""),
+    ("err-div0-cellref", "error-propagation", "=A1/A2", "A1=10;A2=0", "error", "#DIV/0!", ""),
+    ("err-div0-mod", "error-propagation", "=MOD(5,0)", "", "error", "#DIV/0!", ""),
+    ("err-div0-empty-divisor", "error-propagation", "=A1/A2", "A1=5", "error", "#DIV/0!", ""),
+    ("err-na-func", "error-propagation", "=NA()", "", "error", "#N/A", ""),
+    ("err-na-vlookup-miss", "error-propagation", "=VLOOKUP(99,A1:B3,2,FALSE)",
+     "A1=1;B1=10;A2=2;B2=20;A3=3;B3=30", "error", "#N/A", ""),
+    ("err-na-match-miss", "error-propagation", "=MATCH(99,A1:A3,0)", "A1=1;A2=2;A3=3",
+     "error", "#N/A", ""),
+    ("err-na-hlookup-miss", "error-propagation", "=HLOOKUP(99,A1:C2,2,FALSE)",
+     "A1=1;B1=2;C1=3;A2=10;B2=20;C2=30", "error", "#N/A", ""),
+    ("err-value-text-plus", "error-propagation", "=A1+A2", 'A1=5;A2="abc"', "error", "#VALUE!", ""),
+    ("err-value-sqrt-text", "error-propagation", "=SQRT(A1)", 'A1="x"', "error", "#VALUE!", ""),
+    ("err-value-datevalue-bad", "error-propagation", '=DATEVALUE("not a date")', "",
+     "error", "#VALUE!", ""),
+    ("err-num-sqrt-neg", "error-propagation", "=SQRT(-1)", "", "error", "#NUM!", ""),
+    ("err-num-overflow", "error-propagation", "=10^309", "", "error", "#NUM!", ""),
+    ("err-num-large-fact", "error-propagation", "=FACT(200)", "", "error", "#NUM!", ""),
+    ("err-name-typo", "error-propagation", "=SUMM(A1:A2)", "A1=1;A2=2", "error", "#NAME?", ""),
+    ("err-ref-index-oob", "error-propagation", "=INDEX(A1:A3,9)", "A1=1;A2=2;A3=3",
+     "error", "#REF!", ""),
+    ("err-propagate-through-sum", "error-propagation", "=SUM(A1,A2)", "A1=1;A2==1/0",
+     "error", "#DIV/0!", ""),
+    ("err-propagate-through-plus", "error-propagation", "=A1+A2", "A1==1/0;A2=5",
+     "error", "#DIV/0!", ""),
+    ("err-propagate-nested", "error-propagation", "=A1*2", "A1==SQRT(-1)", "error", "#NUM!", ""),
+    ("err-iferror-catches-div0", "error-propagation", "=IFERROR(A1/A2,-1)", "A1=10;A2=0",
+     "number", "-1", "0"),
+    ("err-iferror-passes-value", "error-propagation", "=IFERROR(A1/A2,-1)", "A1=10;A2=2",
+     "number", "5", "0"),
+    ("err-ifna-catches-na", "error-propagation", "=IFNA(NA(),42)", "", "number", "42", "0"),
+    ("err-ifna-ignores-div0", "error-propagation", "=IFNA(1/0,42)", "", "error", "#DIV/0!", ""),
+    ("err-iserror-true", "error-propagation", "=ISERROR(1/0)", "", "bool", "TRUE", ""),
+    ("err-iserror-false", "error-propagation", "=ISERROR(1+1)", "", "bool", "FALSE", ""),
+    ("err-iserr-na-false", "error-propagation", "=ISERR(NA())", "", "bool", "FALSE", ""),
+    ("err-isna-true", "error-propagation", "=ISNA(NA())", "", "bool", "TRUE", ""),
+    ("err-errortype-div0", "error-propagation", "=ERROR.TYPE(1/0)", "", "number", "2", "0"),
+    ("err-errortype-na", "error-propagation", "=ERROR.TYPE(NA())", "", "number", "7", "0"),
+    ("err-aggregate-sum-ignores", "error-propagation", "=SUM(A1:A3)", "A1=1;A2=2;A3=3",
+     "number", "6", "0"),
+    ("err-count-ignores-error", "error-propagation", "=COUNT(A1:A2)", "A1=1;A2==1/0",
+     "number", "1", "0"),
+
+    # ---------------- Empty-cell & type coercion ----------------
+    ("coerce-empty-as-zero-add", "coercion", "=A1+5", "", "number", "5", "0"),
+    ("coerce-empty-in-sum", "coercion", "=SUM(A1,A2,10)", "A2=5", "number", "15", "0"),
+    ("coerce-empty-concat", "coercion", '=A1&"x"', "", "text", "x", ""),
+    ("coerce-text-number-add", "coercion", '="5"+2', "", "number", "7", "0"),
+    ("coerce-text-number-cellref", "coercion", "=A1+2", 'A1="5"', "number", "7", "0"),
+    ("coerce-bool-true-add", "coercion", "=TRUE+1", "", "number", "2", "0"),
+    ("coerce-bool-false-add", "coercion", "=FALSE+5", "", "number", "5", "0"),
+    ("coerce-concat-numbers", "coercion", "=1&2", "", "text", "12", ""),
+    ("coerce-concat-num-text", "coercion", '=A1&"kg"', "A1=5", "text", "5kg", ""),
+    ("coerce-n-of-text", "coercion", '=N("hello")', "", "number", "0", "0"),
+    ("coerce-n-of-number", "coercion", "=N(7)", "", "number", "7", "0"),
+    ("coerce-n-of-true", "coercion", "=N(TRUE)", "", "number", "1", "0"),
+    ("coerce-isblank-empty", "coercion", "=ISBLANK(A1)", "", "bool", "TRUE", ""),
+    ("coerce-isblank-emptystring", "coercion", "=ISBLANK(A1)", 'A1=""', "bool", "FALSE", ""),
+    ("coerce-count-blanks", "coercion", "=COUNT(A1:A3)", "A1=1;A3=3", "number", "2", "0"),
+    ("coerce-counta-blanks", "coercion", "=COUNTA(A1:A3)", "A1=1;A3=3", "number", "2", "0"),
+    ("coerce-countblank", "coercion", "=COUNTBLANK(A1:A3)", "A1=1;A3=3", "number", "1", "0"),
+    ("coerce-sum-mixed-text", "coercion", "=SUM(A1,A2,A3)", 'A1=1;A2="ignored";A3=2',
+     "number", "3", "0"),
+    ("coerce-product-with-bool", "coercion", "=A1*TRUE", "A1=6", "number", "6", "0"),
+    ("coerce-value-func", "coercion", '=VALUE("123")', "", "number", "123", "0"),
+    ("coerce-value-percent", "coercion", '=VALUE("50%")', "", "number", "0.5", "0.0000001"),
+    ("coerce-len-of-number", "coercion", "=LEN(12345)", "", "number", "5", "0"),
+    ("coerce-empty-equals-zero", "coercion", "=A1=0", "", "bool", "TRUE", ""),
+    ("coerce-empty-string-len", "coercion", "=LEN(A1)", "", "number", "0", "0"),
+    ("coerce-if-empty-condition", "coercion", '=IF(A1,"y","n")', "", "text", "n", ""),
+    ("coerce-if-one-condition", "coercion", '=IF(1,"y","n")', "", "text", "y", ""),
+    ("coerce-concat-empty-both", "coercion", "=A1&A2", "", "text", "", ""),
+    ("coerce-sumproduct-bools", "coercion", "=SUMPRODUCT((A1:A3>1)*1)", "A1=1;A2=2;A3=3",
+     "number", "2", "0"),
+
+    # ---------------- Date serials / locale ----------------
+    ("date-serial-2020", "dates", "=DATE(2020,1,1)", "", "number", "43831", "0"),
+    ("date-serial-1900-01-01", "dates", "=DATE(1900,1,1)", "", "number", "1", "0"),
+    ("date-serial-epoch-leapbug", "dates", "=DATE(1900,2,28)", "", "number", "59", "0"),
+    ("date-serial-1900-03-01", "dates", "=DATE(1900,3,1)", "", "number", "61", "0"),
+    ("date-datevalue-iso", "dates", '=DATEVALUE("2020-01-01")', "", "number", "43831", "0"),
+    ("date-day-diff", "dates", "=A1-A2", "A1==DATE(2020,1,31);A2==DATE(2020,1,1)",
+     "number", "30", "0"),
+    ("date-year", "dates", "=YEAR(A1)", "A1==DATE(2021,6,15)", "number", "2021", "0"),
+    ("date-month", "dates", "=MONTH(A1)", "A1==DATE(2021,6,15)", "number", "6", "0"),
+    ("date-day", "dates", "=DAY(A1)", "A1==DATE(2021,6,15)", "number", "15", "0"),
+    ("date-eomonth", "dates", "=EOMONTH(A1,0)", "A1==DATE(2021,2,10)", "number", "44255", "0"),
+    ("date-eomonth-next", "dates", "=EOMONTH(A1,1)", "A1==DATE(2021,1,15)", "number", "44255", "0"),
+    ("date-weekday-default", "dates", "=WEEKDAY(A1)", "A1==DATE(2021,6,14)", "number", "2", "0"),
+    ("date-weeknum", "dates", "=WEEKNUM(A1)", "A1==DATE(2021,1,1)", "number", "1", "0"),
+    # EDATE(2021-01-15, +2) = 2021-03-15 = serial 44270 (verified against the Excel epoch).
+    ("date-edate-forward", "dates", "=EDATE(A1,2)", "A1==DATE(2021,1,15)", "number", "44270", "0"),
+    ("date-days-func", "dates", "=DAYS(A1,A2)", "A1==DATE(2020,1,31);A2==DATE(2020,1,1)",
+     "number", "30", "0"),
+    ("date-yearfrac", "dates", "=YEARFRAC(A1,A2)", "A1==DATE(2020,1,1);A2==DATE(2021,1,1)",
+     "number", "1", "0.01"),
+    ("date-time-serial", "dates", "=TIME(12,0,0)", "", "number", "0.5", "0.0000001"),
+    ("date-hour", "dates", "=HOUR(A1)", "A1=0.75", "number", "18", "0"),
+    ("date-isoweeknum", "dates", "=ISOWEEKNUM(A1)", "A1==DATE(2021,1,4)", "number", "1", "0"),
+    ("date-datedif-days", "dates", '=DATEDIF(A1,A2,"D")', "A1==DATE(2020,1,1);A2==DATE(2020,1,31)",
+     "number", "30", "0"),
+
+    # ---------------- Common-function correctness sweep ----------------
+    ("math-sum-range", "common", "=SUM(A1:A3)", "A1=1;A2=2;A3=3", "number", "6", "0"),
+    ("math-average", "common", "=AVERAGE(A1:A3)", "A1=2;A2=4;A3=6", "number", "4", "0"),
+    ("math-round-half", "common", "=ROUND(2.5,0)", "", "number", "3", "0"),
+    ("math-round-neg", "common", "=ROUND(2.567,2)", "", "number", "2.57", "0.0000001"),
+    ("math-rounddown", "common", "=ROUNDDOWN(2.99,0)", "", "number", "2", "0"),
+    ("math-roundup", "common", "=ROUNDUP(2.01,0)", "", "number", "3", "0"),
+    ("math-mod", "common", "=MOD(10,3)", "", "number", "1", "0"),
+    ("math-mod-negative", "common", "=MOD(-1,3)", "", "number", "2", "0"),
+    ("math-power", "common", "=POWER(2,10)", "", "number", "1024", "0"),
+    ("math-int-negative", "common", "=INT(-2.5)", "", "number", "-3", "0"),
+    ("math-trunc", "common", "=TRUNC(-2.7)", "", "number", "-2", "0"),
+    ("math-abs", "common", "=ABS(-7)", "", "number", "7", "0"),
+    ("math-sqrt", "common", "=SQRT(144)", "", "number", "12", "0"),
+    ("math-max", "common", "=MAX(A1:A3)", "A1=3;A2=9;A3=5", "number", "9", "0"),
+    ("math-min", "common", "=MIN(A1:A3)", "A1=3;A2=9;A3=5", "number", "3", "0"),
+    ("math-sumif", "common", '=SUMIF(A1:A3,">1")', "A1=1;A2=2;A3=3", "number", "5", "0"),
+    ("math-countif", "common", '=COUNTIF(A1:A3,">1")', "A1=1;A2=2;A3=3", "number", "2", "0"),
+    ("math-sumifs", "common", '=SUMIFS(B1:B3,A1:A3,">1")',
+     "A1=1;A2=2;A3=3;B1=10;B2=20;B3=30", "number", "50", "0"),
+    ("math-ceiling", "common", "=CEILING(4.2,1)", "", "number", "5", "0"),
+    ("math-floor", "common", "=FLOOR(4.8,1)", "", "number", "4", "0"),
+    ("lookup-vlookup-exact", "common", "=VLOOKUP(2,A1:B3,2,FALSE)",
+     "A1=1;B1=10;A2=2;B2=20;A3=3;B3=30", "number", "20", "0"),
+    ("lookup-vlookup-approx", "common", "=VLOOKUP(2.5,A1:B3,2,TRUE)",
+     "A1=1;B1=10;A2=2;B2=20;A3=3;B3=30", "number", "20", "0"),
+    ("lookup-hlookup", "common", "=HLOOKUP(2,A1:C2,2,FALSE)",
+     "A1=1;B1=2;C1=3;A2=10;B2=20;C2=30", "number", "20", "0"),
+    ("lookup-index-match", "common", "=INDEX(B1:B3,MATCH(3,A1:A3,0))",
+     "A1=1;B1=10;A2=2;B2=20;A3=3;B3=30", "number", "30", "0"),
+    ("lookup-match-exact", "common", "=MATCH(2,A1:A3,0)", "A1=1;A2=2;A3=3", "number", "2", "0"),
+    ("lookup-choose", "common", '=CHOOSE(2,"a","b","c")', "", "text", "b", ""),
+    ("lookup-offset", "common", "=OFFSET(A1,2,0)", "A1=1;A2=2;A3=3", "number", "3", "0"),
+    ("lookup-rows", "common", "=ROWS(A1:A5)", "", "number", "5", "0"),
+    ("lookup-columns", "common", "=COLUMNS(A1:D1)", "", "number", "4", "0"),
+    ("text-left", "common", '=LEFT("hello",3)', "", "text", "hel", ""),
+    ("text-right", "common", '=RIGHT("hello",2)', "", "text", "lo", ""),
+    ("text-mid", "common", '=MID("hello",2,3)', "", "text", "ell", ""),
+    ("text-len", "common", '=LEN("hello")', "", "number", "5", "0"),
+    ("text-upper", "common", '=UPPER("abc")', "", "text", "ABC", ""),
+    ("text-lower", "common", '=LOWER("ABC")', "", "text", "abc", ""),
+    ("text-trim", "common", '=TRIM("  a  b  ")', "", "text", "a b", ""),
+    ("text-concat", "common", '=CONCAT("a","b","c")', "", "text", "abc", ""),
+    ("text-substitute", "common", '=SUBSTITUTE("a-b-c","-","+")', "", "text", "a+b+c", ""),
+    ("text-find", "common", '=FIND("l","hello")', "", "number", "3", "0"),
+    ("text-search-ci", "common", '=SEARCH("L","heLLo")', "", "number", "3", "0"),
+    ("text-rept", "common", '=REPT("ab",3)', "", "text", "ababab", ""),
+    ("text-exact-true", "common", '=EXACT("a","a")', "", "bool", "TRUE", ""),
+    ("text-exact-false", "common", '=EXACT("a","A")', "", "bool", "FALSE", ""),
+    ("text-textjoin", "common", '=TEXTJOIN("-",TRUE,"a","b","c")', "", "text", "a-b-c", ""),
+    ("text-text-format", "common", '=TEXT(0.5,"0%")', "", "text", "50%", ""),
+    ("logical-and", "common", "=AND(TRUE,TRUE,FALSE)", "", "bool", "FALSE", ""),
+    ("logical-or", "common", "=OR(FALSE,FALSE,TRUE)", "", "bool", "TRUE", ""),
+    ("logical-not", "common", "=NOT(FALSE)", "", "bool", "TRUE", ""),
+    ("logical-xor", "common", "=XOR(TRUE,FALSE)", "", "bool", "TRUE", ""),
+    ("logical-ifs", "common", '=IFS(A1>10,"big",A1>5,"mid",TRUE,"small")', "A1=7",
+     "text", "mid", ""),
+    ("logical-switch", "common", '=SWITCH(2,1,"one",2,"two","other")', "", "text", "two", ""),
+
+    # ---------------- Array / spill (mostly documenting the gap as typed results) ------
+    ("array-sumproduct-implicit", "array-spill", "=SUM(A1:A3*B1:B3)",
+     "A1=1;A2=2;A3=3;B1=4;B2=5;B3=6", "number", "32", "0"),
+    ("array-transpose-index", "array-spill", "=INDEX(TRANSPOSE(A1:C1),2)",
+     "A1=10;B1=20;C1=30", "number", "20", "0"),
+    ("array-sequence-unsupported", "array-spill", "=SEQUENCE(3)", "", "error", "#NAME?", ""),
+    ("array-unique-unsupported", "array-spill", "=UNIQUE(A1:A3)", "A1=1;A2=1;A3=2",
+     "error", "#NAME?", ""),
+    ("array-sort-unsupported", "array-spill", "=SORT(A1:A3)", "A1=3;A2=1;A3=2",
+     "error", "#NAME?", ""),
+    ("array-filter-unsupported", "array-spill", "=FILTER(A1:A3,A1:A3>1)", "A1=1;A2=2;A3=3",
+     "error", "#NAME?", ""),
+    ("array-xmatch-unsupported", "array-spill", "=XMATCH(2,A1:A3)", "A1=1;A2=2;A3=3",
+     "error", "#NAME?", ""),
+    ("array-let-unsupported", "array-spill", "=LET(x,5,x*2)", "", "error", "#NAME?", ""),
+]
+
+
+def main():
+    out_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data",
+        "golden_cases.csv",
+    )
+    ids = [c[0] for c in CASES]
+    assert len(ids) == len(set(ids)), "duplicate case ids"
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(["id", "category", "formula", "inputs", "expected_kind", "expected", "tol"])
+        for row in CASES:
+            writer.writerow(row)
+    print(f"wrote:  {out_path}")
+    print(f"count:  {len(CASES)} cases")
+
+
+if __name__ == "__main__":
+    main()

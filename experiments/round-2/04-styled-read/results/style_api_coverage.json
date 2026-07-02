@@ -1,0 +1,61 @@
+{
+  "capabilities": [
+    {
+      "api": "Model::set_cell_style / Model::get_style_for_cell",
+      "evidence": "set a non-default Style on one cell; get_style_for_cell reads back bold + num_fmt + fill",
+      "id": "per_cell",
+      "question": "Does IronCalc expose per-cell styles (read + write)?",
+      "supported": true
+    },
+    {
+      "api": "Model::set_row_style / Model::get_row_style; resolved by get_style_for_cell",
+      "evidence": "set a row band; an untouched cell far along that row (col 250) resolves the band style; adjacent row does not",
+      "id": "row_band",
+      "question": "Does IronCalc expose ROW-band styles (a style applied to a whole row)?",
+      "supported": true
+    },
+    {
+      "api": "Model::set_column_style / Model::get_column_style; resolved by get_style_for_cell",
+      "evidence": "set a column band; an untouched cell far down that column (row 9000) resolves the band style; adjacent column does not",
+      "id": "column_band",
+      "question": "Does IronCalc expose COLUMN-band styles (a style applied to a whole column)?",
+      "supported": true
+    },
+    {
+      "api": "get_style_for_cell over a valueless cell under a band OR with a direct set_cell_style",
+      "evidence": "a cell with get_cell_value == empty still resolves bold via both a row band and a direct per-cell style",
+      "id": "empty_cell",
+      "question": "Can a styled but VALUELESS cell carry/resolve a style (Excel empty styling)?",
+      "supported": true
+    },
+    {
+      "api": "get_cell_style_index resolution order, surfaced by get_style_for_cell",
+      "evidence": "with a column band, a row band over it, and a per-cell style, each cell resolves to the expected winner (cell/row/column/default)",
+      "id": "precedence",
+      "question": "Is style resolution deterministic: cell > row > column > default?",
+      "supported": true
+    }
+  ],
+  "decision_reopener": false,
+  "engine": "ironcalc",
+  "engine_version": "0.7.1",
+  "experiment": "SP4 -- style-API coverage probe",
+  "known_gaps_carried": [
+    {
+      "attribute": "merged cells",
+      "note": "No public merged-cells API on Model in 0.7 (overview §2 gap; carried, not an SP4 finding).",
+      "public_api": false
+    },
+    {
+      "attribute": "conditional formatting",
+      "note": "No conditional-formatting API in 0.7 (overview §2 gap).",
+      "public_api": false
+    }
+  ],
+  "needed_by_freecell": {
+    "band_styles_row_and_column": true,
+    "empty_cell_styling": true,
+    "per_cell_styles": true
+  },
+  "overview_s2_decision": "stands"
+}

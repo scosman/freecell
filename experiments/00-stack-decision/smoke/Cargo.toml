@@ -1,0 +1,36 @@
+[package]
+name = "smoke"
+version = "0.1.0"
+edition = "2024"
+description = "Formualizer 0.7 hands-on smoke test for FreeCell Phase 1 (Sub-project A gate). Correctness-focused: confirms the crate is real and captures its actual API surface."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Formualizer meta-crate. We opt into the layers the smoke test exercises:
+# - eval/parse/workbook: the calc engine + Workbook API
+# - calamine: read .xlsx
+# - csv: read/write CSV
+# - umya: write .xlsx (Workbook::to_xlsx_bytes) + the styles-capable backend
+# - json + system-clock: pulled in by default; kept explicit for clarity
+# default-features=false so the feature set is deliberate and documented.
+[dependencies]
+anyhow = "1"
+
+[dependencies.formualizer]
+version = "0.7"
+default-features = false
+features = [
+    "eval",
+    "parse",
+    "workbook",
+    "calamine",
+    "csv",
+    "umya",
+    "json",
+    "system-clock",
+]
+
+# Reuse the frozen, engine-neutral generators from shared/ (read-only) to produce
+# a tiny CSV input from committed code (functional_spec §5.3): no hand-made binaries.
+[dev-dependencies.datagen]
+path = "../../shared/datagen"

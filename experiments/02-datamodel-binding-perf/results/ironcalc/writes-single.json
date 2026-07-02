@@ -1,0 +1,29 @@
+{
+  "name": "ironcalc/writes-single",
+  "input_size": 1000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 1000,
+    "min_ns": 935,
+    "max_ns": 173866,
+    "mean_ns": 32305,
+    "p50_ns": 31783,
+    "p99_ns": 76672
+  },
+  "extra": {
+    "design": null,
+    "engine": "ironcalc",
+    "metrics": {
+      "batched_ns": 534377,
+      "single_total_vs_batched_ratio": 60.45357491059683
+    },
+    "scenario": "writes-single"
+  }
+}

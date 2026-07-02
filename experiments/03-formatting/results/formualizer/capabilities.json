@@ -1,0 +1,97 @@
+{
+  "engine": "formualizer",
+  "engine_version": "0.7.0",
+  "umya_version": "2.3.2",
+  "rustc": "1.94.1",
+  "date": "2026-07-01",
+  "rows": [
+    {
+      "attribute": "bold",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "CellData.style == None; via a directly-owned umya workbook. Round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "italic",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "As bold; round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "font_size",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "umya Font::get_size / set_size; round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "fill_color",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "umya Style::set_background_color_solid / get_background_color -> ARGB; round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "number_format",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "umya NumberingFormat::get/set_format_code; round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "borders",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "Inferred",
+      "note": "INFERRED (not probed): umya Style::get_borders per-side exists; no executed assertion. Exhaustive fidelity deferred to Round 2."
+    },
+    {
+      "attribute": "row_height",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "umya Row::get/set_height; round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "col_width",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "umya Column::get/set_width; round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "merges",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "ViaUmya",
+      "provenance": "ProbeBacked",
+      "note": "umya Worksheet::get_merge_cells / add_merge_cells; round-trip re-read by umya_style_edit_survives_roundtrip."
+    },
+    {
+      "attribute": "conditional_formatting",
+      "read": "ViaUmya",
+      "write": "ViaUmya",
+      "roundtrip": "Unverified",
+      "provenance": "Inferred",
+      "note": "INFERRED (not probed): umya exposes get/add_conditional_formatting_collection; read plausible, write-back fidelity unverified. Deferred to Round 2."
+    },
+    {
+      "attribute": "to_xlsx_bytes(engine) preserves styles",
+      "read": "None",
+      "write": "None",
+      "roundtrip": "None",
+      "provenance": "ProbeBacked",
+      "note": "Workbook::to_xlsx_bytes builds a fresh umya file from values/formulas only; ALL styles dropped (values_survive_but_styles_dropped_through_to_xlsx_bytes)."
+    }
+  ]
+}

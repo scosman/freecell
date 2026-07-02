@@ -1,0 +1,41 @@
+{
+  "name": "ironcalc/cascade-fanout",
+  "input_size": 2000,
+  "date": "2026-07-01",
+  "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "commit": "783a515"
+  },
+  "stats": {
+    "count": 5,
+    "min_ns": 77133838,
+    "max_ns": 78345648,
+    "mean_ns": 77702678,
+    "p50_ns": 77544309,
+    "p99_ns": 78345648
+  },
+  "gates": [
+    {
+      "name": "cascade-fanout",
+      "measured_ns": 77544309,
+      "target_ns": 16666666,
+      "verdict": "FAIL"
+    }
+  ],
+  "extra": {
+    "design": null,
+    "engine": "ironcalc",
+    "metrics": {
+      "build_ms": 85,
+      "dependents": 1000,
+      "expected_dependent": 500506.0,
+      "recompute_verified": true,
+      "sources": 1000,
+      "verified_dependent": 500506.0
+    },
+    "scenario": "cascade-fanout"
+  }
+}

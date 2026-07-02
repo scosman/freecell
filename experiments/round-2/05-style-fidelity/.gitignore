@@ -1,0 +1,5 @@
+/target
+# SP5 builds + round-trips its styled fixture entirely in memory (an in-RAM cursor
+# through save_xlsx_to_writer / load_from_xlsx_bytes) -- nothing large is written to
+# disk. The only committed outputs are the JSON fidelity matrix + the env stamp under
+# results/, which are small and intentionally tracked.

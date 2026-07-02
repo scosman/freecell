@@ -31,7 +31,7 @@ app/
 ├── crates/
 │   ├── freecell-core/         # GPUI-free, IronCalc-free foundation
 │   ├── freecell-engine/       # IronCalc adapter + eval worker + caches + file I/O
-│   └── freecell-app/          # GPUI application (macOS)
+│   └── freecell-app/          # GPUI application (macOS + Linux)
 ├── render-tests/              # cell-render snapshot suite (crate; see components/)
 │   ├── baselines/             # committed reference PNGs
 │   └── README.md              # human baseline process

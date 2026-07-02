@@ -64,10 +64,16 @@ alongside; its render→PNG→diff harness authored for the human macOS run) →
   passes within tolerance and a changed scene fails (discriminating power), reports the
   confirmed CI mechanism. GATE: a confirmed working "snapshot the grid in CI" mechanism
   demonstrated end-to-end. (functional_spec C; architecture §5)
+  **✅ GATE CLOSED 2026-07-02** — at synthesis time the end-to-end demo was still
+  outstanding (this checkbox was premature); the human macOS run has since demonstrated
+  the full render→PNG→perceptual-diff pipeline (re-render pixel-identical PASS; changed
+  scene 3.47% FAIL; PNGs committed — see `round-3/C-ci-rendering/findings.md`).
 
 *After the cohort lands (C folded in when the human reports the macOS run):*
 
-- [x] **⛳ BUILD-READINESS CHECKPOINT (human review)** — present A–D findings against each
+- [x] **⛳ BUILD-READINESS CHECKPOINT (human review)** — **CLEARED (2026-07-01, verdict
+  CLEAR TO BUILD, `round-3/SYNTHESIS.md`), with C's end-to-end demo then outstanding;
+  that residual closed 2026-07-02 (macOS run, above)** — present A–D findings against each
   investigation's pass criteria. Any GATE fail or off-ramp (structural edits broken/slow,
   undo/redo missing, cache-shift intractable, surprise load-bearing API gap, no viable
   CI-snapshot mechanism, circular-ref hang) → surface for a human "change-first vs accept"

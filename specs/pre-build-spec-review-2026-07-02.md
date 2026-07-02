@@ -284,7 +284,7 @@ and hygiene.
 |---|---|---|
 | 1 | Write the one-page product spec (user, v1 cut-line, platform, license posture); then make the three pended product calls: dynamic arrays, merges/CF path, comments/validation/hyperlinks | 1–2 days + decisions |
 | 2 | Real-file corpus test (30–50 Excel-authored files): open→save→OOXML-part diff; decide the destructive-save / unknown-part-pass-through policy | 2–3 days |
-| 3 | Run the already-built macOS harnesses: Phase-1 `run_test.sh both` (§5.4 numbers) + round-3 C render→diff demo; commit the JSON/PNGs — **UPDATE 2026-07-02: `run_test.sh both` run — both variants PASS all three §5.4 gates (raw-gpui frame p99 1.98 ms vs the 8.33 ms budget); recorded in `experiments/04-ui-poc/findings.md`. The C demo hit a one-line gpui import drift, now fixed; re-run pending.** | an afternoon |
+| 3 | ~~Run the already-built macOS harnesses~~ **CLOSED 2026-07-02: both harnesses run on macOS. §5.4 Run Test — both variants PASS all three gates (raw-gpui frame p99 1.98 ms vs the 8.33 ms budget; JSON committed). C render→diff demo — GATE closed end-to-end (re-render pixel-identical PASS; changed scene 3.47% FAIL; PNGs committed). Recorded in `experiments/04-ui-poc/findings.md` and `experiments/round-3/C-ci-rendering/findings.md`; syntheses and phase-3 plan annotated. This resolves finding (a) in §4 and the §5.2 checkbox issue.** | ~~an afternoon~~ done |
 | 4 | IME + Excel-clipboard probe on the pinned GPUI rev | 2–3 days |
 | 5 | Save-path design + measurement (save-on-worker, atomic replace, autosave/journal) | ~2 days |
 | 6 | Adversarial file-open suite (subprocess open; depth-bomb, zip-bomb, dimensions) | 1–2 days |

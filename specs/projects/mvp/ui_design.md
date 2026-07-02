@@ -192,8 +192,8 @@ All stock gpui-component modal/dialog components or native macOS panels:
 
 | Dialog | Type | Notes |
 |---|---|---|
-| Open file | **Native** NSOpenPanel | `.xlsx` filter |
-| Save As | **Native** NSSavePanel | enforces `.xlsx` |
+| Open file | **Native** NSOpenPanel (macOS) / GPUI paths-prompt (Linux) | `.xlsx` filter |
+| Save As | **Native** NSSavePanel (macOS) / GPUI paths-prompt (Linux) | enforces `.xlsx` |
 | Unsaved changes on close | gpui-component modal | Save / Don't Save / Cancel; Save routes through Save/Save As |
 | Open/Save failure | gpui-component modal | file name + reason, single OK |
 | Delete sheet confirmation | gpui-component modal | only when sheet has content |
@@ -231,9 +231,13 @@ dialogs are an acceptable fallback — native preferred.
 | Page Up/Down | grid | move one viewport-height up/down |
 | Home / Cmd+Home | grid | column A in current row / cell A1 |
 
+**Linux**: identical map with **Ctrl replacing Cmd** (defined once via per-platform
+keymaps, same actions). Since Linux has no menu bar in MVP, these shortcuts are the
+only path to menu actions there.
+
 Typing a printable character with grid focus does **not** start an edit in MVP (no
 in-cell editing); users click/focus the data row. (Deliberate scope cut; revisit with
-the in-cell editor. Logged in DECISIONS_TO_REVIEW.md.)
+the in-cell editor.)
 
 ## 7. Component inventory (build vs stock)
 
@@ -245,8 +249,8 @@ the in-cell editor. Logged in DECISIONS_TO_REVIEW.md.)
 | Text inputs (data row, tab rename) | Stock gpui-component `TextInput` |
 | Sheet tab bar | Stock if fits, else thin custom row of buttons |
 | Modals/alerts | Stock gpui-component |
-| File pickers | Native macOS panels |
-| Menu bar | GPUI native menu API |
+| File pickers | Native macOS panels; GPUI's platform paths-prompt on Linux |
+| Menu bar | GPUI native menu API (macOS); none on Linux in MVP — shortcuts only |
 | Spinner/indicator | Stock gpui-component |
 
 Spacing rhythm: 8 px base unit, 4 px within tight button groups, 12+ px around window

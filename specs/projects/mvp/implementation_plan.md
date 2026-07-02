@@ -6,17 +6,27 @@ status: draft
 
 Many small phases (per the overview). Details live in `functional_spec.md`,
 `ui_design.md`, `architecture.md`, and `components/*.md` — this is the ordered
-checklist. **Autonomy rule:** implementing agents decide open details per the specs,
-log judgment calls in `DECISIONS_TO_REVIEW.md`, and do not stop to ask.
+checklist.
+
+## Autonomy contract (for implementation agents)
+
+Work **autonomously — never stop to ask a human**. The specs are the source of
+truth; where they're silent, decide yourself in the spirit of the specs and keep
+building. Record in `DECISIONS_TO_REVIEW.md` (append-only, below its marker line):
+any judgment call a human might want to revisit, any spec deviation forced by
+reality (API missing at the pinned rev, etc.), and any placeholder you resolved
+(pinned SHAs, calibrated thresholds). Do **not** relitigate decisions the specs mark
+as decided/ratified. If something is truly blocked (e.g., a dependency won't build
+any way you try), implement the specced fallback, record it, and continue.
 
 ## Dependency graph & parallelism
 
 ```
 P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
                            │              └► P5 cache ───┤   (Track A: engine, Linux)
-                           ├─► P6 grid render ─► P8 grid input ─┐ (Track B: grid, macOS)
+                           ├─► P6 grid render ─► P8 grid input ─┐ (Track B: grid, GPUI)
                            │        └────(P5,P6)─► P7 render suite │
-                           └─► P9 chrome ─► P10 app shell ──────┤ (Track C: shell, macOS)
+                           └─► P9 chrome ─► P10 app shell ──────┤ (Track C: shell, GPUI)
                                                                  ▼
                                     P11 integration ─► P12 perf ─► P13 hardening
 ```
@@ -31,10 +41,17 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
 - [ ] **Phase 1 — Scaffolding & CI.** `app/` workspace; `freecell-core` /
   `freecell-engine` / `freecell-app` / `render-tests` crate skeletons with the strict
   dependency rule; pinned toolchain, rustfmt, clippy(-D warnings), cargo-deny (incl.
-  documented ztracing/GPL exception); GitHub Actions `linux-checks` + `macos-checks`
-  green; hello-world GPUI + gpui-component window builds on macOS CI (this **locks
-  the gpui-component SHA** against the pinned gpui rev — record it + toolchain in
-  DECISIONS_TO_REVIEW.md); `app/README.md` skeleton. (`architecture.md §1, §9-CI`)
+  documented ztracing/GPL exception); GitHub Actions per `architecture.md §9` —
+  Linux `checks` job required-green, `macos-verify` manual/cron job defined;
+  hello-world GPUI + gpui-component window **builds on Linux and macOS** (this
+  **locks the gpui-component SHA** against the pinned gpui rev — record it +
+  toolchain in DECISIONS_TO_REVIEW.md). **Includes the load-bearing Linux render
+  spike**: run the hello-world under Xvfb + Mesa lavapipe on the CI image and
+  capture pixels to PNG (capture-path preference order in
+  `components/render_test_harness.md §Mechanism`); record which capture variant
+  works — if none does, record fallback-to-macOS-capture and adjust the
+  `macos-verify` workflow to carry the render suite. `app/README.md` skeleton.
+  (`architecture.md §1, §9`)
 - [ ] **Phase 2 — Core foundations** (Linux). Axis port + POC tests; A1/CellRange;
   `RenderStyle`; `Publication`/`PublishedCell`; `SheetCaches` read model; input-cap
   validator (incl. round-3 D abort reproducers as rejected cases); sheet-name
@@ -55,21 +72,21 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   + negative control; integrate into worker (StyleCacheUpdated deltas).
   (`components/style_cache.md`)
 
-**Track B — grid (macOS):**
+**Track B — grid (GPUI, cross-platform):**
 - [ ] **Phase 6 — Grid static rendering.** Headers, gridlines, cells (fills, text
   attrs, alignment, clipping), variable geometry, wheel scroll + clamping, custom
   scrollbars, loading overlay — against hand-built core fixtures.
   (`components/grid.md`, `ui_design.md §3.3`)
-- [ ] **Phase 7 — Render-test harness + initial suite.** (needs P5, P6) Offscreen
-  capture + perceptual diff ported from round-3 C; scene builder through the real
-  engine; `generate_baselines`; README (human baseline process); initial ~45-case
-  suite green on macOS CI with committed baselines.
-  (`components/render_test_harness.md`)
+- [ ] **Phase 7 — Render-test harness + initial suite.** (needs P5, P6) Capture via
+  the variant the Phase-1 spike proved (Linux Xvfb+lavapipe primary; macOS fallback)
+  + perceptual diff ported from round-3 C; scene builder through the real engine;
+  `generate_baselines`; README (human baseline process); initial ~45-case suite
+  green in CI with committed baselines. (`components/render_test_harness.md`)
 - [ ] **Phase 8 — Grid interaction.** Mouse selection (click/drag/shift, edge
   auto-scroll), keyboard motions wired, scroll-into-view, ViewportChanged events,
   selection render snapshots. (`components/grid.md`)
 
-**Track C — shell & chrome (macOS):**
+**Track C — shell & chrome (GPUI, cross-platform):**
 - [ ] **Phase 9 — Chrome.** Action row (toggles + fill popover), data row (ref box +
   content field state machine + cap error + eval spinner), sheet tab bar (switch /
   add / inline rename / context menu / delete confirm) — against a test-double
@@ -85,9 +102,12 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   (LoadFailed, SaveFailed, EditRejected, degraded bar); gpui-context integration
   tests + explicit list of anything untestable. (`functional_spec.md` end-to-end)
 - [ ] **Phase 12 — Perf harness + CI gates.** POC run-test scenario against the real
-  grid + 1M×100 styled fixture; gates (frame p99 ≤ 8.33 ms, worst ≤ 16.67 ms, cell
-  load p99 < 2 ms, zero engine calls on scroll path) enforced in `macos-checks`;
-  numbers adversarially reviewed per repo convention. (`architecture.md §4, §9`)
+  grid + 1M×100 styled fixture; true budgets (frame p99 ≤ 8.33 ms, worst ≤ 16.67 ms,
+  cell load p99 < 2 ms, zero engine calls on scroll path) measured on real hardware
+  and recorded; **Linux CI gates hard-fail at committed thresholds = 2× the p99
+  calibrated on the pinned runner image** (buffer for slow shared runners — product
+  call); numbers adversarially reviewed per repo convention.
+  (`architecture.md §4, §9`)
 - [ ] **Phase 13 — Hardening & completion sweep.** Render suite complete w/
   eyeballed baselines; READMEs complete; DECISIONS_TO_REVIEW.md finalized;
   cargo-deny clean-or-documented; manual smoke checklist executed and recorded;

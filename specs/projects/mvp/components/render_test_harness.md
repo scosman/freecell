@@ -4,12 +4,13 @@ status: draft
 
 # Component: Cell-Render Test Harness (`render-tests/`)
 
-The automated pixel-truth suite for the grid: renders the **real** grid component
-offscreen on macOS, captures PNGs, and compares against committed baselines with a
-perceptual diff. Mechanism validated end-to-end in round-3 C
-(`experiments/round-3/C-ci-rendering/findings.md`; demo GATE closed on macOS
-2026-07-02). This is a first-class deliverable of the MVP (per the overview): big
-suite, reusable infra, names a human can read.
+The automated pixel-truth suite for the grid: renders the **real** grid component,
+captures PNGs, and compares against committed baselines with a perceptual diff.
+**Runs in Linux CI** (architecture-round product call) via software-rendered Vulkan;
+the perceptual-diff mechanism was validated end-to-end in round-3 C
+(`experiments/round-3/C-ci-rendering/findings.md`), whose macOS capture harness is
+the fallback path. This is a first-class deliverable of the MVP (per the overview):
+big suite, reusable infra, names a human can read.
 
 ## Purpose and scope
 
@@ -18,25 +19,34 @@ baseline generation tooling; the perceptual diff; failure artifacts (actual/diff
 uploaded on CI failure; README documenting the human baseline workflow.
 
 **Does not:** perf measurement (perf harness's job); chrome/dialog screenshots (P2 if
-ever); non-macOS operation (headless GPUI capture is Metal/macOS-only at our rev —
-confirmed, don't fight it).
+ever).
 
-## Mechanism (locked by round-3 C — do not redesign)
+## Mechanism
 
-- Offscreen capture: GPUI's visual-test path — `show: false` window,
-  `current_headless_renderer()` → capture to image → PNG. Exactly Zed's own
-  `visual_test_runner.rs` approach at the pinned rev; the ported harness code from
-  `experiments/round-3/C-ci-rendering/render-grid/` is the starting point (port, not
-  path-dependency).
+**Primary (Linux CI): Xvfb + Mesa lavapipe (software Vulkan) + GPUI's blade/Vulkan
+backend.** Deterministic software rasterization + bundled Inter should make
+baselines bit-stable across runs — better than macOS Metal-AA variance. The capture
+step is the one unvalidated link (round-3 C's offscreen
+`current_headless_renderer()` path is Metal/macOS-only at our rev), resolved by the
+**Phase-1 spike**, in preference order:
+1. A GPUI capture/screenshot API that works on the Linux backend at our rev, if one
+   exists (`show:false` preferred).
+2. Render to a normal window under Xvfb and capture the X root/window pixels
+   (`xwd`/XGetImage-class capture) after a settle frame.
+3. **Fallback if neither works:** the round-3 C macOS offscreen-Metal harness,
+   verbatim (validated), run as a manual-dispatch/cron macOS workflow; Linux CI
+   then runs everything except pixels. The suite's case table, diff, and baseline
+   process are identical in every variant — only the capture function swaps.
+
 - Perceptual diff (GPUI-free, ported from C's `ci_rendering` crate): per-channel
   tolerance **12/255**, failing-pixel fraction threshold **0.5%**; both constants live
-  in one place and get re-tuned once real-grid baselines exist (C's guidance).
-- Baselines are **committed PNGs** captured on the **same runner class CI uses**
-  (pin `macos-14` or the chosen image; record in the README). Local baselines from a
-  dev Mac are for eyeballing only unless the machine matches. Cell text renders in
-  the **bundled Inter** font (UI round decision), so font-version drift — C's top
-  flakiness risk — is out of the picture; residual cross-machine variance is Metal
-  AA only.
+  in one place and get re-tuned once real-grid baselines exist (C's guidance). If
+  lavapipe proves bit-exact, tighten rather than loosen.
+- Baselines are **committed PNGs** captured on the **pinned CI image + Mesa
+  version** (record both in the README). Regenerate via a CI artifact job or a
+  matching container locally; dev-Mac renders are for eyeballing only. Cell text
+  renders in the **bundled Inter** font (UI round decision), so font-version drift —
+  C's top flakiness risk — is out of the picture on every platform.
 
 ## Test definition model (the extensibility requirement)
 
@@ -88,7 +98,8 @@ its rows in the same table — stated in the README as a review requirement.
 
 ## Runner & tooling
 
-- `cargo test -p render-tests` (macOS): one `#[test]` per case via a small macro over
+- `cargo test -p render-tests` (Linux CI under Xvfb+lavapipe; also runs on a dev
+  machine with a real GPU for eyeballing): one `#[test]` per case via a small macro over
   the table; each renders → captures → diffs → on failure writes
   `target/render-failures/<name>.{actual,baseline,diff}.png` and fails with the diff
   stats. CI uploads `render-failures/` as an artifact.
@@ -105,8 +116,8 @@ its rows in the same table — stated in the README as a review requirement.
 ## Dependencies
 
 Depends on: `freecell-app` (GridView), `freecell-engine`, gpui (visual test context),
-`image`/`png`. Nothing depends on it. macOS-only crate (excluded from Linux CI
-targets).
+`image`/`png`. Nothing depends on it. Builds on Linux + macOS; the capture function
+is the only platform-conditional code.
 
 ## Test plan (tests about the harness itself)
 

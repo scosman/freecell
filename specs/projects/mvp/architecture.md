@@ -41,14 +41,21 @@ app/
 ### Crate dependency rule (strict, CI-enforced by structure)
 
 ```
-freecell-core      →  (std only + small utility deps)      # Linux-testable
-freecell-engine    →  freecell-core, ironcalc(_base)       # Linux-testable
-freecell-app       →  core, engine, gpui, gpui-component   # macOS build
-render-tests       →  freecell-app (grid), gpui            # macOS build
+freecell-core      →  (std only + small utility deps)      # headless-testable, no GPU
+freecell-engine    →  freecell-core, ironcalc(_base)       # headless-testable, no GPU
+freecell-app       →  core, engine, gpui, gpui-component   # macOS (Metal) + Linux (Vulkan)
+render-tests       →  freecell-app (grid), gpui            # runs in Linux CI (see §9)
 ```
 
-`freecell-core` and `freecell-engine` never import GPUI; everything CI-testable on
-Linux lives there. This mirrors the POC's proven `poc-core` split
+**Platform support (product call, architecture round): macOS + Linux from the
+start; Windows out of scope.** macOS is the primary design target; Linux is a
+supported build with three deliberate MVP deltas: Ctrl replaces Cmd (per-platform
+keymaps over the same actions), **no menu bar** (GPUI has no native global menubar
+on Linux — shortcuts cover every menu action), and GPUI's paths-prompt instead of
+NSPanels. Everything else (windows, chrome, grid, engine) is platform-neutral code.
+
+`freecell-core` and `freecell-engine` never import GPUI, so they build and test
+anywhere with no GPU/display. This mirrors the POC's proven `poc-core` split
 (`experiments/04-ui-poc/poc-core`).
 
 ### Pinned dependencies (exact — scaffolding phase must use these)
@@ -283,36 +290,56 @@ Per the overview: each phase ships tested well enough to need no human review.
 |---|---|---|---|
 | `freecell-core` | unit | Linux CI | Axis math (port POC's 20 tests), selection/keyboard rules, A1 conversion, input-cap (incl. the D abort reproducers as *rejected* cases), name validation |
 | `freecell-engine` | unit + integration | Linux CI | worker seam: coalescing (N edits→1 eval), publish-then-bump ordering, staleness bound, catch_unwind recovery, dirty-op accounting; style cache: build + mirror + undo re-read agreement vs engine re-read (port round-3 A's agreement-contract tests + negative control); file: open→edit→save→reopen round-trips (values, formulas, styles, number formats, sheets), atomic-save failure injection, corrupt-file fixtures |
-| grid & chrome | render snapshot | macOS CI | the cell-render suite (below) + a few whole-grid scenes (headers, selection, range) |
-| perf | gated harness | macOS CI | POC run-test scenario against the real grid + engine-backed provider; asserts the §4 gates; **foreground with `timeout`, forced + asserted work, p50/p99 reported** (repo convention) |
-| app flows | integration (gpui test context) | macOS CI | open→edit→save happy path, unsaved-close prompt state machine, welcome lifecycle — as far as the gpui test APIs allow; anything untestable is listed explicitly in the phase plan, not silently skipped |
+| grid & chrome | render snapshot | Linux CI (software Vulkan) | the cell-render suite (below) + a few whole-grid scenes (headers, selection, range) |
+| perf | gated harness | Linux CI (buffered) + real hardware (true budgets) | POC run-test scenario against the real grid + engine-backed provider; asserts the §4 gates; **foreground with `timeout`, forced + asserted work, p50/p99 reported** (repo convention) |
+| app flows | integration (gpui test context) | Linux CI | open→edit→save happy path, unsaved-close prompt state machine, welcome lifecycle — as far as the gpui test APIs allow; anything untestable is listed explicitly in the phase plan, not silently skipped |
 
 ### Cell-render snapshot suite (first-class deliverable)
 
-Full design in `components/render_test_harness.md`. Mechanism = round-3 C, verbatim:
-offscreen Metal capture (`show:false`) on a macOS runner → PNG → perceptual diff
-(per-channel tolerance 12/255, fail fraction 0.5%, tuned after first real baselines).
+Full design in `components/render_test_harness.md`. **Runs in Linux CI** (product
+call, architecture round): GPUI's Linux backend is blade/Vulkan, driven in CI by
+**Mesa lavapipe (software Vulkan) + a virtual display (Xvfb) — deterministic
+software rasterization**, which should beat macOS Metal-AA variance for pixel
+stability. The capture path off-macOS is the one thing round-3 C did **not**
+validate (its offscreen `current_headless_renderer()` is Metal/macOS-only at our
+rev), so **Phase 1 includes a load-bearing spike**: render the hello-world window
+under Xvfb+lavapipe and capture pixels (GPUI capture API if present at the rev,
+else window-level capture). Fallback if the spike fails: the fully-validated
+macOS offscreen-Metal harness (round-3 C) as a manual/dispatch workflow, with
+Linux CI running everything else. The perceptual diff is unchanged either way
+(per-channel tolerance 12/255, fail fraction 0.5%, tuned after first real
+baselines).
+
 Each case renders **the real grid component** over a tiny fixture sheet. Naming:
 `cell_bold`, `cell_bold_italic`, `cell_bold_italic_underline`, `cell_fill_red`,
 `cell_bold_fill_yellow`, `cell_number_currency`, `cell_date_default`,
 `cell_error_div0`, `cell_text_clipped`, `cell_align_right_number`, … — one axis or
 meaningful permutation per test, snake_case, so a red CI line reads as the exact
 feature broken. `generate_baselines` (script/binary flag) rewrites `baselines/`;
-README documents: run it on the CI runner class, eyeball every changed PNG, commit.
-Baselines are committed; capture and validation must use the same runner class
-(Metal AA/font variance — C's risk note).
+README documents: run it on the pinned CI image (via CI artifact or act/container),
+eyeball every changed PNG, commit. Baselines are committed; capture and validation
+must use the same runner image + Mesa version (pinned; bundled Inter removes font
+variance).
 
-### CI (GitHub Actions, repo root)
+### CI (GitHub Actions, repo root — **Linux runners are the gating target**)
 
-1. **linux-checks** (every push/PR): `cargo fmt --check`; `cargo clippy --workspace
-   --exclude freecell-app --exclude render-tests -- -D warnings`; `cargo test -p
-   freecell-core -p freecell-engine`; `cargo-deny check` (licenses/advisories — with a
+1. **checks** (Linux, every push/PR, required): `cargo fmt --check`; `cargo clippy
+   --workspace -- -D warnings`; **full workspace build** (freecell-app compiles on
+   Linux); `cargo test --workspace` (core + engine + app logic tests); render suite
+   under Xvfb + lavapipe; `cargo-deny check` (licenses/advisories — with a
    documented temporary exception for the GPL `ztracing` transitive dep, tracked
    against zed #55470; must be resolved before any binary distribution).
-2. **macos-checks** (every push/PR): full workspace build + clippy `-D warnings` +
-   all tests + render suite; perf harness as a separate always-run step whose gates
-   fail the job.
-3. Caching (`Swatinem/rust-cache`) to keep the gpui build tolerable.
+2. **perf-gates** (Linux, every push/PR, required): the perf harness with **hard
+   but buffered thresholds** (product call): during the perf phase, calibrate on
+   the pinned runner image and commit absolute thresholds = **2× the calibrated
+   p99** (documented next to the numbers); real-hardware budgets (8.33 ms/2 ms)
+   remain the product truth, checked manually on macOS and recorded in the repo.
+   Recalibrate only deliberately (a committed change with rationale), never to
+   quiet a regression.
+3. **macos-verify** (manual dispatch / weekly cron, non-required): full build + test
+   + render-harness smoke on `macos-14` — keeps the primary design target honest
+   without putting slow/expensive runners in the merge path.
+4. Caching (`Swatinem/rust-cache`) to keep the gpui build tolerable.
 
 ## 10. Technical risks & mitigations (build-time)
 
@@ -324,11 +351,20 @@ Baselines are committed; capture and validation must use the same runner class
 - **Text shaping cost** (bold/italic runs, wide columns) is the most likely frame-time
   risk (C's note) — the perf harness scene includes the POC's wide/styled columns so
   it's measured, not felt.
-- **Render-suite baseline flakiness** across runner generations — pin the runner image
-  (e.g. `macos-14`), record it in the render-tests README, and re-baseline only
-  deliberately. Cell text uses the **bundled Inter** font (UI round decision), which
-  removes font-version drift — the main variance source C flagged — from cell pixels;
-  remaining variance is Metal AA only.
+- **Linux capture path is unvalidated** (the one new risk from the Linux-CI call):
+  round-3 C proved capture on macOS/Metal only. Mitigated by the Phase-1 spike
+  (Xvfb + lavapipe + capture) with the validated macOS harness as fallback — the
+  suite's design (cases, diff, baselines process) is identical either way.
+- **Linux/Vulkan runtime is unmeasured** — all POC perf numbers are macOS/Metal.
+  GPUI/Zed ships on Linux at our rev so it's expected to work; the perf harness
+  runs on both (buffered gates in CI, true budgets on real hardware) so a Linux
+  perf cliff would be measured, not discovered by users.
+- **Render-suite baseline flakiness** across runner generations — pin the runner
+  image + Mesa/lavapipe version, record them in the render-tests README, and
+  re-baseline only deliberately. Software rasterization is deterministic and cell
+  text uses the **bundled Inter** font (UI round decision), so baselines should be
+  bit-stable; treat any observed nondeterminism as a bug to investigate, not
+  tolerance to widen.
 - **IronCalc unit conversions** (column-width units / row-height points → px) —
   resolve against SP4/POC constants in the geometry cache; one place only.
 

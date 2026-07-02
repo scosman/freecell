@@ -63,17 +63,23 @@ struct WorkbookWindow {                  // root Entity per document window
   DECISIONS_TO_REVIEW.md** (it's a data-loss papercut).
 - **Quit**: iterate dirty windows, prompt each (front-to-back); any Cancel aborts
   quit.
-- Finder open-events: wire `App::on_open_urls`/equivalent if the pinned rev exposes
-  it; else skip (record).
+- Finder open-events (macOS) / CLI path argument + xdg association (Linux): wire
+  `App::on_open_urls`/equivalent and argv handling if the pinned rev supports them;
+  else skip (best-effort, record in DECISIONS_TO_REVIEW.md).
 
 ### Menus & actions (single source of truth)
 
 GPUI actions: `NewWorkbook, OpenFile, Save, SaveAs, CloseWindow, Undo, Redo,
-ToggleBold, ToggleItalic, ToggleUnderline, Quit, About`. Menu bar (`cx.set_menus`) and
-key bindings both dispatch these; handlers live on `WorkbookWindow` (or the app global
-for New/Open/About/Quit). Enable/disable via standard GPUI action availability (no
-handler in scope = disabled menu item): Save/Undo/etc. are naturally disabled on the
-welcome window because it registers no handlers.
+ToggleBold, ToggleItalic, ToggleUnderline, Quit, About`. Menu bar (`cx.set_menus`,
+macOS only) and key bindings both dispatch these; handlers live on `WorkbookWindow`
+(or the app global for New/Open/About/Quit). Enable/disable via standard GPUI action
+availability (no handler in scope = disabled menu item): Save/Undo/etc. are naturally
+disabled on the welcome window because it registers no handlers.
+
+**Linux**: no menu bar in MVP (GPUI has no native global menubar there); the same
+actions bind to Ctrl-variant keymaps (`keymap-macos.json`-style per-platform binding
+tables over identical action names — one action list, two keymaps). Everything else
+in this component is platform-neutral.
 
 ### Action row
 
@@ -126,9 +132,9 @@ All gpui-component modals rendered by `WorkbookWindow` (or a bare dialog window 
 app-level errors), one at a time via `modal: Option<ActiveModal>`:
 `UnsavedChanges{then: CloseWindow|Quit}`, `ErrorInfo{title, detail}`,
 `ConfirmDeleteSheet{idx}`, `About`. Each is a small enum
-variant + handler — no dialog framework. Native `NSOpenPanel`/`NSSavePanel` via
-GPUI's path-prompt API (confirmed pattern in zed at the rev; gpui-component fallback
-if broken).
+variant + handler — no dialog framework. File pickers via GPUI's platform
+paths-prompt API (native `NSOpenPanel`/`NSSavePanel` on macOS, GPUI's Linux prompt
+on Linux — the pattern zed uses at the rev; gpui-component fallback if broken).
 
 ### Save flow (ties together §5.2 of the functional spec)
 
@@ -151,7 +157,7 @@ matrix), `to_a1_*`, palette constants sanity, data-row state machine as a pure
 (`edit_commit_on_cell_click`, `escape_reverts`, `cap_reject_keeps_editing`,
 `multiselect_disables`, …).
 
-macOS (gpui test context, as far as its APIs allow — anything not drivable is listed
+GPUI integration (Linux CI, gpui test context, as far as its APIs allow — anything not drivable is listed
 in the phase plan explicitly): `welcome_to_workbook_lifecycle`,
 `last_window_close_quits_app`, `open_dedupes_same_path`,
 `close_dirty_prompts_and_cancel_keeps_window`, `save_as_sets_title`,

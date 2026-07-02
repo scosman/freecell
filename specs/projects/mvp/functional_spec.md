@@ -18,7 +18,7 @@ there: CLEAR TO BUILD. This spec builds exactly what those syntheses adopted.
 
 | Area | In MVP | Explicitly out (P2+) |
 |---|---|---|
-| Platform | macOS (Metal) only | Windows/Linux |
+| Platform | **macOS (Metal) + Linux (Vulkan)** from the start; macOS is the primary design target, Linux is a supported build (Ctrl replaces Cmd; no menu bar — see §2.4) | Windows |
 | Files | Open/Save/Save-As `.xlsx` (IronCalc-native features) | CSV, xlsx feature pass-through (merges/CF/comments/etc. — see §8) |
 | Editing | Formula-bar (data-row) editing, delete-to-clear, undo/redo | In-cell editor, IME, clipboard interop, fill handle, autocomplete |
 | Formatting | Bold / italic / underline / fill color; engine-side number-format display | Borders UI, fonts UI, alignment UI, number-format UI |
@@ -40,6 +40,7 @@ data corruption, or UI freezes.
 - Launching the app with no document opens the **Welcome window**.
 - Opening a `.xlsx` from Finder (double-click / drag onto Dock icon / `open -a`) opens
   that file directly in a spreadsheet window (macOS open-file events), skipping Welcome.
+  Linux equivalent (xdg file association / CLI path argument) is best-effort.
 
 ### 2.2 Welcome window
 
@@ -75,6 +76,9 @@ Small, fixed-size, non-resizable window, centered:
 - **Edit**: Undo (Cmd+Z), Redo (Cmd+Shift+Z). (No clipboard items in MVP; see §8.)
 - Menu items enable/disable by context (e.g., Save disabled when Welcome is frontmost;
   Undo/Redo track the focused window's history availability).
+- **Linux**: GPUI has no native global menu bar there — MVP ships **no menu bar on
+  Linux**; every menu action is reachable via its keyboard shortcut (Ctrl replaces
+  Cmd throughout) and the Welcome buttons. An in-window menu strip is P2.
 
 ## 3. Spreadsheet window layout & behavior
 
@@ -283,7 +287,7 @@ Carried from the validated experiment gates; CI-benchmarked where marked:
 
 | Metric | Budget | Where enforced |
 |---|---|---|
-| Scroll frame time, 1M×100 styled sheet | p99 ≤ 8.33 ms (120 fps), worst-case ≤ 16.67 ms | perf harness (run-test scenario from the POC), CI on macOS runner |
+| Scroll frame time, 1M×100 styled sheet | p99 ≤ 8.33 ms (120 fps), worst-case ≤ 16.67 ms on real hardware; **CI (Linux, software rendering) gates hard at calibrated buffered thresholds** — see `architecture.md §9` | perf harness (run-test scenario from the POC), Linux CI |
 | Viewport cell load (value+style read for visible cells) | p99 < 2 ms | perf harness |
 | Style/geometry lookups during scroll | resident cache only — zero engine calls on the scroll path | code review + harness assertion |
 | Edit → UI ack (pending state visible) | < 1 frame | manual + unit |
@@ -327,8 +331,10 @@ Full strategy in `architecture.md`; the functional requirements:
   autonomy goal): unit tests for logic, integration tests for the worker seam and file
   round-trips, and the render suite for pixels.
 - **Cell-render test suite** (first-class deliverable): automated
-  render-cell-to-PNG-vs-reference tests on the macOS CI runner via GPUI offscreen Metal
-  capture + the perceptual diff validated in round-3 C. One test per formatting feature
+  render-cell-to-PNG-vs-reference tests running **in Linux CI** (software-rendered
+  Vulkan; capture path de-risked by an early spike — `architecture.md §9`; the
+  macOS offscreen-Metal harness validated in round-3 C is the fallback), using the
+  round-3 C perceptual diff. One test per formatting feature
   and most meaningful permutations (`bold`, `italic`, `bold_italic`,
   `bold_italic_underline`, `fill_red`, `bold_fill_yellow`, `number_format_currency`,
   `error_value`, `clipped_text`, alignment cases, …) with interpretable snake_case
@@ -340,5 +346,8 @@ Full strategy in `architecture.md`; the functional requirements:
   measured fidelity).
 - **Worker-seam tests**: coalescing, generation ordering, staleness bound, input cap,
   catch_unwind recovery — the SP1/round-3 A test patterns, ported to the real app.
-- **CI**: GitHub Actions — fmt + clippy (warnings deny) + GPUI-free crate tests on
-  Linux; full build + all tests + render suite + perf smoke on a macOS runner.
+- **CI**: GitHub Actions on **Linux runners as the gating target** (product call,
+  architecture round): fmt + clippy (warnings deny) + full workspace build + all
+  tests + render suite + buffered perf gates. macOS runners are **not** in the
+  required path (expensive/slow); a manual-dispatch macOS workflow exists for
+  occasional platform verification.

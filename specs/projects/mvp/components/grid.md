@@ -147,11 +147,11 @@ binary-search edges, 1M-row totals), `apply_motion_*` (each key incl. clamping a
 edges, range extension, Cmd+jumps), `hit_test_*` (px→cell incl. header zones, scrolled,
 variable sizes), `newly_visible_*`.
 
-Render snapshots (macOS CI, via render-tests): `grid_empty_origin`,
+Render snapshots (Linux CI, via render-tests): `grid_empty_origin`,
 `grid_headers_scrolled_deep` (row 1,000,000 labels + widened gutter),
 `grid_selection_single`, `grid_selection_range`, `grid_selection_range_spans_edge`,
 `grid_variable_geometry` (mixed widths/heights), `grid_loading_overlay`, plus every
 `cell_*` case (render_test_harness.md).
 
-Perf (macOS CI): POC run-test script vs the real grid + a 1M×100 styled fixture
-workbook; gates per `architecture.md §4`.
+Perf (Linux CI buffered gates + real-hardware truth runs): POC run-test script vs
+the real grid + a 1M×100 styled fixture workbook; gates per `architecture.md §4/§9`.

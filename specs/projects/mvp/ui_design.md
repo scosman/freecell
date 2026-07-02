@@ -1,5 +1,5 @@
 ---
-status: complete
+status: draft
 ---
 
 # UI Design: FreeCell MVP

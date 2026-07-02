@@ -1,5 +1,5 @@
 ---
-status: complete
+status: draft
 ---
 
 # Component: App Shell & Chrome (`freecell-app`)

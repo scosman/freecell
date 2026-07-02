@@ -1,5 +1,5 @@
 ---
-status: complete
+status: draft
 ---
 
 # Component: Grid (`freecell-app::grid`)

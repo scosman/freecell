@@ -1,0 +1,63 @@
+{
+  "name": "ui-poc-raw-gpui-runtest",
+  "input_size": 348,
+  "date": "2026-07-02",
+  "environment": {
+    "cpu": "",
+    "os": "macos",
+    "arch": "aarch64",
+    "cores": 14,
+    "commit": "9fcb2ee"
+  },
+  "stats": {
+    "count": 348,
+    "min_ns": 337333,
+    "max_ns": 2305292,
+    "mean_ns": 994505,
+    "p50_ns": 921167,
+    "p99_ns": 1976166
+  },
+  "gates": [
+    {
+      "name": "frame-p99",
+      "measured_ns": 1976166,
+      "target_ns": 8333333,
+      "verdict": "PASS"
+    },
+    {
+      "name": "frame-max",
+      "measured_ns": 2305292,
+      "target_ns": 16666667,
+      "verdict": "PASS"
+    },
+    {
+      "name": "cell-load-p99",
+      "measured_ns": 120250,
+      "target_ns": 2000000,
+      "verdict": "PASS"
+    }
+  ],
+  "extra": {
+    "variant": "raw-gpui",
+    "frame_render": {
+      "min_ns": 337333,
+      "max_ns": 2305292,
+      "mean_ns": 994505,
+      "p50_ns": 921167,
+      "p99_ns": 1976166
+    },
+    "cell_load": {
+      "min_ns": 60834,
+      "max_ns": 155958,
+      "mean_ns": 80687,
+      "p50_ns": 79625,
+      "p99_ns": 120250
+    },
+    "frames": 348,
+    "targets_ns": {
+      "frame_p99": 8333333,
+      "frame_max": 16666667,
+      "cell_load_p99": 2000000
+    }
+  }
+}

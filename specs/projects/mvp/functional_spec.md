@@ -128,7 +128,10 @@ Vertical stack (details in `ui_design.md`):
 ### 3.3 Data entry (data row)
 
 - The data row shows the active cell's **raw content**: the formula text (`=SUM(A1:A5)`)
-  for formula cells, the literal for value cells, empty for empty cells.
+  for formula cells, the literal for value cells, empty for empty cells. Content is
+  fetched from the engine per selection; if the fetch is pending > 250 ms (worker
+  mid-eval), a small spinner shows inside the field — no flash on the normal
+  instant case, never blocking selection or scrolling.
 - Typing in the data row edits a pending value. **Enter** commits: the input string is
   handed to the engine as user input (engine parses numbers, booleans, formulas, text),
   the evaluate loop runs (§4), and the active cell moves down one row. **Escape**

@@ -49,9 +49,10 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   spike**: run the hello-world under Xvfb + Mesa lavapipe on the CI image and
   capture pixels to PNG (capture-path preference order in
   `components/render_test_harness.md §Mechanism`); record which capture variant
-  works — if none does, record fallback-to-macOS-capture and adjust the
-  `macos-verify` workflow to carry the render suite. `app/README.md` skeleton.
-  (`architecture.md §1, §9`)
+  works. **A failed spike is a decision point, not a stopper** (product call): if no
+  Linux capture works, record it in DECISIONS_TO_REVIEW.md, move the render suite to
+  the `macos-verify` workflow, and keep building — nothing downstream blocks on the
+  answer. `app/README.md` skeleton. (`architecture.md §1, §9`)
 - [ ] **Phase 2 — Core foundations** (Linux). Axis port + POC tests; A1/CellRange;
   `RenderStyle`; `Publication`/`PublishedCell`; `SheetCaches` read model; input-cap
   validator (incl. round-3 D abort reproducers as rejected cases); sheet-name

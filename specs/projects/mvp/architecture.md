@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: FreeCell MVP
@@ -151,12 +151,14 @@ enum WorkerEvent {
 ```
 
 `Publication` (per sheet, active sheet only): a flat `Vec<PublishedCell>` for the
-overscanned viewport — `{ row, col, display_text, text_color: Option<Rgb>,
-raw_content: String }` — plus the covered ranges and generation. Including
-`raw_content` makes the formula bar instant and never blocked on an in-flight eval;
-`GetCellContent` is the fallback for cells outside the published window. Display text
-and its optional color come from the engine's formatted-value API — **no number-format
-logic in FreeCell** (round-3 B).
+overscanned viewport — `{ row, col, display_text, text_color: Option<Rgb> }` — plus
+the covered ranges and generation. Display text and its optional color come from the
+engine's formatted-value API — **no number-format logic in FreeCell** (round-3 B).
+The formula bar gets its raw text via `GetCellContent` request/response on every
+selection change (product call, architecture round — carrying raw content in the
+publication was cut as premature optimization; evals are a few ms on normal sheets).
+If a reply is pending > 250 ms, the formula field shows a small spinner (same
+no-flash rule as the eval spinner).
 
 ### Dirty tracking
 

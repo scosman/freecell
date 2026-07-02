@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Cell-Render Test Harness (`render-tests/`)
@@ -90,8 +90,9 @@ Layout: `cell_align_left_text`, `cell_align_right_number`, `cell_align_center_ex
 Grid scenes (from `components/grid.md`): `grid_empty_origin`,
 `grid_headers_scrolled_deep`, `grid_selection_single`, `grid_selection_range`,
 `grid_selection_range_spans_edge`, `grid_variable_geometry`, `grid_loading_overlay`,
-`grid_mixed_content` (a busy realistic scene — the canary that catches "everything
-subtly moved").
+`grid_scrollbars_visible` (scene forces scrollbar-visible state — all other scenes
+render with scrollbars hidden for determinism), `grid_mixed_content` (a busy
+realistic scene — the canary that catches "everything subtly moved").
 
 ~45 cases initially. Every future rendering feature (borders, fonts, wrap, …) must add
 its rows in the same table — stated in the README as a review requirement.

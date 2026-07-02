@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Style & Geometry Cache (`freecell-engine::cache`)

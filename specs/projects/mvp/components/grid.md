@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Grid (`freecell-app::grid`)
@@ -103,10 +103,13 @@ extent, overscan)`, `total()`).
      selected rows/cols headers get darker tint + 2 px accent edge line. Header cells
      are divs like the POC (`header_cell` styling: `#F5F5F5` bg, `#D9D9D9` hairlines,
      11.5 px medium text, centered; col labels via ported `column_label`).
-   - **Scrollbars**: two overlay thumbs sized `viewport/total`, positioned
-     `scroll/total`; MVP custom-drawn (two rounded rects + drag handling) — simpler
-     than adapting gpui-component's scrollbar to external virtual extent. Always
-     visible.
+   - **Scrollbars**: macOS-style overlay (`ui_design.md §3.3`) — grey rounded-rect
+     thumbs inset ~3 px from the edges, sized `viewport/total`, positioned
+     `scroll/total`; custom-drawn (two rounded rects + drag handling). Visible while
+     scrolling/dragging/hovered, fade out 2 s after the last scroll event (fade via
+     a gpui delayed-task + opacity animation; visibility state lives in GridState
+     and is deterministic for render tests — scenes render with scrollbars hidden
+     unless the case forces them visible).
    - **Loading overlay** when `loading.is_some()`: translucent white sheet + centered
      gpui-component spinner + label.
 6. No allocation proportional to sheet size anywhere; per-frame allocations bounded by

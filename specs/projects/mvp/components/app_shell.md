@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: App Shell & Chrome (`freecell-app`)
@@ -99,14 +99,17 @@ in this component is platform-neutral.
 - `RefBox`: read-only 72 px field; text from `SelectionModel::to_a1()` (`B7` /
   `B2:D9`).
 - `ContentField`: gpui-component `TextInput`. State machine:
-  - **Idle**: shows active cell's `raw_content` (from Publication;
-    `GetCellContent` fallback for beyond-overscan cells — show a muted "…" until the
-    reply). Multi-cell selection: disabled + empty.
+  - **Idle**: on every `SelectionChanged` (single cell), send `GetCellContent
+    {req_id}` and show the reply. Replies whose `req_id` doesn't match the latest
+    request are dropped (stale selection). If the reply is pending > 250 ms (e.g.,
+    the worker is mid-eval), a small spinner shows **inside the field** — same
+    no-flash rule as the eval spinner; never blocks selection or grid interaction.
+    Multi-cell selection: disabled + empty, no fetch.
   - **Editing** (user focused/typed): pending text held locally; selection changes
     via *grid click* commit-then-move (grid emits `EditCommitRequested` before
     `SelectionChanged` applies); Enter = validate cap → send `SetCellInput` → move
-    down; Shift+Enter/Tab variants per keymap; Escape = revert to raw_content, back
-    to Idle, grid regains focus.
+    down; Shift+Enter/Tab variants per keymap; Escape = revert to the last-fetched
+    cell content, back to Idle, grid regains focus.
   - **Cap-rejected**: danger border + message popover; stays Editing.
 - **Evaluating spinner** lives at the action row's right end (`ui_design.md §3.1`),
   not here. Logic: on `EvalStarted`, arm a 250 ms one-shot timer (gpui delayed task);
@@ -162,6 +165,7 @@ in the phase plan explicitly): `welcome_to_workbook_lifecycle`,
 `last_window_close_quits_app`, `open_dedupes_same_path`,
 `close_dirty_prompts_and_cancel_keeps_window`, `save_as_sets_title`,
 `eval_spinner_only_after_250ms` (short eval never shows it; long eval shows + hides),
+`formula_field_spinner_only_after_250ms`, `stale_cell_content_reply_dropped`,
 `menu_actions_disabled_on_welcome`. Manual smoke checklist (documented in the phase
 plan, not a substitute for the above): traffic-light close prompt, Finder open, panel
 filters.

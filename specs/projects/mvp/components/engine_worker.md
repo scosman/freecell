@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Engine Worker (`freecell-engine`)
@@ -107,10 +107,11 @@ For the stored overscanned window (~3× visible, clamped to sheet bounds) on the
 sheet: iterate populated cells in range (engine iteration API from the B matrix;
 worst-case per-cell probe over the window is acceptable at ≤ ~20k cells given SP4's
 read costs — measure in the perf harness). Per cell: `get_formatted_cell_value` (+
-format color if exposed via the `Formatted` path) and `get_cell_content` →
-`PublishedCell { row, col, display_text, text_color, raw_content }`. Empty cells are
+format color if exposed via the `Formatted` path) →
+`PublishedCell { row, col, display_text, text_color }`. Empty cells are
 omitted (the grid defaults them). `Publication { sheet, rows, cols, cells,
-generation }`.
+generation }`. Raw formula text is **not** published — the formula bar requests it
+per selection via `GetCellContent` (architecture-round call).
 
 `ArcSwapish` = `parking_lot::Mutex<Arc<Publication>>` or `arc_swap::ArcSwap` — use
 `arc_swap` (tiny, well-known crate) unless dependency-count pressure says otherwise.

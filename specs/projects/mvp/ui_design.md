@@ -108,6 +108,9 @@ separating each from the grid. The grid is the only white, full-bleed surface.
 - Thin divider, then the **content field**: single-line stock gpui-component text
   input, stretching to fill the row. Monospace-leaning is unnecessary; default UI font.
 - Multi-cell selection: content field disabled + empty (greyed background).
+- **Content-fetch spinner**: cell content loads via an engine request on selection;
+  if pending > 250 ms a small spinner shows inside the field's right edge (same
+  no-flash rule as the action-row eval spinner).
 - Inline error state (input-cap rejection): field border switches to the theme's
   danger color, error text appears in a tooltip-style popover below; clears on edit.
 
@@ -153,12 +156,13 @@ UI round)
   keeps its normal background (the Excel "white anchor" look).
 - Selection renders above fills, below nothing (it's the topmost cell-layer element).
 
-**Scrollbars**
-- Slim (~10 px) overlay scrollbars on right + bottom edges, rounded thumb,
-  semi-transparent; proportional to viewport/total-extent; draggable; fade when idle if
-  cheap to do, otherwise always-visible is acceptable for MVP. Use gpui-component's
-  scrollbar if it can be driven by our custom virtual scroll model; otherwise draw our
-  own (two rects + drag handling) — decided at implementation.
+**Scrollbars (decided, architecture round): macOS-style overlay**
+- Slim rounded-rect **grey** thumbs, inset slightly from the right/bottom edges
+  (~3 px), semi-transparent; proportional to viewport/total-extent; draggable.
+- **Auto-hide**: appear on scroll, fade out **2 s after scrolling stops**; dragging
+  or hovering the thumb keeps them visible.
+- Custom-drawn (two rounded rects + drag handling) — not gpui-component's scrollbar,
+  which isn't built for an external virtual 1M-row extent.
 
 **Empty expanse**
 - The sheet is Excel-max sized; beyond the used range it's just white cells +

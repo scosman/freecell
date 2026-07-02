@@ -1,6 +1,9 @@
 # Sub-project E — UI Technical Test (GPUI Proof-of-Concept, macOS)
 
-> Status: **code complete; measured verdict pending the human's Mac run.** Sub-project E
+> Status: **complete — measured verdict recorded.** The human ran `run_test.sh both` on
+> macOS/Metal on **2026-07-02**: **both variants PASS all three §5.4 gates** (see
+> *Results / evidence*; transcript at `results/human-run-2026-07-02-runtest.txt`).
+> Original status text follows. Sub-project E
 > is the only UI sub-project and is engine-neutral — no spreadsheet engine, just a static
 > datamodel provider (functional_spec §6.E, architecture §7). The GPUI crates target
 > macOS/Metal and **cannot build in the headless Linux container**, so the numbers come
@@ -109,8 +112,10 @@ gpui-component SHA a known-good pair (the container proxy blocked resolving the 
 
 ## Results / evidence
 
-**PENDING THE HUMAN'S MAC RUN.** No authoritative UI perf can be produced in this
-container (no GPU/display). What is verified in-container:
+**Mac run recorded 2026-07-02** (human run, macOS/Metal; verbatim console transcript
+committed at `results/human-run-2026-07-02-runtest.txt`; the two `*-runtest.json`
+files with the env stamp were written on the human's machine — commit them from there
+when convenient). 348 frames measured per variant. What is verified in-container:
 
 - `poc-core`: `cargo test` → **20 passed**; `cargo clippy --all-targets -- -D warnings`
   → clean; `cargo fmt --check` → clean. This exercises the virtualization math, the
@@ -118,18 +123,31 @@ container (no GPU/display). What is verified in-container:
   computation, and the gate/JSON reporting (incl. an Excel-max-rows no-OOM case and
   PASS/FAIL-at-threshold cases).
 
-To be filled in from the Mac run (paste here):
+Mac run results (2026-07-02):
 
 | Variant | build? | feels smooth? | frame p50 | frame p99 | frame max | cell-load p99 | frame-p99 gate | frame-max gate | cell-load gate | VERDICT |
 |---|---|---|---|---|---|---|---|---|---|---|
-| raw-gpui | | | | | | | | | | |
-| gpui-component | | | | | | | | | | |
+| raw-gpui | yes | (Phase-1: "worked great"; not re-reported) | 921.17 µs | **1.98 ms** | 2.31 ms | 120.25 µs | PASS (≤8.33 ms) | PASS (≤16.67 ms) | PASS (≤2 ms) | **PASS** |
+| gpui-component | yes | (not re-reported) | 17.00 µs | 37.21 µs | 44.17 µs | 41.83 µs | PASS | PASS | PASS | **PASS** |
 
-(and attach / paste `results/raw-gpui-runtest.json` + `results/gpui-component-runtest.json`.)
+**Reading the numbers.** The load-bearing result: **raw-gpui — the adopted grid — clears
+the 120 fps gate with ~4.2× margin on p99** (1.98 ms vs 8.33 ms) and cell-load with ~16×
+margin, closing the §5.4 "measured, not vibes" question in the affirmative.
+
+**⚠ Adversarially flag before trusting the comparison:** gpui-component's frame numbers
+(p50 **17 µs**, ~54× faster than raw-gpui) are surprisingly low for any real GPU frame —
+plausibly its `uniform_list`-based `DataTable` does far less measured work per scripted
+frame (uniform row heights, different scene/virtualization path), i.e. the two variants
+are **not an apples-to-apples frame comparison**. Per the repo convention, do not use
+this delta to rank the variants without reviewing what each harness actually measures.
+It does **not** affect the §5.4 verdict (both PASS; raw-gpui passes on its own numbers)
+or the architectural recommendation below (the disqualifiers are structural, not perf).
 
 ## Conclusion
 
-**Pending the Mac run** for the measured §5.4 verdict. What can be stated now:
+**Measured §5.4 verdict (2026-07-02): PASS on both variants — GPUI hits the bar.** The
+raw-gpui grid renders at frame p99 1.98 ms (~4.2× inside the 120 fps budget) with
+cell-load p99 120 µs (~16× inside). What was stated pre-run still stands:
 
 - The **engine-neutral core is correct and reproducible** (tested in-container): the
   virtualization scales to Excel-max without O(n) memory, the harness is deterministic,
@@ -153,6 +171,11 @@ To be filled in from the Mac run (paste here):
   upstream changes. *(This ranking is provisional until the Mac run's perf numbers either
   confirm it or surface a surprise — e.g. if `DataTable` is dramatically faster, that
   reopens the trade-off.)*
+  **Post-run (2026-07-02):** `DataTable`'s numbers *are* dramatically lower, but the
+  delta is flagged as likely not apples-to-apples (see *Results / evidence* ⚠ note) —
+  and both variants pass §5.4 with wide margins, so perf does not reopen the trade-off;
+  the structural disqualifiers (uniform row heights, per-column materialization) decide
+  it. **Ranking confirmed: raw-gpui custom grid.**
 
 ## Risks / open questions
 
@@ -173,6 +196,12 @@ To be filled in from the Mac run (paste here):
 ---
 
 ## HUMAN RUN REQUIRED
+
+> **COMPLETED (run_test) 2026-07-02.** Step 2 was run (`run_test.sh both`) — both
+> variants built and PASS; results recorded above and in
+> `results/human-run-2026-07-02-runtest.txt`. Still open from this checklist: commit the
+> two `results/*-runtest.json` files from the Mac (they carry the env stamp), and the
+> optional step-3 visual sanity/screenshot. Original ask follows.
 
 The measured verdict and the raw-vs-gpui-component recommendation can only be completed
 after a Mac run. Please do the following on a **macOS/Metal** machine and report back.

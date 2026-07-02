@@ -1,0 +1,47 @@
+Human Mac run — 2026-07-02 — `./run_test.sh both` (macOS/Metal, human machine;
+verbatim console transcript pasted by the human. The per-variant
+results/*-runtest.json files were written on the human's machine and are not yet
+committed; env-stamp details live there.)
+
+$ cd experiments/04-ui-poc/scripts && ./run_test.sh both
+==> Run Test: raw-gpui
+   Compiling bench_util v0.1.0 (.../experiments/shared/bench_util)
+   Compiling datagen v0.1.0 (.../experiments/shared/datagen)
+   Compiling poc_core v0.1.0 (.../experiments/04-ui-poc/poc-core)
+   Compiling raw_gpui_poc v0.1.0 (.../experiments/04-ui-poc/raw-gpui)
+    Finished `release` profile [optimized] target(s) in 3.41s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target/release/raw_gpui_poc --run-test`
+=== Run Test: raw-gpui ===
+frames measured: 348
+frame render  p50=921.17 µs p99=1.98 ms max=2.31 ms
+cell load     p50=79.62 µs p99=120.25 µs max=155.96 µs
+PASS frame-p99: measured 1.98 ms <= target 8.33 ms
+PASS frame-max: measured 2.31 ms <= target 16.67 ms
+PASS cell-load-p99: measured 120.25 µs <= target 2.00 ms
+VERDICT: PASS
+
+results written to .../experiments/04-ui-poc/results/raw-gpui-runtest.json
+==> results: .../experiments/04-ui-poc/results/raw-gpui-runtest.json
+==> Run Test: gpui-component
+   Compiling bench_util v0.1.0 (.../experiments/shared/bench_util)
+   Compiling datagen v0.1.0 (.../experiments/shared/datagen)
+   Compiling poc_core v0.1.0 (.../experiments/04-ui-poc/poc-core)
+   Compiling gpui_component_poc v0.1.0 (.../experiments/04-ui-poc/gpui-component)
+    Finished `release` profile [optimized] target(s) in 4.34s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target/release/gpui_component_poc --run-test`
+=== Run Test: gpui-component ===
+frames measured: 348
+frame render  p50=17.00 µs p99=37.21 µs max=44.17 µs
+cell load     p50=16.67 µs p99=41.83 µs max=42.21 µs
+PASS frame-p99: measured 37.21 µs <= target 8.33 ms
+PASS frame-max: measured 44.17 µs <= target 16.67 ms
+PASS cell-load-p99: measured 41.83 µs <= target 2.00 ms
+VERDICT: PASS
+
+results written to .../experiments/04-ui-poc/results/gpui-component-runtest.json
+==> results: .../experiments/04-ui-poc/results/gpui-component-runtest.json
+==> both variants done; compare .../experiments/04-ui-poc/results/*.json

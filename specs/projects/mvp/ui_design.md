@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # UI Design: FreeCell MVP
@@ -9,8 +9,9 @@ gpui-component controls for all chrome, sensible spacing, no opinionated styling
 one exception: **the grid is ours and gets real design attention. It should look like a
 good spreadsheet.**
 
-Base theme: gpui-component's default **light** theme throughout. No dark mode in MVP
-(chrome would follow the theme, but the grid ships light-only; P2).
+Base theme: gpui-component's default **light** theme throughout — **light-only for
+MVP** (decided, UI round). No dark mode (chrome would follow the theme, but the grid
+ships light-only; P2).
 
 ## 1. Window inventory
 
@@ -76,11 +77,22 @@ separating each from the grid. The grid is the only white, full-bleed surface.
   square), 4 px gaps. Pressed state = the active cell has that attribute.
 - Thin vertical divider, then the **Fill** button: paint-bucket icon (or "Fill" label
   if no suitable icon ships with gpui-component) with a dropdown chevron. Click opens a
-  small popover palette:
-  - Grid of ~10 swatches (white, black, greys ×2, red, orange, yellow, green, blue,
-    purple — exact hexes chosen at implementation from any standard material-ish set)
-    plus a **No fill** entry.
-  - Click a swatch → applies to selection, popover closes.
+  small popover palette (decided, UI round):
+  - **Swatch grid — the Office default theme palette**, for consistency with existing
+    spreadsheets (constants live in `freecell-core::palette`):
+
+    | Name | Hex | | Name | Hex |
+    |---|---|---|---|---|
+    | Background 1 | `#FFFFFF` | | Accent 2 | `#ED7D31` |
+    | Text 1 | `#000000` | | Accent 3 | `#A5A5A5` |
+    | Background 2 | `#E7E6E6` | | Accent 4 | `#FFC000` |
+    | Text 2 | `#44546A` | | Accent 5 | `#5B9BD5` |
+    | Accent 1 | `#4472C4` | | Accent 6 | `#70AD47` |
+
+  - A **No fill** entry (clears the background).
+  - A **Custom…** entry opening gpui-component's **ColorPicker**; the picked RGB
+    applies like any swatch (engine stores an arbitrary `#RRGGBB`).
+  - Click a swatch / pick a color → applies to selection, popover closes.
 - Buttons disabled when a data-row edit is mid-flight? No — formatting commits the
   pending edit first (same rule as clicking another cell), keeping behavior uniform.
 - Tooltips on all four ("Bold ⌘B" etc. — see §6 shortcuts).
@@ -115,17 +127,25 @@ The one custom-built component (raw GPUI, per the adopted architecture — match
   "you are here" affordance in every good spreadsheet.
 - Headers are **fixed** (don't scroll out); content scrolls under them.
 
+**Font (decided, UI round): bundled Inter.** The grid's cell + header text uses
+**Inter** (SIL OFL), shipped in the app bundle and registered at startup via GPUI's
+`add_fonts` — not the system font. Rationale: pixel-stable render-test baselines
+across machines/OS updates (font-version drift was round-3 C's top flakiness risk)
+and a clean, tabular-figures-friendly face. Chrome outside the grid keeps the
+gpui-component theme font.
+
 **Cells**
 - White background; **gridlines** as 1 px light grey (`#E2E2E2`-class) lines. Gridlines
   render *under* cell fills (a filled cell paints over its gridlines, like Excel).
-- Default cell: 13 px system font, dark-grey/near-black text, vertically centered,
+- Default cell: 13 px Inter, dark-grey/near-black text, vertically centered,
   4 px horizontal padding, text clipped at the cell edge (`functional_spec.md §3.6`).
 - Alignment, bold/italic/underline, fill color, number-format text/color per the
   functional spec.
 - Default geometry: column width 100 px, row height 24 px (file overrides honored;
   IronCalc's unit conversions handled in the engine layer).
 
-**Selection**
+**Selection** (accent = gpui-component **primary blue** token everywhere — decided,
+UI round)
 - **Active cell**: 2 px solid accent-blue border (gpui-component primary token) drawn
   on top of gridlines, square corners, no glow/shadow.
 - **Range**: accent-blue at ~10% opacity overlaying the range's cells, 1.5–2 px accent
@@ -220,7 +240,8 @@ the in-cell editor. Logged in DECISIONS_TO_REVIEW.md.)
 | Component | Source |
 |---|---|
 | Grid (headers, cells, selection, scroll, scrollbars) | **Custom** (raw GPUI; port of the raw-gpui POC rendering approach) |
-| Toggle buttons, fill button + popover palette | Stock gpui-component (`Button`, popover/menu) |
+| Toggle buttons, fill button + popover palette | Stock gpui-component (`Button`, popover/menu, `ColorPicker` for Custom…) |
+| Grid/cell font | Bundled **Inter** (SIL OFL), registered via `add_fonts` at startup |
 | Text inputs (data row, tab rename) | Stock gpui-component `TextInput` |
 | Sheet tab bar | Stock if fits, else thin custom row of buttons |
 | Modals/alerts | Stock gpui-component |

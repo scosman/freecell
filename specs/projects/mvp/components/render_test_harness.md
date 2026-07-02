@@ -33,7 +33,10 @@ confirmed, don't fight it).
   in one place and get re-tuned once real-grid baselines exist (C's guidance).
 - Baselines are **committed PNGs** captured on the **same runner class CI uses**
   (pin `macos-14` or the chosen image; record in the README). Local baselines from a
-  dev Mac are for eyeballing only unless the machine matches.
+  dev Mac are for eyeballing only unless the machine matches. Cell text renders in
+  the **bundled Inter** font (UI round decision), so font-version drift — C's top
+  flakiness risk — is out of the picture; residual cross-machine variance is Metal
+  AA only.
 
 ## Test definition model (the extensibility requirement)
 

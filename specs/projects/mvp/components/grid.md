@@ -89,8 +89,9 @@ extent, overscan)`, `total()`).
      scroll_y + col_hdr_h)`, size `(size_of(c), size_of(r))`; `bg =` style fill or
      white; 1 px right+bottom borders in gridline grey `#E2E2E2` (fill paints over —
      borders belong to the filled cell so a fill covers its own gridlines, Excel-look);
-     text from `PublishedCell.display_text` with `RenderStyle` attrs (13 px, bold /
-     italic / underline, text color = format color override or near-black `#1F1F1F`,
+     text from `PublishedCell.display_text` with `RenderStyle` attrs (13 px bundled
+     Inter, bold / italic / underline, text color = format color override or
+     near-black `#1F1F1F`,
      `overflow_hidden` + `whitespace_nowrap`, align per style/type, 4 px h-padding,
      v-centered). Cells with no publication entry and no style = plain white cell (one
      shared cheap element). Cells outside publication coverage (beyond-overscan

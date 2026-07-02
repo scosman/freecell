@@ -23,6 +23,8 @@ rules living in `freecell-core` (validators, selection math).
 // main.rs
 gpui_platform::application().run(|cx| {
     gpui_component::init(cx);            // theme (default light), components
+    cx.text_system().add_fonts(...);     // bundled Inter (regular/bold/italic/bold-italic)
+                                         // BEFORE any window opens (ui_design.md §3.3)
     FreeCellApp::init(cx);               // global: window registry, menus, actions
     FreeCellApp::show_welcome(cx);
 });
@@ -81,9 +83,10 @@ welcome window because it registers no handlers.
 - Click → commit pending data-row edit first (if any) → send
   `SetStyleAttr{selection.range(), attr}`; worker computes multi-cell toggle
   resolution (engine_worker.md).
-- Fill popover: gpui-component popover + a 5×2 swatch grid + "No fill" row; swatch
-  constants in `freecell-core::palette` (10 named colors — chosen at implementation
-  from a standard palette, documented in code).
+- Fill popover: gpui-component popover + a 5×2 swatch grid (the Office-theme palette
+  — exact names/hexes in `ui_design.md §3.1`, constants in `freecell-core::palette`)
+  + a "No fill" row + a "Custom…" row opening gpui-component's `ColorPicker` (picked
+  RGB applies like a swatch).
 
 ### Data row (formula bar)
 

@@ -161,9 +161,10 @@ Vertical stack (details in `ui_design.md`):
 - **Bold / Italic / Underline** toggle buttons. Multi-cell toggle semantics (Excel):
   if any selected cell lacks the attribute → set it on all; if all have it → clear it
   on all. One undo step per click.
-- **Fill color**: button opens a small fixed palette (~10 colors + "No fill"). Applies
-  the background fill to all selected cells. The button is a stock gpui-component
-  control; no custom color wheel in MVP.
+- **Fill color**: button opens a palette popover — the 10 Office-theme colors (for
+  consistency with existing spreadsheets; exact hexes in `ui_design.md §3.1`), a
+  **No fill** entry, and a **Custom…** entry that opens gpui-component's ColorPicker
+  for arbitrary RGB. Applies the background fill to all selected cells.
 - Formatting applies to cells (not ranges-as-objects); applying to a multi-cell
   selection writes per-cell styles through the engine's style API so they persist to
   `.xlsx`.
@@ -173,7 +174,7 @@ Vertical stack (details in `ui_design.md`):
 ### 3.6 Cell rendering (what the grid can draw in MVP)
 
 - Text runs with **bold / italic / underline** (and their combinations) in the app's
-  single default font family/size.
+  single default font (bundled Inter, one size — `ui_design.md §3.3`).
 - **Background fill** color (solid).
 - **Display text is engine-owned**: the grid renders the string from the engine's
   formatted-value API (number formats, dates, percentages, currency, thousands

@@ -22,6 +22,17 @@ These are decided — no longer open for implementation-time relitigating:
     sheet delete, unsaved-changes prompts, loading states + open-error dialogs,
     formula input cap (64 depth / 8192 chars).
 
+## Ratified in UI round (human calls, 2026-07-02)
+
+11. **Bundled Inter** as the grid/cell font (registered via `add_fonts`; also
+    stabilizes render baselines). Chrome keeps the gpui-component theme font.
+12. **Selection/accent = gpui-component primary blue** everywhere.
+13. **Fill palette = the 10 Office-theme colors** (Background 1 `#FFFFFF`, Text 1
+    `#000000`, Background 2 `#E7E6E6`, Text 2 `#44546A`, Accent 1 `#4472C4`, Accent 2
+    `#ED7D31`, Accent 3 `#A5A5A5`, Accent 4 `#FFC000`, Accent 5 `#5B9BD5`, Accent 6
+    `#70AD47`) + **No fill** + **Custom…** via gpui-component's ColorPicker.
+14. **Light theme only** for MVP.
+
 ## Planning-agent judgment calls (still open to review; will be re-surfaced in the
 ## architecture round)
 

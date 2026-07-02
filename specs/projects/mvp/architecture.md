@@ -326,7 +326,9 @@ Baselines are committed; capture and validation must use the same runner class
   it's measured, not felt.
 - **Render-suite baseline flakiness** across runner generations — pin the runner image
   (e.g. `macos-14`), record it in the render-tests README, and re-baseline only
-  deliberately.
+  deliberately. Cell text uses the **bundled Inter** font (UI round decision), which
+  removes font-version drift — the main variance source C flagged — from cell pixels;
+  remaining variance is Metal AA only.
 - **IronCalc unit conversions** (column-width units / row-height points → px) —
   resolve against SP4/POC constants in the geometry cache; one place only.
 

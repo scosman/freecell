@@ -12,6 +12,17 @@
 
 ## Verdict: **CLEAR TO BUILD**
 
+> **Update 2026-07-02 — both outstanding human-run items are now CLOSED.** After this
+> synthesis was written, the human ran both macOS harnesses: **(1)** the Phase-1 §5.4
+> Run Test — **both variants PASS all three gates** (raw-gpui frame p99 **1.98 ms** vs
+> 8.33 ms; cell-load p99 120 µs vs 2 ms; `04-ui-poc/findings.md` + committed JSON), so
+> the GPUI perf claim is finally **measured, not felt**; and **(2)** C's end-to-end
+> render→PNG→perceptual-diff demo — **GATE closed** (re-render pixel-identical PASS;
+> changed scene 3.47% FAIL vs 0.5% threshold; PNGs committed;
+> `C-ci-rendering/findings.md`). Every "not yet demonstrated / pending a macOS run"
+> caveat below is superseded by those two records; what remains against the real grid
+> is only capturing real baselines during the build (carry-forward #2's closing step).
+
 **No off-ramp fired in any investigation.** The build-readiness checkpoint is clean.
 
 A — the crux (style/geometry cache-sync vs structural editing) — passed every GATE:
@@ -122,7 +133,9 @@ are not lost.
    the uncatchable stack-overflow abort, at its source); stack + `catch_unwind` are cheap
    defense-in-depth. Exact limits are a build/product tuning call (`D/findings.md` §Risks).
 2. **C's outstanding empirical snapshot demo — run it, then close it against the real
-   grid.** The strategy is confirmed and the harness fully authored, but the end-to-end
+   grid.** *(Update 2026-07-02: the demo was **run and passed** — mechanism demonstrated
+   end-to-end on macOS, PNGs committed. Remaining is only the "against the real grid"
+   half: capture real-grid baselines on the CI runner class during the build.)* The strategy is confirmed and the harness fully authored, but the end-to-end
    render→PNG→perceptual-diff has **never been executed** — it was unrunnable in this
    no-GPU / proxy-blocked (HTTP 403 on the Zed source) container, so it is **pending a human
    macOS run**; and the team additionally chose not to run the throwaway-stub demo now (the

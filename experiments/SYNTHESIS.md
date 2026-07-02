@@ -1,5 +1,12 @@
 # FreeCell — Phase 1 Final Synthesis (Sub-project H)
 
+> **Update 2026-07-02:** the two §5.4 items this synthesis flags as "not yet measured"
+> (the numeric GPUI Run Test gates; PNG rendering baselines) were **both closed by human
+> macOS runs**: Run Test = **PASS on all three gates, both variants** (raw-gpui frame p99
+> 1.98 ms vs 8.33 ms — `04-ui-poc/findings.md` + committed JSON), and the render→PNG→
+> perceptual-diff mechanism is demonstrated end-to-end
+> (`round-3/C-ci-rendering/findings.md`). The caveats below stand as honest history.
+
 > Status: **complete.** This is the capstone of Phase 1 (Stage 1 of FreeCell): the
 > **go / no-go** artifact that feeds the human's Stage-3 "do we keep going" decision.
 > It is a **synthesis** — no benchmarks were run here. Every quantitative claim is

@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context as _, Result};
 use ci_rendering::{diff_png_files, DiffOptions};
 use gpui::{
-    div, px, rgb, size, Bounds, Context, FontWeight, IntoElement, ParentElement, Pixels,
-    Point, Render, Styled, Window, WindowBounds, WindowOptions,
+    div, px, rgb, size, AppContext as _, Bounds, Context, FontWeight, IntoElement,
+    ParentElement, Pixels, Point, Render, Styled, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::current_platform;
 

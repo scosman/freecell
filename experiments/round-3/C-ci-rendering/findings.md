@@ -1,5 +1,12 @@
 # Investigation C — CI snapshot rendering (GPUI grid → PNG → perceptual diff)
 
+> **GATE CLOSED (2026-07-02).** The human ran `scripts/render_and_diff.sh` on
+> macOS/Metal: the offscreen render→PNG→perceptual-diff pipeline works **end-to-end** —
+> stable re-render PASSES (pixel-identical), deliberate change FAILS (3.47% differing vs
+> the 0.5% threshold). PNGs committed under `results/`; numbers in *Results* below.
+> One line of gpui API drift surfaced and was fixed (exactly the anticipated risk).
+> Original honest-grade text preserved below.
+>
 > Phase-3 investigation C (functional_spec §6-C, architecture §3 / §5-C, overview §5-C).
 > FreeCell's north star includes **rendering tests vs known-good PNGs**, which requires
 > **capturing a snapshot of the GPUI grid in CI** and **perceptually diffing** it against a
@@ -129,12 +136,38 @@ offscreen/windowless capture surface — but it is **Metal-backed and macOS-only
   render impossible here: (1) source fetch is proxy-denied; (2) no GPU/display for Metal
   (and no Linux headless renderer exists in this rev anyway).
 
-### macOS (human-run) — PENDING
+### macOS (human-run) — COMPLETED 2026-07-02
 
-The end-to-end render→PNG→diff demonstration runs on a Mac (`scripts/render_and_diff.sh`).
-Expected: `results/baseline.png` produced; `diff(baseline, rerender)` **PASS**;
-`diff(baseline, changed)` **FAIL**. Results + the committed `baseline.png` land here after
-the human reports (README "HUMAN RUN REQUIRED").
+The human ran `scripts/render_and_diff.sh` on a macOS/Metal machine. Build required one
+fix first: gpui API drift at the pinned rev — `cx.new()` needs the `AppContext` trait in
+scope (`use gpui::AppContext as _`, `render-grid/src/main.rs`) — exactly the "small API
+drift on first macOS build" failure mode anticipated under *Risks*. After the fix the
+script completed and reported **"GATE CLOSED: offscreen render → PNG → perceptual diff
+works end-to-end on macOS; stable re-render PASSES within tolerance and a deliberate
+change FAILS."** The offscreen render needed no visible window.
+
+All three PNGs are committed under `results/` (`baseline.png`, `rerender.png`,
+`changed.png`). The diff lines, reproduced **in-container** from those committed PNGs via
+`cargo run --example diff_committed` (same `DiffOptions::default()` as the macOS `--diff`
+path — the diff half is GPUI-free, so the committed artifacts are re-verifiable anywhere):
+
+```
+baseline vs rerender: 800x328 px: 0 differing (0.0000%), max channel delta 0 -> PASS
+baseline vs changed:  800x328 px: 9093 differing (3.4653%), max channel delta 229 -> FAIL
+```
+
+Two observations worth recording:
+
+- **Same-machine Metal offscreen rendering is fully deterministic** — the re-render is
+  **pixel-identical** (0 differing pixels, max channel delta 0), stronger than
+  "within tolerance." Corollary: the tolerance defaults (12/255, 0.5%) absorbed zero
+  same-machine noise, so their headroom is **untested against cross-machine variation**
+  (different Mac/GPU/font versions) — the "capture baselines on the same CI runner class"
+  risk below is now the *only* tolerance risk, and the first cross-machine CI run should
+  tune from real deltas.
+- The deliberate change lands at **3.47% differing / max delta 229** — ~7× over the 0.5%
+  fail threshold, a decisive margin confirming discriminating power on real Metal output,
+  not just the synthetic test images.
 
 ## Conclusion (GATE grade — honest)
 
@@ -162,6 +195,14 @@ the human reports (README "HUMAN RUN REQUIRED").
   investigation/authoring portion (the render), with the end-to-end render→PNG→diff
   demonstration outstanding on macOS.** State plainly at the checkpoint: **diff proven;
   render authored + capture-surface confirmed; end-to-end pending the Mac run.**
+
+> **Update 2026-07-02 — GATE (Q2) now MET end-to-end.** The macOS run executed the full
+> render→PNG→diff pipeline: re-render PASS (pixel-identical), changed-scene FAIL (3.47%
+> vs 0.5% threshold). See *Results §macOS (human-run)*. The GATE is closed in full; the
+> Phase-3 synthesis's "not yet demonstrated" caveat is superseded. Residual caveat: this
+> demonstrated the mechanism against the minimal fixed scene, not the real FreeCell grid
+> (which doesn't exist yet) — baselines for the real grid land during the build, on the
+> CI runner class that validates them.
 
 ## Recommended CI mechanism + alternative
 
@@ -202,6 +243,10 @@ the human reports (README "HUMAN RUN REQUIRED").
   visual-testing caveat, flagged for the build.
 
 ## HUMAN RUN REQUIRED (macOS)
+
+> **COMPLETED 2026-07-02** — see *Results §macOS (human-run)*. Build succeeded after the
+> one-line `AppContext` import fix; both diff expectations held; PNGs committed; no
+> visible window needed. Original ask follows.
 
 See `README.md` "HUMAN RUN REQUIRED (macOS)". In short, on a macOS/Metal machine from
 `experiments/round-3/C-ci-rendering/`:

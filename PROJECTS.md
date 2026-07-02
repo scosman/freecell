@@ -27,6 +27,18 @@ registry: each entry is a short description plus a pointer to a design note unde
   real-file-corpus de-risk before the build.
   → [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md)
 
+- **IME / International Text Input** — *Future (post-MVP by product call, 2026-07-02).*
+  Full IME (CJK composition), dead keys, layouts, decimal-comma entry for the custom
+  raw-gpui cell editor. What GPUI exposes at the pinned rev is unknown — carries a cheap
+  probe to run before the editor architecture hardens.
+  → [`projects/ime-text-input.md`](projects/ime-text-input.md)
+
+- **Excel Clipboard Interop** — *Future (post-MVP by product call, 2026-07-02).*
+  Rich range copy/paste with Excel via TSV + HTML/XML-Spreadsheet clipboard flavors.
+  All FreeCell-side work (IronCalc's clipboard isn't externally chainable); plain TSV
+  values may ride along with the editor build.
+  → [`projects/excel-clipboard.md`](projects/excel-clipboard.md)
+
 - **Viewport Value Cache** — *Future, optional scroll-perf push.*
   Delta-load only newly-exposed cells' *values* on scroll (styles/geometry come from the
   resident style cache above); invalidate on recompute. Optional — SP4 showed uncached

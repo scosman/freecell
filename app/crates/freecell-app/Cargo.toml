@@ -7,6 +7,10 @@ rust-version.workspace = true
 publish = false
 description = "The FreeCell GPUI application (macOS + Linux): app shell, windows, chrome, and the custom grid. Phase 1 = hello-world window that builds on both platforms + the Linux render spike."
 
+[lib]
+name = "freecell_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "freecell"
 path = "src/main.rs"
@@ -19,6 +23,12 @@ gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 tracing-subscriber.workspace = true
+# Grid data sources (Phase 6, components/grid.md §Public interface): `arc-swap` is the
+# lock-free `Publication` snapshot slot the worker swaps and the grid one-atomic-loads
+# per frame; `parking_lot` is the `RwLock<SheetCaches>` (matches the worker seam's
+# no-poisoning choice, workspace Cargo.toml).
+arc-swap.workspace = true
+parking_lot.workspace = true
 # `anyhow` (edge errors) and `tracing` (span/event macros) arrive with the app shell +
 # document client in later phases; added when first exercised, not forward-declared here.
 

@@ -2017,12 +2017,14 @@ dependencies = [
 name = "freecell-app"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "freecell-core",
  "freecell-engine",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "parking_lot",
  "tracing-subscriber",
 ]
 

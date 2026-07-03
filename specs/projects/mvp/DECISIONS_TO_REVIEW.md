@@ -378,3 +378,76 @@ Known placeholders the build will resolve (append the resolution here):
   path is effectively unreachable today (getters only fail on an invalid sheet index, resolved
   first), so the added test exercises the reachable unresolvable-sheet proxy; the invariant is
   documented on `build_and_store_cache`. (`worker/run.rs`)
+
+- [Phase 6] **Selection accent is pinned to blue-600 `#2563EB`, not "the gpui-component
+  primary token".** `ui_design.md §3.3` says the selection accent = "gpui-component primary
+  blue", but the pinned gpui-component default theme's `primary` is **neutral** (`neutral-900`
+  ≈ near-black, `default-theme.json`), not blue — a spreadsheet selection drawn in it would be
+  black. Pinned the accent to the theme's own blue ramp (`blue-600 = #2563EB`,
+  `default-colors.json`) so it reads as a spreadsheet selection and still comes from
+  gpui-component's palette. (`app/crates/freecell-app/src/grid/mod.rs` `ACCENT`)
+- [Phase 6] **The grid inherits gpui's default UI font in Phase 6; bundled Inter lands at
+  startup (Phase 10).** `ui_design.md §3.3` specs 13 px bundled Inter, registered via
+  `add_fonts` at app startup. Bundling the font file + `add_fonts` is an app-shell concern
+  (Phase 10); Phase 7's render suite needs it for pixel-stable baselines. Phase 6 sets the cell
+  (13 px) / header (11.5 px) sizes + weights but not `font_family`, so text renders on the
+  default font with no fallback-resolution risk. `GRID_FONT_FAMILY = "Inter"` is reserved in one
+  place for when the bundle lands. (`grid/mod.rs`, `grid/view.rs`)
+- [Phase 6] **Default cell alignment is Left (not type-aware).** `components/grid.md` says
+  "align per style/type" (text left, numbers/dates right, …), but `Publication`/`PublishedCell`
+  carries only a pre-formatted display string, not the cell's value type, and a General-format
+  number resolves to `RenderStyle.h_align = None`. So a number is left-aligned unless the file's
+  style sets an explicit alignment. Type-based default right-alignment needs the engine to
+  publish the value type (or a resolved alignment) in the publication — deferred to Phase 11
+  engine wiring. Explicit `h_align` renders correctly today (verified: B4 `1234.5` right-aligned
+  via a fixture style). (`grid/view.rs` `cell_element`)
+- [Phase 6] **Nested clipped containers instead of the POC's flat draw-order.** The port renders
+  the content (cells + selection) inside an `overflow_hidden` container sized to the content area,
+  and each header strip inside its own clipped container, rather than the POC's single flat root
+  that relied on drawing fixed headers last to cover scrolled content. Cleaner and avoids
+  header/content z-fighting or label bleed into the gutter; the virtualization math is identical.
+  (`grid/view.rs` `render`)
+- [Phase 6] **Visible styles are snapshotted under the read lock, then the lock is released
+  before painting.** `components/grid.md §Render pass` says clone the two `Arc<Axis>` so the guard
+  drops "immediately". Resolved styles (`render_style`) still need the cache, so the render path
+  holds the read lock a moment longer to copy the visible cells' `RenderStyle` (`Copy`, bounded by
+  visible-cell count ≈ a few thousand) into a reused buffer, then drops the lock — so **no lock is
+  held while painting**, which is the invariant that matters (`architecture.md §4`). One lock per
+  frame (no re-entrant read locks, to avoid a parking_lot reader/writer starvation deadlock).
+  (`grid/view.rs` `resolve_frame`)
+- [Phase 6] **`GridEventSink` is a boxed `Fn(&GridEvent, &mut Window, &mut App)`.**
+  `components/grid.md` names `GridEventSink` in the constructor but doesn't define it. Chose a
+  boxed closure with full `Window`/`App` access (over gpui's `EventEmitter`) so the Phase-11
+  window can forward `ViewportChanged` to the worker and drive the data row on `SelectionChanged`
+  from one handler. Phase 6 emits only `ViewportChanged` (from the scroll path — it is naturally
+  coupled to scroll and debounced on the visible-index range); selection/commit events + the full
+  input wiring are Phase 8. (`grid/mod.rs` `GridEventSink`, `grid/view.rs` `handle_scroll`)
+- [Phase 6] **`set_active_sheet` takes `cx` only and does not emit on switch (Phase 6).**
+  `components/grid.md` has it "emit ViewportChanged so the worker re-publishes"; that re-publish
+  wiring is Phase 11 (there is no worker in Phase 6). It swaps the per-sheet scroll/selection maps
+  and clears `last_viewport` so the next scroll/publish re-announces the viewport. Generation-driven
+  repaint (`WorkerEvent::Published` → `notify`) is also Phase 11. (`grid/view.rs`)
+- [Phase 6] **`freecell-app` gained a `[lib]` target** (`freecell_app`, `src/lib.rs` → `pub mod
+  grid`) so `render-tests` (Phase 7) and the perf harness (Phase 12) can render the real
+  `GridView` over fixtures, per the `architecture.md §1` crate rule (`render-tests → freecell-app
+  (grid)`). The `freecell` bin now `use`s the lib. Added `arc-swap` + `parking_lot` (workspace
+  pins) to the app manifest for `GridDataSources`. (`app/crates/freecell-app/Cargo.toml`,
+  `src/lib.rs`)
+- [Phase 6] **`row_header_width` estimates the gutter from a per-digit width (7.5 px), not a glyph
+  measurement.** The gutter only needs to comfortably fit the deepest visible row's label; a px of
+  over-estimate is harmless and keeps the width a pure, unit-tested function (no text-system
+  dependency). Floored at 48 px, widens for 7-digit Excel-max labels. (`grid/layout.rs`)
+- [Phase 6] **`scroll_cell_into_view` is implemented now (a `pending_reveal` applied on the next
+  render) though the plan lists it under Phase 8.** The pure `scroll_to_reveal` math is trivial and
+  unit-tested; wiring the method keeps the public interface complete. Keyboard/mouse *drivers* of it
+  (and edge auto-scroll) remain Phase 8. (`grid/view.rs`, `grid/layout.rs`)
+- [Phase 6] **Cross-check of the Phase-4 publish bounds (as that note requested):**
+  `RENDER_OVERSCAN = 2` (the grid's own tiny overscan) and the worker's `MAX_PUBLISH_ROWS=512 ×
+  MAX_PUBLISH_COLS=256` comfortably exceed a real overscanned viewport (a 4K display ≈ 90 visible
+  rows × 38 cols; ×3 worker overscan ≈ 270 × 114), so overscan is never clipped in practice. Margin
+  confirmed. (`grid/layout.rs`, cf. `worker/run.rs clamp_viewport`)
+- [Phase 6] **Visual verification: PASSED.** The Linux render spike (Xvfb + lavapipe + xrefresh)
+  captured the real grid over `demo_sources()` to a non-blank PNG (2082 colors): headers with
+  selected-row/col tint + accent edge, gridlines, bold/italic/underline/fill/right-aligned cells,
+  a clipped long string, the B2:D4 selection with its 10% overlay + white anchor at D4, and the
+  wide-B / tall-row-3 variable geometry all render correctly. (`app/scripts/linux_render_spike.sh`)

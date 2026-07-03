@@ -74,7 +74,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   (`components/style_cache.md`)
 
 **Track B — grid (GPUI, cross-platform):**
-- [ ] **Phase 6 — Grid static rendering.** Headers, gridlines, cells (fills, text
+- [x] **Phase 6 — Grid static rendering.** Headers, gridlines, cells (fills, text
   attrs, alignment, clipping), variable geometry, wheel scroll + clamping, custom
   scrollbars, loading overlay — against hand-built core fixtures.
   (`components/grid.md`, `ui_design.md §3.3`)

@@ -1,0 +1,89 @@
+# cargo-deny configuration for the FreeCell workspace (architecture.md §9).
+#
+# CI runs `cargo deny check` with `working-directory: app` (checks.yml, pinned
+# cargo-deny 0.19.9). The load-bearing item is
+# the license gate: the GPL zed tracing crates (ztracing / ztracing_macro / zlog, pulled
+# transitively via gpui/zed) are allowed by a DOCUMENTED, TEMPORARY exception tracked
+# against zed#55470 and MUST be resolved before any binary distribution. FreeCell ships
+# no binaries yet, so this is acceptable for now.
+#
+# Every `ignore`/`exception` below is a TRANSITIVE dep of gpui/zed at the pinned rev with
+# NO safe upgrade available (we do not control zed's lockfile). They are documented, not
+# silently skipped ("cargo-deny clean-or-documented", P13) — see DECISIONS_TO_REVIEW.md.
+# Re-audit this whole block on every gpui rev bump and before any binary distribution.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+# All transitive via gpui/zed at the pinned rev; "No safe upgrade is available" per each
+# RUSTSEC entry (we cannot bump zed's pinned lockfile). Documented + tracked for re-audit
+# on any gpui bump / before distribution (DECISIONS_TO_REVIEW.md).
+ignore = [
+    "RUSTSEC-2025-0052", # async-std discontinued (via async-tar -> zed http_client). unmaintained.
+    "RUSTSEC-2024-0384", # instant unmaintained (via gpui-component, notify). unmaintained.
+    "RUSTSEC-2024-0436", # paste unmaintained (via gpui-component, metal, rav1e). unmaintained.
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained (via stacksafe -> gpui). unmaintained.
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained (via gpui font stack: fontdb/usvg/rustybuzz).
+    # quick-xml 0.39.4 DoS on UNTRUSTED XML (via wayland-scanner build dep + zbus/atspi
+    # accessibility). FreeCell feeds no untrusted XML through these paths; fixed in
+    # quick-xml >=0.41, which needs a zed/wayland bump. Revisit on gpui bump.
+    "RUSTSEC-2026-0194", # quick-xml quadratic attribute-dup check.
+    "RUSTSEC-2026-0195", # quick-xml unbounded namespace-declaration allocation.
+]
+
+[licenses]
+confidence-threshold = 0.8
+# Allowing a license not present in the tree is not an error (keeps the list stable as
+# deps churn); a real unlicensed/denied crate still fails.
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+    # bzip2 + libbzip2 License v1.0.6 — permissive (BSD-like); via libbz2-rs-sys ->
+    # bzip2 -> async-compression -> async_zip -> zed util. Not on crates.io's default
+    # SPDX allow-lists, so listed explicitly.
+    "bzip2-1.0.6",
+]
+
+# ---------------------------------------------------------------------------------
+# Per-crate license exceptions. The zed GPL tracing family is the exception architecture
+# §9 mandates be documented (tracked vs zed#55470). The crates that actually declare
+# `GPL-3.0-or-later` are `zlog` and `ztracing_macro` (and `ztracing` itself); all three
+# GPL-3.0 SPDX spellings are listed so the exception matches whatever each declares.
+# ---------------------------------------------------------------------------------
+exceptions = [
+    { name = "ztracing", allow = ["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"] },
+    { name = "ztracing_macro", allow = ["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"] },
+    { name = "zlog", allow = ["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"] },
+]
+
+[bans]
+# gpui/zed's dependency tree carries many duplicate crate versions; deduping them is not
+# on the MVP critical path. Left permissive here; P13 hardening may tighten.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+# We intentionally use git dependencies (zed for gpui/gpui_platform, longbridge for
+# gpui-component). zed's own tree pins several git forks, so allow git sources broadly
+# rather than enumerate a moving set; P13 hardening can pin `allow-git` explicitly.
+unknown-git = "allow"

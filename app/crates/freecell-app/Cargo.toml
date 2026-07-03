@@ -1,0 +1,26 @@
+[package]
+name = "freecell-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The FreeCell GPUI application (macOS + Linux): app shell, windows, chrome, and the custom grid. Phase 1 = hello-world window that builds on both platforms + the Linux render spike."
+
+[[bin]]
+name = "freecell"
+path = "src/main.rs"
+
+[dependencies]
+freecell-core.workspace = true
+freecell-engine.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+tracing-subscriber.workspace = true
+# `anyhow` (edge errors) and `tracing` (span/event macros) arrive with the app shell +
+# document client in later phases; added when first exercised, not forward-declared here.
+
+[lints]
+workspace = true

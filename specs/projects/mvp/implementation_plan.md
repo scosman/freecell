@@ -38,7 +38,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
 
 ## Phases
 
-- [ ] **Phase 1 — Scaffolding & CI.** `app/` workspace; `freecell-core` /
+- [x] **Phase 1 — Scaffolding & CI.** `app/` workspace; `freecell-core` /
   `freecell-engine` / `freecell-app` / `render-tests` crate skeletons with the strict
   dependency rule; pinned toolchain, rustfmt, clippy(-D warnings), cargo-deny (incl.
   documented ztracing/GPL exception); GitHub Actions per `architecture.md §9` —

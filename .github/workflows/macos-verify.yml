@@ -1,0 +1,46 @@
+# `macos-verify` — non-required, manual dispatch + weekly cron (architecture.md §9 item 3).
+#
+# Keeps the primary design target (macOS/Metal) honest without putting slow/expensive
+# macOS runners in the merge path. Full build + test on macos-14; the render-harness smoke
+# (offscreen Metal capture — round-3 C's validated path) is the FALLBACK if the Linux
+# render spike does not hold, and is wired here as the render suite matures (Phase 7).
+
+name: macos-verify
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-verify:
+    name: build / test / render smoke (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: Build workspace
+        working-directory: app
+        run: cargo build --workspace
+
+      - name: Test workspace
+        working-directory: app
+        run: cargo test --workspace
+
+      # TODO(Phase 7): render-harness smoke via the macOS offscreen-Metal capture path
+      # (round-3 C), e.g. `cargo test -p render-tests`. This is the fallback that runs the
+      # pixel suite here if the Linux Xvfb+lavapipe capture proves unusable.
+      - name: Render harness smoke (placeholder until Phase 7)
+        run: echo "macOS offscreen-Metal render smoke is wired in Phase 7 (fallback capture path)."

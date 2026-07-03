@@ -1,0 +1,19 @@
+[package]
+name = "freecell-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "IronCalc adapter, evaluation worker, style/geometry caches, and file I/O for FreeCell. GPUI-free: builds and tests headless in Linux CI (architecture.md §2, §5, §6)."
+
+[dependencies]
+freecell-core.workspace = true
+ironcalc_base.workspace = true
+# Added when first exercised, not forward-declared: `ironcalc` (the umbrella crate with
+# the xlsx load/save API) arrives with Document I/O in Phase 3; `thiserror` (EngineError
+# enums) also Phase 3; `tracing` (worker apply/eval/publish timings) Phase 4. The pins
+# for all three stay in the workspace dependency table.
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "render-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Cell-render snapshot suite for FreeCell: renders the real grid, captures PNGs, perceptual-diffs against committed baselines (components/render_test_harness.md). Phase 1 = skeleton; the gpui/grid deps + ported perceptual diff land in Phase 7."
+
+# ---------------------------------------------------------------------------------
+# Phase 1 SKELETON ONLY.
+#
+# The real crate (Phase 7) depends on `freecell-app` (GridView), `freecell-engine`,
+# `gpui`, and `image`/`png`, and runs under Xvfb + lavapipe in Linux CI. Those deps and
+# the ported round-3 C perceptual diff are deliberately NOT wired here: keeping this
+# crate off the gpui dependency edge in Phase 1 means the workspace builds and tests on
+# Linux regardless of the Phase-1 render-spike outcome (implementation_plan.md).
+# ---------------------------------------------------------------------------------
+[dependencies]
+
+[lints]
+workspace = true

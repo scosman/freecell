@@ -1,0 +1,2 @@
+# rustfmt configuration (architecture.md §1): defaults + a wider line limit.
+max_width = 100

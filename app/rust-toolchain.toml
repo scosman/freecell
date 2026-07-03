@@ -1,0 +1,11 @@
+# Pinned toolchain for the FreeCell workspace (architecture.md §1).
+#
+# A recent stable that builds the pinned zed rev (1d217ee3…) — resolved at scaffolding
+# time and recorded in DECISIONS_TO_REVIEW.md. This MUST match (or exceed) zed's own
+# pinned stable at that rev: 1.95.0 (its rust-toolchain.toml). gpui uses
+# `std::hint::cold_path()`, stabilized in 1.95.0, so an older stable fails to build.
+# Bump deliberately alongside a gpui rev bump, never to quiet a build error.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

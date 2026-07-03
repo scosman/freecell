@@ -1,0 +1,13 @@
+[package]
+name = "freecell-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "GPUI-free, IronCalc-free foundation for FreeCell: pure logic types (Axis, A1/ranges, selection, validators, palette, render-model read types). Builds and tests anywhere with no GPU/display."
+
+[dependencies]
+
+[lints]
+workspace = true

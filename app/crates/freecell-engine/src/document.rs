@@ -15,9 +15,10 @@ use std::fs::File;
 use std::io::{self, BufWriter, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use freecell_core::CellRef;
+use freecell_core::{CellRange, CellRef, Rgb};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
+use ironcalc_base::expressions::types::Area;
 #[cfg(test)]
 use ironcalc_base::types::Style;
 
@@ -51,8 +52,8 @@ pub enum DocumentSource {
 
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
 /// underlying engine/OS message is preserved for the details line (`architecture.md §5`,
-/// `functional_spec.md §5.1`).
-#[derive(Debug, Error)]
+/// `functional_spec.md §5.1`). `Clone` so it can ride the worker's `WorkerEvent::LoadFailed`.
+#[derive(Debug, Clone, Error)]
 pub enum LoadError {
     /// The file isn't an `.xlsx` workbook at all (its bytes aren't a Zip/OOXML container).
     #[error("This file isn't an .xlsx workbook: {0}")]
@@ -76,8 +77,9 @@ pub enum LoadError {
 }
 
 /// A typed save failure. Because saves are atomic (temp file + rename), any failure leaves
-/// the original destination file untouched (`functional_spec.md §5.2`).
-#[derive(Debug, Error)]
+/// the original destination file untouched (`functional_spec.md §5.2`). `Clone` so it can ride
+/// the worker's `WorkerEvent::SaveFailed`.
+#[derive(Debug, Clone, Error)]
 pub enum SaveError {
     /// The workbook couldn't be written to / renamed onto disk.
     #[error("The workbook couldn't be saved: {0}")]
@@ -91,6 +93,27 @@ pub enum SaveError {
 #[derive(Debug, Error)]
 #[error("cell query failed: {0}")]
 pub struct CellQueryError(String);
+
+/// A character-format boolean the worker toggles (the engine style paths `font.b` / `font.i`
+/// / `font.u`). In-crate: the toggle *policy* (any-lacking → set-all) lives in the worker;
+/// this is only the read/write *mechanism* over the pinned IronCalc range-style API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FontFlag {
+    Bold,
+    Italic,
+    Underline,
+}
+
+impl FontFlag {
+    /// The IronCalc `update_range_style` / `get_cell_style` path for this flag.
+    fn style_path(self) -> &'static str {
+        match self {
+            FontFlag::Bold => "font.b",
+            FontFlag::Italic => "font.i",
+            FontFlag::Underline => "font.u",
+        }
+    }
+}
 
 /// The magic-byte family of a file, used to classify open failures into typed [`LoadError`]s
 /// before the engine collapses them into generic Zip/XML errors.
@@ -246,9 +269,137 @@ impl WorkbookDocument {
             .map_err(CellQueryError)
     }
 
+    /// Each sheet's `(stable sheet_id, name)` in workbook order — the source the worker uses
+    /// to build `SheetMeta` and to map a stable [`SheetId`](freecell_core::SheetId) onto the
+    /// volatile worksheet index IronCalc's per-cell/sheet APIs take
+    /// (`architecture.md §3` index↔id map).
+    pub(crate) fn sheet_properties(&self) -> Vec<(u32, String)> {
+        self.model
+            .get_worksheets_properties()
+            .into_iter()
+            .map(|p| (p.sheet_id, p.name))
+            .collect()
+    }
+
+    /// Pauses IronCalc's auto-evaluate so a coalesced batch of edits can be applied and then
+    /// evaluated **once** (round-3 A: the `pause`/`resume` batch API is the seam's natural
+    /// coalescing fit). Pair with [`resume_evaluation`](Self::resume_evaluation) +
+    /// [`evaluate`](Self::evaluate).
+    pub(crate) fn pause_evaluation(&mut self) {
+        self.model.pause_evaluation();
+    }
+
+    /// Resumes IronCalc's auto-evaluate (mechanically the pause flag; the worker still calls
+    /// [`evaluate`](Self::evaluate) explicitly to run the single coalesced recompute).
+    pub(crate) fn resume_evaluation(&mut self) {
+        self.model.resume_evaluation();
+    }
+
+    /// Runs one full-workbook `evaluate()` (the coalesced recompute after a drained batch).
+    pub(crate) fn evaluate(&mut self) {
+        self.model.evaluate();
+    }
+
+    /// Sets a cell's raw input (`SetCellInput`). Maps to `set_user_input`; the worker
+    /// re-checks the input cap *before* calling this (the security boundary — the abort-class
+    /// input must never reach the recursive parser). Auto-evaluates unless paused.
+    pub(crate) fn set_cell_input(
+        &mut self,
+        sheet_idx: u32,
+        cell: CellRef,
+        input: &str,
+    ) -> Result<(), String> {
+        let (row, col) = to_engine_coords(cell);
+        self.model.set_user_input(sheet_idx, row, col, input)
+    }
+
+    /// Clears a range's **contents only** (keeps styles) — `ClearCells`. One undoable engine
+    /// op over the rectangle. Auto-evaluates unless paused.
+    pub(crate) fn clear_contents(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+    ) -> Result<(), String> {
+        self.model.range_clear_contents(&area_of(sheet_idx, range))
+    }
+
+    /// Whether `cell` currently has the given character-format flag set (the per-cell read the
+    /// worker samples for toggle resolution).
+    pub(crate) fn font_flag(
+        &self,
+        sheet_idx: u32,
+        cell: CellRef,
+        flag: FontFlag,
+    ) -> Result<bool, String> {
+        let (row, col) = to_engine_coords(cell);
+        let style = self.model.get_cell_style(sheet_idx, row, col)?;
+        Ok(match flag {
+            FontFlag::Bold => style.font.b,
+            FontFlag::Italic => style.font.i,
+            FontFlag::Underline => style.font.u,
+        })
+    }
+
+    /// Sets a character-format flag across a range to `value` (one undoable range-style op).
+    pub(crate) fn set_font_flag(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        flag: FontFlag,
+        value: bool,
+    ) -> Result<(), String> {
+        let v = if value { "true" } else { "false" };
+        self.model
+            .update_range_style(&area_of(sheet_idx, range), flag.style_path(), v)
+    }
+
+    /// Sets (or clears) a solid background fill across a range. `Some(rgb)` sets
+    /// `fill.fg_color` to `#RRGGBB`; `None` passes the empty string, which IronCalc's style
+    /// updater reads as "no fill".
+    pub(crate) fn set_fill(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        fill: Option<Rgb>,
+    ) -> Result<(), String> {
+        let value = match fill {
+            Some(rgb) => format!("#{:06X}", rgb.to_hex()),
+            None => String::new(),
+        };
+        self.model
+            .update_range_style(&area_of(sheet_idx, range), "fill.fg_color", &value)
+    }
+
+    /// Appends a new sheet (`AddSheet`); IronCalc names + numbers it. Undoable.
+    pub(crate) fn add_sheet(&mut self) -> Result<(), String> {
+        self.model.new_sheet()
+    }
+
+    /// Renames the sheet at `sheet_idx` (`RenameSheet`). The worker re-validates the name
+    /// against the other sheets first; IronCalc enforces its own rules too. Undoable.
+    pub(crate) fn rename_sheet(&mut self, sheet_idx: u32, name: &str) -> Result<(), String> {
+        self.model.rename_sheet(sheet_idx, name)
+    }
+
+    /// Deletes the sheet at `sheet_idx` (`DeleteSheet`). Can affect formulas → the worker
+    /// re-evaluates. Undoable.
+    pub(crate) fn delete_sheet(&mut self, sheet_idx: u32) -> Result<(), String> {
+        self.model.delete_sheet(sheet_idx)
+    }
+
+    /// Undoes the last committed edit (engine history). Auto-evaluates unless paused.
+    pub(crate) fn undo(&mut self) -> Result<(), String> {
+        self.model.undo()
+    }
+
+    /// Redoes the last undone edit (engine history). Auto-evaluates unless paused.
+    pub(crate) fn redo(&mut self) -> Result<(), String> {
+        self.model.redo()
+    }
+
     /// Mutable reference to the owned model — the write seam used by the [`fixtures`] module
-    /// to populate cells, and by the Phase-4 worker to apply edits. In-crate only; the model
-    /// is an `ironcalc` type and never leaves this crate.
+    /// to populate cells. In-crate only; the model is an `ironcalc` type and never leaves this
+    /// crate. (The Phase-4 worker drives edits through the typed methods above, not this.)
     ///
     /// [`fixtures`]: crate::fixtures
     pub(crate) fn user_model_mut(&mut self) -> &mut UserModel<'static> {
@@ -270,6 +421,19 @@ impl WorkbookDocument {
 /// The Excel-max bounds (`freecell_core::limits`) fit comfortably in `i32`.
 fn to_engine_coords(cell: CellRef) -> (i32, i32) {
     (cell.row as i32 + 1, cell.col as i32 + 1)
+}
+
+/// Converts a 0-based [`CellRange`] on `sheet_idx` to IronCalc's 1-based inclusive
+/// `Area { row, column, width, height }` (the shape its range-style / clear APIs take).
+fn area_of(sheet_idx: u32, range: CellRange) -> Area {
+    let (row, column) = to_engine_coords(range.start);
+    Area {
+        sheet: sheet_idx,
+        row,
+        column,
+        width: (range.end.col - range.start.col) as i32 + 1,
+        height: (range.end.row - range.start.row) as i32 + 1,
+    }
 }
 
 /// Maps an `save_xlsx_to_writer` failure to a [`SaveError`]: an I/O failure writing the temp

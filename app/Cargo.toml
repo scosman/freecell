@@ -47,6 +47,15 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 thiserror = "2"
 anyhow = "1"
 tempfile = "3"
+# Worker seam (Phase 4, components/engine_worker.md §Threading & channels):
+# `arc-swap` = the lock-free `Publication` snapshot slot (publish-then-bump);
+# `async-channel` = the worker→UI `WorkerEvent` channel (the type `smol::channel`
+# re-exports — awaited by the gpui foreground task, blocking-recv in headless tests —
+# without pulling an async runtime into the headless engine); `parking_lot` = the shared
+# `RwLock<SheetCaches>` (no poisoning if the worker panics under a write lock).
+arc-swap = "1"
+async-channel = "2"
+parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }

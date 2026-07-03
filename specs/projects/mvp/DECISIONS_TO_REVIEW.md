@@ -226,3 +226,73 @@ Known placeholders the build will resolve (append the resolution here):
   `failed_save_leaves_real_existing_xlsx_byte_identical`, root-proof ENOTDIR injection),
   since a save to a writable regular-file target cannot fail root-proof by design.
   (`crates/freecell-engine/src/document.rs`, `tests/roundtrip.rs`)
+- [Phase 4] `SheetId` on the worker seam is IronCalc's **stable `sheet_id`** (not the
+  volatile worksheet index), resolving core's "stable, positional identifier … index↔id
+  map" doc (`refs.rs`). Commands / `Publication` / `SheetMeta` all carry the stable id; the
+  worker maps it to the current index before each IronCalc call. The component-doc command
+  table writes `idx`, but stable ids keep per-sheet UI state (scroll/selection) correct
+  across a sheet **delete** (index shift), not just a rename — the more-correct MVP choice
+  at the cost of an O(sheets) resolve per op (trivial; few sheets). No reorder API exists
+  (round-3 B), so ordering is unaffected. (`worker/protocol.rs`, `worker/run.rs`)
+- [Phase 4] `WorkerEvent` uses `async_channel` (2.x) rather than the spec-named
+  `smol::channel`. `smol::channel` **re-exports `async-channel`** — same types — so the
+  gpui foreground task still `recv().await`s it; using the crate directly keeps the headless
+  `freecell-engine` free of the smol async runtime. (`worker/client.rs`, `Cargo.toml`)
+- [Phase 4] `Publication.text_color` is published as `None` in this phase. IronCalc's
+  formatted-value path exposes number-format colour (`[Red]`-style) only as a **palette
+  index** (`Formatted.color: Option<i32>`; 0–6 named + 1–56 indexed), not an RGB — mapping
+  it needs the indexed-colour table that belongs with the Phase-5 style cache (which owns
+  the colour domain, cf. the fill palette). Display **text** is fully correct; the colour
+  override lands with the style cache. (`worker/run.rs build_publication`)
+- [Phase 4] `DocumentClient` adds `committed_ops() -> u64` (a shared `AtomicU64`) beyond the
+  component-doc interface sketch, mirroring `generation()`. The architecture frames the
+  dirty flag as `latest_committed_op > last_saved_op`; exposing the live committed-op count
+  (incremented on every applied undoable op, including undo/redo per `architecture.md §2`)
+  gives Phase-11 dirty tracking a lock-free read and makes the accounting testable.
+  (`worker/client.rs`, `worker/run.rs`)
+- [Phase 4] `Command` carries a `#[cfg(test)] TestPanic` variant (never compiled into the
+  public build) to inject a panic inside the `catch_unwind`-guarded apply, exercising the
+  recovery + degraded policy deterministically from in-crate unit tests. The degraded policy
+  implemented: 1st caught panic + responsive probe → `EditRejected{EnginePanic}` and keep
+  serving; a 2nd panic **or** an unresponsive probe → `WorkerDegraded`, refuse further edits
+  (reads/save still work — the Save-As escape hatch). (`worker/protocol.rs`, `worker/run.rs`)
+- [Phase 4] Style toggles (`SetStyleAttr` Bold/Italic/Underline) resolve "any-lacking →
+  set-all" by reading current per-cell state **from the engine** (`get_cell_style`) in this
+  phase; Phase 5's resident cache turns this into an O(1)-ish map lookup. Ranges are bounded
+  user selections. `Fill(Option<Rgb>)` is a direct set (`fill.fg_color = #RRGGBB`) / clear
+  (empty string → IronCalc "no fill"). (`worker/run.rs apply_style`, `document.rs`)
+- [Phase 4] `LoadError` / `SaveError` gained `#[derive(Clone)]` so the typed reasons ride
+  `WorkerEvent::LoadFailed` / `SaveFailed` (they carry only `String`s). (`document.rs`)
+- [Phase 4] The worker-side abort-cap test uses cap-**exceeding** reproducers only (depth
+  490 > 64; the canonical round-3 D 11,897-term flat chain ⇒ ~23.8k chars > 8192). The
+  component doc's "~2832-term" figure is D's abort *ceiling on a small default stack*, which
+  is **under** the 8192-char length cap and therefore (correctly) allowed through — a
+  cap-passing chain of that size would reach the engine and overflow the small **test-thread**
+  stack (the 64 MiB stack is the spawned worker's, not the unit-test thread's). The cap
+  eliminates the class *in combination with* the 64 MiB worker stack.
+  (`worker/run.rs` cap test, `input_cap.rs`)
+- [Phase 4] (post-CR) `SetStyleAttr` no longer forces a recompute: a new `AppliedKind::StyleOnly`
+  applies the style + counts a committed op + publishes (a repaint; P5 ships cache deltas) but
+  skips `evaluate()` — styles don't affect values (component-doc command table). Only
+  value/undo/redo/clear (`Cell`) and sheet ops (`SheetOp`) recompute.
+  (`worker/run.rs apply_one`, `apply_edit_batch`)
+- [Phase 4] (post-CR) The published viewport is capped to a bounded overscan window
+  (`MAX_PUBLISH_ROWS=512 × MAX_PUBLISH_COLS=256` = 131,072 cells worst case) in addition to the
+  sheet-bound clamp, so a pathological full-sheet `SetViewport` can't wedge the worker in a
+  billions-of-cells probe (the build-publication loop is the robustness boundary and is not
+  inside `catch_unwind`). The bounds are sized to comfortably exceed a ~3× overscan of the
+  largest supported display (a 4K screen ⇒ ~300 rows × ~180 cols), so overscan pre-fetch is
+  never clipped in practice; a clipped overscan would only render blank and self-heal on the
+  next `SetViewport`. **Phase 6/7 must cross-check** `MAX_PUBLISH_ROWS`/`MAX_PUBLISH_COLS` keep
+  margin over the real overscan dimensions once the grid exists. (`worker/run.rs clamp_viewport`)
+- [Phase 4] (post-CR) The worker now emits the SP1 apply/eval/publish observables as `tracing`
+  debug events (`apply_us` / `eval_us` on the coalesced batch; `publish_us` + cell count in
+  `publish`), so `tracing` is a live dependency and Phase 12's perf harness can read the
+  timings (`architecture.md §8`). (`worker/run.rs`)
+- [Phase 4] (post-CR) The caught-panic recovery's `resume_evaluation()` is itself wrapped in
+  `catch_unwind` — a poisoned model could panic on that call, and recovery must never unwind
+  out of `run()` and kill the thread. (`worker/run.rs apply_edit_batch` Err arm)
+- [Phase 4] (post-CR) `process_batch` command routing is an exhaustive match (control arms +
+  an or-pattern of the edit variants, no catch-all), so a future `Command` variant must be
+  explicitly classified and can't silently fall through to the apply path.
+  (`worker/run.rs process_batch`)

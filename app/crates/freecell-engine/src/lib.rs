@@ -7,14 +7,25 @@
 //!
 //! Phase 3 adds the **file-I/O adapter** ([`WorkbookDocument`]): new/open/save with atomic
 //! temp-file+rename and typed [`LoadError`]/[`SaveError`]s, plus the [`fixtures`] module of
-//! deterministic test workbooks. The worker seam (Phase 4) and caches (Phase 5) build on it.
+//! deterministic test workbooks.
+//!
+//! Phase 4 adds the **eval worker seam** ([`worker`]): [`DocumentClient::spawn`] runs the
+//! `UserModel` on a dedicated 64 MiB-stack thread and drives the drain-coalesce → apply →
+//! publish-then-bump loop, the viewport [`Publication`](freecell_core::Publication) build,
+//! the worker-side input-cap re-check, `catch_unwind` + degraded policy, and dirty-op
+//! accounting. Caches (Phase 5) build on it.
 
 pub mod document;
 pub mod fixtures;
+pub mod worker;
 
 pub use document::{
     CellQueryError, DocumentSource, LoadError, SaveError, WorkbookDocument, DEFAULT_LANGUAGE,
     DEFAULT_LOCALE, DEFAULT_TIMEZONE, NEW_WORKBOOK_NAME,
+};
+pub use worker::{
+    Command, DocumentClient, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent,
+    WorkerEventReceiver, WORKER_STACK_SIZE,
 };
 
 /// Re-export of the pinned IronCalc workbook type the worker will own. `pub(crate)` — the

@@ -64,7 +64,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
 - [x] **Phase 3 — Document I/O.** IronCalc adapter: new/open/save (atomic
   temp+rename), typed load/save errors, fixture workbooks, open→save→reopen
   round-trip tests. (`components/engine_worker.md §File I/O`)
-- [ ] **Phase 4 — Eval worker seam.** Command/event loop, drain-coalescing,
+- [x] **Phase 4 — Eval worker seam.** Command/event loop, drain-coalescing,
   publish-then-bump generation, viewport publication build, 64 MiB stack, worker-side
   cap re-check, catch_unwind + degraded policy, dirty-op accounting, full seam test
   suite (incl. negative control). (`components/engine_worker.md`)

@@ -13,11 +13,19 @@ ironcalc_base.workspace = true
 # Phase 3 (Document I/O): `ironcalc` is the umbrella crate carrying the xlsx load/save API
 # (`import::load_from_xlsx`, `export::save_xlsx_to_writer`, `error::XlsxError`); `thiserror`
 # backs the typed `LoadError`/`SaveError`; `tempfile` provides the atomic temp-file+rename
-# save. `tracing` (worker apply/eval/publish timings) still arrives with the Phase-4 worker;
-# its pin stays in the workspace dependency table until then.
+# save.
 ironcalc.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+# Phase 4 (eval worker seam, components/engine_worker.md): `arc-swap` holds the published
+# `Publication` snapshot (publish-then-bump); `async-channel` carries `WorkerEvent`s to the
+# UI (the type `smol::channel` re-exports; no async runtime in the headless engine);
+# `parking_lot` fronts the shared `RwLock<SheetCaches>`; `tracing` logs apply/eval/publish
+# timings at debug (the SP1 observables).
+arc-swap.workspace = true
+async-channel.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

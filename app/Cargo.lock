@@ -2034,11 +2034,15 @@ version = "0.1.0"
 name = "freecell-engine"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "async-channel 2.5.0",
  "freecell-core",
  "ironcalc",
  "ironcalc_base",
+ "parking_lot",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

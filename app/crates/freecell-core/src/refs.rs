@@ -1,0 +1,281 @@
+//! Cell addressing: zero-based `(row, col)` refs, rectangular ranges, and Excel "A1"
+//! notation conversion (both directions).
+//!
+//! `column_label` / `column_from_label` are the bijective base-26 conversion ported from
+//! the frozen `datagen::column_label` (`experiments/shared/datagen/src/cell.rs`), copied
+//! not referenced (`architecture.md §1`). Everything here is zero-based internally; A1 is
+//! one-based with letter columns, produced only at the UI edge (the ref box).
+
+use crate::limits;
+
+/// A stable, positional identifier for a worksheet. The worker assigns these and keeps an
+/// index↔id map so renames don't invalidate per-sheet UI state (`architecture.md §3`,
+/// `components/style_cache.md`). Grid scroll/selection maps and the caches key on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SheetId(pub u32);
+
+/// A zero-based `(row, col)` cell coordinate (`(0, 0)` is `A1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CellRef {
+    pub row: u32,
+    pub col: u32,
+}
+
+impl CellRef {
+    /// Creates a zero-based cell ref.
+    pub const fn new(row: u32, col: u32) -> Self {
+        Self { row, col }
+    }
+
+    /// Renders this ref in Excel "A1" notation: `(0, 0) -> "A1"`, `(0, 26) -> "AA1"`,
+    /// `(0, 16383) -> "XFD1"`.
+    pub fn to_a1(self) -> String {
+        let mut label = column_label(self.col);
+        // Excel rows are one-based.
+        label.push_str(&(self.row + 1).to_string());
+        label
+    }
+
+    /// Parses an "A1"-notation ref (`"B7"`, `"$C$3"`, case-insensitive). Absolute-marker
+    /// `$` signs are accepted and ignored (MVP has no relative/absolute distinction in the
+    /// ref box). Returns `None` for anything malformed or out of the Excel-max range.
+    pub fn from_a1(text: &str) -> Option<Self> {
+        let s = text.trim();
+        let mut chars = s.chars().peekable();
+
+        // Leading optional `$` then one-or-more ASCII letters → column.
+        if chars.peek() == Some(&'$') {
+            chars.next();
+        }
+        let mut letters = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphabetic() {
+                letters.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if letters.is_empty() {
+            return None;
+        }
+
+        // Optional `$` then one-or-more ASCII digits → row.
+        if chars.peek() == Some(&'$') {
+            chars.next();
+        }
+        let mut digits = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                digits.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        // Anything left over (spaces already trimmed) means it wasn't a clean ref.
+        if chars.next().is_some() || digits.is_empty() {
+            return None;
+        }
+
+        let col = column_from_label(&letters)?;
+        // Row is one-based in A1; reject 0 and out-of-range.
+        let row_one = digits.parse::<u64>().ok()?;
+        if row_one == 0 {
+            return None;
+        }
+        let row = u32::try_from(row_one - 1).ok()?;
+        if row >= limits::MAX_ROWS || col >= limits::MAX_COLS {
+            return None;
+        }
+        Some(Self { row, col })
+    }
+}
+
+/// Converts a zero-based column index to its Excel letter label (`0 -> "A"`, `25 -> "Z"`,
+/// `26 -> "AA"`, `16383 -> "XFD"`).
+///
+/// Bijective base-26 ("bijective hexavigesimal"): no zero digit, so `26` maps to `AA`.
+pub fn column_label(col: u32) -> String {
+    let mut n = col as u64 + 1; // shift to one-based for bijective base-26
+    let mut bytes = Vec::new();
+    while n > 0 {
+        let rem = ((n - 1) % 26) as u8;
+        bytes.push(b'A' + rem);
+        n = (n - 1) / 26;
+    }
+    bytes.reverse();
+    // Bytes are all ASCII 'A'..='Z', so this is always valid UTF-8.
+    String::from_utf8(bytes).expect("column label is ASCII")
+}
+
+/// Parses an Excel column label (`"A" -> 0`, `"XFD" -> 16383`, case-insensitive) back to a
+/// zero-based index. Returns `None` on empty input, non-letters, or overflow past `u32`.
+pub fn column_from_label(label: &str) -> Option<u32> {
+    if label.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for c in label.chars() {
+        let d = match c {
+            'A'..='Z' => (c as u8 - b'A') as u64 + 1,
+            'a'..='z' => (c as u8 - b'a') as u64 + 1,
+            _ => return None,
+        };
+        n = n.checked_mul(26)?.checked_add(d)?;
+        if n > u32::MAX as u64 + 1 {
+            return None;
+        }
+    }
+    // n is one-based; shift back to zero-based.
+    u32::try_from(n - 1).ok()
+}
+
+/// A normalized rectangular range of cells. `start` is always the top-left corner and
+/// `end` the bottom-right (both inclusive), regardless of which corner the user anchored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellRange {
+    pub start: CellRef,
+    pub end: CellRef,
+}
+
+impl CellRange {
+    /// Builds a range from two arbitrary corners, normalizing to top-left / bottom-right.
+    pub fn new(a: CellRef, b: CellRef) -> Self {
+        Self {
+            start: CellRef::new(a.row.min(b.row), a.col.min(b.col)),
+            end: CellRef::new(a.row.max(b.row), a.col.max(b.col)),
+        }
+    }
+
+    /// A single-cell range.
+    pub fn single(cell: CellRef) -> Self {
+        Self {
+            start: cell,
+            end: cell,
+        }
+    }
+
+    /// Whether the range covers exactly one cell.
+    pub fn is_single(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Inclusive row span.
+    pub fn rows(&self) -> std::ops::RangeInclusive<u32> {
+        self.start.row..=self.end.row
+    }
+
+    /// Inclusive column span.
+    pub fn cols(&self) -> std::ops::RangeInclusive<u32> {
+        self.start.col..=self.end.col
+    }
+
+    /// Whether `cell` lies inside the range (inclusive).
+    pub fn contains(&self, cell: CellRef) -> bool {
+        cell.row >= self.start.row
+            && cell.row <= self.end.row
+            && cell.col >= self.start.col
+            && cell.col <= self.end.col
+    }
+
+    /// A1 notation: `"B7"` for a single cell, `"B2:D9"` for a rectangle.
+    pub fn to_a1(&self) -> String {
+        if self.is_single() {
+            self.start.to_a1()
+        } else {
+            format!("{}:{}", self.start.to_a1(), self.end.to_a1())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_label_known_values() {
+        assert_eq!(column_label(0), "A");
+        assert_eq!(column_label(25), "Z");
+        assert_eq!(column_label(26), "AA");
+        assert_eq!(column_label(27), "AB");
+        assert_eq!(column_label(701), "ZZ");
+        assert_eq!(column_label(702), "AAA");
+        assert_eq!(column_label(16383), "XFD"); // Excel's last column.
+    }
+
+    #[test]
+    fn column_label_roundtrip() {
+        for col in [0u32, 1, 25, 26, 27, 51, 52, 700, 701, 702, 16383] {
+            let label = column_label(col);
+            assert_eq!(
+                column_from_label(&label),
+                Some(col),
+                "roundtrip failed for {col}"
+            );
+        }
+        // Case-insensitive.
+        assert_eq!(column_from_label("xfd"), Some(16383));
+        // Rejects junk.
+        assert_eq!(column_from_label(""), None);
+        assert_eq!(column_from_label("A1"), None);
+        assert_eq!(column_from_label("!"), None);
+    }
+
+    #[test]
+    fn a1_roundtrip() {
+        for (row, col) in [(0u32, 0u32), (6, 1), (0, 26), (1_048_575, 16_383), (41, 3)] {
+            let cell = CellRef::new(row, col);
+            let a1 = cell.to_a1();
+            assert_eq!(
+                CellRef::from_a1(&a1),
+                Some(cell),
+                "roundtrip failed for {a1}"
+            );
+        }
+        assert_eq!(CellRef::new(6, 1).to_a1(), "B7");
+        assert_eq!(CellRef::from_a1("B7"), Some(CellRef::new(6, 1)));
+        // Absolute markers accepted and ignored; whitespace trimmed; case-insensitive.
+        assert_eq!(CellRef::from_a1("$C$3"), Some(CellRef::new(2, 2)));
+        assert_eq!(CellRef::from_a1("  aa1 "), Some(CellRef::new(0, 26)));
+    }
+
+    #[test]
+    fn from_a1_rejects_junk() {
+        for bad in [
+            "", "1", "A", "A0", "B7C", "1A", "A1.5", "$$A1", "AAAA1", "B7 D9",
+        ] {
+            assert_eq!(CellRef::from_a1(bad), None, "should reject {bad:?}");
+        }
+        // Out of the Excel-max range.
+        assert_eq!(CellRef::from_a1("A1048577"), None); // one past the last row
+        assert_eq!(CellRef::from_a1("XFE1"), None); // one past the last column
+    }
+
+    #[test]
+    fn cell_range_normalizes_corners() {
+        // Anchor at bottom-right, active at top-left — still normalizes.
+        let r = CellRange::new(CellRef::new(9, 3), CellRef::new(2, 1));
+        assert_eq!(r.start, CellRef::new(2, 1));
+        assert_eq!(r.end, CellRef::new(9, 3));
+        assert!(!r.is_single());
+        assert!(CellRange::single(CellRef::new(4, 4)).is_single());
+    }
+
+    #[test]
+    fn cell_range_contains() {
+        let r = CellRange::new(CellRef::new(2, 1), CellRef::new(9, 3));
+        assert!(r.contains(CellRef::new(2, 1)));
+        assert!(r.contains(CellRef::new(9, 3)));
+        assert!(r.contains(CellRef::new(5, 2)));
+        assert!(!r.contains(CellRef::new(1, 2)));
+        assert!(!r.contains(CellRef::new(5, 4)));
+    }
+
+    #[test]
+    fn range_to_a1_single_vs_rect() {
+        assert_eq!(CellRange::single(CellRef::new(6, 1)).to_a1(), "B7");
+        let r = CellRange::new(CellRef::new(1, 1), CellRef::new(8, 3));
+        assert_eq!(r.to_a1(), "B2:D9");
+    }
+}

@@ -111,3 +111,41 @@ Known placeholders the build will resolve (append the resolution here):
   in P1). The version pins stay in the workspace dependency table; each crate re-adds the
   line in the phase that first uses it (noted inline in the manifests). MSRV corrected to
   `rust-version = "1.95"` to match the pin. (`app/Cargo.toml`, `app/crates/*/Cargo.toml`)
+- [Phase 2] `Axis`'s sizer bound widened from the POC's `Fn(u32) -> f32` to
+  `Fn(u32) -> f32 + Send + Sync` (and the box to `Box<dyn ... + Send + Sync>`) — deviation
+  from the ported `poc-core/layout.rs`, forced by reality: the geometry cache holds
+  `Arc<Axis>` inside `Arc<RwLock<SheetCaches>>` shared between the worker (writes) and UI
+  (reads) threads (`architecture.md §2, §6`), so `Axis` must be `Send + Sync`. All POC
+  tests still pass (their sizers are plain fns). Added `Axis::from_overrides` for the
+  cache's "default + sparse overrides" geometry. (`app/crates/freecell-core/src/axis.rs`)
+- [Phase 2] Input-cap validator is **scoped to formulas** (input starting with `=`);
+  non-formula text passes uncapped. Rationale: round-3 D established that only formulas run
+  through IronCalc's recursive parser (the sole stack-overflow-abort vector); a long plain
+  string is stored, not parsed. `functional_spec.md §3.3` says "reject *formulas* with
+  length > 8192 or nesting depth > 64", so this matches the spec's wording. The paren-depth
+  scan skips double-quoted string literals (`""` escape) so `="((("` isn't miscounted as
+  nesting. Both round-3 D abort reproducers are covered: deep parens → depth cap, long flat
+  `=1+1+…` chain → length cap. (`app/crates/freecell-core/src/input_cap.rs`)
+- [Phase 2] Keyboard-motion model: `apply_motion(sel, Motion, SheetDims)` with a `Motion`
+  enum (Move/Extend/JumpEdge/ExtendEdge/Page/ExtendPage/RowStart/ExtendRowStart). Tab/Enter
+  and their Shift variants are **not** distinct `Motion`s — they map to
+  `Move(Right/Down/Left/Up)` at the window/keymap layer (their only extra behaviour,
+  committing a pending data-row edit, is the data-row reducer's job, not the motion's).
+  Cmd/Ctrl+arrow jumps to the **sheet** edge (MVP: not edge-of-data, per §3.2).
+  (`app/crates/freecell-core/src/selection.rs`)
+- [Phase 2] Data-row reducer: on `EditCommitRequested` (grid click-away) with a
+  cap-**rejected** pending formula, the reducer emits `ShowCapError` and does **not** commit
+  or leave `Editing` — the window must cancel the pending selection change and keep the
+  field editing. Judgment call (the spec covers cap-reject on Enter but not on click-away);
+  chosen so an invalid formula can never be silently committed or lost.
+  (`app/crates/freecell-core/src/data_row.rs`)
+- [Phase 2] `SheetCacheBuilder` (the read-model constructor for fixtures + the Phase-5
+  engine builder) interns `RenderStyle`s by **value equality** into the `resolved` table.
+  This is a fixture-side intern distinct from the engine's worker-side `StyleInterner`
+  (which dedups on the serialized IronCalc `Style`, `components/style_cache.md`); what the
+  read model guarantees is a consistent `StyleId → RenderStyle` mapping, which either
+  interning path satisfies. (`app/crates/freecell-core/src/cache.rs`)
+- [Phase 2] `CellRef::from_a1` implemented (not just `to_a1`, which the read-only ref box
+  needs) to make A1 conversion round-trippable/testable per `architecture.md §3`
+  ("A1-reference conversion"); it accepts and ignores `$` absolute markers and rejects
+  out-of-Excel-max refs. (`app/crates/freecell-core/src/refs.rs`)

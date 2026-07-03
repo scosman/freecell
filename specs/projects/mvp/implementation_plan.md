@@ -53,7 +53,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   Linux capture works, record it in DECISIONS_TO_REVIEW.md, move the render suite to
   the `macos-verify` workflow, and keep building — nothing downstream blocks on the
   answer. `app/README.md` skeleton. (`architecture.md §1, §9`)
-- [ ] **Phase 2 — Core foundations** (Linux). Axis port + POC tests; A1/CellRange;
+- [x] **Phase 2 — Core foundations** (Linux). Axis port + POC tests; A1/CellRange;
   `RenderStyle`; `Publication`/`PublishedCell`; `SheetCaches` read model; input-cap
   validator (incl. round-3 D abort reproducers as rejected cases); sheet-name
   validator; palette; `SelectionModel` + keyboard motions; data-row reducer.

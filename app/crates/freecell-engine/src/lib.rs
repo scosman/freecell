@@ -5,14 +5,23 @@
 //! and the resident style/geometry cache (`architecture.md §2`). This crate is
 //! GPUI-free so it builds and tests headless in Linux CI (`architecture.md §9`).
 //!
-//! Phase 1 (scaffolding) only proves the pinned IronCalc dependency resolves, links,
-//! and is callable. The adapter, worker seam, and caches land in Phases 3–5
-//! (`implementation_plan.md`).
+//! Phase 3 adds the **file-I/O adapter** ([`WorkbookDocument`]): new/open/save with atomic
+//! temp-file+rename and typed [`LoadError`]/[`SaveError`]s, plus the [`fixtures`] module of
+//! deterministic test workbooks. The worker seam (Phase 4) and caches (Phase 5) build on it.
 
-/// Re-export of the pinned IronCalc workbook type the worker will own. Kept here so the
-/// rest of the crate (and its tests) reference a single canonical path as the adapter
-/// grows in later phases.
-pub use ironcalc_base::UserModel;
+pub mod document;
+pub mod fixtures;
+
+pub use document::{
+    CellQueryError, DocumentSource, LoadError, SaveError, WorkbookDocument, DEFAULT_LANGUAGE,
+    DEFAULT_LOCALE, DEFAULT_TIMEZONE, NEW_WORKBOOK_NAME,
+};
+
+/// Re-export of the pinned IronCalc workbook type the worker will own. `pub(crate)` — the
+/// worker lives inside this crate and `WorkbookDocument` keeps every IronCalc type off the
+/// public surface (`architecture.md §2`: `freecell-engine` is the headless boundary; no
+/// IronCalc type escapes it). Kept as a single canonical path for in-crate use.
+pub(crate) use ironcalc_base::UserModel;
 
 #[cfg(test)]
 mod tests {

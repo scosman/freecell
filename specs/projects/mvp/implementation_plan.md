@@ -61,7 +61,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   halves)
 
 **Track A — engine (Linux-testable):**
-- [ ] **Phase 3 — Document I/O.** IronCalc adapter: new/open/save (atomic
+- [x] **Phase 3 — Document I/O.** IronCalc adapter: new/open/save (atomic
   temp+rename), typed load/save errors, fixture workbooks, open→save→reopen
   round-trip tests. (`components/engine_worker.md §File I/O`)
 - [ ] **Phase 4 — Eval worker seam.** Command/event loop, drain-coalescing,

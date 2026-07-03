@@ -149,3 +149,80 @@ Known placeholders the build will resolve (append the resolution here):
   needs) to make A1 conversion round-trippable/testable per `architecture.md §3`
   ("A1-reference conversion"); it accepts and ignores `$` absolute markers and rejects
   out-of-Excel-max refs. (`app/crates/freecell-core/src/refs.rs`)
+- [Phase 3] The file-I/O adapter is `freecell_engine::WorkbookDocument` (new/open/save +
+  typed errors), NOT the `DocumentClient` handle from `components/engine_worker.md` — that
+  name is the Phase-4 worker handle. `WorkbookDocument` owns the `UserModel<'static>` and is
+  what the Phase-4 worker will hold on its thread. `DocumentSource {NewWorkbook, OpenFile}`
+  is defined now as specced. The public read API (`sheet_names`, `formatted_value`,
+  `cell_content`) returns only `std`/`freecell-core` types — no `ironcalc` type escapes the
+  crate; `user_model_mut`/`cell_style` are `pub(crate)`. A compile-time guard asserts
+  `WorkbookDocument: Send` (verified) so the Phase-4 thread move is sound.
+  (`app/crates/freecell-engine/src/document.rs`)
+- [Phase 3] `load_from_xlsx` at 0.7.1 takes **four** args `(path, locale, tz, language)`, not
+  the `(path, locale, tz)` in `components/engine_worker.md §File I/O`. The extra `language`
+  selects the formula-language pack; the adapter passes the `'static` literal `"en"`
+  (`DEFAULT_LANGUAGE`), which is what makes the returned `Model`/`UserModel` `'static`. Not a
+  blocker — an added required arg with an obvious value. (`document.rs`)
+- [Phase 3] Timezone default is **`UTC`**, not the "system tz" the component doc names. UTC
+  is deterministic (only volatile date/time functions like `NOW()`/`TODAY()` depend on it,
+  and those are outside the round-trip test scope); reading the OS timezone would need an
+  extra crate (`iana-time-zone`) and add non-determinism. System-tz detection is deferred;
+  it is a one-line change at `DEFAULT_TIMEZONE` if a real requirement appears. (`document.rs`)
+- [Phase 3] Save uses `ironcalc::export::save_xlsx_to_writer(&Model, W)` into a
+  `tempfile::NamedTempFile` in the destination dir, then `sync_all` (fsync) + `persist`
+  (atomic rename) — **not** `save_to_xlsx`, which hard-errors if the target path already
+  exists (it would make every re-save fail). Durability order is file-fsync-then-rename per
+  the spec; a parent-directory fsync (to persist the rename itself across power loss) is
+  deliberately NOT added — atomicity/no-half-written-target already holds via temp+rename;
+  flagged as optional P13 hardening. Added `tempfile = "3"` to the workspace dep table.
+  (`app/Cargo.toml`, `document.rs`)
+- [Phase 3] Typed open errors are classified by **leading magic bytes** before the load, because
+  IronCalc's flat `XlsxError {IO, Zip, Xml, Workbook, …}` cannot by itself separate
+  not-xlsx / corrupt / password. Rule: OLE2/CFB `D0CF11E0…` → `PasswordProtected` (encrypted
+  OOXML *and* legacy binary `.xls` share this container — the MVP treats both as
+  can't-open/protected); `PK…` → treat as a zip and map any subsequent load failure to
+  `Corrupt`; anything else (text, empty file, other binary) → `NotXlsx`; an OS open/read
+  failure → `Io`. `XlsxError::NotImplemented` (a valid xlsx with unsupported features) maps
+  to `Corrupt` with the underlying message preserved — the spec's `LoadError` enum lists only
+  `{NotXlsx, Corrupt, PasswordProtected, Io}`, so no new variant was added. (`document.rs`)
+- [Phase 3] `SaveError` is split into `{Io, Serialize}` (the component doc only says
+  `SaveFailed{reason}`) so a writer-serialization failure is distinguishable from a
+  disk/rename failure in the eventual dialog. Both leave the destination untouched. (`document.rs`)
+- [Phase 3] The `save_atomic_on_failure` test uses **root-proof** failure injection because the
+  build container runs as **root** (verified: `chmod 0555` dir perms are bypassed, so a
+  read-only-directory injection would not fail). Two injections used instead: (a) a target in a
+  non-existent directory → `ENOENT` on temp creation → `SaveError::Io`, asserts nothing is
+  created; (b) a target that is an existing non-empty **directory** → `EISDIR` on the rename →
+  `SaveError::Io`, asserts the directory + its sentinel file are byte-identical and no temp
+  file leaks (the real "existing file preserved on failed save" invariant). (`tests/roundtrip.rs`)
+- [Phase 3] Round-trip tests assert exact engine-formatted strings that were probe-confirmed
+  live: currency `1234.5`→`"$1,234.50"`, percent `1`→`"100.00%"`, serial `44197`→`"2021-01-01"`,
+  and formula errors `#DIV/0!` / `#CIRC!` survive save→reopen from cached values (no eval on
+  open — SP2). If an IronCalc version bump changes any formatted output, these tests flip and
+  force a conscious update. The circular-ref fixture uses `pause_evaluation`/`evaluate` (the
+  batch API the Phase-4 worker will use) to build the ring once. (`fixtures.rs`,
+  `tests/roundtrip.rs`)
+- [Phase 3] (post-CR) The engine's `UserModel` re-export is tightened to `pub(crate) use`
+  (was `pub use`) — an IronCalc type must not sit on `freecell-engine`'s public surface
+  (`architecture.md §2` headless boundary). Nothing outside the crate referenced it, and the
+  Phase-4 worker lives inside the crate; `WorkbookDocument` keeps all IronCalc types
+  in-crate. Confirmed the crate + all tests still build. (`crates/freecell-engine/src/lib.rs`)
+- [Phase 3] (post-CR) The OLE2/CFB magic (`D0CF11E0…`) can be either an encrypted `.xlsx`
+  **or** a plain (unencrypted) legacy binary `.xls`; the two can't be told apart cheaply
+  (both share the magic — distinguishing needs a CFB directory parse). Rather than add a CFB
+  parser, the spec-named `LoadError::PasswordProtected` variant is **kept** but its
+  user-facing message is reworded to name both possibilities accurately ("a legacy Excel
+  workbook (.xls) or a password-protected/encrypted .xlsx — re-save as modern .xlsx"), so it
+  is not inaccurate for a plain `.xls` (`functional_spec.md §5.1`). A future cheap CFB-stream
+  probe could split this into a distinct `UnsupportedLegacyFormat` reason.
+  (`crates/freecell-engine/src/document.rs`)
+- [Phase 3] (post-CR) `save_xlsx_to_writer` errors are now split accurately: an
+  `XlsxError::IO` (temp-file write failure) → `SaveError::Io`; any other (structural) error →
+  `SaveError::Serialize` (`map_writer_error`). With a healthy model + working temp file the
+  pinned writer only fails on I/O, so `SaveError::Serialize` is a **defensive, not reachably
+  triggerable** path (documented in code) — a malformed model would be needed and the edit
+  APIs prevent that. The real "existing valid `.xlsx` preserved on a failed save" invariant
+  is now covered against a **genuine prior workbook** (test
+  `failed_save_leaves_real_existing_xlsx_byte_identical`, root-proof ENOTDIR injection),
+  since a save to a writable regular-file target cannot fail root-proof by design.
+  (`crates/freecell-engine/src/document.rs`, `tests/roundtrip.rs`)

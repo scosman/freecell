@@ -10,10 +10,14 @@ description = "IronCalc adapter, evaluation worker, style/geometry caches, and f
 [dependencies]
 freecell-core.workspace = true
 ironcalc_base.workspace = true
-# Added when first exercised, not forward-declared: `ironcalc` (the umbrella crate with
-# the xlsx load/save API) arrives with Document I/O in Phase 3; `thiserror` (EngineError
-# enums) also Phase 3; `tracing` (worker apply/eval/publish timings) Phase 4. The pins
-# for all three stay in the workspace dependency table.
+# Phase 3 (Document I/O): `ironcalc` is the umbrella crate carrying the xlsx load/save API
+# (`import::load_from_xlsx`, `export::save_xlsx_to_writer`, `error::XlsxError`); `thiserror`
+# backs the typed `LoadError`/`SaveError`; `tempfile` provides the atomic temp-file+rename
+# save. `tracing` (worker apply/eval/publish timings) still arrives with the Phase-4 worker;
+# its pin stays in the workspace dependency table until then.
+ironcalc.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

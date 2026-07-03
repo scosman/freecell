@@ -19,8 +19,7 @@ use freecell_core::{CellRange, CellRef, Rgb};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
 use ironcalc_base::expressions::types::Area;
-#[cfg(test)]
-use ironcalc_base::types::Style;
+use ironcalc_base::types::{Style, Worksheet};
 
 use crate::UserModel; // the crate's single canonical path to the IronCalc workbook type
 use tempfile::NamedTempFile;
@@ -267,6 +266,77 @@ impl WorkbookDocument {
         self.model
             .get_cell_content(sheet, row, col)
             .map_err(CellQueryError)
+    }
+
+    /// The raw IronCalc worksheet at `sheet_idx` — the enumeration source the Phase-5 cache
+    /// builder scans (`sheet_data` for populated/styled cells, `rows`/`cols` for band styles +
+    /// custom sizes). `pub(crate)`: the `Worksheet` is an IronCalc type and must not leave the
+    /// crate (the cache module lives in this crate and does the conversion to engine-free forms).
+    pub(crate) fn worksheet(&self, sheet_idx: u32) -> Result<&Worksheet, String> {
+        self.model.get_model().workbook.worksheet(sheet_idx)
+    }
+
+    /// The cell's **own** style (the style stored on the cell itself), or `None` when the cell is
+    /// absent from the sheet data. Mirrors IronCalc's `get_cell_style_index` rule: a cell present
+    /// in the sheet data resolves to its own style — even the default — shadowing any band, while
+    /// an absent cell falls through to the row/column band. The Phase-5 mirror path reads this to
+    /// keep the cache's `render_style` in agreement with `get_style_for_cell`.
+    pub(crate) fn cell_own_style(
+        &self,
+        sheet_idx: u32,
+        cell: CellRef,
+    ) -> Result<Option<Style>, String> {
+        let (row, col) = to_engine_coords(cell);
+        self.model
+            .get_model()
+            .get_cell_style_or_none(sheet_idx, row, col)
+    }
+
+    /// The cell's fully-resolved style (cell > row-band > col-band > default) — the engine's
+    /// authoritative `get_style_for_cell`, used by the agreement contract as the "fresh re-read"
+    /// the cache must match. Test-only: the production mirror path reads the cell's *own* style
+    /// ([`cell_own_style`](Self::cell_own_style)), never the resolved one.
+    #[cfg(test)]
+    pub(crate) fn resolved_cell_style(
+        &self,
+        sheet_idx: u32,
+        cell: CellRef,
+    ) -> Result<Style, String> {
+        let (row, col) = to_engine_coords(cell);
+        self.model
+            .get_model()
+            .get_style_for_cell(sheet_idx, row, col)
+    }
+
+    /// The row band style at `row` (0-based), if the row carries one.
+    pub(crate) fn row_band_style(&self, sheet_idx: u32, row: u32) -> Result<Option<Style>, String> {
+        self.model
+            .get_model()
+            .get_row_style(sheet_idx, row as i32 + 1)
+    }
+
+    /// The column band style at `col` (0-based), if the column carries one.
+    pub(crate) fn col_band_style(&self, sheet_idx: u32, col: u32) -> Result<Option<Style>, String> {
+        self.model
+            .get_model()
+            .get_column_style(sheet_idx, col as i32 + 1)
+    }
+
+    /// The row height at `row` (0-based) in **IronCalc pixels** (the cache converts to FreeCell
+    /// device px). IronCalc's getter already returns px (`ironcalc_base/src/constants.rs`).
+    pub(crate) fn row_height_px(&self, sheet_idx: u32, row: u32) -> Result<f64, String> {
+        self.model
+            .get_model()
+            .get_row_height(sheet_idx, row as i32 + 1)
+    }
+
+    /// The column width at `col` (0-based) in **IronCalc pixels** (see [`row_height_px`]).
+    ///
+    /// [`row_height_px`]: Self::row_height_px
+    pub(crate) fn col_width_px(&self, sheet_idx: u32, col: u32) -> Result<f64, String> {
+        self.model
+            .get_model()
+            .get_column_width(sheet_idx, col as i32 + 1)
     }
 
     /// Each sheet's `(stable sheet_id, name)` in workbook order — the source the worker uses

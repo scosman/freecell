@@ -68,7 +68,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   publish-then-bump generation, viewport publication build, 64 MiB stack, worker-side
   cap re-check, catch_unwind + degraded policy, dirty-op accounting, full seam test
   suite (incl. negative control). (`components/engine_worker.md`)
-- [ ] **Phase 5 — Style & geometry cache.** Interner, build-on-activation, unit
+- [x] **Phase 5 — Style & geometry cache.** Interner, build-on-activation, unit
   conversions, mirror-on-edit, undo/redo touch-set re-read, agreement-contract tests
   + negative control; integrate into worker (StyleCacheUpdated deltas).
   (`components/style_cache.md`)

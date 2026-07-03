@@ -23,10 +23,13 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::collections::HashSet;
+
 use freecell_core::input_cap::validate_input;
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{limits, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
+use crate::cache;
 use crate::document::{DocumentSource, FontFlag, WorkbookDocument};
 
 use super::client::Shared;
@@ -45,12 +48,33 @@ enum Flow {
 enum AppliedKind {
     /// A value/undo/redo/clear edit — needs a recompute before republishing values.
     Cell,
-    /// A style-only edit — publishes (cache deltas in P5; a repaint now) but needs **no**
-    /// recompute: styles don't affect values (component-doc command table).
+    /// A style-only edit — publishes (ships cache deltas) but needs **no** recompute: styles
+    /// don't affect values (component-doc command table).
     StyleOnly,
     /// An add/rename/delete sheet — needs a recompute (can affect formulas) and also emits
     /// `SheetsChanged`.
     SheetOp,
+}
+
+/// The cache **touch-set** of one applied undoable op, recorded so `Undo`/`Redo` can re-read the
+/// affected cells (`components/style_cache.md §Lifecycle`: undo/redo re-reads the recorded
+/// touch-set). Kept in a parallel worker-side history aligned 1:1 with IronCalc's undo stack.
+#[derive(Debug, Clone)]
+enum Touch {
+    /// A cell/style/clear edit touched `range` on `sheet`; re-read those cells to mirror it.
+    Cells { sheet: SheetId, range: CellRange },
+    /// A sheet add/rename/delete; on undo/redo, reconcile the caches map + rebuild the active
+    /// sheet (a returning deleted sheet rebuilds lazily on next activation).
+    Sheets,
+}
+
+/// What one successfully-applied edit was, for post-eval cache bookkeeping. `Cells`/`Sheets`
+/// push a [`Touch`]; `Undo`/`Redo` pop/move one (they consume history, don't create it).
+enum AppliedOp {
+    Cells { sheet: SheetId, range: CellRange },
+    Sheets,
+    Undo,
+    Redo,
 }
 
 /// The per-window worker: owns the document + the shared read-surfaces and drives the loop.
@@ -74,6 +98,12 @@ pub(super) struct Worker {
     degraded: bool,
     /// Count of caught panics (a second one, or an unresponsive probe, degrades the worker).
     panic_count: u32,
+    /// Per-op cache touch-sets, aligned 1:1 with IronCalc's undo stack. A new undoable edit
+    /// pushes here (clearing `redo_touches`); `Undo` pops here → `redo_touches`; `Redo` the
+    /// reverse. Re-reading the popped touch-set keeps the cache in agreement across undo/redo.
+    undo_touches: Vec<Touch>,
+    /// The redo side of the touch-set history (mirrors IronCalc's redo stack).
+    redo_touches: Vec<Touch>,
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -111,6 +141,8 @@ impl Worker {
             eval_count: 0,
             degraded: false,
             panic_count: 0,
+            undo_touches: Vec::new(),
+            redo_touches: Vec::new(),
         };
 
         // Point the active sheet at the first sheet's real stable id, and seed an empty
@@ -124,7 +156,15 @@ impl Worker {
             .shared
             .publication
             .store(Arc::new(Publication::empty(worker.active_sheet, 0)));
+
+        // Build the active sheet's style & geometry cache on open, so first paint has geometry +
+        // styles resident (values follow on the first `SetViewport`). Non-active sheets build on
+        // first activation (`components/style_cache.md §Lifecycle`).
+        worker.build_and_store_cache(worker.active_sheet);
         worker.emit(WorkerEvent::Loaded { sheets });
+        worker.emit(WorkerEvent::StyleCacheUpdated {
+            sheet: worker.active_sheet,
+        });
 
         worker.run(cmd_rx);
     }
@@ -193,6 +233,14 @@ impl Worker {
             self.emit(WorkerEvent::Published);
         }
 
+        // Activating a sheet (a viewport switch to it) builds its style/geometry cache on first
+        // visit, then stays resident (`components/style_cache.md §Lifecycle`).
+        if viewport_changed && self.ensure_active_cache_built() {
+            self.emit(WorkerEvent::StyleCacheUpdated {
+                sheet: self.active_sheet,
+            });
+        }
+
         for (sheet, cell, req_id) in reads {
             let raw = match self.resolve(sheet) {
                 Some(idx) => self.doc.cell_content(idx, cell).unwrap_or_default(),
@@ -245,6 +293,11 @@ impl Worker {
             return false;
         }
 
+        // Snapshot the sheet list so a change (add/rename/delete — including via undo/redo) is
+        // detected by comparison after the batch, driving both `SheetsChanged` and the cache-map
+        // reconcile without threading a flag out of every undo path.
+        let sheets_before = self.sheet_metas();
+
         self.emit(WorkerEvent::EvalStarted);
 
         // The IronCalc apply+eval is the only panic-prone region (round-3 D belt-and-braces).
@@ -255,20 +308,26 @@ impl Worker {
                 doc.pause_evaluation();
                 let mut applied = 0u64;
                 let mut needs_eval = false;
-                let mut sheets_changed = false;
                 let mut engine_errors: Vec<String> = Vec::new();
+                // One `AppliedOp` per successfully-applied edit, in order, for post-eval cache
+                // bookkeeping (touch-set stacks + mirror refresh).
+                let mut applied_ops: Vec<AppliedOp> = Vec::new();
                 for edit in &valid {
                     match apply_one(doc, edit) {
                         Ok(AppliedKind::Cell) => {
                             applied += 1;
                             needs_eval = true;
+                            applied_ops.push(op_of(edit));
                         }
                         // Style-only edits don't affect values → skip the recompute.
-                        Ok(AppliedKind::StyleOnly) => applied += 1,
+                        Ok(AppliedKind::StyleOnly) => {
+                            applied += 1;
+                            applied_ops.push(op_of(edit));
+                        }
                         Ok(AppliedKind::SheetOp) => {
                             applied += 1;
                             needs_eval = true;
-                            sheets_changed = true;
+                            applied_ops.push(op_of(edit));
                         }
                         Err(msg) => engine_errors.push(msg),
                     }
@@ -286,14 +345,14 @@ impl Worker {
                     eval_us = eval_done.duration_since(apply_done).as_micros() as u64,
                     "worker: applied coalesced batch"
                 );
-                (applied, needs_eval, sheets_changed, engine_errors)
+                (applied, needs_eval, engine_errors, applied_ops)
             }))
         };
 
         self.emit(WorkerEvent::EvalFinished);
 
         match outcome {
-            Ok((applied, needs_eval, sheets_changed, engine_errors)) => {
+            Ok((applied, needs_eval, engine_errors, applied_ops)) => {
                 for msg in engine_errors {
                     self.emit(WorkerEvent::EditRejected {
                         reason: EditRejectedReason::Engine(msg),
@@ -311,9 +370,18 @@ impl Worker {
                     .store(self.ops_seen, Ordering::Release);
                 self.publish();
                 self.emit(WorkerEvent::Published);
-                if sheets_changed {
-                    let sheets = self.sheet_metas();
-                    self.emit(WorkerEvent::SheetsChanged { sheets });
+
+                // Mirror the applied ops into the style/geometry cache (re-read touched cells;
+                // maintain the undo/redo touch-set stacks), then ship `StyleCacheUpdated` deltas.
+                self.mirror_applied_ops(applied_ops, &sheets_before);
+
+                // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the
+                // tab bar. Compared by value so undo/redo of a sheet op is caught too.
+                let sheets_after = self.sheet_metas();
+                if sheets_after != sheets_before {
+                    self.emit(WorkerEvent::SheetsChanged {
+                        sheets: sheets_after,
+                    });
                 }
                 true
             }
@@ -331,6 +399,156 @@ impl Worker {
                 false
             }
         }
+    }
+
+    /// Mirror a batch's applied ops into the resident cache (`components/style_cache.md
+    /// §Lifecycle`): maintain the undo/redo touch-set stacks, reconcile the caches map when the
+    /// sheet set changed, re-read the touched cells, and emit `StyleCacheUpdated` per changed
+    /// sheet. Runs after the eval + publish (styles don't depend on the recompute).
+    fn mirror_applied_ops(&mut self, applied_ops: Vec<AppliedOp>, sheets_before: &[SheetMeta]) {
+        let mut refresh: Vec<(SheetId, CellRange)> = Vec::new();
+        for op in applied_ops {
+            match op {
+                AppliedOp::Cells { sheet, range } => {
+                    self.undo_touches.push(Touch::Cells { sheet, range });
+                    self.redo_touches.clear(); // a fresh edit invalidates the redo stack
+                    refresh.push((sheet, range));
+                }
+                AppliedOp::Sheets => {
+                    self.undo_touches.push(Touch::Sheets);
+                    self.redo_touches.clear();
+                }
+                AppliedOp::Undo => {
+                    if let Some(touch) = self.undo_touches.pop() {
+                        if let Touch::Cells { sheet, range } = touch {
+                            refresh.push((sheet, range));
+                        }
+                        self.redo_touches.push(touch);
+                    }
+                }
+                AppliedOp::Redo => {
+                    if let Some(touch) = self.redo_touches.pop() {
+                        if let Touch::Cells { sheet, range } = touch {
+                            refresh.push((sheet, range));
+                        }
+                        self.undo_touches.push(touch);
+                    }
+                }
+            }
+        }
+
+        // When the sheet-id SET changed (delete, or undo-of-add), drop caches for absent sheets.
+        // A returning sheet (undo-of-delete) rebuilds lazily on its next activation.
+        let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
+        let ids_after: HashSet<SheetId> = self.sheet_metas().iter().map(|m| m.id).collect();
+        if ids_before != ids_after {
+            self.shared
+                .caches
+                .write()
+                .retain(|id| ids_after.contains(&id));
+        }
+
+        for sheet in self.refresh_cache_cells(&refresh) {
+            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+    }
+
+    /// Re-read every cell in `refresh` and update its cache entry (the mirror primitive), for the
+    /// sheets that are resident. Returns the distinct sheets whose cache changed.
+    ///
+    /// A **band-creating** range (spanning all columns of a row, or all rows of a column) makes
+    /// IronCalc's `update_range_style` set a row/column **band** rather than per-cell styles
+    /// (`ironcalc_base/src/user_model/common.rs`, the full-rows / full-columns branches). The
+    /// per-cell [`cache::refresh_cell`] can't create a band, so such a range — and any
+    /// pathologically large one — falls back to a full (populated-cell-bounded) rebuild that reads
+    /// the bands back from the engine. Non-band ranges take the cheap per-cell path, plus a
+    /// row-height mirror (a value edit can auto-fit a row taller).
+    fn refresh_cache_cells(&self, refresh: &[(SheetId, CellRange)]) -> Vec<SheetId> {
+        let caches = Arc::clone(&self.shared.caches);
+        let mut touched: Vec<SheetId> = Vec::new();
+        for (sheet, range) in refresh {
+            if !caches.read().contains(*sheet) {
+                continue; // not resident → will rebuild correctly on activation
+            }
+            let idx = match self.resolve(*sheet) {
+                Some(i) => i,
+                None => continue, // sheet deleted out from under the touch-set
+            };
+            if is_band_creating(range) || range_area(range) > MAX_REFRESH_CELLS {
+                // A failed rebuild drops the (now stale) entry and returns false; don't announce
+                // a StyleCacheUpdated for a sheet whose cache is no longer resident.
+                if !self.build_and_store_cache(*sheet) {
+                    continue;
+                }
+            } else {
+                let mut guard = caches.write();
+                if let Some(cache) = guard.get_mut(*sheet) {
+                    for row in range.rows() {
+                        for col in range.cols() {
+                            let _ =
+                                cache::refresh_cell(cache, &self.doc, idx, CellRef::new(row, col));
+                        }
+                    }
+                    // Mirror IronCalc's row-height auto-fit over the touched rows (one axis
+                    // rebuild). Cheap: a non-band range spans a bounded number of rows.
+                    let heights: Vec<(u32, Option<f32>)> = range
+                        .rows()
+                        .map(|row| (row, cache::row_override_px(&self.doc, idx, row)))
+                        .collect();
+                    cache.set_row_heights(&heights);
+                }
+            }
+            if !touched.contains(sheet) {
+                touched.push(*sheet);
+            }
+        }
+        touched
+    }
+
+    /// Build `sheet`'s style/geometry cache from the engine's current state and install it under
+    /// the write lock (build-on-activation / full-rebuild path). Returns whether the cache is now
+    /// resident.
+    ///
+    /// On **any** failure to produce a cache (build error, or the sheet no longer resolving) the
+    /// sheet's entry is **dropped**, never left stale: a rebuild replaces a pre-edit cache, so
+    /// leaving the old one in place would make the grid re-read a stale cache — the exact
+    /// divergence this phase exists to prevent. Dropping it makes the grid fall back to unstyled
+    /// (correct-but-plain) instead. (`build_sheet_cache`'s getters only error on an invalid sheet
+    /// index, and callers resolve the index first, so the `Err` path is effectively unreachable
+    /// today; the drop keeps the invariant robust regardless.)
+    fn build_and_store_cache(&self, sheet: SheetId) -> bool {
+        let idx = match self.resolve(sheet) {
+            Some(i) => i,
+            None => {
+                self.shared.caches.write().remove(sheet);
+                return false;
+            }
+        };
+        match cache::build_sheet_cache(&self.doc, idx) {
+            Ok(built) => {
+                self.shared.caches.write().insert(sheet, built);
+                true
+            }
+            Err(error) => {
+                tracing::debug!(
+                    sheet = sheet.0,
+                    %error,
+                    "worker: style-cache build failed; dropping the entry so the grid never reads a stale cache"
+                );
+                self.shared.caches.write().remove(sheet);
+                false
+            }
+        }
+    }
+
+    /// Ensure the active sheet has a resident cache, building it if absent. Returns whether this
+    /// call built one (so the caller emits `StyleCacheUpdated`) — `false` if it was already
+    /// resident or the build failed (in which case the entry stays absent, not stale).
+    fn ensure_active_cache_built(&self) -> bool {
+        if self.shared.caches.read().contains(self.active_sheet) {
+            return false;
+        }
+        self.build_and_store_cache(self.active_sheet)
     }
 
     /// The locked catch_unwind poisoning policy (`components/engine_worker.md §Main loop`):
@@ -550,6 +768,56 @@ fn resolve_idx(doc: &WorkbookDocument, sheet: SheetId) -> Result<u32, String> {
         .ok_or_else(|| format!("no sheet with id {}", sheet.0))
 }
 
+/// Classify a just-applied edit for post-eval cache bookkeeping. Only ever called on
+/// successfully-applied edit commands (control commands are bucketed out before apply, and
+/// `TestPanic` panics before returning `Ok`), so the non-edit arm is unreachable.
+fn op_of(edit: &Command) -> AppliedOp {
+    match edit {
+        Command::SetCellInput { sheet, cell, .. } => AppliedOp::Cells {
+            sheet: *sheet,
+            range: CellRange::single(*cell),
+        },
+        Command::ClearCells { sheet, range } => AppliedOp::Cells {
+            sheet: *sheet,
+            range: *range,
+        },
+        Command::SetStyleAttr { sheet, range, .. } => AppliedOp::Cells {
+            sheet: *sheet,
+            range: *range,
+        },
+        Command::AddSheet | Command::RenameSheet { .. } | Command::DeleteSheet { .. } => {
+            AppliedOp::Sheets
+        }
+        Command::Undo => AppliedOp::Undo,
+        Command::Redo => AppliedOp::Redo,
+        _ => unreachable!("op_of called on a non-edit command"),
+    }
+}
+
+/// The number of cells a [`CellRange`] covers (for the mirror's pathological-range guard).
+fn range_area(range: &CellRange) -> u64 {
+    let rows = (range.end.row - range.start.row) as u64 + 1;
+    let cols = (range.end.col - range.start.col) as u64 + 1;
+    rows * cols
+}
+
+/// Whether a style edit over `range` makes IronCalc create a **band** (a row spanning every
+/// column, or a column spanning every row) instead of per-cell styles — in which case the
+/// per-cell mirror is insufficient and the sheet cache must be rebuilt from the engine. This is
+/// the precise trigger (not the cell-count cap): a single full-row band is only 16,384 cells,
+/// which sits *below* `MAX_REFRESH_CELLS`, so relying on the cap alone would let bands rot the
+/// cache (they'd take the per-cell path and never create the band).
+fn is_band_creating(range: &CellRange) -> bool {
+    let all_columns = range.start.col == 0 && range.end.col == limits::MAX_COLS - 1;
+    let all_rows = range.start.row == 0 && range.end.row == limits::MAX_ROWS - 1;
+    all_columns || all_rows
+}
+
+/// Above this many cells, a mirror re-read of a range falls back to a full active-sheet rebuild
+/// (bounded by populated cells) instead of iterating the selection cell by cell — a guard against
+/// a pathologically large selection. Comfortably exceeds any real user selection.
+const MAX_REFRESH_CELLS: u64 = 100_000;
+
 /// The largest overscan window the worker will publish, per axis. These bounds cap the
 /// per-cell probe cost at `MAX_PUBLISH_ROWS * MAX_PUBLISH_COLS` = 131,072 cells so a
 /// pathological `SetViewport` (e.g. the whole sheet) can't wedge the worker in a billion-cell
@@ -585,6 +853,7 @@ fn clamp_span(range: std::ops::Range<u32>, sheet_max: u32, max_len: u32) -> std:
 mod tests {
     use super::*;
     use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+    use freecell_core::Rgb;
 
     /// Build a headless worker over a fresh empty workbook plus the event receiver, without a
     /// spawned thread — the deterministic substrate for the coalescing / recovery tests.
@@ -602,10 +871,15 @@ mod tests {
             eval_count: 0,
             degraded: false,
             panic_count: 0,
+            undo_touches: Vec::new(),
+            redo_touches: Vec::new(),
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;
         }
+        // Build the active sheet's cache so worker-level tests exercise the same resident-cache
+        // state the real `load_and_run` sets up (build-on-open).
+        worker.build_and_store_cache(worker.active_sheet);
         (worker, rx)
     }
 
@@ -987,6 +1261,308 @@ mod tests {
             worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
             "5",
             "the value is unchanged"
+        );
+    }
+
+    /// Assert the resident cache for `sheet` agrees with a fresh engine re-read over the probe
+    /// grid — the worker-level agreement contract (reads through the real `shared.caches`).
+    fn worker_cache_agrees(worker: &Worker, sheet: SheetId, rows: &[u32], cols: &[u32]) {
+        let idx = worker.resolve(sheet).expect("sheet resolves");
+        let caches = worker.shared.caches.read();
+        let cache = caches.get(sheet).expect("sheet cache is resident");
+        cache::assert_cache_agrees(&worker.doc, cache, idx, rows, cols)
+            .expect("cache must agree with a fresh engine re-read");
+    }
+
+    fn small_probes() -> (Vec<u32>, Vec<u32>) {
+        ((0..6).collect(), (0..6).collect())
+    }
+
+    #[test]
+    fn load_builds_active_sheet_cache() {
+        // `test_worker` mirrors `load_and_run`: the active sheet's cache is resident immediately.
+        let (worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        assert!(worker.shared.caches.read().contains(sheet));
+        let (rows, cols) = small_probes();
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn style_edit_mirrors_cache_and_emits_stylecacheupdated() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "x"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            attr: StyleAttr::Bold,
+        }]);
+
+        // The cache now shows the cell bold, agrees with the engine, and a delta was emitted.
+        let bold = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(1, 1)
+            .copied();
+        assert_eq!(bold.map(|s| s.bold), Some(true));
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
+            "a style edit ships a StyleCacheUpdated delta"
+        );
+    }
+
+    #[test]
+    fn undo_redo_agreement_walk() {
+        // A scripted edit/undo/redo walk: the cache must agree with the engine after EVERY step.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        let bold = |r, c| Command::SetStyleAttr {
+            sheet,
+            range: CellRange::single(CellRef::new(r, c)),
+            attr: StyleAttr::Bold,
+        };
+        let fill = |r, c| Command::SetStyleAttr {
+            sheet,
+            range: CellRange::single(CellRef::new(r, c)),
+            attr: StyleAttr::Fill(Some(Rgb::from_hex(0x00FF00))),
+        };
+
+        let steps: Vec<Command> = vec![
+            set_input(sheet, 1, 1, "a"),
+            bold(1, 1),
+            fill(2, 2),
+            Command::Undo,               // undo fill(2,2)
+            Command::Undo,               // undo bold(1,1)
+            Command::Redo,               // redo bold(1,1)
+            set_input(sheet, 3, 3, "b"), // new edit clears redo of fill
+            bold(3, 3),
+            Command::Undo, // undo bold(3,3)
+            Command::Undo, // undo set_input(3,3)
+            Command::Redo, // redo set_input(3,3)
+        ];
+        for step in steps {
+            worker.process_batch(vec![step]);
+            worker_cache_agrees(&worker, sheet, &rows, &cols);
+        }
+    }
+
+    #[test]
+    fn sheet_switch_builds_cache_on_activation() {
+        let (mut worker, rx) = test_worker();
+        let sheet0_id = sheet0(&worker);
+        worker.process_batch(vec![Command::AddSheet]);
+        let sheets = worker.sheet_metas();
+        let sheet1_id = sheets[1].id;
+        assert_ne!(sheet0_id, sheet1_id);
+        // The new sheet isn't cached until activated.
+        assert!(!worker.shared.caches.read().contains(sheet1_id));
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: sheet1_id,
+            rows: 0..4,
+            cols: 0..4,
+        }]);
+        assert!(worker.shared.caches.read().contains(sheet1_id));
+        let (rows, cols) = small_probes();
+        worker_cache_agrees(&worker, sheet1_id, &rows, &cols);
+        assert!(
+            drain_events(&rx).iter().any(
+                |e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet1_id)
+            ),
+            "activating a sheet ships its StyleCacheUpdated delta"
+        );
+    }
+
+    #[test]
+    fn delete_sheet_reconciles_cache_map() {
+        let (mut worker, _rx) = test_worker();
+        worker.process_batch(vec![Command::AddSheet]);
+        let sheets = worker.sheet_metas();
+        let sheet1_id = sheets[1].id;
+        // Activate + cache the second sheet.
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: sheet1_id,
+            rows: 0..4,
+            cols: 0..4,
+        }]);
+        assert!(worker.shared.caches.read().contains(sheet1_id));
+        // Deleting it drops its resident cache.
+        worker.process_batch(vec![Command::DeleteSheet { sheet: sheet1_id }]);
+        assert!(!worker.shared.caches.read().contains(sheet1_id));
+    }
+
+    /// Probes that include cells FAR out on a row/column, so a band that fills the whole row/column
+    /// is actually exercised (an agreement probe confined to 0..6 would miss a rotted band).
+    fn wide_probes() -> (Vec<u32>, Vec<u32>) {
+        (
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 500, 5000],
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 500, 5000],
+        )
+    }
+
+    #[test]
+    fn full_row_style_edit_creates_band_and_agrees() {
+        // A style edit spanning ALL columns of a row makes IronCalc set a ROW BAND, not per-cell
+        // styles. The per-cell mirror can't represent that, so the worker must rebuild — this test
+        // FAILS on the pre-fix per-cell path (empty banded cells stay default in the cache).
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 2, 0, "x"), // a value on the row (a mix of styled + empty cells)
+        ]);
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::new(CellRef::new(2, 0), CellRef::new(2, limits::MAX_COLS - 1)),
+            attr: StyleAttr::Fill(Some(Rgb::from_hex(0xFFFF00))),
+        }]);
+
+        let (rows, cols) = wide_probes();
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        // A far, empty cell on the banded row resolves to the fill (the band), not the default.
+        let filled = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(2, 500)
+            .map(|s| s.fill);
+        assert_eq!(filled, Some(Some(Rgb::from_hex(0xFFFF00))));
+    }
+
+    #[test]
+    fn full_column_style_edit_creates_band_and_agrees() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 3), CellRef::new(limits::MAX_ROWS - 1, 3)),
+            attr: StyleAttr::Bold,
+        }]);
+
+        let (rows, cols) = wide_probes();
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        let bold = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(5000, 3)
+            .map(|s| s.bold);
+        assert_eq!(bold, Some(true), "a far cell on the banded column is bold");
+    }
+
+    #[test]
+    fn multi_row_block_full_width_band_agrees() {
+        // Six full-width rows: 6 × 16,384 = 98,304 cells — BELOW MAX_REFRESH_CELLS, so the
+        // cell-count cap alone would miss it. Each row still spans all columns → row bands.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(5, limits::MAX_COLS - 1)),
+            attr: StyleAttr::Italic,
+        }]);
+        let (rows, cols) = wide_probes();
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn multiline_input_mirrors_row_height_and_agrees() {
+        // A multi-line value grows the engine row height (auto-fit). The mirror must reflect that
+        // geometry change (and its undo), or the cache diverges — FAILS without the row-height
+        // mirror on the value-edit path.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..6,
+            cols: 0..6,
+        }]);
+        worker.process_batch(vec![set_input(sheet, 1, 1, "line1\nline2\nline3")]);
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        let tall = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(1);
+        assert!(
+            tall > 24.0 + 1.0,
+            "a 3-line input auto-fits row 1 taller than the 24px default (got {tall})"
+        );
+
+        worker.process_batch(vec![Command::Undo]);
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        let reverted = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(1);
+        assert!(
+            (reverted - 24.0).abs() < 1e-3,
+            "undo reverts the auto-fit height to the default (got {reverted})"
+        );
+    }
+
+    #[test]
+    fn failed_rebuild_drops_stale_entry_and_reports_failure() {
+        // A rebuild that cannot produce a cache (here: a SheetId that no longer resolves — the
+        // reachable proxy for a build error) must DROP the entry rather than leave the stale
+        // pre-edit cache in place, and report failure so no StyleCacheUpdated is announced.
+        let (worker, _rx) = test_worker();
+        let bogus = SheetId(9999);
+        worker
+            .shared
+            .caches
+            .write()
+            .insert(bogus, freecell_core::SheetCacheBuilder::new(4, 4).build());
+        assert!(worker.shared.caches.read().contains(bogus));
+
+        let rebuilt = worker.build_and_store_cache(bogus);
+        assert!(!rebuilt, "an unresolvable sheet reports build failure");
+        assert!(
+            !worker.shared.caches.read().contains(bogus),
+            "the stale entry is dropped (grid falls back to unstyled, never a stale re-read)"
         );
     }
 

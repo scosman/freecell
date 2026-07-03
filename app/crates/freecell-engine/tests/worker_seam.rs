@@ -470,3 +470,75 @@ fn edit_reflected_after_publish_and_reads_are_wait_free() {
     assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
     assert_eq!(published_text(&client, 4, 4), "42");
 }
+
+/// After load, the active sheet's style/geometry cache is resident on the **public** surface
+/// (`caches()`), so the grid renders styled + sized from the very first frame (Phase 5).
+#[test]
+fn load_populates_public_style_cache() {
+    let (client, _rx, sheet) = spawn_new();
+    let caches = client.caches();
+    let guard = caches.read();
+    let cache = guard
+        .get(sheet)
+        .expect("the active sheet's cache is resident after Loaded");
+    // A new empty sheet: full Excel-max axes, FreeCell default geometry, no styles.
+    assert_eq!(
+        cache.dims(),
+        (
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS
+        )
+    );
+    assert!((cache.col_width(0) - 100.0).abs() < 1e-3);
+    assert!((cache.row_height(0) - 24.0).abs() < 1e-3);
+    assert_eq!(cache.render_style(0, 0), None); // plain
+}
+
+/// A style edit mirrors into the **public** resident cache and ships a `StyleCacheUpdated`
+/// delta — the seam the grid reacts to (read the cache, repaint) without any engine call.
+#[test]
+fn style_edit_updates_public_cache_and_emits_delta() {
+    let (client, rx, sheet) = spawn_new();
+    // The load itself ships a StyleCacheUpdated (the active sheet built on open).
+    assert!(
+        wait_for(&rx, |e| matches!(e, WorkerEvent::StyleCacheUpdated { .. })).is_some(),
+        "load builds + announces the active sheet's cache"
+    );
+
+    client.send(full_viewport(sheet));
+    client.send(set_input(sheet, 1, 1, "x"));
+    client.send(Command::SetStyleAttr {
+        sheet,
+        range: CellRange::single(CellRef::new(1, 1)),
+        attr: StyleAttr::Bold,
+    });
+
+    // Poll the public cache until the bold edit lands (robust to worker-thread event ordering).
+    let caches = client.caches();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let is_bold = caches
+            .read()
+            .get(sheet)
+            .and_then(|c| c.render_style(1, 1).map(|s| s.bold))
+            == Some(true);
+        if is_bold {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the style edit never reached the public cache"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    // And a StyleCacheUpdated delta arrives for the edit.
+    assert!(
+        wait_for(
+            &rx,
+            |e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)
+        )
+        .is_some(),
+        "the style edit ships a StyleCacheUpdated delta"
+    );
+}

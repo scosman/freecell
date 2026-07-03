@@ -25,8 +25,13 @@ pub const DEFAULT_ROW_HEIGHT_PX: f32 = 24.0;
 pub struct StyleId(pub u32);
 
 /// The resident cache for one worksheet: variable geometry (default + sparse overrides,
-/// fronted by prefix-sum [`Axis`]es) and resolved cell/band styles. Immutable once built;
-/// the worker rebuilds affected parts on edits and swaps the entry under the `RwLock`.
+/// fronted by prefix-sum [`Axis`]es) and resolved cell/band styles.
+///
+/// The worker builds it (`freecell-engine::cache::build_sheet_cache`) then keeps it in
+/// agreement with IronCalc by **mirroring each issued edit** — the in-place mutators below
+/// (`set_cell_style`, geometry setters, …) let a style edit touch only the changed cells
+/// instead of rebuilding the whole sheet (`components/style_cache.md §Lifecycle`). Writes
+/// happen on the worker thread under the `RwLock`; the UI only ever reads.
 #[derive(Debug)]
 pub struct SheetCache {
     row_count: u32,
@@ -40,7 +45,15 @@ pub struct SheetCache {
     cell_styles: BTreeMap<(u32, u32), StyleId>,
     row_styles: BTreeMap<u32, StyleId>,
     col_styles: BTreeMap<u32, StyleId>,
+    /// `StyleId` → resolved render form (parallel table; `StyleId(i)` indexes `resolved[i]`).
     resolved: Vec<RenderStyle>,
+    /// Reverse index for O(1) interning on mutation: equal [`RenderStyle`]s share one
+    /// [`StyleId`]. `RenderStyle` is `Eq + Hash`, so — unlike the full IronCalc `Style`, which
+    /// needed serialization to be a map key — the render form is a direct key
+    /// (`components/style_cache.md`: the MVP read model holds `RenderStyle`, so the dedup is by
+    /// render form). Entries are never removed; the resolved table only grows, bounded by the
+    /// (small) number of distinct styles a sheet uses.
+    style_ids: HashMap<RenderStyle, StyleId>,
 }
 
 impl SheetCache {
@@ -117,6 +130,119 @@ impl SheetCache {
     pub fn col_overrides(&self) -> &BTreeMap<u32, f32> {
         &self.col_overrides
     }
+
+    /// Whether `(row, col)` sits on a styled row or column band. The worker's mirror path uses
+    /// this to decide whether a cell reverting to the *default* style must be stored as an
+    /// explicit entry to **shadow** the band (reproducing IronCalc's rule that a cell present in
+    /// the sheet data uses its own style, even the default, over any band).
+    pub fn is_on_band(&self, row: u32, col: u32) -> bool {
+        self.row_styles.contains_key(&row) || self.col_styles.contains_key(&col)
+    }
+
+    /// Interns `style` into the resolved table (equal styles share a [`StyleId`]).
+    fn intern(&mut self, style: RenderStyle) -> StyleId {
+        if let Some(&id) = self.style_ids.get(&style) {
+            return id;
+        }
+        let id = StyleId(self.resolved.len() as u32);
+        self.resolved.push(style);
+        self.style_ids.insert(style, id);
+        id
+    }
+
+    /// Sets (or replaces) the per-cell style at `(row, col)` — the mirror-on-edit primitive.
+    pub fn set_cell_style(&mut self, row: u32, col: u32, style: RenderStyle) {
+        let id = self.intern(style);
+        self.cell_styles.insert((row, col), id);
+    }
+
+    /// Removes the per-cell style at `(row, col)` (it reverts to the band/default resolution).
+    pub fn clear_cell_style(&mut self, row: u32, col: u32) {
+        self.cell_styles.remove(&(row, col));
+    }
+
+    /// Sets (or replaces) a whole-row band style.
+    pub fn set_row_band_style(&mut self, row: u32, style: RenderStyle) {
+        let id = self.intern(style);
+        self.row_styles.insert(row, id);
+    }
+
+    /// Removes a whole-row band style.
+    pub fn clear_row_band_style(&mut self, row: u32) {
+        self.row_styles.remove(&row);
+    }
+
+    /// Sets (or replaces) a whole-column band style.
+    pub fn set_col_band_style(&mut self, col: u32, style: RenderStyle) {
+        let id = self.intern(style);
+        self.col_styles.insert(col, id);
+    }
+
+    /// Removes a whole-column band style.
+    pub fn clear_col_band_style(&mut self, col: u32) {
+        self.col_styles.remove(&col);
+    }
+
+    /// Sets a per-row height override (px) and rebuilds the row axis. `Axis` is immutable, so a
+    /// geometry change rebuilds the affected axis (ms-scale even at 1M rows — measured in the
+    /// POC; `components/style_cache.md §Data structures`).
+    pub fn set_row_height(&mut self, row: u32, px: f32) {
+        self.row_overrides.insert(row, px);
+        self.rebuild_row_axis();
+    }
+
+    /// Removes a per-row height override (the row reverts to the default) and rebuilds the axis.
+    pub fn reset_row_height(&mut self, row: u32) {
+        if self.row_overrides.remove(&row).is_some() {
+            self.rebuild_row_axis();
+        }
+    }
+
+    /// Sets a per-column width override (px) and rebuilds the column axis.
+    pub fn set_col_width(&mut self, col: u32, px: f32) {
+        self.col_overrides.insert(col, px);
+        self.rebuild_col_axis();
+    }
+
+    /// Removes a per-column width override (the column reverts to the default) and rebuilds it.
+    pub fn reset_col_width(&mut self, col: u32) {
+        if self.col_overrides.remove(&col).is_some() {
+            self.rebuild_col_axis();
+        }
+    }
+
+    /// Applies a batch of row-height overrides — `Some(px)` sets, `None` resets to the default —
+    /// rebuilding the row axis **at most once**. The worker's mirror path uses this to reflect
+    /// IronCalc's row-height auto-fit (a value edit can grow a row) across a touched range without
+    /// an axis rebuild per row.
+    pub fn set_row_heights(&mut self, updates: &[(u32, Option<f32>)]) {
+        let mut changed = false;
+        for &(row, px) in updates {
+            match px {
+                Some(v) => changed |= self.row_overrides.insert(row, v) != Some(v),
+                None => changed |= self.row_overrides.remove(&row).is_some(),
+            }
+        }
+        if changed {
+            self.rebuild_row_axis();
+        }
+    }
+
+    fn rebuild_row_axis(&mut self) {
+        self.row_axis = Arc::new(Axis::from_overrides(
+            self.row_count,
+            self.row_default_px,
+            self.row_overrides.clone(),
+        ));
+    }
+
+    fn rebuild_col_axis(&mut self) {
+        self.col_axis = Arc::new(Axis::from_overrides(
+            self.col_count,
+            self.col_default_px,
+            self.col_overrides.clone(),
+        ));
+    }
 }
 
 /// Builds a [`SheetCache`] from geometry + styles. Used by test/render fixtures and by the
@@ -134,6 +260,7 @@ pub struct SheetCacheBuilder {
     row_styles: BTreeMap<u32, StyleId>,
     col_styles: BTreeMap<u32, StyleId>,
     resolved: Vec<RenderStyle>,
+    style_ids: HashMap<RenderStyle, StyleId>,
 }
 
 impl SheetCacheBuilder {
@@ -150,6 +277,7 @@ impl SheetCacheBuilder {
             row_styles: BTreeMap::new(),
             col_styles: BTreeMap::new(),
             resolved: Vec::new(),
+            style_ids: HashMap::new(),
         }
     }
 
@@ -160,57 +288,82 @@ impl SheetCacheBuilder {
         self
     }
 
+    /// Interns `style` into the resolved table, keyed on the render form (`Eq + Hash`), so
+    /// equal styles share a [`StyleId`]. The built cache inherits this map, so builder-built
+    /// and mutation-built caches dedup identically.
+    fn intern(&mut self, style: RenderStyle) -> StyleId {
+        if let Some(&id) = self.style_ids.get(&style) {
+            return id;
+        }
+        let id = StyleId(self.resolved.len() as u32);
+        self.resolved.push(style);
+        self.style_ids.insert(style, id);
+        id
+    }
+
+    // --- Non-consuming setters (the engine's build-on-activation loop drives these) ---
+
+    /// Sets a per-row height override (px).
+    pub fn push_row_height(&mut self, row: u32, px: f32) {
+        self.row_overrides.insert(row, px);
+    }
+
+    /// Sets a per-column width override (px).
+    pub fn push_col_width(&mut self, col: u32, px: f32) {
+        self.col_overrides.insert(col, px);
+    }
+
+    /// Interns + sets the style of a single cell.
+    pub fn push_cell_style(&mut self, row: u32, col: u32, style: RenderStyle) {
+        let id = self.intern(style);
+        self.cell_styles.insert((row, col), id);
+    }
+
+    /// Interns + sets a whole-row band style.
+    pub fn push_row_style(&mut self, row: u32, style: RenderStyle) {
+        let id = self.intern(style);
+        self.row_styles.insert(row, id);
+    }
+
+    /// Interns + sets a whole-column band style.
+    pub fn push_col_style(&mut self, col: u32, style: RenderStyle) {
+        let id = self.intern(style);
+        self.col_styles.insert(col, id);
+    }
+
+    // --- Consuming setters (fluent, for hand-built fixtures/tests) ---
+
     /// Sets a per-row height override (px).
     pub fn row_height(mut self, row: u32, px: f32) -> Self {
-        self.row_overrides.insert(row, px);
+        self.push_row_height(row, px);
         self
     }
 
     /// Sets a per-column width override (px).
     pub fn col_width(mut self, col: u32, px: f32) -> Self {
-        self.col_overrides.insert(col, px);
+        self.push_col_width(col, px);
         self
-    }
-
-    /// Interns `style`, returning its [`StyleId`] (deduped by value).
-    ///
-    /// This linear scan of `resolved` is intentional and fits the builder's scope:
-    /// fixtures and a per-sheet cache build touch a bounded set of distinct styles (the
-    /// worker interns against a small resolved table, not per cell). If this builder were
-    /// ever driven with a very large number of *distinct* styles, swap the scan for a
-    /// `HashMap<RenderStyle, StyleId>` (`RenderStyle: Eq + Hash`).
-    fn intern(&mut self, style: RenderStyle) -> StyleId {
-        if let Some(idx) = self.resolved.iter().position(|s| *s == style) {
-            StyleId(idx as u32)
-        } else {
-            let id = StyleId(self.resolved.len() as u32);
-            self.resolved.push(style);
-            id
-        }
     }
 
     /// Sets the style of a single cell.
     pub fn cell_style(mut self, row: u32, col: u32, style: RenderStyle) -> Self {
-        let id = self.intern(style);
-        self.cell_styles.insert((row, col), id);
+        self.push_cell_style(row, col, style);
         self
     }
 
     /// Sets a whole-row band style.
     pub fn row_style(mut self, row: u32, style: RenderStyle) -> Self {
-        let id = self.intern(style);
-        self.row_styles.insert(row, id);
+        self.push_row_style(row, style);
         self
     }
 
     /// Sets a whole-column band style.
     pub fn col_style(mut self, col: u32, style: RenderStyle) -> Self {
-        let id = self.intern(style);
-        self.col_styles.insert(col, id);
+        self.push_col_style(col, style);
         self
     }
 
-    /// Builds the immutable cache, constructing the prefix-sum axes from the geometry.
+    /// Builds the immutable-shell cache, constructing the prefix-sum axes from the geometry.
     pub fn build(self) -> SheetCache {
         let row_axis = Arc::new(Axis::from_overrides(
             self.row_count,
@@ -235,6 +388,7 @@ impl SheetCacheBuilder {
             row_styles: self.row_styles,
             col_styles: self.col_styles,
             resolved: self.resolved,
+            style_ids: self.style_ids,
         }
     }
 }
@@ -255,6 +409,18 @@ impl SheetCaches {
     /// The cache for `sheet`, if it has been built.
     pub fn get(&self, sheet: SheetId) -> Option<&SheetCache> {
         self.sheets.get(&sheet)
+    }
+
+    /// Mutable access to the cache for `sheet` — the worker's mirror-on-edit path takes the
+    /// write lock and updates the touched cells in place (`components/style_cache.md`).
+    pub fn get_mut(&mut self, sheet: SheetId) -> Option<&mut SheetCache> {
+        self.sheets.get_mut(&sheet)
+    }
+
+    /// Drops every resident cache whose sheet no longer satisfies `keep` — the worker calls this
+    /// after a sheet add/delete (or its undo/redo) so caches for removed sheets don't linger.
+    pub fn retain(&mut self, keep: impl Fn(SheetId) -> bool) {
+        self.sheets.retain(|id, _| keep(*id));
     }
 
     /// Installs (or replaces) the cache for `sheet`.
@@ -417,6 +583,86 @@ mod tests {
             (cache.total_width() - limits::MAX_COLS as f64 * DEFAULT_COL_WIDTH_PX as f64).abs()
                 < 1.0
         );
+    }
+
+    #[test]
+    fn mutators_intern_and_resolve() {
+        // Start from a built cache, then drive the mirror-on-edit mutators.
+        let mut cache = SheetCacheBuilder::new(10, 10).build();
+        cache.set_cell_style(1, 1, bold());
+        cache.set_cell_style(2, 2, bold()); // shares the bold StyleId
+        cache.set_cell_style(3, 3, red_fill()); // distinct
+        assert_eq!(cache.render_style(1, 1), Some(&bold()));
+        assert_eq!(cache.render_style(3, 3), Some(&red_fill()));
+        assert_eq!(cache.cell_styles[&(1, 1)], cache.cell_styles[&(2, 2)]);
+        assert_ne!(cache.cell_styles[&(1, 1)], cache.cell_styles[&(3, 3)]);
+        assert_eq!(cache.resolved.len(), 2, "equal styles share one StyleId");
+
+        // Clearing reverts to default resolution.
+        cache.clear_cell_style(1, 1);
+        assert_eq!(cache.render_style(1, 1), None);
+
+        // Band set/clear + resolution order (cell > row > col).
+        cache.set_row_band_style(5, red_fill());
+        cache.set_col_band_style(6, bold());
+        assert_eq!(cache.render_style(5, 9), Some(&red_fill())); // row band
+        assert_eq!(cache.render_style(9, 6), Some(&bold())); // col band
+        cache.set_cell_style(5, 6, RenderStyle::default());
+        assert_eq!(
+            cache.render_style(5, 6),
+            Some(&RenderStyle::default()),
+            "a cell entry (even default) shadows the bands"
+        );
+        cache.clear_row_band_style(5);
+        assert_eq!(cache.render_style(5, 9), None);
+        cache.clear_col_band_style(6);
+        assert_eq!(cache.render_style(9, 6), None);
+    }
+
+    #[test]
+    fn is_on_band_detects_band_membership() {
+        let mut cache = SheetCacheBuilder::new(10, 10).build();
+        assert!(!cache.is_on_band(3, 4));
+        cache.set_row_band_style(3, bold());
+        assert!(cache.is_on_band(3, 0) && cache.is_on_band(3, 4));
+        assert!(!cache.is_on_band(4, 0));
+        cache.set_col_band_style(4, red_fill());
+        assert!(cache.is_on_band(9, 4));
+    }
+
+    #[test]
+    fn geometry_mutation_rebuilds_axis() {
+        let mut cache = SheetCacheBuilder::new(4, 3).defaults(20.0, 100.0).build();
+        assert!((cache.total_height() - 80.0).abs() < 1e-6);
+        cache.set_row_height(1, 50.0);
+        assert_eq!(cache.row_height(1), 50.0);
+        // 20 + 50 + 20 + 20 = 110; the axis (offsets) reflects the change.
+        assert!((cache.total_height() - 110.0).abs() < 1e-6);
+        assert!((cache.row_axis().offset_of(2) - 70.0).abs() < 1e-6);
+        cache.reset_row_height(1);
+        assert_eq!(cache.row_height(1), 20.0);
+        assert!((cache.total_height() - 80.0).abs() < 1e-6);
+
+        cache.set_col_width(0, 250.0);
+        assert_eq!(cache.col_width(0), 250.0);
+        assert!((cache.total_width() - (250.0 + 100.0 + 100.0)).abs() < 1e-6);
+        cache.reset_col_width(0);
+        assert!((cache.total_width() - 300.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_row_heights_batches_sets_and_resets() {
+        let mut cache = SheetCacheBuilder::new(5, 2).defaults(20.0, 100.0).build();
+        cache.set_row_heights(&[(0, Some(40.0)), (1, Some(60.0)), (2, None)]);
+        assert_eq!(cache.row_height(0), 40.0);
+        assert_eq!(cache.row_height(1), 60.0);
+        assert_eq!(cache.row_height(2), 20.0); // reset/absent → default
+                                               // total = 40 + 60 + 20 + 20 + 20 = 160, axis rebuilt.
+        assert!((cache.total_height() - 160.0).abs() < 1e-6);
+        assert!((cache.row_axis().offset_of(2) - 100.0).abs() < 1e-6);
+        // A reset removes the override.
+        cache.set_row_heights(&[(0, None)]);
+        assert_eq!(cache.row_height(0), 20.0);
     }
 
     #[test]

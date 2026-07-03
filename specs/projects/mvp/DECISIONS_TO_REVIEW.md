@@ -296,3 +296,85 @@ Known placeholders the build will resolve (append the resolution here):
   an or-pattern of the edit variants, no catch-all), so a future `Command` variant must be
   explicitly classified and can't silently fall through to the apply path.
   (`worker/run.rs process_batch`)
+
+- [Phase 5] **IronCalc geometry getters return pixels, not raw units/points** as
+  `components/style_cache.md` assumed. `get_row_height`/`get_column_width`
+  (`ironcalc_base/src/constants.rs`: "COLUMN_WIDTH and ROW_HEIGHT are pixel values"; defaults
+  125 px col / 28 px row) already apply IronCalc's own COLUMN_WIDTH_FACTOR/ROW_HEIGHT_FACTOR.
+  FreeCell's chosen grid defaults are 100 px / 24 px (`ui_design.md §3.3`). The single
+  conversion (`cache::col_px`/`row_px`) scales an override by `freecell_default /
+  ironcalc_default` (0.8 col, 6/7 row), so a track at IronCalc's default maps exactly to the
+  FreeCell default and deviations scale proportionally. The exact scale may want calibration
+  against real render fidelity in Phase 7. (`freecell-engine/src/cache.rs`)
+- [Phase 5] **The style interner dedups by `RenderStyle` (in `freecell-core`), not by a
+  serialized IronCalc `Style` (in `freecell-engine`)** as the component doc's data-structure
+  sketch phrased it. Rationale: the *MVP read model holds `RenderStyle`*, which is `Eq + Hash`,
+  so it is a direct map key (no serialization needed — the doc's serialize-because-not-Hash was
+  for a full-`Style` cache). The engine still owns the IronCalc-touching part (the
+  `Style → RenderStyle` conversion in `cache::render_style_from`); `freecell-core` owns the
+  render-form dedup. Two distinct engine `Style`s that differ only in fields the grid ignores
+  (borders/font size/…) collapse to one `RenderStyle`/`StyleId` — correct for rendering and
+  keeps the resolved table minimal. (`freecell-core/src/cache.rs`, `freecell-engine/src/cache.rs`)
+- [Phase 5] **`SheetCache` is mutable in place**, not "immutable once built" as the doc phrased
+  it: in-place mutators (`set_cell_style`/`clear_cell_style`, band + geometry setters) let
+  mirror-on-edit touch only the changed cells under the write lock instead of rebuilding the
+  whole sheet — the cheap forward path the doc's lifecycle §2 intends. Geometry setters rebuild
+  the affected `Axis` (immutable). The interner never GCs unused `StyleId`s (bounded distinct
+  styles; matches the builder). (`freecell-core/src/cache.rs`)
+- [Phase 5] **Style→RenderStyle mapping choices:** IronCalc's default font colour is pure black
+  (`#000000`); black (and absent/unparseable) maps to `RenderStyle.font_color = None` (= the
+  grid's default near-black), so plain cells intern to the default style. `num_format_is_default
+  = num_fmt.eq_ignore_ascii_case("general")`. Fill = `fill.fg_color` when present (a cleared
+  fill leaves `fg_color = None`). Only Left/Center/Right alignment map to `Some`; General and the
+  unimplemented variants → `None`. (`freecell-engine/src/cache.rs render_style_from`)
+- [Phase 5] **Build-on-activation reproduces IronCalc's cell-vs-band shadowing exactly**: a cell
+  present in `sheet_data` uses its *own* style (via `get_cell_style_or_none`), even the default,
+  which shadows any band (matching `Model::get_cell_style_index`); an absent cell falls through
+  to the row (gated on `custom_format`) then col band. A populated cell with default own style on
+  a non-default band gets an explicit default entry to shadow it. Micro-edge not handled: a
+  `custom_format` row whose style resolves to default while shadowing a non-default *col* band —
+  not reachably produced by the edit APIs (setting a row style to index 0 clears `custom_format`).
+  (`freecell-engine/src/cache.rs build_sheet_cache`, `refresh_cell`)
+- [Phase 5] **Undo/redo touch-sets are aligned 1:1 with IronCalc's undo history.** The worker
+  keeps `undo_touches`/`redo_touches` stacks (`Touch::Cells{sheet,range}` for cell edits,
+  `Touch::Sheets` markers for sheet ops) so a pop re-reads exactly the reverted op's cells.
+  Sheet-op undo/redo is handled by comparing the sheet-id set before/after and dropping caches
+  for absent sheets (a returning sheet rebuilds lazily on activation) rather than replaying the
+  marker. A rejected edit creates no engine history entry and pushes no touch, so the stacks stay
+  aligned. (`freecell-engine/src/worker/run.rs mirror_applied_ops`)
+- [Phase 5] `StyleCacheUpdated{sheet}` is emitted on load, on sheet activation, and after any
+  cell-edit batch that mirrored the active sheet (this slightly over-emits on pure value edits —
+  a cheap, always-correct "re-read the cache" signal). `SheetsChanged` is now driven by a
+  sheet-list value comparison (so undo/redo of an add/rename/delete re-syncs the tab bar too), a
+  small enhancement over Phase 4's applied-kind flag. A pathological mirror range (> 100k cells)
+  falls back to a full active-sheet rebuild. (`freecell-engine/src/worker/run.rs`)
+
+- [Phase 5] (post-CR) **Band-creating style edits force a full cache rebuild, detected by range
+  shape — not the cell-count cap.** A `SetStyleAttr` spanning all columns of a row (or all rows of
+  a column) makes IronCalc's `update_range_style` take its full-rows/full-columns branch and set a
+  ROW/COLUMN BAND (`ironcalc_base/src/user_model/common.rs`), which the per-cell `refresh_cell`
+  mirror structurally cannot create. A single full-row band is only 16,384 cells — below
+  `MAX_REFRESH_CELLS` (100k) — so the old cap-only guard let it slip to the per-cell path and rot
+  the cache (empty banded cells stayed default). Fix: `is_band_creating(range)` → full
+  `build_and_store_cache`. Full columns (1M rows) were already caught by the cap; now covered
+  explicitly too. (`worker/run.rs refresh_cache_cells` + `is_band_creating`)
+- [Phase 5] (post-CR) **Row-height auto-fit is mirrored on value edits (not worked around by
+  stripping newlines).** IronCalc's `set_user_input` grows a row's height when the content is
+  taller than the current height (multi-line, or *any* input on a row currently shorter than
+  ~21px) — so stripping newlines alone would NOT uphold the agreement contract for all inputs. The
+  mirror path re-reads the touched rows' heights (`cache::row_override_px`) and applies them via
+  the batched `SheetCache::set_row_heights` (one axis rebuild), so multi-line input and its undo
+  stay in agreement with the engine — with no silent alteration of user data. The MVP grid still
+  renders a single clipped line (a Phase-6 concern), independent of the cache's correct geometry.
+  (`worker/run.rs refresh_cache_cells`, `freecell-core/src/cache.rs set_row_heights`,
+  `freecell-engine/src/cache.rs row_override_px`)
+
+- [Phase 5] (post-CR2) **A failed cache rebuild DROPS the sheet's entry (never leaves it stale)**
+  and reports failure, so no `StyleCacheUpdated` is announced for it. A full-rebuild replaces a
+  pre-edit cache; leaving the old one on a build failure would make the grid re-read a stale cache
+  (the divergence this phase prevents). `build_and_store_cache` now returns `bool` and `remove`s
+  the entry on `Err`/unresolvable sheet (mirroring how activation already stays absent on
+  failure); `refresh_cache_cells` skips the `touched`/emit for a failed rebuild. The build `Err`
+  path is effectively unreachable today (getters only fail on an invalid sheet index, resolved
+  first), so the added test exercises the reachable unresolvable-sheet proxy; the invariant is
+  documented on `build_and_store_cache`. (`worker/run.rs`)

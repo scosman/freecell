@@ -13,8 +13,16 @@
 //! `UserModel` on a dedicated 64 MiB-stack thread and drives the drain-coalesce → apply →
 //! publish-then-bump loop, the viewport [`Publication`](freecell_core::Publication) build,
 //! the worker-side input-cap re-check, `catch_unwind` + degraded policy, and dirty-op
-//! accounting. Caches (Phase 5) build on it.
+//! accounting.
+//!
+//! Phase 5 adds the **style & geometry cache** ([`cache`]): the IronCalc-facing builder/mutator
+//! that converts engine geometry + `Style` into the engine-free
+//! [`SheetCache`](freecell_core::SheetCache) read model (resolved `RenderStyle`s + px geometry).
+//! The worker builds it on sheet activation and mirrors each issued edit into it (re-reading the
+//! touched cells), shipping `StyleCacheUpdated` deltas — provably in agreement with a fresh
+//! engine re-read (the load-bearing contract).
 
+pub(crate) mod cache;
 pub mod document;
 pub mod fixtures;
 pub mod worker;

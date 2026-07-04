@@ -12,6 +12,23 @@ what changes. **All engine/gpui facts below were verified against the pinned sou
 ironcalc_base 0.7.1 paths; `gpui/…` are `crates/gpui/…` at the pinned zed rev. The
 implementing agent should treat these as ground truth and not re-derive them.
 
+**Two-phase design.** This doc is the system level: verified APIs, data model, worker
+protocol, cross-cutting rules. The five complex components have full designs
+(interfaces, state machines, algorithms, named tests) in `components/` — **where a
+component doc refines a sketch here, the component doc wins**:
+
+- `components/edit_controller.md` — pending-edit state machine, type-to-replace,
+  mirror, in-cell editor, Tab, cap popover (expands §4, §7.2)
+- `components/clipboard.md` — coordinator + worker slot + TSV (expands §6)
+- `components/action_bar.md` — control state derivation + command emission (expands §3.1–3.3 UI side)
+- `components/grid_structure.md` — resize preview math, header selection, insert/
+  delete + two-layer merge guard (expands §5)
+- `components/style_render.md` — cache/render extensions, border paint, auto-grow,
+  publication (expands §1, §3.3–3.4 render side)
+
+Small features fully specified here alone: titlebar (§7.1), cap-popover chrome wiring
+(§7.2), `.back` backup (§7.3).
+
 ## 0. Principles (unchanged, restated as constraints)
 
 - Every engine mutation goes through the worker (`freecell-engine/src/worker/`) as a
@@ -34,6 +51,7 @@ Add fields (the omission comment at style.rs:20-22 is now partially lifted):
 pub font_size_q: u16,      // font size in quarter-points; 0 = default (engine default 11pt)
 pub font_family: u16,      // index into SheetCache.font_families; 0 = default font
 pub border: u16,           // index into SheetCache.border_specs; 0 = no borders
+pub num_fmt: u16,          // index into SheetCache.num_fmts; 0 = "general" (action bar needs the string)
 ```
 
 Side tables on `SheetCache` (freecell-core/src/cache.rs), built worker-side with the
@@ -41,7 +59,9 @@ rest of the cache and swapped atomically with it:
 
 ```rust
 pub font_families: Vec<SharedString>,           // [0] = "" (default)
+pub num_fmts: Vec<SharedString>,                // [0] = "general"
 pub border_specs: Vec<BorderSpec>,              // [0] = BorderSpec::NONE
+pub merges: Vec<CellRange>,                     // parsed merge_cells (guard UI, §5.3)
 pub struct BorderSpec { pub top: Option<Edge>, pub right: …, pub bottom: …, pub left: … }
 pub struct Edge { pub weight: u8 /*1,2,3 px*/, pub color: Rgb }
 ```
@@ -129,9 +149,10 @@ select-all formatting applies the op to the used range only (clamped via
 
 Number-format dropdown codes: General→`general` (clears), Number→`#,##0.00`,
 Currency→`$#,##0.00`, Percent→`0.00%`, Date→`m/d/yyyy`, Time→`h:mm AM/PM`, Text→`@`.
-Decimals ±: read active cell's `num_fmt` (already resident in cache), regex-adjust
-the last `0.0…0` group (add/remove one `0`; min zero decimals), apply to selection
-via `num_fmt` path. No-op if current format is General/Text/Date/Time.
+Decimals ±: computed **UI-side** from the cache-resident `num_fmt` string
+(`format_ui::adjust_decimals`, components/action_bar.md — unit-testable, worker gets
+a plain `num_fmt` SetStylePath), regex-adjusting the last `0.0…0` group (add/remove
+one `0`; min zero decimals). No-op if current format is General/Text/Date/Time.
 
 ### 3.2 Category display for the dropdown
 

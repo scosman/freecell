@@ -5,7 +5,11 @@ status: complete
 # Implementation Plan: MVP Gaps — Core Spreadsheet Feel
 
 Ordered checklist; details live in `functional_spec.md`, `ui_design.md`,
-`architecture.md` (§ references below). Phases 3–7 are mutually independent — if one
+`architecture.md` (§ references below), and `components/*.md` (full designs — where a
+component doc covers a phase, it is the primary spec: Phase 2 →
+`components/edit_controller.md`; Phase 3 → `components/clipboard.md`; Phases 4–6 →
+`components/action_bar.md` + `components/style_render.md`; Phase 7 →
+`components/grid_structure.md`). Phases 3–7 are mutually independent — if one
 stalls, skip and return. The MVP autonomy contract applies (work autonomously, record
 judgment calls in a `DECISIONS_TO_REVIEW.md` here).
 

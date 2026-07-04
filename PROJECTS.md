@@ -11,6 +11,11 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 ## Backlog
 
+> **Known gaps** (things missing / partial / deferred, as opposed to the forward-looking
+> initiatives below) live in the running log at [`GAPS.md`](GAPS.md). Several entries
+> below are the *design notes* for gaps tracked there (type-aware alignment, bundled
+> Inter, pre-distribution audit).
+
 - **All-Styles Resident Cache (grid geometry + styling)** — *Near-MVP.*
   An always-resident cache of the full resolved style for the sheet — **all** row/col
   sizes (geometry) + fills/lines/bold/number-format — **not** viewport-based. Needed to
@@ -44,3 +49,26 @@ registry: each entry is a short description plus a pointer to a design note unde
   Delta-load only newly-exposed cells' *values* on scroll (styles/geometry come from the
   resident style cache above); invalidate on recompute. Optional — SP4 showed uncached
   value reads are cheap. → [`projects/viewport-cache.md`](projects/viewport-cache.md)
+
+- **Bundled Inter Font** — *Future (deferred from MVP Phase 13, 2026-07-04).*
+  Ship Inter (SIL OFL) via GPUI `add_fonts` at startup (`ui_design.md §3.3`) for a clean
+  face + baselines portable across font environments. Deferred: the MVP's baseline
+  stability is already delivered by pinning the render-suite runner image, so Inter is a
+  portability/robustness upgrade, not a functional gap — and changing the render font
+  means regenerating + re-eyeballing all 48 pixel baselines. App runs on the default font.
+  → [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md)
+
+- **Type-Aware Default Cell Alignment (+ number-format text color)** — *Future (deferred
+  from MVP Phase 13).* Render Excel's type-based default alignment (numbers/dates right,
+  booleans/errors center) and `[Red]`-style number-format text color. The MVP publishes
+  only a display string per cell (`PublishedCell`), so every cell defaults to left and
+  text is the default color; values/formats/errors are correct, and *explicit* alignment
+  renders correctly. Needs the worker to publish per-cell value type + resolved color.
+  → [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md)
+
+- **Pre-Distribution Security & License Audit** — *Future, MANDATORY before shipping any
+  binary.* Re-audit `cargo-deny`: resolve the GPL `ztracing` license exception (zed#55470)
+  and the quick-xml ≥0.41 DoS advisories (transitive via ironcalc's xlsx reader + zed's
+  wayland/atspi stack), tighten bans/sources. No safe upgrade exists at the pinned gpui/
+  ironcalc revs today; FreeCell ships no binaries yet, so the documented posture is
+  acceptable for now. → [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)

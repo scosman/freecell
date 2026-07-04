@@ -1,0 +1,102 @@
+# Linux `checks` — the required-green gate (architecture.md §9).
+#
+# Runs on every push/PR: format, clippy (-D warnings), full workspace build (freecell-app
+# compiles on Linux), workspace tests, the render step under Xvfb + Mesa lavapipe, and
+# cargo-deny (licenses/advisories, incl. the documented GPL ztracing exception).
+#
+# The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
+
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: fmt / clippy / build / test / render / deny (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # System deps for the GPUI Linux (blade/Vulkan) build + the render suite:
+      # X11/Wayland/xkb, Vulkan loader + lavapipe (software Vulkan) ICD, fontconfig +
+      # freetype for text shaping, gbm, ALSA, and the capture tools — Xvfb (xvfb-run),
+      # ImageMagick (import), x11-xserver-utils (xrefresh), x11-utils (xwininfo: the
+      # render suite finds each case's window by id — Phase 7).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake \
+            libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan-dev libgbm-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            mesa-vulkan-drivers vulkan-tools \
+            xvfb x11-apps x11-xserver-utils x11-utils imagemagick
+
+      # Installs the toolchain pinned by app/rust-toolchain.toml. `rustup toolchain
+      # install` (no arg) reads the override file; `rustup show` no longer installs on
+      # rustup >= 1.28.
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: Format
+        working-directory: app
+        run: cargo fmt --all --check
+
+      - name: Clippy (-D warnings)
+        working-directory: app
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build workspace
+        working-directory: app
+        run: cargo build --workspace
+
+      - name: Test workspace
+        working-directory: app
+        run: cargo test --workspace
+
+      # Phase 7: the REQUIRED render-test suite (Xvfb + Mesa lavapipe), replacing the
+      # Phase-1 informational spike. Renders the real grid over engine-produced scenes and
+      # perceptual-diffs each against a committed baseline. The harness sizes an Xvfb
+      # display per case (a small window on a large screen won't present under lavapipe),
+      # so this is not wrapped in a single xvfb-run; the script sets FREECELL_RENDER=1.
+      # (`cargo test --workspace` above already ran the GPUI-free diff unit tests; without
+      # FREECELL_RENDER the pixel cases there skip.)
+      - name: Render-test suite (Xvfb + lavapipe)
+        working-directory: app
+        run: render-tests/scripts/render_tests.sh test
+
+      - name: Upload render failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-failures
+          path: app/target/render-failures/
+          if-no-files-found: ignore
+
+      # Pin the exact cargo-deny the gate was authored + verified against (0.19.9), so a
+      # future action bump can't silently change gate behaviour. Installs a prebuilt
+      # binary (no compile).
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.9
+
+      - name: cargo-deny
+        working-directory: app
+        run: cargo deny check

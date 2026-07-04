@@ -1,0 +1,69 @@
+# Linux `perf-gates` — required-green performance gate (architecture.md §9 item 2).
+#
+# Runs the Phase-12 perf harness: the POC "Run Test" scenario against the REAL GridView over a
+# 1M×100 styled engine-backed fixture, under Xvfb + Mesa lavapipe. It measures the CPU
+# render-build path (representative under software Vulkan; GPU present is NOT and is not gated)
+# plus the engine-call counter, and HARD-FAILS at the committed buffered thresholds
+# (= 2× the p99 calibrated on this runner image — render-tests/src/perf.rs `CI_*`) and on the
+# zero-engine-calls-on-scroll gate. Real-hardware budgets (8.33 ms / 2 ms) stay the product
+# truth, checked on macos-verify. Recalibrate only deliberately (a committed change).
+
+name: perf-gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: perf-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-gates:
+    name: perf harness (Linux, buffered thresholds)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake \
+            libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan-dev libgbm-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            mesa-vulkan-drivers vulkan-tools xvfb
+
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      # The harness builds itself in release (perf numbers must be optimized — CLAUDE.md) and
+      # runs FOREGROUND under Xvfb + lavapipe, HARD-FAILING at the committed buffered thresholds
+      # (render-tests/src/perf.rs `CI_*`) + the zero-engine-calls-on-scroll gate. The run stamps
+      # its environment (CPU / OS / rustc / lavapipe) into the printed report + results JSON.
+      # `timeout` is belt-and-braces (CLAUDE.md benchmark convention) around the build+run — the
+      # harness is already internally bounded (DRAIN_CAP); 30 min covers a cold-cache release
+      # build and fails cleanly rather than hanging the job.
+      - name: Perf harness (Linux, buffered thresholds — hard gate)
+        working-directory: app
+        env:
+          FREECELL_COMMIT: ${{ github.sha }}
+        run: timeout 1800 render-tests/scripts/perf.sh gate
+
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-runtest
+          path: app/render-tests/results/perf-runtest.json
+          if-no-files-found: warn

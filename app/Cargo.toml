@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/freecell-core",
+    "crates/freecell-engine",
+    "crates/freecell-app",
+    "render-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# MSRV must match the pinned toolchain: gpui needs `std::hint::cold_path()`, stabilized
+# in 1.95.0 (see rust-toolchain.toml + DECISIONS_TO_REVIEW.md). 1.94 cannot build it.
+rust-version = "1.95"
+publish = false
+
+# ---------------------------------------------------------------------------------
+# Shared dependency pins (architecture.md §1 "Pinned dependencies").
+#
+# The gpui/zed rev and the gpui-component SHA are a KNOWN-GOOD PAIR: gpui-component's
+# workspace at the pinned SHA pins this exact zed rev. Bump both together, never one
+# alone (architecture.md §10 risk "gpui-component SHA compatibility").
+# ---------------------------------------------------------------------------------
+[workspace.dependencies]
+# Internal crates
+freecell-core = { path = "crates/freecell-core" }
+freecell-engine = { path = "crates/freecell-engine" }
+# `freecell-app` exposes a `[lib]` (`freecell_app`, Phase 6): `render-tests` (Phase 7) and
+# the perf harness (Phase 12) depend on it to render the real grid over fixtures.
+freecell-app = { path = "crates/freecell-app" }
+
+# Engine (exact pin — the number all experiment results are comparable against)
+ironcalc = "=0.7.1"
+ironcalc_base = "=0.7.1"
+
+# GPUI (pinned zed rev). gpui_platform features mirror gpui-component's own workspace
+# (font-kit + the Linux backends x11/wayland + runtime_shaders) so the cross-platform
+# build matches the known-good gpui-component configuration.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+
+# gpui-component pinned to a main SHA that pins the zed rev above (resolved at
+# scaffolding time — see DECISIONS_TO_REVIEW.md, Phase 1).
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
+
+# Utility
+thiserror = "2"
+anyhow = "1"
+tempfile = "3"
+# Worker seam (Phase 4, components/engine_worker.md §Threading & channels):
+# `arc-swap` = the lock-free `Publication` snapshot slot (publish-then-bump);
+# `async-channel` = the worker→UI `WorkerEvent` channel (the type `smol::channel`
+# re-exports — awaited by the gpui foreground task, blocking-recv in headless tests —
+# without pulling an async runtime into the headless engine); `parking_lot` = the shared
+# `RwLock<SheetCaches>` (no poisoning if the worker panics under a write lock).
+arc-swap = "1"
+async-channel = "2"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+png = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.clippy]
+# Kept intentionally light; CI runs `clippy --workspace -- -D warnings` as the real gate.
+# `rust_2018_idioms` is deliberately NOT enabled: its `elided_lifetimes_in_paths` fights
+# gpui's pervasive idiomatic `Context<Self>` / `&mut App` signatures across the app crate.
+todo = "warn"
+
+# gpui is slow when built unoptimised (per gpui-component's own workspace); build it
+# and its platform layer with optimisation even in dev so frame times stay usable.
+[profile.dev.package.gpui]
+opt-level = 3
+
+[profile.dev.package.gpui_platform]
+opt-level = 3

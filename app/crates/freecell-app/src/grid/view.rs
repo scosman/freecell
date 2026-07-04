@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 
 use gpui::{
     div, prelude::*, px, rgb, rgba, AnyElement, App, Context, FocusHandle, Focusable, FontWeight,
-    Rgba, Window,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Rgba, Window,
 };
 use gpui_component::spinner::Spinner;
 use gpui_component::{Icon, IconName, Sizable as _};
@@ -27,15 +27,17 @@ use freecell_core::cache::SheetCaches;
 use freecell_core::color::Rgb;
 use freecell_core::publication::Publication;
 use freecell_core::refs::{column_label, SheetId};
-use freecell_core::{Align, Axis, RenderStyle, SelectionModel};
+use freecell_core::{apply_motion, Align, Axis, CellRef, RenderStyle, SelectionModel, SheetDims};
 
+use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
-    self, ContentArea, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
+    self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
 };
 use super::{
-    GridEvent, GridEventSink, ACCENT, CELL_BG, CELL_FONT_PX, CELL_H_PAD, CELL_TEXT, GRIDLINE,
-    HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT,
-    SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
+    GridEvent, GridEventSink, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX, CELL_H_PAD,
+    CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, GRIDLINE, HEADER_BG,
+    HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT, SCROLLBAR_FADE_SECS,
+    SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
 };
 
 /// The worker-written / UI-read data the grid renders from (`components/grid.md §Public
@@ -48,6 +50,14 @@ pub struct GridDataSources {
     pub caches: Arc<RwLock<SheetCaches>>,
     /// The generation counter — bumped after each publish (read by Phase-11 wiring).
     pub generation: Arc<AtomicU64>,
+}
+
+/// An in-flight mouse drag-selection (`components/grid.md §State`: "anchor cell + last hovered
+/// cell"). The anchor is the fixed corner the range extends from; the hovered cell is recomputed
+/// from the pointer each move, so only the anchor is retained.
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    anchor: CellRef,
 }
 
 /// The custom virtualized grid view.
@@ -75,6 +85,13 @@ pub struct GridView {
     last_viewport: Option<(Range<u32>, Range<u32>)>,
     /// A pending `scroll_cell_into_view` request applied on the next render.
     pending_reveal: Option<(u32, u32)>,
+    /// The in-flight mouse drag-selection, if any (`None` = not dragging).
+    drag: Option<DragState>,
+    /// Whether the edge auto-scroll timer loop is currently running.
+    autoscrolling: bool,
+    /// Monotonic epoch; a running auto-scroll loop stops as soon as this changes (drag end /
+    /// pointer back inside), the same guard pattern as the scrollbar fade.
+    autoscroll_epoch: u64,
     /// Reused per-frame index: visible `(row, col)` → index into the publication's cells.
     cell_index: HashMap<(u32, u32), usize>,
     /// Reused per-frame snapshot: visible `(row, col)` → resolved style (default = absent).
@@ -119,6 +136,9 @@ impl GridView {
             scroll_activity: 0,
             last_viewport: None,
             pending_reveal: None,
+            drag: None,
+            autoscrolling: false,
+            autoscroll_epoch: 0,
             cell_index: HashMap::new(),
             visible_styles: HashMap::new(),
         }
@@ -341,6 +361,468 @@ impl GridView {
             .ok();
         })
         .detach();
+    }
+
+    // ---- Input plumbing (Phase 8) ---------------------------------------------------------
+
+    /// Replaces the active sheet's selection and announces it (`SelectionChanged`). Unlike the
+    /// demo-facing [`GridView::set_selection`], this is the input path, so it emits the event
+    /// that drives the data row / ref box (`components/grid.md §Public interface`).
+    fn set_selection_and_emit(
+        &mut self,
+        selection: SelectionModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection.insert(self.active_sheet, selection);
+        self.events
+            .emit(&GridEvent::SelectionChanged(selection), window, cx);
+    }
+
+    /// The active sheet's dimensions (axis track counts), for clamping keyboard motions. `None`
+    /// when the sheet has no resident cache yet (no motion possible).
+    fn sheet_dims(&self) -> Option<SheetDims> {
+        let caches = self.sources.caches.read();
+        let cache = caches.get(self.active_sheet)?;
+        let (row_axis, col_axis) = cache.axes();
+        Some(SheetDims::new(row_axis.count(), col_axis.count()))
+    }
+
+    /// The number of rows in the current viewport — the Page Up/Down step
+    /// (`ui_design.md §6`). At least 1 so a page always advances.
+    fn page_rows(&self, window: &Window) -> u32 {
+        let (_, scroll_y) = self.scroll_of(self.active_sheet);
+        let viewport_h = f32::from(window.viewport_size().height) as f64;
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let caches = self.sources.caches.read();
+        let Some(cache) = caches.get(self.active_sheet) else {
+            return 1;
+        };
+        let (row_axis, _) = cache.axes();
+        let visible = row_axis.visible_range(scroll_y, content_h, 0);
+        (visible.end - visible.start).max(1)
+    }
+
+    /// The grid-local pixel of a mouse event. The grid is full-window in Phase 8, so window
+    /// coordinates are grid-local. PHASE 11: once chrome wraps the grid, subtract the grid
+    /// element's laid-out origin here (matching the `viewport_size()` note in `handle_scroll`).
+    fn event_local(position: gpui::Point<gpui::Pixels>) -> (f32, f32) {
+        (f32::from(position.x), f32::from(position.y))
+    }
+
+    /// The row-header gutter width for the current scroll (matches the render path's sizing).
+    fn gutter_width(row_axis: &Axis, scroll_y: f64, content_h: f64) -> f32 {
+        let rows = row_axis.visible_range(scroll_y, content_h, RENDER_OVERSCAN);
+        layout::row_header_width(rows.end.saturating_sub(1))
+    }
+
+    /// Mouse down: claim keyboard focus, hit-test, and (on a data cell) set the selection —
+    /// shift-click extends from the current anchor, a plain click selects the single cell — then
+    /// begin a drag from the resulting anchor. Header / corner clicks are a no-op in the MVP
+    /// (`components/grid.md §Input`).
+    fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Focus the grid so arrow keys route here (the window arranges focus after commits).
+        let handle = self.focus_handle.clone();
+        window.focus(&handle, cx);
+
+        let (local_x, local_y) = Self::event_local(event.position);
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let viewport_h = f32::from(window.viewport_size().height) as f64;
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+
+        let hit = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            layout::hit_test(
+                local_x,
+                local_y,
+                row_header_w,
+                scroll_x,
+                scroll_y,
+                &row_axis,
+                &col_axis,
+            )
+        };
+        let GridHit::Cell { row, col } = hit else {
+            return; // header / corner: no-op in MVP (row/col selection is a P2 feature)
+        };
+
+        let cell = CellRef::new(row, col);
+        let selection = if event.modifiers.shift {
+            // Shift-click extends the range from the existing anchor.
+            SelectionModel {
+                anchor: self.selection().anchor,
+                active: cell,
+            }
+        } else {
+            SelectionModel::single(cell)
+        };
+        self.set_selection_and_emit(selection, window, cx);
+        // Begin a drag from the (kept or new) anchor; subsequent moves extend to the hovered cell.
+        self.drag = Some(DragState {
+            anchor: selection.anchor,
+        });
+        cx.notify();
+    }
+
+    /// Mouse move: while dragging, extend the selection to the hovered cell and — when the
+    /// pointer is past a viewport edge — kick off the edge auto-scroll loop.
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.drag else {
+            return; // not dragging — nothing to do
+        };
+        let (local_x, local_y) = Self::event_local(event.position);
+        self.extend_drag_to_point(drag.anchor, local_x, local_y, window, cx);
+        self.maybe_start_autoscroll(window, cx);
+    }
+
+    /// Mouse up: end the drag (stopping any auto-scroll loop via the epoch) and let the
+    /// scrollbars fade if a drag-scroll had shown them.
+    fn handle_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag.take().is_some() {
+            // Bump the epoch to stop the loop, but deliberately DON'T clear `autoscrolling` here:
+            // the running loop still clears it itself on its next tick (≤ AUTOSCROLL_INTERVAL_MS).
+            // That leaves a narrow window where a brand-new drag past an edge won't relaunch
+            // auto-scroll until its next move event — an acceptable, self-healing trade-off for
+            // the stronger guarantee that only ONE loop is ever live (clearing the flag here could
+            // let a new loop start while the old one is still awaiting its timer → double speed).
+            self.autoscroll_epoch = self.autoscroll_epoch.wrapping_add(1);
+            if self.scrollbars_visible {
+                self.mark_scrollbars_active(cx); // schedule the fade-out
+            }
+        }
+    }
+
+    /// Extend the drag selection: map the pointer to a data cell and move `active` there,
+    /// keeping the drag's anchor. Emits `SelectionChanged` only when the cell actually changed.
+    fn extend_drag_to_point(
+        &mut self,
+        anchor: CellRef,
+        local_x: f32,
+        local_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let viewport = window.viewport_size();
+        let viewport_w = f32::from(viewport.width) as f64;
+        let viewport_h = f32::from(viewport.height) as f64;
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+
+        let cell = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            layout::cell_at_point(
+                local_x,
+                local_y,
+                row_header_w,
+                scroll_x,
+                scroll_y,
+                &row_axis,
+                &col_axis,
+                content_w,
+                content_h,
+            )
+        };
+        let selection = SelectionModel {
+            anchor,
+            active: cell,
+        };
+        if *self.selection() != selection {
+            self.set_selection_and_emit(selection, window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The current per-axis edge auto-scroll delta for the live pointer (`0` inside the content).
+    fn current_edge_delta(&self, window: &Window) -> (f64, f64) {
+        let pos = window.mouse_position();
+        let (local_x, local_y) = Self::event_local(pos);
+        let active = self.active_sheet;
+        let (_, scroll_y) = self.scroll_of(active);
+        let viewport = window.viewport_size();
+        let viewport_w = f32::from(viewport.width) as f64;
+        let viewport_h = f32::from(viewport.height) as f64;
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let caches = self.sources.caches.read();
+        let Some(cache) = caches.get(active) else {
+            return (0.0, 0.0);
+        };
+        let (row_axis, _) = cache.axes();
+        let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+        let content_w = (viewport_w - row_header_w as f64).max(0.0);
+        layout::edge_autoscroll_delta(
+            local_x,
+            local_y,
+            row_header_w,
+            content_w,
+            content_h,
+            EDGE_AUTOSCROLL_STEP_PX,
+            EDGE_AUTOSCROLL_HOTZONE_PX,
+        )
+    }
+
+    /// If a drag is active and the pointer is past a viewport edge, start the auto-scroll loop
+    /// (a `spawn_in` timer, so it advances even while the pointer is held still with no
+    /// mouse-move events — the "drag to the edge and wait" case).
+    fn maybe_start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.autoscrolling || self.drag.is_none() {
+            return;
+        }
+        let (dx, dy) = self.current_edge_delta(window);
+        if dx == 0.0 && dy == 0.0 {
+            return; // pointer inside — no auto-scroll needed yet
+        }
+        self.autoscrolling = true;
+        self.autoscroll_epoch = self.autoscroll_epoch.wrapping_add(1);
+        self.scrollbars_visible = true; // scrolling shows the overlay bars
+        let epoch = self.autoscroll_epoch;
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(AUTOSCROLL_INTERVAL_MS))
+                .await;
+            let keep = this
+                .update_in(cx, |this, window, cx| {
+                    if this.autoscroll_epoch != epoch || this.drag.is_none() {
+                        this.autoscrolling = false;
+                        return false;
+                    }
+                    this.autoscroll_tick(window, cx)
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// One auto-scroll frame: apply the fixed edge step (clamped), re-extend the selection to the
+    /// hovered cell, and announce a debounced `ViewportChanged`. Returns whether to keep looping
+    /// (`false` once the pointer returns inside the content, stopping the loop).
+    fn autoscroll_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.drag else {
+            self.autoscrolling = false;
+            return false;
+        };
+        let pos = window.mouse_position();
+        let (local_x, local_y) = Self::event_local(pos);
+        let active = self.active_sheet;
+        let (scroll_x0, scroll_y0) = self.scroll_of(active);
+        let viewport = window.viewport_size();
+        let viewport_w = f32::from(viewport.width) as f64;
+        let viewport_h = f32::from(viewport.height) as f64;
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+
+        let step = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                self.autoscrolling = false;
+                return false;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let total_w = cache.total_width();
+            let total_h = cache.total_height();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y0, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            let (dx, dy) = layout::edge_autoscroll_delta(
+                local_x,
+                local_y,
+                row_header_w,
+                content_w,
+                content_h,
+                EDGE_AUTOSCROLL_STEP_PX,
+                EDGE_AUTOSCROLL_HOTZONE_PX,
+            );
+            if dx == 0.0 && dy == 0.0 {
+                None // pointer back inside — stop
+            } else {
+                let area = ContentArea {
+                    row_header_w,
+                    width: content_w,
+                    height: content_h,
+                };
+                let (nx, ny) =
+                    layout::clamp_scroll(scroll_x0 + dx, scroll_y0 + dy, total_w, total_h, area);
+                let cell = layout::cell_at_point(
+                    local_x,
+                    local_y,
+                    row_header_w,
+                    nx,
+                    ny,
+                    &row_axis,
+                    &col_axis,
+                    content_w,
+                    content_h,
+                );
+                let rows = row_axis.visible_range(ny, content_h, RENDER_OVERSCAN);
+                let cols = col_axis.visible_range(nx, content_w, RENDER_OVERSCAN);
+                Some((nx, ny, cell, rows, cols))
+            }
+        };
+
+        let Some((nx, ny, cell, rows, cols)) = step else {
+            self.autoscrolling = false;
+            return false;
+        };
+
+        let mut changed = false;
+        if (nx, ny) != (scroll_x0, scroll_y0) {
+            self.scroll.insert(active, (nx, ny));
+            self.scrollbars_visible = true;
+            changed = true;
+        }
+        let selection = SelectionModel {
+            anchor: drag.anchor,
+            active: cell,
+        };
+        if *self.selection() != selection {
+            self.set_selection_and_emit(selection, window, cx);
+            changed = true;
+        }
+        let ranges = (rows, cols);
+        if self.last_viewport.as_ref() != Some(&ranges) {
+            self.last_viewport = Some(ranges.clone());
+            let (rows, cols) = ranges;
+            self.events
+                .emit(&GridEvent::ViewportChanged { rows, cols }, window, cx);
+        }
+        if changed {
+            cx.notify();
+        }
+        true // still past an edge — keep auto-scrolling
+    }
+
+    /// Reveals `(row, col)` immediately (not via the render-time `pending_reveal`) and announces
+    /// a debounced `ViewportChanged`, so a keyboard motion that scrolls the active cell into view
+    /// re-publishes the newly visible window. Mirrors `handle_scroll`'s viewport-announce.
+    fn reveal_and_announce(
+        &mut self,
+        row: u32,
+        col: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_sheet;
+        let (scroll_x0, scroll_y0) = self.scroll_of(active);
+        let viewport = window.viewport_size();
+        let viewport_w = f32::from(viewport.width) as f64;
+        let viewport_h = f32::from(viewport.height) as f64;
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+
+        let (nx, ny, rows, cols) = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            // Gutter wide enough for both the current view and the (possibly deeper) target row,
+            // matching `resolve_frame`'s conservative reveal sizing.
+            let cur_rows = row_axis.visible_range(scroll_y0, content_h, RENDER_OVERSCAN);
+            let reveal_gutter = layout::row_header_width(cur_rows.end.saturating_sub(1))
+                .max(layout::row_header_width(row));
+            let content_w = (viewport_w - reveal_gutter as f64).max(0.0);
+            let area = ContentArea {
+                row_header_w: reveal_gutter,
+                width: content_w,
+                height: content_h,
+            };
+            let (nx, ny) = layout::scroll_to_reveal(
+                row, col, &row_axis, &col_axis, area, scroll_x0, scroll_y0,
+            );
+            // Recompute the visible ranges (and gutter/content) at the new scroll.
+            let rows = row_axis.visible_range(ny, content_h, RENDER_OVERSCAN);
+            let content_w2 =
+                (viewport_w - layout::row_header_width(rows.end.saturating_sub(1)) as f64).max(0.0);
+            let cols = col_axis.visible_range(nx, content_w2, RENDER_OVERSCAN);
+            (nx, ny, rows, cols)
+        };
+
+        self.scroll.insert(active, (nx, ny));
+        let ranges = (rows, cols);
+        if self.last_viewport.as_ref() != Some(&ranges) {
+            self.last_viewport = Some(ranges.clone());
+            let (rows, cols) = ranges;
+            self.events
+                .emit(&GridEvent::ViewportChanged { rows, cols }, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Key down: resolve the MVP keyboard map (`ui_design.md §6`) to a grid command and dispatch
+    /// it — a motion updates the selection via `apply_motion` (then reveals the active cell), a
+    /// clear emits `ClearCells`. Unmapped keys are ignored (propagate).
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let shift = event.keystroke.modifiers.shift;
+        // `secondary()` = Cmd on macOS, Ctrl on Linux — resolved here so the mapper stays
+        // platform-agnostic (`ui_design.md §6` Linux note).
+        let secondary = event.keystroke.modifiers.secondary();
+        // Only Page Up/Down need the viewport height in rows; computing it takes a caches read
+        // lock, so resolve it lazily to keep every other keystroke lock-free.
+        let page_rows = if matches!(key, "pageup" | "pagedown") {
+            self.page_rows(window)
+        } else {
+            0
+        };
+
+        let Some(command) = command_for_key(key, shift, secondary, page_rows) else {
+            return;
+        };
+        match command {
+            GridKeyCommand::Motion(motion) => {
+                let Some(dims) = self.sheet_dims() else {
+                    return;
+                };
+                let selection = apply_motion(*self.selection(), motion, dims);
+                // Emit + reveal only when the motion actually moved the selection (a no-op at a
+                // sheet edge changes nothing), matching the drag / auto-scroll change-guarded paths.
+                if *self.selection() != selection {
+                    self.set_selection_and_emit(selection, window, cx);
+                    self.reveal_and_announce(
+                        selection.active.row,
+                        selection.active.col,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            GridKeyCommand::ClearCells => {
+                let range = self.selection().range();
+                self.events.emit(&GridEvent::ClearCells(range), window, cx);
+            }
+        }
     }
 }
 
@@ -760,6 +1242,24 @@ impl Render for GridView {
                     this.handle_scroll(event, window, cx);
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.handle_mouse_down(event, window, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.handle_mouse_move(event, window, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.handle_mouse_up(event, window, cx);
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.handle_key_down(event, window, cx);
+            }))
             .children(root_children)
     }
 }

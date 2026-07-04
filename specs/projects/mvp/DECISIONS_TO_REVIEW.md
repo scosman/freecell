@@ -561,3 +561,78 @@ Known placeholders the build will resolve (append the resolution here):
   refactor" of round-3 C** — the metric and both tolerance constants are identical, but the code
   extracts `pixel_delta` and adds `diff_image` (the magenta failure visualization), so "verbatim"
   was inaccurate. Doc-only. (`render-tests/src/diff.rs`)
+
+- [Phase 8] **Keyboard is wired via `on_key_down` + a pure `command_for_key` mapper, NOT GPUI
+  `Action`/keymap registration.** `components/grid.md §Public interface` says "the grid registers
+  GPUI key bindings"; instead the grid handler reads `keystroke.key` + `modifiers` and calls a
+  gpui-free `grid::input::command_for_key(key, shift, secondary, page_rows) -> Option<GridKeyCommand>`
+  (unit-tested headless). Rationale: it keeps the key→motion map **pure + unit-tested** (the
+  manager's explicit requirement), avoids app-global `bind_keys` registration that the render-test
+  harness / demo don't need, and resolves Cmd-on-mac / Ctrl-on-linux uniformly via
+  `Modifiers::secondary()` (no per-platform keymap files). The window-level shortcuts (Cmd+B/I/U,
+  undo/redo, menu actions) still bind as actions in later phases; those aren't the grid's.
+  (`grid/input.rs`, `grid/view.rs handle_key_down`)
+- [Phase 8] **Added `Motion::DocumentStart` / `Motion::ExtendDocumentStart` to `freecell-core`.**
+  `ui_design.md §6` maps Cmd/Ctrl+Home → cell A1, which no existing `Motion` could express
+  (`JumpEdge(Up)` keeps the column). Added the two variants (collapse / keep-anchor to A1) so
+  every keyboard selection change still flows through the single `apply_motion` transformer,
+  keeping it the pure, testable dispatch point. Cmd/Ctrl+Shift+Home (extend to A1) is wired for
+  symmetry with RowStart/ExtendRowStart though §6 lists only Home/Cmd+Home. (`selection.rs`)
+- [Phase 8] **Added `GridEvent::ClearCells(CellRange)`.** `components/grid.md §Input` says
+  "Delete emits a ClearCells request via the event sink", but the Phase-6 `GridEvent` enum had no
+  such variant. Added it carrying the selection range (sheet-less); the window supplies the active
+  `SheetId` → `Command::ClearCells` (which already exists in the worker protocol) in Phase 11. The
+  grid does not clear anything itself (no engine access). (`grid/mod.rs`, `grid/view.rs`)
+- [Phase 8] **Edge auto-scroll is a `cx.spawn_in(window, …)` timer loop polling
+  `window.mouse_position()`**, not `request_animation_frame`. The manager flagged that a
+  held-at-the-edge drag emits no mouse-move events, so a frame/timer must drive it. `spawn_in`
+  gives an `AsyncWindowContext` (→ `update_in` yields `&mut Window`), so each 16 ms tick reads the
+  live pointer, applies the fixed `EDGE_AUTOSCROLL_STEP_PX` (20 px, clamped via `clamp_scroll`),
+  re-extends the selection to the hovered cell (`cell_at_point`), and emits debounced
+  `ViewportChanged`. An epoch guard stops the loop on drag-end; the loop self-stops when the
+  pointer returns inside the content (delta 0). `request_animation_frame` was rejected: it doesn't
+  present headless under Xvfb and couples auto-scroll to the render cadence. (`grid/view.rs`
+  `maybe_start_autoscroll` / `autoscroll_tick`)
+- [Phase 8] **Mouse event positions are treated as grid-local (window == grid) with the same
+  PHASE 11 caveat as `handle_scroll`/`render`.** The grid is full-window in Phase 8 (demo +
+  render harness), so `MouseDownEvent.position` (window coords) is grid-local. Once chrome wraps
+  the grid (Phase 11), `event_local` must subtract the grid element's laid-out origin — flagged
+  inline, matching the existing `viewport_size()` notes. (`grid/view.rs event_local`)
+- [Phase 8] **Keyboard motions reveal the active cell immediately + announce `ViewportChanged`
+  (`reveal_and_announce`), rather than deferring to the render-time `pending_reveal`.** The
+  Phase-6 `scroll_cell_into_view` sets a pending reveal applied in `resolve_frame` but does NOT
+  emit `ViewportChanged` (fine when there was no worker). A keyboard scroll must re-publish, so the
+  key handler computes the reveal-scroll eagerly and emits the debounced `ViewportChanged` (mirrors
+  `handle_scroll`). `pending_reveal` stays for the public `scroll_cell_into_view` + render-test
+  `reveal` hook. (`grid/view.rs reveal_and_announce`)
+- [Phase 8] **The three new selection render cases set the post-interaction state directly (via
+  the existing `selection`/`reveal` harness hooks), not by injecting synthetic input events.** The
+  drag/shift/scroll *logic* is unit-tested (`cell_at_point`, `edge_autoscroll_delta`,
+  `command_for_key`, `apply_motion`); the render cases capture the real `GridView` selection layer
+  for the resulting states — `grid_selection_shift_extended` (active at the range's top-left),
+  `grid_selection_drag_extended` (larger block, active bottom-right), `grid_selection_scrolled`
+  (top-left clipped off-screen, the complement of `grid_selection_range_spans_edge`). This mirrors
+  Phase 7's choice to set selection directly rather than drive it through a (non-existent) worker
+  command. Baselines generated on the pinned image, eyeballed, committed; full suite green
+  (53 tests, 235 s). (`render-tests/src/cases.rs`, `render-tests/tests/render_suite.rs`,
+  `render-tests/baselines/grid_selection_{shift_extended,drag_extended,scrolled}.png`)
+
+- [Phase 8] (post-CR) **Edge auto-scroll gained an inward HOTZONE inset so it can START at the
+  right/bottom edges — the initial version could never trigger there.** gpui delivers
+  `on_mouse_move` only while the pointer is inside the (full-window) grid element, but the content's
+  right/bottom edges coincide with the window edge, and the first `edge_autoscroll_delta` only
+  returned a positive step *strictly past* those edges — exactly where no move event fires. So
+  dragging past the right/bottom never auto-scrolled (top/left worked incidentally, over the header
+  strips). Fix landed in the PURE, unit-tested `edge_autoscroll_delta`: it now returns the step when
+  the pointer is within `EDGE_AUTOSCROLL_HOTZONE_PX` (24 px, ~a cell) INSIDE each edge, so the loop
+  launches from a real move event; the running loop still re-reads the unclamped out-of-window
+  pointer. New test `edge_autoscroll_delta_starts_inside_hotzone`. Excel-like feel (scroll begins as
+  the pointer nears an edge). The capture-based hot-zone was chosen over pointer-capture-on-mousedown
+  (simpler + testable). (`grid/layout.rs`, `grid/mod.rs EDGE_AUTOSCROLL_HOTZONE_PX`)
+- [Phase 8] (post-CR) **Mild CR items:** keyboard motions now emit `SelectionChanged` + reveal ONLY
+  when the motion actually moved the selection (a no-op at a sheet edge changes nothing), matching
+  the change-guarded drag/auto-scroll paths; `page_rows` (a caches read) is resolved lazily, only for
+  `pageup`/`pagedown`, so every other keystroke stays lock-free; the `handle_mouse_up` auto-scroll
+  restart gap (`autoscrolling` stays set until the running loop's next ≤16 ms tick) is documented as
+  the deliberate "one loop live" trade-off; and `cell_at_point`'s benign inclusive-edge clamp is
+  noted in a comment. (`grid/view.rs`, `grid/layout.rs`)

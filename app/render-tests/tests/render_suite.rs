@@ -186,7 +186,8 @@ render_cases! {
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
     // Whole-grid scenes
     grid_empty_origin, grid_headers_scrolled_deep, grid_selection_single, grid_selection_range,
-    grid_selection_range_spans_edge, grid_variable_geometry, grid_loading_overlay,
+    grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
+    grid_selection_scrolled, grid_variable_geometry, grid_loading_overlay,
     grid_scrollbars_visible, grid_mixed_content,
 }
 

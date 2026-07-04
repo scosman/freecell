@@ -42,6 +42,8 @@ pub enum Direction {
 ///   its current page height in rows).
 /// - [`Motion::RowStart`] / [`Motion::ExtendRowStart`] — Home / Shift+Home: to column 0 of
 ///   the active row.
+/// - [`Motion::DocumentStart`] / [`Motion::ExtendDocumentStart`] — Cmd/Ctrl+Home /
+///   Cmd/Ctrl+Shift+Home: to cell A1 (the sheet origin).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
     Move(Direction),
@@ -52,6 +54,8 @@ pub enum Motion {
     ExtendPage { direction: Direction, rows: u32 },
     RowStart,
     ExtendRowStart,
+    DocumentStart,
+    ExtendDocumentStart,
 }
 
 /// The current selection: an active cell and the anchor a range extends from. A single
@@ -168,6 +172,11 @@ pub fn apply_motion(sel: SelectionModel, motion: Motion, dims: SheetDims) -> Sel
         Motion::ExtendRowStart => SelectionModel {
             anchor: sel.anchor,
             active: CellRef::new(sel.active.row, 0),
+        },
+        Motion::DocumentStart => SelectionModel::single(CellRef::new(0, 0)),
+        Motion::ExtendDocumentStart => SelectionModel {
+            anchor: sel.anchor,
+            active: CellRef::new(0, 0),
         },
     }
 }
@@ -323,6 +332,25 @@ mod tests {
         let ext = apply_motion(sel, Motion::ExtendRowStart, dims());
         assert_eq!(ext.anchor, cell(7, 40));
         assert_eq!(ext.active, cell(7, 0));
+    }
+
+    #[test]
+    fn document_start_goes_to_a1() {
+        // Cmd/Ctrl+Home collapses to the sheet origin regardless of the current cell.
+        let sel = SelectionModel::single(cell(7, 40));
+        let out = apply_motion(sel, Motion::DocumentStart, dims());
+        assert_eq!(out, SelectionModel::single(cell(0, 0)));
+        assert!(out.is_single());
+    }
+
+    #[test]
+    fn extend_document_start_keeps_anchor() {
+        // Cmd/Ctrl+Shift+Home extends the range back to A1, keeping the anchor fixed.
+        let sel = SelectionModel::single(cell(7, 40));
+        let out = apply_motion(sel, Motion::ExtendDocumentStart, dims());
+        assert_eq!(out.anchor, cell(7, 40));
+        assert_eq!(out.active, cell(0, 0));
+        assert_eq!(out.range(), CellRange::new(cell(0, 0), cell(7, 40)));
     }
 
     #[test]

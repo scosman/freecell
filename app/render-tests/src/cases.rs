@@ -222,12 +222,39 @@ pub fn all() -> Vec<RenderCase> {
         )
         .selection(sel((1, 1), (3, 3))),
         RenderCase::new(
-            // A range extending well past the viewport → the overlay clips at the edges.
+            // A range extending well past the viewport → the overlay clips at the bottom/right.
             "grid_selection_range_spans_edge",
             Scene::new(),
             GRID_VP,
         )
         .selection(sel((1, 1), (40, 26))),
+        RenderCase::new(
+            // A shift-click / shift-extend outcome with the ACTIVE cell at the range's TOP-LEFT
+            // corner (extension up-left): the "white anchor" sits at B2, exercising the overlay
+            // sub-rectangles for an active cell the bottom-right cases don't cover (Phase 8).
+            "grid_selection_shift_extended",
+            Scene::new().input(1, 1, "B2").input(4, 4, "E5"),
+            GRID_VP,
+        )
+        .selection(sel((4, 4), (1, 1))),
+        RenderCase::new(
+            // A click-drag outcome: a larger block dragged out from the anchor (B2→E6), active
+            // at the bottom-right (Phase 8 drag-extend).
+            "grid_selection_drag_extended",
+            Scene::new().input(1, 1, "B2").input(5, 4, "E6"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (5, 4))),
+        RenderCase::new(
+            // A selection scrolled so its top-left is clipped ABOVE/LEFT of the viewport (the
+            // complement of `grid_selection_range_spans_edge`): anchor off-screen, active cell
+            // visible near the bottom-right — the drag-then-auto-scroll end state (Phase 8).
+            "grid_selection_scrolled",
+            Scene::new().input(2, 1, "top").input(24, 8, "deep"),
+            GRID_VP,
+        )
+        .selection(sel((2, 1), (24, 8)))
+        .reveal(24, 8),
         RenderCase::new(
             "grid_variable_geometry",
             Scene::new()

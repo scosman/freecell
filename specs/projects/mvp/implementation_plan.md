@@ -83,7 +83,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   + perceptual diff ported from round-3 C; scene builder through the real engine;
   `generate_baselines`; README (human baseline process); initial ~45-case suite
   green in CI with committed baselines. (`components/render_test_harness.md`)
-- [ ] **Phase 8 — Grid interaction.** Mouse selection (click/drag/shift, edge
+- [x] **Phase 8 — Grid interaction.** Mouse selection (click/drag/shift, edge
   auto-scroll), keyboard motions wired, scroll-into-view, ViewportChanged events,
   selection render snapshots. (`components/grid.md`)
 

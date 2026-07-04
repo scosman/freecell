@@ -7,10 +7,13 @@
 //! (`experiments/04-ui-poc/raw-gpui/src/grid.rs`).
 //!
 //! Phase 6 scope: static rendering + wheel scroll + clamping + overlay scrollbars +
-//! loading overlay, driven by hand-built `freecell-core` fixtures. Mouse selection,
-//! keyboard motions, and edge auto-scroll are Phase 8.
+//! loading overlay, driven by hand-built `freecell-core` fixtures. Phase 8 adds the input
+//! plumbing: mouse selection (click / drag / shift-click + edge auto-scroll), keyboard
+//! motions dispatched through `freecell_core::apply_motion`, and the `SelectionChanged` /
+//! `ClearCells` events (`components/grid.md §Input`, `ui_design.md §5–6`).
 
 pub mod fixtures;
+pub mod input;
 pub mod layout;
 mod view;
 
@@ -18,7 +21,7 @@ use std::ops::Range;
 
 use gpui::{App, Window};
 
-use freecell_core::SelectionModel;
+use freecell_core::{CellRange, SelectionModel};
 
 pub use view::{GridDataSources, GridView};
 
@@ -57,14 +60,29 @@ pub const CELL_H_PAD: f32 = 4.0;
 /// Seconds the overlay scrollbars stay visible after the last scroll before fading.
 pub const SCROLLBAR_FADE_SECS: u64 = 2;
 
+/// Fixed auto-scroll step (px) applied each frame while a drag is held past a viewport edge
+/// (`components/grid.md §Input`: "fixed 20 px/frame step").
+pub const EDGE_AUTOSCROLL_STEP_PX: f64 = 20.0;
+/// Inward hot-zone (px, ~a cell height) within which a drag near a viewport edge starts
+/// auto-scrolling. Load-bearing: gpui delivers `on_mouse_move` only while the pointer is inside
+/// the grid element, so the loop must be able to START from a move event fired while the pointer
+/// is still `EDGE_AUTOSCROLL_HOTZONE_PX` inside the edge (the content right/bottom edges coincide
+/// with the window edge). Excel-like — scrolling begins as the pointer nears an edge.
+pub const EDGE_AUTOSCROLL_HOTZONE_PX: f64 = 24.0;
+/// The auto-scroll timer interval (ms) — roughly one 60 fps frame. While a drag is held past
+/// an edge, a `spawn_in` loop applies [`EDGE_AUTOSCROLL_STEP_PX`] every tick (the "held at the
+/// edge with no mouse-move events" case; a live `window.mouse_position()` drives the extend).
+pub const AUTOSCROLL_INTERVAL_MS: u64 = 16;
+
 /// The grid/cell font family (`ui_design.md §3.3`: bundled Inter). Registered at app
 /// startup (Phase 10); until then gpui falls back to the default UI font. Reserved here so
 /// the render path names the intended family in one place.
 pub const GRID_FONT_FAMILY: &str = "Inter";
 
-/// Events the grid raises to its owner (`WorkbookWindow`, Phase 11). Phase 6 emits only
-/// [`GridEvent::ViewportChanged`] (from the scroll path); selection/commit events arrive
-/// with input wiring in Phase 8.
+/// Events the grid raises to its owner (`WorkbookWindow`, Phase 11). Phase 8 drives
+/// [`GridEvent::SelectionChanged`] (mouse + keyboard), [`GridEvent::ViewportChanged`]
+/// (scroll / keyboard reveal / edge auto-scroll), and [`GridEvent::ClearCells`]
+/// (Delete/Backspace); the window forwards them to the worker + sibling chrome in Phase 11.
 #[derive(Debug, Clone)]
 pub enum GridEvent {
     /// The selection changed — drives the data row, action row, and ref box.
@@ -72,6 +90,10 @@ pub enum GridEvent {
     /// The visible index range changed (pre-overscan). The window forwards this to the
     /// worker as `SetViewport` with its own ~3× overscan.
     ViewportChanged { rows: Range<u32>, cols: Range<u32> },
+    /// Delete/Backspace with grid focus: clear the selection's cell contents (keep styles).
+    /// The window supplies the active `SheetId` → `Command::ClearCells` (`components/grid.md
+    /// §Input`, `ui_design.md §6`).
+    ClearCells(CellRange),
     /// A click-away happened while the data row was editing (commit the pending edit).
     EditCommitRequested,
 }

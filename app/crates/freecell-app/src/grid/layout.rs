@@ -211,6 +211,90 @@ fn reveal_axis(index: u32, axis: &Axis, content: f64, scroll: f64, max: f64) -> 
     scroll.clamp(0.0, max)
 }
 
+/// Maps a **grid-local** pixel to the data cell under it, clamping the point into the content
+/// rectangle first — so a drag into the header strips or past a viewport edge still resolves to
+/// the nearest data cell (a drag-extend never lands on a header). Used while dragging a
+/// selection (`components/grid.md §Input`). Unlike [`hit_test`], the result is always a
+/// `CellRef` (headers are folded into the adjacent content cell).
+#[allow(clippy::too_many_arguments)]
+pub fn cell_at_point(
+    local_x: f32,
+    local_y: f32,
+    row_header_w: f32,
+    scroll_x: f64,
+    scroll_y: f64,
+    row_axis: &Axis,
+    col_axis: &Axis,
+    content_w: f64,
+    content_h: f64,
+) -> CellRef {
+    let left = row_header_w as f64;
+    let top = COL_HEADER_H as f64;
+    // Clamp into the content rect, then convert to content-space (scroll + local offset).
+    let clamped_x = (local_x as f64).clamp(left, left + content_w);
+    let clamped_y = (local_y as f64).clamp(top, top + content_h);
+    let content_x = scroll_x + (clamped_x - left);
+    let content_y = scroll_y + (clamped_y - top);
+    // Inclusive right/bottom clamp: when `content_w`/`content_h` lands exactly on a track
+    // boundary, `index_at` can name the track just past the last fully-visible one. This is
+    // intentional and benign for drag-extend — the `.min(count - 1)` below keeps it a valid
+    // cell, and auto-scroll reveals a cell selected one past the edge.
+    let col = col_axis
+        .index_at(content_x)
+        .min(col_axis.count().saturating_sub(1));
+    let row = row_axis
+        .index_at(content_y)
+        .min(row_axis.count().saturating_sub(1));
+    CellRef::new(row, col)
+}
+
+/// The per-axis scroll delta (px) for drag-past-edge **auto-scroll**: a fixed `step` toward the
+/// origin (`-step`) when the pointer is within `hotzone` px of the left/top content edge, `+step`
+/// toward the end when within `hotzone` of the right/bottom edge, and `0` in the interior
+/// (`components/grid.md §Input`: "auto-scroll when dragging past edges … fixed 20 px/frame step").
+/// The caller adds this to the current scroll and clamps it.
+///
+/// The `hotzone` inset is load-bearing, not cosmetic: gpui delivers `on_mouse_move` only while
+/// the grid element is **hovered** (the pointer is inside its bounds), and the content's
+/// right/bottom edges coincide with the window edge — so a pointer *strictly past* them never
+/// generates the move event that would START the auto-scroll loop. Firing while the pointer is
+/// still `hotzone` px INSIDE each edge lets the loop launch from a real move event; once running
+/// it re-reads the (out-of-window, unclamped) pointer directly. This is also the Excel feel — the
+/// scroll begins as the pointer nears an edge, not only once it leaves the window.
+pub fn edge_autoscroll_delta(
+    local_x: f32,
+    local_y: f32,
+    row_header_w: f32,
+    content_w: f64,
+    content_h: f64,
+    step: f64,
+    hotzone: f64,
+) -> (f64, f64) {
+    let left = row_header_w as f64;
+    let right = left + content_w;
+    let top = COL_HEADER_H as f64;
+    let bottom = top + content_h;
+    let (lx, ly) = (local_x as f64, local_y as f64);
+    // Each test covers both "within hotzone inside the edge" and "past the edge" (the running
+    // loop sees unclamped, out-of-window coordinates); the left/top branch is checked first so a
+    // degenerate content area narrower than 2×hotzone resolves deterministically.
+    let dx = if lx < left + hotzone {
+        -step
+    } else if lx > right - hotzone {
+        step
+    } else {
+        0.0
+    };
+    let dy = if ly < top + hotzone {
+        -step
+    } else if ly > bottom - hotzone {
+        step
+    } else {
+        0.0
+    };
+    (dx, dy)
+}
+
 /// Decomposes a selection range **minus its active cell** into ≤4 index sub-rectangles
 /// (each `rows × cols`, both half-open), which together tile the range exactly once and
 /// never cover the active cell — the Excel "white anchor" overlay (`ui_design.md §3.3`,
@@ -424,6 +508,185 @@ mod tests {
         let (x, y) = scroll_to_reveal(999, 999, &rows, &cols, c, 0.0, 0.0);
         assert!(x <= max_scroll(cols.total(), c.width) + 1e-6);
         assert!(y <= max_scroll(rows.total(), c.height) + 1e-6);
+    }
+
+    #[test]
+    fn cell_at_point_inside_and_clamped() {
+        let rows = uniform(100, 24.0);
+        let cols = uniform(100, 100.0);
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        // Inside the content: A1 at the top-left content pixel.
+        assert_eq!(
+            cell_at_point(
+                rhw + 1.0,
+                COL_HEADER_H + 1.0,
+                rhw,
+                0.0,
+                0.0,
+                &rows,
+                &cols,
+                cw,
+                ch
+            ),
+            CellRef::new(0, 0)
+        );
+        // A point in the column-header strip clamps DOWN into the top content row (row 0).
+        assert_eq!(
+            cell_at_point(rhw + 150.0, 3.0, rhw, 0.0, 0.0, &rows, &cols, cw, ch),
+            CellRef::new(0, 1)
+        );
+        // A point in the row-header gutter clamps RIGHT into the first content column (col 0).
+        assert_eq!(
+            cell_at_point(
+                5.0,
+                COL_HEADER_H + 50.0,
+                rhw,
+                0.0,
+                0.0,
+                &rows,
+                &cols,
+                cw,
+                ch
+            ),
+            CellRef::new(2, 0)
+        );
+        // Far above/left of the whole grid clamps to A1 (the corner).
+        assert_eq!(
+            cell_at_point(-99.0, -99.0, rhw, 0.0, 0.0, &rows, &cols, cw, ch),
+            CellRef::new(0, 0)
+        );
+        // Far past the bottom-right edge clamps into the last visible cell of the content rect.
+        let past = cell_at_point(9999.0, 9999.0, rhw, 0.0, 0.0, &rows, &cols, cw, ch);
+        // Content is 400×300 → ~4 cols (0..=3/4) and ~12 rows visible from the origin.
+        assert!(
+            past.col <= 4 && past.row <= 12,
+            "clamped into view: {past:?}"
+        );
+    }
+
+    #[test]
+    fn cell_at_point_scrolled_variable_geometry() {
+        let rows = varied(1000);
+        let cols = varied(1000);
+        let rhw = ROW_HEADER_MIN_W;
+        // Scroll to the start of row 50 / col 40; the top-left content pixel is that cell.
+        let scroll_y = rows.offset_of(50);
+        let scroll_x = cols.offset_of(40);
+        assert_eq!(
+            cell_at_point(
+                rhw + 0.5,
+                COL_HEADER_H + 0.5,
+                rhw,
+                scroll_x,
+                scroll_y,
+                &rows,
+                &cols,
+                400.0,
+                300.0
+            ),
+            CellRef::new(50, 40)
+        );
+    }
+
+    /// Auto-scroll hot-zone inset used in the tests (a cell height, matching the app constant).
+    const HZ: f64 = 24.0;
+
+    #[test]
+    fn edge_autoscroll_delta_zero_inside() {
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        // A pointer comfortably inside the content (well outside every hot-zone) → no scroll.
+        assert_eq!(
+            edge_autoscroll_delta(rhw + 200.0, COL_HEADER_H + 150.0, rhw, cw, ch, 20.0, HZ),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn edge_autoscroll_delta_starts_inside_hotzone() {
+        // The critical case (the CR bug): the pointer is still INSIDE the content — so a real
+        // `on_mouse_move` fires — but within the hot-zone of an edge, and auto-scroll must START.
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        let right = rhw as f64 + cw;
+        let bottom = COL_HEADER_H as f64 + ch;
+        // Just inside the right edge (within the hot-zone) → positive x step, no y.
+        assert_eq!(
+            edge_autoscroll_delta(
+                (right - 5.0) as f32,
+                COL_HEADER_H + 150.0,
+                rhw,
+                cw,
+                ch,
+                20.0,
+                HZ
+            ),
+            (20.0, 0.0)
+        );
+        // Just inside the bottom edge (within the hot-zone) → positive y step, no x.
+        assert_eq!(
+            edge_autoscroll_delta(rhw + 200.0, (bottom - 5.0) as f32, rhw, cw, ch, 20.0, HZ),
+            (0.0, 20.0)
+        );
+        // Just inside the left/top edges → negative steps.
+        assert_eq!(
+            edge_autoscroll_delta(rhw + 5.0, COL_HEADER_H + 5.0, rhw, cw, ch, 20.0, HZ),
+            (-20.0, -20.0)
+        );
+        // One px further inside than the hot-zone (interior side) → no scroll on that axis.
+        assert_eq!(
+            edge_autoscroll_delta(
+                (right - HZ - 1.0) as f32,
+                COL_HEADER_H + 150.0,
+                rhw,
+                cw,
+                ch,
+                20.0,
+                HZ,
+            ),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn edge_autoscroll_delta_past_each_edge() {
+        // Once running, the loop re-reads the unclamped, out-of-window pointer — same steps.
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        let right = rhw as f64 + cw;
+        let bottom = COL_HEADER_H as f64 + ch;
+        // Past the left/top edges → negative (scroll toward the origin).
+        assert_eq!(
+            edge_autoscroll_delta(rhw - 50.0, COL_HEADER_H - 50.0, rhw, cw, ch, 20.0, HZ),
+            (-20.0, -20.0)
+        );
+        // Past the right/bottom edges → positive (scroll toward the end).
+        assert_eq!(
+            edge_autoscroll_delta(
+                (right + 50.0) as f32,
+                (bottom + 50.0) as f32,
+                rhw,
+                cw,
+                ch,
+                20.0,
+                HZ,
+            ),
+            (20.0, 20.0)
+        );
+        // Only one axis past an edge → only that axis scrolls.
+        assert_eq!(
+            edge_autoscroll_delta(
+                (right + 50.0) as f32,
+                COL_HEADER_H + 150.0,
+                rhw,
+                cw,
+                ch,
+                20.0,
+                HZ
+            ),
+            (20.0, 0.0)
+        );
     }
 
     #[test]

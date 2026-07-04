@@ -105,4 +105,42 @@ built-in number-format table, and accepts an `xfId`-less `cellXfs`, `open_fixups
 
 | Gap | Severity | Why it matters | Sketch |
 |-----|----------|----------------|--------|
-| **Save a `.back` backup before the first save** | High (we're alpha) | The save path can lose data (IronCalc's writer silently strips anything it doesn't model; we're early and bugs are likely). A one-time backup of the original bytes means an overwrite can never be the *only* copy. | Before the **first** save of a document opened from disk, copy the original file to `filename.xlsx.back` (write-once — do **not** re-back-up / overwrite the backup on subsequent saves, so the backup always holds the pristine original). Applies to files opened from disk; a never-saved new workbook has nothing to back up. Deferred — not implemented yet. |
+| **Save a `.back` backup before the first save** | High (we're alpha) | The save path can lose data (IronCalc's writer silently strips anything it doesn't model; we're early and bugs are likely). A one-time backup of the original bytes means an overwrite can never be the *only* copy. | Before the **first** save of a document opened from disk, copy the original file to `filename.xlsx.back` (write-once — do **not** re-back-up / overwrite the backup on subsequent saves, so the backup always holds the pristine original). Applies to files opened from disk; a never-saved new workbook has nothing to back up. **Picked up in `specs/projects/mvp-gaps`.** |
+
+---
+
+## Post-MVP UX features — surveyed for `mvp-gaps`, deferred (2026-07-04)
+
+Candidate features surveyed while scoping the **`specs/projects/mvp-gaps`** project (the
+first post-MVP gap-closing round). These did **not** make that project's scope; recorded
+here so they aren't lost. All were deliberate MVP scope cuts (`functional_spec.md §8`),
+now re-triaged. Severity here = product gap vs. a "real spreadsheet app", not a defect.
+
+| Feature | Severity | Notes |
+|---|---|---|
+| **Grid cell right-click context menu** (cut/copy/paste/clear/…) | Moderate | Cheap once range clipboard lands (it's in `mvp-gaps`). Note: a *header* right-click menu for insert/delete rows/cols **is** in `mvp-gaps`; this row is the general cell-area menu. |
+| **Fill down/right (Cmd+D / Cmd+R) + drag fill handle** | Moderate | Fill-down/right is small once range ops exist; the drag handle is the larger half. Engine support exists and is undoable: `UserModel::auto_fill_rows/auto_fill_columns` incl. sequence detection (verified in the 2026-07-04 0.7.1 audit) — cheap when picked up. |
+| **Zoom control (sheet-area zoom dropdown)** | Moderate | Cut in `mvp-gaps` scope-back (punt pre-authorized): a scale factor cross-cutting perf-gated geometry (`Axis`, hit-testing, scrollbars), text sizing, and all pixel baselines — high blast radius for a mid-size win. |
+| **Merged-cell rendering + selection ("tiers a+b")** | Moderate | Cut in `mvp-gaps` scope-back. Investigated and **ready to build with zero engine changes** (merges already round-trip open→save at 0.7.1); render-only without selection snapping is a UX trap, and the pair drags selection-fixpoint logic through delicate input code — deserves its own focused project. Full plan: [`projects/merged-cells.md`](projects/merged-cells.md). Meanwhile `mvp-gaps` ships a guard blocking insert/delete rows/cols that would displace merges. |
+| **Find (Cmd+F) / replace** | Moderate | Find-only would cover most usage; replace adds engine-write fan-out. |
+| **Autofit column width** (double-click header divider) | Mild | Pairs with the resize UI shipping in `mvp-gaps`; needs text measurement over the column's cells. |
+| **Cmd+arrow jumps to edge-of-*sheet*, not edge-of-*data*** | Mild | MVP behavior (spec §3.2) is the nonstandard one; edge-of-data needs a cheap occupied-extent query. |
+| **Recent files on Welcome window** | Mild | Spec'd out of MVP (§2.2); needs a small persisted MRU store. |
+| **Freeze panes** | Moderate | Viewport-split rendering + scroll clamping in the custom grid — real complexity, defer until asked for. Engine side is trivial when picked up: `UserModel::set_frozen_rows_count/set_frozen_columns_count` exist and are undoable (2026-07-04 audit). |
+| **Sort / filter** | Moderate | Large feature (engine ops + UI + selection semantics); own project when picked up. |
+| **Text overflow into empty neighbors + wrap** | Moderate | Spec §3.6 clips at cell boundary; overflow needs neighbor-emptiness lookups on the render path, wrap needs row-height interaction. |
+| **Merge/unmerge UI** ("tier c") | Moderate | Blocked on an IronCalc `UserModel` merge API (fork or upstream PR); *rendering* file-loaded merges is in `mvp-gaps`. See [`projects/merged-cells.md`](projects/merged-cells.md). |
+
+### `mvp-gaps` — accepted behavior deviations (owner-approved 2026-07-04)
+
+Product judgment calls baked into the `mvp-gaps` specs, reviewed and accepted at
+planning sign-off. Each ships as specced; listed here so the follow-up path isn't
+lost if one bites in practice.
+
+| Deviation | Vs. Excel | Follow-up if needed |
+|---|---|---|
+| **Cut has no visual indicator** | Excel shows marching ants; Esc cancels a cut | Cmd+X looks like copy; source clears at paste time. Cheap cue later: dim the cut source range. |
+| **Font family/size on full-row/col doesn't apply to future cells** | Excel sets a row/col-level font | No font band API at IronCalc 0.7.1 (`update_range_style` has no `font.name`/absolute-size path); we clamp to the used range via `on_paste_styles`. Fix = upstream a font band path, then swap the clamp for a band call. |
+| **External TSV paste skips empty tokens instead of clearing cells** | Excel blanks the target cell | Engine `paste_csv_string` behavior. Fix = FreeCell pre-clears the target area (one extra undoable step) if this bites. |
+| **`.back` backup failure blocks the save** | n/a (our feature) | Data-safety-wins call: "Couldn't create backup — file not saved." The annoying case (unwritable dir) mostly implies the atomic save would fail too. Could soften to warn-and-continue. |
+| **No action-bar overflow; window min-width rises to fit the control row** | Excel ribbon collapses | Could feel restrictive on small/split screens. Fix = overflow menu for trailing groups. |

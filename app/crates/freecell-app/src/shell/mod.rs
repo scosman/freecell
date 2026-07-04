@@ -2,10 +2,10 @@
 //! window registry, the welcome window, the per-document [`WorkbookWindow`], the menu bar +
 //! key bindings, the dialogs, and the save / close / quit flows.
 //!
-//! **Split with Phase 11.** Phase 10 builds the *shell* — the window/menu/dialog plumbing and
-//! the lifecycle around each document window. The end-to-end composition of grid + chrome +
-//! worker *inside* a [`WorkbookWindow`] (event routing, selection/viewport wiring) is Phase
-//! 11, which fills in the placeholder content body this phase renders.
+//! Phase 10 built the *shell* — the window/menu/dialog plumbing and the lifecycle around each
+//! document window; **Phase 11** composed the grid + chrome + worker *inside* each
+//! [`WorkbookWindow`] (worker-event routing, grid/chrome coupling, selection/viewport wiring),
+//! replacing the Phase-10 placeholder body.
 //!
 //! **Pure vs GPUI.** The lifecycle *decisions* — window dedupe, quit-when-empty, dirty
 //! accounting, save targeting, quit-prompt ordering — live in the gpui-free [`registry`] and

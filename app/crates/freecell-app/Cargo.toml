@@ -40,7 +40,11 @@ tracing.workspace = true
 # (additive: only enabled for test builds, so the release binary stays lean). This is the
 # same knob gpui-component enables for its own widget tests.
 gpui = { workspace = true, features = ["test-support"] }
-# Phase 10 save-flow tests spawn a real `NewWorkbook` worker and write to a temp dir.
+# Phase 11 gpui window tests compose a `WorkbookWindow` over a worker-less `DocumentClient`
+# (`test-support` → `DocumentClient::detached()`), so the deterministic `TestScheduler` never
+# races a real OS-thread worker. Test-build only; the release binary never sees `detached()`.
+freecell-engine = { workspace = true, features = ["test-support"] }
+# save-flow / round-trip test fixtures write to a temp dir.
 tempfile.workspace = true
 
 [lints]

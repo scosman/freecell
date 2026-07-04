@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +16,9 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, AnyElement, App, Context, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Rgba, Window,
+    canvas, div, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context, FocusHandle,
+    Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Rgba, Window,
 };
 use gpui_component::spinner::Spinner;
 use gpui_component::{Icon, IconName, Sizable as _};
@@ -27,6 +27,7 @@ use freecell_core::cache::SheetCaches;
 use freecell_core::color::Rgb;
 use freecell_core::publication::Publication;
 use freecell_core::refs::{column_label, SheetId};
+use freecell_core::selection::Motion;
 use freecell_core::{apply_motion, Align, Axis, CellRef, RenderStyle, SelectionModel, SheetDims};
 
 use super::input::{command_for_key, GridKeyCommand};
@@ -42,14 +43,16 @@ use super::{
 
 /// The worker-written / UI-read data the grid renders from (`components/grid.md §Public
 /// interface`). In Phase 6 these are built from hand fixtures ([`super::fixtures`]); the
-/// worker fills them for real in Phase 11.
+/// worker fills them for real from the `DocumentClient`'s shared read-surfaces (Phase 11).
+///
+/// There is deliberately **no generation counter** here: the grid re-reads the `publication`
+/// `ArcSwap` every frame, and the window schedules a repaint on `WorkerEvent::Published` via
+/// `grid.notify()` — so a separate generation the grid would poll is redundant.
 pub struct GridDataSources {
     /// The active sheet's overscanned viewport values snapshot, swapped by the worker.
     pub publication: Arc<ArcSwap<Publication>>,
     /// The resident geometry + resolved-style caches (worker writes, UI reads).
     pub caches: Arc<RwLock<SheetCaches>>,
-    /// The generation counter — bumped after each publish (read by Phase-11 wiring).
-    pub generation: Arc<AtomicU64>,
 }
 
 /// An in-flight mouse drag-selection (`components/grid.md §State`: "anchor cell + last hovered
@@ -96,6 +99,12 @@ pub struct GridView {
     cell_index: HashMap<(u32, u32), usize>,
     /// Reused per-frame snapshot: visible `(row, col)` → resolved style (default = absent).
     visible_styles: HashMap<(u32, u32), RenderStyle>,
+    /// The grid element's real laid-out bounds, captured during paint (a `canvas` probe).
+    /// `None` until the first paint. Used instead of `window.viewport_size()` so the grid's
+    /// virtualization + hit-testing are correct once chrome wraps it (the grid is no longer
+    /// full-window). Falls back to the window size (whole window) when not yet captured — the
+    /// full-window render-tests / demo are unaffected (bounds ≈ the window).
+    bounds: Option<Bounds<Pixels>>,
 }
 
 /// The per-frame geometry resolved under the (briefly held) caches read lock.
@@ -141,7 +150,30 @@ impl GridView {
             autoscroll_epoch: 0,
             cell_index: HashMap::new(),
             visible_styles: HashMap::new(),
+            bounds: None,
         }
+    }
+
+    /// The grid's viewport size in px — its real laid-out bounds once captured, else the whole
+    /// window (the pre-composition fallback). This is the extent virtualization + scroll-clamp
+    /// math measure against, so it must be the grid's own area, not the window's.
+    fn viewport_wh(&self, window: &Window) -> (f64, f64) {
+        match self.bounds {
+            Some(b) => (
+                f32::from(b.size.width) as f64,
+                f32::from(b.size.height) as f64,
+            ),
+            None => {
+                let vp = window.viewport_size();
+                (f32::from(vp.width) as f64, f32::from(vp.height) as f64)
+            }
+        }
+    }
+
+    /// Focuses the grid (window shell hands focus back after a data-row commit / escape).
+    pub fn focus_self(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.focus_handle.clone();
+        window.focus(&handle, cx);
     }
 
     /// Switches the active sheet, restoring its scroll + selection (origin + A1 if unseen).
@@ -287,13 +319,9 @@ impl GridView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // PHASE 11: `viewport_size()` is the whole window — correct while the grid is
-        // full-window (Phase 6 demo + Phase 7 render harness). Once chrome (toolbar / data row
-        // / tab bar) wraps the grid, this must switch to the grid element's own laid-out bounds,
-        // or the visible-range / scroll-clamp math over-computes and allows slight over-scroll.
-        let viewport = window.viewport_size();
-        let viewport_w = f32::from(viewport.width) as f64;
-        let viewport_h = f32::from(viewport.height) as f64;
+        // The grid's own laid-out bounds (`viewport_wh`), not the whole window — so the
+        // visible-range / scroll-clamp math is correct now that chrome wraps the grid.
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
         let line_height = window.line_height();
         let delta = event.delta.pixel_delta(line_height);
         let dx = f32::from(delta.x) as f64;
@@ -392,7 +420,7 @@ impl GridView {
     /// (`ui_design.md §6`). At least 1 so a page always advances.
     fn page_rows(&self, window: &Window) -> u32 {
         let (_, scroll_y) = self.scroll_of(self.active_sheet);
-        let viewport_h = f32::from(window.viewport_size().height) as f64;
+        let (_, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
         let caches = self.sources.caches.read();
         let Some(cache) = caches.get(self.active_sheet) else {
@@ -403,11 +431,15 @@ impl GridView {
         (visible.end - visible.start).max(1)
     }
 
-    /// The grid-local pixel of a mouse event. The grid is full-window in Phase 8, so window
-    /// coordinates are grid-local. PHASE 11: once chrome wraps the grid, subtract the grid
-    /// element's laid-out origin here (matching the `viewport_size()` note in `handle_scroll`).
-    fn event_local(position: gpui::Point<gpui::Pixels>) -> (f32, f32) {
-        (f32::from(position.x), f32::from(position.y))
+    /// The grid-local pixel of a mouse event (window-absolute position minus the grid element's
+    /// captured origin), so hit-testing is correct once chrome wraps the grid. Falls back to raw
+    /// window coordinates before the first paint captures bounds (grid ≈ full window then).
+    fn event_local(&self, position: gpui::Point<gpui::Pixels>) -> (f32, f32) {
+        let (ox, oy) = match self.bounds {
+            Some(b) => (f32::from(b.origin.x), f32::from(b.origin.y)),
+            None => (0.0, 0.0),
+        };
+        (f32::from(position.x) - ox, f32::from(position.y) - oy)
     }
 
     /// The row-header gutter width for the current scroll (matches the render path's sizing).
@@ -430,10 +462,10 @@ impl GridView {
         let handle = self.focus_handle.clone();
         window.focus(&handle, cx);
 
-        let (local_x, local_y) = Self::event_local(event.position);
+        let (local_x, local_y) = self.event_local(event.position);
         let active = self.active_sheet;
         let (scroll_x, scroll_y) = self.scroll_of(active);
-        let viewport_h = f32::from(window.viewport_size().height) as f64;
+        let (_, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
         let hit = {
@@ -486,7 +518,7 @@ impl GridView {
         let Some(drag) = self.drag else {
             return; // not dragging — nothing to do
         };
-        let (local_x, local_y) = Self::event_local(event.position);
+        let (local_x, local_y) = self.event_local(event.position);
         self.extend_drag_to_point(drag.anchor, local_x, local_y, window, cx);
         self.maybe_start_autoscroll(window, cx);
     }
@@ -525,9 +557,7 @@ impl GridView {
     ) {
         let active = self.active_sheet;
         let (scroll_x, scroll_y) = self.scroll_of(active);
-        let viewport = window.viewport_size();
-        let viewport_w = f32::from(viewport.width) as f64;
-        let viewport_h = f32::from(viewport.height) as f64;
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
         let cell = {
@@ -563,12 +593,10 @@ impl GridView {
     /// The current per-axis edge auto-scroll delta for the live pointer (`0` inside the content).
     fn current_edge_delta(&self, window: &Window) -> (f64, f64) {
         let pos = window.mouse_position();
-        let (local_x, local_y) = Self::event_local(pos);
+        let (local_x, local_y) = self.event_local(pos);
         let active = self.active_sheet;
         let (_, scroll_y) = self.scroll_of(active);
-        let viewport = window.viewport_size();
-        let viewport_w = f32::from(viewport.width) as f64;
-        let viewport_h = f32::from(viewport.height) as f64;
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
         let caches = self.sources.caches.read();
         let Some(cache) = caches.get(active) else {
@@ -632,12 +660,10 @@ impl GridView {
             return false;
         };
         let pos = window.mouse_position();
-        let (local_x, local_y) = Self::event_local(pos);
+        let (local_x, local_y) = self.event_local(pos);
         let active = self.active_sheet;
         let (scroll_x0, scroll_y0) = self.scroll_of(active);
-        let viewport = window.viewport_size();
-        let viewport_w = f32::from(viewport.width) as f64;
-        let viewport_h = f32::from(viewport.height) as f64;
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
         let step = {
@@ -731,9 +757,7 @@ impl GridView {
     ) {
         let active = self.active_sheet;
         let (scroll_x0, scroll_y0) = self.scroll_of(active);
-        let viewport = window.viewport_size();
-        let viewport_w = f32::from(viewport.width) as f64;
-        let viewport_h = f32::from(viewport.height) as f64;
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
         let (nx, ny, rows, cols) = {
@@ -801,27 +825,26 @@ impl GridView {
             return;
         };
         match command {
-            GridKeyCommand::Motion(motion) => {
-                let Some(dims) = self.sheet_dims() else {
-                    return;
-                };
-                let selection = apply_motion(*self.selection(), motion, dims);
-                // Emit + reveal only when the motion actually moved the selection (a no-op at a
-                // sheet edge changes nothing), matching the drag / auto-scroll change-guarded paths.
-                if *self.selection() != selection {
-                    self.set_selection_and_emit(selection, window, cx);
-                    self.reveal_and_announce(
-                        selection.active.row,
-                        selection.active.col,
-                        window,
-                        cx,
-                    );
-                }
-            }
+            GridKeyCommand::Motion(motion) => self.move_active(motion, window, cx),
             GridKeyCommand::ClearCells => {
                 let range = self.selection().range();
                 self.events.emit(&GridEvent::ClearCells(range), window, cx);
             }
+        }
+    }
+
+    /// Applies a keyboard `motion` to the active sheet's selection (clamped to sheet bounds),
+    /// emits `SelectionChanged`, and reveals the active cell — the shared path for both the
+    /// grid's own key handler and the chrome's data-row commit (`MoveActive`, Phase 11). A
+    /// motion that changes nothing (at a sheet edge) is a no-op.
+    pub fn move_active(&mut self, motion: Motion, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dims) = self.sheet_dims() else {
+            return;
+        };
+        let selection = apply_motion(*self.selection(), motion, dims);
+        if *self.selection() != selection {
+            self.set_selection_and_emit(selection, window, cx);
+            self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
         }
     }
 }
@@ -946,17 +969,58 @@ impl Focusable for GridView {
 
 impl Render for GridView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // PHASE 11: `viewport_size()` is the whole window — correct while the grid is
-        // full-window (Phase 6 demo + Phase 7 render harness). Once chrome wraps the grid, this
-        // must switch to the grid element's own laid-out bounds, or virtualization over-computes
-        // the visible range (see the matching note in `handle_scroll`).
-        let viewport = window.viewport_size();
-        let viewport_w = f32::from(viewport.width) as f64;
-        let viewport_h = f32::from(viewport.height) as f64;
+        // The grid's own laid-out bounds (captured by the `canvas` probe below), not the whole
+        // window — so virtualization measures the grid area now that chrome wraps it.
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
 
         let mut root_children: Vec<AnyElement> = Vec::new();
 
+        // A zero-cost `canvas` probe filling the grid: its prepaint captures the grid element's
+        // real bounds into the entity so `viewport_wh` / `event_local` use the grid's own area +
+        // origin (correct once chrome wraps the grid). It notifies on an actual change so a resize
+        // repaints crisply; a stable layout captures once and never render-loops. The notify is
+        // suppressed under a render-test capture (`freeze_spinner`) — the grid is full-window there
+        // so bounds equal the window (no correction needed) and the capture stays a single frame.
+        let probe = cx.entity().downgrade();
+        root_children.push(
+            canvas(
+                move |bounds, _window, app| {
+                    probe
+                        .update(app, |this, cx| {
+                            if this.bounds != Some(bounds) {
+                                this.bounds = Some(bounds);
+                                if !this.freeze_spinner {
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+        );
+
         if let Some(frame) = self.resolve_frame(viewport_w, viewport_h) {
+            // Announce the visible range once it settles (debounced) — the single
+            // viewport-announce that covers first paint, sheet switch, and resize. Scroll /
+            // keyboard paths still emit eagerly; all share `last_viewport` so there is no
+            // double-emit and a values-only republish (same range) never re-announces.
+            let ranges = (frame.rows.clone(), frame.cols.clone());
+            if self.last_viewport.as_ref() != Some(&ranges) {
+                self.last_viewport = Some(ranges.clone());
+                self.events.emit(
+                    &GridEvent::ViewportChanged {
+                        rows: ranges.0,
+                        cols: ranges.1,
+                    },
+                    window,
+                    cx,
+                );
+            }
+
             let selection = *self.selection();
             let publication = self.sources.publication.load_full();
             let covers_active = publication.sheet == self.active_sheet;

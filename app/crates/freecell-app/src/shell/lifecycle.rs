@@ -89,6 +89,29 @@ pub fn with_xlsx_extension(path: PathBuf) -> PathBuf {
     }
 }
 
+/// The bootstrap viewport a sheet **switch** sends before the grid has laid out the new sheet
+/// (`Command::SetViewport`): generous enough to cover a maximized window's top-left so the
+/// worker builds the sheet's cache + publishes values immediately; the grid's own
+/// `ViewportChanged` (emitted once it renders the new sheet) then refines it to the exact
+/// visible range. Rows/cols are pre-overscan (the window applies [`overscan_range`]).
+pub const INITIAL_VIEWPORT_ROWS: u32 = 80;
+/// See [`INITIAL_VIEWPORT_ROWS`].
+pub const INITIAL_VIEWPORT_COLS: u32 = 30;
+
+/// Expands a visible index range to the worker's ~3× overscan window, clamped to `[0, max)`
+/// (`architecture.md §2`: the window forwards the grid's pre-overscan range with its own 3×
+/// overscan). The range grows by its own length on each side (`len` before + `len` + `len`
+/// after ≈ 3×); an empty range stays empty.
+pub fn overscan_range(range: std::ops::Range<u32>, max: u32) -> std::ops::Range<u32> {
+    if range.start >= range.end || max == 0 {
+        return range.start.min(max)..range.end.min(max);
+    }
+    let len = range.end - range.start;
+    let start = range.start.saturating_sub(len);
+    let end = range.end.saturating_add(len).min(max);
+    start..end
+}
+
 /// The next step the quit flow should take (`functional_spec.md §2.3`: "prompts per-window
 /// for unsaved changes, any Cancel aborts the quit").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +205,29 @@ mod tests {
         );
         // Dirty but the native edited-dot is used → title stays clean.
         assert_eq!(window_title("Budget.xlsx", true, false), "Budget.xlsx");
+    }
+
+    #[test]
+    fn overscan_range_expands_by_length_and_clamps() {
+        // A mid-sheet range grows by its own length on each side (~3× total).
+        assert_eq!(
+            overscan_range(100..110, freecell_core::limits::MAX_ROWS),
+            90..120
+        );
+        // Clamped at the low edge (no underflow below 0).
+        assert_eq!(
+            overscan_range(0..10, freecell_core::limits::MAX_ROWS),
+            0..20
+        );
+        // Clamped at the high edge (no overflow past the Excel max).
+        let max = freecell_core::limits::MAX_COLS;
+        assert_eq!(overscan_range(max - 5..max, max), max - 10..max);
+    }
+
+    #[test]
+    fn overscan_range_empty_stays_empty() {
+        assert_eq!(overscan_range(5..5, freecell_core::limits::MAX_ROWS), 5..5);
+        assert_eq!(overscan_range(0..0, freecell_core::limits::MAX_ROWS), 0..0);
     }
 
     #[test]

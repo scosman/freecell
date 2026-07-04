@@ -657,14 +657,16 @@ impl Worker {
         }
     }
 
-    /// The sheet list as `SheetMeta` (stable id + current name), in workbook order.
+    /// The sheet list as `SheetMeta` (stable id + current name + `has_content`), in workbook
+    /// order. `has_content` gates the UI's delete-confirm modal (`functional_spec.md §3.7`).
     fn sheet_metas(&self) -> Vec<SheetMeta> {
         self.doc
-            .sheet_properties()
+            .sheet_properties_with_content()
             .into_iter()
-            .map(|(id, name)| SheetMeta {
+            .map(|(id, name, has_content)| SheetMeta {
                 id: SheetId(id),
                 name,
+                has_content,
             })
             .collect()
     }

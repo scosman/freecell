@@ -101,6 +101,11 @@ pub struct ChromeView {
     /// The sheet pending a delete confirmation (non-empty sheet), if any.
     confirm_delete: Option<SheetId>,
 
+    /// The grid, hosted as the chrome's body so the layout is action-row → data-row → **grid**
+    /// → tab-bar (`ui_design.md §3`). `None` in the standalone Phase-9 demo/tests; the Phase-11
+    /// window installs the real `GridView` via [`set_grid_body`](Self::set_grid_body).
+    body: Option<gpui::AnyView>,
+
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -145,8 +150,29 @@ impl ChromeView {
             rename_error: false,
             context_menu: None,
             confirm_delete: None,
+            body: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Installs the grid as the chrome's body (the Phase-11 window calls this once), so the
+    /// chrome renders action-row → data-row → grid (flex-fill) → tab-bar in one stack.
+    pub fn set_grid_body(&mut self, body: gpui::AnyView, cx: &mut Context<Self>) {
+        self.body = Some(body);
+        cx.notify();
+    }
+
+    /// Re-reads the active cell's resolved style (the action-row toggle pressed states) without
+    /// disturbing the data row — for a `StyleCacheUpdated` after a formatting edit that didn't
+    /// move the selection (`components/app_shell.md §Action row`).
+    pub fn refresh_active_style(&mut self, cx: &mut Context<Self>) {
+        self.active_style = if self.selection.is_single() {
+            self.client
+                .render_style(self.active_sheet, self.selection.active)
+        } else {
+            None
+        };
+        cx.notify();
     }
 
     // ---- Selection + data-row plumbing ----------------------------------------------------
@@ -426,23 +452,16 @@ impl ChromeView {
         cx.notify();
     }
 
-    /// Merges a worker sheet-meta list into the tab mirror, preserving known `has_content`
-    /// (the worker's `SheetMeta` doesn't carry it — see DECISIONS_TO_REVIEW).
+    /// Merges a worker sheet-meta list into the tab mirror. `has_content` is now sourced
+    /// directly from the worker's `SheetMeta` (Phase 11 populated it), so the delete-confirm
+    /// gate is correct against the real workbook.
     fn merge_sheet_metas(&mut self, metas: &[freecell_engine::SheetMeta]) {
         self.sheets = metas
             .iter()
-            .map(|meta| {
-                let has_content = self
-                    .sheets
-                    .iter()
-                    .find(|t| t.id == meta.id)
-                    .map(|t| t.has_content)
-                    .unwrap_or(false);
-                SheetTab {
-                    id: meta.id,
-                    name: meta.name.clone(),
-                    has_content,
-                }
+            .map(|meta| SheetTab {
+                id: meta.id,
+                name: meta.name.clone(),
+                has_content: meta.has_content,
             })
             .collect();
         if !self.sheets.iter().any(|t| t.id == self.active_sheet) {
@@ -450,6 +469,23 @@ impl ChromeView {
                 self.active_sheet = first.id;
             }
         }
+    }
+
+    /// Adopts `id` as the active sheet because the *window* (not a tab click) switched it — the
+    /// worker added a sheet, a sheet was deleted, or the initial load resolved. Unlike
+    /// [`select_sheet`](Self::select_sheet) this does **not** re-emit a `SetActiveSheet` grid
+    /// request (that would re-enter the window's `defer` loop); it only re-points the chrome's
+    /// active sheet so every subsequent command/fetch and the tab highlight target the right
+    /// sheet, and refreshes the action-row toggle state. Load-bearing: without this, adding a
+    /// sheet left the chrome pointing at the OLD sheet and routed edits there (`functional_spec.md
+    /// §3.7`).
+    pub fn adopt_active_sheet(&mut self, id: SheetId, cx: &mut Context<Self>) {
+        if id == self.active_sheet {
+            return;
+        }
+        self.active_sheet = id;
+        self.context_menu = None;
+        self.refresh_active_style(cx);
     }
 
     /// Switches the active sheet (tab click) and asks the grid to follow.
@@ -712,8 +748,15 @@ impl Render for ChromeView {
             .flex()
             .flex_col()
             .w_full()
+            // Fill the available height when hosting the grid, so the grid slot can flex.
+            .when(self.body.is_some(), |d| d.flex_1().min_h_0())
             .child(self.render_action_row(cx))
             .child(self.render_data_row(cx))
+            // The grid body fills the space between the data row and the tab bar
+            // (`ui_design.md §3`: action → data → grid → tabs).
+            .when_some(self.body.clone(), |d, body| {
+                d.child(div().flex_1().min_h_0().w_full().child(body))
+            })
             .child(self.render_tab_bar(cx))
             .children(self.render_overlays(cx))
     }
@@ -1768,10 +1811,12 @@ mod tests {
                         SheetMeta {
                             id: SheetId(0),
                             name: "Sheet1".into(),
+                            has_content: false,
                         },
                         SheetMeta {
                             id: SheetId(7),
                             name: "Sheet2".into(),
+                            has_content: false,
                         },
                     ],
                 },

@@ -1,33 +1,54 @@
 //! [`WorkbookWindow`] — the root entity of a document window (`components/app_shell.md
 //! §Structure`, `functional_spec.md §2.3, §5, §6`).
 //!
-//! **Phase-10 scope (shell).** This owns the document window's *lifecycle* — the worker
-//! ([`DocumentClient`]), the loading / degraded / dirty state, the window title + macOS
-//! edited dot, the modal dialogs, and the save / close flows. The grid + chrome composition
-//! and their event routing land in **Phase 11**, which replaces the placeholder content body
-//! here; the shell folds only the lifecycle-relevant worker events (Loaded / LoadFailed /
-//! Saved / SaveFailed / Published / WorkerDegraded).
+//! Owns the document window's *lifecycle* — the worker ([`DocumentClient`]), loading /
+//! degraded / dirty state, the window title + macOS edited dot, the modal dialogs, and the
+//! save / close flows — and, since **Phase 11**, the composed [`GridView`] + [`ChromeView`]
+//! (the chrome hosts the grid as its body). The window routes every [`WorkerEvent`] to the
+//! grid / chrome / lifecycle state, forwards [`GridEvent`]s to the worker + chrome, and drives
+//! the chrome→grid coupling — all without ever leasing this entity from inside a sibling's
+//! `update` (the sinks capture the *sibling* handles; cyclic follow-ups are `Window::defer`red).
 //!
 //! The lifecycle *decisions* are the pure [`super::lifecycle`] helpers (title, dirty, save
-//! target, `.xlsx` enforcement); this module performs them against real windows + panels +
-//! dialogs.
+//! target, `.xlsx` enforcement, viewport overscan); this module performs them against real
+//! windows + panels + dialogs, and mediates the grid/chrome/worker seams.
 
+use std::cell::{Cell, OnceCell};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, PathPromptOptions,
-    Window,
+    div, prelude::*, px, rgb, AnyView, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    PathPromptOptions, WeakEntity, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::spinner::Spinner;
 
-use freecell_engine::{Command, DocumentClient, DocumentSource, WorkerEvent, WorkerEventReceiver};
+use freecell_core::{limits, SelectionModel, SheetId};
+use freecell_engine::{
+    Command, DocumentClient, DocumentSource, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent,
+    WorkerEventReceiver,
+};
+
+use crate::chrome::{ChromeGridRequest, ChromeGridSink, ChromeView};
+use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView};
 
 use super::lifecycle::{self, SaveTarget};
 use super::registry::WindowKey;
 use super::{
     CloseWindow, FreeCellApp, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
 };
+
+/// Shared, lock-free state the grid/chrome sinks read on the UI thread (they run from inside a
+/// sibling entity's `update`, so they must not touch the `WorkbookWindow` entity). The window
+/// writes these on sheet switch / load.
+struct SinkShared {
+    /// The active sheet — read by the grid's `ViewportChanged` / `ClearCells` routing to scope
+    /// the worker command, and set by the window on a switch.
+    active_sheet: Cell<SheetId>,
+    /// The last *accepted* selection — restored on the grid if a click-away commit is blocked by
+    /// a cap-rejected pending edit (`functional_spec.md §3.3`).
+    last_selection: Cell<SelectionModel>,
+}
 
 // --- Look constants (functional-POC greys, matching the chrome / grid) ---------------------
 const WINDOW_BG: u32 = 0xFFFFFF;
@@ -59,8 +80,19 @@ enum ActiveModal {
 pub struct WorkbookWindow {
     /// The registry key that identifies this window app-side.
     key: WindowKey,
-    /// The per-window engine worker handle (`components/engine_worker.md`).
-    client: DocumentClient,
+    /// The per-window engine worker handle (`components/engine_worker.md`). Held behind `Rc` so
+    /// the composed [`ChromeView`] can send commands + read styles through the same client
+    /// (`Rc<dyn ChromeClient>`) the window uses.
+    client: Rc<DocumentClient>,
+    /// The composed grid + chrome (`ui_design.md §3`). The chrome hosts the grid as its body;
+    /// the window renders the chrome and routes worker/grid/chrome events between them.
+    grid: Entity<GridView>,
+    chrome: Entity<ChromeView>,
+    /// Shared state the grid/chrome sinks read (active sheet + last accepted selection).
+    sink_shared: Rc<SinkShared>,
+    /// The window's mirror of the worker's sheet list — for reconciling adds/deletes and
+    /// deciding the active sheet on `SheetsChanged`.
+    sheets: Vec<SheetMeta>,
     focus_handle: FocusHandle,
 
     /// The file's canonical path, or `None` for an unsaved (`Untitled`) workbook.
@@ -109,10 +141,94 @@ impl WorkbookWindow {
             DocumentSource::OpenFile(p) => Some(lifecycle::document_name(Some(p))),
         };
         let (client, receiver) = DocumentClient::spawn(source);
+        Self::build(key, Rc::new(client), receiver, loading, path, window, cx)
+    }
+
+    /// Test-only constructor over a **worker-less** [`DocumentClient::detached`] client, so a
+    /// `#[gpui::test]` can compose the real grid + chrome without spawning an OS-thread worker
+    /// (which races gpui's deterministic `TestScheduler`). Behaviour is otherwise identical; tests
+    /// drive folding by injecting `WorkerEvent`s.
+    #[cfg(test)]
+    pub(crate) fn new_detached_for_test(
+        key: WindowKey,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (client, receiver) = DocumentClient::detached();
+        Self::build(key, Rc::new(client), receiver, None, path, window, cx)
+    }
+
+    /// Shared construction for [`new`](Self::new) and the detached test constructor: wires the
+    /// event task, builds + cross-links the grid + chrome, sets loading/title.
+    fn build(
+        key: WindowKey,
+        client: Rc<DocumentClient>,
+        receiver: WorkerEventReceiver,
+        loading: Option<String>,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let event_task = Self::spawn_event_loop(receiver, window, cx);
         let focus_handle = cx.focus_handle();
-        focus_handle.focus(window, cx);
 
+        // Shared state the sinks read (they fire from inside a sibling entity's `update`, so they
+        // never touch the `WorkbookWindow` entity — the active sheet + last selection ride here).
+        let sink_shared = Rc::new(SinkShared {
+            active_sheet: Cell::new(SheetId(0)),
+            last_selection: Cell::new(SelectionModel::default()),
+        });
+
+        // The grid needs the chrome handle and vice-versa; resolve both after construction via
+        // one-shot slots the sinks read.
+        let grid_slot: Rc<OnceCell<WeakEntity<GridView>>> = Rc::new(OnceCell::new());
+        let chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>> = Rc::new(OnceCell::new());
+
+        // The grid renders from the client's shared read-surfaces (zero engine calls per frame).
+        let sources = GridDataSources {
+            publication: client.publication_swap(),
+            caches: client.caches(),
+        };
+        let grid_sink = make_grid_sink(
+            chrome_slot.clone(),
+            grid_slot.clone(),
+            client.clone(),
+            sink_shared.clone(),
+        );
+        let grid = cx.new(|cx| GridView::new(sources, grid_sink, cx));
+
+        let chrome_grid_sink = make_chrome_grid_sink(
+            grid_slot.clone(),
+            chrome_slot.clone(),
+            client.clone(),
+            sink_shared.clone(),
+        );
+        let client_dyn: Rc<dyn crate::chrome::ChromeClient> = client.clone();
+        let chrome = cx.new(|cx| {
+            ChromeView::new(
+                client_dyn,
+                chrome_grid_sink,
+                SheetId(0),
+                Vec::new(),
+                window,
+                cx,
+            )
+        });
+
+        // Resolve the cross-references and host the grid inside the chrome (so the layout is
+        // action-row → data-row → grid → tab-bar).
+        let _ = grid_slot.set(grid.downgrade());
+        let _ = chrome_slot.set(chrome.downgrade());
+        let grid_view: AnyView = grid.clone().into();
+        chrome.update(cx, |c, cx| c.set_grid_body(grid_view, cx));
+
+        // An `OpenFile` window shows the "Opening name…" overlay over the grid until `Loaded`.
+        if let Some(name) = loading.clone() {
+            grid.update(cx, |g, cx| g.set_loading(Some(name), cx));
+        }
+
+        focus_handle.focus(window, cx);
         window.set_window_title(&lifecycle::window_title(
             &lifecycle::document_name(path.as_deref()),
             false,
@@ -122,6 +238,10 @@ impl WorkbookWindow {
         Self {
             key,
             client,
+            grid,
+            chrome,
+            sink_shared,
+            sheets: Vec::new(),
             focus_handle,
             path,
             loading,
@@ -157,13 +277,14 @@ impl WorkbookWindow {
         })
     }
 
-    /// Folds a lifecycle-relevant worker event (`components/engine_worker.md`). Grid/chrome
-    /// events (Published viewport paint, CellContent, EvalStarted/Finished, StyleCacheUpdated,
-    /// SheetsChanged, EditRejected) are Phase-11 concerns and ignored here.
+    /// Folds a worker event (`components/engine_worker.md`), routing each to the window's
+    /// lifecycle state, the grid (repaint), and/or the chrome (data row, tabs, spinner).
     fn on_worker_event(&mut self, event: WorkerEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            WorkerEvent::Loaded { .. } => {
+            WorkerEvent::Loaded { sheets } => {
                 self.loading = None;
+                self.grid.update(cx, |g, cx| g.set_loading(None, cx));
+                self.reconcile_sheets(sheets, window, cx);
                 self.refresh_dirty(window, cx);
                 // The document finished loading → the welcome window (if still up) can close.
                 FreeCellApp::note_window_loaded(self.key, cx);
@@ -171,6 +292,9 @@ impl WorkbookWindow {
             }
             WorkerEvent::LoadFailed { error } => {
                 self.loading = None;
+                // Clear the grid's "Opening…" overlay too (symmetry with the Loaded arm) so it is
+                // not left spinning behind the error dialog's backdrop.
+                self.grid.update(cx, |g, cx| g.set_loading(None, cx));
                 self.modal = Some(ActiveModal::Error {
                     title: "Couldn't open the workbook".into(),
                     detail: error.to_string(),
@@ -179,46 +303,159 @@ impl WorkbookWindow {
                 cx.notify();
             }
             WorkerEvent::Published => {
+                // A fresh generation is available — repaint the grid from the new publication
+                // (the grid re-reads the `ArcSwap` each frame; `notify` schedules that frame).
+                self.grid.update(cx, |_g, cx| cx.notify());
                 self.refresh_dirty(window, cx);
             }
-            WorkerEvent::Saved { req_id, ops_seen } if self.pending_save_req == Some(req_id) => {
-                self.pending_save_req = None;
-                self.last_saved_ops = ops_seen;
-                if let Some(path) = self.pending_save_path.take() {
-                    // Canonicalize the adopted path (best-effort — the file exists, we just
-                    // wrote it) so a later open of the same file dedupes against it: `Open…`
-                    // canonicalizes before `resolve_open`, so a raw/relative Save-As path here
-                    // would miss the dedupe and let two windows edit one file
-                    // (`functional_spec.md §5.1`).
-                    let path = path.canonicalize().unwrap_or(path);
-                    self.path = Some(path.clone());
-                    FreeCellApp::note_window_path(self.key, path, cx);
+            WorkerEvent::StyleCacheUpdated { sheet } => {
+                // Styles/geometry changed — repaint the grid and refresh the action-row toggles
+                // for the active sheet (`components/app_shell.md §Action row`).
+                self.grid.update(cx, |_g, cx| cx.notify());
+                if sheet == self.sink_shared.active_sheet.get() {
+                    self.chrome.update(cx, |c, cx| c.refresh_active_style(cx));
                 }
+            }
+            WorkerEvent::SheetsChanged { sheets } => {
+                self.reconcile_sheets(sheets, window, cx);
                 self.refresh_dirty(window, cx);
-                if self.close_after_save {
+            }
+            WorkerEvent::CellContent { .. }
+            | WorkerEvent::EvalStarted
+            | WorkerEvent::EvalFinished => {
+                // Data-row content reply + evaluating-spinner drive live on the chrome.
+                self.chrome
+                    .update(cx, |c, cx| c.on_worker_event(event, window, cx));
+            }
+            WorkerEvent::EditRejected { reason } => self.on_edit_rejected(reason, window, cx),
+            // Saved / SaveFailed match unconditionally then branch on the pending-save `req_id`
+            // (a stale ack from a superseded save is ignored) — so the match stays exhaustive with
+            // no catch-all, and a new `WorkerEvent` variant is a compile error that forces a
+            // conscious routing decision (mirroring the worker's exhaustive command routing).
+            WorkerEvent::Saved { req_id, ops_seen } => {
+                if self.pending_save_req == Some(req_id) {
+                    self.pending_save_req = None;
+                    self.last_saved_ops = ops_seen;
+                    if let Some(path) = self.pending_save_path.take() {
+                        // Canonicalize the adopted path (best-effort — the file exists, we just
+                        // wrote it) so a later open of the same file dedupes against it: `Open…`
+                        // canonicalizes before `resolve_open`, so a raw/relative Save-As path here
+                        // would miss the dedupe and let two windows edit one file
+                        // (`functional_spec.md §5.1`).
+                        let path = path.canonicalize().unwrap_or(path);
+                        self.path = Some(path.clone());
+                        FreeCellApp::note_window_path(self.key, path, cx);
+                    }
+                    self.refresh_dirty(window, cx);
+                    if self.close_after_save {
+                        self.close_after_save = false;
+                        window.remove_window();
+                    }
+                    cx.notify();
+                }
+            }
+            WorkerEvent::SaveFailed { req_id, error } => {
+                if self.pending_save_req == Some(req_id) {
+                    self.pending_save_req = None;
+                    self.pending_save_path = None;
+                    // A failed save aborts any close/quit follow-up (§5.2: stay dirty + open).
                     self.close_after_save = false;
-                    window.remove_window();
+                    FreeCellApp::note_prompt_cancelled(cx);
+                    self.modal = Some(ActiveModal::Error {
+                        title: "Couldn't save the workbook".into(),
+                        detail: error.to_string(),
+                        close_window_on_dismiss: false,
+                    });
+                    cx.notify();
                 }
-                cx.notify();
-            }
-            WorkerEvent::SaveFailed { req_id, error } if self.pending_save_req == Some(req_id) => {
-                self.pending_save_req = None;
-                self.pending_save_path = None;
-                // A failed save aborts any close/quit follow-up (§5.2: stay dirty + open).
-                self.close_after_save = false;
-                FreeCellApp::note_prompt_cancelled(cx);
-                self.modal = Some(ActiveModal::Error {
-                    title: "Couldn't save the workbook".into(),
-                    detail: error.to_string(),
-                    close_window_on_dismiss: false,
-                });
-                cx.notify();
             }
             WorkerEvent::WorkerDegraded { reason } => {
                 self.degraded = Some(reason);
                 cx.notify();
             }
-            _ => {}
+        }
+    }
+
+    /// Routes an `EditRejected` (`components/engine_worker.md`): a cap rejection surfaces on the
+    /// data row (danger border); a caught engine panic / typed engine error surfaces a transient
+    /// "couldn't be applied" dialog (the document is intact, `functional_spec.md §6`); an invalid
+    /// sheet name (backstop — the chrome validates first) and a degraded refusal (the degraded
+    /// bar already explains it) need no dialog.
+    fn on_edit_rejected(
+        &mut self,
+        reason: EditRejectedReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &reason {
+            EditRejectedReason::InputCap(_) => {
+                self.chrome.update(cx, |c, cx| {
+                    c.on_worker_event(WorkerEvent::EditRejected { reason }, window, cx)
+                });
+            }
+            EditRejectedReason::EnginePanic | EditRejectedReason::Engine(_) => {
+                if self.modal.is_none() {
+                    let detail = match &reason {
+                        EditRejectedReason::Engine(msg) => msg.clone(),
+                        _ => "The workbook is unchanged. Please try again.".to_string(),
+                    };
+                    self.modal = Some(ActiveModal::Error {
+                        title: "That change couldn't be applied".into(),
+                        detail,
+                        close_window_on_dismiss: false,
+                    });
+                    cx.notify();
+                }
+            }
+            EditRejectedReason::InvalidSheetName(_) | EditRejectedReason::Degraded => {}
+        }
+    }
+
+    /// Reconciles a worker sheet list (`Loaded` / `SheetsChanged`) into the tab bar and the
+    /// active sheet: a newly-added sheet becomes active (`functional_spec.md §3.7`: `+` switches
+    /// to it), a surviving active sheet stays, and a deleted active sheet falls back to the first
+    /// remaining. The switch restores the grid's per-sheet scroll/selection and re-points the
+    /// data row.
+    fn reconcile_sheets(
+        &mut self,
+        new_sheets: Vec<SheetMeta>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prev_ids: std::collections::HashSet<SheetId> =
+            self.sheets.iter().map(|s| s.id).collect();
+        let current_active = self.sink_shared.active_sheet.get();
+        let added = new_sheets
+            .iter()
+            .map(|s| s.id)
+            .find(|id| !prev_ids.contains(id));
+        let survives = new_sheets.iter().any(|s| s.id == current_active);
+        let new_active = added
+            .or_else(|| survives.then_some(current_active))
+            .or_else(|| new_sheets.first().map(|s| s.id));
+
+        self.sheets = new_sheets.clone();
+        self.chrome.update(cx, |c, cx| {
+            c.on_worker_event(
+                WorkerEvent::SheetsChanged { sheets: new_sheets },
+                window,
+                cx,
+            )
+        });
+
+        if let Some(new_active) = new_active {
+            if new_active != current_active || added.is_some() {
+                let chrome_weak = self.chrome.downgrade();
+                switch_grid_to_sheet(
+                    &self.grid,
+                    Some(&chrome_weak),
+                    &self.client,
+                    &self.sink_shared,
+                    new_active,
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -474,6 +711,44 @@ impl WorkbookWindow {
         self.loading = name;
     }
 
+    /// Test seam: the window's active sheet (mirrored to the grid + chrome).
+    #[cfg(test)]
+    pub(crate) fn active_sheet_for_test(&self) -> SheetId {
+        self.sink_shared.active_sheet.get()
+    }
+
+    /// Test seam: the composed grid entity.
+    #[cfg(test)]
+    pub(crate) fn grid_for_test(&self) -> Entity<GridView> {
+        self.grid.clone()
+    }
+
+    /// Test seam: the composed chrome entity.
+    #[cfg(test)]
+    pub(crate) fn chrome_for_test(&self) -> Entity<ChromeView> {
+        self.chrome.clone()
+    }
+
+    /// Test seam: drive a grid `SelectionChanged` through the window's *real* routing (the same
+    /// [`route_selection_changed`] the grid's sink calls), so the commit-first + adopt/revert
+    /// logic is exercised without a synthetic re-implementation.
+    #[cfg(test)]
+    pub(crate) fn route_selection_changed_for_test(
+        &mut self,
+        sel: SelectionModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        route_selection_changed(
+            &self.chrome,
+            self.grid.downgrade(),
+            &self.sink_shared,
+            sel,
+            window,
+            cx,
+        );
+    }
+
     /// Test seam: for an active error modal, whether dismissing it closes the window
     /// (`true` for a load failure, `false` for a save failure / app-level error); `None` if no
     /// error modal is showing.
@@ -521,12 +796,18 @@ impl Render for WorkbookWindow {
             .on_action(cx.listener(|this, _: &Redo, _window, _cx| {
                 this.client.send(Command::Redo);
             }))
-            // Bold/Italic/Underline are keyboard-only no-op placeholders (cmd/ctrl-b/i/u): the
-            // real handlers need the grid selection and land in Phase 11. There is no Format
-            // menu yet, so nothing else references them.
-            .on_action(cx.listener(|_this, _: &ToggleBold, _window, _cx| {}))
-            .on_action(cx.listener(|_this, _: &ToggleItalic, _window, _cx| {}))
-            .on_action(cx.listener(|_this, _: &ToggleUnderline, _window, _cx| {}))
+            // Bold/Italic/Underline (cmd/ctrl-b/i/u) toggle the character style over the grid
+            // selection through the chrome — the same path as the action-row buttons (commit any
+            // pending data-row edit first, then `SetStyleAttr`).
+            .on_action(cx.listener(|this, _: &ToggleBold, window, cx| {
+                this.toggle_style(StyleAttr::Bold, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleItalic, window, cx| {
+                this.toggle_style(StyleAttr::Italic, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleUnderline, window, cx| {
+                this.toggle_style(StyleAttr::Underline, window, cx)
+            }))
             .children(
                 self.degraded
                     .clone()
@@ -538,34 +819,26 @@ impl Render for WorkbookWindow {
 }
 
 impl WorkbookWindow {
-    /// The window body: the loading overlay while opening, else the placeholder content Phase
-    /// 11 replaces with the composed grid + chrome.
+    /// The window body: the composed chrome (action row → data row → grid → tab bar). The grid
+    /// shows the "Opening name…" overlay itself while `loading`; the chrome hosts the grid as its
+    /// flex-fill body. This wrapper is a flex column so the chrome (a `flex_1` child) stretches to
+    /// the full body height — otherwise the chrome sizes to its content and the grid slot
+    /// collapses to zero.
     fn render_body(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let center = div()
+        div()
             .flex_1()
+            .min_h_0()
+            .w_full()
             .flex()
-            .items_center()
-            .justify_center()
-            .w_full();
-        match &self.loading {
-            Some(name) => center.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Spinner::new())
-                    .child(
-                        div()
-                            .text_color(rgb(MUTED_TEXT))
-                            .child(format!("Opening {name}…")),
-                    ),
-            ),
-            None => center.child(
-                div()
-                    .text_color(rgb(MUTED_TEXT))
-                    .child("Document window — grid + chrome are wired in Phase 11."),
-            ),
-        }
+            .flex_col()
+            .child(self.chrome.clone())
+    }
+
+    /// Toggles a character style over the selection through the chrome (shared by the Cmd/Ctrl
+    /// shortcuts and — via the chrome's own buttons — the action row).
+    fn toggle_style(&mut self, attr: StyleAttr, window: &mut Window, cx: &mut Context<Self>) {
+        self.chrome
+            .update(cx, |c, cx| c.toggle_style(attr, window, cx));
     }
 
     /// Renders the active modal over a dim backdrop (`components/app_shell.md §Dialogs` — a
@@ -695,6 +968,157 @@ impl WorkbookWindow {
                 cx.listener(|this, _: &ClickEvent, window, cx| this.save(true, window, cx)),
             ))
             .into_any_element()
+    }
+}
+
+/// Routes a grid `SelectionChanged` to the chrome: commit any pending data-row edit first
+/// (Excel click-away), then adopt the new selection — unless a cap-rejected edit blocks the
+/// commit, in which case the field stays editing and the grid is reverted to the last accepted
+/// cell (`functional_spec.md §3.3`). The revert is deferred because the grid is mid-`update` as
+/// the emitter. `grid` is the weak handle used only for the (rare) revert.
+fn route_selection_changed(
+    chrome: &Entity<ChromeView>,
+    grid: WeakEntity<GridView>,
+    shared: &SinkShared,
+    sel: SelectionModel,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let committed = chrome.update(cx, |c, cx| {
+        let ok = c.on_edit_commit_requested(window, cx);
+        if ok {
+            c.on_selection_changed(sel, window, cx);
+        }
+        ok
+    });
+    if committed {
+        shared.last_selection.set(sel);
+    } else {
+        let last = shared.last_selection.get();
+        window.defer(cx, move |_window, cx| {
+            if let Some(grid) = grid.upgrade() {
+                grid.update(cx, |g, cx| g.set_selection(last, cx));
+            }
+        });
+    }
+}
+
+/// Builds the grid's [`GridEventSink`] — routes grid events to the sibling chrome + the worker
+/// **without touching the `WorkbookWindow` entity** (the sink fires from inside the grid's own
+/// `update`). Cyclic follow-ups (the cap-reject selection revert) are deferred.
+fn make_grid_sink(
+    chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>>,
+    grid_slot: Rc<OnceCell<WeakEntity<GridView>>>,
+    client: Rc<DocumentClient>,
+    shared: Rc<SinkShared>,
+) -> GridEventSink {
+    GridEventSink::new(move |event, window, cx| match event {
+        GridEvent::SelectionChanged(sel) => {
+            let Some(grid) = grid_slot.get().cloned() else {
+                return;
+            };
+            let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) else {
+                return;
+            };
+            route_selection_changed(&chrome, grid, &shared, *sel, window, cx);
+        }
+        GridEvent::ViewportChanged { rows, cols } => {
+            client.send(Command::SetViewport {
+                sheet: shared.active_sheet.get(),
+                rows: lifecycle::overscan_range(rows.clone(), limits::MAX_ROWS),
+                cols: lifecycle::overscan_range(cols.clone(), limits::MAX_COLS),
+            });
+        }
+        GridEvent::ClearCells(range) => {
+            client.send(Command::ClearCells {
+                sheet: shared.active_sheet.get(),
+                range: *range,
+            });
+        }
+        // The grid commits click-aways via the `SelectionChanged` path above, so it never emits
+        // this variant; kept exhaustive so a future emit is a conscious wiring change.
+        GridEvent::EditCommitRequested => {}
+    })
+}
+
+/// Builds the chrome→grid [`ChromeGridSink`]. `FocusGrid` is direct (the grid is a sibling, not
+/// leased); `MoveActive` / `SetActiveSheet` are deferred because applying them makes the grid
+/// re-emit into the chrome, which is mid-`update` as the emitter.
+fn make_chrome_grid_sink(
+    grid_slot: Rc<OnceCell<WeakEntity<GridView>>>,
+    chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>>,
+    client: Rc<DocumentClient>,
+    shared: Rc<SinkShared>,
+) -> ChromeGridSink {
+    ChromeGridSink::new(move |request, window, cx| {
+        let Some(grid) = grid_slot.get().cloned() else {
+            return;
+        };
+        match request {
+            ChromeGridRequest::FocusGrid => {
+                if let Some(grid) = grid.upgrade() {
+                    grid.update(cx, |g, cx| g.focus_self(window, cx));
+                }
+            }
+            ChromeGridRequest::MoveActive(motion) => {
+                let motion = *motion;
+                window.defer(cx, move |window, cx| {
+                    if let Some(grid) = grid.upgrade() {
+                        grid.update(cx, |g, cx| g.move_active(motion, window, cx));
+                    }
+                });
+            }
+            ChromeGridRequest::SetActiveSheet(id) => {
+                let id = *id;
+                let chrome = chrome_slot.get().cloned();
+                let client = client.clone();
+                let shared = shared.clone();
+                window.defer(cx, move |window, cx| {
+                    let Some(grid) = grid.upgrade() else {
+                        return;
+                    };
+                    switch_grid_to_sheet(&grid, chrome.as_ref(), &client, &shared, id, window, cx);
+                });
+            }
+        }
+    })
+}
+
+/// Switches the grid + chrome to `sheet`: restores the grid's per-sheet scroll/selection,
+/// bootstraps the worker's viewport for the new sheet, and points the chrome (ref box + content
+/// fetch) at the restored active cell. Shared by the tab-click path and the window's own
+/// sheet-reconciliation (add/delete).
+fn switch_grid_to_sheet(
+    grid: &Entity<GridView>,
+    chrome: Option<&WeakEntity<ChromeView>>,
+    client: &DocumentClient,
+    shared: &SinkShared,
+    sheet: SheetId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    shared.active_sheet.set(sheet);
+    let sel = grid.update(cx, |g, cx| {
+        g.set_active_sheet(sheet, cx);
+        *g.selection()
+    });
+    shared.last_selection.set(sel);
+    // Bootstrap the new sheet's cache + values (an unvisited sheet has no cache yet); the grid's
+    // own `ViewportChanged` refines the range once it renders the sheet.
+    client.send(Command::SetViewport {
+        sheet,
+        rows: lifecycle::overscan_range(0..lifecycle::INITIAL_VIEWPORT_ROWS, limits::MAX_ROWS),
+        cols: lifecycle::overscan_range(0..lifecycle::INITIAL_VIEWPORT_COLS, limits::MAX_COLS),
+    });
+    if let Some(chrome) = chrome.and_then(|w| w.upgrade()) {
+        chrome.update(cx, |c, cx| {
+            // Re-point the chrome at the new sheet BEFORE fetching content — otherwise every
+            // subsequent edit/style/fetch (and the tab highlight) would target the OLD sheet after
+            // an add (`functional_spec.md §3.7`). `adopt_active_sheet` no-ops on the tab-click path
+            // (chrome already switched itself) and does not re-emit `SetActiveSheet`.
+            c.adopt_active_sheet(sheet, cx);
+            c.on_selection_changed(sel, window, cx);
+        });
     }
 }
 

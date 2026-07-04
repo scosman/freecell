@@ -351,6 +351,25 @@ impl WorkbookDocument {
             .collect()
     }
 
+    /// Each sheet's `(stable sheet_id, name, has_content)` in workbook order. `has_content` is
+    /// `true` iff the worksheet has any populated cell (`sheet_data` non-empty) — the
+    /// delete-confirm gate (`functional_spec.md §3.7`). Property position `i` is worksheet
+    /// index `i`, so the content probe reads `worksheet(i).sheet_data`.
+    pub(crate) fn sheet_properties_with_content(&self) -> Vec<(u32, String, bool)> {
+        self.model
+            .get_worksheets_properties()
+            .into_iter()
+            .enumerate()
+            .map(|(idx, p)| {
+                let has_content = self
+                    .worksheet(idx as u32)
+                    .map(|ws| !ws.sheet_data.is_empty())
+                    .unwrap_or(false);
+                (p.sheet_id, p.name, has_content)
+            })
+            .collect()
+    }
+
     /// Pauses IronCalc's auto-evaluate so a coalesced batch of edits can be applied and then
     /// evaluated **once** (round-3 A: the `pause`/`resume` batch API is the seam's natural
     /// coalescing fit). Pair with [`resume_evaluation`](Self::resume_evaluation) +
@@ -582,6 +601,23 @@ mod tests {
     fn to_engine_coords_is_one_based() {
         assert_eq!(to_engine_coords(CellRef::new(0, 0)), (1, 1)); // A1
         assert_eq!(to_engine_coords(CellRef::new(6, 1)), (7, 2)); // B7
+    }
+
+    #[test]
+    fn sheet_properties_report_has_content() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A fresh workbook's only sheet is empty → has_content = false (delete-confirm gate off).
+        let before = doc.sheet_properties_with_content();
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].2, "an empty sheet reports has_content = false");
+
+        // Writing a value populates `sheet_data` → has_content = true.
+        doc.set_cell_input(0, CellRef::new(0, 0), "hello").unwrap();
+        let after = doc.sheet_properties_with_content();
+        assert!(
+            after[0].2,
+            "a sheet with a populated cell reports has_content = true"
+        );
     }
 
     #[test]

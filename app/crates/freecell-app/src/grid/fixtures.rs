@@ -2,7 +2,6 @@
 //! reference for Phase-7 render scenes. No engine involved (`components/grid.md`: the grid
 //! is buildable + render-testable against core fixtures before the engine track lands).
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -104,7 +103,6 @@ pub fn demo_sources() -> GridDataSources {
     GridDataSources {
         publication: Arc::new(ArcSwap::from_pointee(publication)),
         caches: Arc::new(RwLock::new(caches)),
-        generation: Arc::new(AtomicU64::new(1)),
     }
 }
 

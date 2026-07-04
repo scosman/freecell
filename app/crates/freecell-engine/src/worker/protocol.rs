@@ -103,11 +103,14 @@ pub enum EditRejectedReason {
 }
 
 /// Sheet metadata the worker publishes for the tab bar (`architecture.md §3`). `id` is stable
-/// across renames; `name` is the current display name.
+/// across renames; `name` is the current display name; `has_content` gates the delete-confirm
+/// modal (`functional_spec.md §3.7`: a non-empty sheet confirms before delete).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SheetMeta {
     pub id: SheetId,
     pub name: String,
+    /// Whether the sheet has any cell content (populated worker-side from `sheet_data`).
+    pub has_content: bool,
 }
 
 /// An event the worker pushes to the UI over the (unbounded) event channel. The window awaits

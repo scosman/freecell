@@ -91,6 +91,19 @@ impl FreeCellApp {
         });
     }
 
+    /// Test-only mirror of [`new_workbook`](Self::new_workbook) over a worker-less window.
+    #[cfg(test)]
+    pub(crate) fn new_workbook_detached(cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| app.open_detached_document(None, cx));
+    }
+
+    /// Test-only mirror of [`open_path`](Self::open_path): same canonicalize + dedupe, but the
+    /// opened window is worker-less (so the required suite stays deterministic).
+    #[cfg(test)]
+    pub(crate) fn open_path_detached(path: &Path, cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| app.do_open_path_detached(path, cx));
+    }
+
     /// Opens the native file panel, then opens the chosen `.xlsx` (`functional_spec.md §5.1`).
     pub fn open_via_panel(cx: &mut App) {
         let receiver = cx.prompt_for_paths(open_panel_options());
@@ -220,17 +233,49 @@ impl FreeCellApp {
         }
     }
 
+    /// Test-only: [`do_open_path`](Self::do_open_path) with a worker-less window on `OpenNew` (the
+    /// dedupe/activate path is identical — it is what the tests exercise).
+    #[cfg(test)]
+    fn do_open_path_detached(&mut self, path: &Path, cx: &mut App) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        match self.registry.resolve_open(&canonical) {
+            OpenOutcome::Activate(key) => {
+                if let Some(w) = self.windows.iter().find(|w| w.key == key) {
+                    w.handle
+                        .update(cx, |_, window, _| window.activate_window())
+                        .ok();
+                }
+            }
+            OpenOutcome::OpenNew => self.open_detached_document(Some(canonical), cx),
+        }
+    }
+
     /// Opens a document window over `source`. `canonical` is the file's path (for an open) so
     /// dedupe + the title are correct before the load completes; `None` for a new workbook.
     fn open_document(&mut self, source: DocumentSource, canonical: Option<PathBuf>, cx: &mut App) {
         let key = self.registry.register(canonical.clone());
+        let title_path = canonical;
+        self.install_document_window(
+            key,
+            move |window, cx| WorkbookWindow::new(key, source, title_path, window, cx),
+            cx,
+        );
+    }
 
+    /// Opens the document window built by `build` (the real spawn-a-worker constructor in
+    /// production, or the worker-less test constructor), registering its handle + close hook.
+    fn install_document_window(
+        &mut self,
+        key: WindowKey,
+        build: impl FnOnce(&mut gpui::Window, &mut gpui::Context<WorkbookWindow>) -> WorkbookWindow
+            + 'static,
+        cx: &mut App,
+    ) {
         let mut entity_slot: Option<Entity<WorkbookWindow>> = None;
         let slot = &mut entity_slot;
-        let title_path = canonical.clone();
         let handle: WindowHandle<Root> = cx
             .open_window(document_window_options(cx), move |window, cx| {
-                let ww = cx.new(|cx| WorkbookWindow::new(key, source, title_path, window, cx));
+                let ww = cx.new(|cx| build(window, cx));
                 *slot = Some(ww.clone());
                 let close_entity = ww.clone();
                 window.on_window_should_close(cx, move |window, cx| {
@@ -248,6 +293,19 @@ impl FreeCellApp {
             handle: any,
             entity,
         });
+    }
+
+    /// Test-only: opens a document window over a **worker-less** [`WorkbookWindow`] (no OS thread
+    /// under the deterministic `TestScheduler`), used by the gpui window tests.
+    #[cfg(test)]
+    fn open_detached_document(&mut self, canonical: Option<PathBuf>, cx: &mut App) {
+        let key = self.registry.register(canonical.clone());
+        let title_path = canonical;
+        self.install_document_window(
+            key,
+            move |window, cx| WorkbookWindow::new_detached_for_test(key, title_path, window, cx),
+            cx,
+        );
     }
 
     fn do_request_quit(&mut self, cx: &mut App) {
@@ -461,21 +519,19 @@ fn welcome_window_options(cx: &App) -> WindowOptions {
 
 #[cfg(test)]
 mod tests {
-    //! GPUI-context tests for the shell lifecycle.
+    //! GPUI-context tests for the shell lifecycle + Phase-11 composition.
     //!
-    //! **Determinism boundary.** A [`WorkbookWindow`] spawns the real eval worker on a
-    //! dedicated OS thread ([`DocumentClient::spawn`]). gpui's test scheduler is strictly
-    //! deterministic and *panics* if a test observes activity on any thread other than its own
-    //! (`TestScheduler::assert_correct_thread`). So a test may **not** `run_until_parked` while
-    //! a worker is live — i.e. the *end-to-end* flows that wait for the worker to **emit** an
-    //! event (welcome-closes-on-`Loaded`, the save round-trip's `Saved`, a real `LoadFailed`)
-    //! are **not drivable here**; those are covered by the `freecell-engine` round-trips
-    //! (`tests/roundtrip.rs`, `tests/worker_seam.rs`) + the Phase-10 manual smoke checklist +
-    //! Phase-11 integration. The event **folding** logic, however, *is* deterministically
-    //! testable by **injecting** a synthesized [`WorkerEvent`] straight into `on_worker_event`
-    //! (no worker emission, no parking) — see `saved_*` / `save_failed_*` / `load_failed_*`
-    //! below. All tests here stay **fully synchronous** (no `run_until_parked` once a worker
-    //! exists).
+    //! **Determinism.** In production a [`WorkbookWindow`] spawns the real eval worker on a
+    //! dedicated OS thread ([`DocumentClient::spawn`]); gpui's test scheduler is strictly
+    //! deterministic and *panics at `end_test`* if it observes activity on any thread other than
+    //! its own. So these tests compose windows over a **worker-less** client
+    //! ([`DocumentClient::detached`], via the `test-support` feature +
+    //! `new_workbook_detached` / `open_path_detached`) — no OS thread, no flake. The *end-to-end*
+    //! flows that need the worker to actually **emit** an event (welcome-closes-on-`Loaded`, a
+    //! real `Saved`, real published values) remain covered by the `freecell-engine` round-trips
+    //! (`tests/roundtrip.rs`, `tests/worker_seam.rs`, which drive the real worker via blocking
+    //! `recv`) + the Xvfb smoke launch. The event **folding** logic is tested here by **injecting**
+    //! synthesized [`WorkerEvent`]s straight into `on_worker_event` (no emission, no parking).
 
     use super::*;
     use freecell_engine::{LoadError, SaveError, WorkerEvent};
@@ -517,7 +573,7 @@ mod tests {
     fn new_workbook_registers_a_document_window(cx: &mut TestAppContext) {
         boot(cx);
         cx.update(FreeCellApp::show_welcome);
-        cx.update(FreeCellApp::new_workbook);
+        cx.update(FreeCellApp::new_workbook_detached);
         // The document window is registered synchronously on open (the welcome-closes-on-Loaded
         // step needs a worker event — see the module note).
         assert_eq!(window_count(cx), 1, "a document window opened");
@@ -530,17 +586,17 @@ mod tests {
         let path = dir.path().join("book.xlsx");
         write_xlsx(&path);
 
-        cx.update(|cx| FreeCellApp::open_path(&path, cx));
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
         assert_eq!(window_count(cx), 1);
         // A second open of the same canonical path focuses the existing window — no duplicate.
-        cx.update(|cx| FreeCellApp::open_path(&path, cx));
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
         assert_eq!(window_count(cx), 1, "same path deduped to one window");
     }
 
     #[gpui::test]
     fn close_dirty_prompts_and_cancel_keeps_window(cx: &mut TestAppContext) {
         boot(cx);
-        cx.update(FreeCellApp::new_workbook);
+        cx.update(FreeCellApp::new_workbook_detached);
         let handle = cx.update(|cx| FreeCellApp::nth_window_handle(cx, 0).unwrap());
         let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0).unwrap());
 
@@ -574,7 +630,7 @@ mod tests {
     #[gpui::test]
     fn clean_close_does_not_prompt(cx: &mut TestAppContext) {
         boot(cx);
-        cx.update(FreeCellApp::new_workbook);
+        cx.update(FreeCellApp::new_workbook_detached);
         let handle = cx.update(|cx| FreeCellApp::nth_window_handle(cx, 0).unwrap());
         let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0).unwrap());
         // A clean window closing shows no modal (it proceeds straight to close).
@@ -588,12 +644,12 @@ mod tests {
         assert!(!cx.update(|cx| entity.read(cx).has_unsaved_modal()));
     }
 
-    /// A fresh document window whose worker is spawned but never observed (no parking), for
-    /// direct `WorkerEvent` injection. A welcome window is kept open so that a save-then-close
+    /// A fresh **worker-less** document window (no OS thread under the deterministic scheduler),
+    /// for direct `WorkerEvent` injection. A welcome window is kept open so that a save-then-close
     /// in these tests doesn't leave the registry empty and trigger `cx.quit()`.
     fn new_injectable_window(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<WorkbookWindow>) {
         cx.update(FreeCellApp::show_welcome);
-        cx.update(FreeCellApp::new_workbook);
+        cx.update(FreeCellApp::new_workbook_detached);
         let handle = cx.update(|cx| FreeCellApp::nth_window_handle(cx, 0).unwrap());
         let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0).unwrap());
         (handle, entity)
@@ -727,5 +783,235 @@ mod tests {
             !cx.update(|cx| entity.read(cx).is_loading()),
             "the loading state is cleared on load failure"
         );
+    }
+
+    // ---- Phase 11: composed grid + chrome + worker-event routing ---------------------------
+    //
+    // These drive the window's *folding* logic by **injecting** worker events (fully synchronous —
+    // `reconcile_sheets` / `on_edit_rejected` / `Published` / the grid→chrome selection route run
+    // against the sibling entities without deferral or worker observation). Windows are worker-less
+    // (`new_injectable_window` → detached client), so the required suite is deterministic. The
+    // deferred chrome→grid follow-ups (`MoveActive`/`SetActiveSheet`) + worker-command emission are
+    // the documented untestable boundary (Phase-8/9 component tests + the Xvfb smoke).
+
+    use freecell_core::data_row::FieldMode;
+    use freecell_core::input_cap::InputRejection;
+    use freecell_core::{CellRef, SelectionModel, SheetId};
+    use freecell_engine::{EditRejectedReason, SheetMeta};
+
+    fn sheet_meta(id: u32, name: &str, has_content: bool) -> SheetMeta {
+        SheetMeta {
+            id: SheetId(id),
+            name: name.into(),
+            has_content,
+        }
+    }
+
+    /// A worker-less document window with a synthesized `Loaded` already folded in.
+    fn loaded_window(
+        cx: &mut TestAppContext,
+        sheets: Vec<SheetMeta>,
+    ) -> (AnyWindowHandle, Entity<WorkbookWindow>) {
+        let (handle, entity) = new_injectable_window(cx);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(WorkerEvent::Loaded { sheets }, window, ctx);
+                });
+            })
+            .unwrap();
+        (handle, entity)
+    }
+
+    #[gpui::test]
+    fn loaded_populates_tabs_and_switches_active_sheet(cx: &mut TestAppContext) {
+        boot(cx);
+        let (_h, entity) = loaded_window(
+            cx,
+            vec![sheet_meta(3, "Data", false), sheet_meta(5, "Notes", false)],
+        );
+        // Window, grid, and chrome all adopt the first loaded sheet.
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).active_sheet_for_test()),
+            SheetId(3)
+        );
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+        assert_eq!(cx.update(|cx| grid.read(cx).active_sheet()), SheetId(3));
+        let chrome = cx.update(|cx| entity.read(cx).chrome_for_test());
+        assert_eq!(cx.update(|cx| chrome.read(cx).active_sheet()), SheetId(3));
+        let names: Vec<String> = cx.update(|cx| {
+            chrome
+                .read(cx)
+                .sheets()
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
+        });
+        assert_eq!(names, vec!["Data".to_string(), "Notes".to_string()]);
+        assert!(!cx.update(|cx| entity.read(cx).is_loading()));
+    }
+
+    #[gpui::test]
+    fn sheets_changed_add_switches_to_new_sheet(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::SheetsChanged {
+                            sheets: vec![
+                                sheet_meta(3, "Data", false),
+                                sheet_meta(9, "Sheet2", false),
+                            ],
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        // The newly-added sheet becomes active (`functional_spec.md §3.7`) — on the window AND on
+        // the chrome. The chrome's active sheet is load-bearing: it scopes every command/fetch, so
+        // if it lagged (the CRITICAL bug) edits would route to the OLD sheet.
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).active_sheet_for_test()),
+            SheetId(9)
+        );
+        let chrome = cx.update(|cx| entity.read(cx).chrome_for_test());
+        assert_eq!(
+            cx.update(|cx| chrome.read(cx).active_sheet()),
+            SheetId(9),
+            "the chrome must adopt the added sheet, else edits route to the old sheet"
+        );
+    }
+
+    #[gpui::test]
+    fn sheets_changed_delete_active_falls_back_to_first(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(
+            cx,
+            vec![sheet_meta(3, "Data", false), sheet_meta(5, "Notes", false)],
+        );
+        // The active sheet (3) is deleted → fall back to the first remaining (5), window + chrome.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::SheetsChanged {
+                            sheets: vec![sheet_meta(5, "Notes", false)],
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).active_sheet_for_test()),
+            SheetId(5)
+        );
+        let chrome = cx.update(|cx| entity.read(cx).chrome_for_test());
+        assert_eq!(cx.update(|cx| chrome.read(cx).active_sheet()), SheetId(5));
+    }
+
+    #[gpui::test]
+    fn edit_rejected_engine_panic_shows_transient_dialog(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = new_injectable_window(cx);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EditRejected {
+                            reason: EditRejectedReason::EnginePanic,
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            cx.update(|cx| entity.read(cx).has_error_modal()),
+            "a caught engine panic surfaces the transient error dialog"
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_closes_window_on_dismiss()),
+            Some(false),
+            "the document is intact — dismissing keeps the window (§6)"
+        );
+    }
+
+    #[gpui::test]
+    fn edit_rejected_input_cap_flags_chrome_data_row(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EditRejected {
+                            reason: EditRejectedReason::InputCap(InputRejection::TooLong {
+                                len: 9000,
+                                max: 8192,
+                            }),
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        let chrome = cx.update(|cx| entity.read(cx).chrome_for_test());
+        assert!(
+            cx.update(|cx| chrome.read(cx).cap_error_visible()),
+            "a worker cap rejection lights the data-row danger state"
+        );
+    }
+
+    #[gpui::test]
+    fn published_and_style_cache_updated_are_folded(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        // Both repaint-class events fold without panicking (grid notify + chrome style refresh).
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(WorkerEvent::Published, window, ctx);
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::StyleCacheUpdated { sheet: SheetId(3) },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).active_sheet_for_test()),
+            SheetId(3)
+        );
+    }
+
+    #[gpui::test]
+    fn grid_selection_routes_to_chrome_ref_box(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        // A grid selection (as its sink delivers it) drives the chrome ref box + a content fetch
+        // (single cell → the field goes Idle and awaits the reply).
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.route_selection_changed_for_test(
+                        SelectionModel::single(CellRef::new(6, 1)),
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        let chrome = cx.update(|cx| entity.read(cx).chrome_for_test());
+        assert_eq!(cx.update(|cx| chrome.read(cx).ref_box_text()), "B7");
+        assert_eq!(cx.update(|cx| chrome.read(cx).data_mode()), FieldMode::Idle);
     }
 }

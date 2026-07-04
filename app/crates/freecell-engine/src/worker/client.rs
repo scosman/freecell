@@ -25,10 +25,13 @@ pub const WORKER_STACK_SIZE: usize = 64 << 20;
 /// The read-surfaces shared between the worker (writer) and the UI (reader). All lock-free or
 /// briefly-locked so the render loop never blocks on the worker (`architecture.md §2`).
 pub(super) struct Shared {
-    /// The latest published viewport snapshot (swapped before the generation bump).
-    pub(super) publication: ArcSwap<Publication>,
+    /// The latest published viewport snapshot (swapped before the generation bump). Held
+    /// behind its own `Arc` so the window can hand the exact swap container to the grid's
+    /// `GridDataSources` (the grid loads it wait-free each frame).
+    pub(super) publication: Arc<ArcSwap<Publication>>,
     /// Bumped strictly **after** the publication swap — a bump always has fresh data behind
-    /// it (SP1's publish-then-bump ordering fix).
+    /// it (SP1's publish-then-bump ordering fix). Read via [`DocumentClient::generation`]; the
+    /// grid does not poll it (it re-reads the publication + repaints on `Published`).
     pub(super) generation: AtomicU64,
     /// The count of committed undoable ops (dirty tracking; `architecture.md §2`). The UI's
     /// dirty flag = `committed_ops > last_saved_op`.
@@ -41,7 +44,7 @@ pub(super) struct Shared {
 impl Shared {
     pub(super) fn new(initial_sheet: SheetId) -> Self {
         Self {
-            publication: ArcSwap::from_pointee(Publication::empty(initial_sheet, 0)),
+            publication: Arc::new(ArcSwap::from_pointee(Publication::empty(initial_sheet, 0))),
             generation: AtomicU64::new(0),
             committed_ops: AtomicU64::new(0),
             caches: Arc::new(RwLock::new(SheetCaches::new())),
@@ -82,6 +85,22 @@ impl DocumentClient {
         )
     }
 
+    /// A **worker-less** client for headless UI tests: no OS thread is spawned, sent commands go
+    /// nowhere (the command receiver is dropped), and the event channel is closed so the window's
+    /// event task completes immediately (`recv().await` → `None`). Tests drive folding by
+    /// injecting `WorkerEvent`s directly, so no real events are needed. Behind the `test-support`
+    /// feature so it can never reach a release build. Reads return the empty initial state.
+    #[cfg(feature = "test-support")]
+    pub fn detached() -> (DocumentClient, WorkerEventReceiver) {
+        let (tx, _rx) = mpsc::channel::<Command>(); // `_rx` dropped → sends are no-ops
+        let (_event_tx, event_rx) = async_channel::unbounded::<WorkerEvent>(); // closed → recv None
+        let shared = Arc::new(Shared::new(SheetId(0)));
+        (
+            DocumentClient { tx, shared },
+            WorkerEventReceiver { rx: event_rx },
+        )
+    }
+
     /// Sends a command to the worker. Non-blocking and infallible to the caller: if the worker
     /// is gone the send is dropped (the UI observes the closed event channel instead).
     pub fn send(&self, cmd: Command) {
@@ -92,6 +111,13 @@ impl DocumentClient {
     /// per-frame read; never blocks on the worker).
     pub fn publication(&self) -> Arc<Publication> {
         self.shared.publication.load_full()
+    }
+
+    /// The publication **swap container** itself (not a load) — the shape the grid's
+    /// `GridDataSources` needs so the render path loads the latest snapshot wait-free each
+    /// frame (`components/grid.md §Public interface`).
+    pub fn publication_swap(&self) -> Arc<ArcSwap<Publication>> {
+        Arc::clone(&self.shared.publication)
     }
 
     /// The resident style/geometry cache (populated in Phase 5).

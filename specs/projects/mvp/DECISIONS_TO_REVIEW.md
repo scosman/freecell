@@ -820,3 +820,114 @@ Known placeholders the build will resolve (append the resolution here):
   `anyhow::Result` (handled with `.expect`), so `freecell-app` needs no direct `anyhow` dep yet;
   `tracing` is now a live dep (the `register_fonts` hook logs). `tempfile` added as a dev-dep for
   the save-flow test fixtures. (`crates/freecell-app/Cargo.toml`)
+
+- [Phase 11] **`SheetMeta` gained `has_content: bool`, sourced worker-side** (resolving the
+  Phase-9 follow-up). `document.sheet_properties_with_content()` checks `!worksheet.sheet_data.
+  is_empty()` per sheet; `sheet_metas()` populates it; the chrome's `merge_sheet_metas` now reads
+  `meta.has_content` (dropped the "preserve own guess" fallback). This makes the delete-confirm
+  gate correct — deleting a non-empty sheet now actually confirms (data-safety, `functional_spec.md
+  §3.7`). Engine + chrome `SheetMeta { id, name }` constructions updated. (`worker/protocol.rs`,
+  `document.rs`, `worker/run.rs`, `chrome/view.rs`)
+- [Phase 11] **`Shared` publication/generation are now `Arc<ArcSwap<Publication>>` /
+  `Arc<AtomicU64>`** (were bare fields inside `Arc<Shared>`) + `DocumentClient::publication_swap()`
+  / `generation_counter()` accessors, so the window can hand the exact swap container + counter to
+  the grid's `GridDataSources` (which need those `Arc` shapes). The worker's `.store()`/`.fetch_add()`
+  still work through the `Arc` via `Deref`. (`worker/client.rs`)
+- [Phase 11] **Resolved the Phase-6/8 "window-vs-element bounds" marker via a `gpui::canvas`
+  probe.** The grid renders a zero-cost full-size `canvas` whose prepaint captures the grid
+  element's real laid-out `Bounds` into the entity; `viewport_wh()` uses `bounds.size` and
+  `event_local()` subtracts `bounds.origin`, so virtualization + hit-testing are correct now that
+  chrome offsets the grid down (~68 px) and shrinks it. Falls back to `window.viewport_size()`
+  before the first capture (grid ≈ full window then → identical for the full-window render-tests /
+  demo). The probe's `cx.notify()` (for crisp resize) is suppressed under a render-test capture
+  (`freeze_spinner`) so the pixel suite stays a single deterministic frame — verified: all 53
+  render baselines still pass. (`grid/view.rs`)
+- [Phase 11] **The grid announces its viewport from `render` (debounced on `last_viewport`)** — the
+  single viewport-announce covering first paint, sheet switch, and resize; scroll/keyboard still
+  emit eagerly, all sharing `last_viewport` so there is no double-emit and a values-only republish
+  (same range) never re-announces. Emitting from render is side-effect-only (`client.send` via the
+  sink, no entity update), so it is safe on the hot path. (`grid/view.rs render`)
+- [Phase 11] **Grid ⇄ chrome routing goes through boxed-closure sinks that capture the *sibling*
+  entity handles (not the `WorkbookWindow` entity)**, resolved via `Rc<OnceCell<WeakEntity<..>>>`
+  slots after both children are built. This is the load-bearing anti-reentrancy design: a sink
+  fires from *inside* a sibling's `update`, so it must never lease the window entity (which owns the
+  worker-event task + action handlers). Cyclic follow-ups are broken with `Window::defer`:
+  chrome→`MoveActive`/`SetActiveSheet` (the grid re-emits `SelectionChanged`/`ViewportChanged` back
+  into the still-leased chrome) and the grid→`SelectionChanged` cap-reject revert. `FocusGrid`,
+  `ViewportChanged`, `ClearCells` are direct (no cycle). The active sheet + last-accepted selection
+  the sinks read ride a shared `Rc<SinkShared>` (lock-free `Cell`s) the window writes on switch.
+  (`shell/window.rs make_grid_sink`, `make_chrome_grid_sink`, `route_selection_changed`)
+- [Phase 11] **`ChromeView` hosts the grid as an `AnyView` body slot** (`set_grid_body`), rendering
+  action-row → data-row → **grid (flex-fill)** → tab-bar in one entity, so the tab bar sits below
+  the grid per `ui_design.md §3` while the window still owns both entities for event routing. The
+  window body wrapper is a flex column so the chrome's `flex_1` stretches (found + fixed via the
+  Xvfb smoke — without it the grid slot collapsed to zero). Phase-9 standalone chrome (no body)
+  renders as before. (`chrome/view.rs`, `shell/window.rs render_body`)
+- [Phase 11] **`DocumentClient` is held as `Rc<DocumentClient>`** and shared with the chrome as
+  `Rc<dyn ChromeClient>` (respecting the Phase-4 "not `Clone`, one window one worker" spirit — a
+  single handle, one worker, shared within the one window). (`shell/window.rs`)
+- [Phase 11] **Sheet reconciliation on `Loaded`/`SheetsChanged`:** a newly-added sheet becomes
+  active (`+` switches to it), a surviving active sheet stays, a deleted active falls back to the
+  first remaining; the switch restores the grid's per-sheet scroll/selection, sends a **bootstrap**
+  `SetViewport` (overscanned `INITIAL_VIEWPORT_*`, so an unvisited sheet's cache builds + publishes
+  even before the grid lays it out), and re-points the data row. `overscan_range` (3×, clamped) is a
+  pure unit-tested helper in `lifecycle`. (`shell/window.rs reconcile_sheets`,
+  `switch_grid_to_sheet`, `shell/lifecycle.rs`)
+- [Phase 11] **`EditRejected` routing:** `InputCap` → chrome danger border; `EnginePanic`/`Engine`
+  → transient "That change couldn't be applied" dialog (only if no modal is up; document intact,
+  `functional_spec.md §6`); `InvalidSheetName` (backstop — chrome validates first) + `Degraded` (the
+  degraded bar already explains it) → no dialog. `ToggleBold/Italic/Underline` are wired to
+  `chrome.toggle_style` (Phase-10 left them no-op placeholders). (`shell/window.rs on_edit_rejected`,
+  render actions)
+- [Phase 11] **Degraded-worker edit refusal is worker-enforced, not UI-disabled.** The degraded bar
+  + Save-As show, and the worker rejects any further edit (`EditRejected{Degraded}`, ignored UI-side
+  since the bar is up); the chrome's toggles/data-row are NOT greyed out. Acceptable for the MVP
+  (no data change slips through — the worker is the boundary); a future pass can disable the chrome
+  inputs while degraded. (`shell/window.rs`)
+- [Phase 11] **Untestable boundary (documented, not skipped):** the deferred chrome→grid follow-ups
+  (`MoveActive`/`SetActiveSheet`) and every worker-*command* emission (`SetViewport`/`SetCellInput`/
+  …) are not deterministically assertable in `#[gpui::test]` — the window holds a live OS-thread
+  worker and `run_until_parked` trips gpui's cross-thread `end_test` panic (Phase-10 boundary), and
+  `Window::defer` needs a parked flush. The **synchronous** folding (`reconcile_sheets`,
+  `on_edit_rejected`, `Published`/`StyleCacheUpdated`, the grid→chrome selection route via the real
+  `route_selection_changed`) IS injection-tested (7 new `shell/app.rs` tests). The deferred paths +
+  the full composed pixel layout are covered by the Phase-8/9 component tests + the **Xvfb+lavapipe
+  smoke launch** (Phase 11 ran it: opened a styled fixture `.xlsx` → the composed window rendered
+  the real grid values/styles, the data row's `GetCellContent` reply, the action-row bold state,
+  and the bottom tab bar, with correct grid hit-test offset — no panics). (`shell/app.rs` tests)
+- [Phase 11 · CR fix] **Flaky gpui gate FIXED — the window tests are now worker-less.** The
+  gpui shell/composition tests used to spawn a real OS-thread worker (`DocumentClient::spawn` via
+  `FreeCellApp::new_workbook` / `open_path`), which intermittently tripped gpui's `TestScheduler`
+  non-determinism `end_test` panic in the full-workspace run. Added a `test-support` cargo feature
+  on `freecell-engine` exposing `DocumentClient::detached()` — a worker-less client (dropped
+  command receiver → sends are no-ops; closed event channel → the window's event task completes
+  immediately; empty initial read-surfaces). `freecell-app`'s **dev-dependencies** enable the
+  feature (test build only — the release binary never sees `detached()`), and the tests build
+  windows via `WorkbookWindow::new_detached_for_test` / `FreeCellApp::{new_workbook_detached,
+  open_path_detached}`. Folding is still injection-tested; the real worker stays covered by the
+  `freecell-engine` `worker_seam.rs`/`roundtrip.rs` blocking-`recv` tests + the Xvfb smoke.
+  **Verified: `cargo test -p freecell-app --lib` 25/25 clean + 3 full-workspace runs clean.**
+  (`freecell-engine/Cargo.toml`, `worker/client.rs`, `freecell-app/Cargo.toml`, `shell/window.rs`,
+  `shell/app.rs`)
+- [Phase 11 · CR fix] **CRITICAL data-safety bug fixed: adding a sheet routed edits to the WRONG
+  sheet.** On a `SheetsChanged` that *added* a sheet, `switch_grid_to_sheet` moved the grid + the
+  window's active sheet but never re-pointed `ChromeView::active_sheet` (its `merge_sheet_metas`
+  only reassigns on a *delete*), so after clicking `+` the tab highlight, formula bar, and every
+  subsequent `SetCellInput`/`SetStyleAttr`/`GetCellContent` targeted the OLD sheet while the user
+  looked at the new one. Fix: added `ChromeView::adopt_active_sheet(id)` (sets the active sheet +
+  refreshes the toggle style, WITHOUT re-emitting `SetActiveSheet` — it must not re-enter the
+  window's defer loop), called in `switch_grid_to_sheet` before the content fetch. Regression:
+  `sheets_changed_add_switches_to_new_sheet` now asserts `chrome.active_sheet() == SheetId(9)` (the
+  delete-fallback path asserts the chrome too). (`chrome/view.rs adopt_active_sheet`,
+  `shell/window.rs switch_grid_to_sheet`, `shell/app.rs` tests)
+- [Phase 11 · CR fix] **Dropped the vestigial `GridDataSources.generation`** (the grid never read
+  it — repaint is `Published` → `grid.notify()` + the per-frame `ArcSwap` re-read) + the
+  `DocumentClient::generation_counter()` accessor, and reverted `Shared.generation` to a plain
+  `AtomicU64` (no longer needs `Arc`-wrapping; `publication` stays `Arc<ArcSwap>`). Render baselines
+  unaffected (53/53 pass). (`grid/view.rs`, `worker/client.rs`, `grid/fixtures.rs`,
+  `render-tests/src/scene.rs`)
+- [Phase 11 · CR fix] **Mild:** `LoadFailed` now also clears the grid's "Opening…" overlay
+  (`grid.set_loading(None)`, symmetry with `Loaded`); and `on_worker_event` is now an **exhaustive**
+  match (no `_ => {}`) — `Saved`/`SaveFailed` match unconditionally and branch on the pending
+  `req_id` inside, so a future `WorkerEvent` variant is a compile error forcing a conscious routing
+  decision. (`shell/window.rs on_worker_event`)

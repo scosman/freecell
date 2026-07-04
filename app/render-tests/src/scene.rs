@@ -19,7 +19,6 @@
 //! exercised alignment/geometry, and keeps the render path (the thing under test) fully real.
 
 use std::ops::Range;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -217,7 +216,6 @@ pub fn build_sources(scene: &Scene) -> Result<GridDataSources> {
     Ok(GridDataSources {
         publication: Arc::new(ArcSwap::from(publication)),
         caches,
-        generation: Arc::new(AtomicU64::new(client.generation())),
     })
 }
 

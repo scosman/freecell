@@ -27,5 +27,13 @@ async-channel.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 
+[features]
+# Exposes `DocumentClient::detached()` — a worker-less client for headless UI tests, so a
+# `#[gpui::test]` composing a `WorkbookWindow` does not spawn a real OS thread under gpui's
+# deterministic `TestScheduler` (which panics on cross-thread activity). Off by default so the
+# no-op client can never be wired into a release build; `freecell-app`'s dev-dependencies enable
+# it for the test build only.
+test-support = []
+
 [lints]
 workspace = true

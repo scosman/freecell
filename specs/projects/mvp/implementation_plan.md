@@ -99,7 +99,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   `functional_spec.md §2`)
 
 **Integration (serial):**
-- [ ] **Phase 11 — Integration.** Real `DocumentClient` wired end-to-end
+- [x] **Phase 11 — Integration.** Real `DocumentClient` wired end-to-end
   (grid+chrome+worker+shell); open/edit/eval/save flows; dirty + title state; sheet
   switching with per-sheet scroll/selection; eval indicator; error paths
   (LoadFailed, SaveFailed, EditRejected, degraded bar); gpui-context integration

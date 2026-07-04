@@ -76,23 +76,30 @@ gpui-capability spike before estimating. None are blocked by the others.
 
 ## Engine (IronCalc 0.7.1) — `.xlsx` import fidelity bugs
 
-Bugs in the pinned IronCalc's **import** path, found while opening a real Excel template
-(a mortgage calculator with a custom purple theme + accounting number formats). IronCalc
-evaluates every formula correctly; these are **import/presentation** defects. FreeCell now
-corrects the common cases at open time in
-[`freecell-engine::open_fixups`](app/crates/freecell-engine/src/open_fixups.rs) (applied in
-`WorkbookDocument::open`, before the model is wrapped). Entries marked *worked around* are
-fixed for the observed cases; the *residual* rows are the parts our fix does not cover.
+Bugs in the pinned IronCalc's **import** path, found while opening real Excel/Numbers files
+(a mortgage calculator with a custom purple theme + accounting number formats; a Numbers
+export with a custom indexed colour palette). IronCalc evaluates every formula correctly;
+these are **import/presentation** defects — except E4, which is a hard **parse rejection**
+that stops the file opening at all. FreeCell corrects the common cases at open time in two
+best-effort adapters, both driven from `WorkbookDocument::open`:
+[`open_repair`](app/crates/freecell-engine/src/open_repair.rs) runs **pre-parse** (repairs
+the bytes and retries on a specific parse failure) and
+[`open_fixups`](app/crates/freecell-engine/src/open_fixups.rs) runs **post-parse** (corrects
+the loaded model). Entries marked *worked around* are fixed for the observed cases; the
+*residual* rows are the parts our fix does not cover.
 
 | # | Bug (IronCalc) | Symptom | Our status | Detail |
 |---|----------------|---------|------------|--------|
 | E1 | **Theme colours resolved against a hardcoded default Office palette, ignoring the file's `xl/theme/theme1.xml`.** `import::colors::get_themed_color` uses a fixed 12-colour array and discards the theme index + tint, storing only the (wrong) resolved RGB. | Every theme-indexed fill/font colour is wrong. On this file (whose theme swaps `dk1`/`lt1` and uses a purple `dk2`) the purple header rendered navy, white label cells rendered solid black, lavender bands rendered blue-grey. | **Worked around (our bug fixed).** `open_fixups::correct_theme_colors` re-reads `theme1.xml` + `styles.xml`, recomputes each theme-indexed colour against the *file* palette (OOXML dark/light swap + §18.8.3 tint), and overwrites the resolved RGB. | Unit + crafted-zip tests in `open_fixups`. Verified end-to-end on the real file. |
 | E2 | **`DEFAULT_NUM_FMTS` table (`ironcalc_base::number_format`) maps standard built-in `numFmtId`s to garbage codes** — e.g. id 39 (`#,##0.00_);(#,##0.00)`) → `"t0.00"`, ids 41–44 (accounting) → `"t0"/"t0.00"/…`. `get_formatted_cell_value` then returns **`#VALUE!`** for a perfectly valid number. | Currency/accounting/number cells show `#VALUE!` even though the underlying value is correct (proven: `NPER` over those cells returns the right number; raw `get_cell_value_by_index` is correct). On this file all loan/payment/total cells (id 39) showed `#VALUE!`. | **Worked around (our bug fixed).** `open_fixups::inject_builtin_num_fmts` injects the correct ECMA-376 built-in code (ids 5–8, 37–49) for ids the workbook references but does not itself define, so `get_num_fmt` picks it up ahead of the broken table. IronCalc's formatter handles the correct code fine. | Unit tests in `open_fixups`; values now match Excel's CSV export exactly. |
 | E3 | **Residual: date/time and other built-in `numFmtId`s IronCalc mis-maps are not corrected.** Our E2 fix deliberately covers only the locale-independent numeric/currency/accounting/misc block (ids 5–8, 37–49). IronCalc's table is also wrong/garbage for ids 11–13 (spacing) and 23–36, and dates 14–22 are locale-sensitive. | A file relying on those specific built-in ids (rare vs. the E2 block) may still format wrong. Not seen in the test file. | **Tracked (IronCalc limitation).** Extend `STANDARD_BUILTIN_NUM_FMTS` if a real file needs it, or upstream a fix to IronCalc's `DEFAULT_NUM_FMTS`. | — |
+| E4 | **Styles parser wrongly *requires* the optional `xfId` on every `<cellXfs>`/`<xf>`.** `import::styles.rs` reads it with `get_attribute(&xfs, "xfId")?` (mandatory), but per OOXML §18.8.10 `xfId` on a `cellXfs/xf` is **optional** (default: none). IronCalc reads it optionally on `cellStyleXfs` but not here. | The **entire open fails** with `XML Error: Missing "xfId" XML attribute` — the file never loads. Hits Numbers, LibreOffice, and various generators that omit `xfId`. Reproduced on the committed `numbers_table.xlsx` fixture (22 `<cellXfs>` `<xf>`, none with `xfId`). | **Worked around (our bug fixed).** `open_repair::try_repair_and_reload` runs *only* on this specific error: it re-reads the zip, injects `xfId="0"` into `<cellXfs>` `<xf>` elements that lack it (scoped strictly to the `cellXfs` block — `cellStyleXfs` untouched), and reloads from the repaired bytes via `load_from_xlsx_bytes`. Reactive, so files that already parse are untouched; on any repair/reload failure the original typed error is surfaced. | Unit + crafted-zip tests in `open_repair`; integration test opens the fixture through `WorkbookDocument::open` and asserts its values. |
+| E5 | **Custom indexed colour palette ignored.** `import::colors::get_indexed_color` uses a hardcoded legacy default indexed palette and never reads the workbook's `<colors><indexedColors>` override (OOXML §18.8.27). So an `indexed="n"` fill/font colour resolves to Excel's *default* colour n, not the file's redefined colour n. | Fills/fonts/borders that use `indexed=` render the wrong colour. On `numbers_table.xlsx`: column A's light-grey band (custom index 12 = `#DBDBDB`) renders **bright blue** (default 12 = `#0000FF`); the TOTAL cells render default index 13/14 (`#FFFF00` yellow / `#FF00FF` magenta) instead of the file's `#FFD931` amber / `#FE634D` red-orange. Values are unaffected — the file opens and all numbers/labels are correct. | **Tracked (deferred — fixable, same class as E1).** Directly analogous to E1 (theme palette) and fixable the same way: a future `open_fixups` pass re-reads `<indexedColors>` and re-resolves every `indexed=` fill/font/border colour against the file palette (parallel to `correct_theme_colors`). Deferred — not built because it is off the "file opens + values load" critical path, not because it is hard. | Residual; observed in the `numbers_table.xlsx` capture. |
 
-**Upgrade note:** E1/E2 are compensations for IronCalc import bugs. If IronCalc is bumped to
-a release that resolves file themes and ships a correct built-in number-format table,
-`open_fixups` (and the `zip`/`roxmltree` deps it adds) can be deleted.
+**Upgrade note:** E1/E2/E4 are compensations for IronCalc import bugs. If IronCalc is bumped to
+a release that resolves file themes, ships a correct built-in number-format table, and accepts
+an `xfId`-less `cellXfs`, `open_fixups` + `open_repair` (and the `zip`/`roxmltree` deps they
+add) can be deleted.
 
 ## Data safety & robustness
 

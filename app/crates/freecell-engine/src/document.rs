@@ -188,9 +188,24 @@ impl WorkbookDocument {
             // A real read error after the magic check (e.g. the file vanished mid-open).
             Err(ironcalc::error::XlsxError::IO(msg)) => Err(LoadError::Io(msg)),
             // It IS a Zip, so any structural/parse/workbook/feature failure means the
-            // workbook itself is damaged or unsupported. The message is preserved for the
-            // dialog details line (a `NotImplemented` message names the unsupported feature).
-            Err(other) => Err(LoadError::Corrupt(other.to_string())),
+            // workbook itself is damaged or unsupported. Before giving up, try one
+            // best-effort **reactive repair** for IronCalc's over-strict styles parser
+            // (which rejects a `<cellXfs>` `<xf>` that omits the *optional* `xfId` — as
+            // Numbers/LibreOffice-exported files do). `try_repair_and_reload` returns `Some`
+            // only for that specific error class and only if the read→patch→reload all
+            // succeed; on any failure we fall through to the ORIGINAL typed error so the
+            // file's real problem is what surfaces (`open_repair` module docs).
+            Err(other) => match crate::open_repair::try_repair_and_reload(path, &other) {
+                Some(mut model) => {
+                    crate::open_fixups::apply_open_fixups(&mut model, path);
+                    Ok(Self {
+                        model: UserModel::from_model(model),
+                    })
+                }
+                // The message is preserved for the dialog details line (a `NotImplemented`
+                // message names the unsupported feature).
+                None => Err(LoadError::Corrupt(other.to_string())),
+            },
         }
     }
 

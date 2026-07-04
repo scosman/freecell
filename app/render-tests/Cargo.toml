@@ -5,18 +5,52 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Cell-render snapshot suite for FreeCell: renders the real grid, captures PNGs, perceptual-diffs against committed baselines (components/render_test_harness.md). Phase 1 = skeleton; the gpui/grid deps + ported perceptual diff land in Phase 7."
+description = "Cell-render snapshot suite for FreeCell: renders the real grid over engine-produced scenes, captures PNGs under Xvfb + Mesa lavapipe, and perceptual-diffs against committed baselines (components/render_test_harness.md)."
 
 # ---------------------------------------------------------------------------------
-# Phase 1 SKELETON ONLY.
+# Phase 7. Renders the REAL `GridView` (freecell-app) over scenes produced by the REAL
+# engine (freecell-engine worker / DocumentClient), captures pixels on Linux under
+# Xvfb + Mesa lavapipe (the Phase-1 spike's proven capture variant), and perceptual-diffs
+# against committed baselines (the diff ported from round-3 C `ci_rendering`).
 #
-# The real crate (Phase 7) depends on `freecell-app` (GridView), `freecell-engine`,
-# `gpui`, and `image`/`png`, and runs under Xvfb + lavapipe in Linux CI. Those deps and
-# the ported round-3 C perceptual diff are deliberately NOT wired here: keeping this
-# crate off the gpui dependency edge in Phase 1 means the workspace builds and tests on
-# Linux regardless of the Phase-1 render-spike outcome (implementation_plan.md).
+# `image` + the diff live in a GPUI-free module so the diff logic is unit-tested
+# everywhere; the gpui/grid deps are only needed to render + capture.
 # ---------------------------------------------------------------------------------
+[lib]
+name = "render_tests"
+path = "src/lib.rs"
+
+# The per-case gpui renderer: opens ONE window sized to a case's viewport with the real
+# GridView over engine-built sources, and self-quits (the capture harness forces
+# presentation with xrefresh and captures the X root — the Phase-1 spike mechanism).
+[[bin]]
+name = "render_scene"
+path = "src/bin/render_scene.rs"
+
+# Re-renders every (or a filtered set of) case into `baselines/` (the human baseline tool).
+[[bin]]
+name = "generate_baselines"
+path = "src/bin/generate_baselines.rs"
+
 [dependencies]
+freecell-core.workspace = true
+freecell-engine.workspace = true
+freecell-app.workspace = true
+# `arc-swap` builds the `GridDataSources.publication` slot the grid loads per frame;
+# `parking_lot` is the `RwLock<SheetCaches>` type the scene injects command-less render
+# features (alignment / geometry) into after the real worker builds it.
+arc-swap.workspace = true
+parking_lot.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+image.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

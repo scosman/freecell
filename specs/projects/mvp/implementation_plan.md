@@ -78,7 +78,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   attrs, alignment, clipping), variable geometry, wheel scroll + clamping, custom
   scrollbars, loading overlay — against hand-built core fixtures.
   (`components/grid.md`, `ui_design.md §3.3`)
-- [ ] **Phase 7 — Render-test harness + initial suite.** (needs P5, P6) Capture via
+- [x] **Phase 7 — Render-test harness + initial suite.** (needs P5, P6) Capture via
   the variant the Phase-1 spike proved (Linux Xvfb+lavapipe primary; macOS fallback)
   + perceptual diff ported from round-3 C; scene builder through the real engine;
   `generate_baselines`; README (human baseline process); initial ~45-case suite

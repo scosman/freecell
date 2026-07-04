@@ -1,0 +1,303 @@
+//! The declarative case table — **one row per rendering feature or meaningful permutation**
+//! (`components/render_test_harness.md §Case inventory`). Adding a rendering feature = adding
+//! rows here (stated as a review requirement in `README.md`). `name` is snake_case and IS the
+//! baseline filename, so a red CI line names the exact broken feature.
+
+use freecell_core::{Align, CellRef, SelectionModel};
+
+use crate::scene::Scene;
+
+/// A demonstrative multi-line-ish word with an ascender + descenders, so bold / italic /
+/// underline read clearly in a baseline.
+const SAMPLE: &str = "Sample";
+
+/// One render case: a scene, the (tight) capture viewport, and any post-construction grid state
+/// (selection / loading overlay / forced scrollbars / a scroll-into-view reveal) that the MVP
+/// worker protocol can't express as an edit.
+pub struct RenderCase {
+    /// snake_case — IS the baseline PNG filename (`<name>.png`).
+    pub name: &'static str,
+    /// The engine-driven + cache-injected fixture.
+    pub scene: Scene,
+    /// Capture size in device px (small & tight — `components/render_test_harness.md`).
+    pub viewport: (u32, u32),
+    /// A non-default selection (drives the selection overlay / active-cell border).
+    pub selection: Option<SelectionModel>,
+    /// `Some(name)` renders the file-open loading overlay.
+    pub loading: Option<&'static str>,
+    /// Forces the overlay scrollbars visible (they otherwise fade).
+    pub force_scrollbars: bool,
+    /// A `(row, col)` scrolled fully into view before capture (deep-header / scroll cases).
+    pub reveal: Option<(u32, u32)>,
+}
+
+impl RenderCase {
+    fn new(name: &'static str, scene: Scene, viewport: (u32, u32)) -> Self {
+        Self {
+            name,
+            scene,
+            viewport,
+            selection: None,
+            loading: None,
+            force_scrollbars: false,
+            reveal: None,
+        }
+    }
+
+    fn selection(mut self, selection: SelectionModel) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+
+    fn loading(mut self, name: &'static str) -> Self {
+        self.loading = Some(name);
+        self
+    }
+
+    fn force_scrollbars(mut self) -> Self {
+        self.force_scrollbars = true;
+        self
+    }
+
+    fn reveal(mut self, row: u32, col: u32) -> Self {
+        self.reveal = Some((row, col));
+        self
+    }
+}
+
+/// The tight viewport for single-feature cell/value/layout cases.
+const CELL_VP: (u32, u32) = (480, 160);
+/// A roomier viewport for whole-grid scenes (headers + selection + geometry).
+const GRID_VP: (u32, u32) = (640, 320);
+
+fn sel(anchor: (u32, u32), active: (u32, u32)) -> SelectionModel {
+    SelectionModel {
+        anchor: CellRef::new(anchor.0, anchor.1),
+        active: CellRef::new(active.0, active.1),
+    }
+}
+
+/// The whole initial suite (~45 cases). Rebuilt fresh on each call — the `render_scene` bin
+/// looks a case up by name, so this is the single source of truth.
+pub fn all() -> Vec<RenderCase> {
+    let cell = |name, scene| RenderCase::new(name, scene, CELL_VP);
+    // The tested cell sits at B2 so the default A1 active-cell outline never overlaps it.
+    let at = |scene: Scene| scene.input(1, 1, SAMPLE);
+
+    let mut cases = vec![
+        // ---- Text attributes -----------------------------------------------------------
+        cell("cell_plain", at(Scene::new())),
+        cell("cell_bold", at(Scene::new()).bold(1, 1)),
+        cell("cell_italic", at(Scene::new()).italic(1, 1)),
+        cell("cell_underline", at(Scene::new()).underline(1, 1)),
+        cell("cell_bold_italic", at(Scene::new()).bold(1, 1).italic(1, 1)),
+        cell(
+            "cell_bold_underline",
+            at(Scene::new()).bold(1, 1).underline(1, 1),
+        ),
+        cell(
+            "cell_italic_underline",
+            at(Scene::new()).italic(1, 1).underline(1, 1),
+        ),
+        cell(
+            "cell_bold_italic_underline",
+            at(Scene::new()).bold(1, 1).italic(1, 1).underline(1, 1),
+        ),
+        // ---- Fill ----------------------------------------------------------------------
+        cell("cell_fill_red", at(Scene::new()).fill(1, 1, 0xFF0000)),
+        cell("cell_fill_yellow", at(Scene::new()).fill(1, 1, 0xFFEB3B)),
+        cell(
+            // A dark fill with an explicit light font colour for contrast.
+            "cell_fill_dark_text_contrast",
+            at(Scene::new())
+                .fill(1, 1, 0x2E4053)
+                .font_color(1, 1, 0xFFFFFF),
+        ),
+        cell(
+            // A fill explicitly set then cleared ("No Fill") renders as the default white cell.
+            "cell_fill_none_explicit",
+            at(Scene::new()).fill(1, 1, 0xFF0000).fill_none(1, 1),
+        ),
+        cell(
+            "cell_bold_fill_yellow",
+            at(Scene::new()).bold(1, 1).fill(1, 1, 0xFFEB3B),
+        ),
+        cell(
+            "cell_bold_italic_underline_fill_blue",
+            at(Scene::new())
+                .bold(1, 1)
+                .italic(1, 1)
+                .underline(1, 1)
+                .fill(1, 1, 0x64B5F6),
+        ),
+        cell(
+            // A 2×2 fill block: the fill paints over the interior gridlines (Excel look).
+            "cell_fill_covers_gridlines",
+            Scene::new().fill_range(
+                freecell_core::CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)),
+                0xFFEB3B,
+            ),
+        ),
+        // ---- Values & engine-owned number formats --------------------------------------
+        cell("cell_number_plain", Scene::new().input(1, 1, "42")),
+        cell(
+            "cell_number_thousands",
+            Scene::new().input(1, 1, "1,234,567"),
+        ),
+        cell(
+            "cell_number_currency",
+            Scene::new().input(1, 1, "$1,234.50"),
+        ),
+        cell("cell_number_percent", Scene::new().input(1, 1, "50%")),
+        cell(
+            // The [Red] number-format COLOUR is not yet published (Phase-4: text_color = None);
+            // this baseline shows the negative number correctly formatted in the default colour.
+            "cell_number_negative_red",
+            Scene::new().input(1, 1, "-1,234.50"),
+        ),
+        cell("cell_date_default", Scene::new().input(1, 1, "2021-01-01")),
+        cell("cell_boolean", Scene::new().input(1, 1, "TRUE")),
+        cell("cell_text_plain", Scene::new().input(1, 1, "hello")),
+        // ---- Formula errors (values, rendered in-cell) ---------------------------------
+        cell("cell_error_div0", Scene::new().input(1, 1, "=1/0")),
+        cell("cell_error_name", Scene::new().input(1, 1, "=NOTAREALNAME")),
+        cell(
+            // A two-cell ring: B2 → B3 → B2, so both resolve to #CIRC!.
+            "cell_error_circ",
+            Scene::new().input(1, 1, "=B3").input(2, 1, "=B2"),
+        ),
+        // ---- Layout / alignment / geometry ---------------------------------------------
+        cell(
+            "cell_align_left_text",
+            Scene::new().input(1, 1, "Left").align(1, 1, Align::Left),
+        ),
+        cell(
+            "cell_align_right_number",
+            Scene::new().input(1, 1, "42").align(1, 1, Align::Right),
+        ),
+        cell(
+            "cell_align_center_explicit",
+            Scene::new().input(1, 1, "Mid").align(1, 1, Align::Center),
+        ),
+        cell(
+            // Text defaults left; an explicit Right alignment overrides that.
+            "cell_align_explicit_overrides_default",
+            Scene::new().input(1, 1, "Txt").align(1, 1, Align::Right),
+        ),
+        cell(
+            "cell_text_clipped",
+            Scene::new().input(1, 1, "clipped-very-long-text-abcdefghijklmnop"),
+        ),
+        cell(
+            // A short word in a snug column: fills it without clipping.
+            "cell_text_exact_fit",
+            Scene::new().input(1, 1, "Exactly").col_width(1, 62.0),
+        ),
+        cell("cell_empty_styled", Scene::new().fill(1, 1, 0xFFEB3B)),
+        cell(
+            "cell_tall_row",
+            Scene::new().input(1, 1, "Tall").row_height(1, 60.0),
+        ),
+        cell(
+            "cell_wide_column",
+            Scene::new().input(1, 1, "Wide column").col_width(1, 220.0),
+        ),
+        cell(
+            "cell_narrow_column_clipped_number",
+            Scene::new().input(1, 1, "123456789").col_width(1, 40.0),
+        ),
+        // ---- Whole-grid scenes ---------------------------------------------------------
+        RenderCase::new("grid_empty_origin", Scene::new(), GRID_VP),
+        RenderCase::new("grid_headers_scrolled_deep", Scene::new(), GRID_VP).reveal(500, 30),
+        RenderCase::new(
+            "grid_selection_single",
+            Scene::new().input(2, 2, "C3").input(1, 1, "B2"),
+            GRID_VP,
+        )
+        .selection(sel((2, 2), (2, 2))),
+        RenderCase::new(
+            "grid_selection_range",
+            Scene::new().input(1, 1, "B2").input(3, 3, "D4"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (3, 3))),
+        RenderCase::new(
+            // A range extending well past the viewport → the overlay clips at the edges.
+            "grid_selection_range_spans_edge",
+            Scene::new(),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (40, 26))),
+        RenderCase::new(
+            "grid_variable_geometry",
+            Scene::new()
+                .input(0, 0, "A1")
+                .input(1, 1, "B2")
+                .input(2, 2, "C3")
+                .col_width(1, 180.0)
+                .col_width(3, 60.0)
+                .row_height(2, 52.0)
+                .row_height(4, 40.0),
+            GRID_VP,
+        ),
+        RenderCase::new(
+            "grid_loading_overlay",
+            Scene::new().input(0, 0, "A1"),
+            GRID_VP,
+        )
+        .loading("Book.xlsx"),
+        RenderCase::new(
+            "grid_scrollbars_visible",
+            Scene::new().input(0, 0, "A1").input(1, 1, "B2"),
+            GRID_VP,
+        )
+        .force_scrollbars(),
+        RenderCase::new("grid_mixed_content", mixed_content_scene(), (720, 400))
+            .selection(sel((2, 1), (4, 3))),
+    ];
+
+    // A stable order is nice for the changed/unchanged summary; keep table order.
+    cases.sort_by_key(|c| c.name);
+    cases
+}
+
+/// The busy "canary" scene: a realistic mix of headers, values, number formats, fills,
+/// character styles, alignment, and variable geometry — the case that catches "everything
+/// subtly moved" (`components/render_test_harness.md`).
+fn mixed_content_scene() -> Scene {
+    Scene::new()
+        .input(0, 0, "Item")
+        .input(0, 1, "Qty")
+        .input(0, 2, "Price")
+        .input(0, 3, "Total")
+        .bold(0, 0)
+        .bold(0, 1)
+        .bold(0, 2)
+        .bold(0, 3)
+        .fill_range(
+            freecell_core::CellRange::new(CellRef::new(0, 0), CellRef::new(0, 3)),
+            0xE0E0E0,
+        )
+        .input(1, 0, "Widget")
+        .input(1, 1, "3")
+        .input(1, 2, "$4.50")
+        .input(1, 3, "=B2*C2")
+        .input(2, 0, "Gadget")
+        .input(2, 1, "12")
+        .input(2, 2, "$1.25")
+        .input(2, 3, "=B3*C3")
+        .input(3, 0, "Gizmo")
+        .input(3, 1, "7")
+        .input(3, 2, "$9.99")
+        .input(3, 3, "=B4*C4")
+        .input(5, 0, "Discount")
+        .input(5, 2, "10%")
+        .italic(5, 0)
+        .input(6, 0, "Note")
+        .input(6, 1, "clipped-long-note-text")
+        .align(1, 1, Align::Right)
+        .align(2, 1, Align::Right)
+        .align(3, 1, Align::Right)
+        .col_width(0, 120.0)
+        .row_height(0, 30.0)
+}

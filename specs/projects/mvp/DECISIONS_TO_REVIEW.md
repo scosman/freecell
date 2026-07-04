@@ -451,3 +451,113 @@ Known placeholders the build will resolve (append the resolution here):
   selected-row/col tint + accent edge, gridlines, bold/italic/underline/fill/right-aligned cells,
   a clipped long string, the B2:D4 selection with its 10% overlay + white anchor at D4, and the
   wide-B / tall-row-3 variable geometry all render correctly. (`app/scripts/linux_render_spike.sh`)
+
+- [Phase 7] **Capture = Phase-1 spike option 2, refined: per-case Xvfb sized to the viewport +
+  capture the window by id.** A load-bearing finding beyond the spike: gpui/lavapipe (backend is
+  `gpui_wgpu`, not blade, at this rev) only *presents* a window's frame to the framebuffer when the
+  window **nearly fills the screen** — a small window on a large screen captures blank (verified:
+  480×160 on 1400×900 = blank both via root and by-id; on 488×168 = 534 colours). So each case
+  renders under its **own** `xvfb-run` display sized to `viewport + 8px`, and the harness finds the
+  grid window (`xwininfo` by `WxH`) and captures it with `import -window <id>` (clean, no crop). The
+  xrefresh-forces-Expose-so-gpui-presents trick from Phase 1 still applies. Subprocess-per-case
+  (the `render_scene` bin) = clean gpui lifecycle, no resize API, no stale-pixel races.
+  (`render-tests/src/capture.rs`, `render-tests/src/bin/render_scene.rs`)
+- [Phase 7] **The scene builder drives the REAL worker** (`DocumentClient(NewWorkbook)` →
+  `SetCellInput` / `SetStyleAttr` → `SetViewport` → drain → read `Publication` + `SheetCaches`). Two
+  render features have **no MVP worker edit command** and are applied to the real `SheetCache` the
+  grid consumes (its public mutators, the same the worker uses), after the worker builds it:
+  (a) column/row **geometry** (`cell_tall_row`, `cell_wide_column`, `grid_variable_geometry`);
+  (b) explicit **alignment** + **font colour** (`cell_align_*`, `cell_fill_dark_text_contrast`). In
+  the product these arrive from an opened file, not an edit — there is no "more real" path to drive
+  them at this rev; this mirrors how Phase 6 itself tested alignment/geometry. Values/formats/errors
+  and bold/italic/underline/fill are fully engine-driven. (`render-tests/src/scene.rs`)
+- [Phase 7] **Number formats are driven by IronCalc input inference, not a `num_fmt` command**
+  (the worker has none). Probed against the pinned engine: `set_user_input` infers currency
+  (`"$1,234.50"`→`$1,234.50`), percent (`"50%"`→`50%`), thousands (`"1,234,567"`), and date
+  (`"2021-01-01"`) from the input string, exactly Excel-like. Guarded by the
+  `scene_number_formats_infer` unit test so an engine bump that changes inference flips a test.
+  (`render-tests/src/lib.rs`, `render-tests/src/scene.rs`)
+- [Phase 7] **`cell_number_negative_red`: the `[Red]` number-format COLOUR path is still deferred.**
+  The worker publishes `PublishedCell.text_color = None` (Phase-4 decision — the palette-index→RGB
+  mapping is future work), so this baseline shows the negative number correctly *formatted* in the
+  default colour, not red. The case stays in the table so the feature is tracked; its baseline
+  updates when `text_color` is wired. (`render-tests/src/cases.rs`, README note)
+- [Phase 7] **Perceptual-diff thresholds RESOLVED: kept at round-3 C's 12/255 per-channel & 0.5%
+  fraction** (the "thresholds after first real baselines" placeholder). With real lavapipe baselines
+  in hand the whole suite re-renders and passes deterministically at these defaults (47 tests green,
+  ~222 s), so no re-tune was needed. They may be *tightened* later if lavapipe proves bit-exact
+  (never loosened). Both constants live in one place, `DiffOptions::default()`.
+  (`render-tests/src/diff.rs`, README "Tolerance constants")
+- [Phase 7] **The pixel suite is gated on `FREECELL_RENDER=1` (+ capture tooling present), separate
+  from `cargo test --workspace`.** Without the env var the render integration test skips (the
+  GPUI-free perceptual-diff unit tests still run), so a plain `cargo test --workspace` needs no
+  display and the desktop-dev footgun (rendering on a real GPU vs lavapipe baselines) is avoided. CI
+  runs the **required** pixel gate as a dedicated step (`render-tests/scripts/render_tests.sh test`)
+  that sets the env var; the harness self-manages the per-case Xvfb (no single ambient `xvfb-run`
+  wrapper). This replaces the Phase-1 informational render-spike step in `checks.yml`.
+  (`render-tests/tests/render_suite.rs`, `render-tests/scripts/render_tests.sh`, `.github/workflows/checks.yml`)
+- [Phase 7] **CI system-dep added: `x11-utils` (provides `xwininfo`)** — the capture path finds each
+  case's window by id via `xwininfo`, which was NOT in the Phase-1 apt list (only `x11-apps` +
+  `x11-xserver-utils`). Added to `checks.yml`. `convert` is no longer used (capture-by-id needs no
+  crop); `import` (imagemagick) + `xrefresh` (x11-xserver-utils) + `xvfb-run` (xvfb) are the rest.
+  (`.github/workflows/checks.yml`)
+- [Phase 7] **`freecell-app` added to the workspace dependency table** so `render-tests` can depend
+  on its `[lib]` (`freecell_app`) to render the real `GridView` (`architecture.md §1` crate rule
+  `render-tests → freecell-app (grid)`). `render-tests` gained `gpui`/`gpui_platform`/`gpui-component`/
+  `freecell-engine`/`image`/`arc-swap`/`parking_lot` deps + two bins (`render_scene`,
+  `generate_baselines`); all are already in the tree, so `cargo deny` stays clean.
+  (`app/Cargo.toml`, `render-tests/Cargo.toml`)
+- [Phase 7] **Initial suite = 45 cases, all committed baselines generated on the pinned image and
+  visually spot-checked** (montages): text attrs, fills (incl. a 2×2 fill covering gridlines),
+  engine-formatted numbers/currency/percent/date, #DIV/0! / #NAME? / #CIRC! errors, alignment,
+  clipping, tall-row/wide-column/variable geometry, deep-scrolled headers (rows 490–501, cols
+  Z–AE), single/range/edge-spanning selection, the loading overlay, forced scrollbars, and a busy
+  `grid_mixed_content` canary whose formula totals (`=B2*C2` → `$13.50`, …) evaluate through the
+  real engine. The full human eyeball-sweep of all baselines is Phase 13. (`render-tests/baselines/`)
+- [Phase 7] **macOS pixel capture stays a documented, UNIMPLEMENTED fallback.** The Phase-1 Linux
+  spike PASSED, so the Linux Xvfb+lavapipe suite is the primary + only implemented pixel gate; the
+  round-3 C macOS offscreen-Metal capture function is not written (it would only be needed if the
+  Linux path regressed, and can't be validated in the Linux container). `render-tests` still builds
+  on macOS and its GPUI-free perceptual-diff unit tests run there; the pixel cases self-skip
+  (no lavapipe/xvfb). The `macos-verify` placeholder step was updated to say so.
+  (`.github/workflows/macos-verify.yml`, `render-tests/src/capture.rs`)
+
+- [Phase 7] (post-CR) **The loading spinner is FROZEN to a static loader icon under a render-test
+  capture, gated by a `GridView` flag (not an env var/cfg).** The animated `gpui_component`
+  `Spinner` rotates by wall-clock elapsed time between first paint and the xrefresh-forced capture
+  (~3.5 s ± jitter), so the `grid_loading_overlay` baseline was non-deterministic. Chose a
+  `GridView::set_freeze_spinner` flag (mirroring the existing `force_scrollbars` render-test hook)
+  over reading `FREECELL_RENDER` inside `view.rs`: it keeps the app crate free of any test-harness
+  env-var knowledge (cleaner layering) and is explicit/testable. The render harness sets it on every
+  capture (`render.rs`); the normal app leaves it off and keeps the animated spinner. The frozen
+  render matches the old animated baseline within tolerance (the icon is tiny vs the 640×320
+  viewport, the reviewer's own point), but the baseline was regenerated so it is now deterministic:
+  the case passed the full suite and two back-to-back frozen renders both diffed `unchanged`
+  (< 0.5 %). Only `grid_loading_overlay.png` was regenerated. (`grid/view.rs`, `render-tests/src/render.rs`,
+  `render-tests/baselines/grid_loading_overlay.png`)
+- [Phase 7] (post-CR) **A required pixel gate can no longer silently self-skip to green.** When
+  `FREECELL_RENDER=1` (operator explicitly wants the pixel suite) but `capture_available()` is false,
+  the suite now **FAILS** instead of skipping. Factored the policy into a pure `gate(want_render,
+  capture)` fn (Skip / Fail / Render) so it is unit-tested without the process-global env var +
+  `OnceLock` (three new tests, run on every `cargo test --workspace`). The `capture_available()`
+  skip is kept ONLY for the implicit path (`FREECELL_RENDER` unset — `cargo test --workspace` /
+  macOS). Belt-and-suspenders: `render_tests.sh` also asserts the tools (`xvfb-run`, `xrefresh`,
+  `xwininfo`, `import`, lavapipe ICD) exist before invoking cargo and exits non-zero otherwise, for a
+  clear early operator message even when the script is used directly.
+  (`render-tests/tests/render_suite.rs`, `render-tests/scripts/render_tests.sh`)
+- [Phase 7] (post-CR) **`scene.rs drain_to_idle` escalates the `DRAIN_CAP` (10 s) path to a hard
+  error** instead of returning `Ok(())` and rendering possibly-incomplete data. Keyed "done" off an
+  explicit publish signal was considered but not adopted: `WorkerEvent::Published` is a unit variant
+  carrying no generation, so precise keying would need publish-counting against coalescing, whereas
+  the 200 ms idle-gap drain works reliably (all 45 baselines) and now fails loudly on a genuine
+  worker fault rather than silently proceeding. (`render-tests/src/scene.rs`)
+- [Phase 7] (post-CR) **`capture.rs unique_colors` comment corrected to match the guard (not the
+  guard strengthened).** The guard rejects a capture with `<= 1` distinct colour (a failed present is
+  uniform); the stale comment claimed "a real grid has many colours". Fixed the comment rather than
+  raising the threshold, because a higher bar risks false-failing legitimately sparse captures and
+  the 45-case suite is green at the current bar; the real failure mode this guards (window didn't
+  present) is a single uniform colour, which the `>= 2` check catches. (`render-tests/src/capture.rs`)
+- [Phase 7] (post-CR) **`diff.rs` module doc reworded from "ported verbatim" to "a faithful
+  refactor" of round-3 C** — the metric and both tolerance constants are identical, but the code
+  extracts `pixel_delta` and adds `diff_image` (the magenta failure visualization), so "verbatim"
+  was inaccurate. Doc-only. (`render-tests/src/diff.rs`)

@@ -21,6 +21,7 @@ use gpui::{
     Rgba, Window,
 };
 use gpui_component::spinner::Spinner;
+use gpui_component::{Icon, IconName, Sizable as _};
 
 use freecell_core::cache::SheetCaches;
 use freecell_core::color::Rgb;
@@ -65,6 +66,9 @@ pub struct GridView {
     scrollbars_visible: bool,
     /// Render-test / debug override: keep the scrollbars visible regardless of activity.
     force_scrollbars: bool,
+    /// Render-test / debug override: freeze the loading spinner to a static icon (no
+    /// wall-clock-driven rotation) so a capture is deterministic. The app leaves this off.
+    freeze_spinner: bool,
     /// Monotonic scroll epoch; a fade task only hides if the epoch is unchanged when it fires.
     scroll_activity: u64,
     /// The last emitted visible range (for `ViewportChanged` debouncing).
@@ -111,6 +115,7 @@ impl GridView {
             loading: None,
             scrollbars_visible: false,
             force_scrollbars: false,
+            freeze_spinner: false,
             scroll_activity: 0,
             last_viewport: None,
             pending_reveal: None,
@@ -152,6 +157,15 @@ impl GridView {
     /// Forces the overlay scrollbars visible (render-test / debug hook).
     pub fn set_force_scrollbars(&mut self, force: bool, cx: &mut Context<Self>) {
         self.force_scrollbars = force;
+        cx.notify();
+    }
+
+    /// Freezes the loading spinner to a static loader icon (render-test / debug hook). The
+    /// animated `Spinner` rotates by wall-clock elapsed time, so a capture taken at an
+    /// arbitrary moment (after `xrefresh`) would be non-deterministic; freezing makes the
+    /// `grid_loading_overlay` baseline stable. The normal app leaves this off.
+    pub fn set_freeze_spinner(&mut self, freeze: bool, cx: &mut Context<Self>) {
+        self.freeze_spinner = freeze;
         cx.notify();
     }
 
@@ -700,6 +714,17 @@ impl Render for GridView {
 
         // ---- Loading overlay (over everything) ------------------------------------------
         if let Some(name) = self.loading.clone() {
+            // In the app the spinner animates; under a render-test capture it is FROZEN to a
+            // static loader icon (no `with_animation`), because the animation's rotation angle
+            // depends on wall-clock time between first paint and the frame grabbed at xrefresh —
+            // which would make the capture non-deterministic (`set_freeze_spinner`).
+            let spinner: AnyElement = if self.freeze_spinner {
+                Icon::new(IconName::Loader)
+                    .with_size(gpui_component::Size::Medium)
+                    .into_any_element()
+            } else {
+                Spinner::new().into_any_element()
+            };
             root_children.push(
                 div()
                     .absolute()
@@ -712,7 +737,7 @@ impl Render for GridView {
                     .justify_center()
                     .gap_3()
                     .bg(rgb(CELL_BG).opacity(0.7))
-                    .child(Spinner::new())
+                    .child(spinner)
                     .child(
                         div()
                             .text_color(rgb(HEADER_TEXT))

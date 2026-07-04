@@ -5485,6 +5485,21 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "render-tests"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "freecell-app",
+ "freecell-core",
+ "freecell-engine",
+ "gpui",
+ "gpui-component",
+ "gpui-component-assets",
+ "gpui_platform",
+ "image",
+ "parking_lot",
+ "tempfile",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "renderdoc-sys"

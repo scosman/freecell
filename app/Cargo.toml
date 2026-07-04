@@ -27,6 +27,9 @@ publish = false
 # Internal crates
 freecell-core = { path = "crates/freecell-core" }
 freecell-engine = { path = "crates/freecell-engine" }
+# `freecell-app` exposes a `[lib]` (`freecell_app`, Phase 6): `render-tests` (Phase 7) and
+# the perf harness (Phase 12) depend on it to render the real grid over fixtures.
+freecell-app = { path = "crates/freecell-app" }
 
 # Engine (exact pin — the number all experiment results are comparable against)
 ironcalc = "=0.7.1"

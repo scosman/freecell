@@ -698,6 +698,88 @@ mod tests {
     }
 
     #[gpui::test]
+    fn first_save_of_opened_file_writes_back_backup_once(cx: &mut TestAppContext) {
+        use crate::shell::lifecycle::backup_path;
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Budget.xlsx");
+        write_xlsx(&path);
+        let original = std::fs::read(&path).unwrap();
+
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0).unwrap());
+        let handle = cx.update(|cx| FreeCellApp::nth_window_handle(cx, 0).unwrap());
+        let canonical = cx
+            .update(|cx| entity.read(cx).path().map(|p| p.to_path_buf()))
+            .unwrap();
+        let backup = backup_path(&canonical);
+
+        // First save of a disk-opened document backs up the original bytes.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.save(false, window, ctx));
+            })
+            .unwrap();
+        assert!(
+            backup.exists(),
+            "the first save-in-place creates <name>.back"
+        );
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            original,
+            "the backup holds the original bytes"
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).has_error_modal()),
+            "a successful backup does not raise a dialog"
+        );
+
+        // Corrupt the backup, then save again — it must NOT be overwritten (write-once).
+        std::fs::write(&backup, b"sentinel").unwrap();
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.save(false, window, ctx));
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"sentinel",
+            "a later save must not overwrite the existing backup"
+        );
+    }
+
+    #[gpui::test]
+    fn backup_failure_aborts_the_save_with_a_dialog(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Budget.xlsx");
+        write_xlsx(&path);
+
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0).unwrap());
+        let handle = cx.update(|cx| FreeCellApp::nth_window_handle(cx, 0).unwrap());
+        let canonical = cx
+            .update(|cx| entity.read(cx).path().map(|p| p.to_path_buf()))
+            .unwrap();
+
+        // Remove the source so the pre-save `fs::copy` fails → the save aborts with a dialog.
+        std::fs::remove_file(&canonical).unwrap();
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.save(false, window, ctx));
+            })
+            .unwrap();
+        assert!(
+            cx.update(|cx| entity.read(cx).has_error_modal()),
+            "a backup failure surfaces the 'file not saved' dialog"
+        );
+        assert!(
+            !crate::shell::lifecycle::backup_path(&canonical).exists(),
+            "no backup is left behind when the copy fails"
+        );
+    }
+
+    #[gpui::test]
     fn save_failed_keeps_window_and_shows_non_closing_error(cx: &mut TestAppContext) {
         boot(cx);
         let (handle, entity) = new_injectable_window(cx);

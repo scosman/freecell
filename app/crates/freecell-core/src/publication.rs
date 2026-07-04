@@ -11,9 +11,40 @@ use std::ops::Range;
 
 use crate::color::Rgb;
 use crate::refs::SheetId;
+use crate::style::Align;
 
-/// One cell's published value: the display string and its optional format colour. Empty
-/// cells inside the viewport are simply omitted from [`Publication::cells`].
+/// The evaluated type of a published cell (`architecture.md §1.2`). Drives the grid's
+/// type-aware default alignment (`§1.3`) and could carry other type-specific presentation
+/// later. `Date` is a `Number` cell whose number format is date/time-like (the engine has
+/// no distinct date type — dates are serial numbers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum CellKind {
+    Number,
+    Date,
+    #[default]
+    Text,
+    Bool,
+    Error,
+}
+
+impl CellKind {
+    /// The type-aware default horizontal alignment for a cell with **no** explicit
+    /// alignment (`architecture.md §1.3`, GAPS #1): numbers and dates align right,
+    /// booleans and errors center, text left. An explicit [`Align`] on the cell's style
+    /// always wins over this default.
+    pub fn default_align(self) -> Align {
+        match self {
+            CellKind::Number | CellKind::Date => Align::Right,
+            CellKind::Bool | CellKind::Error => Align::Center,
+            CellKind::Text => Align::Left,
+        }
+    }
+}
+
+/// One cell's published value: the display string, its evaluated kind, and its optional
+/// resolved text colour. Empty cells inside the viewport are simply omitted from
+/// [`Publication::cells`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedCell {
     pub row: u32,
@@ -21,7 +52,11 @@ pub struct PublishedCell {
     /// The engine's formatted display text (numbers/dates/currency/errors already
     /// rendered to a string).
     pub display_text: String,
-    /// A number-format colour override (e.g. `[Red]`), if the format specifies one.
+    /// The cell's evaluated type — drives type-aware default alignment (`§1.3`).
+    pub kind: CellKind,
+    /// The fully-resolved text colour: the cell's explicit (non-black) font colour if set,
+    /// else the number format's produced colour (e.g. `[Red]` negatives), else `None`
+    /// (the grid's near-black default).
     pub text_color: Option<Rgb>,
 }
 
@@ -84,6 +119,7 @@ mod tests {
                 row: 12,
                 col: 4,
                 display_text: "42".into(),
+                kind: CellKind::Number,
                 text_color: None,
             }],
         };
@@ -92,5 +128,16 @@ mod tests {
         assert!(!p.covers(20, 4)); // row end is exclusive
         assert!(!p.covers(12, 8)); // col end is exclusive
         assert!(!p.covers(9, 4));
+    }
+
+    #[test]
+    fn cell_kind_default_align() {
+        assert_eq!(CellKind::Number.default_align(), Align::Right);
+        assert_eq!(CellKind::Date.default_align(), Align::Right);
+        assert_eq!(CellKind::Bool.default_align(), Align::Center);
+        assert_eq!(CellKind::Error.default_align(), Align::Center);
+        assert_eq!(CellKind::Text.default_align(), Align::Left);
+        // Text is the default kind (used for empty/unknown cells).
+        assert_eq!(CellKind::default(), CellKind::Text);
     }
 }

@@ -7,7 +7,7 @@
 //! [`DataRow`], feeds it [`DataRowEvent`]s, and performs the returned [`DataRowEffect`]s
 //! (send worker commands, move the grid selection, toggle the spinner, focus the grid).
 
-use crate::input_cap::validate_input;
+use crate::input_cap::{validate_input, InputRejection};
 use crate::selection::{Direction, Motion};
 
 /// The field's high-level mode.
@@ -36,8 +36,9 @@ pub struct DataRow {
     awaiting: bool,
     /// Whether the content-fetch spinner is currently shown.
     spinner: bool,
-    /// Whether the last commit attempt was input-cap rejected (danger border).
-    cap_error: bool,
+    /// The last commit attempt's input-cap rejection, if it was rejected (drives the danger
+    /// border + the cap-error popover message). `None` once cleared by the next edit/escape.
+    cap_rejection: Option<InputRejection>,
 }
 
 impl Default for DataRow {
@@ -49,7 +50,7 @@ impl Default for DataRow {
             latest_req: 0,
             awaiting: false,
             spinner: false,
-            cap_error: false,
+            cap_rejection: None,
         }
     }
 }
@@ -106,9 +107,15 @@ impl DataRow {
         self.spinner
     }
 
-    /// Whether the field is in the cap-rejected error state.
+    /// Whether the field is in the cap-rejected error state (drives the danger border).
     pub fn cap_error(&self) -> bool {
-        self.cap_error
+        self.cap_rejection.is_some()
+    }
+
+    /// The active input-cap rejection, if any — the popover reads it for its message
+    /// (`functional_spec.md §4.2`).
+    pub fn cap_rejection(&self) -> Option<InputRejection> {
+        self.cap_rejection
     }
 
     /// Clears the spinner and returns the `SetSpinner(false)` effect iff it was showing.
@@ -126,7 +133,7 @@ impl DataRow {
         self.mode = FieldMode::Idle;
         self.text.clear();
         self.awaiting = true;
-        self.cap_error = false;
+        self.cap_rejection = None;
         effects.push(DataRowEffect::Fetch {
             req_id: self.latest_req,
         });
@@ -158,7 +165,7 @@ impl DataRow {
                     self.text.clear();
                     self.committed.clear();
                     self.awaiting = false;
-                    self.cap_error = false;
+                    self.cap_rejection = None;
                 }
             }
             DataRowEvent::ContentFetched { req_id, raw } => {
@@ -186,7 +193,7 @@ impl DataRow {
                 self.mode = FieldMode::Editing;
                 self.text = text;
                 self.awaiting = false;
-                self.cap_error = false;
+                self.cap_rejection = None;
                 self.hide_spinner(&mut effects);
             }
             DataRowEvent::Commit => {
@@ -196,16 +203,16 @@ impl DataRow {
                             let input = self.text.clone();
                             self.committed = input.clone();
                             self.mode = FieldMode::Idle;
-                            self.cap_error = false;
+                            self.cap_rejection = None;
                             effects.push(DataRowEffect::Commit { input });
                             // Enter moves the active cell down; the resulting
                             // SelectionChanged will fetch the new cell's content.
                             effects.push(DataRowEffect::MoveActive(Motion::Move(Direction::Down)));
                             effects.push(DataRowEffect::FocusGrid);
                         }
-                        Err(_) => {
-                            // Cap-rejected: stay Editing, flag the error, don't commit.
-                            self.cap_error = true;
+                        Err(rejection) => {
+                            // Cap-rejected: stay Editing, record the reason, don't commit.
+                            self.cap_rejection = Some(rejection);
                             effects.push(DataRowEffect::ShowCapError);
                         }
                     }
@@ -222,11 +229,11 @@ impl DataRow {
                             let input = self.text.clone();
                             self.committed = input.clone();
                             self.mode = FieldMode::Idle;
-                            self.cap_error = false;
+                            self.cap_rejection = None;
                             effects.push(DataRowEffect::Commit { input });
                         }
-                        Err(_) => {
-                            self.cap_error = true;
+                        Err(rejection) => {
+                            self.cap_rejection = Some(rejection);
                             effects.push(DataRowEffect::ShowCapError);
                         }
                     }
@@ -236,7 +243,7 @@ impl DataRow {
                 if self.mode == FieldMode::Editing {
                     self.text = self.committed.clone();
                     self.mode = FieldMode::Idle;
-                    self.cap_error = false;
+                    self.cap_rejection = None;
                     effects.push(DataRowEffect::FocusGrid);
                 }
             }
@@ -349,6 +356,23 @@ mod tests {
         assert!(!effects
             .iter()
             .any(|e| matches!(e, DataRowEffect::Commit { .. })));
+    }
+
+    #[test]
+    fn cap_rejection_exposes_kind_and_clears() {
+        let mut d = idle_with("");
+        let huge = format!("={}", "1".repeat(crate::input_cap::MAX_INPUT_LEN));
+        d.reduce(DataRowEvent::Edited { text: huge });
+        d.reduce(DataRowEvent::Commit);
+        // The popover reads the specific rejection kind for its message.
+        assert!(matches!(
+            d.cap_rejection(),
+            Some(crate::input_cap::InputRejection::TooLong { .. })
+        ));
+        // The next keystroke clears the rejection (popover dismisses).
+        d.reduce(DataRowEvent::Edited { text: "=1".into() });
+        assert_eq!(d.cap_rejection(), None);
+        assert!(!d.cap_error());
     }
 
     #[test]

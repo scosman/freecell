@@ -21,6 +21,34 @@ pub const UNTITLED_FILE: &str = "Untitled.xlsx";
 /// The enforced workbook extension (MVP is `.xlsx`-only, `functional_spec.md §1, §5.2`).
 pub const XLSX_EXT: &str = "xlsx";
 
+/// The suffix appended to a document's path for its one-time backup copy
+/// (`functional_spec.md §7.3`): `Budget.xlsx` → `Budget.xlsx.back`.
+pub const BACKUP_SUFFIX: &str = ".back";
+
+/// The `.back` backup path for `path` — the full file name (extension included) with
+/// [`BACKUP_SUFFIX`] appended, so it never collides with the workbook itself.
+pub fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(BACKUP_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// The `.back` backup to create before a save, or `None` when no backup is due
+/// (`functional_spec.md §7.3`). A backup is due **iff** the document was opened from disk,
+/// the save target is that same path (never a Save-As to a new path), and the backup does
+/// not already exist (write-once across sessions).
+pub fn backup_target(opened_from: Option<&Path>, save_target: &Path) -> Option<PathBuf> {
+    let opened = opened_from?;
+    if opened != save_target {
+        return None;
+    }
+    let back = backup_path(opened);
+    if back.exists() {
+        return None;
+    }
+    Some(back)
+}
+
 /// The document name for a window: the path's file name, or `Untitled` when unsaved.
 pub fn document_name(path: Option<&Path>) -> String {
     path.and_then(|p| p.file_name())
@@ -193,6 +221,46 @@ mod tests {
     fn document_name_untitled_and_named() {
         assert_eq!(document_name(None), "Untitled");
         assert_eq!(document_name(Some(&path("/a/Budget.xlsx"))), "Budget.xlsx");
+    }
+
+    #[test]
+    fn backup_path_appends_back_to_full_name() {
+        assert_eq!(
+            backup_path(&path("/d/Budget.xlsx")),
+            path("/d/Budget.xlsx.back")
+        );
+        // The whole name (extension included) is preserved before `.back`.
+        assert_eq!(backup_path(&path("a.xlsx")), path("a.xlsx.back"));
+    }
+
+    #[test]
+    fn backup_target_first_save_in_place_is_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Budget.xlsx");
+        std::fs::write(&file, b"orig").unwrap();
+        // Opened from `file`, saving back to `file`, no `.back` yet → back up.
+        assert_eq!(backup_target(Some(&file), &file), Some(backup_path(&file)));
+    }
+
+    #[test]
+    fn backup_target_is_write_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Budget.xlsx");
+        std::fs::write(&file, b"orig").unwrap();
+        std::fs::write(backup_path(&file), b"orig").unwrap(); // backup already exists
+        assert_eq!(backup_target(Some(&file), &file), None);
+    }
+
+    #[test]
+    fn backup_target_skips_save_as_and_new_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = dir.path().join("Budget.xlsx");
+        let elsewhere = dir.path().join("Copy.xlsx");
+        std::fs::write(&opened, b"orig").unwrap();
+        // Save-As to a different path never backs up the original.
+        assert_eq!(backup_target(Some(&opened), &elsewhere), None);
+        // A never-opened (new) document has no origin to back up.
+        assert_eq!(backup_target(None, &opened), None);
     }
 
     #[test]

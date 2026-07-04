@@ -15,7 +15,7 @@ judgment calls in a `DECISIONS_TO_REVIEW.md` here).
 
 ## Phases
 
-- [ ] **Phase 1 — Quick wins & publication**: `.back` backup (§7.3); cap-error
+- [x] **Phase 1 — Quick wins & publication**: `.back` backup (§7.3); cap-error
       popover, data-row only for now (§7.2); `PublishedCell.kind` + populated
       `text_color` + type-aware default alignment + `[Red]` color (§1.2–1.3);
       update GAPS.md rows on completion.

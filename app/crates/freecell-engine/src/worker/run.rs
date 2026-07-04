@@ -27,7 +27,7 @@ use std::collections::HashSet;
 
 use freecell_core::input_cap::validate_input;
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{limits, CellRange, CellRef, Publication, PublishedCell, SheetId};
+use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
 use crate::cache;
 use crate::document::{DocumentSource, FontFlag, WorkbookDocument};
@@ -629,17 +629,23 @@ impl Worker {
                 let mut cells = Vec::new();
                 for row in vp.rows.clone() {
                     for col in vp.cols.clone() {
-                        if let Ok(text) = self.doc.formatted_value(idx, CellRef::new(row, col)) {
+                        let cell = CellRef::new(row, col);
+                        if let Ok(text) = self.doc.formatted_value(idx, cell) {
                             if !text.is_empty() {
+                                // Classify the cell + resolve its text colour ([Red]-style
+                                // number-format colour or explicit font colour, `§1.2`). A
+                                // rare read error defaults to plain text (never fails a
+                                // publish).
+                                let (kind, text_color) = self
+                                    .doc
+                                    .published_style(idx, cell)
+                                    .unwrap_or((CellKind::Text, None));
                                 cells.push(PublishedCell {
                                     row,
                                     col,
                                     display_text: text,
-                                    // Number-format colour ([Red]-style) is a palette index in
-                                    // the pinned engine, not an RGB; mapping it belongs with the
-                                    // Phase-5 style cache (which owns the colour table). P4
-                                    // publishes text only (DECISIONS_TO_REVIEW).
-                                    text_color: None,
+                                    kind,
+                                    text_color,
                                 });
                             }
                         }

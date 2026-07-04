@@ -25,7 +25,7 @@ use gpui_component::{Icon, IconName, Sizable as _};
 
 use freecell_core::cache::SheetCaches;
 use freecell_core::color::Rgb;
-use freecell_core::publication::Publication;
+use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::Motion;
 use freecell_core::{apply_motion, Align, Axis, CellRef, RenderStyle, SelectionModel, SheetDims};
@@ -910,19 +910,26 @@ impl GridView {
                     .and_then(|s| s.fill)
                     .map(to_rgba)
                     .unwrap_or_else(|| rgb(CELL_BG));
-                let (text, text_color) = match self.cell_index.get(&(r, c)) {
+                let (text, text_color, kind) = match self.cell_index.get(&(r, c)) {
                     Some(&idx) => {
                         let pc = &publication.cells[idx];
+                        // `pc.text_color` is already fully resolved (explicit non-black font
+                        // colour → number-format colour), so the `.or(font_color)` fallback is
+                        // redundant here — kept as a harmless minimal-diff belt-and-braces
+                        // (both use the same black-filter, so they agree). See DECISIONS §4.
                         let color = pc
                             .text_color
                             .or(style.and_then(|s| s.font_color))
                             .map(to_rgba)
                             .unwrap_or_else(|| rgb(CELL_TEXT));
-                        (pc.display_text.clone(), color)
+                        (pc.display_text.clone(), color, pc.kind)
                     }
-                    None => (String::new(), rgb(CELL_TEXT)),
+                    // Empty cells carry no text, so their kind never drives alignment.
+                    None => (String::new(), rgb(CELL_TEXT), CellKind::Text),
                 };
-                content_children.push(cell_element(x, y, w, h, fill, text, text_color, style));
+                content_children.push(cell_element(
+                    x, y, w, h, fill, text, text_color, kind, style,
+                ));
             }
         }
 
@@ -1236,6 +1243,7 @@ fn cell_element(
     fill: Rgba,
     text: String,
     text_color: Rgba,
+    kind: CellKind,
     style: Option<RenderStyle>,
 ) -> AnyElement {
     let mut el = div()
@@ -1257,7 +1265,12 @@ fn cell_element(
         .text_size(px(CELL_FONT_PX))
         .text_color(text_color);
 
-    el = match style.and_then(|s| s.h_align).unwrap_or(Align::Left) {
+    // Explicit alignment wins; otherwise fall back to the cell's type-aware default
+    // (numbers/dates right, booleans/errors center, text left — `architecture.md §1.3`).
+    el = match style
+        .and_then(|s| s.h_align)
+        .unwrap_or_else(|| kind.default_align())
+    {
         Align::Left => el.justify_start(),
         Align::Center => el.justify_center(),
         Align::Right => el.justify_end(),

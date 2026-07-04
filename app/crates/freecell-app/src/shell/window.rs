@@ -97,6 +97,10 @@ pub struct WorkbookWindow {
 
     /// The file's canonical path, or `None` for an unsaved (`Untitled`) workbook.
     path: Option<PathBuf>,
+    /// The disk path this document was opened from (`None` for a new workbook), captured at
+    /// construction and never changed by Save-As — the `.back` backup gate
+    /// (`functional_spec.md §7.3`).
+    opened_from: Option<PathBuf>,
     /// `Some(file_name)` renders the "Opening <name>…" loading state (`functional_spec.md
     /// §5.1`); `None` once the document has loaded.
     loading: Option<String>,
@@ -243,6 +247,9 @@ impl WorkbookWindow {
             sink_shared,
             sheets: Vec::new(),
             focus_handle,
+            // The disk path this document was opened from (captured before any Save-As can
+            // mutate `path`) — gates the one-time `.back` backup (`functional_spec.md §7.3`).
+            opened_from: path.clone(),
             path,
             loading,
             degraded: None,
@@ -607,13 +614,34 @@ impl WorkbookWindow {
     }
 
     /// Sends the atomic `Save` command (`functional_spec.md §5.2` — the Phase-3 temp+rename
-    /// write); `Saved`/`SaveFailed` drive the rest.
+    /// write); `Saved`/`SaveFailed` drive the rest. Before the write, a disk-opened file gets
+    /// a one-time `.back` backup of its original bytes (`§7.3`); a backup failure aborts the
+    /// save with a dialog — data safety wins over convenience.
     fn send_save(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(backup) = lifecycle::backup_target(self.opened_from.as_deref(), &path) {
+            if let Err(err) = std::fs::copy(&path, &backup) {
+                self.abort_save_with_backup_error(err, cx);
+                return;
+            }
+        }
         let req_id = self.next_req_id;
         self.next_req_id += 1;
         self.pending_save_req = Some(req_id);
         self.pending_save_path = Some(path.clone());
         self.client.send(Command::Save { path, req_id });
+        cx.notify();
+    }
+
+    /// Aborts a save whose pre-write `.back` backup couldn't be created (`§7.3`): the write is
+    /// never dispatched, any close/quit follow-up is cancelled, and a dialog explains it.
+    fn abort_save_with_backup_error(&mut self, err: std::io::Error, cx: &mut Context<Self>) {
+        self.close_after_save = false;
+        FreeCellApp::note_prompt_cancelled(cx);
+        self.modal = Some(ActiveModal::Error {
+            title: "Couldn't create backup".into(),
+            detail: format!("File not saved. The backup copy could not be written: {err}"),
+            close_window_on_dismiss: false,
+        });
         cx.notify();
     }
 

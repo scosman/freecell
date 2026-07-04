@@ -15,11 +15,16 @@ use std::fs::File;
 use std::io::{self, BufWriter, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use freecell_core::{CellRange, CellRef, Rgb};
+use freecell_core::format_color::{format_color_rgb, is_date_format};
+use freecell_core::{CellKind, CellRange, CellRef, Rgb};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
+use ironcalc_base::cell::CellValue;
 use ironcalc_base::expressions::types::Area;
-use ironcalc_base::types::{Style, Worksheet};
+use ironcalc_base::formatter::format::format_number;
+use ironcalc_base::locale::get_locale;
+use ironcalc_base::types::{CellType, Style, Worksheet};
+use ironcalc_base::Model;
 
 use crate::UserModel; // the crate's single canonical path to the IronCalc workbook type
 use tempfile::NamedTempFile;
@@ -282,6 +287,45 @@ impl WorkbookDocument {
         self.model
             .get_formatted_cell_value(sheet, row, col)
             .map_err(CellQueryError)
+    }
+
+    /// A published cell's evaluated [`CellKind`] and fully-resolved text colour
+    /// (`architecture.md §1.2`) — the two presentation attributes the worker adds to each
+    /// [`PublishedCell`](freecell_core::PublishedCell).
+    ///
+    /// - **kind**: the engine cell type (`get_cell_type`) mapped to `CellKind`, with a
+    ///   `Number` reclassified to `Date` when its number format is date/time-like (the
+    ///   engine stores dates as serial numbers, so it has no distinct date type).
+    /// - **text colour** (precedence per `§1.2`): the cell's explicit non-black font colour
+    ///   if set; else the number format's produced colour (e.g. `[Red]` negatives) when the
+    ///   format specifies one and the value is numeric; else `None` (the grid's default).
+    pub fn published_style(
+        &self,
+        sheet: u32,
+        cell: CellRef,
+    ) -> Result<(CellKind, Option<Rgb>), CellQueryError> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        let cell_type = self
+            .model
+            .get_cell_type(sheet, row, col)
+            .map_err(CellQueryError)?;
+        let model = self.model.get_model();
+        let style = model
+            .get_style_for_cell(sheet, row, col)
+            .map_err(CellQueryError)?;
+
+        let kind = match cell_type {
+            CellType::Number if is_date_format(&style.num_fmt) => CellKind::Date,
+            CellType::Number => CellKind::Number,
+            CellType::LogicalValue => CellKind::Bool,
+            CellType::ErrorValue => CellKind::Error,
+            // Text, and the rare Array / CompoundData results, default to text alignment.
+            _ => CellKind::Text,
+        };
+
+        let text_color = resolve_text_color(model, sheet, row, col, &style);
+        Ok((kind, text_color))
     }
 
     /// The raw content of a cell: the `=formula` text for formula cells, the literal for
@@ -558,6 +602,36 @@ impl WorkbookDocument {
     }
 }
 
+/// The fully-resolved text colour for a cell (`architecture.md §1.2`, precedence: explicit
+/// non-black font colour → number-format `[Red]`-style colour → `None`). Shares the cache's
+/// [`parse_color`](crate::cache::parse_color) + black-filter so it agrees with the resident
+/// style cache the grid also reads.
+fn resolve_text_color(model: &Model, sheet: u32, row: i32, col: i32, style: &Style) -> Option<Rgb> {
+    // 1. An explicit non-black font colour always wins (a pure-black colour is
+    //    indistinguishable from IronCalc's default, so it falls through — matching the cache).
+    if let Some(rgb) = style
+        .font
+        .color
+        .as_deref()
+        .and_then(crate::cache::parse_color)
+        .filter(|c| *c != Rgb::new(0, 0, 0))
+    {
+        return Some(rgb);
+    }
+    // 2. A number-format-produced colour (e.g. `[Red]` negatives). Only formats carrying a
+    //    `[...]` section can produce one, and only numeric values are formatted — gate on
+    //    both to avoid formatting text/blank cells.
+    if !style.num_fmt.contains('[') {
+        return None;
+    }
+    let value = match model.get_cell_value_by_index(sheet, row, col) {
+        Ok(CellValue::Number(v)) => v,
+        _ => return None,
+    };
+    let locale = get_locale(&model.workbook.settings.locale).ok()?;
+    format_color_rgb(format_number(value, &style.num_fmt, locale).color?)
+}
+
 /// Converts a 0-based [`CellRef`] to IronCalc's 1-based `(row, column)` `i32` coordinates.
 /// The Excel-max bounds (`freecell_core::limits`) fit comfortably in `i32`.
 fn to_engine_coords(cell: CellRef) -> (i32, i32) {
@@ -680,6 +754,64 @@ mod tests {
     fn to_engine_coords_is_one_based() {
         assert_eq!(to_engine_coords(CellRef::new(0, 0)), (1, 1)); // A1
         assert_eq!(to_engine_coords(CellRef::new(6, 1)), (7, 2)); // B7
+    }
+
+    #[test]
+    fn published_style_maps_cell_kinds() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "42").unwrap(); // number
+        doc.set_cell_input(0, CellRef::new(1, 0), "hello").unwrap(); // text
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap(); // bool
+        doc.set_cell_input(0, CellRef::new(3, 0), "=1/0").unwrap(); // error
+        doc.set_cell_input(0, CellRef::new(4, 0), "2021-01-01")
+            .unwrap(); // date (inferred fmt)
+        doc.evaluate();
+
+        let kind = |r| doc.published_style(0, CellRef::new(r, 0)).unwrap().0;
+        assert_eq!(kind(0), CellKind::Number);
+        assert_eq!(kind(1), CellKind::Text);
+        assert_eq!(kind(2), CellKind::Bool);
+        assert_eq!(kind(3), CellKind::Error);
+        assert_eq!(kind(4), CellKind::Date, "a date-formatted number is Date");
+    }
+
+    #[test]
+    fn published_style_resolves_format_and_explicit_colors() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        let range = CellRange::single(a1);
+        // A currency format whose negative section is `[Red]`.
+        doc.set_cell_input(0, a1, "-5").unwrap();
+        doc.user_model_mut()
+            .update_range_style(&area_of(0, range), "num_fmt", "$#,##0.00;[Red]$#,##0.00")
+            .unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, a1).unwrap().1,
+            Some(Rgb::new(0xFF, 0, 0)),
+            "a negative value under a [Red] format publishes red text"
+        );
+
+        // A positive value uses the (colourless) positive section → no override.
+        doc.set_cell_input(0, a1, "5").unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, a1).unwrap().1,
+            None,
+            "the positive section has no colour"
+        );
+
+        // An explicit non-black font colour wins over the format colour.
+        doc.set_cell_input(0, a1, "-5").unwrap();
+        doc.user_model_mut()
+            .update_range_style(&area_of(0, range), "font.color", "#00AA00")
+            .unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, a1).unwrap().1,
+            Some(Rgb::new(0x00, 0xAA, 0x00)),
+            "explicit font colour beats the number-format colour"
+        );
     }
 
     #[test]

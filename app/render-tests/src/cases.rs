@@ -150,8 +150,13 @@ pub fn all() -> Vec<RenderCase> {
         ),
         cell("cell_number_percent", Scene::new().input(1, 1, "50%")),
         cell(
-            // The [Red] number-format COLOUR is not yet published (Phase-4: text_color = None);
-            // this baseline shows the negative number correctly formatted in the default colour.
+            // NOTE (mvp-gaps Phase 1): despite the name, this renders in the DEFAULT colour,
+            // not red. IronCalc infers `#,##0.00` from `-1,234.50` — a single colourless
+            // section — so `resolve_text_color` short-circuits (`!num_fmt.contains('[')`) and
+            // publishes no `text_color`. Phase 1 changes only its ALIGNMENT (Number → right).
+            // The `[Red]` text-colour path (GAPS #2) has no render case — the Scene builder
+            // can't set a custom `num_fmt` — so it is guarded by the engine integration test
+            // `published_style_resolves_format_and_explicit_colors` (see DECISIONS §6).
             "cell_number_negative_red",
             Scene::new().input(1, 1, "-1,234.50"),
         ),
@@ -174,6 +179,12 @@ pub fn all() -> Vec<RenderCase> {
         cell(
             "cell_align_right_number",
             Scene::new().input(1, 1, "42").align(1, 1, Align::Right),
+        ),
+        cell(
+            // A number defaults right (Phase-1 §1.3); an explicit Left alignment overrides
+            // the type-default — the mirror of `cell_align_explicit_overrides_default`.
+            "cell_number_align_left",
+            Scene::new().input(1, 1, "42").align(1, 1, Align::Left),
         ),
         cell(
             "cell_align_center_explicit",

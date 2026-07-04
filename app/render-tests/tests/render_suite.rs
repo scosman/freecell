@@ -181,7 +181,8 @@ render_cases! {
     // Formula errors
     cell_error_div0, cell_error_name, cell_error_circ,
     // Layout / alignment / geometry
-    cell_align_left_text, cell_align_right_number, cell_align_center_explicit,
+    cell_align_left_text, cell_align_right_number, cell_number_align_left,
+    cell_align_center_explicit,
     cell_align_explicit_overrides_default, cell_text_clipped, cell_text_exact_fit,
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
     // Whole-grid scenes

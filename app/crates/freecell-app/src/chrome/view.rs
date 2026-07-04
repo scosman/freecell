@@ -30,6 +30,7 @@ use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
+use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
@@ -52,11 +53,17 @@ const TEXT: u32 = 0x1F1F1F;
 const MUTED_TEXT: u32 = 0x555555;
 /// Danger border/text for cap-rejected input + invalid rename (theme danger, `#DC2626`).
 const DANGER: u32 = 0xDC2626;
+/// Dark tooltip fill + text for the cap-error popover (`ui_design.md §4`).
+const TOOLTIP_BG: u32 = 0x2B2B2B;
+const TOOLTIP_TEXT: u32 = 0xF5F5F5;
 
 const ACTION_ROW_H: f32 = 36.0;
 const DATA_ROW_H: f32 = 32.0;
 const TAB_BAR_H: f32 = 30.0;
 const REF_BOX_W: f32 = 72.0;
+/// The content field's left edge inside the data row = padding + ref box + gap + divider +
+/// gap (`render_data_row` layout); the cap-error popover anchors here.
+const DATA_ROW_CONTENT_LEFT: f32 = 8.0 + REF_BOX_W + 8.0 + 1.0 + 8.0;
 
 /// The chrome around the grid: action row + data row + sheet tab bar.
 pub struct ChromeView {
@@ -76,9 +83,9 @@ pub struct ChromeView {
     data_row: DataRow,
     /// The content field's text buffer (stock gpui-component input).
     content_input: Entity<InputState>,
-    /// A worker `EditRejected{InputCap}` backstop flag (the UI validates first, so this is
-    /// rare); shows the danger border like a local cap reject.
-    cap_error_external: bool,
+    /// A worker `EditRejected{InputCap}` backstop (the UI validates first, so this is rare);
+    /// carries the rejection so the popover shows the same message as a local cap reject.
+    cap_error_external: Option<InputRejection>,
 
     /// The evaluating-spinner state machine (`freecell-core`).
     eval: EvalIndicator,
@@ -140,7 +147,7 @@ impl ChromeView {
             active_style: None,
             data_row: DataRow::default(),
             content_input,
-            cap_error_external: false,
+            cap_error_external: None,
             eval: EvalIndicator::default(),
             fill_open: false,
             color_picker,
@@ -186,7 +193,7 @@ impl ChromeView {
         cx: &mut Context<Self>,
     ) {
         self.selection = selection;
-        self.cap_error_external = false;
+        self.cap_error_external = None;
         self.active_style = if selection.is_single() {
             self.client
                 .render_style(self.active_sheet, selection.active)
@@ -261,9 +268,9 @@ impl ChromeView {
                 cx.notify();
             }
             WorkerEvent::EditRejected {
-                reason: EditRejectedReason::InputCap(_),
+                reason: EditRejectedReason::InputCap(rejection),
             } => {
-                self.cap_error_external = true;
+                self.cap_error_external = Some(rejection);
                 cx.notify();
             }
             // Published/Saved/SaveFailed/StyleCacheUpdated/other EditRejected reasons /
@@ -291,6 +298,10 @@ impl ChromeView {
     ) {
         match event {
             InputEvent::Change => {
+                // A keystroke dismisses the cap-error popover (`functional_spec.md §4.2`): the
+                // reducer clears its own rejection in `Edited`; the worker backstop is cleared
+                // here so both sources dismiss on the next keystroke.
+                self.cap_error_external = None;
                 let text = self.content_input.read(cx).value().to_string();
                 let effects = self.data_row.reduce(DataRowEvent::Edited { text });
                 self.apply_data_effects(effects, window, cx);
@@ -312,7 +323,15 @@ impl ChromeView {
                 self.apply_data_effects(effects, window, cx);
                 cx.notify();
             }
-            InputEvent::Focus | InputEvent::Blur => {}
+            InputEvent::Blur => {
+                // Focus leaving the field dismisses the cap-error popover
+                // (`functional_spec.md §4.2`). The reducer clears its own rejection on the
+                // next edit/escape; the worker backstop is cleared here.
+                if self.cap_error_external.take().is_some() {
+                    cx.notify();
+                }
+            }
+            InputEvent::Focus => {}
         }
     }
 
@@ -684,7 +703,16 @@ impl ChromeView {
 
     /// Whether the content field shows the cap-rejection danger state.
     pub fn cap_error_visible(&self) -> bool {
-        self.data_row.cap_error() || self.cap_error_external
+        self.data_row.cap_error() || self.cap_error_external.is_some()
+    }
+
+    /// The cap-error popover message (`functional_spec.md §4.2`), if a cap rejection is
+    /// active. A local reject (the reducer's) takes precedence over the worker backstop.
+    pub fn cap_error_message(&self) -> Option<String> {
+        self.data_row
+            .cap_rejection()
+            .or(self.cap_error_external)
+            .map(|r| r.message())
     }
 
     /// The active sheet id.
@@ -967,6 +995,9 @@ impl ChromeView {
     fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut overlays: Vec<gpui::AnyElement> = Vec::new();
 
+        if let Some(message) = self.cap_error_message() {
+            overlays.push(self.render_cap_error_popover(message));
+        }
         if self.fill_open {
             overlays.push(self.render_fill_popover(cx));
         }
@@ -990,6 +1021,26 @@ impl ChromeView {
                 on_dismiss(this, window, cx);
             }),
         )
+    }
+
+    /// The cap-error popover (`functional_spec.md §4.2`, `ui_design.md §4`): a small dark
+    /// tooltip anchored just below the data-row content field's left edge. No backdrop — it
+    /// auto-dismisses on the next keystroke (reducer clears its rejection) or focus change.
+    fn render_cap_error_popover(&self, message: String) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .top(px(ACTION_ROW_H + DATA_ROW_H + 2.0))
+            .left(px(DATA_ROW_CONTENT_LEFT))
+            .px_2()
+            .py_1()
+            .bg(rgb(TOOLTIP_BG))
+            .text_color(rgb(TOOLTIP_TEXT))
+            .text_size(px(11.0))
+            .rounded_md()
+            .shadow_md()
+            .whitespace_nowrap()
+            .child(message)
+            .into_any_element()
     }
 
     fn render_fill_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1469,6 +1520,15 @@ mod tests {
         );
         assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
         assert!(upd(&h, cx, |c, _w, _cx| c.cap_error_visible()));
+        // The popover shows the length-specific message (`functional_spec.md §4.2`).
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.cap_error_message()),
+            Some("Formula too long (max 8,192 characters)".to_string())
+        );
+        // The next keystroke clears the danger state + popover.
+        upd(&h, cx, |c, window, cx| c.test_type("=1", window, cx));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.cap_error_visible()));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.cap_error_message()), None);
     }
 
     #[gpui::test]
@@ -1849,5 +1909,14 @@ mod tests {
             );
         });
         assert!(upd(&h, cx, |c, _w, _cx| c.cap_error_visible()));
+        // The worker backstop carries the rejection, so the popover message matches too.
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.cap_error_message()),
+            Some("Formula too long (max 8,192 characters)".to_string())
+        );
+        // The next keystroke dismisses the backstop popover (`functional_spec.md §4.2`).
+        upd(&h, cx, |c, window, cx| c.test_type("=1", window, cx));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.cap_error_visible()));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.cap_error_message()), None);
     }
 }

@@ -33,7 +33,7 @@ comment on `shell/window.rs`, not a real test — the compiled count is 92.)
 |---|---|---|
 | §2.1 Launch with no doc → Welcome | Auto | `shell/app.rs::welcome_window_opens_on_show` |
 | §2.1 Open `.xlsx` via CLI argv / xdg (Linux best-effort) | Auto+Manual | `main.rs` `xlsx_arg` wiring; **M-1** (launch with a fixture path) |
-| §2.1 macOS Finder open-file (`on_open_urls`) | Known-limitation | Deferred at pinned rev (callback lacks `cx`); CLI argv is the wired path. `DECISIONS` Phase 10; **M-15** documented-manual (macOS) |
+| §2.1 macOS Finder open-file (`on_open_urls`) | Known-limitation | Deferred at pinned rev (callback lacks `cx`); CLI argv is the wired path. `DECISIONS` Phase 10; **M-15** documented-manual (macOS). Home: `projects/mvp-deferred-behaviors.md` (#4) |
 | §2.2 New Spreadsheet button → empty workbook window, Welcome closes | Auto+Manual | `shell/app.rs::new_workbook_registers_a_document_window`; **M-2** |
 | §2.2 Open… button → native picker, opens on success / stays on cancel | Manual | Native panel — **M-3** (driven), **M-16** (macOS NSOpenPanel doc) |
 | §2.2 No recent-files list (MVP) | N/A | Explicit MVP omission (§8) |
@@ -94,7 +94,7 @@ comment on `shell/window.rs`, not a real test — the compiled count is 92.)
 | Click another cell commits pending first, then moves | Auto | `data_row.rs::edit_commit_on_cell_click`; `chrome/view.rs::edit_commit_requested_commits_without_moving` |
 | Delete/Backspace (grid focus) clears selected cells, one undo | Auto | `grid/input.rs::delete_backspace_clear`; `GridEvent::ClearCells` → `worker/run.rs` `ClearCells` |
 | Input cap: reject formula > 8192 chars / depth > 64, keep focus + inline error, cell unmodified | Auto | `input_cap.rs::rejects_over_length`, `rejects_over_nesting_depth`, `rejects_round3_d_deep_parens_reproducer`, `rejects_round3_d_flat_chain_reproducer`, `boundary_at_exactly_the_caps`, `paren_in_string_literal_not_counted`; `data_row.rs::cap_reject_keeps_editing`; `worker/run.rs::worker_side_cap_rejects_abort_reproducers_without_touching_engine`; `chrome/view.rs::cap_reject_keeps_editing_and_flags_error`, `worker_input_cap_reject_flags_error` |
-| Input-cap error shows inline message-popover text | Known-limitation | Danger **border** only; message-popover text deferred (`DECISIONS` Phase 9 post-CR). Cell unmodified + focus kept are covered. `PROJECTS`: chrome polish |
+| Input-cap error shows inline message-popover text | Known-limitation | Danger **border** only; message-popover text deferred (`DECISIONS` Phase 9 post-CR). Cell unmodified + focus kept are covered. Home: `projects/mvp-deferred-behaviors.md` (#3) |
 
 ### §3.4 Formulas
 

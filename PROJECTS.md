@@ -11,6 +11,15 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 ## Backlog
 
+- **MVP Deferred Behaviors (tracked gaps)** — *Future (deferred from the MVP build,
+  2026-07-04).* The consolidated list of `functional_spec.md` behaviors the MVP ships
+  **deferred** — type-based default cell alignment (§3.6), `[Red]` number-format text
+  color (§3.6), input-cap rejection message text (§3.3), and macOS Finder open-file
+  (§2.1), plus the bundled-Inter nicety. None are calculation gaps (values/formats/errors
+  are correct); they're presentation / entry-point deferrals, each with severity, root
+  cause, and a fix sketch. One-stop so nothing is lost.
+  → [`projects/mvp-deferred-behaviors.md`](projects/mvp-deferred-behaviors.md)
+
 - **All-Styles Resident Cache (grid geometry + styling)** — *Near-MVP.*
   An always-resident cache of the full resolved style for the sheet — **all** row/col
   sizes (geometry) + fills/lines/bold/number-format — **not** viewport-based. Needed to

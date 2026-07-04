@@ -29,8 +29,10 @@ tracing-subscriber.workspace = true
 # no-poisoning choice, workspace Cargo.toml).
 arc-swap.workspace = true
 parking_lot.workspace = true
-# `anyhow` (edge errors) and `tracing` (span/event macros) arrive with the app shell +
-# document client in later phases; added when first exercised, not forward-declared here.
+# `tracing` (span/event macros) is used by the Phase-10 app shell (fonts hook + lifecycle
+# logging). `anyhow` is not yet used directly (gpui returns its own `Result` from
+# `open_window`), so it stays out of the manifest until first exercised.
+tracing.workspace = true
 
 [dev-dependencies]
 # Phase 9 chrome interaction tests drive `ChromeView` through gpui's headless
@@ -38,6 +40,8 @@ parking_lot.workspace = true
 # (additive: only enabled for test builds, so the release binary stays lean). This is the
 # same knob gpui-component enables for its own widget tests.
 gpui = { workspace = true, features = ["test-support"] }
+# Phase 10 save-flow tests spawn a real `NewWorkbook` worker and write to a temp dir.
+tempfile.workspace = true
 
 [lints]
 workspace = true

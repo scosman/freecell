@@ -708,3 +708,115 @@ Known placeholders the build will resolve (append the resolution here):
   precise `InputRejection` reason). Recording per the CR (UI approved fine-for-MVP); a future
   pass adds the reason text. (`chrome/view.rs` `render_data_row` cap-error branch,
   `DataRowEffect::ShowCapError` is a no-op in `apply_data_effects`)
+
+- [Phase 10] **Lifecycle/registry/save/quit DECISIONS are extracted to gpui-free modules
+  (`shell/registry.rs`, `shell/lifecycle.rs`) and unit-tested headlessly** (20 pure tests in
+  `cargo test --workspace`); the GPUI submodules (`shell/app.rs` `FreeCellApp` global,
+  `shell/window.rs` `WorkbookWindow`, `shell/welcome.rs`, `shell/menus.rs`) are thin plumbing
+  that performs those decisions. `components/app_shell.md`'s test plan only lists pure logic in
+  `freecell-core`; the shell decisions live in `freecell-app` (gpui-allowed crate) but the
+  modules themselves import no gpui, so they test with plain `#[test]`. The registry keys
+  windows on an opaque `WindowKey(u64)` (not gpui `WindowId`) so it stays pure.
+  (`crates/freecell-app/src/shell/{registry,lifecycle}.rs`)
+- [Phase 10] **Last-window-closes-quits is implemented in the `on_window_closed` observer →
+  `WindowRegistry::is_empty()` → `cx.quit()`.** The welcome window counts toward the open
+  count (`open_count = workbook windows + welcome`), so closing Welcome with no workbook
+  windows also quits (`functional_spec.md §2`). The observer body is wrapped in `cx.defer(…)`
+  so it never runs nested inside another `update_global` lease (a `remove_window` issued from
+  within the welcome-close flow synchronously fires the observer → a nested `update_global`
+  would panic "no global registered"). (`shell/app.rs on_window_closed`)
+- [Phase 10] **The good close-interception API EXISTS at the pinned rev — NO data-loss
+  papercut.** `components/app_shell.md §Lifecycle rules` flagged that the traffic-light close
+  might skip the dirty prompt if `on_should_close` were absent. `Window::on_window_should_close
+  (cx, |window, cx| -> bool)` is present and used: a dirty window vetoes the OS close and shows
+  the unsaved-changes modal. The fallback (Cmd+W-only interception) was NOT needed.
+  (`shell/app.rs open_document`, `shell/window.rs on_titlebar_close`)
+- [Phase 10] **Per-platform key bindings = one action list, two keymaps via
+  `cfg!(target_os = "macos")`.** Actions (`shell/mod.rs actions!`) bind to `cmd-*` on macOS and
+  `ctrl-*` on Linux (`functional_spec.md §2.4`). The macOS menu bar (`cx.set_menus`) is
+  installed only on macOS; Linux has no menu bar (every action reachable via its shortcut).
+  Window-scoped actions (Save/SaveAs/CloseWindow/Undo/Redo/ToggleBold/Italic/Underline) are
+  registered on the `WorkbookWindow` root element (so they are disabled on Welcome = no handler
+  in scope); New/Open/About/Quit are global. (`shell/menus.rs`, `shell/window.rs`, `shell/app.rs`)
+- [Phase 10] **Silent-strip save (no fidelity warning, `functional_spec.md §5.2`).** `Save`
+  resolves a `SaveTarget` (titled `Save` → its path; untitled / `Save As` → native save panel
+  with `.xlsx` enforced), then sends `Command::Save{path, req_id}` and folds `Saved`/`SaveFailed`.
+  There is deliberately no fidelity dialog — a successful write silently drops anything IronCalc
+  can't model (the warn-and-strip UX is `projects/xlsx-preservation.md`).
+  (`shell/window.rs save/send_save`, `shell/lifecycle.rs resolve_save_target`)
+- [Phase 10] **gpui `PathPromptOptions` has NO extension filter at the pinned rev.** So the
+  open panel can't be restricted to `.xlsx` in-dialog; the restriction is enforced *after*
+  selection by the loader's typed `LoadError::NotXlsx` (a non-xlsx pick opens a loading window
+  that immediately shows the error dialog and closes). Recorded as an API limitation.
+  (`shell/window.rs open_panel_options`)
+- [Phase 10] **Finder open-file events (`App::on_open_urls`) are deferred (best-effort per
+  `components/app_shell.md`).** The pinned-rev callback is `FnMut(Vec<String>)` with **no `cx`**,
+  so it can't open a window from inside itself without an app-global channel; skipped for the
+  MVP. **CLI `.xlsx` argv open IS wired** in `main.rs` (both platforms) — the Linux/CLI path the
+  spec calls best-effort. macOS Finder double-click / xdg association is a follow-up.
+  (`main.rs xlsx_arg`, `shell/app.rs` — no `on_open_urls` wiring)
+- [Phase 10] **Bundled Inter is NOT vendored yet; `register_fonts` is a best-effort hook.**
+  `components/app_shell.md §Structure` / `ui_design.md §3.3` bundle Inter via `add_fonts` before
+  any window opens. The four Inter TTFs are not committed (the Phase-6/7 render baselines were
+  captured on gpui's default UI font — vendoring + `add_fonts` now would change every baseline).
+  `register_fonts` logs + no-ops; the app runs on the default font. **Phase 13 owns the font
+  pass** (vendor `assets/fonts/Inter-*.ttf` + flip the hook + regenerate baselines).
+  (`shell/fonts.rs`)
+- [Phase 10] **macOS edited-dot vs `— Edited` suffix.** `Window::set_window_edited` exists at
+  the pinned rev, so on macOS the dirty state shows as the native document-edited dot and the
+  title stays clean; on Linux the fallback `— Edited` title suffix is used
+  (`title_uses_suffix() = !cfg!(target_os = "macos")`). Both drive from the same op-accounting
+  dirty flag. (`shell/window.rs refresh_dirty/title_uses_suffix`, `shell/lifecycle.rs window_title`)
+- [Phase 10] **`WorkbookWindow` is the shell scaffold; grid+chrome composition is Phase 11.**
+  It owns the worker (`DocumentClient`), loading/degraded/dirty state, the window title + edited
+  dot, all modals, and the save/close flows, and folds only the *lifecycle* worker events
+  (Loaded/LoadFailed/Saved/SaveFailed/Published/WorkerDegraded). It renders a placeholder body;
+  Phase 11 replaces it with the composed grid+chrome and routes the remaining events
+  (CellContent/EvalStarted/Finished/StyleCacheUpdated/SheetsChanged/EditRejected). The
+  `ToggleBold/Italic/Underline` action handlers are registered as **keyboard-only no-op
+  placeholders** (cmd/ctrl-b/i/u) — the real handlers need the grid selection range and land in
+  Phase 11; there is **no Format menu** yet, so nothing else references them. `Undo`/`Redo` send
+  real `Command`s; `Save`/`SaveAs`/`Close Window` are fully functional. **About is a single
+  path**: it is registered *only* as a global action (`app.rs`) that routes to the frontmost
+  document window (else the welcome window) — the earlier duplicate per-window `About` handler
+  was removed so `do_show_about`'s document-window branch is live, not dead. (`shell/window.rs`,
+  `shell/app.rs do_show_about`)
+- [Phase 10] **Only worker-*emission* flows (not the folding logic) are undrivable in
+  `#[gpui::test]`.** `DocumentClient::spawn` runs the eval worker on a real OS thread; gpui's
+  `TestScheduler` panics at `end_test` if a test observes cross-thread activity (via
+  `run_until_parked`) — so the *end-to-end* flows that wait for the worker to **emit** an event
+  (welcome-closes-on-`Loaded`, the save round-trip's real `Saved`, a real `LoadFailed`) can't be
+  driven headlessly here (covered by the `freecell-engine` round-trips `roundtrip.rs` /
+  `worker_seam.rs` + the manual smoke checklist below + Phase-11 integration). The event
+  **folding** logic, however, **IS** deterministically testable by **injecting** a synthesized
+  `WorkerEvent` straight into `on_worker_event` (no emission, no parking): three injection tests
+  now cover the highest-risk arms — `saved_adopts_canonical_path_and_closes_after_save` (path
+  adoption + close-on-save), `save_failed_keeps_window_and_shows_non_closing_error` (quit-abort +
+  non-closing error, stays open), `load_failed_shows_closing_error_and_clears_loading`
+  (close-on-dismiss dialog). Together with the pure decision logic (registry/lifecycle/quit,
+  21 tests) and the 5 synchronous lifecycle tests (`welcome_window_opens_on_show`,
+  `new_workbook_registers_a_document_window`, `open_dedupes_same_path_activates_existing`,
+  `close_dirty_prompts_and_cancel_keeps_window`, `clean_close_does_not_prompt`). **Manual smoke
+  checklist (Phase 13 executes + records):**
+  welcome New/Open buttons; new-workbook window opens + welcome closes; open a real `.xlsx` (CLI
+  argv) → document window; Save/Save-As native panel writes `.xlsx`; Save-failed dialog keeps
+  dirty; close-dirty Save/Don't-Save/Cancel; Cmd/Ctrl+Q multi-window quit with per-window
+  prompts + Cancel aborts; macOS traffic-light close prompt; menu enable/disable on Welcome vs
+  document; the degraded bar's real **Save As…** button; Welcome Cmd/Ctrl+W closes it; launching
+  with a **bad `.xlsx` path** surfaces an error dialog on the welcome window (no invisible app).
+  Runtime-verified this phase: the app boots under Xvfb+lavapipe (`FreeCellApp::init` +
+  `show_welcome` open the welcome window, clean exit, no panics). (`shell/app.rs tests`, `main.rs`)
+- [Phase 10 · code-review fixes] Behavior hardened after review: **(a)** the quit-prompt order
+  (`front_to_back_keys`) is now the **union** of the `window_stack()` order and every registered
+  window — a partial/empty stack can never let a dirty window skip its prompt and be force-closed.
+  **(b)** A startup/`Open…` path that fails to resolve now reports on the frontmost document
+  window if one is active, else **opens the welcome window to host the error dialog** — no more
+  windowless, unquittable zombie on a bad CLI path (`report_error`, `functional_spec.md §5.1`).
+  **(c)** `Saved` **canonicalizes** the adopted Save-As path before storing/registering, so a
+  later open of that file dedupes (`§5.1`). **(d)** A window not in the quit's pending set closing
+  mid-quit no longer re-issues the in-flight prompt (`on_window_closed` gates on
+  `QuitPlan::is_pending`). (`shell/app.rs`, `shell/window.rs`, `shell/lifecycle.rs`)
+- [Phase 10] **`anyhow` not added; `tracing` added.** gpui's `open_window` returns its own
+  `anyhow::Result` (handled with `.expect`), so `freecell-app` needs no direct `anyhow` dep yet;
+  `tracing` is now a live dep (the `register_fonts` hook logs). `tempfile` added as a dev-dep for
+  the save-flow test fixtures. (`crates/freecell-app/Cargo.toml`)

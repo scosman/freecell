@@ -1,25 +1,23 @@
-//! FreeCell application entry point.
+//! FreeCell application entry point (`components/app_shell.md §Structure`,
+//! `functional_spec.md §2`).
 //!
-//! Phase 6 mounts the custom [`GridView`](freecell_app::grid::GridView) over hand-built
-//! `freecell-core` fixtures (`grid::fixtures::demo_sources`) inside a gpui-component `Root`,
-//! replacing the Phase-1 hello-world. This gives a real, capturable spreadsheet grid frame
-//! (headers, gridlines, styled cells, selection) on both macOS (Metal) and Linux
-//! (blade/Vulkan). The real app shell + chrome (`components/app_shell.md`) and the engine
-//! wiring (`components/engine_worker.md`) land in later phases; this bin stays a thin
-//! bootstrap that hosts the grid.
+//! Phase 10 replaces the Phase-6 demo grid window with the real app shell: initialize
+//! gpui-component + fonts, install the [`FreeCellApp`] global (window registry, menus, key
+//! bindings, action handlers), then show the welcome window — or open a `.xlsx` passed on the
+//! command line. The document window's grid + chrome composition is wired in Phase 11; this
+//! bin stays a thin bootstrap.
 //!
 //! The `--exit-after-ms` flag remains the Linux render-spike safety valve
-//! (`architecture.md §9`, `DECISIONS_TO_REVIEW` Phase 1): open the window, let it paint,
-//! and quit deterministically off an executor timer (not a paint-path deadline — headless
-//! under Xvfb `render` is called only once).
+//! (`architecture.md §9`, `DECISIONS_TO_REVIEW` Phase 1): quit deterministically off an
+//! executor timer (not a paint-path deadline — headless under Xvfb `render` runs once).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::{prelude::*, App, AsyncApp, WindowOptions};
-use gpui_component::Root;
+use gpui::{App, AsyncApp};
 use gpui_platform::application;
 
-use freecell_app::grid::{fixtures, GridEventSink, GridView};
+use freecell_app::shell::{register_fonts, FreeCellApp};
 
 /// Parses an optional `--exit-after-ms <n>` argument (the render-spike safety valve).
 fn exit_after_ms() -> Option<u64> {
@@ -30,9 +28,17 @@ fn exit_after_ms() -> Option<u64> {
         .and_then(|s| s.parse().ok())
 }
 
+/// The first non-flag `.xlsx` path argument, if any (best-effort CLI open — Finder open-file
+/// events are a separate, deferred path; see DECISIONS_TO_REVIEW Phase 10).
+fn xlsx_arg() -> Option<PathBuf> {
+    std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-') && a.to_ascii_lowercase().ends_with(".xlsx"))
+        .map(PathBuf::from)
+}
+
 fn main() {
-    // Logging setup per architecture.md §8 (tracing + env-filter). Best-effort: a second
-    // init in tests/embedded use would fail, which we ignore.
+    // Logging setup per architecture.md §8 (tracing + env-filter). Best-effort init.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -41,22 +47,19 @@ fn main() {
         .try_init();
 
     let exit_after = exit_after_ms();
+    let open_path = xlsx_arg();
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        register_fonts(cx); // bundled fonts BEFORE any window opens (ui_design.md §3.3)
         cx.activate(true);
 
-        cx.open_window(WindowOptions::default(), |window, cx| {
-            let grid = cx.new(|cx| {
-                let mut view = GridView::new(fixtures::demo_sources(), GridEventSink::noop(), cx);
-                view.set_selection(fixtures::demo_selection(), cx);
-                view
-            });
-            // gpui-component requires the top-level window element to be a `Root`.
-            cx.new(|cx| Root::new(grid, window, cx))
-        })
-        .expect("failed to open FreeCell window");
+        FreeCellApp::init(cx);
+        match open_path {
+            Some(path) => FreeCellApp::open_path(&path, cx),
+            None => FreeCellApp::show_welcome(cx),
+        }
 
         // Render-spike safety valve: quit after a real executor timer, independent of
         // rendering (a render-loop deadline does NOT fire headless under Xvfb).

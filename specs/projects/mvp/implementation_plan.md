@@ -92,7 +92,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   content field state machine + cap error + eval spinner), sheet tab bar (switch /
   add / inline rename / context menu / delete confirm) — against a test-double
   client. (`components/app_shell.md`, `ui_design.md §3.1–3.4`)
-- [ ] **Phase 10 — App shell.** Welcome window, window registry + lifecycle rules
+- [x] **Phase 10 — App shell.** Welcome window, window registry + lifecycle rules
   (last window closes → app quits), menu bar (macOS) + actions + per-platform key
   bindings, file panels, all modals, save flow (no fidelity warning — silent strip
   per `functional_spec.md §5.2`), quit flow. (`components/app_shell.md`,

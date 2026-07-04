@@ -88,7 +88,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   selection render snapshots. (`components/grid.md`)
 
 **Track C — shell & chrome (GPUI, cross-platform):**
-- [ ] **Phase 9 — Chrome.** Action row (toggles + fill popover), data row (ref box +
+- [x] **Phase 9 — Chrome.** Action row (toggles + fill popover), data row (ref box +
   content field state machine + cap error + eval spinner), sheet tab bar (switch /
   add / inline rename / context menu / delete confirm) — against a test-double
   client. (`components/app_shell.md`, `ui_design.md §3.1–3.4`)

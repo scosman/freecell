@@ -32,5 +32,12 @@ parking_lot.workspace = true
 # `anyhow` (edge errors) and `tracing` (span/event macros) arrive with the app shell +
 # document client in later phases; added when first exercised, not forward-declared here.
 
+[dev-dependencies]
+# Phase 9 chrome interaction tests drive `ChromeView` through gpui's headless
+# `TestAppContext` / `VisualTestContext`, which live behind gpui's `test-support` feature
+# (additive: only enabled for test builds, so the release binary stays lean). This is the
+# same knob gpui-component enables for its own widget tests.
+gpui = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

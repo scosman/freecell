@@ -14,6 +14,7 @@ pub mod axis;
 pub mod cache;
 pub mod color;
 pub mod data_row;
+pub mod eval_indicator;
 pub mod input_cap;
 pub mod palette;
 pub mod publication;

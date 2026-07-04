@@ -636,3 +636,75 @@ Known placeholders the build will resolve (append the resolution here):
   restart gap (`autoscrolling` stays set until the running loop's next ≤16 ms tick) is documented as
   the deliberate "one loop live" trade-off; and `cell_at_point`'s benign inclusive-edge clamp is
   noted in a comment. (`grid/view.rs`, `grid/layout.rs`)
+
+- [Phase 9] **Chrome ↔ engine seam = a `ChromeClient` trait** (`send(Command)` +
+  `render_style(sheet, cell) -> Option<RenderStyle>`), implemented for the real
+  `DocumentClient` and by a `RecordingClient` double. `components/app_shell.md` sketched the
+  chrome holding a concrete `DocumentClient`; the trait keeps Phase 9 fully headless and lets
+  Phase 11 drop the real client in unchanged. Chrome→grid coupling (move active cell / focus
+  grid / switch sheet) is a second seam, `ChromeGridSink` (a boxed closure like
+  `GridEventSink`) delivering `ChromeGridRequest`. (`chrome/client.rs`, `chrome/mod.rs`)
+- [Phase 9] **Added `freecell-core::eval_indicator`** — the action-row evaluating-spinner
+  250 ms no-flash timer as a pure `reduce(event) -> Vec<Effect>` reducer (mirrors the
+  data-row fetch spinner), table-tested headless. `app_shell.md` places the eval-spinner
+  logic in the window; extracting it to core keeps the timing (short-never-flashes,
+  long-shows-then-hides, coalesced-stays-shown, stale-timeout-noops) unit-tested without
+  gpui, and the GPUI layer just arms a timer on `ArmTimer`. (`freecell-core/src/eval_indicator.rs`)
+- [Phase 9] **Fill popover, tab context menu, and delete-confirm modal are lightweight
+  `ChromeView`-owned panels, NOT the stock gpui-component `Popover`/`ContextMenu`/`Modal`.**
+  Those widgets' content closures run in a *foreign* entity context (`PopoverState` /
+  `PopupMenu`) and `PopupMenu` items dispatch app-global gpui `Action`s — both would force
+  cross-entity dispatch / an action registry for what `ui_design.md` calls a
+  "don't-over-invest" chrome surface. The custom panels are controlled by view state
+  (`fill_open` / `context_menu` / `confirm_delete`), so every action is a directly-testable
+  method. Stock gpui-component `Button`, `Input`/`InputState`, `ColorPicker` (the fill
+  "Custom…" entry), and `Spinner` ARE used as specced. (`chrome/view.rs`)
+- [Phase 9] **The chrome keeps its own `SheetTab { id, name, has_content }` mirror; the
+  worker's `SheetMeta { id, name }` has no `has_content`.** `app_shell.md` says "the worker
+  includes `has_content` in `SheetMeta`" (gates the delete-confirm modal), but Phase 4 built
+  `SheetMeta` without it. Rather than change the engine seam from Track C, the chrome carries
+  `has_content` on its own view-model (defaults false; `merge_sheet_metas` preserves a known
+  value across a `SheetsChanged`). **Phase 11 must source `has_content`** — either add the
+  field to `SheetMeta` (worker populates it) or a per-sheet content query — before the
+  delete-confirm rule is correct against the real worker. (`chrome/mod.rs`, `chrome/view.rs`)
+- [Phase 9] **gpui `test-support` feature enabled as a `freecell-app` dev-dependency** so the
+  chrome interaction tests can drive `ChromeView` through the headless `TestAppContext` /
+  `VisualTestContext` (additive feature; the release binary is unaffected). Same knob
+  gpui-component uses for its own widget tests. (`crates/freecell-app/Cargo.toml`)
+- [Phase 9] **Controlled content field:** `InputState` owns the text buffer; the `DataRow`
+  reducer is the state machine. Widget `Change` → `Edited`; reducer text → widget via
+  `set_value` (verified to suppress the `Change` event, so no feedback loop). A late
+  `CellContent` reply is synced to the widget only while the field is Idle, never mid-edit —
+  so a stale reply can't reset the caret. Escape is caught by an `on_key_down` on the
+  data-row container (the `InputState` propagates Escape). Shift+Enter remaps the reducer's
+  `MoveActive(Down)` to `Up` in the GPUI layer (the reducer's Commit hardcodes Down); a
+  Tab-commit in the formula bar is deferred (a single-line `Input` emits no commit on Tab —
+  minor, revisit with the in-cell editor). (`chrome/view.rs`)
+- [Phase 9] **Chrome tests are direct method + handler invocation against `TestAppContext`
+  (no synthetic pixel input, no draw).** The heavy state machines are unit-tested in core
+  (`data_row`, `eval_indicator`, `sheet_name`); the 27 gpui-context tests drive the real
+  `ChromeView` entity (subscriptions' handlers, the 250 ms timers via `advance_clock`, the
+  `RecordingClient`/`ChromeGridSink` command+request assertions) but do not render or inject
+  keystrokes — matching the Phase-8 precedent (pure logic + real render baselines, no
+  gpui-input simulation). Full widget event-dispatch + the rendered look are verified via the
+  manual smoke checklist (phase plan) and Phase 11. (`chrome/view.rs` tests)
+- [Phase 9] **Toggle pressed state (`bold`/`italic`/`underline`) reads the active cell's
+  `RenderStyle` from `ChromeClient::render_style` at selection-change time.** `app_shell.md`
+  also refreshes it on `StyleCacheUpdated`; in Phase 9 there is no worker, so only
+  `on_selection_changed` refreshes. The `StyleCacheUpdated` refresh is Phase-11 wiring (the
+  window will re-read the active cell's style on that event). (`chrome/view.rs`)
+- [Phase 9] **Chrome uses flat grey constants, not gpui-component theme tokens.**
+  `ui_design.md §3` names "gpui-component's secondary/panel background token"; for the
+  functional-POC chrome the rows use plain `#F3F3F3`/`#D9D9D9`-class greys (like the grid's
+  own look constants) rather than threading `cx.theme()` through every element. A theme-token
+  pass is optional polish. (`chrome/view.rs`)
+
+- [Phase 9] (post-CR) **Input-cap rejection surfaces the danger BORDER only, not the
+  message popover** that `app_shell.md §Data row` ("danger border + message popover") and
+  `ui_design.md §3.2` ("error text in a tooltip-style popover below") specify. The field
+  border switches to the theme danger colour and the field stays Editing (cap-reject-keeps-
+  editing works), so the rejection is visible and non-destructive — a POC-acceptable partial.
+  The message-popover text is deferred (it needs a positioned tooltip/popover keyed off the
+  precise `InputRejection` reason). Recording per the CR (UI approved fine-for-MVP); a future
+  pass adds the reason text. (`chrome/view.rs` `render_data_row` cap-error branch,
+  `DataRowEffect::ShowCapError` is a no-op in `apply_data_effects`)

@@ -40,6 +40,21 @@ fn wait_for(
     }
 }
 
+/// Poll `cond` until it returns true, or panic with `msg` at the [`TIMEOUT`] deadline.
+///
+/// Robust to worker-thread event ordering: two live back-to-back `client.send()` edits may
+/// coalesce into ONE publish or land in TWO (the worker loop is `recv()` + `try_iter()` with
+/// no batching window, so coalescing of live sends is opportunistic on scheduling). A single
+/// `wait_for(Published)` + immediate `arc_swap` read races the second publish's store; polling
+/// the converged read model instead is deterministic without weakening any assertion.
+fn poll_until(mut cond: impl FnMut() -> bool, msg: &str) {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "{msg}");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Spawn over a source and return the client, the receiver, and the loaded sheet list.
 fn spawn(source: DocumentSource) -> (DocumentClient, WorkerEventReceiver, Vec<SheetMeta>) {
     let (client, rx) = DocumentClient::spawn(source);
@@ -130,8 +145,13 @@ fn set_viewport_then_edit_publishes_values() {
 
     client.send(set_input(sheet, 0, 0, "42"));
     client.send(set_input(sheet, 2, 1, "=40+2"));
-    // Two edits coalesce; wait for the publish that reflects them.
-    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    // The two live edits may coalesce into one publish or land in two; poll the published
+    // snapshot until BOTH values are present rather than racing a single wait_for(Published)
+    // (which can catch the first publish and read before the second's arc_swap store).
+    poll_until(
+        || published_text(&client, 0, 0) == "42" && published_text(&client, 2, 1) == "42",
+        "both edits should reach the published viewport",
+    );
 
     assert_eq!(published_text(&client, 0, 0), "42");
     assert_eq!(published_text(&client, 2, 1), "42"); // =40+2 evaluated
@@ -295,17 +315,25 @@ fn worker_side_cap_rejects_and_never_evaluates() {
 
 #[test]
 fn undo_redo_through_worker() {
-    let (client, rx, sheet) = spawn_new();
+    let (client, _rx, sheet) = spawn_new();
     client.send(full_viewport(sheet));
     client.send(set_input(sheet, 0, 0, "1"));
     client.send(set_input(sheet, 0, 0, "2"));
-    // Drain to the last publish reflecting "2".
-    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    // The two edits may coalesce or split; poll until the publication reflects the final "2"
+    // (which implies both undoable ops applied — apply increments committed_ops before the
+    // publish), rather than racing a single wait_for(Published).
+    poll_until(
+        || published_text(&client, 0, 0) == "2",
+        "both edits should reach the published viewport",
+    );
     let ops_after_edits = client.committed_ops();
     assert!(ops_after_edits >= 2);
 
     client.send(Command::Undo);
-    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    poll_until(
+        || published_text(&client, 0, 0) == "1",
+        "undo should reflect the prior value in the publication",
+    );
     assert_eq!(
         published_text(&client, 0, 0),
         "1",
@@ -315,7 +343,10 @@ fn undo_redo_through_worker() {
     assert_eq!(client.committed_ops(), ops_after_edits + 1);
 
     client.send(Command::Redo);
-    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    poll_until(
+        || published_text(&client, 0, 0) == "2",
+        "redo should re-apply the value in the publication",
+    );
     assert_eq!(published_text(&client, 0, 0), "2", "redo re-applies");
 }
 

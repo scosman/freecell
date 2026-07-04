@@ -39,32 +39,56 @@ so they build and test headless in Linux CI.
 
 ```sh
 cargo build --workspace          # full build (freecell-app compiles on Linux + macOS)
-cargo run -p freecell-app        # the hello-world window (Phase 1)
-cargo test --workspace           # core + engine + app logic tests
+cargo run -p freecell-app        # launch FreeCell (opens the Welcome window)
+cargo run -p freecell-app -- Book.xlsx   # open a workbook directly (CLI argv path)
+cargo test --workspace           # core + engine + app logic tests (no display needed)
 cargo fmt --all --check          # formatting gate
 cargo clippy --workspace --all-targets -- -D warnings   # lint gate
 cargo deny check                 # licenses/advisories (see deny.toml)
 ```
 
+`freecell-app` is the full spreadsheet application: a Welcome window, one window per
+workbook (grid + action row + formula bar + sheet tabs), open/edit/save `.xlsx`, basic
+formatting, and multi-sheet management. On Linux it runs on X11/Wayland (Ctrl for Cmd, no
+menu bar — `architecture.md §1`); `cargo test --workspace` is headless (the pixel render
+suite is a separate step, below).
+
 ## Render tests & baselines
 
-The cell-render snapshot suite (`render-tests/`, Phase 7) renders the real grid, captures
-PNGs, and perceptually diffs them against committed baselines. On Linux CI it runs under
-**Xvfb + Mesa lavapipe** (software Vulkan). Phase 1 ships the **capture spike** that
-validates that path:
+The cell-render snapshot suite (`render-tests/`) renders the **real** `GridView` over
+scenes produced by the **real** engine, captures PNGs on Linux under **Xvfb + Mesa
+lavapipe** (software Vulkan), and perceptually diffs them against 48 committed baselines —
+one `#[test]` per feature/permutation, so a red line names the exact broken thing.
 
 ```sh
-app/scripts/linux_render_spike.sh   # renders the hello-world under Xvfb+lavapipe, captures a PNG
+render-tests/scripts/render_tests.sh test              # run the full pixel suite (asserts baselines)
+render-tests/scripts/render_tests.sh generate [--only <prefix>]   # regenerate baselines/
 ```
 
-The full baseline workflow (regenerate on the pinned runner image, eyeball every changed
-PNG, commit) is documented in `render-tests/README.md`.
+The full human baseline workflow (regenerate on the pinned runner image, **eyeball every
+changed PNG**, commit together with the code change), the pinned image + Mesa version, and
+the tolerance constants are documented in
+[`render-tests/README.md`](render-tests/README.md). (`app/scripts/linux_render_spike.sh` is
+the original Phase-1 capture-path spike, kept for reference.)
+
+## Perf harness & gates
+
+The perf harness drives the real grid over a 1M×100 styled fixture (the POC "Run Test"
+scroll scenario) and asserts the `architecture.md §4` budgets (frame p99, cell-load p99,
+zero engine calls on the scroll path):
+
+```sh
+render-tests/scripts/perf.sh            # run the perf harness + CI-buffered gates
+```
+
+Calibrated thresholds + methodology are in `render-tests/src/perf.rs` and
+`DECISIONS_TO_REVIEW.md` (Phase 12).
 
 ## CI
 
 GitHub Actions live at the repo root (`../.github/workflows/`):
 
-- **checks** (Linux, required): fmt, clippy `-D warnings`, build, test, render (spike in
-  Phase 1 → render suite in Phase 7), cargo-deny.
-- **perf-gates** (Linux, required): the perf harness with buffered thresholds (Phase 12).
+- **checks** (Linux, required): fmt, clippy `-D warnings`, workspace build, workspace test,
+  the render suite (Xvfb + lavapipe), cargo-deny (licenses/advisories — see `deny.toml`).
+- **perf-gates** (Linux, required): the perf harness with buffered thresholds.
 - **macos-verify** (manual/weekly, non-required): build + test + render smoke on macOS.

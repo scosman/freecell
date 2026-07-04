@@ -111,7 +111,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   calibrated on the pinned runner image** (buffer for slow shared runners — product
   call); numbers adversarially reviewed per repo convention.
   (`architecture.md §4, §9`)
-- [ ] **Phase 13 — Hardening & completion sweep.** Render suite complete w/
+- [x] **Phase 13 — Hardening & completion sweep.** Render suite complete w/
   eyeballed baselines; READMEs complete; DECISIONS_TO_REVIEW.md finalized;
   cargo-deny clean-or-documented; manual smoke checklist executed and recorded;
   verify every `functional_spec.md` behavior has a test or an explicit

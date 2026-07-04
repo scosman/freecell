@@ -997,3 +997,103 @@ Known placeholders the build will resolve (append the resolution here):
   style-only (blank text) — the real beyond-overscan regime — so the heaviest (fully-valued +
   styled) frames dominate p99. Env overrides `FREECELL_PERF_COLS` / `FREECELL_PERF_VALUE_ROWS`
   shrink it for a quick smoke run (never for calibration/gate). (`render-tests/src/perf.rs`)
+
+- [Phase 13] **FONTS DECISION: bundled Inter DEFERRED; MVP ships on the default UI font.**
+  `ui_design.md §3.3`/§7 call for bundled Inter (registered via `add_fonts`) for pixel-stable
+  baselines. Decided to DEFER, evidence-based: (a) the baseline-stability rationale is already
+  delivered for the MVP by pinning the render-suite runner image + Mesa + font packages (the
+  48-case suite is green + bit-stable on the default font); (b) only Inter *variable* fonts are
+  readily fetchable here, not the 4 static faces the spec names, adding font-kit variable-axis
+  resolution risk; (c) the render harness (`render_scene`) opens its own gpui `App` and doesn't
+  register fonts, so vendoring means wiring `add_fonts` there too AND regenerating + re-eyeballing
+  all 48 baselines against the load-bearing pixel gate at the finish line — disproportionate to a
+  robustness upgrade that is not a functional gap. Tracked: `PROJECTS.md` +
+  `projects/bundled-inter-font.md`. Fixed the stale/aspirational font claims so nothing falsely
+  says fonts are registered: `shell/fonts.rs` (module + fn doc now state it's a no-op),
+  `main.rs` (comment), `grid/mod.rs` (`GRID_FONT_FAMILY` doc = reserved-not-applied).
+  (`shell/fonts.rs`, `main.rs`, `grid/mod.rs`, `projects/bundled-inter-font.md`)
+- [Phase 13] **KNOWN LIMITATION finalized: type-based default cell alignment + `[Red]` number-format
+  text color are not rendered.** `functional_spec.md §3.6` says unstyled numbers/dates default
+  right, booleans/errors center, and `[Red]` formats color the text. `PublishedCell` carries only a
+  display string (+ an always-`None` `text_color`), no value type, so the grid defaults **all** cells
+  to left (`grid/view.rs`: `style.h_align.unwrap_or(Align::Left)`) in the default color. Phase 6
+  deferred this to "Phase 11 engine wiring", which did not land it; Phase 13 (no new features) tracks
+  it rather than change the publication schema + regenerate ~10 baselines at the finish line. Values,
+  formats (currency/percent/date/thousands), error text, and **explicit** alignment are all correct
+  (verified in the baselines). Home: `projects/type-aware-alignment.md`, `PROJECTS.md`. This
+  supersedes the Phase-6/Phase-4 "deferred to Phase 11" notes. (`crates/freecell-core/src/publication.rs`,
+  `grid/view.rs`, `worker/run.rs build_publication`)
+- [Phase 13] **cargo-deny RE-AUDIT: posture unchanged — still no safe upgrade at the pinned gpui/
+  ironcalc revs; documented, not silent.** Re-ran `cargo deny check` (0.19.9, `working-directory:
+  app`) → clean. Re-verified every ignored advisory + the GPL `ztracing` license exception (zed#55470)
+  still has no upgrade we control. **Corrected a provenance detail** (the Phase-1 note + the task
+  framing loosely attributed quick-xml to ironcalc): verified against `Cargo.lock`, the **quick-xml
+  0.39.4 DoS pair** (`RUSTSEC-2026-0194/-0195`) enters the tree ONLY via desktop-protocol/build-time
+  parsers of **trusted** XML — `wayland-scanner` (build), `xcb` (build, 0.30.0), and `zbus_xml`
+  (D-Bus introspection via atspi). It is **NOT** on the `.xlsx` open path: ironcalc `=0.7.1` reads
+  workbooks with `roxmltree` + `zip 0.6.6`, not quick-xml — so a hostile `.xlsx` does not exercise
+  these advisories. Fixed in quick-xml ≥0.41 (needs a zed/wayland bump). Captured the full posture +
+  the pre-ship checklist as a security note
+  with a home: `PROJECTS.md` + `projects/pre-distribution-security-audit.md`. FreeCell ships no
+  binaries yet, so the documented exception posture is acceptable for MVP. `deny.toml` header + the
+  Phase-1 cargo-deny entry above remain accurate; no `deny.toml` change needed. (`app/deny.toml`,
+  `projects/pre-distribution-security-audit.md`)
+- [Phase 13] **Render baselines EYEBALLED (all 48).** Reviewed every committed baseline PNG (via
+  category montages): text attrs (bold/italic/underline + combos), fills (incl. dark-fill contrast,
+  fill-covers-gridlines, empty-styled), engine-formatted numbers/currency/percent/date/boolean/text,
+  `#DIV/0!`/`#NAME?`/`#CIRC!` errors (incl. the circular-ref pair resolving with no hang), explicit
+  alignment (left/right/center + overrides-default), clipping (clipped/exact-fit/narrow-column),
+  variable geometry (tall row / wide column), and grid scenes (empty origin, deep-scrolled headers
+  Z→AE / rows 490–501, single/range/edge-spanning/shift/drag/scrolled selections with the white
+  anchor + blue overlay, visible scrollbars, the loading overlay, the mixed-content canary). All
+  render correctly and match their intended scenes. The only cross-spec observations are the two
+  known limitations above (default-left alignment; non-red negative), which are visible + tracked.
+  The human final-eyeball remains the user's, but this sweep found nothing wrong. (`render-tests/baselines/`)
+- [Phase 13] **Coverage matrix + smoke checklist produced as durable artifacts.**
+  `specs/projects/mvp/coverage_matrix.md` maps EVERY `functional_spec.md §2–§9` behavior to a named
+  automated test or a documented-manual smoke item (`M-1`…`M-16`) — no silent gaps. Smoke items
+  driveable under Xvfb+lavapipe were driven this phase (see `smoke_checklist.md`); native-OS /
+  real-hardware items are recorded documented-manual with repro steps. (`coverage_matrix.md`,
+  `smoke_checklist.md`)
+- [Phase 13] **READMEs completed.** Created the repo **root `README.md`** (there was none) describing
+  the real project (full spreadsheet, not the "hello-world" the stale `app/README.md` run line
+  implied); fixed that stale `app/README.md` line + refreshed its CI/render/perf sections;
+  `render-tests/README.md` verified accurate (pinned image, tolerance, human baseline process).
+  (`README.md`, `app/README.md`, `app/render-tests/README.md`)
+
+---
+## Phase 13 resolution index (curated — disposition of every deferred/flagged item)
+
+A reviewer's one-stop list. "Resolved" = done in-repo; "Known-limitation" = shipped as-is with a
+tracked home (nothing silently lost); "MVP-scope" = intentional §8 omission.
+
+**Resolved this phase**
+- Fonts placeholder / false `add_fonts` claim → conscious DEFER decision + code-claim fixes (above).
+- cargo-deny re-audit → re-run clean; posture documented with a home (above).
+- All render baselines → eyeballed (above).
+- READMEs (root missing, app "hello-world" line) → written/fixed (above).
+- Coverage completeness → `coverage_matrix.md` (every behavior mapped).
+
+**Known-limitations shipped with a home (not silent)**
+- Type-based default alignment (§3.6) → `projects/type-aware-alignment.md`.
+- `[Red]` number-format text color (§3.6; Phase 4/7) → same project note.
+- Input-cap message-popover *text* (§3.3; Phase 9 post-CR) → danger border shown; popover text is
+  chrome polish. Cell-unmodified + focus-kept behaviors ARE covered.
+- Bundled Inter (§3.3) → `projects/bundled-inter-font.md`.
+- macOS Finder open-file `on_open_urls` (§2.1; Phase 10) → CLI argv wired; macOS Finder assoc is a
+  documented gap.
+- GPL `ztracing` + quick-xml DoS + bans/sources leniency → `projects/pre-distribution-security-audit.md`
+  (MANDATORY pre-distribution).
+- Save fidelity silent-strip (§5.2) → intentional; warn-and-strip is `projects/xlsx-preservation.md`.
+
+**MVP-scope (intentional §8 omissions, already tracked)**
+- Dynamic arrays/spill; in-cell edit; IME; clipboard; structural-edit UI; row/col resize; merges/CF/
+  comments/validation/hyperlinks; CSV; recent-files; find/replace; sort/filter; freeze; hide; zoom;
+  charts; named-range UI; multi-range; fill handle; session restore; autosave; Windows. Homes in §8 +
+  `PROJECTS.md` (`xlsx-preservation`, `ime-text-input`, `excel-clipboard`, `viewport-cache`,
+  `style-cache`).
+
+**Un-driveable-here manual smoke (documented in `smoke_checklist.md`, native-OS / real-hardware)**
+- Native NSOpen/NSSave panels; macOS menu bar + enable/disable; traffic-light close prompt; edited
+  dot; 100 MB open timing; real read-only-perms save failure (container runs as root); real-hardware
+  frame budget; scrollbar auto-hide + held-drag edge auto-scroll.

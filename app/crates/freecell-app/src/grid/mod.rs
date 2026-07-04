@@ -74,9 +74,10 @@ pub const EDGE_AUTOSCROLL_HOTZONE_PX: f64 = 24.0;
 /// edge with no mouse-move events" case; a live `window.mouse_position()` drives the extend).
 pub const AUTOSCROLL_INTERVAL_MS: u64 = 16;
 
-/// The grid/cell font family (`ui_design.md §3.3`: bundled Inter). Registered at app
-/// startup (Phase 10); until then gpui falls back to the default UI font. Reserved here so
-/// the render path names the intended family in one place.
+/// The grid/cell font family the design *intends* (`ui_design.md §3.3`: bundled Inter).
+/// **Reserved, not applied in MVP** — the grid renders on GPUI's default UI font (bundling
+/// Inter was deferred; see `shell/fonts.rs` + `projects/bundled-inter-font.md`). Kept in one
+/// place so a future font pass names the family here and at the `grid/view.rs` text sites.
 pub const GRID_FONT_FAMILY: &str = "Inter";
 
 /// Events the grid raises to its owner (`WorkbookWindow`, Phase 11). Phase 8 drives

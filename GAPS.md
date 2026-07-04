@@ -71,3 +71,9 @@ Items #1 and #2 share a root cause (the publication carries no per-cell type/col
 should be done together — see [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md)
 for the publication → grid threading plan. #3 is a small chrome-local change. #4 needs a
 gpui-capability spike before estimating. None are blocked by the others.
+
+## Data safety & robustness
+
+| Gap | Severity | Why it matters | Sketch |
+|-----|----------|----------------|--------|
+| **Save a `.back` backup before the first save** | High (we're alpha) | The save path can lose data (IronCalc's writer silently strips anything it doesn't model; we're early and bugs are likely). A one-time backup of the original bytes means an overwrite can never be the *only* copy. | Before the **first** save of a document opened from disk, copy the original file to `filename.xlsx.back` (write-once — do **not** re-back-up / overwrite the backup on subsequent saves, so the backup always holds the pristine original). Applies to files opened from disk; a never-saved new workbook has nothing to back up. Deferred — not implemented yet. |

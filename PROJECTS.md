@@ -45,6 +45,13 @@ registry: each entry is a short description plus a pointer to a design note unde
   values may ride along with the editor build.
   → [`projects/excel-clipboard.md`](projects/excel-clipboard.md)
 
+- **Merge/Unmerge UI ("tier c")** — *Future (split out of `mvp-gaps` scoping, 2026-07-04).*
+  Creating/removing merged cells from the UI. Blocked on an IronCalc `UserModel` merge
+  API (upstream PR preferred, minimal patch-fork fallback) + the structural-edit
+  merge-adjustment landmine. *Rendering + selection for file-loaded merges needs no
+  engine change and ships in `specs/projects/mvp-gaps`.*
+  → [`projects/merged-cells.md`](projects/merged-cells.md)
+
 - **Viewport Value Cache** — *Future, optional scroll-perf push.*
   Delta-load only newly-exposed cells' *values* on scroll (styles/geometry come from the
   resident style cache above); invalidate on recompute. Optional — SP4 showed uncached

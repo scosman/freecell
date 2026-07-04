@@ -32,10 +32,18 @@ path = "src/bin/render_scene.rs"
 name = "generate_baselines"
 path = "src/bin/generate_baselines.rs"
 
+# Phase 12: the perf harness — the POC "Run Test" scenario against the real GridView over a
+# 1M×100 styled engine-backed fixture, measuring the §4 budgets + the zero-engine-calls gate.
+[[bin]]
+name = "perf_harness"
+path = "src/bin/perf_harness.rs"
+
 [dependencies]
 freecell-core.workspace = true
 freecell-engine.workspace = true
 freecell-app.workspace = true
+# Phase 12: the perf report is serialized here (`freecell-core` stays serde-free).
+serde_json.workspace = true
 # `arc-swap` builds the `GridDataSources.publication` slot the grid loads per frame;
 # `parking_lot` is the `RwLock<SheetCaches>` type the scene injects command-less render
 # features (alignment / geometry) into after the real worker builds it.

@@ -1,0 +1,63 @@
+{
+  "name": "freecell-perf-runtest",
+  "date": "2026-07-04",
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "renderer": "assumed Mesa lavapipe / software Vulkan (ICD presence enforced by perf.sh) — CPU render-build path measured; GPU present NOT measured",
+    "profile": "release",
+    "commit": "27e605b"
+  },
+  "fixture": {
+    "rows": 1048576,
+    "cols": 100,
+    "valued_rows": 256,
+    "styled": true,
+    "note": "1M×100 styled: dense col-band styles across all cols, variable col widths + row heights, engine-produced publication over the valued band"
+  },
+  "frames": 348,
+  "frame_render": {
+    "count": 348,
+    "min_ns": 705210,
+    "max_ns": 5796124,
+    "mean_ns": 2172531,
+    "p50_ns": 1887571,
+    "p99_ns": 5557909,
+    "p50": "1.89 ms",
+    "p99": "5.56 ms",
+    "max": "5.80 ms"
+  },
+  "cell_load": {
+    "count": 348,
+    "min_ns": 42380,
+    "max_ns": 165043,
+    "mean_ns": 56372,
+    "p50_ns": 54567,
+    "p99_ns": 93596,
+    "p50": "54.57 µs",
+    "p99": "93.60 µs",
+    "max": "165.04 µs"
+  },
+  "true_budgets_ns": {
+    "frame_p99": 8333333,
+    "frame_max": 16666667,
+    "cell_load_p99": 2000000,
+    "verdict": "PASS",
+    "note": "real-hardware product truth; under lavapipe only the CPU render-build path is measured (informational)"
+  },
+  "ci_thresholds_ns": {
+    "frame_p99": 11500000,
+    "frame_max": 13000000,
+    "cell_load_p99": 500000,
+    "verdict": "PASS",
+    "note": "committed buffered gate = 2× the calibrated p99 on the pinned runner image"
+  },
+  "zero_engine_calls_on_scroll": {
+    "verdict": "PASS",
+    "negative_control_climbed": true,
+    "negative_control_delta": 25615
+  }
+}

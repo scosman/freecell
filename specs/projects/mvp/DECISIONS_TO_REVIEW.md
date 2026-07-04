@@ -931,3 +931,69 @@ Known placeholders the build will resolve (append the resolution here):
   match (no `_ => {}`) — `Saved`/`SaveFailed` match unconditionally and branch on the pending
   `req_id` inside, so a future `WorkerEvent` variant is a compile error forcing a conscious routing
   decision. (`shell/window.rs on_worker_event`)
+
+- [Phase 12] **Perf-gate CI thresholds CALIBRATED + committed** (resolves the placeholder in
+  this file's header). Calibrated on this container (proxy for the pinned ubuntu-24.04 runner
+  image): **Intel Xeon @ 2.80 GHz, 4 cores, Linux x86_64, rustc 1.95.0, `--release`, Mesa
+  lavapipe (software Vulkan)**. Measured over the POC "Run Test" scenario (348 scripted
+  frames) against the **real `GridView`** + a **1M×100 styled** engine-backed fixture. This is
+  the **single canonical run** cited identically here, in `render-tests/src/perf.rs`, and in
+  `render-tests/results/perf-runtest.json`: **frame-build p50 = 1.89 ms, p99 = 5.56 ms,
+  max = 5.80 ms; cell-load p50 = 54.6 µs, p99 = 93.6 µs, max = 165 µs.** These meet the §4
+  real-hardware budgets (frame p99 ≤ 8.33 ms, worst ≤ 16.67 ms, cell-load p99 < 2 ms) even on
+  this slow shared CPU. Committed buffered CI gates (`render-tests/src/perf.rs` `CI_*`), each
+  ≥ ~2× the canonical figure it buffers: **frame-p99 = 11.5 ms** (2.07× the 5.56 ms p99),
+  **frame-max = 13 ms** (2.24× the 5.80 ms max), **cell-load-p99 = 500 µs**. The cell-load gate
+  is a **deviation from strict-2×**: the calibrated 93.6 µs is a micro-measurement dominated by
+  scheduler/cache noise, so a ~190 µs (2×) gate would be flaky across runner CPUs; 500 µs
+  (~5.3×) still catches a real regression yet stays 4× under the 2 ms product budget.
+  Recalibrate only deliberately (a committed change), never to quiet a regression.
+  (`render-tests/src/perf.rs`, `.github/workflows/perf-gates.yml`)
+- [Phase 12] **What lavapipe does / doesn't represent (and how the harness handles it).**
+  This container renders through software Vulkan, so **GPU present + gpui layout/text-shaping**
+  (which run *after* `render()` returns) are **not representative** of real hardware and are
+  **deliberately NOT measured/gated**. The harness measures the **CPU render-build path** —
+  data resolution (axis math + resident-style snapshot + the O(published-cells) publication
+  scan) + element construction — exactly the window the POC's `frame_render_ns` timed on
+  macOS/Metal, plus the **engine-call counter** (fully representative). The frame-build p99
+  (5.56 ms) is directly comparable to the POC's raw-gpui p99 (~2 ms on M-series); ~2.8× is
+  plausible slow-shared-CPU scaling, not a measurement artifact. The full painted-frame budget
+  (layout + shaping + present) remains a **macos-verify (real-hardware) concern**, recorded but
+  not gated in Linux CI. (`render-tests/src/bin/perf_harness.rs`, `grid/view.rs measure_frame`)
+- [Phase 12] **"Zero engine calls on the scroll path" is asserted with an instrumented engine
+  counter + a negative control.** `freecell-engine::instrument` holds a process-global
+  `AtomicU64` bumped at the entry of **every `WorkbookDocument` method that reads or mutates the
+  constructed IronCalc model** — all per-cell/geometry reads, sheet-metadata reads, edits, batch
+  controls, `save`, and the `user_model_mut` escape hatch; the only exclusions are the
+  constructors (they *build* a fresh model) and two `#[cfg(test)]` style-read helpers.
+  `WorkbookDocument` is the single IronCalc boundary; the grid render path never holds one. The
+  harness snapshots `engine_call_count()` before/after the whole 348-frame scroll sweep and
+  asserts a **zero delta** (measured: 0 calls over 284 distinct viewports) — the sweep reads only
+  the shared `Publication` + `SheetCaches`, never the worker. **Negative control:** one real edit
+  (`SetStyleAttr`) to the still-alive worker moves the counter by **25,615 calls** (apply +
+  publish re-probe), proving the gate is discriminating, not vacuous. Both are hard-failed in
+  `--gate` mode. (`freecell-engine/src/instrument.rs`, `document.rs`,
+  `render-tests/src/bin/perf_harness.rs`)
+- [Phase 12] **The perf harness drives the REAL grid via a `measure_frame` hook, not a copy.**
+  `GridView::render`'s frame-dependent element build was factored into a shared
+  `build_grid_layers` used by BOTH `render()` and the new `GridView::measure_frame` (perf), so
+  the measured build can never drift from the real render path. `measure_frame` is a public hook
+  alongside the existing render-test/debug hooks (`set_force_scrollbars` / `set_freeze_spinner`);
+  it applies a scripted scroll (clamped to the sheet), times the build, and FORCE+ASSERTs
+  non-empty content (can't measure a no-op). The scripted scenario + latency stats + gates live
+  in `freecell-core::perf` (engine-free, gpui-free, unit-tested — ported from
+  `experiments/04-ui-poc/poc-core`; core stays serde-free, so JSON is written by the binary).
+  (`grid/view.rs`, `freecell-core/src/perf.rs`)
+- [Phase 12] **Fixture design — "1M×100 styled" realized within the publication cap.** The
+  sheet is Excel-max deep (1,048,576 rows) with the 100-col region of interest densely styled
+  via **col-band styles** (5-way rotating fills/bold/italic/underline/align — so every visible
+  cell at any scroll depth builds a fully-styled element, near-worst-case the whole sweep),
+  variable column widths (incl. 300 px wide cols for text-shaping stress), and a spread of
+  row-height overrides (variable geometry at 1M scale). Real engine **values** populate the top
+  256 rows × 100 cols and are published as one window (25,600 cells, under the worker's 512×256
+  `MAX_PUBLISH` cap) — deliberately larger than a typical overscan so every frame pays the
+  `O(published-cells)` publication scan the grid flags in `grid/view.rs` (measured fine at
+  cell-load p99 = 93.6 µs, resolving that concern). Deep-scroll frames beyond the valued band render
+  style-only (blank text) — the real beyond-overscan regime — so the heaviest (fully-valued +
+  styled) frames dominate p99. Env overrides `FREECELL_PERF_COLS` / `FREECELL_PERF_VALUE_ROWS`
+  shrink it for a quick smoke run (never for calibration/gate). (`render-tests/src/perf.rs`)

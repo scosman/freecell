@@ -202,6 +202,7 @@ impl WorkbookDocument {
     /// original file at `path` is left untouched (`functional_spec.md §5.2`,
     /// `components/engine_worker.md §File I/O`).
     pub fn save(&self, path: &Path) -> Result<(), SaveError> {
+        crate::instrument::record_engine_call();
         let dir = destination_dir(path);
 
         // Same-directory temp file → the final rename is a same-filesystem atomic op.
@@ -236,6 +237,7 @@ impl WorkbookDocument {
 
     /// The workbook's sheet names, in workbook order.
     pub fn sheet_names(&self) -> Vec<String> {
+        crate::instrument::record_engine_call();
         self.model
             .get_worksheets_properties()
             .into_iter()
@@ -245,6 +247,7 @@ impl WorkbookDocument {
 
     /// The number of sheets in the workbook.
     pub fn sheet_count(&self) -> usize {
+        crate::instrument::record_engine_call();
         self.model.get_worksheets_properties().len()
     }
 
@@ -253,6 +256,7 @@ impl WorkbookDocument {
     /// exact per-cell call the Phase-4 `Publication` build uses — display formatting is
     /// engine-owned (round-3 B; FreeCell adds none).
     pub fn formatted_value(&self, sheet: u32, cell: CellRef) -> Result<String, CellQueryError> {
+        crate::instrument::record_engine_call();
         let (row, col) = to_engine_coords(cell);
         self.model
             .get_formatted_cell_value(sheet, row, col)
@@ -262,6 +266,7 @@ impl WorkbookDocument {
     /// The raw content of a cell: the `=formula` text for formula cells, the literal for
     /// value cells, `""` for empty cells (what the formula bar shows/edits).
     pub fn cell_content(&self, sheet: u32, cell: CellRef) -> Result<String, CellQueryError> {
+        crate::instrument::record_engine_call();
         let (row, col) = to_engine_coords(cell);
         self.model
             .get_cell_content(sheet, row, col)
@@ -273,6 +278,7 @@ impl WorkbookDocument {
     /// custom sizes). `pub(crate)`: the `Worksheet` is an IronCalc type and must not leave the
     /// crate (the cache module lives in this crate and does the conversion to engine-free forms).
     pub(crate) fn worksheet(&self, sheet_idx: u32) -> Result<&Worksheet, String> {
+        crate::instrument::record_engine_call();
         self.model.get_model().workbook.worksheet(sheet_idx)
     }
 
@@ -286,6 +292,7 @@ impl WorkbookDocument {
         sheet_idx: u32,
         cell: CellRef,
     ) -> Result<Option<Style>, String> {
+        crate::instrument::record_engine_call();
         let (row, col) = to_engine_coords(cell);
         self.model
             .get_model()
@@ -310,6 +317,7 @@ impl WorkbookDocument {
 
     /// The row band style at `row` (0-based), if the row carries one.
     pub(crate) fn row_band_style(&self, sheet_idx: u32, row: u32) -> Result<Option<Style>, String> {
+        crate::instrument::record_engine_call();
         self.model
             .get_model()
             .get_row_style(sheet_idx, row as i32 + 1)
@@ -317,6 +325,7 @@ impl WorkbookDocument {
 
     /// The column band style at `col` (0-based), if the column carries one.
     pub(crate) fn col_band_style(&self, sheet_idx: u32, col: u32) -> Result<Option<Style>, String> {
+        crate::instrument::record_engine_call();
         self.model
             .get_model()
             .get_column_style(sheet_idx, col as i32 + 1)
@@ -325,6 +334,7 @@ impl WorkbookDocument {
     /// The row height at `row` (0-based) in **IronCalc pixels** (the cache converts to FreeCell
     /// device px). IronCalc's getter already returns px (`ironcalc_base/src/constants.rs`).
     pub(crate) fn row_height_px(&self, sheet_idx: u32, row: u32) -> Result<f64, String> {
+        crate::instrument::record_engine_call();
         self.model
             .get_model()
             .get_row_height(sheet_idx, row as i32 + 1)
@@ -334,6 +344,7 @@ impl WorkbookDocument {
     ///
     /// [`row_height_px`]: Self::row_height_px
     pub(crate) fn col_width_px(&self, sheet_idx: u32, col: u32) -> Result<f64, String> {
+        crate::instrument::record_engine_call();
         self.model
             .get_model()
             .get_column_width(sheet_idx, col as i32 + 1)
@@ -344,6 +355,7 @@ impl WorkbookDocument {
     /// volatile worksheet index IronCalc's per-cell/sheet APIs take
     /// (`architecture.md §3` index↔id map).
     pub(crate) fn sheet_properties(&self) -> Vec<(u32, String)> {
+        crate::instrument::record_engine_call();
         self.model
             .get_worksheets_properties()
             .into_iter()
@@ -356,6 +368,7 @@ impl WorkbookDocument {
     /// delete-confirm gate (`functional_spec.md §3.7`). Property position `i` is worksheet
     /// index `i`, so the content probe reads `worksheet(i).sheet_data`.
     pub(crate) fn sheet_properties_with_content(&self) -> Vec<(u32, String, bool)> {
+        crate::instrument::record_engine_call();
         self.model
             .get_worksheets_properties()
             .into_iter()
@@ -375,17 +388,20 @@ impl WorkbookDocument {
     /// coalescing fit). Pair with [`resume_evaluation`](Self::resume_evaluation) +
     /// [`evaluate`](Self::evaluate).
     pub(crate) fn pause_evaluation(&mut self) {
+        crate::instrument::record_engine_call();
         self.model.pause_evaluation();
     }
 
     /// Resumes IronCalc's auto-evaluate (mechanically the pause flag; the worker still calls
     /// [`evaluate`](Self::evaluate) explicitly to run the single coalesced recompute).
     pub(crate) fn resume_evaluation(&mut self) {
+        crate::instrument::record_engine_call();
         self.model.resume_evaluation();
     }
 
     /// Runs one full-workbook `evaluate()` (the coalesced recompute after a drained batch).
     pub(crate) fn evaluate(&mut self) {
+        crate::instrument::record_engine_call();
         self.model.evaluate();
     }
 
@@ -398,6 +414,7 @@ impl WorkbookDocument {
         cell: CellRef,
         input: &str,
     ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         let (row, col) = to_engine_coords(cell);
         self.model.set_user_input(sheet_idx, row, col, input)
     }
@@ -409,6 +426,7 @@ impl WorkbookDocument {
         sheet_idx: u32,
         range: CellRange,
     ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         self.model.range_clear_contents(&area_of(sheet_idx, range))
     }
 
@@ -420,6 +438,7 @@ impl WorkbookDocument {
         cell: CellRef,
         flag: FontFlag,
     ) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
         let (row, col) = to_engine_coords(cell);
         let style = self.model.get_cell_style(sheet_idx, row, col)?;
         Ok(match flag {
@@ -437,6 +456,7 @@ impl WorkbookDocument {
         flag: FontFlag,
         value: bool,
     ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         let v = if value { "true" } else { "false" };
         self.model
             .update_range_style(&area_of(sheet_idx, range), flag.style_path(), v)
@@ -451,6 +471,7 @@ impl WorkbookDocument {
         range: CellRange,
         fill: Option<Rgb>,
     ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         let value = match fill {
             Some(rgb) => format!("#{:06X}", rgb.to_hex()),
             None => String::new(),
@@ -461,28 +482,33 @@ impl WorkbookDocument {
 
     /// Appends a new sheet (`AddSheet`); IronCalc names + numbers it. Undoable.
     pub(crate) fn add_sheet(&mut self) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         self.model.new_sheet()
     }
 
     /// Renames the sheet at `sheet_idx` (`RenameSheet`). The worker re-validates the name
     /// against the other sheets first; IronCalc enforces its own rules too. Undoable.
     pub(crate) fn rename_sheet(&mut self, sheet_idx: u32, name: &str) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         self.model.rename_sheet(sheet_idx, name)
     }
 
     /// Deletes the sheet at `sheet_idx` (`DeleteSheet`). Can affect formulas → the worker
     /// re-evaluates. Undoable.
     pub(crate) fn delete_sheet(&mut self, sheet_idx: u32) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         self.model.delete_sheet(sheet_idx)
     }
 
     /// Undoes the last committed edit (engine history). Auto-evaluates unless paused.
     pub(crate) fn undo(&mut self) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         self.model.undo()
     }
 
     /// Redoes the last undone edit (engine history). Auto-evaluates unless paused.
     pub(crate) fn redo(&mut self) -> Result<(), String> {
+        crate::instrument::record_engine_call();
         self.model.redo()
     }
 
@@ -490,8 +516,13 @@ impl WorkbookDocument {
     /// to populate cells. In-crate only; the model is an `ironcalc` type and never leaves this
     /// crate. (The Phase-4 worker drives edits through the typed methods above, not this.)
     ///
+    /// Handing out this raw handle is itself counted as an engine access: the ops performed
+    /// *through* it are not individually instrumented, so bumping the counter here keeps the
+    /// "any engine model access bumps the counter" invariant airtight for this escape hatch.
+    ///
     /// [`fixtures`]: crate::fixtures
     pub(crate) fn user_model_mut(&mut self) -> &mut UserModel<'static> {
+        crate::instrument::record_engine_call();
         &mut self.model
     }
 
@@ -595,6 +626,33 @@ mod tests {
         );
         // A bare filename has an empty parent → save beside it in the current directory.
         assert_eq!(destination_dir(Path::new("a.xlsx")), PathBuf::from("."));
+    }
+
+    /// NEGATIVE CONTROL for Phase 12's "zero engine calls on the scroll path" gate: a real
+    /// model read/edit MUST bump `engine_call_count()`. If this ever stopped incrementing, the
+    /// harness's zero-delta assertion across a scroll sweep would pass vacuously — this proves
+    /// the counter can register engine work.
+    #[test]
+    fn engine_call_counter_registers_real_model_work() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+
+        let before = crate::instrument::engine_call_count();
+        // A pure read (formatted_value) is one engine call.
+        let _ = doc.formatted_value(0, CellRef::new(0, 0)).unwrap();
+        let after_read = crate::instrument::engine_call_count();
+        assert!(
+            after_read > before,
+            "a formatted_value read must bump the engine-call counter"
+        );
+
+        // An edit + evaluate is more engine calls.
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.evaluate();
+        let after_edit = crate::instrument::engine_call_count();
+        assert!(
+            after_edit > after_read,
+            "a set_cell_input + evaluate must bump the counter further"
+        );
     }
 
     #[test]

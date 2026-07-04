@@ -14,6 +14,7 @@
 pub mod capture;
 pub mod cases;
 pub mod diff;
+pub mod perf;
 pub mod render;
 pub mod scene;
 

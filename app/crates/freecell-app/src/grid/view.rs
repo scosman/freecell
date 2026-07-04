@@ -122,6 +122,19 @@ struct Frame {
     scroll_y: f64,
 }
 
+/// Optional per-frame timing captured by [`GridView::build_grid_layers`] for the Phase-12
+/// perf harness (`freecell_core::perf`). `None` on the normal render path — zero overhead
+/// (no `Instant` is even read).
+#[derive(Default)]
+struct FrameTiming {
+    /// Nanoseconds spent building the visible-cell index from the publication — the
+    /// O(published-cells) per-frame scan the perf harness watches (`architecture.md §4`).
+    cell_index_ns: u64,
+    /// How many content-layer elements (cells + selection overlays) the frame built — the
+    /// FORCE + ASSERT witness that the per-cell build actually ran.
+    content_cells: u32,
+}
+
 impl GridView {
     /// Builds the grid over `sources`, delivering [`GridEvent`]s to `events`. The active
     /// sheet defaults to the publication's sheet, at origin scroll with an A1 selection.
@@ -847,6 +860,346 @@ impl GridView {
             self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
         }
     }
+
+    /// Build the frame-dependent element layers (cells + selection, headers, scrollbars) from a
+    /// resolved [`Frame`] — the shared hot path used by both [`Render::render`] and the Phase-12
+    /// perf harness's [`GridView::measure_frame`], so the measured build never drifts from the
+    /// real render. When `timing` is `Some`, records the publication-scan duration + content-cell
+    /// count (the perf harness's cell-load witness); `None` on the render path reads no clock.
+    fn build_grid_layers(
+        &mut self,
+        frame: &Frame,
+        mut timing: Option<&mut FrameTiming>,
+    ) -> Vec<AnyElement> {
+        let mut root_children: Vec<AnyElement> = Vec::new();
+
+        let selection = *self.selection();
+        let publication = self.sources.publication.load_full();
+        let covers_active = publication.sheet == self.active_sheet;
+
+        // Rebuild the reused visible-cell index from the publication. The scan is over the
+        // published (non-empty) cells, which the worker caps at `MAX_PUBLISH_ROWS ×
+        // MAX_PUBLISH_COLS` (512×256) and are typically far fewer than that — not O(sheet).
+        // The publication has no spatial index, so a per-visible-cell lookup would need this
+        // map first; building it once per frame is the right structure given the flat `Vec`.
+        // PHASE 12: the perf harness times this scan and gates the frame p99 (`freecell_core::perf`).
+        let index_start = timing.as_ref().map(|_| std::time::Instant::now());
+        self.cell_index.clear();
+        if covers_active {
+            for (i, cell) in publication.cells.iter().enumerate() {
+                if frame.rows.contains(&cell.row) && frame.cols.contains(&cell.col) {
+                    self.cell_index.insert((cell.row, cell.col), i);
+                }
+            }
+        }
+        if let (Some(t), Some(start)) = (timing.as_mut(), index_start) {
+            t.cell_index_ns = start.elapsed().as_nanos() as u64;
+        }
+
+        // ---- Content layer: cells + selection, clipped to the content area ----------
+        let mut content_children: Vec<AnyElement> = Vec::with_capacity(
+            ((frame.rows.end - frame.rows.start) * (frame.cols.end - frame.cols.start)) as usize
+                + 16,
+        );
+
+        for r in frame.rows.clone() {
+            for c in frame.cols.clone() {
+                let (x, y, w, h) = cell_rect(r, c, frame);
+                let style = self.visible_styles.get(&(r, c)).copied();
+                let fill = style
+                    .and_then(|s| s.fill)
+                    .map(to_rgba)
+                    .unwrap_or_else(|| rgb(CELL_BG));
+                let (text, text_color) = match self.cell_index.get(&(r, c)) {
+                    Some(&idx) => {
+                        let pc = &publication.cells[idx];
+                        let color = pc
+                            .text_color
+                            .or(style.and_then(|s| s.font_color))
+                            .map(to_rgba)
+                            .unwrap_or_else(|| rgb(CELL_TEXT));
+                        (pc.display_text.clone(), color)
+                    }
+                    None => (String::new(), rgb(CELL_TEXT)),
+                };
+                content_children.push(cell_element(x, y, w, h, fill, text, text_color, style));
+            }
+        }
+
+        // Selection: translucent overlay (range − active), range border, active border.
+        let range = selection.range();
+        for (rows, cols) in layout::range_overlay_rects(range, selection.active) {
+            // Clip to the visible ranges so the overlay divs stay viewport-sized.
+            let rows = rows.start.max(frame.rows.start)..rows.end.min(frame.rows.end);
+            let cols = cols.start.max(frame.cols.start)..cols.end.min(frame.cols.end);
+            if rows.start >= rows.end || cols.start >= cols.end {
+                continue;
+            }
+            let (x, y, w, h) = span_rect(rows, cols, frame);
+            content_children.push(
+                rect_div(x, y, w, h)
+                    .bg(rgb(ACCENT).opacity(SELECTION_FILL_ALPHA))
+                    .into_any_element(),
+            );
+        }
+        if !range.is_single() {
+            let (x, y, w, h) = span_rect(
+                range.start.row..range.end.row + 1,
+                range.start.col..range.end.col + 1,
+                frame,
+            );
+            content_children.push(
+                rect_div(x, y, w, h)
+                    .border_2()
+                    .border_color(rgb(ACCENT))
+                    .into_any_element(),
+            );
+        }
+        {
+            let (x, y, w, h) = cell_rect(selection.active.row, selection.active.col, frame);
+            content_children.push(
+                rect_div(x, y, w, h)
+                    .border_2()
+                    .border_color(rgb(ACCENT))
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(t) = timing.as_mut() {
+            t.content_cells = content_children.len() as u32;
+        }
+
+        root_children.push(
+            div()
+                .absolute()
+                .left(px(frame.row_header_w))
+                .top(px(COL_HEADER_H))
+                .w(px(frame.content_w as f32))
+                .h(px(frame.content_h as f32))
+                .overflow_hidden()
+                .children(content_children)
+                .into_any_element(),
+        );
+
+        // ---- Header layer (fixed, opaque, clipped to its strip) ---------------------
+        let (sel_r0, sel_r1) = (range.start.row, range.end.row);
+        let (sel_c0, sel_c1) = (range.start.col, range.end.col);
+
+        // Column-header strip.
+        let mut col_children: Vec<AnyElement> = Vec::new();
+        for c in frame.cols.clone() {
+            let x = (frame.col_axis.offset_of(c) - frame.scroll_x) as f32;
+            let w = frame.col_axis.size_of(c);
+            let selected = c >= sel_c0 && c <= sel_c1;
+            col_children.push(header_element(
+                x,
+                0.0,
+                w,
+                COL_HEADER_H,
+                column_label(c),
+                selected,
+            ));
+        }
+        // Accent edge under the selected columns.
+        {
+            let (x, _y, w, _h) = span_rect(0..1, sel_c0..sel_c1 + 1, frame);
+            col_children.push(
+                rect_div(x, COL_HEADER_H - 2.0, w, 2.0)
+                    .bg(rgb(ACCENT))
+                    .into_any_element(),
+            );
+        }
+        root_children.push(
+            div()
+                .absolute()
+                .left(px(frame.row_header_w))
+                .top(px(0.0))
+                .w(px(frame.content_w as f32))
+                .h(px(COL_HEADER_H))
+                .bg(rgb(HEADER_BG))
+                .overflow_hidden()
+                .children(col_children)
+                .into_any_element(),
+        );
+
+        // Row-header gutter.
+        let mut row_children: Vec<AnyElement> = Vec::new();
+        for r in frame.rows.clone() {
+            let y = (frame.row_axis.offset_of(r) - frame.scroll_y) as f32;
+            let h = frame.row_axis.size_of(r);
+            let selected = r >= sel_r0 && r <= sel_r1;
+            row_children.push(header_element(
+                0.0,
+                y,
+                frame.row_header_w,
+                h,
+                (r + 1).to_string(),
+                selected,
+            ));
+        }
+        // Accent edge beside the selected rows.
+        {
+            let (_x, y, _w, h) = span_rect(sel_r0..sel_r1 + 1, 0..1, frame);
+            row_children.push(
+                rect_div(frame.row_header_w - 2.0, y, 2.0, h)
+                    .bg(rgb(ACCENT))
+                    .into_any_element(),
+            );
+        }
+        root_children.push(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(COL_HEADER_H))
+                .w(px(frame.row_header_w))
+                .h(px(frame.content_h as f32))
+                .bg(rgb(HEADER_BG))
+                .overflow_hidden()
+                .children(row_children)
+                .into_any_element(),
+        );
+
+        // Top-left corner cap.
+        root_children.push(
+            rect_div(0.0, 0.0, frame.row_header_w, COL_HEADER_H)
+                .bg(rgb(HEADER_BG))
+                .border_r_1()
+                .border_b_1()
+                .border_color(rgb(HEADER_HAIRLINE))
+                .into_any_element(),
+        );
+
+        // ---- Overlay scrollbars -----------------------------------------------------
+        if self.scrollbars_visible || self.force_scrollbars {
+            if let Some(thumb) = layout::scrollbar_thumb(
+                frame.total_h,
+                frame.content_h,
+                frame.scroll_y,
+                frame.content_h as f32,
+            ) {
+                let x = frame.row_header_w + frame.content_w as f32
+                    - SCROLLBAR_THICKNESS
+                    - SCROLLBAR_INSET;
+                root_children.push(
+                    rect_div(
+                        x,
+                        COL_HEADER_H + thumb.offset,
+                        SCROLLBAR_THICKNESS,
+                        thumb.length,
+                    )
+                    .bg(rgba(SCROLLBAR_RGBA))
+                    .rounded_full()
+                    .into_any_element(),
+                );
+            }
+            if let Some(thumb) = layout::scrollbar_thumb(
+                frame.total_w,
+                frame.content_w,
+                frame.scroll_x,
+                frame.content_w as f32,
+            ) {
+                let y =
+                    COL_HEADER_H + frame.content_h as f32 - SCROLLBAR_THICKNESS - SCROLLBAR_INSET;
+                root_children.push(
+                    rect_div(
+                        frame.row_header_w + thumb.offset,
+                        y,
+                        thumb.length,
+                        SCROLLBAR_THICKNESS,
+                    )
+                    .bg(rgba(SCROLLBAR_RGBA))
+                    .rounded_full()
+                    .into_any_element(),
+                );
+            }
+        }
+
+        root_children
+    }
+
+    /// Phase-12 perf hook (`freecell_core::perf`): apply a scripted scroll to the active sheet,
+    /// run the **real** render build path (`resolve_frame` + `build_grid_layers`), and return a
+    /// timed [`FrameSample`](freecell_core::perf::FrameSample) plus the resulting visible ranges.
+    ///
+    /// Timing follows the POC's methodology: `cell_load_ns` covers the data resolution (visible
+    /// style snapshot in `resolve_frame` + the publication scan), and `frame_render_ns` covers the
+    /// whole build (data + element construction). gpui layout, text shaping, and GPU present run
+    /// **after** this returns, inside gpui's paint — under lavapipe those are unrepresentative and
+    /// are deliberately NOT timed here (a macos-verify concern; see DECISIONS_TO_REVIEW.md).
+    ///
+    /// FORCE + ASSERT (`CLAUDE.md`): the scroll is clamped to the sheet extents and applied (so a
+    /// deep jump lands in-bounds), and the build must produce a non-empty, `black_box`ed content
+    /// layer — a measurement that touched no cells panics rather than silently reporting a no-op.
+    pub fn measure_frame(
+        &mut self,
+        scroll_x: f64,
+        scroll_y: f64,
+        viewport_w: f64,
+        viewport_h: f64,
+        prev: Option<(Range<u32>, Range<u32>)>,
+    ) -> (freecell_core::perf::FrameSample, (Range<u32>, Range<u32>)) {
+        use std::time::Instant;
+
+        // Clamp the scripted scroll to the active sheet's real extents, then apply it.
+        let active = self.active_sheet;
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let (nx, ny) = {
+            let caches = self.sources.caches.read();
+            let cache = caches
+                .get(active)
+                .expect("perf fixture must build the active-sheet cache");
+            let (row_axis, _) = cache.axes();
+            let total_w = cache.total_width();
+            let total_h = cache.total_height();
+            let rows = row_axis.visible_range(scroll_y.max(0.0), content_h, RENDER_OVERSCAN);
+            let row_header_w = layout::row_header_width(rows.end.saturating_sub(1));
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            let area = ContentArea {
+                row_header_w,
+                width: content_w,
+                height: content_h,
+            };
+            layout::clamp_scroll(scroll_x, scroll_y, total_w, total_h, area)
+        };
+        self.scroll.insert(active, (nx, ny));
+
+        // Time the data resolution (axis math + visible-style snapshot under the caches lock).
+        let t0 = Instant::now();
+        let frame = self
+            .resolve_frame(viewport_w, viewport_h)
+            .expect("perf fixture must build the active-sheet cache");
+        let resolve_ns = t0.elapsed().as_nanos() as u64;
+
+        let ranges = (frame.rows.clone(), frame.cols.clone());
+        let mut timing = FrameTiming::default();
+        let layers = self.build_grid_layers(&frame, Some(&mut timing));
+        let frame_render_ns = t0.elapsed().as_nanos() as u64;
+        let cell_load_ns = resolve_ns + timing.cell_index_ns;
+
+        // FORCE + ASSERT: the per-cell build actually ran; keep the built layers observable so the
+        // optimiser can't elide the construction we just timed.
+        assert!(
+            timing.content_cells > 0 && !layers.is_empty(),
+            "measure_frame built no content — refusing to report a no-op measurement"
+        );
+        std::hint::black_box(&layers);
+        drop(layers);
+
+        let newly_visible = match &prev {
+            Some((pr, pc)) => freecell_core::perf::newly_visible_2d(pr, pc, &ranges.0, &ranges.1),
+            None => (ranges.0.end - ranges.0.start) * (ranges.1.end - ranges.1.start),
+        };
+
+        (
+            freecell_core::perf::FrameSample {
+                frame_render_ns,
+                cell_load_ns,
+                newly_visible,
+                elements: timing.content_cells,
+            },
+            ranges,
+        )
+    }
 }
 
 /// Maps a core `Rgb` onto a gpui colour.
@@ -1021,241 +1374,7 @@ impl Render for GridView {
                 );
             }
 
-            let selection = *self.selection();
-            let publication = self.sources.publication.load_full();
-            let covers_active = publication.sheet == self.active_sheet;
-
-            // Rebuild the reused visible-cell index from the publication. The scan is over the
-            // published (non-empty) cells, which the worker caps at `MAX_PUBLISH_ROWS ×
-            // MAX_PUBLISH_COLS` (512×256) and are typically far fewer than that — not O(sheet).
-            // The publication has no spatial index, so a per-visible-cell lookup would need this
-            // map first; building it once per frame is the right structure given the flat `Vec`.
-            // PHASE 12: the perf harness should confirm this scan stays within the frame
-            // p99 ≤ 8.33 ms gate on the 1M×100 styled fixture.
-            self.cell_index.clear();
-            if covers_active {
-                for (i, cell) in publication.cells.iter().enumerate() {
-                    if frame.rows.contains(&cell.row) && frame.cols.contains(&cell.col) {
-                        self.cell_index.insert((cell.row, cell.col), i);
-                    }
-                }
-            }
-
-            // ---- Content layer: cells + selection, clipped to the content area ----------
-            let mut content_children: Vec<AnyElement> = Vec::with_capacity(
-                ((frame.rows.end - frame.rows.start) * (frame.cols.end - frame.cols.start))
-                    as usize
-                    + 16,
-            );
-
-            for r in frame.rows.clone() {
-                for c in frame.cols.clone() {
-                    let (x, y, w, h) = cell_rect(r, c, &frame);
-                    let style = self.visible_styles.get(&(r, c)).copied();
-                    let fill = style
-                        .and_then(|s| s.fill)
-                        .map(to_rgba)
-                        .unwrap_or_else(|| rgb(CELL_BG));
-                    let (text, text_color) = match self.cell_index.get(&(r, c)) {
-                        Some(&idx) => {
-                            let pc = &publication.cells[idx];
-                            let color = pc
-                                .text_color
-                                .or(style.and_then(|s| s.font_color))
-                                .map(to_rgba)
-                                .unwrap_or_else(|| rgb(CELL_TEXT));
-                            (pc.display_text.clone(), color)
-                        }
-                        None => (String::new(), rgb(CELL_TEXT)),
-                    };
-                    content_children.push(cell_element(x, y, w, h, fill, text, text_color, style));
-                }
-            }
-
-            // Selection: translucent overlay (range − active), range border, active border.
-            let range = selection.range();
-            for (rows, cols) in layout::range_overlay_rects(range, selection.active) {
-                // Clip to the visible ranges so the overlay divs stay viewport-sized.
-                let rows = rows.start.max(frame.rows.start)..rows.end.min(frame.rows.end);
-                let cols = cols.start.max(frame.cols.start)..cols.end.min(frame.cols.end);
-                if rows.start >= rows.end || cols.start >= cols.end {
-                    continue;
-                }
-                let (x, y, w, h) = span_rect(rows, cols, &frame);
-                content_children.push(
-                    rect_div(x, y, w, h)
-                        .bg(rgb(ACCENT).opacity(SELECTION_FILL_ALPHA))
-                        .into_any_element(),
-                );
-            }
-            if !range.is_single() {
-                let (x, y, w, h) = span_rect(
-                    range.start.row..range.end.row + 1,
-                    range.start.col..range.end.col + 1,
-                    &frame,
-                );
-                content_children.push(
-                    rect_div(x, y, w, h)
-                        .border_2()
-                        .border_color(rgb(ACCENT))
-                        .into_any_element(),
-                );
-            }
-            {
-                let (x, y, w, h) = cell_rect(selection.active.row, selection.active.col, &frame);
-                content_children.push(
-                    rect_div(x, y, w, h)
-                        .border_2()
-                        .border_color(rgb(ACCENT))
-                        .into_any_element(),
-                );
-            }
-
-            root_children.push(
-                div()
-                    .absolute()
-                    .left(px(frame.row_header_w))
-                    .top(px(COL_HEADER_H))
-                    .w(px(frame.content_w as f32))
-                    .h(px(frame.content_h as f32))
-                    .overflow_hidden()
-                    .children(content_children)
-                    .into_any_element(),
-            );
-
-            // ---- Header layer (fixed, opaque, clipped to its strip) ---------------------
-            let (sel_r0, sel_r1) = (range.start.row, range.end.row);
-            let (sel_c0, sel_c1) = (range.start.col, range.end.col);
-
-            // Column-header strip.
-            let mut col_children: Vec<AnyElement> = Vec::new();
-            for c in frame.cols.clone() {
-                let x = (frame.col_axis.offset_of(c) - frame.scroll_x) as f32;
-                let w = frame.col_axis.size_of(c);
-                let selected = c >= sel_c0 && c <= sel_c1;
-                col_children.push(header_element(
-                    x,
-                    0.0,
-                    w,
-                    COL_HEADER_H,
-                    column_label(c),
-                    selected,
-                ));
-            }
-            // Accent edge under the selected columns.
-            {
-                let (x, _y, w, _h) = span_rect(0..1, sel_c0..sel_c1 + 1, &frame);
-                col_children.push(
-                    rect_div(x, COL_HEADER_H - 2.0, w, 2.0)
-                        .bg(rgb(ACCENT))
-                        .into_any_element(),
-                );
-            }
-            root_children.push(
-                div()
-                    .absolute()
-                    .left(px(frame.row_header_w))
-                    .top(px(0.0))
-                    .w(px(frame.content_w as f32))
-                    .h(px(COL_HEADER_H))
-                    .bg(rgb(HEADER_BG))
-                    .overflow_hidden()
-                    .children(col_children)
-                    .into_any_element(),
-            );
-
-            // Row-header gutter.
-            let mut row_children: Vec<AnyElement> = Vec::new();
-            for r in frame.rows.clone() {
-                let y = (frame.row_axis.offset_of(r) - frame.scroll_y) as f32;
-                let h = frame.row_axis.size_of(r);
-                let selected = r >= sel_r0 && r <= sel_r1;
-                row_children.push(header_element(
-                    0.0,
-                    y,
-                    frame.row_header_w,
-                    h,
-                    (r + 1).to_string(),
-                    selected,
-                ));
-            }
-            // Accent edge beside the selected rows.
-            {
-                let (_x, y, _w, h) = span_rect(sel_r0..sel_r1 + 1, 0..1, &frame);
-                row_children.push(
-                    rect_div(frame.row_header_w - 2.0, y, 2.0, h)
-                        .bg(rgb(ACCENT))
-                        .into_any_element(),
-                );
-            }
-            root_children.push(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .top(px(COL_HEADER_H))
-                    .w(px(frame.row_header_w))
-                    .h(px(frame.content_h as f32))
-                    .bg(rgb(HEADER_BG))
-                    .overflow_hidden()
-                    .children(row_children)
-                    .into_any_element(),
-            );
-
-            // Top-left corner cap.
-            root_children.push(
-                rect_div(0.0, 0.0, frame.row_header_w, COL_HEADER_H)
-                    .bg(rgb(HEADER_BG))
-                    .border_r_1()
-                    .border_b_1()
-                    .border_color(rgb(HEADER_HAIRLINE))
-                    .into_any_element(),
-            );
-
-            // ---- Overlay scrollbars -----------------------------------------------------
-            if self.scrollbars_visible || self.force_scrollbars {
-                if let Some(thumb) = layout::scrollbar_thumb(
-                    frame.total_h,
-                    frame.content_h,
-                    frame.scroll_y,
-                    frame.content_h as f32,
-                ) {
-                    let x = frame.row_header_w + frame.content_w as f32
-                        - SCROLLBAR_THICKNESS
-                        - SCROLLBAR_INSET;
-                    root_children.push(
-                        rect_div(
-                            x,
-                            COL_HEADER_H + thumb.offset,
-                            SCROLLBAR_THICKNESS,
-                            thumb.length,
-                        )
-                        .bg(rgba(SCROLLBAR_RGBA))
-                        .rounded_full()
-                        .into_any_element(),
-                    );
-                }
-                if let Some(thumb) = layout::scrollbar_thumb(
-                    frame.total_w,
-                    frame.content_w,
-                    frame.scroll_x,
-                    frame.content_w as f32,
-                ) {
-                    let y = COL_HEADER_H + frame.content_h as f32
-                        - SCROLLBAR_THICKNESS
-                        - SCROLLBAR_INSET;
-                    root_children.push(
-                        rect_div(
-                            frame.row_header_w + thumb.offset,
-                            y,
-                            thumb.length,
-                            SCROLLBAR_THICKNESS,
-                        )
-                        .bg(rgba(SCROLLBAR_RGBA))
-                        .rounded_full()
-                        .into_any_element(),
-                    );
-                }
-            }
+            root_children.extend(self.build_grid_layers(&frame, None));
         }
 
         // ---- Loading overlay (over everything) ------------------------------------------
@@ -1332,5 +1451,66 @@ impl GridView {
     /// The active sheet (for tests / Phase-11 wiring).
     pub fn active_sheet(&self) -> SheetId {
         self.active_sheet
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::fixtures::demo_sources;
+    use crate::grid::GridEventSink;
+    use gpui::{px, size, TestAppContext};
+    use gpui_component::Root;
+
+    /// Builds a real `GridView` over the demo (Excel-max, styled) sources inside a test window.
+    fn grid(cx: &mut TestAppContext) -> gpui::Entity<GridView> {
+        cx.update(gpui_component::init);
+        let mut out: Option<gpui::Entity<GridView>> = None;
+        let slot = &mut out;
+        cx.open_window(size(px(1200.0), px(800.0)), |window, cx| {
+            let g = cx.new(|cx| GridView::new(demo_sources(), GridEventSink::noop(), cx));
+            *slot = Some(g.clone());
+            Root::new(g, window, cx)
+        });
+        out.expect("grid built")
+    }
+
+    /// The Phase-12 perf hook measures REAL work: a non-empty content build with recorded
+    /// timings — the FORCE + ASSERT witness that the harness isn't measuring a no-op.
+    #[gpui::test]
+    fn measure_frame_builds_nonempty_layers_and_times_them(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        let (sample, ranges) =
+            grid.update(cx, |g, _cx| g.measure_frame(0.0, 0.0, 1200.0, 800.0, None));
+        assert!(
+            sample.elements > 0,
+            "the per-cell build must have produced cells"
+        );
+        assert!(
+            sample.newly_visible > 0,
+            "the first frame reports its whole visible region as newly-visible"
+        );
+        // The visible region is a real, non-empty rectangle.
+        assert!(ranges.0.end > ranges.0.start && ranges.1.end > ranges.1.start);
+        // frame_render must be at least the cell-load segment it contains.
+        assert!(sample.frame_render_ns >= sample.cell_load_ns);
+    }
+
+    /// A deep scripted scroll actually MOVES the viewport (so the harness measures scrolling,
+    /// not the same frame 348 times) — and the clamp keeps it in-bounds.
+    #[gpui::test]
+    fn measure_frame_scroll_moves_viewport(cx: &mut TestAppContext) {
+        let grid = grid(cx);
+        let (_s0, origin) =
+            grid.update(cx, |g, _cx| g.measure_frame(0.0, 0.0, 1200.0, 800.0, None));
+        // Scroll ~4000 px down (far past the origin viewport).
+        let (_s1, deep) = grid.update(cx, |g, _cx| {
+            g.measure_frame(0.0, 4000.0, 1200.0, 800.0, Some(origin.clone()))
+        });
+        assert_ne!(
+            origin.0, deep.0,
+            "a deep scroll must change the visible row range"
+        );
+        assert!(deep.0.start > origin.0.start, "scrolled downward");
     }
 }

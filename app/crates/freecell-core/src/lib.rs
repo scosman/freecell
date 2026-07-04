@@ -17,6 +17,7 @@ pub mod data_row;
 pub mod eval_indicator;
 pub mod input_cap;
 pub mod palette;
+pub mod perf;
 pub mod publication;
 pub mod refs;
 pub mod selection;

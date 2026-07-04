@@ -25,12 +25,14 @@
 pub(crate) mod cache;
 pub mod document;
 pub mod fixtures;
+pub mod instrument;
 pub mod worker;
 
 pub use document::{
     CellQueryError, DocumentSource, LoadError, SaveError, WorkbookDocument, DEFAULT_LANGUAGE,
     DEFAULT_LOCALE, DEFAULT_TIMEZONE, NEW_WORKBOOK_NAME,
 };
+pub use instrument::{engine_call_count, reset_engine_call_count};
 pub use worker::{
     Command, DocumentClient, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent,
     WorkerEventReceiver, WORKER_STACK_SIZE,

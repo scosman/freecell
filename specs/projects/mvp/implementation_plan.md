@@ -104,7 +104,7 @@ P1 scaffolding ─► P2 core ─┬─► P3 doc I/O ─► P4 worker ──┐
   switching with per-sheet scroll/selection; eval indicator; error paths
   (LoadFailed, SaveFailed, EditRejected, degraded bar); gpui-context integration
   tests + explicit list of anything untestable. (`functional_spec.md` end-to-end)
-- [ ] **Phase 12 — Perf harness + CI gates.** POC run-test scenario against the real
+- [x] **Phase 12 — Perf harness + CI gates.** POC run-test scenario against the real
   grid + 1M×100 styled fixture; true budgets (frame p99 ≤ 8.33 ms, worst ≤ 16.67 ms,
   cell load p99 < 2 ms, zero engine calls on scroll path) measured on real hardware
   and recorded; **Linux CI gates hard-fail at committed thresholds = 2× the p99

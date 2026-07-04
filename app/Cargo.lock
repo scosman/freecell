@@ -5570,6 +5570,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "parking_lot",
+ "serde_json",
  "tempfile",
  "tracing-subscriber",
 ]

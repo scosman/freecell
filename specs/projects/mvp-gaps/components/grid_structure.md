@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Grid Structure (resize, header selection, insert/delete)

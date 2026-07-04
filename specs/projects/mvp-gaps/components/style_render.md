@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Style Cache & Render Extensions (fonts, borders, num-fmt, types)

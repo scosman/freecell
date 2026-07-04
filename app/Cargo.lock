@@ -2068,9 +2068,11 @@ dependencies = [
  "ironcalc",
  "ironcalc_base",
  "parking_lot",
+ "roxmltree 0.19.0",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "zip",
 ]
 
 [[package]]

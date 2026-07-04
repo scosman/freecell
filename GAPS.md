@@ -72,6 +72,28 @@ should be done together — see [`projects/type-aware-alignment.md`](projects/ty
 for the publication → grid threading plan. #3 is a small chrome-local change. #4 needs a
 gpui-capability spike before estimating. None are blocked by the others.
 
+---
+
+## Engine (IronCalc 0.7.1) — `.xlsx` import fidelity bugs
+
+Bugs in the pinned IronCalc's **import** path, found while opening a real Excel template
+(a mortgage calculator with a custom purple theme + accounting number formats). IronCalc
+evaluates every formula correctly; these are **import/presentation** defects. FreeCell now
+corrects the common cases at open time in
+[`freecell-engine::open_fixups`](app/crates/freecell-engine/src/open_fixups.rs) (applied in
+`WorkbookDocument::open`, before the model is wrapped). Entries marked *worked around* are
+fixed for the observed cases; the *residual* rows are the parts our fix does not cover.
+
+| # | Bug (IronCalc) | Symptom | Our status | Detail |
+|---|----------------|---------|------------|--------|
+| E1 | **Theme colours resolved against a hardcoded default Office palette, ignoring the file's `xl/theme/theme1.xml`.** `import::colors::get_themed_color` uses a fixed 12-colour array and discards the theme index + tint, storing only the (wrong) resolved RGB. | Every theme-indexed fill/font colour is wrong. On this file (whose theme swaps `dk1`/`lt1` and uses a purple `dk2`) the purple header rendered navy, white label cells rendered solid black, lavender bands rendered blue-grey. | **Worked around (our bug fixed).** `open_fixups::correct_theme_colors` re-reads `theme1.xml` + `styles.xml`, recomputes each theme-indexed colour against the *file* palette (OOXML dark/light swap + §18.8.3 tint), and overwrites the resolved RGB. | Unit + crafted-zip tests in `open_fixups`. Verified end-to-end on the real file. |
+| E2 | **`DEFAULT_NUM_FMTS` table (`ironcalc_base::number_format`) maps standard built-in `numFmtId`s to garbage codes** — e.g. id 39 (`#,##0.00_);(#,##0.00)`) → `"t0.00"`, ids 41–44 (accounting) → `"t0"/"t0.00"/…`. `get_formatted_cell_value` then returns **`#VALUE!`** for a perfectly valid number. | Currency/accounting/number cells show `#VALUE!` even though the underlying value is correct (proven: `NPER` over those cells returns the right number; raw `get_cell_value_by_index` is correct). On this file all loan/payment/total cells (id 39) showed `#VALUE!`. | **Worked around (our bug fixed).** `open_fixups::inject_builtin_num_fmts` injects the correct ECMA-376 built-in code (ids 5–8, 37–49) for ids the workbook references but does not itself define, so `get_num_fmt` picks it up ahead of the broken table. IronCalc's formatter handles the correct code fine. | Unit tests in `open_fixups`; values now match Excel's CSV export exactly. |
+| E3 | **Residual: date/time and other built-in `numFmtId`s IronCalc mis-maps are not corrected.** Our E2 fix deliberately covers only the locale-independent numeric/currency/accounting/misc block (ids 5–8, 37–49). IronCalc's table is also wrong/garbage for ids 11–13 (spacing) and 23–36, and dates 14–22 are locale-sensitive. | A file relying on those specific built-in ids (rare vs. the E2 block) may still format wrong. Not seen in the test file. | **Tracked (IronCalc limitation).** Extend `STANDARD_BUILTIN_NUM_FMTS` if a real file needs it, or upstream a fix to IronCalc's `DEFAULT_NUM_FMTS`. | — |
+
+**Upgrade note:** E1/E2 are compensations for IronCalc import bugs. If IronCalc is bumped to
+a release that resolves file themes and ships a correct built-in number-format table,
+`open_fixups` (and the `zip`/`roxmltree` deps it adds) can be deleted.
+
 ## Data safety & robustness
 
 | Gap | Severity | Why it matters | Sketch |

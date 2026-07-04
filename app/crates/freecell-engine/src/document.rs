@@ -177,9 +177,14 @@ impl WorkbookDocument {
             .ok_or_else(|| LoadError::Io(format!("path is not valid UTF-8: {}", path.display())))?;
 
         match load_from_xlsx(path_str, DEFAULT_LOCALE, DEFAULT_TIMEZONE, DEFAULT_LANGUAGE) {
-            Ok(model) => Ok(Self {
-                model: UserModel::from_model(model),
-            }),
+            Ok(mut model) => {
+                // Correct IronCalc's theme-colour and built-in number-format import before the
+                // model is wrapped and read by the caches (`open_fixups` module docs).
+                crate::open_fixups::apply_open_fixups(&mut model, path);
+                Ok(Self {
+                    model: UserModel::from_model(model),
+                })
+            }
             // A real read error after the magic check (e.g. the file vanished mid-open).
             Err(ironcalc::error::XlsxError::IO(msg)) => Err(LoadError::Io(msg)),
             // It IS a Zip, so any structural/parse/workbook/feature failure means the

@@ -17,6 +17,12 @@ ironcalc_base.workspace = true
 ironcalc.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+# Open-time OOXML fix-ups (`open_fixups`): IronCalc discards the file's theme palette
+# (resolving theme-indexed colours against a hardcoded DEFAULT Office theme) and mis-maps
+# several built-in `numFmtId`s. We re-read `xl/theme/theme1.xml` + `xl/styles.xml` from the
+# `.xlsx` to correct them. Versions match IronCalc's own so the compiled artifacts are reused.
+roxmltree = "0.19"
+zip = "0.6"
 # Phase 4 (eval worker seam, components/engine_worker.md): `arc-swap` holds the published
 # `Publication` snapshot (publish-then-bump); `async-channel` carries `WorkerEvent`s to the
 # UI (the type `smol::channel` re-exports; no async runtime in the headless engine);

@@ -1,18 +1,33 @@
-# Merge/Unmerge UI ("tier c" of merged-cell support)
+# Merged Cells (render + selection + merge/unmerge UI)
 
-**Status:** Future
+**Status:** Future — tiers a+b investigated and **ready to build**
 
 ## Context
 
-Merged-cell support was scoped for the `mvp-gaps` project (investigation 2026-07-04,
-against pinned IronCalc 0.7.1 source). Three tiers were identified:
+Merged-cell support was scoped during `mvp-gaps` planning (investigation 2026-07-04,
+against pinned IronCalc 0.7.1 source). Three tiers were identified; **all three were
+ultimately deferred out of `mvp-gaps`** in scope-back (render-only is a UX trap
+without selection snapping; with snapping it drags range-expansion fixpoint logic
+through the grid's most delicate input code and couples to insert/delete rows/cols).
+This project is the focused home for all of them:
 
 - **(a) Render file-loaded merges** — anchor spans the region, covered cells + interior
-  gridlines suppressed; save round-trip. **In `mvp-gaps`.**
+  gridlines suppressed; save round-trip (already works at 0.7.1 — add tests). Zero
+  engine changes; S–M.
 - **(b) Selection/editing correctness** — clicking a covered cell selects the merge,
-  ranges expand to whole merges, active-cell border spans the merge; editing routes to
-  the anchor via selection snapping. **In `mvp-gaps`.**
-- **(c) Create/remove merges from the UI** — **this project.**
+  ranges expand to whole merges (fixpoint: a merge at a range edge can pull in more
+  merges), active-cell border spans the merge; editing routes to the anchor via
+  selection snapping. Zero engine changes; M including (a).
+- **(c) Create/remove merges from the UI** — needs an engine API (below); M–L.
+
+Implementation anchors for (a)+(b), from the investigation: merge list is readable at
+cache-build time (`WorkbookDocument::worksheet().merge_cells`, public field); the
+resident `SheetCache` is the natural home (ranges + covered→anchor map); the grid's
+`span_rect()` helper and skip-covered-cells painting give rendering nearly for free
+(skipping covered cells auto-suppresses interior gridlines); three mouse call sites
+need anchor-snapping. Interim guard shipping in `mvp-gaps`: insert/delete rows/cols
+is blocked when it would displace merges (IronCalc doesn't adjust `merge_cells` on
+structural edits).
 
 Tiers (a)+(b) need **zero IronCalc changes**: `Worksheet.merge_cells` is a public field
 (`ironcalc_base src/types.rs:113`), the xlsx importer parses `<mergeCells>`

@@ -178,8 +178,9 @@ impl WorkbookDocument {
 
         match load_from_xlsx(path_str, DEFAULT_LOCALE, DEFAULT_TIMEZONE, DEFAULT_LANGUAGE) {
             Ok(mut model) => {
-                // Correct IronCalc's theme-colour and built-in number-format import before the
-                // model is wrapped and read by the caches (`open_fixups` module docs).
+                // Correct IronCalc's theme-colour, indexed-colour, and built-in number-format
+                // import before the model is wrapped and read by the caches (`open_fixups`
+                // module docs).
                 crate::open_fixups::apply_open_fixups(&mut model, path);
                 Ok(Self {
                     model: UserModel::from_model(model),

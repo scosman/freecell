@@ -1,6 +1,6 @@
 //! `open_fixups` — corrections applied to an IronCalc [`Model`] right after `load_from_xlsx`,
-//! before it is wrapped in a `UserModel`. IronCalc 0.7.1 imports two things wrong for real
-//! Excel files, and both are correctable from the original `.xlsx` bytes:
+//! before it is wrapped in a `UserModel`. IronCalc 0.7.1 imports three things wrong for real
+//! Excel/Numbers files, and all three are correctable from the original `.xlsx` bytes:
 //!
 //! 1. **Theme colours resolved against the wrong palette.** IronCalc resolves every
 //!    theme-indexed colour (`<fgColor theme="3" tint="…"/>`, `<color theme="1"/>`) against a
@@ -12,7 +12,17 @@
 //!    recompute each theme-indexed fill/font colour against the *file's* palette (applying the
 //!    OOXML §18.8.3 tint), and overwrite the resolved RGB in the style tables.
 //!
-//! 2. **Built-in `numFmtId`s mapped to garbage codes.** IronCalc's `DEFAULT_NUM_FMTS` table
+//! 2. **Custom indexed-colour palette ignored.** IronCalc resolves every `indexed="n"`
+//!    colour (`<fgColor indexed="9"/>`, `<color indexed="14"/>`) against a *hardcoded legacy
+//!    indexed palette* (`ironcalc::import::colors::get_indexed_color`) and never reads the
+//!    workbook's own `<colors><indexedColors>` override (OOXML §18.8.27). A file that
+//!    redefines palette entries (as Numbers exports do) renders those `indexed=` fills/fonts
+//!    with Excel's *default* colour n instead of the file's colour n. We re-read
+//!    `<indexedColors>` from `styles.xml` and, **only when the file supplies that override**,
+//!    overwrite each `indexed=`-derived fill/font RGB with the file's palette entry. A file
+//!    with no override is left entirely to IronCalc, so standard-palette files never change.
+//!
+//! 3. **Built-in `numFmtId`s mapped to garbage codes.** IronCalc's `DEFAULT_NUM_FMTS` table
 //!    (`ironcalc_base::number_format`) is wrong for many standard built-in ids — e.g. id 39
 //!    (Excel's `#,##0.00_);(#,##0.00)`) maps to `"t0.00"`, which its own formatter then can't
 //!    parse and returns `#VALUE!` for. The cell's *value* is correct; only the display format
@@ -20,10 +30,10 @@
 //!    standard built-in code (only for ids the workbook references but doesn't define itself),
 //!    which `get_num_fmt` picks up ahead of its broken default table.
 //!
-//! Both corrections are **best-effort**: any parse/read failure leaves the model as IronCalc
-//! imported it (never fails the open), and only entries that actually used a theme / a broken
-//! built-in id are touched — explicit `rgb=`/`indexed=` colours and file-defined formats are
-//! left exactly as IronCalc parsed them.
+//! All corrections are **best-effort**: any parse/read failure leaves the model as IronCalc
+//! imported it (never fails the open), and only entries that actually used a theme / an indexed
+//! colour with a file override / a broken built-in id are touched — explicit `rgb=` colours,
+//! `auto=` (system) colours, and file-defined formats are left exactly as IronCalc parsed them.
 
 use std::path::Path;
 
@@ -34,9 +44,12 @@ use ironcalc_base::Model;
 /// Applies the open-time OOXML fix-ups to a freshly loaded model. See the module docs.
 pub(crate) fn apply_open_fixups(model: &mut Model, path: &Path) {
     // Number-format correction needs only the model (the referenced ids live in the style
-    // tables), so it always runs. Theme correction needs the original `.xlsx` bytes.
+    // tables), so it always runs. Colour corrections need the original `.xlsx` bytes. Theme
+    // and indexed colours are disjoint (a colour node uses exactly one of `theme=`/`indexed=`/
+    // `rgb=`/`auto=`), so the order between the two colour passes does not matter.
     inject_builtin_num_fmts(model);
     correct_theme_colors(model, path);
+    correct_indexed_colors(model, path);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -157,6 +170,134 @@ fn read_theme_palette(path: &Path) -> Option<[Option<Rgb>; THEME_SLOTS]> {
         slot("hlink"),
         slot("folHlink"),
     ])
+}
+
+// ---------------------------------------------------------------------------------------------
+// Indexed-colour correction (OOXML §18.8.27 `<colors><indexedColors>`)
+// ---------------------------------------------------------------------------------------------
+
+/// Re-reads the file's `<colors><indexedColors>` override and overwrites every `indexed=`-derived
+/// fill/font colour with the file's palette entry. **Only runs when the file actually supplies an
+/// override** — a standard-palette file (no `<indexedColors>`) is left entirely to IronCalc, so it
+/// can never regress. Best-effort: returns silently on any read/parse failure.
+fn correct_indexed_colors(model: &mut Model, path: &Path) {
+    let Some(styles_xml) = read_zip_entry(path, "xl/styles.xml") else {
+        return;
+    };
+    let Ok(doc) = roxmltree::Document::parse(&styles_xml) else {
+        return;
+    };
+    let root = doc.root_element();
+
+    // The key safety gate: without a `<colors><indexedColors>` override there is nothing to
+    // correct, and touching nothing guarantees standard-palette files are byte-for-byte
+    // unaffected. Bail before walking any style entry.
+    let Some(palette) = read_indexed_palette(root) else {
+        return;
+    };
+
+    // Fills: the i-th `<fill>` in `<fills>` is `styles.fills[i]` (IronCalc pushes one entry per
+    // child, in document order — we enumerate identically so the indices line up, exactly as the
+    // theme pass does). Only a solid fill's `<fgColor>`/`<bgColor>` that used `indexed=` (and not
+    // an explicit `rgb=`) is rewritten.
+    if let Some(fills) = root.children().find(|n| n.has_tag_name("fills")) {
+        for (i, fill) in fills.children().enumerate() {
+            if i >= model.workbook.styles.fills.len() {
+                break;
+            }
+            let Some(pattern) = fill.children().find(|n| n.has_tag_name("patternFill")) else {
+                continue;
+            };
+            for color in pattern.children() {
+                let is_fg = color.has_tag_name("fgColor");
+                let is_bg = color.has_tag_name("bgColor");
+                if !(is_fg || is_bg) {
+                    continue;
+                }
+                if let Some(rgb) = indexed_rgb(&color, &palette) {
+                    let hex = to_hex(rgb);
+                    if is_fg {
+                        model.workbook.styles.fills[i].fg_color = Some(hex);
+                    } else {
+                        model.workbook.styles.fills[i].bg_color = Some(hex);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fonts: the i-th `<font>` in `<fonts>` is `styles.fonts[i]`. Only a `<color indexed="…"/>`
+    // is rewritten.
+    if let Some(fonts) = root.children().find(|n| n.has_tag_name("fonts")) {
+        for (i, font) in fonts.children().enumerate() {
+            if i >= model.workbook.styles.fonts.len() {
+                break;
+            }
+            if let Some(color) = font.children().find(|n| n.has_tag_name("color")) {
+                if let Some(rgb) = indexed_rgb(&color, &palette) {
+                    model.workbook.styles.fonts[i].color = Some(to_hex(rgb));
+                }
+            }
+        }
+    }
+}
+
+/// Resolves a colour node against the file's indexed palette **iff** it used `indexed=` (and not an
+/// explicit `rgb=`, which takes precedence in IronCalc's `get_color`). Returns `None` — leaving
+/// IronCalc's value in place — for `rgb=`/`theme=`/`auto=`, for the conventional system indices
+/// 64/65 (auto foreground/background, not a palette lookup), for an index past the end of the
+/// override list, and for a malformed override entry.
+fn indexed_rgb(node: &roxmltree::Node, palette: &[Option<Rgb>]) -> Option<Rgb> {
+    // `rgb=` wins over `indexed=` in IronCalc's `get_color`, so an explicit-RGB node was never
+    // resolved from the palette — don't disturb it.
+    if node.has_attribute("rgb") {
+        return None;
+    }
+    let idx: usize = node.attribute("indexed")?.parse().ok()?;
+    // Indices 64/65 are Excel's "system foreground/background" (automatic), not palette entries;
+    // IronCalc/Excel resolve them from the system colours, so never map them to an override slot.
+    if idx >= 64 {
+        return None;
+    }
+    // Out of range → `None` (leave IronCalc's value); a malformed override entry is stored as
+    // `None` and likewise leaves IronCalc's value.
+    *palette.get(idx)?
+}
+
+/// Reads `xl/styles.xml`'s `<colors><indexedColors>` override into a palette indexed by position
+/// (the OOXML `indexed="…"` value). Each entry is `<rgbColor rgb="AARRGGBB"/>`; the leading alpha
+/// byte is dropped. Returns `None` when there is no override (or it is empty) — the signal to the
+/// caller that nothing should be touched. A malformed `rgb=` becomes a `None` slot (that index is
+/// left to IronCalc), never a panic.
+fn read_indexed_palette(root: roxmltree::Node) -> Option<Vec<Option<Rgb>>> {
+    let colors = root.children().find(|n| n.has_tag_name("colors"))?;
+    let indexed = colors
+        .children()
+        .find(|n| n.has_tag_name("indexedColors"))?;
+    let palette: Vec<Option<Rgb>> = indexed
+        .children()
+        .filter(|n| n.has_tag_name("rgbColor"))
+        .map(|n| n.attribute("rgb").and_then(parse_indexed_rgb))
+        .collect();
+    if palette.is_empty() {
+        return None;
+    }
+    Some(palette)
+}
+
+/// Parses an `<rgbColor rgb="…"/>` value: `AARRGGBB` (drop the alpha byte) or a bare `RRGGBB`.
+/// Any other shape / non-hex → `None`.
+fn parse_indexed_rgb(s: &str) -> Option<Rgb> {
+    // Check all-hex first so the `[2..8]` slice below always lands on a char boundary (a
+    // multibyte-garbage string can never panic).
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    match s.len() {
+        8 => parse_hex6(&s[2..8]), // AARRGGBB → keep RRGGBB
+        6 => parse_hex6(s),
+        _ => None,
+    }
 }
 
 /// Reads one entry from the `.xlsx` (a Zip archive) into a string. `None` on any I/O / missing
@@ -680,6 +821,296 @@ mod tests {
             model.workbook.styles.fills[0].fg_color.as_deref(),
             Some("#000000"),
             "no theme file → nothing is rewritten"
+        );
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Indexed-colour correction (`<colors><indexedColors>` override)
+    // ----------------------------------------------------------------------------------------
+
+    /// A minified styles.xml carrying a `<colors><indexedColors>` override (the first 8 standard
+    /// entries + this file's custom 9/12/13/14, mirroring the Numbers fixture) and fills/fonts
+    /// exercising every branch: an in-range `indexed=` fill (2), another in-range indexed fill
+    /// (3), an out-of-range index (4), the system index 64 (5), and an explicit `rgb=` (6); font 1
+    /// uses an in-range `indexed=` colour.
+    const CRAFTED_INDEXED_STYLES: &str = concat!(
+        r#"<?xml version="1.0"?><styleSheet xmlns="ns"><fills>"#,
+        r#"<fill><patternFill patternType="none"/></fill>"#,
+        r#"<fill><patternFill patternType="gray125"/></fill>"#,
+        r#"<fill><patternFill patternType="solid"><fgColor indexed="9"/><bgColor auto="1"/></patternFill></fill>"#,
+        r#"<fill><patternFill patternType="solid"><fgColor indexed="13"/></patternFill></fill>"#,
+        r#"<fill><patternFill patternType="solid"><fgColor indexed="99"/></patternFill></fill>"#,
+        r#"<fill><patternFill patternType="solid"><fgColor indexed="64"/></patternFill></fill>"#,
+        r#"<fill><patternFill patternType="solid"><fgColor rgb="FFAABBCC"/></patternFill></fill>"#,
+        r#"</fills><fonts>"#,
+        r#"<font><sz val="10"/></font>"#,
+        r#"<font><color indexed="14"/><sz val="10"/></font>"#,
+        r#"</fonts>"#,
+        r#"<colors><indexedColors>"#,
+        r#"<rgbColor rgb="ff000000"/><rgbColor rgb="ffffffff"/><rgbColor rgb="ffff0000"/>"#,
+        r#"<rgbColor rgb="ff00ff00"/><rgbColor rgb="ff0000ff"/><rgbColor rgb="ffffff00"/>"#,
+        r#"<rgbColor rgb="ffff00ff"/><rgbColor rgb="ff00ffff"/><rgbColor rgb="ff000000"/>"#,
+        r#"<rgbColor rgb="ffbdc0bf"/><rgbColor rgb="ffa5a5a5"/><rgbColor rgb="ff3f3f3f"/>"#,
+        r#"<rgbColor rgb="ffdbdbdb"/><rgbColor rgb="ffffd931"/><rgbColor rgb="fffe634d"/>"#,
+        r#"</indexedColors></colors></styleSheet>"#,
+    );
+
+    /// The same fills as above but with **no** `<colors><indexedColors>` override — a
+    /// standard-palette file. `correct_indexed_colors` must touch nothing.
+    const CRAFTED_INDEXED_NO_OVERRIDE: &str = concat!(
+        r#"<?xml version="1.0"?><styleSheet xmlns="ns"><fills>"#,
+        r#"<fill><patternFill patternType="none"/></fill>"#,
+        r#"<fill><patternFill patternType="solid"><fgColor indexed="13"/></patternFill></fill>"#,
+        r#"</fills><fonts><font><color indexed="14"/><sz val="10"/></font></fonts></styleSheet>"#,
+    );
+
+    /// Zips a single `xl/styles.xml` into a `.xlsx` (no theme) — the input `correct_indexed_colors`
+    /// reads. Named distinctly from the theme helper so the two colour passes stay independent.
+    fn write_styles_only_xlsx(dir: &std::path::Path, styles: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join("indexed.xlsx");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        zw.start_file("xl/styles.xml", zip::write::FileOptions::default())
+            .unwrap();
+        zw.write_all(styles.as_bytes()).unwrap();
+        zw.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_indexed_rgb_strips_alpha_and_validates() {
+        // AARRGGBB (the form Excel/Numbers write) drops the leading alpha byte.
+        assert_eq!(parse_indexed_rgb("ffbdc0bf"), Some(Rgb::from_hex(0xBDC0BF)));
+        assert_eq!(parse_indexed_rgb("00FFD931"), Some(Rgb::from_hex(0xFFD931)));
+        // A bare RRGGBB is accepted too.
+        assert_eq!(parse_indexed_rgb("fe634d"), Some(Rgb::from_hex(0xFE634D)));
+        // Malformed → None (skipped, never a panic).
+        assert_eq!(parse_indexed_rgb("xyz"), None); // wrong length
+        assert_eq!(parse_indexed_rgb("gggggggg"), None); // non-hex
+        assert_eq!(parse_indexed_rgb(""), None);
+    }
+
+    #[test]
+    fn read_indexed_palette_parses_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_styles_only_xlsx(dir.path(), CRAFTED_INDEXED_STYLES);
+        let xml = read_zip_entry(&path, "xl/styles.xml").unwrap();
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let palette = read_indexed_palette(doc.root_element()).unwrap();
+        assert_eq!(palette.len(), 15);
+        assert_eq!(palette[9], Some(Rgb::from_hex(0xBDC0BF)));
+        assert_eq!(palette[12], Some(Rgb::from_hex(0xDBDBDB)));
+        assert_eq!(palette[13], Some(Rgb::from_hex(0xFFD931)));
+        assert_eq!(palette[14], Some(Rgb::from_hex(0xFE634D)));
+
+        // A styles.xml with no `<colors><indexedColors>` yields `None` — the "leave it alone"
+        // signal that keeps standard-palette files untouched.
+        let path2 = write_styles_only_xlsx(dir.path(), CRAFTED_INDEXED_NO_OVERRIDE);
+        let xml2 = read_zip_entry(&path2, "xl/styles.xml").unwrap();
+        let doc2 = roxmltree::Document::parse(&xml2).unwrap();
+        assert!(read_indexed_palette(doc2.root_element()).is_none());
+    }
+
+    #[test]
+    fn indexed_rgb_honours_precedence_and_guards() {
+        let palette = vec![
+            Some(Rgb::from_hex(0x000000)),
+            Some(Rgb::from_hex(0xFFFFFF)),
+            None, // a malformed override entry
+        ];
+        let resolve = |xml: &str| {
+            let doc = roxmltree::Document::parse(xml).unwrap();
+            indexed_rgb(&doc.root_element(), &palette)
+        };
+        // In-range index → the override slot.
+        assert_eq!(
+            resolve(r#"<fgColor indexed="1"/>"#),
+            Some(Rgb::from_hex(0xFFFFFF))
+        );
+        // Explicit rgb= takes precedence in IronCalc, so we decline (leave its value).
+        assert_eq!(resolve(r#"<fgColor rgb="FFAABBCC" indexed="1"/>"#), None);
+        // System index 64 (auto) is not a palette lookup → declined.
+        assert_eq!(resolve(r#"<fgColor indexed="64"/>"#), None);
+        // Out of range → declined (leave IronCalc's value).
+        assert_eq!(resolve(r#"<fgColor indexed="9"/>"#), None);
+        // A malformed override slot (stored None) → declined.
+        assert_eq!(resolve(r#"<fgColor indexed="2"/>"#), None);
+        // A theme= / auto= node is not indexed → declined.
+        assert_eq!(resolve(r#"<fgColor theme="3"/>"#), None);
+        assert_eq!(resolve(r#"<bgColor auto="1"/>"#), None);
+    }
+
+    #[test]
+    fn correct_indexed_colors_rewrites_only_indexed_entries() {
+        use ironcalc_base::types::{Fill, Font};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_styles_only_xlsx(dir.path(), CRAFTED_INDEXED_STYLES);
+
+        // A model whose style tables mirror how IronCalc imports the crafted styles.xml — every
+        // `indexed=` colour resolved WRONGLY against IronCalc's hardcoded legacy palette.
+        let mut model = Model::new_empty("b", "en", "UTC", "en").unwrap();
+        let solid = |fg: Option<&str>| Fill {
+            pattern_type: "solid".into(),
+            fg_color: fg.map(str::to_string),
+            bg_color: None,
+        };
+        model.workbook.styles.fills = vec![
+            Fill {
+                pattern_type: "none".into(),
+                fg_color: None,
+                bg_color: None,
+            },
+            Fill {
+                pattern_type: "gray125".into(),
+                fg_color: None,
+                bg_color: None,
+            },
+            solid(Some("#FFFFFF")), // fill 2: index 9 → IronCalc default white
+            solid(Some("#FFFF00")), // fill 3: index 13 → IronCalc default yellow
+            solid(Some("#000000")), // fill 4: index 99 → IronCalc out-of-range fallback
+            solid(Some("#000000")), // fill 5: index 64 → IronCalc "auto"/fallback
+            solid(Some("#AABBCC")), // fill 6: explicit rgb=FFAABBCC
+        ];
+        model.workbook.styles.fonts = vec![
+            Font::default(),
+            Font {
+                color: Some("#FF00FF".into()), // font 1: index 14 → IronCalc default magenta
+                ..Font::default()
+            },
+        ];
+
+        correct_indexed_colors(&mut model, &path);
+
+        // Fill 2 (index 9) → the file's #BDC0BF; its auto bgColor was never set and stays None.
+        assert_eq!(
+            model.workbook.styles.fills[2].fg_color.as_deref(),
+            Some("#BDC0BF")
+        );
+        assert_eq!(model.workbook.styles.fills[2].bg_color, None);
+        // Fill 3 (index 13) → the file's #FFD931 (gold), not IronCalc's yellow.
+        assert_eq!(
+            model.workbook.styles.fills[3].fg_color.as_deref(),
+            Some("#FFD931")
+        );
+        // Fill 4 (index 99, out of range) → left as IronCalc parsed it.
+        assert_eq!(
+            model.workbook.styles.fills[4].fg_color.as_deref(),
+            Some("#000000"),
+            "an out-of-range index must not be remapped"
+        );
+        // Fill 5 (index 64, system auto) → left as IronCalc parsed it.
+        assert_eq!(
+            model.workbook.styles.fills[5].fg_color.as_deref(),
+            Some("#000000"),
+            "index 64 (auto) must not be remapped to an override slot"
+        );
+        // Fill 6 (explicit rgb=) → untouched.
+        assert_eq!(
+            model.workbook.styles.fills[6].fg_color.as_deref(),
+            Some("#AABBCC"),
+            "an explicit rgb= colour is not indexed and must be left alone"
+        );
+        // Font 1 (index 14) → the file's #FE634D (red-orange), not IronCalc's magenta.
+        assert_eq!(
+            model.workbook.styles.fonts[1].color.as_deref(),
+            Some("#FE634D")
+        );
+    }
+
+    #[test]
+    fn correct_indexed_colors_is_noop_without_override() {
+        use ironcalc_base::types::{Fill, Font};
+        // A standard-palette file (indexed fills, but NO `<colors><indexedColors>` override): the
+        // pass must change nothing, so files using the standard palette never regress.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_styles_only_xlsx(dir.path(), CRAFTED_INDEXED_NO_OVERRIDE);
+
+        let mut model = Model::new_empty("b", "en", "UTC", "en").unwrap();
+        model.workbook.styles.fills = vec![
+            Fill {
+                pattern_type: "none".into(),
+                fg_color: None,
+                bg_color: None,
+            },
+            Fill {
+                pattern_type: "solid".into(),
+                fg_color: Some("#FFFF00".into()), // IronCalc's index-13 default
+                bg_color: None,
+            },
+        ];
+        model.workbook.styles.fonts = vec![Font {
+            color: Some("#FF00FF".into()), // IronCalc's index-14 default
+            ..Font::default()
+        }];
+
+        correct_indexed_colors(&mut model, &path);
+
+        assert_eq!(
+            model.workbook.styles.fills[1].fg_color.as_deref(),
+            Some("#FFFF00"),
+            "no override → indexed fill left exactly as IronCalc parsed it"
+        );
+        assert_eq!(
+            model.workbook.styles.fonts[0].color.as_deref(),
+            Some("#FF00FF"),
+            "no override → indexed font colour left exactly as IronCalc parsed it"
+        );
+    }
+
+    /// End-to-end colour regression over the committed Numbers fixture: opening it through the
+    /// full public path (`WorkbookDocument::open`, which runs `apply_open_fixups`) and reading the
+    /// resolved fill through the exact grid/cache accessor (`cache::render_style_from` over the
+    /// resolved style) must yield the file's palette colours, not IronCalc's legacy defaults.
+    #[test]
+    fn numbers_fixture_indexed_fills_resolve_to_file_palette() {
+        use crate::cache::render_style_from;
+        use crate::document::WorkbookDocument;
+        use freecell_core::CellRef;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/numbers_table.xlsx");
+        let doc = WorkbookDocument::open(&path).expect("the Numbers fixture opens (via repair)");
+
+        // The resolved fill the grid would paint for a 0-based cell.
+        let fill = |row: u32, col: u32| -> Option<Rgb> {
+            let style = doc
+                .resolved_cell_style(0, CellRef::new(row, col))
+                .expect("cell style resolves");
+            render_style_from(&style).fill
+        };
+
+        // Header band B2 uses fill `indexed="9"` → the file's light grey #BDC0BF
+        // (IronCalc's legacy default 9 is white).
+        assert_eq!(
+            fill(1, 1),
+            Some(Rgb::from_hex(0xBDC0BF)),
+            "B2 header band → file index 9 (#BDC0BF)"
+        );
+        // The ASDF/TOTAL label column A uses fill `indexed="12"` → the file's #DBDBDB
+        // (IronCalc's legacy default 12 is bright blue #0000FF — the reported bug).
+        assert_eq!(
+            fill(2, 0),
+            Some(Rgb::from_hex(0xDBDBDB)),
+            "A3 label column → file index 12 (#DBDBDB)"
+        );
+        assert_eq!(
+            fill(17, 0),
+            Some(Rgb::from_hex(0xDBDBDB)),
+            "A18 TOTAL label → file index 12 (#DBDBDB)"
+        );
+        // TOTAL B18 uses `indexed="13"` → gold #FFD931 (not IronCalc's yellow #FFFF00).
+        assert_eq!(
+            fill(17, 1),
+            Some(Rgb::from_hex(0xFFD931)),
+            "B18 → file index 13 (#FFD931 gold)"
+        );
+        // TOTAL C18 uses `indexed="14"` → red-orange #FE634D (not IronCalc's magenta #FF00FF).
+        assert_eq!(
+            fill(17, 2),
+            Some(Rgb::from_hex(0xFE634D)),
+            "C18 → file index 14 (#FE634D red-orange)"
         );
     }
 }

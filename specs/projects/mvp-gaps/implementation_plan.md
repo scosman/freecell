@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Implementation Plan: MVP Gaps — Core Spreadsheet Feel

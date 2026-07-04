@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: MVP Gaps — Core Spreadsheet Feel

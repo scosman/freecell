@@ -81,3 +81,17 @@ registry: each entry is a short description plus a pointer to a design note unde
   wayland/atspi stack), tighten bans/sources. No safe upgrade exists at the pinned gpui/
   ironcalc revs today; FreeCell ships no binaries yet, so the documented posture is
   acceptable for now. → [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)
+
+- **Windows Port** — *Future (packaging wired 2026-07-05; app build not a real target).*
+  Make FreeCell compile + run on Windows (GPUI DirectX backend, `cfg(windows)` dep split,
+  Windows arms for the macOS/Linux-gated code paths), then promote the already-wired NSIS
+  installer + Windows CI job from experimental (`continue-on-error`) to supported. The
+  `cargo-packager` work added the packaging half; the app half is untouched.
+  → [`projects/windows-port.md`](projects/windows-port.md)
+
+- **Release Signing & Distribution** — *Future, required before publishing any binary.*
+  The `cargo-packager` pipeline ships **unsigned dev artifacts** (uploaded as CI run
+  artifacts, not GitHub Releases) by deliberate scope decision — no signing config/hooks
+  exist. This adds macOS Developer-ID signing + notarization, Windows Authenticode, and the
+  switch to attaching signed assets to a GitHub Release. Hard-gated on the
+  pre-distribution security audit above. → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)

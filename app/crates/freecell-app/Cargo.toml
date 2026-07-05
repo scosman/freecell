@@ -7,6 +7,45 @@ rust-version.workspace = true
 publish = false
 description = "The FreeCell GPUI application (macOS + Linux): app shell, windows, chrome, and the custom grid. Phase 1 = hello-world window that builds on both platforms + the Linux render spike."
 
+# ---------------------------------------------------------------------------------
+# cargo-packager: build distributable bundles/installers for the `freecell` binary.
+#
+# Drives `app/scripts/package.sh` (macOS/Linux) + `app/scripts/package.ps1` (Windows)
+# and the `release` GitHub Actions workflow. See `app/PACKAGING.md` for the full story
+# (formats, local usage, the unsigned-build note, Windows-port status) and
+# `packaging/icons/README.md` for the placeholder-icon writeup.
+#
+# cargo-packager reads this table via `cargo metadata`, so it auto-fills `version`
+# (workspace 0.1.0) and auto-detects the `freecell` bin target — no `binaries`/`version`
+# needed here. IMPORTANT: cargo-packager `cd`s into THIS crate's manifest directory
+# (`app/crates/freecell-app/`) before packaging, so the `icons` (and any `resources`) paths
+# below are relative to THIS Cargo.toml, not to the workspace root or the shell's CWD.
+# Package FORMATS are chosen per-OS by the scripts (`--formats`), NOT pinned here, so this
+# one config serves macOS (app/dmg), Linux (deb/appimage) and the experimental Windows
+# (nsis) job. Builds are UNSIGNED (dev builds); signing is future work — see PACKAGING.md.
+# ---------------------------------------------------------------------------------
+[package.metadata.packager]
+product-name = "FreeCell"
+identifier = "com.scosman.freecell"
+category = "productivity"
+description = "A GPU-rendered, Excel-compatible spreadsheet — stupid-fast on huge sheets."
+homepage = "https://github.com/scosman/freecell"
+# Placeholder icons (dark-green spreadsheet grid). cargo-packager uses the .icns for the
+# macOS bundle, the .ico for the Windows installer, and the sized PNGs for Linux hicolor
+# theme entries. Regenerate all formats with `packaging/icons/generate_icons.py`.
+icons = [
+    "packaging/icons/icon.icns",
+    "packaging/icons/icon.ico",
+    "packaging/icons/16x16.png",
+    "packaging/icons/32x32.png",
+    "packaging/icons/48x48.png",
+    "packaging/icons/64x64.png",
+    "packaging/icons/128x128.png",
+    "packaging/icons/128x128@2x.png",
+    "packaging/icons/256x256.png",
+    "packaging/icons/512x512.png",
+]
+
 [lib]
 name = "freecell_app"
 path = "src/lib.rs"

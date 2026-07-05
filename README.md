@@ -23,7 +23,7 @@ not a design-polished or feature-complete product (see `specs/projects/mvp/funct
 | [`GAPS.md`](GAPS.md) | **Running log of known gaps, deferred behaviors & limitations** — the durable place we append gaps so none are lost (e.g. the MVP's deferred type-aware alignment, macOS Finder-open, input-cap message text). |
 | [`PROJECTS.md`](PROJECTS.md) + [`projects/`](projects/) | The "save for later" backlog — optimizations/features/goals off the MVP critical path (e.g. `.xlsx` preservation, bundled Inter, type-aware alignment, pre-distribution security audit). Distinct from `specs/projects/`. |
 | [`CLAUDE.md`](CLAUDE.md) | Project conventions (benchmark discipline, commit cadence, the projects backlog rule). |
-| [`.github/workflows/`](.github/workflows/) | CI: `checks.yml` (Linux, required), `perf-gates.yml` (Linux, required), `macos-verify.yml` (manual/weekly). |
+| [`.github/workflows/`](.github/workflows/) | CI: `checks.yml` (Linux, required), `perf-gates.yml` (Linux, required), `macos-verify.yml` (manual/weekly), `release.yml` (tag `v*` / dispatch — `cargo-packager` bundles, uploaded as run artifacts; see [`app/PACKAGING.md`](app/PACKAGING.md)). |
 
 ## Quick start
 

@@ -92,3 +92,22 @@ GitHub Actions live at the repo root (`../.github/workflows/`):
   the render suite (Xvfb + lavapipe), cargo-deny (licenses/advisories — see `deny.toml`).
 - **perf-gates** (Linux, required): the perf harness with buffered thresholds.
 - **macos-verify** (manual/weekly, non-required): build + test + render smoke on macOS.
+- **release** (tag `v*` / manual dispatch): package the app with `cargo-packager` for
+  macOS + Linux (required) and Windows (experimental), uploading unsigned installers as run
+  artifacts. See [`PACKAGING.md`](PACKAGING.md).
+
+## Packaging / releases
+
+`cargo-packager` builds distributable bundles (macOS `.app`/`.dmg`, Linux `.deb`/`.AppImage`,
+experimental Windows NSIS `.exe`). Build them locally with the same scripts CI uses:
+
+```sh
+cargo install cargo-packager --locked --version 0.11.8   # one-time
+scripts/package.sh          # macOS / Linux  -> app/target/packages/
+scripts\package.ps1         # Windows (PowerShell)
+```
+
+Builds are **unsigned dev builds** (not for distribution yet). Config, formats, prerequisites,
+the Windows-port requirements, and the signing deferral are documented in
+[`PACKAGING.md`](PACKAGING.md); the placeholder icons in
+[`crates/freecell-app/packaging/icons/`](crates/freecell-app/packaging/icons/README.md).

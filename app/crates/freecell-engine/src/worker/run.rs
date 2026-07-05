@@ -250,6 +250,7 @@ impl Worker {
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
+                | Command::SetBorders { .. }
                 | Command::AddSheet
                 | Command::RenameSheet { .. }
                 | Command::DeleteSheet { .. }
@@ -1149,6 +1150,16 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             // Text color / alignment / number format never change values → no recompute.
             Ok(AppliedKind::StyleOnly)
         }
+        Command::SetBorders {
+            sheet,
+            range,
+            preset,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_borders(idx, *range, preset.border_type_tag())?;
+            // Borders never change values → no recompute.
+            Ok(AppliedKind::StyleOnly)
+        }
         Command::AddSheet => {
             doc.add_sheet()?;
             Ok(AppliedKind::SheetOp)
@@ -1235,6 +1246,14 @@ fn op_of(edit: &Command) -> AppliedOp {
                 range: *range,
             }
         }
+        // `set_area_with_border` also fixes up the four cells adjacent to the range (heavier-wins
+        // sync of the shared edge), so the mirror must re-read a one-cell ring around the target.
+        // A full row/col stays band-creating after expansion → the refresh takes the full-rebuild
+        // path, which reads bands back correctly.
+        Command::SetBorders { sheet, range, .. } => AppliedOp::Cells {
+            sheet: *sheet,
+            range: expand_by_one_cell(*range),
+        },
         Command::AddSheet | Command::RenameSheet { .. } | Command::DeleteSheet { .. } => {
             AppliedOp::Sheets
         }
@@ -1266,6 +1285,23 @@ fn range_area(range: &CellRange) -> u64 {
     let rows = (range.end.row - range.start.row) as u64 + 1;
     let cols = (range.end.col - range.start.col) as u64 + 1;
     rows * cols
+}
+
+/// Grows `range` by one cell in every direction, clamped to the sheet bounds — the refresh window
+/// for a border edit (the engine's `set_area_with_border` also touches the four adjacent strips).
+/// A full-row/col range is unchanged on its spanning axis (already at the bound), so it stays
+/// band-creating and the refresh full-rebuilds.
+fn expand_by_one_cell(range: CellRange) -> CellRange {
+    CellRange::new(
+        CellRef::new(
+            range.start.row.saturating_sub(1),
+            range.start.col.saturating_sub(1),
+        ),
+        CellRef::new(
+            (range.end.row + 1).min(limits::MAX_ROWS - 1),
+            (range.end.col + 1).min(limits::MAX_COLS - 1),
+        ),
+    )
 }
 
 /// Whether a style edit over `range` makes IronCalc create a **band** (a row spanning every
@@ -1907,6 +1943,99 @@ mod tests {
             "color is untouched"
         );
         worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn set_borders_applies_and_undo() {
+        use crate::worker::protocol::BorderPreset;
+        use freecell_core::BorderSpec;
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 1, 1, "x"),
+        ]);
+        drain_events(&rx);
+
+        // Apply "All" over a bounded 2×2 block B2:C3 (one undoable diff-list).
+        worker.process_batch(vec![Command::SetBorders {
+            sheet,
+            range: CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)),
+            preset: BorderPreset::All,
+        }]);
+
+        // B2 now carries all four thin edges, and the cache agrees with a fresh engine re-read
+        // (which also validates the adjacent-strip fix-up refresh via the expanded range).
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let rs = cache
+                .render_style(1, 1)
+                .copied()
+                .expect("bordered cell stored");
+            let spec = cache.border_spec(rs.border);
+            assert!(spec.top.is_some() && spec.right.is_some() && spec.bottom.is_some());
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
+            "a border edit ships a StyleCacheUpdated delta"
+        );
+
+        // One undo step reverts the whole border edit → B2 has no border again.
+        worker.process_batch(vec![Command::Undo]);
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let border = cache
+                .render_style(1, 1)
+                .map(|rs| cache.border_spec(rs.border))
+                .unwrap_or(BorderSpec::NONE);
+            assert!(border.is_none(), "undo reverts the border to NONE");
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn set_borders_full_column_is_band() {
+        use crate::worker::protocol::BorderPreset;
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        // Full-column "All" over column D → `set_area_with_border` routes to a column band; the
+        // mirror must full-rebuild (band-creating, even after the +1 expansion) rather than
+        // materialize 1M cells.
+        worker.process_batch(vec![Command::SetBorders {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 3), CellRef::new(limits::MAX_ROWS - 1, 3)),
+            preset: BorderPreset::All,
+        }]);
+
+        let (rows, cols) = wide_probes();
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        // A far, empty cell on the banded column resolves to the border (the band), not default.
+        let spec = {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            cache
+                .render_style(5000, 3)
+                .map(|rs| cache.border_spec(rs.border))
+        };
+        assert!(
+            matches!(spec, Some(s) if !s.is_none()),
+            "a far cell on the banded column carries the border"
+        );
     }
 
     /// Send a `SetFont` and drain — the font op runs standalone after any edit batch.

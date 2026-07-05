@@ -29,7 +29,7 @@ judgment calls in a `DECISIONS_TO_REVIEW.md` here).
       (§3.1–3.2, ui_design §2).
 - [x] **Phase 5 — Fonts**: `RenderStyle`/cache font fields + rendering; `SetFont` via
       on_paste_styles + clamps + row auto-grow; family/size dropdowns (§3.3).
-- [ ] **Phase 6 — Borders**: cache `BorderSpec` interning + edge rendering; presets
+- [x] **Phase 6 — Borders**: cache `BorderSpec` interning + edge rendering; presets
       menu via `set_area_with_border` (§3.4).
 - [ ] **Phase 7 — Structure**: resize hotspots/cursors/preview/commit (§5.1); header
       selection + select-all + clamping rule (§5.2); insert/delete menu + merge

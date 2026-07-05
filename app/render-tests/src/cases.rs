@@ -3,9 +3,24 @@
 //! rows here (stated as a review requirement in `README.md`). `name` is snake_case and IS the
 //! baseline filename, so a red CI line names the exact broken feature.
 
-use freecell_core::{Align, CellRef, SelectionModel};
+use freecell_core::{Align, BorderSpec, CellRef, Edge, Rgb, SelectionModel};
 
 use crate::scene::Scene;
+
+/// A solid black border edge of the given px `weight` (the render-case builder's shorthand).
+fn edge(weight: u8) -> Option<Edge> {
+    Some(Edge::new(weight, Rgb::new(0, 0, 0)))
+}
+
+/// A four-sided border, every edge `weight` px black.
+fn all_edges(weight: u8) -> BorderSpec {
+    BorderSpec {
+        top: edge(weight),
+        right: edge(weight),
+        bottom: edge(weight),
+        left: edge(weight),
+    }
+}
 
 /// A demonstrative multi-line-ish word with an ascender + descenders, so bold / italic /
 /// underline read clearly in a baseline.
@@ -348,6 +363,101 @@ pub fn all() -> Vec<RenderCase> {
             // the style is preserved). Guards that a missing family never blanks the cell.
             "font_missing_family_fallback",
             at(Scene::new()).font(1, 1, Some("NoSuchFontXYZ123"), None),
+        ),
+        // ---- Borders (Phase 6): edge paint, presets, shared-edge precedence -------------
+        cell(
+            // A single cell with all four thin (1px) black edges.
+            "border_all_thin",
+            at(Scene::new()).border(1, 1, all_edges(1)),
+        ),
+        cell(
+            // A 2×2 block with a medium (2px) OUTER border only — each corner cell carries just its
+            // two outward edges, so no interior edges draw.
+            "border_outer_medium",
+            at(Scene::new())
+                .input(1, 2, "b")
+                .input(2, 1, "c")
+                .input(2, 2, "d")
+                .border(
+                    1,
+                    1,
+                    BorderSpec {
+                        top: edge(2),
+                        left: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    1,
+                    2,
+                    BorderSpec {
+                        top: edge(2),
+                        right: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    2,
+                    1,
+                    BorderSpec {
+                        bottom: edge(2),
+                        left: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    2,
+                    2,
+                    BorderSpec {
+                        bottom: edge(2),
+                        right: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                ),
+        ),
+        cell(
+            // Adjacent cells DISAGREE on the shared edge: B2's right is thin (1px), C2's left is
+            // thick (3px). The heavier (thick) wins, and the edge is drawn once — by B2.
+            "border_heavier_edge_wins",
+            at(Scene::new())
+                .input(1, 2, "X")
+                .border(
+                    1,
+                    1,
+                    BorderSpec {
+                        right: edge(1),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    1,
+                    2,
+                    BorderSpec {
+                        left: edge(3),
+                        ..BorderSpec::NONE
+                    },
+                ),
+        ),
+        cell(
+            // A border painted over a fill: the edges draw ON TOP of the yellow fill (Excel look).
+            "border_over_fill",
+            at(Scene::new())
+                .fill(1, 1, 0xFFEB3B)
+                .border(1, 1, all_edges(1)),
+        ),
+        cell(
+            // Two adjacent all-thin cells: the shared vertical edge is drawn exactly ONCE (by the
+            // left cell), so it looks identical to a single continuous line — no double-thick seam.
+            "border_shared_edge_adjacent",
+            at(Scene::new())
+                .input(1, 2, "Y")
+                .border(1, 1, all_edges(1))
+                .border(1, 2, all_edges(1)),
+        ),
+        cell(
+            // A cell whose border was cleared (NONE) renders as a plain cell — guards the clear path.
+            "border_none_clear",
+            at(Scene::new()).border(1, 1, BorderSpec::NONE),
         ),
     ];
 

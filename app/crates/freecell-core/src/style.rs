@@ -55,6 +55,13 @@ pub struct RenderStyle {
     /// default family). Non-zero renders that family (missing families fall back via gpui's
     /// fallback stack — display-only, the style is preserved).
     pub font_family: u16,
+    /// Index into the owning [`SheetCache`](crate::SheetCache)'s `border_specs` side table for this
+    /// cell's resolved [`BorderSpec`](crate::BorderSpec); `0` = [`BorderSpec::NONE`](crate::BorderSpec::NONE)
+    /// (no borders). Non-zero draws that cell's edges (the grid resolves the spec from the side
+    /// table and paints each effective edge — `components/style_render.md §Border painting`). Like
+    /// the other side-table indices it participates in interning identity, so cells that differ
+    /// only by border get distinct [`StyleId`](crate::StyleId)s.
+    pub border: u16,
 }
 
 #[cfg(test)]
@@ -79,6 +86,10 @@ mod tests {
         assert_eq!(
             s.font_family, 0,
             "a default cell uses the workbook default family"
+        );
+        assert_eq!(
+            s.border, 0,
+            "a default cell has no borders (index 0 = NONE)"
         );
     }
 }

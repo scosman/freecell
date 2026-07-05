@@ -26,8 +26,10 @@
 //! it converts the 1-based `Row.r` / `Col.min..=max` itself.
 
 use freecell_core::cache::{DEFAULT_COL_WIDTH_PX, DEFAULT_ROW_HEIGHT_PX};
-use freecell_core::{limits, CellRef, RenderStyle, Rgb, SheetCache, SheetCacheBuilder};
-use ironcalc_base::types::{HorizontalAlignment, Style};
+use freecell_core::{
+    limits, BorderSpec, CellRef, Edge, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
+};
+use ironcalc_base::types::{Border, BorderItem, BorderStyle, HorizontalAlignment, Style};
 
 use crate::document::WorkbookDocument;
 
@@ -84,10 +86,49 @@ pub(crate) fn parse_color(s: &str) -> Option<Rgb> {
     Some(Rgb::from_hex(value))
 }
 
-/// Derives the engine-free [`RenderStyle`] from an IronCalc `Style` — the MVP subset the grid
-/// draws (`functional_spec.md §3.6`). Everything IronCalc models but the grid ignores (borders,
-/// font family/size, strikethrough, wrap, vertical align) is intentionally dropped from the
-/// render form; it stays in the engine and round-trips on save.
+/// Maps an IronCalc [`BorderStyle`] to the grid's px weight class (`architecture.md §1.1`, corrected
+/// to the actual nine 0.7.1 variants — the spec's `Hair`/`Dashed` don't exist at this rev; see
+/// DECISIONS_TO_REVIEW): Thin/Dotted → `1`; the Medium family + SlantDashDot → `2`; Thick/Double →
+/// `3`. All are drawn solid (dotted/dashed fidelity collapses to its weight class — SP5-accepted).
+pub(crate) fn border_weight(style: &BorderStyle) -> u8 {
+    match style {
+        BorderStyle::Thin | BorderStyle::Dotted => 1,
+        BorderStyle::Medium
+        | BorderStyle::MediumDashed
+        | BorderStyle::MediumDashDot
+        | BorderStyle::MediumDashDotDot
+        | BorderStyle::SlantDashDot => 2,
+        BorderStyle::Thick | BorderStyle::Double => 3,
+    }
+}
+
+/// Resolves one IronCalc [`BorderItem`] to a render [`Edge`]: its weight class + colour (defaulting
+/// to black when the item carries none or an unparseable string — the render never panics).
+fn edge_from(item: &BorderItem) -> Edge {
+    let color = item
+        .color
+        .as_deref()
+        .and_then(parse_color)
+        .unwrap_or(Rgb::new(0, 0, 0));
+    Edge::new(border_weight(&item.style), color)
+}
+
+/// Resolves an IronCalc [`Border`] into the engine-free [`BorderSpec`] the grid paints. Only the
+/// four side edges are drawn (diagonals are out of scope — `functional_spec.md §3.6`).
+pub(crate) fn border_spec_from(border: &Border) -> BorderSpec {
+    BorderSpec {
+        top: border.top.as_ref().map(edge_from),
+        right: border.right.as_ref().map(edge_from),
+        bottom: border.bottom.as_ref().map(edge_from),
+        left: border.left.as_ref().map(edge_from),
+    }
+}
+
+/// Derives the engine-free [`RenderStyle`] from an IronCalc `Style` — the subset the grid draws
+/// (`functional_spec.md §3.6`). Font family/size, borders, and number format are **side-table
+/// indices** resolved by the caller (which holds the interning tables); everything IronCalc models
+/// but the grid ignores (strikethrough, wrap, vertical/diagonal) stays in the engine and
+/// round-trips on save.
 ///
 /// `render_style_from(&Style::default()) == RenderStyle::default()` (asserted in the tests) — so
 /// a plain cell interns to the default style and resolves to `None` (the grid's default paint).
@@ -108,14 +149,15 @@ pub(crate) fn render_style_from(style: &Style) -> RenderStyle {
             .and_then(parse_color)
             .filter(|rgb| *rgb != Rgb::new(0, 0, 0)),
         h_align: h_align_of(style),
-        // `num_fmt` / `font_family` are side-table indices resolved by the caller (build/refresh),
-        // which holds the interning tables; a bare conversion carries `0` (= "general" / the
-        // workbook default family). `font_size_q` is likewise resolved by the caller against the
-        // workbook default (`font_size_q_of`). The caller overrides all three before the
-        // default-check so a font/format-only cell is still stored.
+        // `num_fmt` / `font_family` / `border` are side-table indices resolved by the caller
+        // (build/refresh), which holds the interning tables; a bare conversion carries `0`
+        // (= "general" / the workbook default family / BorderSpec::NONE). `font_size_q` is likewise
+        // resolved by the caller against the workbook default (`font_size_q_of`). The caller
+        // overrides all four before the default-check so a font/format/border-only cell is still stored.
         num_fmt: 0,
         font_size_q: 0,
         font_family: 0,
+        border: 0,
     }
 }
 
@@ -195,6 +237,7 @@ pub(crate) fn build_sheet_cache(
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
                 if rs != RenderStyle::default() {
                     for c in col.min..=col.max {
                         let c0 = (c - 1) as u32;
@@ -220,6 +263,7 @@ pub(crate) fn build_sheet_cache(
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
                 if rs != RenderStyle::default() {
                     builder.push_row_style(r0, rs);
                     band_rows.insert(r0);
@@ -239,6 +283,7 @@ pub(crate) fn build_sheet_cache(
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
                 // `band_rows`/`band_cols` hold only *non-default* bands. A populated cell with a
                 // default own style on such a band gets an explicit default entry to shadow it.
                 // MICRO-EDGE (DECISIONS_TO_REVIEW, Phase 5): a `custom_format` row whose style
@@ -283,6 +328,7 @@ pub(crate) fn refresh_cell(
             } else {
                 cache.intern_font_family(&style.font.name)
             };
+            rs.border = cache.intern_border_spec(border_spec_from(&style.border));
             if rs != RenderStyle::default() {
                 cache.set_cell_style(cell.row, cell.col, rs);
             } else if cache.is_on_band(cell.row, cell.col) {
@@ -324,16 +370,27 @@ pub(crate) fn assert_cache_agrees(
             let cached_structural = RenderStyle {
                 num_fmt: 0,
                 font_family: 0,
+                border: 0,
                 ..cached
             };
             let engine_structural = RenderStyle {
                 num_fmt: 0,
                 font_family: 0,
+                border: 0,
                 ..engine
             };
             if cached_structural != engine_structural {
                 return Err(format!(
                     "style mismatch at ({r},{c}): cache={cached:?} engine={engine:?}"
+                ));
+            }
+            // The border agreement is over the resolved *spec* (the `border` field is a cache-local
+            // index; the engine side resolves the spec directly).
+            let cached_spec = cache.border_spec(cached.border);
+            let engine_spec = border_spec_from(&engine_style.border);
+            if cached_spec != engine_spec {
+                return Err(format!(
+                    "border mismatch at ({r},{c}): cache={cached_spec:?} engine={engine_spec:?}"
                 ));
             }
             // The num-fmt agreement is over the resolved *string* (general normalized).
@@ -611,6 +668,87 @@ mod tests {
         assert_eq!(parse_color("#GGGGGG"), None);
         assert_eq!(parse_color("#12é45678"), None);
         assert_eq!(parse_color(""), None);
+    }
+
+    #[test]
+    fn border_weight_mapping_all_nine_styles() {
+        use ironcalc_base::types::BorderStyle::*;
+        // The actual nine 0.7.1 variants → px weight class (`architecture.md §1.1`, corrected).
+        assert_eq!(border_weight(&Thin), 1);
+        assert_eq!(border_weight(&Dotted), 1);
+        assert_eq!(border_weight(&Medium), 2);
+        assert_eq!(border_weight(&MediumDashed), 2);
+        assert_eq!(border_weight(&MediumDashDot), 2);
+        assert_eq!(border_weight(&MediumDashDotDot), 2);
+        assert_eq!(border_weight(&SlantDashDot), 2);
+        assert_eq!(border_weight(&Thick), 3);
+        assert_eq!(border_weight(&Double), 3);
+    }
+
+    #[test]
+    fn border_spec_from_reads_all_four_edges_and_colour() {
+        use freecell_core::Edge;
+        use ironcalc_base::types::{Border, BorderItem, BorderStyle};
+        let item = |style, color: &str| {
+            Some(BorderItem {
+                style,
+                color: Some(color.to_string()),
+            })
+        };
+        let border = Border {
+            top: item(BorderStyle::Thin, "#000000"),
+            right: item(BorderStyle::Thick, "#FF0000"),
+            bottom: item(BorderStyle::Medium, "#00FF00"),
+            left: None,
+            ..Border::default()
+        };
+        let spec = border_spec_from(&border);
+        assert_eq!(spec.top, Some(Edge::new(1, Rgb::new(0, 0, 0))));
+        assert_eq!(spec.right, Some(Edge::new(3, Rgb::new(0xFF, 0, 0))));
+        assert_eq!(spec.bottom, Some(Edge::new(2, Rgb::new(0, 0xFF, 0))));
+        assert_eq!(spec.left, None);
+        // A colourless item defaults to black (never panics).
+        let b2 = Border {
+            top: Some(BorderItem {
+                style: BorderStyle::Thin,
+                color: None,
+            }),
+            ..Border::default()
+        };
+        assert_eq!(
+            border_spec_from(&b2).top,
+            Some(Edge::new(1, Rgb::new(0, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn cache_carries_border_from_file() {
+        use freecell_core::{BorderSpec, Edge};
+        // A cell whose ONLY styling is an All-thin border is stored (border != 0), and its resolved
+        // BorderSpec round-trips through the side table; a plain neighbour stays default.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "x").unwrap();
+        doc.set_cell_input(0, CellRef::new(5, 5), "y").unwrap();
+        doc.set_borders(0, CellRange::single(CellRef::new(0, 0)), "All")
+            .unwrap();
+
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let rs = cache
+            .render_style(0, 0)
+            .expect("a border-only cell is stored");
+        assert_ne!(rs.border, 0);
+        let thin = Some(Edge::new(1, Rgb::new(0, 0, 0)));
+        assert_eq!(
+            cache.border_spec(rs.border),
+            BorderSpec {
+                top: thin,
+                right: thin,
+                bottom: thin,
+                left: thin,
+            }
+        );
+        // The plain far cell has no border (unstored).
+        assert!(cache.render_style(5, 5).is_none());
     }
 
     #[test]

@@ -29,7 +29,10 @@ use freecell_core::color::Rgb;
 use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
-use freecell_core::{apply_motion, Align, Axis, CellRef, RenderStyle, SelectionModel, SheetDims};
+use freecell_core::{
+    apply_motion, effective_edge, Align, Axis, BorderSpec, CellRef, Edge, RenderStyle,
+    SelectionModel, SheetDims,
+};
 
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
@@ -104,6 +107,10 @@ pub struct GridView {
     /// `RenderStyle::font_family` index resolves to a name after the cache lock is released
     /// (`components/style_render.md`). Index `0` = `""` = the workbook default (grid default family).
     visible_font_families: Vec<SharedString>,
+    /// Reused per-frame snapshot of the active cache's border side table, so a cell's
+    /// `RenderStyle::border` index resolves to a [`BorderSpec`] after the cache lock is released
+    /// (`components/style_render.md §Border painting`). Index `0` = [`BorderSpec::NONE`].
+    visible_border_specs: Vec<BorderSpec>,
     /// The grid element's real laid-out bounds, captured during paint (a `canvas` probe).
     /// `None` until the first paint. Used instead of `window.viewport_size()` so the grid's
     /// virtualization + hit-testing are correct once chrome wraps it (the grid is no longer
@@ -180,6 +187,7 @@ impl GridView {
             cell_index: HashMap::new(),
             visible_styles: HashMap::new(),
             visible_font_families: Vec::new(),
+            visible_border_specs: Vec::new(),
             bounds: None,
             mirror: None,
             incell_open: None,
@@ -374,6 +382,9 @@ impl GridView {
             .iter()
             .map(|name| SharedString::from(name.to_string()))
             .collect();
+        // Snapshot the border side table (cheap — `BorderSpec` is `Copy`), so a cell's `border`
+        // index (and its neighbours') resolves to a spec after the lock is dropped.
+        self.visible_border_specs = cache.border_specs().to_vec();
         drop(caches);
 
         Some(Frame {
@@ -1090,6 +1101,52 @@ impl GridView {
             }
         }
 
+        // ---- Border edges: painted after every cell fill so they cover the gridline + any
+        // neighbouring cell's fill (Excel look, `components/style_render.md §Border painting`).
+        // Each shared edge is drawn exactly ONCE: a bordered cell always draws its right + bottom
+        // effective edges; it draws its left/top only when no neighbour to the left/above will draw
+        // that shared edge (the first visible track, or an unbordered neighbour that is skipped).
+        // Effective edge = the heavier of the cell's own edge and the neighbour's opposing one.
+        for r in frame.rows.clone() {
+            for c in frame.cols.clone() {
+                let spec = self.border_spec_at(r, c);
+                if spec.is_none() {
+                    continue;
+                }
+                let (x, y, w, h) = cell_rect(r, c, frame);
+                // Right edge (shared with the cell at c+1) — always drawn by this (left) cell.
+                if let Some(edge) = effective_edge(spec.right, self.border_spec_at(r, c + 1).left) {
+                    content_children.push(vertical_edge_quad(x + w, y, h, edge));
+                }
+                // Bottom edge (shared with r+1) — always drawn by this (upper) cell.
+                if let Some(edge) = effective_edge(spec.bottom, self.border_spec_at(r + 1, c).top) {
+                    content_children.push(horizontal_edge_quad(x, y + h, w, edge));
+                }
+                // Left edge: only when the left neighbour won't draw it as its right edge.
+                if self.no_left_owner(r, c, frame) {
+                    let left_nbr = if c == 0 {
+                        BorderSpec::NONE
+                    } else {
+                        self.border_spec_at(r, c - 1)
+                    };
+                    if let Some(edge) = effective_edge(spec.left, left_nbr.right) {
+                        content_children.push(vertical_edge_quad(x, y, h, edge));
+                    }
+                }
+                // Top edge: only when the top neighbour won't draw it as its bottom edge.
+                if self.no_top_owner(r, c, frame) {
+                    let top_nbr = if r == 0 {
+                        BorderSpec::NONE
+                    } else {
+                        self.border_spec_at(r - 1, c)
+                    };
+                    if let Some(edge) = effective_edge(spec.top, top_nbr.bottom) {
+                        content_children.push(horizontal_edge_quad(x, y, w, edge));
+                    }
+                }
+            }
+        }
+
         // Selection: translucent overlay (range − active), range border, active border.
         let range = selection.range();
         for (rows, cols) in layout::range_overlay_rects(range, selection.active) {
@@ -1288,6 +1345,36 @@ impl GridView {
         root_children
     }
 
+    /// The resolved [`BorderSpec`] for a visible cell, from the per-frame snapshot: its
+    /// `RenderStyle::border` index into `visible_border_specs`. A cell absent from the style
+    /// snapshot (the common, borderless case) → [`BorderSpec::NONE`], so neighbour lookups
+    /// short-circuit. Off-frame neighbours are also absent → treated as unbordered (the accepted
+    /// viewport-boundary approximation, `architecture.md §3.4`).
+    fn border_spec_at(&self, row: u32, col: u32) -> BorderSpec {
+        self.visible_styles
+            .get(&(row, col))
+            .and_then(|rs| self.visible_border_specs.get(rs.border as usize).copied())
+            .unwrap_or(BorderSpec::NONE)
+    }
+
+    /// Whether no cell to the *left* of `(row, col)` will draw the shared left edge as its own
+    /// right edge — i.e. this cell owns that edge. True at the first visible column (no in-frame
+    /// left neighbour) or when the left neighbour is unbordered (skipped by the paint loop).
+    ///
+    /// The "is the neighbour bordered?" test goes through [`border_spec_at`](Self::border_spec_at) —
+    /// the SAME predicate the paint loop uses to decide whether that neighbour draws its right edge —
+    /// so ownership and draw can never disagree (a `border != 0` that resolved to `NONE` under some
+    /// future partial snapshot would be skipped by BOTH, not dropped between them).
+    fn no_left_owner(&self, row: u32, col: u32, frame: &Frame) -> bool {
+        col == frame.cols.start || self.border_spec_at(row, col - 1).is_none()
+    }
+
+    /// Whether no cell *above* `(row, col)` will draw the shared top edge as its own bottom edge
+    /// (the horizontal analogue of [`no_left_owner`](Self::no_left_owner); same shared predicate).
+    fn no_top_owner(&self, row: u32, col: u32, frame: &Frame) -> bool {
+        row == frame.rows.start || self.border_spec_at(row - 1, col).is_none()
+    }
+
     /// Phase-12 perf hook (`freecell_core::perf`): apply a scripted scroll to the active sheet,
     /// run the **real** render build path (`resolve_frame` + `build_grid_layers`), and return a
     /// timed [`FrameSample`](freecell_core::perf::FrameSample) plus the resulting visible ranges.
@@ -1395,6 +1482,24 @@ fn span_rect(rows: Range<u32>, cols: Range<u32>, frame: &Frame) -> (f32, f32, f3
     let y0 = frame.row_axis.offset_of(rows.start) - frame.scroll_y;
     let y1 = frame.row_axis.offset_of(rows.end) - frame.scroll_y;
     (x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
+}
+
+/// A vertical border edge: a solid `edge.weight`-px strip centred on `boundary_x` (the shared
+/// column boundary), spanning the cell's row height. Painted over the gridline/fills.
+fn vertical_edge_quad(boundary_x: f32, y: f32, h: f32, edge: Edge) -> AnyElement {
+    let w = edge.weight as f32;
+    rect_div(boundary_x - w / 2.0, y, w, h)
+        .bg(to_rgba(edge.color))
+        .into_any_element()
+}
+
+/// A horizontal border edge: a solid `edge.weight`-px strip centred on `boundary_y` (the shared
+/// row boundary), spanning the cell's column width.
+fn horizontal_edge_quad(x: f32, boundary_y: f32, w: f32, edge: Edge) -> AnyElement {
+    let h = edge.weight as f32;
+    rect_div(x, boundary_y - h / 2.0, w, h)
+        .bg(to_rgba(edge.color))
+        .into_any_element()
 }
 
 /// Builds one data cell element (fill, gridlines, text with resolved style attributes).

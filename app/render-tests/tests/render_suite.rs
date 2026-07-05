@@ -194,6 +194,9 @@ render_cases! {
     cell_mirror_typing, incell_editor_open,
     // Fonts (Phase 5): family + size + row auto-grow
     font_family_serif, font_size_24_row_grown, font_missing_family_fallback,
+    // Borders (Phase 6): edge paint, presets, shared-edge precedence
+    border_all_thin, border_outer_medium, border_heavier_edge_wins, border_over_fill,
+    border_shared_edge_adjacent, border_none_clear,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

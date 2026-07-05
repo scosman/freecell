@@ -39,7 +39,9 @@ use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{Align, CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
 
-use freecell_engine::{Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent};
+use freecell_engine::{
+    BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
+};
 
 use super::{
     ChromeClient, ChromeGridRequest, ChromeGridSink, EditController, EditOrigin, SheetTab,
@@ -64,11 +66,12 @@ const TOOLTIP_TEXT: u32 = 0xF5F5F5;
 
 const ACTION_ROW_H: f32 = 36.0;
 /// The action row's natural (uncompressed) width for the current control set — font family +
-/// size (Phase 5), B/I/U, text color + fill, alignment, number format + decimals — with its
-/// dividers. The row never wraps (`ui_design.md §2`: raise the window's min width instead), so it
-/// holds this min width; the document window (1200 px) is far wider. Grows in Phase 6 (borders).
-/// Recorded in DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips.
-const ACTION_ROW_MIN_W: f32 = 816.0;
+/// size (Phase 5), B/I/U, text color + fill, **borders** (Phase 6), alignment, number format +
+/// decimals — with its dividers. The row never wraps (`ui_design.md §2`: raise the window's min
+/// width instead), so it holds this min width; the document window (1200 px) is far wider. Phase 6
+/// adds the borders button (~64 px) + a divider, so this grows 816 → 896. Recorded in
+/// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips.
+const ACTION_ROW_MIN_W: f32 = 896.0;
 
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
@@ -156,6 +159,9 @@ pub struct ChromeView {
     font_family_open: bool,
     /// The font-size dropdown's open state.
     font_size_open: bool,
+    /// The borders-preset popover's open state (a 4×2 preset grid — presets are actions, not
+    /// toggles, so it carries no active-state derivation; `components/action_bar.md`).
+    borders_open: bool,
 
     /// The sheet tabs (the chrome's mirror of the worker's sheet list).
     sheets: Vec<SheetTab>,
@@ -244,6 +250,7 @@ impl ChromeView {
             font_names,
             font_family_open: false,
             font_size_open: false,
+            borders_open: false,
             sheets,
             rename_target: None,
             rename_input,
@@ -996,6 +1003,42 @@ impl ChromeView {
         cx.notify();
     }
 
+    // ---- Action row: SetBorders (preset popover) ------------------------------------------
+
+    /// Applies a border `preset` over the selection, closing the borders popover. Commits any
+    /// pending edit first and degraded-guards, the same rule as the other action-row controls
+    /// (`components/action_bar.md`). Fire-and-forget: the worker logs any engine rejection.
+    pub fn apply_borders(
+        &mut self,
+        preset: BorderPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.borders_open = false;
+        if self.degraded {
+            return;
+        }
+        if !self.commit_pending_edit(window, cx) {
+            return;
+        }
+        self.client.send(Command::SetBorders {
+            sheet: self.active_sheet,
+            range: self.selection.range(),
+            preset,
+        });
+        cx.notify();
+    }
+
+    fn toggle_borders_popover(&mut self, cx: &mut Context<Self>) {
+        self.borders_open = !self.borders_open;
+        cx.notify();
+    }
+
+    /// Whether the borders popover is open (test/render introspection).
+    pub fn borders_open(&self) -> bool {
+        self.borders_open
+    }
+
     /// The font-family dropdown's active label: the active cell's family, or "System Default" for a
     /// default-font (or multi-cell) selection (`components/action_bar.md`).
     pub fn font_family_label(&self) -> &str {
@@ -1045,6 +1088,7 @@ impl ChromeView {
                 self.num_fmt_open = false;
                 self.font_family_open = false;
                 self.font_size_open = false;
+                self.borders_open = false;
             }
             cx.notify();
         }
@@ -1576,7 +1620,20 @@ impl ChromeView {
                         this.toggle_fill_popover(cx);
                     })),
             )
-            // [Borders land in Phase 6 here.]
+            .child(action_divider())
+            // Borders preset popover:
+            .child(
+                Button::new("borders")
+                    .label("⊞ ▾")
+                    .tooltip("Borders")
+                    .ghost()
+                    .small()
+                    .disabled(disabled)
+                    .selected(self.borders_open)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_borders_popover(cx);
+                    })),
+            )
             .child(action_divider())
             // Alignment L / C / R:
             .child(align_btn("align-left", "Align left", Align::Left, "⇤", cx))
@@ -1805,6 +1862,9 @@ impl ChromeView {
         }
         if self.font_size_open {
             overlays.push(self.render_font_size_popover(cx));
+        }
+        if self.borders_open {
+            overlays.push(self.render_borders_popover(cx));
         }
         if let Some(id) = self.context_menu {
             overlays.push(self.render_context_menu(id, cx));
@@ -2157,6 +2217,72 @@ impl ChromeView {
             .into_any_element()
     }
 
+    /// The borders popover: a 4×2 grid of preset actions (All/Inner/Outer/None over
+    /// Top/Bottom/Left/Right — `ui_design.md §2`). Presets are actions, not toggles, so no button
+    /// carries pressed state.
+    fn render_borders_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let preset_btn = |id: &'static str,
+                          label: &'static str,
+                          preset: BorderPreset,
+                          cx: &mut Context<Self>| {
+            Button::new(id)
+                .label(label)
+                .ghost()
+                .small()
+                .w(px(64.0))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_borders(preset, window, cx);
+                }))
+        };
+        let row1 = div()
+            .flex()
+            .gap_1()
+            .child(preset_btn("border-all", "All", BorderPreset::All, cx))
+            .child(preset_btn("border-inner", "Inner", BorderPreset::Inner, cx))
+            .child(preset_btn("border-outer", "Outer", BorderPreset::Outer, cx))
+            .child(preset_btn("border-none", "None", BorderPreset::None, cx));
+        let row2 = div()
+            .flex()
+            .gap_1()
+            .child(preset_btn("border-top", "Top", BorderPreset::Top, cx))
+            .child(preset_btn(
+                "border-bottom",
+                "Bottom",
+                BorderPreset::Bottom,
+                cx,
+            ))
+            .child(preset_btn("border-left", "Left", BorderPreset::Left, cx))
+            .child(preset_btn("border-right", "Right", BorderPreset::Right, cx));
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                self.backdrop(|this, _w, _cx| this.borders_open = false, cx)
+                    .child(div()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(ACTION_ROW_H))
+                    .left(px(300.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .bg(rgb(ACTIVE_TAB_BG))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded_md()
+                    .shadow_md()
+                    .child(row1)
+                    .child(row2),
+            )
+            .into_any_element()
+    }
+
     fn render_context_menu(&self, id: SheetId, cx: &mut Context<Self>) -> gpui::AnyElement {
         let delete_enabled = self.delete_enabled();
         div()
@@ -2357,7 +2483,7 @@ mod tests {
     use crate::chrome::{ChromeClient, RecordingClient};
     use freecell_core::input_cap::MAX_INPUT_LEN;
     use freecell_core::{CellRef, SelectionModel};
-    use freecell_engine::{Command, SheetMeta, StyleAttr, WorkerEvent};
+    use freecell_engine::{BorderPreset, Command, SheetMeta, StyleAttr, WorkerEvent};
     use gpui::{px, size, TestAppContext};
     use gpui_component::Root;
     use std::cell::RefCell;
@@ -2904,6 +3030,56 @@ mod tests {
         assert!(
             h.client.take_commands().is_empty(),
             "no SetStylePath dispatches while degraded"
+        );
+    }
+
+    // ---- Action row: SetBorders (preset popover) ------------------------------------------
+
+    #[gpui::test]
+    fn borders_popover_toggles(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open()));
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.borders_open()));
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open()));
+    }
+
+    #[gpui::test]
+    fn apply_borders_sends_command_over_selection(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, window, cx| {
+            c.apply_borders(BorderPreset::All, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetBorders { preset: BorderPreset::All, range, .. }]
+                    if *range == freecell_core::CellRange::single(cell(1, 1))
+            ),
+            "picking a preset dispatches one SetBorders over the selection, got {cmds:?}"
+        );
+        // Picking closes the popover.
+        assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open()));
+    }
+
+    #[gpui::test]
+    fn borders_disabled_in_degraded_mode(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        // The popover is force-closed and a preset click can no longer dispatch.
+        assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open()));
+        upd(&h, cx, |c, window, cx| {
+            c.apply_borders(BorderPreset::Outer, window, cx)
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "no SetBorders dispatches while degraded"
         );
     }
 

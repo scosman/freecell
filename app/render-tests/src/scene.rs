@@ -27,7 +27,7 @@ use arc_swap::ArcSwap;
 
 use freecell_app::grid::GridDataSources;
 use freecell_core::cache::SheetCaches;
-use freecell_core::{Align, CellRange, CellRef, RenderStyle, Rgb, SheetId};
+use freecell_core::{Align, BorderSpec, CellRange, CellRef, RenderStyle, Rgb, SheetId};
 use freecell_engine::{Command, DocumentClient, DocumentSource, StyleAttr, WorkerEvent};
 
 /// One command-less style injection applied to the real `SheetCache` after the worker builds it.
@@ -38,6 +38,10 @@ enum Inject {
     RowHeight(u32, f32),
     /// A per-cell font family (`None` = default) + size in quarter-points (`0` = default).
     Font(u32, u32, Option<String>, u16),
+    /// A per-cell resolved border (interned into the real cache's `border_specs` side table). Files
+    /// carry borders that arrive at the cache the same way (`components/style_render.md`); the real
+    /// `SetBorders` write path is exercised by the engine integration tests.
+    Border(u32, u32, BorderSpec),
 }
 
 /// A declarative render fixture. Build it fluently, then [`build_sources`] realizes it through
@@ -151,6 +155,12 @@ impl Scene {
         let size_q = pt.map(|p| (p * 4.0).round() as u16).unwrap_or(0);
         self.injects
             .push(Inject::Font(row, col, family.map(str::to_string), size_q));
+        self
+    }
+
+    /// Sets a resolved [`BorderSpec`] on a cell (injected into the real cache — no worker command).
+    pub fn border(mut self, row: u32, col: u32, spec: BorderSpec) -> Self {
+        self.injects.push(Inject::Border(row, col, spec));
         self
     }
 
@@ -304,6 +314,11 @@ fn apply_injections(caches: &parking_lot::RwLock<SheetCaches>, sheet: SheetId, i
                         ..base
                     },
                 );
+            }
+            Inject::Border(row, col, spec) => {
+                let base = cache.render_style(*row, *col).copied().unwrap_or_default();
+                let border = cache.intern_border_spec(*spec);
+                cache.set_cell_style(*row, *col, RenderStyle { border, ..base });
             }
         }
     }

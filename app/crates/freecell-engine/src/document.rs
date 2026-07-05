@@ -27,6 +27,7 @@ use ironcalc_base::types::{CellType, Font, Style, Worksheet};
 use ironcalc_base::Model;
 
 use crate::UserModel; // the crate's single canonical path to the IronCalc workbook type
+use ironcalc_base::BorderArea;
 use ironcalc_base::ClipboardData;
 use serde::Deserialize;
 use tempfile::NamedTempFile;
@@ -584,6 +585,29 @@ impl WorkbookDocument {
         crate::instrument::record_engine_call();
         self.model
             .update_range_style(&area_of(sheet_idx, range), path, value)
+    }
+
+    /// Applies a border `preset` (an IronCalc `BorderType` serde tag) over a range via
+    /// `set_area_with_border` (`architecture.md §3.4`, `border.rs:346`). One undoable diff-list;
+    /// band-aware for full rows/columns; the engine applies its heavier-wins fix-up to the four
+    /// adjacent strips. `BorderArea` has `pub(crate)` fields and no constructor at 0.7.1 but derives
+    /// `Deserialize`, so it is built from JSON — thin black only (the only style the borders popover
+    /// applies; `functional_spec.md §3.6`). For `type: "None"` the engine ignores `item` and clears
+    /// the edges.
+    pub(crate) fn set_borders(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        border_type: &str,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let border_area: BorderArea = serde_json::from_value(serde_json::json!({
+            "item": { "style": "thin", "color": "#000000" },
+            "type": border_type,
+        }))
+        .map_err(|e| format!("failed to build BorderArea for {border_type:?}: {e}"))?;
+        self.model
+            .set_area_with_border(&area_of(sheet_idx, range), &border_area)
     }
 
     /// The workbook's **default font** `(size_pt, family_name)` — the font a truly-unstyled cell
@@ -1163,6 +1187,36 @@ mod tests {
         let (sz, name) = doc.default_font();
         assert_eq!(sz, 13);
         assert_eq!(name, "Calibri");
+    }
+
+    #[test]
+    fn set_borders_applies_all_and_none_clears() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        doc.set_cell_input(0, a1, "x").unwrap();
+
+        // "All" sets all four thin edges.
+        doc.set_borders(0, CellRange::single(a1), "All").unwrap();
+        let b = doc.cell_style(0, a1).unwrap().border;
+        assert!(
+            b.top.is_some() && b.right.is_some() && b.bottom.is_some() && b.left.is_some(),
+            "All applies every edge"
+        );
+        assert_eq!(
+            b.top.as_ref().unwrap().style,
+            ironcalc_base::types::BorderStyle::Thin
+        );
+
+        // "None" clears them again.
+        doc.set_borders(0, CellRange::single(a1), "None").unwrap();
+        let b = doc.cell_style(0, a1).unwrap().border;
+        assert!(
+            b.top.is_none() && b.right.is_none() && b.bottom.is_none() && b.left.is_none(),
+            "None clears every edge"
+        );
+
+        // A bogus tag is a clean error (never panics).
+        assert!(doc.set_borders(0, CellRange::single(a1), "Bogus").is_err());
     }
 
     #[test]

@@ -465,3 +465,116 @@ now shadow the band). This is inherent to the 0.7.1 mechanism (the same reason f
 the used range — Decision #4), and it only affects cells the user explicitly re-fonts. Accepted for MVP; the
 only alternative is an engine-level font-band API that does not exist at this rev. Flagged so the
 band-shadowing behaviour is explicit, not implied.
+
+## Phase 6 — Borders (BorderSpec cache + edge render + presets menu)
+
+### 1. Border weight map corrected to the real nine 0.7.1 `BorderStyle` variants
+
+`architecture.md §1.1` / `components/style_render.md` list `Hair` and `Dashed` variants that **do
+not exist** in ironcalc_base 0.7.1. The actual nine `BorderStyle` variants (verified `types.rs:596`)
+and the weight class each maps to (`freecell_engine::cache::border_weight`):
+
+- **1 px:** `Thin`, `Dotted`
+- **2 px:** `Medium`, `MediumDashed`, `MediumDashDot`, `MediumDashDotDot`, `SlantDashDot`
+- **3 px:** `Thick`, `Double`
+
+All drawn **solid** (dotted/dashed collapse to their weight class — SP5-accepted fidelity). The
+`border_weight_mapping_all_nine_styles` test enumerates all nine. No `Hair`/`Dashed` handling exists
+(they can't be constructed at this rev). If a future IronCalc adds variants, extend the match.
+
+### 2. `border_weight` mapping + its test live in `freecell-engine`, not `freecell-core`
+
+`components/style_render.md`'s test plan lists `border_weight_mapping_all_nine_styles` under
+"Unit (freecell-core)". But the weight map takes an IronCalc `BorderStyle`, which the engine-free
+`freecell-core` cannot name. So the mapping (`border_weight`) and its all-nine test live in
+`freecell-engine::cache` (the IronCalc-facing layer). `freecell-core` keeps the engine-free border
+types (`BorderSpec`, `Edge`, `effective_edge`) and their tests
+(`effective_edge_heavier_wins_and_tie_prefers_own`, `border_spec_interning_dedups`). No behavioural
+change — only the crate a test file sits in.
+
+### 3. Render "draw once" rule reconciles architecture §3.4 and style_render.md
+
+The two specs describe **different** border-paint strategies:
+- `architecture.md §3.4`: draw each cell's right + bottom (+ boundary left/top), no overdraw — but
+  it iterates *every* visible cell.
+- `components/style_render.md`: iterate only bordered cells, draw all four effective edges,
+  accepting pixel-identical overdraw on shared edges.
+
+Neither alone is both "drawn once" (the coding prompt's explicit requirement) **and** "only bordered
+cells" (the perf property). The naive "right + bottom only, over bordered cells" **misses** the left
+edge of a bordered cell whose left neighbour is unbordered. Implemented rule (grid/view.rs, iterating
+only bordered cells): a cell **always** draws its right + bottom effective edges; it draws its **left**
+only when `col == cols.start` or the left neighbour is unbordered, and its **top** only when
+`row == rows.start` or the top neighbour is unbordered. This draws every shared edge **exactly once**
+(the left/top cell owns the boundary; the right/bottom neighbour defers), handles bordered-next-to-
+unbordered, and processes only bordered cells. Effective edge = `effective_edge(own, neighbour-
+opposing)` (heavier wins, ties → own). Off-frame neighbours are treated as unbordered (the accepted
+viewport-boundary approximation — the off-screen neighbour could only make the edge heavier).
+
+### 4. `SetBorders` rides the coalesced edit path; `op_of` expands the refresh range by one cell
+
+Unlike `SetFont` (which emits a variable number of diff-lists → must run standalone), `set_area_with_
+border` is **one** undoable diff-list and **band-aware** (full row/col → engine band), exactly like
+`SetStylePath`. So `SetBorders` is bucketed into the coalesced edit batch (`AppliedKind::StyleOnly`,
+no eval). Because the engine also fixes up the **four adjacent strips** (heavier-wins sync of the
+shared edge), `op_of` returns the target range **expanded by one cell in every direction** (clamped to
+sheet bounds) so the mirror re-reads those fixed-up neighbours. A full row/col stays band-creating
+after the +1 expansion, so it takes the full-rebuild refresh path (reads bands back correctly).
+Verified by `set_borders_applies_and_undo` (bounded, one undo step) and `set_borders_full_column_is_
+band` (band, no 1M materialisation).
+
+### 5. `ACTION_ROW_MIN_W` raised 816 → 896 for the borders group (supersedes Phase-5 #6's 816)
+
+Phase 6 adds the borders button (~64 px) + a divider between Fill and Alignment, so the row's natural
+uncompressed width grew. `ACTION_ROW_MIN_W` was raised from **816** (Phase-5 #6) to **896**. Same
+caveats: it is an **estimate**, not render-measured (this container can't run the GPU app); the
+document window opens at 1200 px, far wider, so the row never clips in practice; re-measure on a real
+device if it ever does. This entry is the recorded 896 value the `ACTION_ROW_MIN_W` comment refers to.
+
+### 6. Borders popover uses text labels, not icon glyphs
+
+`ui_design.md §2` describes a 4×2 grid of preset **icons**. The popover is implemented with text
+labels (All / Inner / Outer / None over Top / Bottom / Left / Right) instead — the action bar is
+explicitly **not** pixel-tested (`components/action_bar.md`: "action-bar states are not pixel-tested"),
+and text labels are unambiguous + testable by button id. Swap to icons later if desired; the wiring
+(`apply_borders(BorderPreset)`) is unaffected.
+
+### 7. `SheetCache.merges` side table deferred to Phase 7
+
+`components/style_render.md`'s data model lists a `merges: Vec<CellRange>` side table alongside
+`border_specs`. It is consumed only by the Phase-7 merge guard (`functional_spec.md §5.3`,
+`components/grid_structure.md`), and Phase 6's scope is borders only (implementation_plan.md). So
+`merges` is **not** added here — it lands with the structure phase that uses it. Only the border side
+table + field were added to `RenderStyle`/`SheetCache` in this phase.
+
+### 8. Render baselines to regenerate on the pinned runner (all ADDITIVE — no existing baseline changes)
+
+Borders are a **new** rendered output; **no existing baseline changes** (a cell with no border draws
+exactly as before — border index 0 = NONE short-circuits the paint loop). **Six NEW additive render
+cases** need generating + eyeballing on the pinned Xvfb + lavapipe runner (`app/render-tests/README.md`;
+this container cannot run the capture stack — dev renders were NOT committed):
+
+- `border_all_thin` — a single cell with all four thin (1 px) black edges.
+- `border_outer_medium` — a 2×2 block with a medium (2 px) OUTER border only (no interior edges).
+- `border_heavier_edge_wins` — adjacent cells disagree (B2.right thin vs C2.left thick); the thick
+  edge wins and is drawn once (precedence + shared-edge correctness).
+- `border_over_fill` — an all-thin border painted OVER a yellow fill (draw order).
+- `border_shared_edge_adjacent` — two adjacent all-thin cells; the shared vertical edge is drawn
+  exactly ONCE (no double-thick seam — the draw-once rule, #3).
+- `border_none_clear` — a cell with `BorderSpec::NONE` renders as a plain cell (clear path).
+
+All six are **additive** (new `<name>.png` baselines); **none modify** an existing baseline. They are
+registered in the `render_cases!` macro (so `case_names_match_table` stays green) and skip cleanly
+without `FREECELL_RENDER=1`.
+
+### 9. Band-axis-parallel border presets are a silent engine no-op (not a regression)
+
+At IronCalc 0.7.1 the band write paths make some preset/selection combinations do **nothing**: a
+full-**column** selection (`set_columns_with_border`) with **Top**/**Bottom** is a no-op
+(`border.rs:269-279` — a column band has no single top/bottom row), and a full-**row** selection
+(`set_rows_with_border`) with **Left**/**Right** is a no-op (`border.rs:158-168`). The popover offers
+all eight presets unconditionally, so selecting a whole column via the header and clicking "Top
+border" visibly does nothing. This is engine-owned and geometrically defensible (a band has no single
+perpendicular edge). Recorded so it isn't later mistaken for a bug. NOT fixed by disabling those
+presets for band selections — that gating is gold-plating the MVP doesn't need (`All`/`Outer`/`Inner`/
+the axis-matching edge presets all still work on bands).

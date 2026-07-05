@@ -55,6 +55,48 @@ impl StylePath {
     }
 }
 
+/// A fixed border preset the borders popover applies over the selection (`functional_spec.md §3.6`,
+/// `components/action_bar.md`). Each maps 1:1 to an IronCalc `BorderType` (thin black only — the
+/// worker builds the `BorderArea` from [`border_type_tag`](BorderPreset::border_type_tag)). Kept a
+/// plain enum (no IronCalc type crosses the seam), mirroring [`StylePath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderPreset {
+    /// Every edge of every selected cell.
+    All,
+    /// Interior edges only (between adjacent selected cells).
+    Inner,
+    /// The selection's outer perimeter.
+    Outer,
+    /// The top edge of the selection's top row.
+    Top,
+    /// The bottom edge of the selection's bottom row.
+    Bottom,
+    /// The left edge of the selection's left column.
+    Left,
+    /// The right edge of the selection's right column.
+    Right,
+    /// Clears all borders in the selection.
+    None,
+}
+
+impl BorderPreset {
+    /// The IronCalc `BorderType` serde tag for this preset (the `"type"` field of the JSON-built
+    /// `BorderArea`, `architecture.md §3.4`). Same pattern as [`StylePath::as_str`]: a plain string,
+    /// not an engine type.
+    pub fn border_type_tag(self) -> &'static str {
+        match self {
+            BorderPreset::All => "All",
+            BorderPreset::Inner => "Inner",
+            BorderPreset::Outer => "Outer",
+            BorderPreset::Top => "Top",
+            BorderPreset::Bottom => "Bottom",
+            BorderPreset::Left => "Left",
+            BorderPreset::Right => "Right",
+            BorderPreset::None => "None",
+        }
+    }
+}
+
 /// A command the UI hands the worker over the (unbounded, non-blocking) command channel.
 /// Undoable edits trigger a coalesced eval + publish; reads/control do not
 /// (`components/engine_worker.md §Public interface` — the authoritative semantics table).
@@ -102,6 +144,15 @@ pub enum Command {
         range: CellRange,
         family: Option<String>,
         size_pt: Option<f64>,
+    },
+    /// Apply a border preset over a range (`architecture.md §3.4`, `components/action_bar.md`).
+    /// Style-only (no evaluation): applied via IronCalc `set_area_with_border` — one undoable
+    /// diff-list, band-aware for full rows/columns, with the engine's heavier-wins fix-up on the
+    /// four adjacent strips. Fire-and-forget (log-only on engine rejection). Thin black only.
+    SetBorders {
+        sheet: SheetId,
+        range: CellRange,
+        preset: BorderPreset,
     },
     /// Append a new sheet.
     AddSheet,

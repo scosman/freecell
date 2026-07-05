@@ -1,0 +1,146 @@
+# `release` — build distributable packages for macOS + Linux (+ experimental Windows).
+#
+# Triggers on a version tag push (`v*`) or manual dispatch. Each job builds the release
+# binary and runs the SAME packaging script used locally (app/scripts/package.sh /
+# package.ps1), then uploads the result as a workflow ARTIFACT (downloadable from the run
+# page). It does NOT create or attach a GitHub Release — the builds are UNSIGNED dev builds
+# and must not be published as releases until signing/notarization + the pre-distribution
+# security audit are done (see app/PACKAGING.md, projects/pre-distribution-security-audit.md).
+#
+# macOS + Linux are REQUIRED (they build today). Windows is EXPERIMENTAL and non-blocking
+# (`continue-on-error`): the app currently wires only macOS/Metal + Linux x11/wayland, so a
+# Windows build is not guaranteed to compile without port work (app/PACKAGING.md).
+#
+# The workspace lives in `app/`; the toolchain comes from `app/rust-toolchain.toml`.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: package (macOS — app + dmg)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      # cargo-packager pinned to the version the config + scripts were authored against.
+      # `cargo install` (compile) is used rather than a prebuilt action so the release path
+      # has no dependency on a third-party tool index; it is cached implicitly across runs
+      # via ~/.cargo. Releases are infrequent (tag pushes), so the compile cost is fine.
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Build + package (app/scripts/package.sh)
+        run: app/scripts/package.sh
+
+      # Upload only the .dmg: it wraps a faithful, launchable .app. We deliberately do NOT
+      # upload the raw *.app bundle — actions/upload-artifact@v4 zips matched paths and drops
+      # Unix exec bits + symlinks, so a downloaded raw .app would not launch. Users mount the
+      # .dmg to get the working .app.
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecell-macos
+          path: app/target/packages/*.dmg
+          if-no-files-found: error
+
+  linux:
+    name: package (Linux — deb + AppImage)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build deps for the GPUI Linux (blade/Vulkan) build — the same libs as `checks.yml`,
+      # minus the render/capture-only tools (no rendering happens while packaging). `file` +
+      # `patchelf` are used by linuxdeploy while assembling the .AppImage; desktop-file-utils
+      # provides `desktop-file-validate`. `libfuse2t64` is defensive FUSE insurance for
+      # AppImage: linuxdeploy is invoked with `--appimage-extract-and-run` (which normally
+      # avoids FUSE), but that is version-dependent and this job is REQUIRED, so we install it
+      # rather than risk a blocking failure the first time an AppImage is assembled in CI.
+      # NOTE: on ubuntu-24.04 (noble) the package is `libfuse2t64` (the t64 transition renamed
+      # `libfuse2`); if the runner image changes, adjust this name. See app/PACKAGING.md.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake \
+            libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan-dev libgbm-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            file patchelf desktop-file-utils libfuse2t64
+
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Build + package (app/scripts/package.sh)
+        run: app/scripts/package.sh
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecell-linux
+          path: |
+            app/target/packages/*.deb
+            app/target/packages/*.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: package (Windows — nsis, EXPERIMENTAL / non-blocking)
+    runs-on: windows-latest
+    # Windows is best-effort: it must never gate a release. The app does not yet wire a
+    # Windows GPUI backend, so this build may fail to compile — that is expected for now.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Build + package (app/scripts/package.ps1)
+        shell: pwsh
+        run: app/scripts/package.ps1
+
+      - name: Upload Windows packages
+        # `always()` so a partial/failed experimental run still surfaces whatever it produced.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecell-windows
+          path: app/target/packages/*.exe
+          if-no-files-found: ignore

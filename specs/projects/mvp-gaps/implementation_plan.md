@@ -19,7 +19,7 @@ judgment calls in a `DECISIONS_TO_REVIEW.md` here).
       popover, data-row only for now (§7.2); `PublishedCell.kind` + populated
       `text_color` + type-aware default alignment + `[Red]` color (§1.2–1.3);
       update GAPS.md rows on completion.
-- [ ] **Phase 2 — Editing feel**: EditController refactor (§4.1); type-to-replace
+- [x] **Phase 2 — Editing feel**: EditController refactor (§4.1); type-to-replace
       (§4.2); live mirror (§4.3); in-cell editor (§4.4); Tab-commit (§4.5); cap
       popover on the in-cell editor.
 - [ ] **Phase 3 — Range clipboard**: worker commands + slot, copy/cut/paste internal,

@@ -11,10 +11,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use gpui::{px, size, App, AppContext as _, AsyncApp, Bounds, Point, WindowBounds, WindowOptions};
+use gpui_component::input::InputState;
 use gpui_component::Root;
 use gpui_platform::application;
 
 use freecell_app::grid::{GridEventSink, GridView};
+use freecell_core::CellRef;
 
 use crate::cases;
 use crate::scene::build_sources;
@@ -35,6 +37,8 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let loading = case.loading.map(str::to_string);
     let force_scrollbars = case.force_scrollbars;
     let reveal = case.reveal;
+    let mirror = case.mirror;
+    let in_cell = case.in_cell;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
@@ -70,6 +74,25 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     }
                     if let Some((row, col)) = reveal {
                         view.scroll_cell_into_view(row, col, cx);
+                    }
+                    // Editing-feel overlays (Phase 2): a live mirror and/or an open in-cell editor.
+                    let sheet = view.active_sheet();
+                    if let Some((row, col, text)) = mirror {
+                        view.set_edit_state(
+                            Some((sheet, CellRef::new(row, col), text.into())),
+                            None,
+                            None,
+                            cx,
+                        );
+                    }
+                    if let Some((row, col, text)) = in_cell {
+                        let input = cx.new(|cx| {
+                            let mut state = InputState::new(window, cx);
+                            state.set_value(text, window, cx);
+                            state
+                        });
+                        view.set_incell_input(input, cx);
+                        view.set_edit_state(None, Some(CellRef::new(row, col)), None, cx);
                     }
                     view
                 });

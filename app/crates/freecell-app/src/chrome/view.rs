@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable, Hsla,
-    KeyDownEvent, MouseButton, MouseDownEvent, Rgba, Window,
+    KeyDownEvent, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
@@ -34,11 +34,13 @@ use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{RenderStyle, Rgb, SelectionModel, SheetId};
+use freecell_core::{CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
 
 use freecell_engine::{Command, EditRejectedReason, StyleAttr, WorkerEvent};
 
-use super::{ChromeClient, ChromeGridRequest, ChromeGridSink, SheetTab};
+use super::{
+    ChromeClient, ChromeGridRequest, ChromeGridSink, EditController, EditOrigin, SheetTab,
+};
 
 /// The 250 ms no-flash delay for both the content-fetch and evaluating spinners
 /// (`ui_design.md §3.1/§3.2`, mirrored from the grid's own delayed hooks).
@@ -83,6 +85,21 @@ pub struct ChromeView {
     data_row: DataRow,
     /// The content field's text buffer (stock gpui-component input).
     content_input: Entity<InputState>,
+    /// The in-cell editor + cross-editor sync (`components/edit_controller.md`). Owns the reused
+    /// in-cell overlay `InputState`; the data-row half is `content_input` + the `DataRow` reducer.
+    edit: EditController,
+    /// Whether the last edit-state push to the grid was non-empty (a mirror / overlay was shown),
+    /// so an idle selection move doesn't re-push an all-`None` clear on every keystroke.
+    edit_state_shown: bool,
+    /// The `(sheet, cell)` whose fetched content currently lives in the reducer's `committed`
+    /// field. The in-cell editor seeds from `committed` **only** for this exact sheet+cell — the
+    /// single shared reducer keeps a previous cell's `committed` across a single→single selection
+    /// change, and its content is not sheet-scoped, so seeding by `(sheet, cell)` prevents opening
+    /// the editor with another cell's/sheet's stale content while the target's fetch is in flight
+    /// (`components/edit_controller.md §Grid integration`; data-corruption guard). Reset to `None`
+    /// whenever `committed` is cleared or invalidated (multi-select, sheet switch); `None` until the
+    /// first reply lands.
+    committed_cell: Option<(SheetId, CellRef)>,
     /// A worker `EditRejected{InputCap}` backstop (the UI validates first, so this is rare);
     /// carries the rejection so the popover shows the same message as a local cap reject.
     cap_error_external: Option<InputRejection>,
@@ -129,11 +146,13 @@ impl ChromeView {
         cx: &mut Context<Self>,
     ) -> Self {
         let content_input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
+        let in_cell_input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
 
         let subscriptions = vec![
             cx.subscribe_in(&content_input, window, Self::on_content_event),
+            cx.subscribe_in(&in_cell_input, window, Self::on_incell_event),
             cx.subscribe_in(&rename_input, window, Self::on_rename_event),
             cx.subscribe_in(&color_picker, window, Self::on_color_picker_event),
         ];
@@ -147,6 +166,9 @@ impl ChromeView {
             active_style: None,
             data_row: DataRow::default(),
             content_input,
+            edit: EditController::new(in_cell_input),
+            edit_state_shown: false,
+            committed_cell: None,
             cap_error_external: None,
             eval: EvalIndicator::default(),
             fill_open: false,
@@ -194,6 +216,12 @@ impl ChromeView {
     ) {
         self.selection = selection;
         self.cap_error_external = None;
+        // A multi-cell selection clears the reducer's `committed` (data_row multi arm), so the
+        // seed tag it named is no longer valid — reset it (else a later collapse-to-single +
+        // in-cell open would seed the just-cleared empty content; data-corruption guard).
+        if !selection.is_single() {
+            self.committed_cell = None;
+        }
         self.active_style = if selection.is_single() {
             self.client
                 .render_style(self.active_sheet, selection.active)
@@ -206,6 +234,9 @@ impl ChromeView {
         // begin_fetch / disable cleared the field; mirror the reducer's text into the widget.
         self.sync_input_from_reducer(window, cx);
         self.apply_data_effects(effects, window, cx);
+        // A selection change ends any pending edit — close the in-cell overlay + clear the mirror.
+        self.edit.close();
+        self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
 
@@ -217,23 +248,269 @@ impl ChromeView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let was_editing = self.data_row.mode() == FieldMode::Editing;
         let effects = self.data_row.reduce(DataRowEvent::EditCommitRequested);
         self.apply_data_effects(effects, window, cx);
         let committed = self.data_row.mode() != FieldMode::Editing;
+        self.note_commit(was_editing);
+        // A committed (or absent) edit closes the overlay; a cap-rejected one stays open + editing.
+        if committed {
+            self.edit.close();
+        }
+        self.refresh_edit_grid_state(window, cx);
         cx.notify();
         committed
     }
 
-    /// Escape while editing: revert the field to the last-fetched content and hand focus back
-    /// to the grid.
+    /// Escape while editing: revert the field to the last-fetched content, close any in-cell
+    /// overlay, and hand focus back to the grid.
     pub fn escape_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.data_row.mode() != FieldMode::Editing {
             return;
         }
         let effects = self.data_row.reduce(DataRowEvent::Escape);
         self.sync_input_from_reducer(window, cx);
+        self.mirror_to_in_cell(window, cx);
         self.apply_data_effects(effects, window, cx);
+        self.edit.close();
+        self.refresh_edit_grid_state(window, cx);
         cx.notify();
+    }
+
+    // ---- Pending edit: type-to-replace, in-cell editor, Tab, mirror -----------------------
+    // (`components/edit_controller.md`; the single pending edit lives in `content_input` + the
+    // `DataRow` reducer, with `edit` adding the in-cell overlay + two-editor sync.)
+
+    /// The reused in-cell editor input — the window hands a clone to the grid so it can render the
+    /// overlay (`components/edit_controller.md §4.4`).
+    pub fn in_cell_input(&self) -> Entity<InputState> {
+        self.edit.in_cell_input()
+    }
+
+    /// Type-to-replace (`functional_spec.md §1.1`): a printable keystroke on the focused grid
+    /// starts an edit of the active cell whose content is **replaced** by `text`, caret at end, in
+    /// the data row (never the in-cell overlay). Works from Idle **or** a multi-cell selection
+    /// (targets the active cell — the grid collapses the range first).
+    pub fn begin_typed(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit.close();
+        self.edit.set_origin(EditOrigin::DataRow);
+        self.cap_error_external = None;
+        // Force Editing with the typed char (supersedes any pending fetch / disabled multi state).
+        let effects = self.data_row.reduce(DataRowEvent::Edited {
+            text: text.to_string(),
+        });
+        self.content_input.update(cx, |input, cx| {
+            input.set_value(text.to_string(), window, cx);
+            input.focus(window, cx);
+        });
+        self.apply_data_effects(effects, window, cx);
+        self.refresh_edit_grid_state(window, cx);
+        cx.notify();
+    }
+
+    /// Open the in-cell editor over `cell` (`functional_spec.md §1.3`). Double-click / F2 route
+    /// here. Seeds from the reducer's **committed** content (the last fetched raw), so it shows the
+    /// real content even if a redundant re-select cleared the live field but the reply already
+    /// landed. If a first content fetch is still in flight the overlay opens empty and
+    /// [`on_worker_event`](Self::on_worker_event) promotes it once the reply arrives
+    /// (empty-with-spinner, `§Grid integration`).
+    pub fn begin_in_cell(&mut self, cell: CellRef, window: &mut Window, cx: &mut Context<Self>) {
+        // Don't relocate the overlay onto a different cell while another cell's edit is still
+        // pending (e.g. a cap-rejected click-away, whose selection revert is deferred) — the
+        // reducer + selection remain on the old cell, so opening here would diverge (review #2).
+        if self.data_row.mode() == FieldMode::Editing && cell != self.selection.active {
+            return;
+        }
+        self.cap_error_external = None;
+        // Enter Editing seeded with the committed raw content, unless already editing this cell
+        // (F2 mid-edit keeps the pending text) or the fetch for THIS cell hasn't landed yet. The
+        // reducer keeps a previous cell's `committed` across a single→single selection change, so
+        // seed only when `committed` is known to belong to `cell`; otherwise open empty and let the
+        // in-flight reply promote it (guards a cross-cell stale-content commit, review New Critical).
+        // Only seed when not already editing this cell AND `committed` is known to hold THIS
+        // sheet+cell's fetched content; otherwise leave the reducer Idle-awaiting and let the
+        // in-flight reply promote the overlay.
+        if self.data_row.mode() != FieldMode::Editing
+            && self.committed_cell == Some((self.active_sheet, cell))
+        {
+            let committed = self.data_row.committed().to_string();
+            self.content_input.update(cx, |input, cx| {
+                input.set_value(committed.clone(), window, cx);
+            });
+            let effects = self
+                .data_row
+                .reduce(DataRowEvent::Edited { text: committed });
+            self.apply_data_effects(effects, window, cx);
+        }
+        let text = self.content_input.read(cx).value().to_string();
+        self.edit.set_syncing(true);
+        self.edit.in_cell().update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.focus(window, cx);
+        });
+        self.edit.set_syncing(false);
+        self.edit.open_on(cell);
+        self.refresh_edit_grid_state(window, cx);
+        cx.notify();
+    }
+
+    /// Tab / Shift+Tab from the in-cell overlay (routed via the grid): commit + move
+    /// right / left (`functional_spec.md §1.4`).
+    pub fn commit_incell_move(
+        &mut self,
+        dir: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_and_move(dir, window, cx);
+    }
+
+    /// Escape from the in-cell overlay (routed via the grid): cancel the edit, revert, close. When
+    /// the overlay is open but no edit has started yet (a first fetch is still in flight), there is
+    /// nothing to revert — just close the overlay and return focus to the grid.
+    pub fn cancel_incell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.data_row.mode() == FieldMode::Editing {
+            self.escape_edit(window, cx);
+        } else if self.edit.is_open() {
+            self.edit.close();
+            self.grid.emit(ChromeGridRequest::FocusGrid, window, cx);
+            self.refresh_edit_grid_state(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Commit the pending edit and move the active cell in `dir` (Enter → Down, Shift+Enter → Up,
+    /// Tab → Right, Shift+Tab → Left). A cap-rejected commit keeps the edit (no move). Shared by
+    /// both editors' Enter/Tab paths.
+    fn commit_and_move(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        let was_editing = self.data_row.mode() == FieldMode::Editing;
+        let mut effects = self.data_row.reduce(DataRowEvent::Commit);
+        // The reducer's Commit hardcodes a Down move; retarget it to `dir`.
+        for effect in &mut effects {
+            if matches!(
+                effect,
+                DataRowEffect::MoveActive(Motion::Move(Direction::Down))
+            ) {
+                *effect = DataRowEffect::MoveActive(Motion::Move(dir));
+            }
+        }
+        self.apply_data_effects(effects, window, cx);
+        self.note_commit(was_editing);
+        // A successful commit ends the edit → close the overlay; a cap-rejected one stays open.
+        if self.data_row.mode() != FieldMode::Editing {
+            self.edit.close();
+        }
+        self.refresh_edit_grid_state(window, cx);
+        cx.notify();
+    }
+
+    /// After a `Commit`/`EditCommitRequested` reduce, keep the [`committed_cell`](Self::committed_cell)
+    /// tag consistent with the reducer's `committed`. When an edit that was in progress
+    /// (`was_editing`) just committed (now no longer Editing), the reducer set `committed` to the
+    /// **active cell's** just-committed content — so re-tag it to `(active_sheet, active)`. In the
+    /// click-away path `selection.active` is still the edited cell here (the selection moves only
+    /// afterwards), so the tag names the right cell (data-corruption guard).
+    fn note_commit(&mut self, was_editing: bool) {
+        if was_editing && self.data_row.mode() != FieldMode::Editing {
+            self.committed_cell = Some((self.active_sheet, self.selection.active));
+        }
+    }
+
+    /// The in-cell overlay input emitted an event: `Change` drives the shared edit (mirrored to the
+    /// data row); `PressEnter` commits + moves; `Focus` makes the in-cell editor the driver.
+    fn on_incell_event(
+        &mut self,
+        _input: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Change => {
+                if self.edit.is_syncing() {
+                    return; // the echo of our own push into this editor — ignore (guard the loop)
+                }
+                self.cap_error_external = None;
+                let text = self.edit.in_cell().read(cx).value().to_string();
+                // Push into the data-row editor (events suppressed) and drive the shared reducer.
+                self.edit.set_syncing(true);
+                self.content_input.update(cx, |input, cx| {
+                    input.set_value(text.clone(), window, cx);
+                });
+                self.edit.set_syncing(false);
+                let effects = self.data_row.reduce(DataRowEvent::Edited { text });
+                self.apply_data_effects(effects, window, cx);
+                self.refresh_edit_grid_state(window, cx);
+                cx.notify();
+            }
+            InputEvent::PressEnter { shift, .. } => {
+                self.commit_and_move(
+                    if *shift {
+                        Direction::Up
+                    } else {
+                        Direction::Down
+                    },
+                    window,
+                    cx,
+                );
+            }
+            InputEvent::Focus => {
+                self.edit.set_origin(EditOrigin::InCell);
+                // The active editor drives which side shows the cap popover — re-push so the grid
+                // reflects the flip (avoids a transient double popover, review #4).
+                self.refresh_edit_grid_state(window, cx);
+                cx.notify();
+            }
+            InputEvent::Blur => {}
+        }
+    }
+
+    /// Mirrors the data-row editor's current text into the in-cell editor (events suppressed) when
+    /// the overlay is open — the other half of the two-editor sync.
+    fn mirror_to_in_cell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.edit.is_open() || self.edit.is_syncing() {
+            return;
+        }
+        let text = self.content_input.read(cx).value().to_string();
+        self.edit.set_syncing(true);
+        self.edit.in_cell().update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+        });
+        self.edit.set_syncing(false);
+    }
+
+    /// Pushes the current edit's grid-facing state (live mirror, in-cell overlay cell, in-cell cap
+    /// message) to the grid. Called after every edit transition
+    /// (`components/edit_controller.md §4.3–4.4`). The overlay is opened/closed explicitly by the
+    /// edit entry/exit methods (not auto-closed here), so the in-cell editor can stay open while an
+    /// initial content fetch is still in flight (empty-with-spinner, `§Grid integration`).
+    fn refresh_edit_grid_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editing = self.data_row.mode() == FieldMode::Editing;
+        let mirror = editing.then(|| {
+            let text: SharedString = self.content_input.read(cx).value().to_string().into();
+            (self.active_sheet, self.selection.active, text)
+        });
+        let in_cell = self.edit.open_cell();
+        let cap = (self.edit.origin() == EditOrigin::InCell)
+            .then(|| self.cap_error_message())
+            .flatten()
+            .map(SharedString::from);
+        let nonempty = mirror.is_some() || in_cell.is_some();
+        // Skip an all-`None` clear when nothing was shown (idle selection moves would otherwise
+        // re-push every keystroke); always push when something is/was shown so the clear lands.
+        if !nonempty && !self.edit_state_shown {
+            return;
+        }
+        self.edit_state_shown = nonempty;
+        self.grid.emit(
+            ChromeGridRequest::EditState {
+                mirror,
+                in_cell,
+                cap,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Folds a worker event into the chrome (Phase 11 calls this from the event task; tests
@@ -246,12 +523,28 @@ impl ChromeView {
     ) {
         match event {
             WorkerEvent::CellContent { req_id, raw } => {
+                let was_awaiting = self.data_row.is_awaiting();
                 self.data_row
                     .reduce(DataRowEvent::ContentFetched { req_id, raw });
                 // Sync the widget only when the reducer populated the field (fresh reply,
                 // still Idle) — never mid-edit, so a late reply can't reset the caret.
                 if self.data_row.mode() == FieldMode::Idle {
                     self.sync_input_from_reducer(window, cx);
+                    // A reply that actually landed (cleared `awaiting`) is the current active
+                    // cell's content — record which cell `committed` now belongs to, and, if the
+                    // in-cell editor opened before its content arrived (empty-with-spinner),
+                    // promote it to an edit seeded with it (`§Grid integration`; review #3).
+                    let landed = was_awaiting && !self.data_row.is_awaiting();
+                    if landed {
+                        self.committed_cell = Some((self.active_sheet, self.selection.active));
+                        if self.edit.is_open() {
+                            let text = self.content_input.read(cx).value().to_string();
+                            let effects = self.data_row.reduce(DataRowEvent::Edited { text });
+                            self.apply_data_effects(effects, window, cx);
+                            self.mirror_to_in_cell(window, cx);
+                            self.refresh_edit_grid_state(window, cx);
+                        }
+                    }
                 }
                 cx.notify();
             }
@@ -298,6 +591,9 @@ impl ChromeView {
     ) {
         match event {
             InputEvent::Change => {
+                if self.edit.is_syncing() {
+                    return; // the echo of an in-cell → data-row push — ignore (guard the loop)
+                }
                 // A keystroke dismisses the cap-error popover (`functional_spec.md §4.2`): the
                 // reducer clears its own rejection in `Edited`; the worker backstop is cleared
                 // here so both sources dismiss on the next keystroke.
@@ -305,23 +601,21 @@ impl ChromeView {
                 let text = self.content_input.read(cx).value().to_string();
                 let effects = self.data_row.reduce(DataRowEvent::Edited { text });
                 self.apply_data_effects(effects, window, cx);
+                self.mirror_to_in_cell(window, cx);
+                self.refresh_edit_grid_state(window, cx);
                 cx.notify();
             }
             InputEvent::PressEnter { shift, .. } => {
-                let mut effects = self.data_row.reduce(DataRowEvent::Commit);
-                if *shift {
-                    // Shift+Enter commits and moves up (the reducer's Commit hardcodes Down).
-                    for effect in &mut effects {
-                        if matches!(
-                            effect,
-                            DataRowEffect::MoveActive(Motion::Move(Direction::Down))
-                        ) {
-                            *effect = DataRowEffect::MoveActive(Motion::Move(Direction::Up));
-                        }
-                    }
-                }
-                self.apply_data_effects(effects, window, cx);
-                cx.notify();
+                // Enter commits + moves down, Shift+Enter up (the reducer's Commit hardcodes Down).
+                self.commit_and_move(
+                    if *shift {
+                        Direction::Up
+                    } else {
+                        Direction::Down
+                    },
+                    window,
+                    cx,
+                );
             }
             InputEvent::Blur => {
                 // Focus leaving the field dismisses the cap-error popover
@@ -331,7 +625,12 @@ impl ChromeView {
                     cx.notify();
                 }
             }
-            InputEvent::Focus => {}
+            InputEvent::Focus => {
+                self.edit.set_origin(EditOrigin::DataRow);
+                // Re-push so the in-cell cap popover (grid-side) clears when focus flips to the data
+                // row and the data-row popover takes over (avoids a transient double, review #4).
+                self.refresh_edit_grid_state(window, cx);
+            }
         }
     }
 
@@ -440,6 +739,11 @@ impl ChromeView {
         if self.data_row.mode() == FieldMode::Editing {
             let effects = self.data_row.reduce(DataRowEvent::EditCommitRequested);
             self.apply_data_effects(effects, window, cx);
+            self.note_commit(true);
+            if self.data_row.mode() != FieldMode::Editing {
+                self.edit.close();
+            }
+            self.refresh_edit_grid_state(window, cx);
         }
         self.data_row.mode() != FieldMode::Editing
     }
@@ -503,6 +807,9 @@ impl ChromeView {
             return;
         }
         self.active_sheet = id;
+        // The committed content belongs to the old sheet — invalidate its seed tag (the tag is also
+        // sheet-qualified, so this is belt-and-braces against a cross-sheet stale seed).
+        self.committed_cell = None;
         self.context_menu = None;
         self.refresh_active_style(cx);
     }
@@ -513,6 +820,7 @@ impl ChromeView {
             return;
         }
         self.active_sheet = id;
+        self.committed_cell = None;
         self.context_menu = None;
         self.grid
             .emit(ChromeGridRequest::SetActiveSheet(id), window, cx);
@@ -885,6 +1193,20 @@ impl ChromeView {
                     this.escape_edit(window, cx);
                 }
             }))
+            // Tab / Shift+Tab commit + move right/left (`functional_spec.md §1.4`). Captured
+            // **before** the input consumes the key (the bare gpui-component Input emits no commit
+            // on Tab — `components/edit_controller.md §Tab interception`).
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab" && this.data_mode() == FieldMode::Editing {
+                    cx.stop_propagation();
+                    let dir = if event.keystroke.modifiers.shift {
+                        Direction::Left
+                    } else {
+                        Direction::Right
+                    };
+                    this.commit_and_move(dir, window, cx);
+                }
+            }))
             // Ref box: read-only A1 address.
             .child(
                 div()
@@ -995,8 +1317,12 @@ impl ChromeView {
     fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut overlays: Vec<gpui::AnyElement> = Vec::new();
 
-        if let Some(message) = self.cap_error_message() {
-            overlays.push(self.render_cap_error_popover(message));
+        // The data-row cap popover anchors under the data row only when it is the active editor;
+        // an in-cell cap error is shown under the overlay by the grid (`edit_controller.md §4.2`).
+        if self.edit.origin() == EditOrigin::DataRow {
+            if let Some(message) = self.cap_error_message() {
+                overlays.push(self.render_cap_error_popover(message));
+            }
         }
         if self.fill_open {
             overlays.push(self.render_fill_popover(cx));
@@ -1258,6 +1584,61 @@ impl ChromeView {
     fn test_rename_type(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.rename_input
             .update(cx, |input, cx| input.set_value(text, window, cx));
+    }
+
+    /// Test seam: simulate typing `text` into the in-cell editor (sets the widget text, then
+    /// delivers the `Change` event the subscription would).
+    fn test_incell_type(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.edit.in_cell().clone();
+        handle.update(cx, |input, cx| input.set_value(text, window, cx));
+        self.on_incell_event(&handle, &InputEvent::Change, window, cx);
+    }
+
+    /// Test seam: simulate pressing Enter (optionally with Shift) in the in-cell editor.
+    fn test_incell_press_enter(
+        &mut self,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = self.edit.in_cell().clone();
+        self.on_incell_event(
+            &handle,
+            &InputEvent::PressEnter {
+                secondary: false,
+                shift,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Test seam: replicate the data-row Tab handler (commit + move right/left) without the
+    /// widget-level `capture_key_down`.
+    fn test_data_row_tab(&mut self, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.data_mode() == FieldMode::Editing {
+            let dir = if shift {
+                Direction::Left
+            } else {
+                Direction::Right
+            };
+            self.commit_and_move(dir, window, cx);
+        }
+    }
+
+    /// Test seam: the in-cell editor's current text.
+    fn incell_text(&self, cx: &App) -> String {
+        self.edit.in_cell().read(cx).value().to_string()
+    }
+
+    /// Test seam: the open in-cell overlay cell, if any.
+    fn incell_open(&self) -> Option<CellRef> {
+        self.edit.open_cell()
+    }
+
+    /// Test seam: which editor currently drives the edit.
+    fn edit_origin(&self) -> EditOrigin {
+        self.edit.origin()
     }
 }
 
@@ -1918,5 +2299,579 @@ mod tests {
         upd(&h, cx, |c, window, cx| c.test_type("=1", window, cx));
         assert!(!upd(&h, cx, |c, _w, _cx| c.cap_error_visible()));
         assert_eq!(upd(&h, cx, |c, _w, _cx| c.cap_error_message()), None);
+    }
+
+    // ---- Editing feel: type-to-replace, in-cell editor, sync, Tab, mirror ----------------
+
+    /// The most recent edit-state push the chrome sent to the grid (mirror / in-cell / cap).
+    type EditStatePush = (
+        Option<(SheetId, CellRef, gpui::SharedString)>,
+        Option<CellRef>,
+        Option<gpui::SharedString>,
+    );
+    fn last_edit_state(reqs: &[ChromeGridRequest]) -> Option<EditStatePush> {
+        reqs.iter().rev().find_map(|r| match r {
+            ChromeGridRequest::EditState {
+                mirror,
+                in_cell,
+                cap,
+            } => Some((mirror.clone(), *in_cell, cap.clone())),
+            _ => None,
+        })
+    }
+
+    /// A chrome whose active cell A1 has fetched `content` (single selection, reply applied).
+    fn idle_on_a1(cx: &mut TestAppContext, content: &str) -> Harness {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 1,
+                    raw: content.into(),
+                },
+                window,
+                cx,
+            );
+        });
+        h.client.take_commands();
+        h.grid_requests.borrow_mut().clear();
+        h
+    }
+
+    #[gpui::test]
+    fn type_to_replace_starts_edit_with_char(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "old");
+        upd(&h, cx, |c, window, cx| c.begin_typed("x", window, cx));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "x");
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.edit_origin()),
+            EditOrigin::DataRow
+        );
+        // A live mirror of the typed char was pushed to the grid for the active cell.
+        let mirror = last_edit_state(&h.grid_requests.borrow())
+            .and_then(|(m, _, _)| m)
+            .expect("mirror pushed while editing");
+        assert_eq!(mirror.1, cell(0, 0));
+        assert_eq!(mirror.2.as_ref(), "x");
+    }
+
+    #[gpui::test]
+    fn type_to_replace_on_multiselect_targets_active(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(
+                SelectionModel {
+                    anchor: cell(1, 1),
+                    active: cell(3, 3),
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Disabled);
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("5", window, cx);
+            c.test_press_enter(false, window, cx);
+        });
+        // The commit targets the active cell of the (multi) selection.
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.first(), Some(Command::SetCellInput { cell: cc, input, .. }) if *cc == cell(3, 3) && input == "5"),
+            "expected SetCellInput at D4 with \"5\", got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn f2_opens_in_cell_keeping_content(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "42");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx)
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), Some(cell(0, 0)));
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "42");
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "42");
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.edit_origin()),
+            EditOrigin::InCell
+        );
+        // The grid got the in-cell overlay open on A1.
+        assert_eq!(
+            last_edit_state(&h.grid_requests.borrow()).and_then(|(_, ic, _)| ic),
+            Some(cell(0, 0))
+        );
+    }
+
+    #[gpui::test]
+    fn in_cell_and_data_row_stay_in_sync(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            // Typing in the in-cell editor updates the data row.
+            c.test_incell_type("=A1", window, cx);
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "=A1");
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "=A1");
+        // Typing in the data row updates the in-cell editor (both directions, no echo loop).
+        upd(&h, cx, |c, window, cx| c.test_type("=B2", window, cx));
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "=B2");
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "=B2");
+    }
+
+    #[gpui::test]
+    fn in_cell_enter_commits_and_moves_down(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type("99", window, cx);
+            c.test_incell_press_enter(false, window, cx);
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "99"),
+            "expected SetCellInput \"99\", got {cmds:?}"
+        );
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Down))
+        )));
+        // The overlay closed on commit.
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), None);
+        assert_eq!(
+            last_edit_state(&h.grid_requests.borrow()).and_then(|(_, ic, _)| ic),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn in_cell_tab_commits_and_moves_right(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type("7", window, cx);
+            c.commit_incell_move(Direction::Right, window, cx);
+        });
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), None);
+    }
+
+    #[gpui::test]
+    fn in_cell_escape_cancels_and_reverts(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "42");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type("999", window, cx);
+            c.cancel_incell(window, cx);
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "42");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), None);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        assert!(h
+            .grid_requests
+            .borrow()
+            .iter()
+            .any(|r| matches!(r, ChromeGridRequest::FocusGrid)));
+    }
+
+    #[gpui::test]
+    fn in_cell_cap_reject_keeps_editing_and_flags(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        let huge = format!("={}", "1".repeat(MAX_INPUT_LEN));
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type(&huge, window, cx);
+            c.test_incell_press_enter(false, window, cx);
+        });
+        // No commit, still editing, overlay still open.
+        assert!(!h
+            .client
+            .take_commands()
+            .iter()
+            .any(|cmd| matches!(cmd, Command::SetCellInput { .. })));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), Some(cell(0, 0)));
+        // The cap message is pushed for the in-cell popover (origin == InCell).
+        let cap = last_edit_state(&h.grid_requests.borrow()).and_then(|(_, _, cap)| cap);
+        assert_eq!(
+            cap.as_deref(),
+            Some("Formula too long (max 8,192 characters)")
+        );
+    }
+
+    #[gpui::test]
+    fn begin_in_cell_mid_edit_keeps_pending_text(cx: &mut TestAppContext) {
+        // Type-to-replace in the data row, then F2 → the in-cell editor keeps the pending text.
+        let h = idle_on_a1(cx, "old");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("x", window, cx);
+            c.begin_in_cell(cell(0, 0), window, cx);
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "x");
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "x");
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.edit_origin()),
+            EditOrigin::InCell
+        );
+    }
+
+    #[gpui::test]
+    fn data_row_tab_commits_and_moves_right(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.test_type("=1", window, cx);
+            c.test_data_row_tab(false, window, cx);
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "=1"));
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+    }
+
+    #[gpui::test]
+    fn data_row_shift_tab_moves_left(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.test_type("=1", window, cx);
+            c.test_data_row_tab(true, window, cx);
+        });
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Left))
+        )));
+    }
+
+    #[gpui::test]
+    fn mirror_cleared_on_commit(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.test_type("=1", window, cx);
+        });
+        // Mirror present while editing.
+        assert!(last_edit_state(&h.grid_requests.borrow())
+            .and_then(|(m, _, _)| m)
+            .is_some());
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| {
+            c.test_press_enter(false, window, cx)
+        });
+        // Cleared on commit.
+        assert_eq!(
+            last_edit_state(&h.grid_requests.borrow()).and_then(|(m, _, _)| m),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn double_click_reselect_keeps_content(cx: &mut TestAppContext) {
+        // Replays the real double-click chrome-level order: the second mousedown re-emits
+        // SelectionChanged for the already-selected cell (restarting the fetch + clearing the
+        // field) BEFORE OpenInCellEditor. The in-cell editor must still show the cell's real
+        // content ("42"), not the just-cleared field (review Critical #1 — data-loss guard).
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 1,
+                    raw: "42".into(),
+                },
+                window,
+                cx,
+            );
+            // Redundant re-select (the grid also elides this now, but the chrome must be robust).
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.begin_in_cell(cell(0, 0), window, cx);
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "42");
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "42");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn begin_in_cell_ignored_while_other_cell_editing(cx: &mut TestAppContext) {
+        // A cap-rejected/deferred-revert click-away leaves the reducer + selection on the OLD cell;
+        // opening the in-cell editor on a DIFFERENT cell must no-op (review Moderate #2).
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("x", window, cx); // editing A1 (the active cell)
+            c.begin_in_cell(cell(1, 1), window, cx); // a divergent cell
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.incell_open()),
+            None,
+            "overlay must not relocate onto a cell the edit isn't on"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "x");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn in_cell_opens_empty_while_fetch_pending_then_populates(cx: &mut TestAppContext) {
+        // F2 before the content reply arrives: the overlay opens empty (no forced empty edit), and
+        // the in-flight reply promotes it once it lands (empty-with-spinner intent, review #3).
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.begin_in_cell(cell(0, 0), window, cx); // reply not yet delivered
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), Some(cell(0, 0)));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.data_mode()),
+            FieldMode::Idle,
+            "no empty edit forced while the fetch is still in flight"
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 1,
+                    raw: "hello".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "hello");
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "hello");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), Some(cell(0, 0)));
+    }
+
+    #[gpui::test]
+    fn double_click_cross_cell_pending_fetch_opens_empty(cx: &mut TestAppContext) {
+        // Select non-empty A1 (reply lands), then B2 whose fetch is still in flight, then open the
+        // in-cell editor on B2. It must NOT seed A1's stale committed "42" (the reducer keeps A1's
+        // `committed` across the single→single switch) — it opens empty, and B2's reply populates
+        // it (review New Critical — cross-cell data-corruption guard).
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 1,
+                    raw: "42".into(),
+                },
+                window,
+                cx,
+            );
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx); // B2, no reply
+            c.begin_in_cell(cell(1, 1), window, cx);
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c.incell_text(cx)),
+            "",
+            "must not seed the previous cell's stale content"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), Some(cell(1, 1)));
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 2,
+                    raw: "world".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "world");
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "world");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn multiselect_collapse_open_does_not_seed_stale(cx: &mut TestAppContext) {
+        // A1 reply "42" tags the seed. A range multi-select clears `committed` and resets the tag.
+        // Collapsing back to A1 (fetch in flight) and opening the in-cell editor must NOT seed the
+        // just-cleared empty content — it opens empty, and A1's reply repopulates it (New Critical
+        // path #1: multi-select clears committed but the bare tag used to survive).
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 1,
+                    raw: "42".into(),
+                },
+                window,
+                cx,
+            );
+            // A range selection → multi → the reducer clears `committed`.
+            c.on_selection_changed(
+                SelectionModel {
+                    anchor: cell(0, 0),
+                    active: cell(2, 2),
+                },
+                window,
+                cx,
+            );
+            // Collapse back to A1 → a fresh fetch (req 2) is in flight, `committed` still "".
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.begin_in_cell(cell(0, 0), window, cx);
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c.incell_text(cx)),
+            "",
+            "must not seed the just-cleared committed content"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), Some(cell(0, 0)));
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 2,
+                    raw: "42".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "42");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn sheet_switch_open_does_not_seed_other_sheet(cx: &mut TestAppContext) {
+        // Sheet1!A1 reply lands (tag = (Sheet1, A1)). Switch to Sheet2 and open the in-cell editor
+        // on Sheet2!A1 (the default landing cell, same CellRef) before its fetch replies — it must
+        // NOT seed Sheet1's content across sheets (New Critical path #2: the bare tag ignored the
+        // sheet). Opens empty; Sheet2's reply promotes with the right content.
+        let h = two_sheets(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 1,
+                    raw: "sheet1A1".into(),
+                },
+                window,
+                cx,
+            );
+            // Switch to Sheet2 (window-driven adopt), then select its A1 (fetch req 2 in flight).
+            c.adopt_active_sheet(SheetId(1), cx);
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.begin_in_cell(cell(0, 0), window, cx);
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c.incell_text(cx)),
+            "",
+            "must not seed another sheet's content"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 2,
+                    raw: "sheet2A1".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "sheet2A1");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn commit_retags_so_reopen_other_cell_does_not_seed_committed(cx: &mut TestAppContext) {
+        // The commit paths overwrite the reducer's `committed` with the EDITED cell's content; the
+        // seed tag must move with it (New Critical — commit-path stale seed). Repro: land A1="Zval",
+        // type-to-replace B1="x", click-away commit of B1, then reopen A1 before its re-fetch reply.
+        // The A1 editor must NOT show B1's "x"; it opens empty and A1's reply repopulates "Zval".
+        let h = one_sheet(cx);
+        let b1 = cell(0, 1);
+        upd(&h, cx, |c, window, cx| {
+            // 1. A1 reply lands → tag = (s, A1).
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 1,
+                    raw: "Zval".into(),
+                },
+                window,
+                cx,
+            );
+            // 2. Move to B1, type-to-replace "x"; B1's reply arrives mid-edit and is dropped.
+            c.on_selection_changed(SelectionModel::single(b1), window, cx);
+            c.begin_typed("x", window, cx);
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 2,
+                    raw: "Bval".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        // 3. Click-away commit of B1 (the tag must move to B1 here — selection.active is still B1).
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.on_edit_commit_requested(window, cx);
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { cell: cc, input, .. }] if *cc == b1 && input == "x"),
+            "B1 must receive the committed \"x\", got {cmds:?}"
+        );
+        // Select A1 (its re-fetch req 3 is in flight), then reopen the in-cell editor on A1.
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.begin_in_cell(cell(0, 0), window, cx);
+        });
+        assert_ne!(
+            upd(&h, cx, |c, _w, cx| c.incell_text(cx)),
+            "x",
+            "A1 must not seed B1's just-committed content"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.incell_open()), Some(cell(0, 0)));
+        // 4. A1's real reply (req 3) promotes the overlay with A1's content.
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::CellContent {
+                    req_id: 3,
+                    raw: "Zval".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "Zval");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn focus_flip_clears_incell_cap_push(cx: &mut TestAppContext) {
+        // After an in-cell cap reject (grid shows the popover), flipping focus to the data row must
+        // clear the in-cell cap push so only one popover shows (review Mild #4).
+        let h = idle_on_a1(cx, "");
+        let huge = format!("={}", "1".repeat(MAX_INPUT_LEN));
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type(&huge, window, cx);
+            c.test_incell_press_enter(false, window, cx);
+        });
+        assert!(last_edit_state(&h.grid_requests.borrow())
+            .and_then(|(_, _, cap)| cap)
+            .is_some());
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| {
+            let handle = c.content_input.clone();
+            c.on_content_event(&handle, &InputEvent::Focus, window, cx);
+        });
+        assert_eq!(
+            last_edit_state(&h.grid_requests.borrow()).and_then(|(_, _, cap)| cap),
+            None,
+            "the in-cell cap popover clears when focus flips to the data row"
+        );
     }
 }

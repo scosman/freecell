@@ -113,3 +113,79 @@ The base container was missing the GPUI link libraries documented in `app/README
 `libfontconfig1-dev`, `libfreetype-dev`, `libasound2-dev`, `libxcb1-dev`); `cargo build
 --workspace` failed to link `render-tests` bins until I `apt-get install`ed them. Not a code
 change — recorded for reproducibility of the checks.
+
+## Phase 2 — Editing feel
+
+### 1. `EditController` ownership: one entity (chrome), not the window (deviation)
+
+`components/edit_controller.md` specifies a `WorkbookWindow`-owned `EditController` that owns
+**both** editor `InputState`s and the whole pending-edit state machine, with the data-row
+logic torn out of chrome. I instead kept the single pending edit inside **one entity** —
+`ChromeView`, which already owns the data-row `InputState` + the proven, table-tested
+`freecell_core::data_row::DataRow` reducer (fetch / spinner / disabled / stale-reply / cap /
+commit / escape). The new `chrome/edit.rs` `EditController` owns only the **second** (in-cell
+overlay) `InputState` plus the overlay's open cell, the `EditOrigin`, and the `syncing` guard.
+
+**Rationale.** The two editors live in *different* entities (data row in the chrome, in-cell
+overlay rendered by the grid). The doc's own design fights an `InputState` text-sync feedback
+loop with a `syncing` guard; doing that sync **across entity boundaries** (a window-owned
+controller pushing text into a chrome-owned input and a grid-rendered input) is brittle.
+Keeping both editors' text sync **inside one entity** eliminates the cross-entity loop, and
+reuses every existing data-row test unchanged (they all stayed green). The canonical pending
+**text + commit/cap** stay in the `DataRow` reducer; `EditController` layers the in-cell
+editor, the two-way sync, and origin tracking on top. Module lives at `chrome/edit.rs` (not
+the doc's `shell/edit.rs`) because the chrome owns it. **Please confirm this is acceptable**;
+if a window-owned controller is required, it is a larger refactor for the same behaviour.
+
+### 2. Grid ⇄ chrome wiring for the mirror + overlay
+
+The mirror text, the in-cell overlay open cell, and the in-cell cap message are pushed from
+the chrome to the grid via a new `ChromeGridRequest::EditState { mirror, in_cell, cap }` on the
+existing chrome→grid sink; the grid renders them (`set_edit_state`). The reused in-cell
+`InputState` handle is handed to the grid once at window-build time. New `GridEvent`s
+(`TypeToEdit`, `OpenInCellEditor`, `InCellCommitMove`, `InCellCancel`) carry the grid-side
+triggers back to the chrome. The `EditState` grid update is **deferred** (`window.defer`)
+because a grid-originated trigger (type-to-replace / double-click / F2 / in-cell Tab) has the
+grid mid-`update` when the chrome pushes state back — a direct grid `update` would re-enter it.
+A one-cycle defer is imperceptible for the live mirror.
+
+### 3. In-cell "select all on double-click" not implemented (caret at end instead)
+
+`functional_spec.md §1.3` asks that a double-click open the in-cell editor with the content
+**fully selected** (F2 → caret at end). The pinned gpui-component `InputState::select_all` is
+`pub(super)` (not reachable), and `set_value` unconditionally places the caret at end for
+single-line inputs. So **both** double-click and F2 open with the caret at end; the text is
+preserved (the tested behaviour). Selecting-all-on-open would need dispatching the input's
+private `SelectAll` action, deferred as cosmetic. The user can still Cmd/Ctrl+A in the editor.
+
+### 4. Type-to-replace targets the selection's **active** cell (not the literal "anchor")
+
+`components/edit_controller.md`/`functional_spec.md §1.1` say a typed edit on a multi-cell
+selection targets the "anchor". FreeCell targets the **active** cell (the white cursor cell),
+which matches Excel's behaviour and the existing commit path (which already routes
+`SetCellInput`/`GetCellContent` to `selection.active`). The grid collapses a multi-selection to
+`single(active)` before emitting `TypeToEdit`. For a single selection anchor == active, so this
+only differs for a multi-cell selection.
+
+### 5. In-cell worker cap-reject backstop popover
+
+The in-cell cap-error popover is driven by the **UI** validation path (commit → reducer
+validates → cap message pushed to the grid), which is what fires in practice (the UI validates
+before the worker ever sees the input). The rare worker `EditRejected{InputCap}` *backstop*
+still lights the data-row danger state but is **not** re-pushed to the in-cell overlay popover
+(no edit transition triggers the push). Extreme edge (the UI already rejects over-cap input);
+left for a later polish pass if needed.
+
+### 6. Render baselines require a pinned-runner regeneration (could not do it here)
+
+Phase 2 adds **two** new render cases exercising new rendered output — `cell_mirror_typing`
+(the live mirror) and `incell_editor_open` (the in-cell overlay) — wired through new
+`RenderCase` fields (`mirror`, `in_cell`) applied in `render-tests/src/render.rs`. This
+container **cannot** regenerate the pixel baselines (needs the pinned Xvfb + lavapipe runner +
+a human eyeball, per `render-tests/README.md`), so **no baseline PNGs were committed**. Plain
+`cargo test --workspace` stays green (the pixel diff is gated behind `FREECELL_RENDER=1`; the
+`case_names_match_table` guard passes because the macro list + table were updated together).
+
+**Action needed:** on the pinned runner, `render-tests/scripts/render_tests.sh generate --only
+cell_mirror_typing` and `--only incell_editor_open`, eyeball, and commit the two PNGs. No
+existing baselines change (both cases are additive; no other rendered output changed).

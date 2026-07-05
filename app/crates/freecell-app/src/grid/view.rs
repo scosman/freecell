@@ -16,10 +16,11 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use gpui::{
-    canvas, div, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context, FocusHandle,
-    Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Rgba, Window,
+    canvas, deferred, div, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context, Entity,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Rgba, SharedString, Window,
 };
+use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
 use gpui_component::{Icon, IconName, Sizable as _};
 
@@ -27,7 +28,7 @@ use freecell_core::cache::SheetCaches;
 use freecell_core::color::Rgb;
 use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
-use freecell_core::selection::Motion;
+use freecell_core::selection::{Direction, Motion};
 use freecell_core::{apply_motion, Align, Axis, CellRef, RenderStyle, SelectionModel, SheetDims};
 
 use super::input::{command_for_key, GridKeyCommand};
@@ -105,6 +106,17 @@ pub struct GridView {
     /// full-window). Falls back to the window size (whole window) when not yet captured — the
     /// full-window render-tests / demo are unaffected (bounds ≈ the window).
     bounds: Option<Bounds<Pixels>>,
+
+    // ---- Pending-edit overlays (pushed by the chrome, `components/edit_controller.md`) ----
+    /// The live cell mirror: raw pending text to paint in `(sheet, cell)` instead of its published
+    /// value while an edit is pending (`functional_spec.md §1.2`). `None` when no edit is pending.
+    mirror: Option<(SheetId, CellRef, SharedString)>,
+    /// The cell the in-cell editor overlay covers, or `None` when the overlay is closed.
+    incell_open: Option<CellRef>,
+    /// The reused in-cell editor input (owned by the chrome; the grid renders it as the overlay).
+    incell_input: Option<Entity<InputState>>,
+    /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
+    incell_cap: Option<SharedString>,
 }
 
 /// The per-frame geometry resolved under the (briefly held) caches read lock.
@@ -164,6 +176,44 @@ impl GridView {
             cell_index: HashMap::new(),
             visible_styles: HashMap::new(),
             bounds: None,
+            mirror: None,
+            incell_open: None,
+            incell_input: None,
+            incell_cap: None,
+        }
+    }
+
+    /// Installs the reused in-cell editor input the chrome owns, so the grid can render the overlay
+    /// (`components/edit_controller.md §4.4`). Called once at window wiring time.
+    pub fn set_incell_input(&mut self, input: Entity<InputState>, cx: &mut Context<Self>) {
+        self.incell_input = Some(input);
+        cx.notify();
+    }
+
+    /// Pushes the chrome's current edit state onto the grid (live mirror, in-cell overlay cell,
+    /// in-cell cap message). `None`s clear the corresponding overlay. Repaints so the mirror tracks
+    /// each keystroke (`components/edit_controller.md §4.3–4.4`).
+    pub fn set_edit_state(
+        &mut self,
+        mirror: Option<(SheetId, CellRef, SharedString)>,
+        incell_open: Option<CellRef>,
+        incell_cap: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mirror = mirror;
+        self.incell_open = incell_open;
+        self.incell_cap = incell_cap;
+        cx.notify();
+    }
+
+    /// The mirror's raw text for `(sheet, cell)` if a pending edit is mirrored there on this sheet
+    /// (`functional_spec.md §1.2`).
+    fn mirror_text_for(&self, cell: CellRef) -> Option<&str> {
+        match &self.mirror {
+            Some((sheet, mcell, text)) if *sheet == self.active_sheet && *mcell == cell => {
+                Some(text.as_ref())
+            }
+            _ => None,
         }
     }
 
@@ -196,6 +246,11 @@ impl GridView {
         self.selection.entry(sheet).or_default();
         // Force the next scroll/publish to re-announce the viewport for the new sheet.
         self.last_viewport = None;
+        // Defensive: an edit overlay is anchored to the *previous* sheet's cell (the chrome commits
+        // the pending edit before a switch); drop it so it can never leak onto the new sheet.
+        self.mirror = None;
+        self.incell_open = None;
+        self.incell_cap = None;
         cx.notify();
     }
 
@@ -512,7 +567,19 @@ impl GridView {
         } else {
             SelectionModel::single(cell)
         };
-        self.set_selection_and_emit(selection, window, cx);
+        let is_double = event.click_count >= 2;
+        // The second mousedown of a double-click lands on the already-selected cell. Re-emitting
+        // its `SelectionChanged` would restart the content fetch and blank the in-cell editor about
+        // to open (data loss; `functional_spec.md §1.3`, review #1), so skip the redundant select
+        // and only open the editor.
+        let already_active_single = self.selection().is_single() && *self.selection() == selection;
+        if !(is_double && already_active_single) {
+            self.set_selection_and_emit(selection, window, cx);
+        }
+        if is_double {
+            self.events
+                .emit(&GridEvent::OpenInCellEditor(cell), window, cx);
+        }
         // Begin a drag from the (kept or new) anchor; subsequent moves extend to the hovered cell.
         self.drag = Some(DragState {
             anchor: selection.anchor,
@@ -821,11 +888,27 @@ impl GridView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // While the in-cell editor owns the keyboard, the grid's own motions / type-to-replace stay
+        // out of the way; its Tab/Escape are handled at the grid root's capture handler
+        // (`components/edit_controller.md §Grid integration`).
+        if self.incell_open.is_some() {
+            return;
+        }
+
         let key = event.keystroke.key.as_str();
-        let shift = event.keystroke.modifiers.shift;
+        let modifiers = &event.keystroke.modifiers;
+        // F2 opens the in-cell editor on a single-cell selection (`functional_spec.md §1.3`).
+        if key == "f2" && !modifiers.modified() && self.selection().is_single() {
+            let active = self.selection().active;
+            self.events
+                .emit(&GridEvent::OpenInCellEditor(active), window, cx);
+            return;
+        }
+
+        let shift = modifiers.shift;
         // `secondary()` = Cmd on macOS, Ctrl on Linux — resolved here so the mapper stays
         // platform-agnostic (`ui_design.md §6` Linux note).
-        let secondary = event.keystroke.modifiers.secondary();
+        let secondary = modifiers.secondary();
         // Only Page Up/Down need the viewport height in rows; computing it takes a caches read
         // lock, so resolve it lazily to keep every other keystroke lock-free.
         let page_rows = if matches!(key, "pageup" | "pagedown") {
@@ -835,6 +918,8 @@ impl GridView {
         };
 
         let Some(command) = command_for_key(key, shift, secondary, page_rows) else {
+            // An unmapped key may be a printable one → start a type-to-replace edit.
+            self.maybe_type_to_edit(event, window, cx);
             return;
         };
         match command {
@@ -844,6 +929,34 @@ impl GridView {
                 self.events.emit(&GridEvent::ClearCells(range), window, cx);
             }
         }
+    }
+
+    /// Type-to-replace (`functional_spec.md §1.1`): a printable, modifier-free (Shift allowed)
+    /// keystroke starts an edit whose content is the typed character. A multi-cell selection first
+    /// collapses to the active cell (Excel behaviour). Cmd/Ctrl/Alt combinations and control keys
+    /// (Enter/Tab/arrows/…) never qualify (`key_char` is `None`/control for those).
+    fn maybe_type_to_edit(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let m = &event.keystroke.modifiers;
+        if m.control || m.alt || m.platform || m.function {
+            return;
+        }
+        let Some(ch) = event.keystroke.key_char.as_deref() else {
+            return;
+        };
+        if ch.is_empty() || ch.chars().any(char::is_control) {
+            return;
+        }
+        if !self.selection().is_single() {
+            let active = self.selection().active;
+            self.set_selection_and_emit(SelectionModel::single(active), window, cx);
+        }
+        self.events
+            .emit(&GridEvent::TypeToEdit(ch.to_string()), window, cx);
     }
 
     /// Applies a keyboard `motion` to the active sheet's selection (clamped to sheet bounds),
@@ -910,25 +1023,32 @@ impl GridView {
                     .and_then(|s| s.fill)
                     .map(to_rgba)
                     .unwrap_or_else(|| rgb(CELL_BG));
-                let (text, text_color, kind) = match self.cell_index.get(&(r, c)) {
-                    Some(&idx) => {
-                        let pc = &publication.cells[idx];
-                        // `pc.text_color` is already fully resolved (explicit non-black font
-                        // colour → number-format colour), so the `.or(font_color)` fallback is
-                        // redundant here — kept as a harmless minimal-diff belt-and-braces
-                        // (both use the same black-filter, so they agree). See DECISIONS §4.
-                        let color = pc
-                            .text_color
-                            .or(style.and_then(|s| s.font_color))
-                            .map(to_rgba)
-                            .unwrap_or_else(|| rgb(CELL_TEXT));
-                        (pc.display_text.clone(), color, pc.kind)
-                    }
-                    // Empty cells carry no text, so their kind never drives alignment.
-                    None => (String::new(), rgb(CELL_TEXT), CellKind::Text),
-                };
+                // A pending edit mirrors its raw text here in the grid's default style, left-
+                // aligned, over the committed value (`functional_spec.md §1.2`). The cell's fill is
+                // kept (no flash), but text attributes / alignment fall back to default (`None`).
+                let (text, text_color, kind, attr_style) =
+                    match self.mirror_text_for(CellRef::new(r, c)) {
+                        Some(raw) => (raw.to_string(), rgb(CELL_TEXT), CellKind::Text, None),
+                        None => match self.cell_index.get(&(r, c)) {
+                            Some(&idx) => {
+                                let pc = &publication.cells[idx];
+                                // `pc.text_color` is already fully resolved (explicit non-black font
+                                // colour → number-format colour), so the `.or(font_color)` fallback is
+                                // redundant here — kept as a harmless minimal-diff belt-and-braces
+                                // (both use the same black-filter, so they agree). See DECISIONS §4.
+                                let color = pc
+                                    .text_color
+                                    .or(style.and_then(|s| s.font_color))
+                                    .map(to_rgba)
+                                    .unwrap_or_else(|| rgb(CELL_TEXT));
+                                (pc.display_text.clone(), color, pc.kind, style)
+                            }
+                            // Empty cells carry no text, so their kind never drives alignment.
+                            None => (String::new(), rgb(CELL_TEXT), CellKind::Text, style),
+                        },
+                    };
                 content_children.push(cell_element(
-                    x, y, w, h, fill, text, text_color, kind, style,
+                    x, y, w, h, fill, text, text_color, kind, attr_style,
                 ));
             }
         }
@@ -970,6 +1090,13 @@ impl GridView {
                     .border_color(rgb(ACCENT))
                     .into_any_element(),
             );
+        }
+
+        // In-cell editor overlay (deferred → painted above the cells; `functional_spec.md §1.3`).
+        // Rendered even when the anchored cell is scrolled out of view — the content layer's
+        // `overflow_hidden` clips it, and keeping it in the tree preserves the input's focus.
+        if let (Some(cell), Some(input)) = (self.incell_open, self.incell_input.clone()) {
+            content_children.extend(self.in_cell_overlay_elements(cell, &input, frame));
         }
 
         if let Some(t) = timing.as_mut() {
@@ -1327,6 +1454,73 @@ fn rect_div(x: f32, y: f32, w: f32, h: f32) -> gpui::Div {
     div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h))
 }
 
+/// The in-cell editor overlay's minimum width (px) — grows rightward over neighbours for narrow
+/// columns (`functional_spec.md §1.3`, `ui_design.md §3`).
+const IN_CELL_MIN_W: f32 = 80.0;
+/// The in-cell editor's cap-reject danger border/tooltip colour (theme danger, matching chrome).
+const IN_CELL_DANGER: u32 = 0xDC2626;
+/// Dark tooltip fill + text for the in-cell cap-error popover (`ui_design.md §4`, matching chrome).
+const IN_CELL_TOOLTIP_BG: u32 = 0x2B2B2B;
+const IN_CELL_TOOLTIP_TEXT: u32 = 0xF5F5F5;
+
+impl GridView {
+    /// The in-cell editor overlay elements at `cell`: the bordered white editor box holding the
+    /// reused `Input`, plus the cap-error popover below it when a cap rejection is active
+    /// (`components/edit_controller.md §4.4`, `ui_design.md §3–4`). Both are `deferred()` so they
+    /// paint above the selection borders; keys (Tab/Escape) are captured at the grid root.
+    fn in_cell_overlay_elements(
+        &self,
+        cell: CellRef,
+        input: &Entity<InputState>,
+        frame: &Frame,
+    ) -> Vec<AnyElement> {
+        let (x, y, w, h) = cell_rect(cell.row, cell.col, frame);
+        let w = w.max(IN_CELL_MIN_W);
+        let danger = self.incell_cap.is_some();
+        let border = if danger {
+            rgb(IN_CELL_DANGER)
+        } else {
+            rgb(ACCENT)
+        };
+        let editor = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(w))
+            .h(px(h))
+            .flex()
+            .items_center()
+            .bg(rgb(CELL_BG))
+            .border_2()
+            .border_color(border)
+            .px(px(1.0))
+            .text_size(px(CELL_FONT_PX))
+            .text_color(rgb(CELL_TEXT))
+            .child(Input::new(input).w_full());
+
+        let mut elements = vec![deferred(editor).into_any_element()];
+
+        if let Some(message) = &self.incell_cap {
+            let popover = div()
+                .absolute()
+                .left(px(x))
+                .top(px(y + h + 2.0))
+                .px_2()
+                .py_1()
+                .bg(rgb(IN_CELL_TOOLTIP_BG))
+                .text_color(rgb(IN_CELL_TOOLTIP_TEXT))
+                .text_size(px(11.0))
+                .rounded_md()
+                .shadow_md()
+                .whitespace_nowrap()
+                .child(message.clone());
+            elements.push(deferred(popover).into_any_element());
+        }
+
+        elements
+    }
+}
+
 impl Focusable for GridView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1453,6 +1647,31 @@ impl Render for GridView {
                     this.handle_mouse_up(event, window, cx);
                 }),
             )
+            // Tab / Escape in the in-cell overlay, captured **before** the input consumes them
+            // (`components/edit_controller.md §Tab interception`); routed to the chrome's commit /
+            // cancel via the window. Everything else (typing, arrows, Enter) reaches the input.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.incell_open.is_none() {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "tab" => {
+                        cx.stop_propagation();
+                        let dir = if event.keystroke.modifiers.shift {
+                            Direction::Left
+                        } else {
+                            Direction::Right
+                        };
+                        this.events
+                            .emit(&GridEvent::InCellCommitMove(dir), window, cx);
+                    }
+                    "escape" => {
+                        cx.stop_propagation();
+                        this.events.emit(&GridEvent::InCellCancel, window, cx);
+                    }
+                    _ => {}
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
@@ -1472,8 +1691,10 @@ mod tests {
     use super::*;
     use crate::grid::fixtures::demo_sources;
     use crate::grid::GridEventSink;
-    use gpui::{px, size, TestAppContext};
+    use gpui::{px, size, Keystroke, Modifiers, TestAppContext};
     use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// Builds a real `GridView` over the demo (Excel-max, styled) sources inside a test window.
     fn grid(cx: &mut TestAppContext) -> gpui::Entity<GridView> {
@@ -1525,5 +1746,102 @@ mod tests {
             "a deep scroll must change the visible row range"
         );
         assert!(deep.0.start > origin.0.start, "scrolled downward");
+    }
+
+    // ---- Editing-feel input triggers (`components/edit_controller.md §Grid integration`) ----
+
+    /// A `GridView` over the demo sources with a **recording** event sink + the window handle, so a
+    /// synthesized keystroke's emitted [`GridEvent`]s can be asserted.
+    #[allow(clippy::type_complexity)]
+    fn grid_recording(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<GridView>,
+        gpui::WindowHandle<Root>,
+        Rc<RefCell<Vec<GridEvent>>>,
+    ) {
+        cx.update(gpui_component::init);
+        let events: Rc<RefCell<Vec<GridEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let ev = events.clone();
+        let mut out: Option<gpui::Entity<GridView>> = None;
+        let slot = &mut out;
+        let window = cx.open_window(size(px(1200.0), px(800.0)), |window, cx| {
+            let sink = GridEventSink::new(move |e, _w, _cx| ev.borrow_mut().push(e.clone()));
+            let g = cx.new(|cx| GridView::new(demo_sources(), sink, cx));
+            *slot = Some(g.clone());
+            Root::new(g, window, cx)
+        });
+        (out.expect("grid built"), window, events)
+    }
+
+    fn key_ev(key: &str, key_char: Option<&str>, shift: bool) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    shift,
+                    ..Default::default()
+                },
+                key: key.into(),
+                key_char: key_char.map(|s| s.to_string()),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    #[gpui::test]
+    fn printable_key_emits_type_to_edit(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.handle_key_down(&key_ev("x", Some("x"), false), window, cx);
+                });
+            })
+            .unwrap();
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, GridEvent::TypeToEdit(t) if t == "x")));
+    }
+
+    #[gpui::test]
+    fn f2_emits_open_in_cell(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.handle_key_down(&key_ev("f2", None, false), window, cx);
+                });
+            })
+            .unwrap();
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, GridEvent::OpenInCellEditor(c) if *c == CellRef::new(0, 0))));
+    }
+
+    #[gpui::test]
+    fn keys_ignored_while_in_cell_open(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, cx);
+                    events.borrow_mut().clear();
+                    // A printable key and an arrow both no-op while the overlay owns the keyboard.
+                    grid.handle_key_down(&key_ev("x", Some("x"), false), window, cx);
+                    grid.handle_key_down(&key_ev("down", None, false), window, cx);
+                });
+            })
+            .unwrap();
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::TypeToEdit(_) | GridEvent::SelectionChanged(_))),
+            "the in-cell overlay must own the keyboard: {:?}",
+            events.borrow()
+        );
     }
 }

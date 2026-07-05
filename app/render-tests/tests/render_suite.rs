@@ -190,6 +190,8 @@ render_cases! {
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
     grid_selection_scrolled, grid_variable_geometry, grid_loading_overlay,
     grid_scrollbars_visible, grid_mixed_content,
+    // Editing feel (Phase 2): live mirror + in-cell editor overlay
+    cell_mirror_typing, incell_editor_open,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

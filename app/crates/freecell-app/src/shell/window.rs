@@ -227,6 +227,11 @@ impl WorkbookWindow {
         let grid_view: AnyView = grid.clone().into();
         chrome.update(cx, |c, cx| c.set_grid_body(grid_view, cx));
 
+        // Hand the grid the reused in-cell editor input the chrome owns, so it can render the
+        // in-cell overlay (`components/edit_controller.md §4.4`).
+        let in_cell_input = chrome.read(cx).in_cell_input();
+        grid.update(cx, |g, cx| g.set_incell_input(in_cell_input, cx));
+
         // An `OpenFile` window shows the "Opening name…" overlay over the grid until `Loaded`.
         if let Some(name) = loading.clone() {
             grid.update(cx, |g, cx| g.set_loading(Some(name), cx));
@@ -1066,6 +1071,31 @@ fn make_grid_sink(
         // The grid commits click-aways via the `SelectionChanged` path above, so it never emits
         // this variant; kept exhaustive so a future emit is a conscious wiring change.
         GridEvent::EditCommitRequested => {}
+        // Type-to-replace / in-cell-editor triggers are routed to the chrome (the single
+        // pending-edit owner, `components/edit_controller.md`).
+        GridEvent::TypeToEdit(text) => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let text = text.clone();
+                chrome.update(cx, |c, cx| c.begin_typed(&text, window, cx));
+            }
+        }
+        GridEvent::OpenInCellEditor(cell) => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let cell = *cell;
+                chrome.update(cx, |c, cx| c.begin_in_cell(cell, window, cx));
+            }
+        }
+        GridEvent::InCellCommitMove(dir) => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let dir = *dir;
+                chrome.update(cx, |c, cx| c.commit_incell_move(dir, window, cx));
+            }
+        }
+        GridEvent::InCellCancel => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                chrome.update(cx, |c, cx| c.cancel_incell(window, cx));
+            }
+        }
     })
 }
 
@@ -1106,6 +1136,23 @@ fn make_chrome_grid_sink(
                         return;
                     };
                     switch_grid_to_sheet(&grid, chrome.as_ref(), &client, &shared, id, window, cx);
+                });
+            }
+            ChromeGridRequest::EditState {
+                mirror,
+                in_cell,
+                cap,
+            } => {
+                // Deferred: the chrome may be emitting this from inside the grid's own `update`
+                // (a grid-originated type-to-replace / in-cell trigger), so touching the grid now
+                // would re-enter it. A one-cycle defer is imperceptible for the live mirror.
+                let mirror = mirror.clone();
+                let in_cell = *in_cell;
+                let cap = cap.clone();
+                window.defer(cx, move |_window, cx| {
+                    if let Some(grid) = grid.upgrade() {
+                        grid.update(cx, |g, cx| g.set_edit_state(mirror, in_cell, cap, cx));
+                    }
                 });
             }
         }

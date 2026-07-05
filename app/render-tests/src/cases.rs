@@ -29,6 +29,11 @@ pub struct RenderCase {
     pub force_scrollbars: bool,
     /// A `(row, col)` scrolled fully into view before capture (deep-header / scroll cases).
     pub reveal: Option<(u32, u32)>,
+    /// A live cell mirror `(row, col, raw text)` painted over the cell's published value while an
+    /// edit is pending (`functional_spec.md §1.2`).
+    pub mirror: Option<(u32, u32, &'static str)>,
+    /// An open in-cell editor overlay `(row, col, text)` (`functional_spec.md §1.3`).
+    pub in_cell: Option<(u32, u32, &'static str)>,
 }
 
 impl RenderCase {
@@ -41,11 +46,23 @@ impl RenderCase {
             loading: None,
             force_scrollbars: false,
             reveal: None,
+            mirror: None,
+            in_cell: None,
         }
     }
 
     fn selection(mut self, selection: SelectionModel) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    fn mirror(mut self, row: u32, col: u32, text: &'static str) -> Self {
+        self.mirror = Some((row, col, text));
+        self
+    }
+
+    fn in_cell(mut self, row: u32, col: u32, text: &'static str) -> Self {
+        self.in_cell = Some((row, col, text));
         self
     }
 
@@ -292,6 +309,25 @@ pub fn all() -> Vec<RenderCase> {
         .force_scrollbars(),
         RenderCase::new("grid_mixed_content", mixed_content_scene(), (720, 400))
             .selection(sel((2, 1), (4, 3))),
+        // ---- Editing feel (Phase 2): live mirror + in-cell editor overlay --------------
+        RenderCase::new(
+            // The active cell shows the raw text being typed (default style, left-aligned)
+            // instead of its committed value (`functional_spec.md §1.2`).
+            "cell_mirror_typing",
+            Scene::new().input(1, 1, "42"),
+            CELL_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .mirror(1, 1, "=1+2"),
+        RenderCase::new(
+            // The in-cell editor overlay open over B2 (2 px accent border, raw content;
+            // `functional_spec.md §1.3`).
+            "incell_editor_open",
+            Scene::new().input(1, 1, "42"),
+            CELL_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(1, 1, "=SUM(A1:A3)"),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

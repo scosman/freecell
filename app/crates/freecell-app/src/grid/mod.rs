@@ -21,7 +21,8 @@ use std::ops::Range;
 
 use gpui::{App, Window};
 
-use freecell_core::{CellRange, SelectionModel};
+use freecell_core::selection::Direction;
+use freecell_core::{CellRange, CellRef, SelectionModel};
 
 pub use view::{GridDataSources, GridView};
 
@@ -97,6 +98,17 @@ pub enum GridEvent {
     ClearCells(CellRange),
     /// A click-away happened while the data row was editing (commit the pending edit).
     EditCommitRequested,
+    /// A printable, modifier-free keystroke on the focused grid with a single (or collapsed-to-
+    /// active) selection — start a **type-to-replace** edit whose content is `text`
+    /// (`functional_spec.md §1.1`). The window routes this to `ChromeView::begin_typed`.
+    TypeToEdit(String),
+    /// Double-click on a cell, or F2 with a single selection — open the **in-cell editor** over
+    /// `cell` (`functional_spec.md §1.3`). Routed to `ChromeView::begin_in_cell`.
+    OpenInCellEditor(CellRef),
+    /// Tab / Shift+Tab captured in the in-cell overlay — commit + move (`functional_spec.md §1.4`).
+    InCellCommitMove(Direction),
+    /// Escape captured in the in-cell overlay — cancel the pending edit.
+    InCellCancel,
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

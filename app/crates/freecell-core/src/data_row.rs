@@ -102,6 +102,19 @@ impl DataRow {
         &self.text
     }
 
+    /// The last content fetched from the engine — what Escape reverts to. The in-cell editor
+    /// seeds from this (not the live field text) so it survives a redundant re-fetch that clears
+    /// the field but leaves the committed content intact (`components/edit_controller.md`).
+    pub fn committed(&self) -> &str {
+        &self.committed
+    }
+
+    /// Whether an Idle content fetch is still outstanding (no reply yet) — the in-cell editor
+    /// opens empty-with-spinner while this is true instead of forcing an empty edit.
+    pub fn is_awaiting(&self) -> bool {
+        self.awaiting
+    }
+
     /// Whether the content-fetch spinner is shown.
     pub fn spinner(&self) -> bool {
         self.spinner

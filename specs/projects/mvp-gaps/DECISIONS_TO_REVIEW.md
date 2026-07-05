@@ -369,3 +369,99 @@ formats. `functional_spec.md §3.4` only guarantees the dropdown-native numeric 
 scope-honest limitation, not a regression: a file-authored custom format is never one-click-broken;
 its exact decimal count is edited by re-authoring the format string (out of scope — no custom-code
 editor in this project).
+
+## Phase 5 — Fonts (family + size)
+
+### 1. The engine default font is 13pt Calibri, NOT 11pt; "default" is detected per-workbook
+
+`architecture.md §1.1` and `components/style_render.md` repeatedly state the "engine default 11pt".
+Verified against the pinned ironcalc_base 0.7.1: `Font::default()` is **`sz: 13`, `name: "Calibri"`**
+(`types.rs:410`), and `new_empty` seeds the workbook with it (`Styles::default().fonts = [Font::default()]`).
+Hardcoding 11 would make **every** new-workbook cell non-default → rendered at 13pt→17px and stored
+individually, changing every render baseline and bloating opened files. Instead, `RenderStyle.font_size_q ==
+0` / `font_family == 0` mean **"the workbook's default font"** (`document.default_font()` reads
+`styles.cell_xfs[0].font_id` → `styles.fonts[id]`), exactly as `font.color` is resolved relative to black
+today. Consequences: (a) new-workbook **and** opened-file default cells intern to `RenderStyle::default()` and
+render at the grid default (Inter `CELL_FONT_PX = 13px`) — **zero baseline change, no behaviour change for
+opened files** (they look exactly as today); only cells whose font *differs* from the workbook default get an
+explicit family/size. (b) **The size box labels a default cell with the workbook's real default size**
+(CR Moderate fix): the cache records `default_font_size_q` at build (13pt→52 for a new workbook, the file's
+default otherwise), the chrome reads it (`ChromeClient::default_font_size_pt`), and `font_size_label` shows it
+for a `font_size_q == 0` cell — so the box shows **"13"** (or the file default), never a hardcoded "11".
+`font_size_display(0)`'s legacy `"11"` is no longer on the default-cell path (it survives only as the
+committed Phase-4 unit test). Re-picking the shown default from the dropdown is a **visual no-op**: the engine
+maps `sz == workbook default` back to the sentinel (`font_size_q_of`), so no cell materialises a size change
+and no size jump occurs (verified: `font_size_box_shows_workbook_default_for_default_cell`).
+
+### 2. Residual pt↔px seam: the "13" default label vs the 13px default render (accepted)
+
+The default cell's label now shows its **nominal engine point size** (13pt) while it **renders** at the app's
+`CELL_FONT_PX = 13px` (which at 96 dpi is ≈ 9.75pt). Non-default sizes render at `px(font_size_q/4 · 96/72)`
+per `components/style_render.md` (auto-grow uses the same factor against `get_row_height`'s 28px-default
+space). So the number shown and the pixels drawn use different scales, and explicitly picking a size *near*
+the default renders slightly larger than the default cell (e.g. an explicit 12pt → 16px > the 13px default).
+A perfectly no-jump reconciliation would require changing the pt→px factor for the **default** render — which
+would move every existing baseline — so it was **not** done (per the CR constraint: don't change default-cell
+output). The label shows the value that best reflects the engine's stored/round-tripped size, and re-picking
+the *exact* shown default is a no-op (Decision #1b). Residual seam: the numeric scale (points) and the render
+scale (device px) differ by the `96/72` vs `13px/13pt` mismatch. **Flagged** for the owner to pick a preferred
+px factor if the visual seam matters; it is cosmetic and touches no data.
+
+### 3. `SetFont` = one style paste + K row-grow runs ⇒ up to K+1 undo steps
+
+IronCalc 0.7.1 has no font-name/absolute-size `update_range_style` path, so `SetFont` applies via
+`on_paste_styles` (one diff-list) and auto-grows rows via `set_rows_height` (one diff-list **per contiguous
+run**). Each is a separate engine undo entry, so the worker pushes exactly that many touch-set entries (kept
+1:1 with the undo stack — verified by `set_font_undo_reverts_size_and_height`). Undoing a font change is
+therefore up to **K+1** presses (typically 2: style + one contiguous row run). `architecture.md §3.3` accepts
+this ("undo restores height then style, two steps"). No coalescing into one undo entry is possible without an
+engine change.
+
+### 4. Font ops materialise per-cell styles → full row/col/select-all clamps to the used range
+
+`on_paste_styles` writes a style **per cell** (no font bands at this rev), so a full-column/row/select-all
+`SetFont` is clamped to `worksheet.dimension()` first (`document.clamp_to_used`), and a clamped selection over
+**> 100k** cells is refused with a dialog ("Selection too large for font changes"). Matches
+`functional_spec.md §3` ("font family/size clamps to the used range on full-row/col selections — documented
+deviation"). A band-shaped selection entirely outside the used range is a silent no-op.
+
+### 5. Render baselines to regenerate on the pinned runner + FONT-AVAILABILITY RISK
+
+This phase changes rendered output (per-cell font family/size + row geometry). **No existing baseline
+changes** — default-font cells still render at the grid default (Decision #1). **Three NEW additive render
+cases** need generating + eyeballing on the pinned runner (`app/render-tests/README.md`; this container cannot
+run the Xvfb+lavapipe capture stack):
+
+- `font_family_serif` — a cell in **"DejaVu Serif"**.
+- `font_size_24_row_grown` — a 24pt cell in a grown (38px) row.
+- `font_missing_family_fallback` — a bogus family (`"NoSuchFontXYZ123"`) → gpui fallback (renders in the
+  default font; guards that a missing family never blanks the cell).
+
+**FONT-AVAILABILITY RISK (cross-environment):** `font_family_serif` renders a real installed family. It uses
+**"DejaVu Serif"** (the near-universal Ubuntu `fonts-dejavu` default) so the pinned runner very likely has it,
+but this is a genuine cross-environment dependency: if the runner image lacks that family, the baseline will
+render in gpui's fallback (indistinguishable from `font_missing_family_fallback`) and the "family visibly
+changed" assertion is lost. **Before generating baselines, confirm "DejaVu Serif" is installed on the pinned
+runner** (or swap the case to a family that is, and re-record). No dev renders were committed.
+
+### 6. `ACTION_ROW_MIN_W` raised 620 → 816 for the two new font groups (supersedes Phase-4 #7's 620)
+
+Phase 5 prepends the font-family (140px) + size (56px) dropdowns to the action row, so its natural
+uncompressed width grew. `ACTION_ROW_MIN_W` was raised from **620** (Phase-4 #7, which pinned 620 for the
+B/I/U + text-color/fill + alignment + number-format/decimals set) to **816** — the earlier 620 + ~196px for
+the two new groups (`140 + 56` px + a divider + gaps). Same caveats as Phase-4 #7: it is an **estimate**, not
+render-measured (this container can't run the GPU app); the document window opens at 1200px, far wider, so the
+row never clips in practice; re-measure/raise on a real device if it ever does (it grows again in Phase 6 with
+borders). This entry is the recorded 816 value the `ACTION_ROW_MIN_W` comment refers to.
+
+### 7. `SetFont` materialises inherited band styles into per-cell styles (side effect of `on_paste_styles`)
+
+Because IronCalc 0.7.1 has no font-name path, `SetFont` goes through `on_paste_styles`, which writes each
+cell's **fully-resolved** style (`get_style_for_cell` = cell > row-band > col-band > default). So applying a
+font to a cell that currently inherits a **band** fill/border/format converts those inherited attributes into
+an **explicit per-cell style** carrying the same values. Visible result is unchanged at apply time (same
+resolved appearance), but a **later edit to that band no longer propagates** to the font-touched cells (they
+now shadow the band). This is inherent to the 0.7.1 mechanism (the same reason full-row/col font ops clamp to
+the used range — Decision #4), and it only affects cells the user explicitly re-fonts. Accepted for MVP; the
+only alternative is an engine-level font-band API that does not exist at this rev. Flagged so the
+band-shadowing behaviour is explicit, not implied.

@@ -89,6 +89,20 @@ pub enum Command {
         path: StylePath,
         value: String,
     },
+    /// Set the font **family** and/or **size** over a range (`architecture.md §3.3`,
+    /// `components/action_bar.md`). IronCalc 0.7.1 has no font-name/absolute-size style path, so the
+    /// worker applies it via `on_paste_styles` (materialising per-cell styles → full row/col/
+    /// select-all clamps to the used range, a documented deviation) and **auto-grows** rows too
+    /// small for a larger size. Style-only: no evaluation. `family = Some("")` = System Default
+    /// (reset to the workbook default); `Some(name)` sets it; `None` leaves the family. `size_pt =
+    /// Some(pt)` sets the size; `None` leaves it. A too-large clamped selection replies
+    /// [`WorkerEvent::EditRejected`] with an `Engine` message the window dialogs.
+    SetFont {
+        sheet: SheetId,
+        range: CellRange,
+        family: Option<String>,
+        size_pt: Option<f64>,
+    },
     /// Append a new sheet.
     AddSheet,
     /// Rename a sheet (re-validated against the other sheet names here).

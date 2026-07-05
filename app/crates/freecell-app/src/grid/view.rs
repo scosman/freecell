@@ -100,6 +100,10 @@ pub struct GridView {
     cell_index: HashMap<(u32, u32), usize>,
     /// Reused per-frame snapshot: visible `(row, col)` → resolved style (default = absent).
     visible_styles: HashMap<(u32, u32), RenderStyle>,
+    /// Reused per-frame snapshot of the active cache's font-family side table, so a cell's
+    /// `RenderStyle::font_family` index resolves to a name after the cache lock is released
+    /// (`components/style_render.md`). Index `0` = `""` = the workbook default (grid default family).
+    visible_font_families: Vec<SharedString>,
     /// The grid element's real laid-out bounds, captured during paint (a `canvas` probe).
     /// `None` until the first paint. Used instead of `window.viewport_size()` so the grid's
     /// virtualization + hit-testing are correct once chrome wraps it (the grid is no longer
@@ -175,6 +179,7 @@ impl GridView {
             autoscroll_epoch: 0,
             cell_index: HashMap::new(),
             visible_styles: HashMap::new(),
+            visible_font_families: Vec::new(),
             bounds: None,
             mirror: None,
             incell_open: None,
@@ -362,6 +367,13 @@ impl GridView {
                 }
             }
         }
+        // Snapshot the font-family side table too (cheap — a handful of `Arc<str>` → `SharedString`),
+        // so a cell's `font_family` index resolves to a name after the lock is dropped.
+        self.visible_font_families = cache
+            .font_families()
+            .iter()
+            .map(|name| SharedString::from(name.to_string()))
+            .collect();
         drop(caches);
 
         Some(Frame {
@@ -1055,8 +1067,25 @@ impl GridView {
                             None => (String::new(), rgb(CELL_TEXT), CellKind::Text, style),
                         },
                     };
+                // Resolve the cell's font family name from the snapshot (index 0 / mirror = default).
+                let font_family = attr_style.and_then(|s| {
+                    let idx = s.font_family as usize;
+                    self.visible_font_families
+                        .get(idx)
+                        .filter(|name| !name.is_empty())
+                        .cloned()
+                });
                 content_children.push(cell_element(
-                    x, y, w, h, fill, text, text_color, kind, attr_style,
+                    x,
+                    y,
+                    w,
+                    h,
+                    fill,
+                    text,
+                    text_color,
+                    kind,
+                    attr_style,
+                    font_family,
                 ));
             }
         }
@@ -1380,6 +1409,7 @@ fn cell_element(
     text_color: Rgba,
     kind: CellKind,
     style: Option<RenderStyle>,
+    font_family: Option<SharedString>,
 ) -> AnyElement {
     let mut el = div()
         .absolute()
@@ -1420,6 +1450,16 @@ fn cell_element(
         if s.underline {
             el = el.underline();
         }
+        // A non-default font size renders at `q/4` pt → px (`components/style_render.md`); the
+        // default (`0`) keeps the grid's `CELL_FONT_PX`. Mirror/pending cells pass `style: None`,
+        // so they always render in the default font (`functional_spec.md §1.2`).
+        if s.font_size_q != 0 {
+            el = el.text_size(px(s.font_size_q as f32 / 4.0 * 96.0 / 72.0));
+        }
+    }
+    // A non-default family renders per-cell (missing families fall back via gpui's fallback stack).
+    if let Some(name) = font_family {
+        el = el.font_family(name);
     }
 
     if text.is_empty() {

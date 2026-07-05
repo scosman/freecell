@@ -108,10 +108,39 @@ pub(crate) fn render_style_from(style: &Style) -> RenderStyle {
             .and_then(parse_color)
             .filter(|rgb| *rgb != Rgb::new(0, 0, 0)),
         h_align: h_align_of(style),
-        // `num_fmt` is a side-table index resolved by the caller (build/refresh), which has the
-        // interning table; a bare conversion carries `0` (= "general"). The caller overrides it via
-        // `intern_num_fmt(&style.num_fmt)` before the default-check so a format-only cell is stored.
+        // `num_fmt` / `font_family` are side-table indices resolved by the caller (build/refresh),
+        // which holds the interning tables; a bare conversion carries `0` (= "general" / the
+        // workbook default family). `font_size_q` is likewise resolved by the caller against the
+        // workbook default (`font_size_q_of`). The caller overrides all three before the
+        // default-check so a font/format-only cell is still stored.
         num_fmt: 0,
+        font_size_q: 0,
+        font_family: 0,
+    }
+}
+
+/// Converts an IronCalc font size (whole points, `i32`) to [`RenderStyle::font_size_q`]
+/// quarter-points, mapping the **workbook default** size (`default_sz`) — and any non-positive
+/// garbage — to `0` ("the workbook default"). Resolving the default relative to `default_sz`
+/// (rather than a hardcoded 11/13) keeps every default-font cell interning to the default style,
+/// so opened files render unchanged (`architecture.md §1.1`; the spec's literal "11pt" is a
+/// documented misstatement — IronCalc's real default is 13pt). Saturates for hostile huge sizes.
+pub(crate) fn font_size_q_of(sz: i32, default_sz: i32) -> u16 {
+    if sz <= 0 || sz == default_sz {
+        0
+    } else {
+        (sz.clamp(0, u16::MAX as i32) as u16).saturating_mul(4)
+    }
+}
+
+/// Resolves a cell/band font `name` to a [`RenderStyle::font_family`] id against the workbook
+/// default: the default name (and `""`) → `0`; any other name interns into the builder's side
+/// table. Keeps a default-font cell mapping to the default style.
+fn resolve_family(builder: &mut SheetCacheBuilder, name: &str, default_name: &str) -> u16 {
+    if name == default_name {
+        0
+    } else {
+        builder.intern_font_family(name)
     }
 }
 
@@ -138,6 +167,12 @@ pub(crate) fn build_sheet_cache(
 ) -> Result<SheetCache, String> {
     let mut builder = SheetCacheBuilder::new(limits::MAX_ROWS, limits::MAX_COLS);
     let ws = doc.worksheet(sheet_idx)?;
+    // The workbook default font — each cell's font_size_q/font_family is resolved relative to it,
+    // so a default-font cell interns to the default style (`font_size_q_of` + the family check).
+    let (def_sz, def_name) = doc.default_font();
+    // Record the workbook default size (quarter-points) so the action bar can label a default cell
+    // with the real workbook default rather than a hardcoded value.
+    builder.set_default_font_size_q((def_sz.clamp(0, u16::MAX as i32) as u16).saturating_mul(4));
 
     // Track the rows/cols that carry a *non-default* band, so a populated cell reverting to the
     // default style still gets an explicit entry to shadow the band (IronCalc's rule that a cell
@@ -158,6 +193,8 @@ pub(crate) fn build_sheet_cache(
             if let Some(style) = doc.col_band_style(sheet_idx, (col.min - 1) as u32)? {
                 let mut rs = render_style_from(&style);
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
+                rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+                rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
                 if rs != RenderStyle::default() {
                     for c in col.min..=col.max {
                         let c0 = (c - 1) as u32;
@@ -181,6 +218,8 @@ pub(crate) fn build_sheet_cache(
             if let Some(style) = doc.row_band_style(sheet_idx, r0)? {
                 let mut rs = render_style_from(&style);
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
+                rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+                rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
                 if rs != RenderStyle::default() {
                     builder.push_row_style(r0, rs);
                     band_rows.insert(r0);
@@ -198,6 +237,8 @@ pub(crate) fn build_sheet_cache(
             if let Some(style) = doc.cell_own_style(sheet_idx, cell)? {
                 let mut rs = render_style_from(&style);
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
+                rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+                rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
                 // `band_rows`/`band_cols` hold only *non-default* bands. A populated cell with a
                 // default own style on such a band gets an explicit default entry to shadow it.
                 // MICRO-EDGE (DECISIONS_TO_REVIEW, Phase 5): a `custom_format` row whose style
@@ -221,16 +262,27 @@ pub(crate) fn build_sheet_cache(
 /// present in the sheet data uses its own style (even the default, which shadows a band); an
 /// absent cell falls through to the band/default. Guarantees `cache.render_style(cell)` keeps
 /// matching `get_style_for_cell(cell)`.
+///
+/// `def_sz` / `def_name` are the workbook default font (`doc.default_font()`), passed in so a
+/// multi-cell refresh resolves it **once** rather than re-reading + re-cloning it per cell.
 pub(crate) fn refresh_cell(
     cache: &mut SheetCache,
     doc: &WorkbookDocument,
     sheet_idx: u32,
     cell: CellRef,
+    def_sz: i32,
+    def_name: &str,
 ) -> Result<(), String> {
     match doc.cell_own_style(sheet_idx, cell)? {
         Some(style) => {
             let mut rs = render_style_from(&style);
             rs.num_fmt = cache.intern_num_fmt(&style.num_fmt);
+            rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+            rs.font_family = if style.font.name == def_name {
+                0
+            } else {
+                cache.intern_font_family(&style.font.name)
+            };
             if rs != RenderStyle::default() {
                 cache.set_cell_style(cell.row, cell.col, rs);
             } else if cache.is_on_band(cell.row, cell.col) {
@@ -259,18 +311,27 @@ pub(crate) fn assert_cache_agrees(
     rows_probe: &[u32],
     cols_probe: &[u32],
 ) -> Result<(), String> {
+    let (def_sz, def_name) = doc.default_font();
     for &r in rows_probe {
         for &c in cols_probe {
             let cached = cache.render_style(r, c).copied().unwrap_or_default();
             let engine_style = doc.resolved_cell_style(sheet_idx, CellRef::new(r, c))?;
-            // Structural compare ignores `num_fmt` (a cache-local index, meaningless across a fresh
-            // convert); `render_style_from` yields `num_fmt: 0`, so zero the cached side to match.
-            let engine = render_style_from(&engine_style);
+            // Structural compare ignores the cache-local indices (`num_fmt`, `font_family`), but
+            // resolves the *value* fields the engine side also carries (`font_size_q` is an absolute
+            // quarter-point value, comparable directly once resolved against the workbook default).
+            let mut engine = render_style_from(&engine_style);
+            engine.font_size_q = font_size_q_of(engine_style.font.sz, def_sz);
             let cached_structural = RenderStyle {
                 num_fmt: 0,
+                font_family: 0,
                 ..cached
             };
-            if cached_structural != engine {
+            let engine_structural = RenderStyle {
+                num_fmt: 0,
+                font_family: 0,
+                ..engine
+            };
+            if cached_structural != engine_structural {
                 return Err(format!(
                     "style mismatch at ({r},{c}): cache={cached:?} engine={engine:?}"
                 ));
@@ -288,6 +349,18 @@ pub(crate) fn assert_cache_agrees(
                 return Err(format!(
                     "num_fmt mismatch at ({r},{c}): cache={cached_code:?} engine={:?}",
                     engine_style.num_fmt
+                ));
+            }
+            // The font-family agreement is over the resolved *name* (default → "").
+            let cached_family = cache.font_family_name(cached.font_family);
+            let engine_family = if engine_style.font.name == def_name {
+                ""
+            } else {
+                engine_style.font.name.as_str()
+            };
+            if cached_family != engine_family {
+                return Err(format!(
+                    "font_family mismatch at ({r},{c}): cache={cached_family:?} engine={engine_family:?}"
                 ));
             }
         }
@@ -414,6 +487,115 @@ mod tests {
         assert_eq!(cache.num_fmt_code(formatted.num_fmt), "$#,##0.00");
         // The plain number cell resolves to the default (general) — no stored style, index 0.
         assert!(cache.render_style(1, 0).is_none());
+    }
+
+    #[test]
+    fn default_font_detects_workbook_default() {
+        // A fresh workbook's default font (13pt Calibri) resolves cells to font_size_q/font_family
+        // 0 — so a default-font cell interns to the default style and renders at the grid default.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "plain").unwrap();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        assert!(
+            cache.render_style(0, 0).is_none(),
+            "a default-font cell is not stored (interns to default)"
+        );
+    }
+
+    #[test]
+    fn opened_file_nondefault_default_font_interns_to_sentinel() {
+        // Simulate an OPENED file whose default (style 0) font is Arial 10 — NOT new_empty's
+        // Calibri 13. This substantiates "no opened-file regression": unstyled cells still intern
+        // to the sentinel (render unchanged) and the cache reports the file's default size.
+        let mut model = ironcalc_base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        model.workbook.styles.fonts[0].name = "Arial".to_string();
+        model.workbook.styles.fonts[0].sz = 10;
+        let mut doc = WorkbookDocument::from_test_model(model);
+        assert_eq!(doc.default_font(), (10, "Arial".to_string()));
+
+        doc.set_cell_input(0, CellRef::new(0, 0), "x").unwrap();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        assert!(
+            cache.render_style(0, 0).is_none(),
+            "a cell inheriting the file default font interns to the sentinel (renders unchanged)"
+        );
+        assert_eq!(
+            cache.default_font_size_q(),
+            40,
+            "10pt → 40 quarter-points (the action-bar default label)"
+        );
+
+        // A cell explicitly set to a DIFFERENT font (Calibri 13) is stored non-default.
+        let (_, def_name) = doc.default_font();
+        doc.set_cell_input(0, CellRef::new(1, 0), "y").unwrap();
+        doc.set_font(
+            0,
+            CellRange::single(CellRef::new(1, 0)),
+            Some("Calibri"),
+            Some(13.0),
+            &def_name,
+        )
+        .unwrap();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let rs = cache
+            .render_style(1, 0)
+            .expect("a font differing from the file default is stored");
+        assert_eq!(cache.font_family_name(rs.font_family), "Calibri");
+        assert_eq!(rs.font_size_q, 13 * 4);
+    }
+
+    #[test]
+    fn build_carries_font_from_file() {
+        // A cell with a non-default family + size resolves to a non-zero font_family/font_size_q
+        // whose name round-trips through the side table; a plain cell stays 0/0 (unstored).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        doc.set_cell_input(0, a1, "styled").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "plain").unwrap();
+        let (_, def_name) = doc.default_font();
+        doc.set_font(
+            0,
+            CellRange::single(a1),
+            Some("Times New Roman"),
+            Some(24.0),
+            &def_name,
+        )
+        .unwrap();
+
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let rs = cache.render_style(0, 0).expect("font-only cell is stored");
+        assert_eq!(rs.font_size_q, 24 * 4, "24pt → 96 quarter-points");
+        assert_ne!(rs.font_family, 0);
+        assert_eq!(cache.font_family_name(rs.font_family), "Times New Roman");
+        // The plain cell resolves to the default (no stored style).
+        assert!(cache.render_style(1, 0).is_none());
+    }
+
+    #[test]
+    fn band_font_resolves_into_cells() {
+        // A whole-column band font-size (an in-engine col band via the full-height fast path)
+        // resolves into the RenderStyle of every cell in that column — the band path shares the
+        // build loop's `font_size_q_of` resolution.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // `font.size_delta` on a full column creates a col band whose font size is default + delta.
+        let col_area = ironcalc_base::expressions::types::Area {
+            sheet: 0,
+            row: 1,
+            column: 4, // 0-based column 3
+            width: 1,
+            height: limits::MAX_ROWS as i32,
+        };
+        doc.user_model_mut()
+            .update_range_style(&col_area, "font.size_delta", "10")
+            .unwrap();
+        let (def_sz, _) = doc.default_font();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        // A cell in the band (no own style) resolves to the band's font size.
+        let rs = cache
+            .render_style(20, 3)
+            .expect("a col-band cell resolves to the band style");
+        assert_eq!(rs.font_size_q, font_size_q_of(def_sz + 10, def_sz));
+        assert_ne!(rs.font_size_q, 0, "the band's larger size is non-default");
     }
 
     #[test]
@@ -583,11 +765,18 @@ mod tests {
     fn set_bold(doc: &mut WorkbookDocument, cache: &mut SheetCache, range: CellRange) {
         doc.set_font_flag(0, range, crate::document::FontFlag::Bold, true)
             .unwrap();
+        let (def_sz, def_name) = doc.default_font();
         for row in range.rows() {
             for col in range.cols() {
-                refresh_cell(cache, doc, 0, CellRef::new(row, col)).unwrap();
+                refresh_cell(cache, doc, 0, CellRef::new(row, col), def_sz, &def_name).unwrap();
             }
         }
+    }
+
+    /// Refresh a single cell's cache entry, resolving the workbook default font inline (test-only).
+    fn refresh_one(cache: &mut SheetCache, doc: &WorkbookDocument, cell: CellRef) {
+        let (def_sz, def_name) = doc.default_font();
+        refresh_cell(cache, doc, 0, cell, def_sz, &def_name).unwrap();
     }
 
     #[test]
@@ -614,11 +803,11 @@ mod tests {
             Some(Rgb::from_hex(0x00FF00)),
         )
         .unwrap();
-        refresh_cell(&mut cache, &doc, 0, CellRef::new(6, 6)).unwrap();
+        refresh_one(&mut cache, &doc, CellRef::new(6, 6));
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
         doc.set_fill(0, CellRange::single(CellRef::new(6, 6)), None)
             .unwrap();
-        refresh_cell(&mut cache, &doc, 0, CellRef::new(6, 6)).unwrap();
+        refresh_one(&mut cache, &doc, CellRef::new(6, 6));
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
     }
 

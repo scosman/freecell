@@ -192,6 +192,8 @@ render_cases! {
     grid_scrollbars_visible, grid_mixed_content,
     // Editing feel (Phase 2): live mirror + in-cell editor overlay
     cell_mirror_typing, incell_editor_open,
+    // Fonts (Phase 5): family + size + row auto-grow
+    font_family_serif, font_size_24_row_grown, font_missing_family_fallback,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

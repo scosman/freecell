@@ -30,7 +30,9 @@ use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
-use freecell_core::format_ui::{adjust_decimals, num_fmt_category, Category, DROPDOWN_FORMATS};
+use freecell_core::format_ui::{
+    adjust_decimals, font_size_display, num_fmt_category, Category, DROPDOWN_FORMATS,
+};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
@@ -61,12 +63,17 @@ const TOOLTIP_BG: u32 = 0x2B2B2B;
 const TOOLTIP_TEXT: u32 = 0xF5F5F5;
 
 const ACTION_ROW_H: f32 = 36.0;
-/// The action row's natural (uncompressed) width for the Phase-4 control set — B/I/U, text
-/// color + fill, alignment, number format + decimals — with its dividers. The row never wraps
-/// (`ui_design.md §2`: raise the window's min width instead), so it holds this min width; the
-/// document window (1200 px) is far wider. Grows in Phase 5 (fonts) / 6 (borders). Recorded in
-/// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it ever clips.
-const ACTION_ROW_MIN_W: f32 = 620.0;
+/// The action row's natural (uncompressed) width for the current control set — font family +
+/// size (Phase 5), B/I/U, text color + fill, alignment, number format + decimals — with its
+/// dividers. The row never wraps (`ui_design.md §2`: raise the window's min width instead), so it
+/// holds this min width; the document window (1200 px) is far wider. Grows in Phase 6 (borders).
+/// Recorded in DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips.
+const ACTION_ROW_MIN_W: f32 = 816.0;
+
+/// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
+const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
+/// The top "clear the family override" entry in the font-family dropdown (`ui_design.md §2`).
+const SYSTEM_DEFAULT_FAMILY: &str = "System Default";
 const DATA_ROW_H: f32 = 32.0;
 const TAB_BAR_H: f32 = 30.0;
 const REF_BOX_W: f32 = 72.0;
@@ -91,6 +98,15 @@ pub struct ChromeView {
     /// number-format dropdown's category label + the decimals ± enabled/computed state
     /// (`components/action_bar.md`). `None` on a multi-cell selection (matches `active_style`).
     active_num_fmt: Option<String>,
+    /// The active cell's font-family name (`""` = the workbook default = "System Default"), cached
+    /// alongside `active_style` for the family dropdown's label. `None` on a multi-cell selection.
+    active_font_family: Option<String>,
+    /// The workbook's default font size in points, cached from the resident cache — the size box
+    /// labels a **default** cell (`font_size_q == 0`) with this instead of a hardcoded value, so the
+    /// label reflects the real default (13pt for a new workbook, the file's default otherwise —
+    /// `components/action_bar.md`). `None` until a cache is resident. Workbook-global, so it is
+    /// refreshed unconditionally (not gated on a single-cell selection).
+    default_font_size_pt: Option<f64>,
     /// Whether the worker is degraded (read-only): every mutating action-bar control disables
     /// (`functional_spec.md §6`). Set by the window on `WorkerDegraded`.
     degraded: bool,
@@ -132,6 +148,14 @@ pub struct ChromeView {
     text_color_picker: Entity<ColorPickerState>,
     /// The number-format dropdown's open state (a `ChromeView`-owned menu panel).
     num_fmt_open: bool,
+    /// The installed font-family names for the family dropdown, fetched once at build
+    /// (`cx.text_system().all_font_names()`), sorted-unique with "System Default" prepended
+    /// (`components/action_bar.md`). `Rc` so the render closure can clone it cheaply.
+    font_names: Rc<Vec<SharedString>>,
+    /// The font-family dropdown's open state (a `ChromeView`-owned scrolling menu panel).
+    font_family_open: bool,
+    /// The font-size dropdown's open state.
+    font_size_open: bool,
 
     /// The sheet tabs (the chrome's mirror of the worker's sheet list).
     sheets: Vec<SheetTab>,
@@ -172,6 +196,20 @@ impl ChromeView {
         let color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
         let text_color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
 
+        // Installed font families for the dropdown, fetched once (`all_font_names` is verified
+        // available). "System Default" is prepended as the clear-the-override entry.
+        let mut names: Vec<SharedString> =
+            std::iter::once(SharedString::from(SYSTEM_DEFAULT_FAMILY))
+                .chain(
+                    cx.text_system()
+                        .all_font_names()
+                        .into_iter()
+                        .map(SharedString::from),
+                )
+                .collect();
+        names.dedup();
+        let font_names = Rc::new(names);
+
         let subscriptions = vec![
             cx.subscribe_in(&content_input, window, Self::on_content_event),
             cx.subscribe_in(&in_cell_input, window, Self::on_incell_event),
@@ -188,6 +226,8 @@ impl ChromeView {
             selection: SelectionModel::default(),
             active_style: None,
             active_num_fmt: None,
+            active_font_family: None,
+            default_font_size_pt: None,
             degraded: false,
             data_row: DataRow::default(),
             content_input,
@@ -201,6 +241,9 @@ impl ChromeView {
             text_color_open: false,
             text_color_picker,
             num_fmt_open: false,
+            font_names,
+            font_family_open: false,
+            font_size_open: false,
             sheets,
             rename_target: None,
             rename_input,
@@ -227,10 +270,14 @@ impl ChromeView {
             let cell = self.selection.active;
             self.active_style = self.client.render_style(self.active_sheet, cell);
             self.active_num_fmt = self.client.num_fmt_code(self.active_sheet, cell);
+            self.active_font_family = self.client.font_family_name(self.active_sheet, cell);
         } else {
             self.active_style = None;
             self.active_num_fmt = None;
+            self.active_font_family = None;
         }
+        // The workbook default size is selection-independent (used to label a default cell).
+        self.default_font_size_pt = self.client.default_font_size_pt(self.active_sheet);
         cx.notify();
     }
 
@@ -259,10 +306,16 @@ impl ChromeView {
             self.active_num_fmt = self
                 .client
                 .num_fmt_code(self.active_sheet, selection.active);
+            self.active_font_family = self
+                .client
+                .font_family_name(self.active_sheet, selection.active);
         } else {
             self.active_style = None;
             self.active_num_fmt = None;
+            self.active_font_family = None;
         }
+        // The workbook default size is selection-independent (used to label a default cell).
+        self.default_font_size_pt = self.client.default_font_size_pt(self.active_sheet);
         let effects = self.data_row.reduce(DataRowEvent::SelectionChanged {
             single: selection.is_single(),
         });
@@ -889,6 +942,84 @@ impl ChromeView {
         cx.notify();
     }
 
+    // ---- Action row: SetFont (family + size) ----------------------------------------------
+
+    /// Sends one `SetFont` over the selection after committing any pending edit (fire-and-forget,
+    /// degraded-guarded — the same rule as the `SetStylePath` controls).
+    fn apply_set_font(
+        &mut self,
+        family: Option<String>,
+        size_pt: Option<f64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.degraded {
+            return;
+        }
+        if !self.commit_pending_edit(window, cx) {
+            return;
+        }
+        self.client.send(Command::SetFont {
+            sheet: self.active_sheet,
+            range: self.selection.range(),
+            family,
+            size_pt,
+        });
+        cx.notify();
+    }
+
+    /// Applies a font family over the selection, closing the family dropdown. "System Default"
+    /// clears the override (sent as `Some("")`); any other name sets it.
+    pub fn apply_font_family(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.font_family_open = false;
+        let family = if name == SYSTEM_DEFAULT_FAMILY {
+            String::new()
+        } else {
+            name.to_string()
+        };
+        self.apply_set_font(Some(family), None, window, cx);
+    }
+
+    /// Applies a font size (points) over the selection, closing the size dropdown.
+    pub fn apply_font_size(&mut self, pt: f64, window: &mut Window, cx: &mut Context<Self>) {
+        self.font_size_open = false;
+        self.apply_set_font(None, Some(pt), window, cx);
+    }
+
+    fn toggle_font_family_popover(&mut self, cx: &mut Context<Self>) {
+        self.font_family_open = !self.font_family_open;
+        cx.notify();
+    }
+
+    fn toggle_font_size_popover(&mut self, cx: &mut Context<Self>) {
+        self.font_size_open = !self.font_size_open;
+        cx.notify();
+    }
+
+    /// The font-family dropdown's active label: the active cell's family, or "System Default" for a
+    /// default-font (or multi-cell) selection (`components/action_bar.md`).
+    pub fn font_family_label(&self) -> &str {
+        match self.active_font_family.as_deref() {
+            Some(name) if !name.is_empty() => name,
+            _ => SYSTEM_DEFAULT_FAMILY,
+        }
+    }
+
+    /// The font-size dropdown's active label. An explicit size (`font_size_q != 0`) shows `q/4` pt;
+    /// a **default** cell shows the workbook's real default size (13pt for a new workbook, the file's
+    /// default otherwise) — never a hardcoded value that would mismatch the cell. Re-picking that
+    /// shown default from the list is a visual no-op (the engine maps size == the workbook default
+    /// back to the sentinel), so no surprising size jump. `13` is the fallback before a cache loads
+    /// (IronCalc's default; `DECISIONS_TO_REVIEW` records the residual pt↔px seam).
+    pub fn font_size_label(&self) -> String {
+        let q = self.active_style.map(|s| s.font_size_q).unwrap_or(0);
+        if q != 0 {
+            font_size_display(q)
+        } else {
+            format_size_pt(self.default_font_size_pt.unwrap_or(13.0))
+        }
+    }
+
     fn on_text_color_picker_event(
         &mut self,
         _picker: &Entity<ColorPickerState>,
@@ -912,6 +1043,8 @@ impl ChromeView {
                 self.fill_open = false;
                 self.text_color_open = false;
                 self.num_fmt_open = false;
+                self.font_family_open = false;
+                self.font_size_open = false;
             }
             cx.notify();
         }
@@ -1271,6 +1404,12 @@ fn hsla_to_rgb(hsla: Hsla) -> Rgb {
     )
 }
 
+/// Formats a font size in points for the size box, trimming a trailing `.0` (`13.0` → `"13"`,
+/// `10.5` → `"10.5"`) — the same look as [`font_size_display`] for explicit sizes.
+fn format_size_pt(pt: f64) -> String {
+    format!("{pt}")
+}
+
 /// A vertical divider between action-row control groups (`ui_design.md §2`, existing styling).
 fn action_divider() -> gpui::Div {
     div().w(px(1.0)).h(px(20.0)).mx_1().bg(rgb(DIVIDER))
@@ -1358,7 +1497,35 @@ impl ChromeView {
             .bg(rgb(CHROME_BG))
             .border_b_1()
             .border_color(rgb(HAIRLINE))
-            // [Font family/size land in Phase 5 here.] B I U:
+            // Font family · size (`ui_design.md §2`):
+            .child(
+                Button::new("font-family")
+                    .label(format!("{} ▾", self.font_family_label()))
+                    .tooltip("Font")
+                    .ghost()
+                    .small()
+                    .w(px(140.0))
+                    .disabled(disabled)
+                    .selected(self.font_family_open)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_font_family_popover(cx);
+                    })),
+            )
+            .child(
+                Button::new("font-size")
+                    .label(format!("{} ▾", self.font_size_label()))
+                    .tooltip("Font size")
+                    .ghost()
+                    .small()
+                    .w(px(56.0))
+                    .disabled(disabled)
+                    .selected(self.font_size_open)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_font_size_popover(cx);
+                    })),
+            )
+            .child(action_divider())
+            // B I U:
             .child(toggle(
                 "bold",
                 "B",
@@ -1633,6 +1800,12 @@ impl ChromeView {
         if self.num_fmt_open {
             overlays.push(self.render_num_fmt_popover(cx));
         }
+        if self.font_family_open {
+            overlays.push(self.render_font_family_popover(cx));
+        }
+        if self.font_size_open {
+            overlays.push(self.render_font_size_popover(cx));
+        }
         if let Some(id) = self.context_menu {
             overlays.push(self.render_context_menu(id, cx));
         }
@@ -1872,6 +2045,108 @@ impl ChromeView {
                     .flex()
                     .flex_col()
                     .p_1()
+                    .bg(rgb(ACTIVE_TAB_BG))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded_md()
+                    .shadow_md()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
+    /// The font-family dropdown: a scrolling menu of the installed families (fetched once at build),
+    /// "System Default" first, the active cell's family highlighted (`components/action_bar.md`).
+    fn render_font_family_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active = self.font_family_label().to_string();
+        let names = Rc::clone(&self.font_names);
+        let mut menu = div().flex().flex_col().gap(px(1.0));
+        for (i, name) in names.iter().enumerate() {
+            let pick = name.to_string();
+            menu = menu.child(
+                Button::new(gpui::ElementId::NamedInteger(
+                    "font-family".into(),
+                    i as u64,
+                ))
+                .label(name.clone())
+                .ghost()
+                .small()
+                .selected(name.as_ref() == active)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_font_family(&pick, window, cx);
+                })),
+            );
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                self.backdrop(|this, _w, _cx| this.font_family_open = false, cx)
+                    .child(div()),
+            )
+            .child(
+                div()
+                    .id("font-family-menu")
+                    .absolute()
+                    .top(px(ACTION_ROW_H))
+                    .left(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    // The installed-font list is long — cap the height and scroll it.
+                    .max_h(px(320.0))
+                    .overflow_y_scroll()
+                    .bg(rgb(ACTIVE_TAB_BG))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded_md()
+                    .shadow_md()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
+    /// The font-size dropdown: the fixed point list, the active cell's size highlighted.
+    fn render_font_size_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active = self.font_size_label();
+        let mut menu = div().flex().flex_col().gap(px(1.0));
+        for pt in FONT_SIZES {
+            let label = format!("{pt}");
+            menu = menu.child(
+                Button::new(gpui::ElementId::NamedInteger("font-size".into(), pt as u64))
+                    .label(label.clone())
+                    .ghost()
+                    .small()
+                    .selected(label == active)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.apply_font_size(pt, window, cx);
+                    })),
+            );
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                self.backdrop(|this, _w, _cx| this.font_size_open = false, cx)
+                    .child(div()),
+            )
+            .child(
+                div()
+                    .id("font-size-menu")
+                    .absolute()
+                    .top(px(ACTION_ROW_H))
+                    .left(px(150.0))
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    .max_h(px(320.0))
+                    .overflow_y_scroll()
                     .bg(rgb(ACTIVE_TAB_BG))
                     .border_1()
                     .border_color(rgb(HAIRLINE))
@@ -2629,6 +2904,100 @@ mod tests {
         assert!(
             h.client.take_commands().is_empty(),
             "no SetStylePath dispatches while degraded"
+        );
+    }
+
+    // ---- Action row: SetFont (family + size) ----------------------------------------------
+
+    #[gpui::test]
+    fn font_dropdowns_reflect_active_cell(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_font_family(SheetId(0), cell(1, 1), "Arial");
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                font_size_q: 48, // 12pt
+                ..Default::default()
+            },
+        );
+        select_single(&h, cx, 1, 1);
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.font_family_label().to_string()),
+            "Arial"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.font_size_label()), "12");
+    }
+
+    #[gpui::test]
+    fn font_size_box_shows_workbook_default_for_default_cell(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // A default cell (no explicit font_size_q) shows the WORKBOOK default (13pt for a new
+        // workbook) — not a hardcoded "11" that would mismatch the cell (CR Moderate).
+        h.client.set_default_font_size_pt(13.0);
+        select_single(&h, cx, 1, 1);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.font_size_label()), "13");
+
+        // An opened file whose default is 10pt shows "10" for its default cells (and re-picking 10
+        // is a no-op in the engine, so no size jump).
+        h.client.set_default_font_size_pt(10.0);
+        select_single(&h, cx, 2, 2);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.font_size_label()), "10");
+    }
+
+    #[gpui::test]
+    fn font_family_pick_and_system_default(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+
+        upd(&h, cx, |c, window, cx| {
+            c.apply_font_family("Times New Roman", window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetFont { family: Some(f), size_pt: None, .. }] if f == "Times New Roman"
+            ),
+            "family pick emits SetFont, got {cmds:?}"
+        );
+
+        // "System Default" clears the override (family = Some("")).
+        upd(&h, cx, |c, window, cx| {
+            c.apply_font_family(SYSTEM_DEFAULT_FAMILY, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetFont { family: Some(f), size_pt: None, .. }] if f.is_empty()
+        ));
+    }
+
+    #[gpui::test]
+    fn font_size_pick_emits_setfont(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, window, cx| c.apply_font_size(18.0, window, cx));
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetFont { family: None, size_pt: Some(pt), .. }] if (*pt - 18.0).abs() < 1e-9
+        ));
+    }
+
+    #[gpui::test]
+    fn font_controls_disabled_in_degraded_mode(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        // A pick made while degraded dispatches nothing.
+        upd(&h, cx, |c, window, cx| c.apply_font_size(24.0, window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.apply_font_family("Arial", window, cx)
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "no SetFont dispatches while degraded"
         );
     }
 

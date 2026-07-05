@@ -23,7 +23,7 @@ use ironcalc_base::cell::CellValue;
 use ironcalc_base::expressions::types::Area;
 use ironcalc_base::formatter::format::format_number;
 use ironcalc_base::locale::get_locale;
-use ironcalc_base::types::{CellType, Style, Worksheet};
+use ironcalc_base::types::{CellType, Font, Style, Worksheet};
 use ironcalc_base::Model;
 
 use crate::UserModel; // the crate's single canonical path to the IronCalc workbook type
@@ -226,6 +226,16 @@ impl WorkbookDocument {
                 // message names the unsupported feature).
                 None => Err(LoadError::Corrupt(other.to_string())),
             },
+        }
+    }
+
+    /// Wraps a pre-built IronCalc `Model` (test-only): lets a test author a workbook whose
+    /// **default** style differs from `new_empty`'s (e.g. an opened file with a non-Calibri default
+    /// font) by mutating the public `workbook.styles` before wrapping.
+    #[cfg(test)]
+    pub(crate) fn from_test_model(model: Model<'static>) -> Self {
+        Self {
+            model: UserModel::from_model(model),
         }
     }
 
@@ -574,6 +584,126 @@ impl WorkbookDocument {
         crate::instrument::record_engine_call();
         self.model
             .update_range_style(&area_of(sheet_idx, range), path, value)
+    }
+
+    /// The workbook's **default font** `(size_pt, family_name)` — the font a truly-unstyled cell
+    /// resolves to (style index 0). Read from the public workbook styles
+    /// (`cell_xfs[0].font_id` → `fonts[id]`); a hostile/empty styles table falls back to
+    /// IronCalc's `Font::default()` (13pt Calibri) rather than panicking. The cache resolves each
+    /// cell's `font_size_q`/`font_family` **relative to this** (so a default-font cell interns to
+    /// the default style, exactly as `font.color` is resolved relative to black — `architecture.md
+    /// §1.1`, `components/style_render.md`). Cheap (a couple of `Vec` index reads).
+    pub(crate) fn default_font(&self) -> (i32, String) {
+        crate::instrument::record_engine_call();
+        let styles = &self.model.get_model().workbook.styles;
+        let font = styles
+            .cell_xfs
+            .first()
+            .map(|xf| xf.font_id as usize)
+            .and_then(|id| styles.fonts.get(id));
+        match font {
+            Some(f) => (f.sz, f.name.clone()),
+            None => {
+                let d = Font::default();
+                (d.sz, d.name)
+            }
+        }
+    }
+
+    /// Sets the font **family** and/or **size** over a range (`SetFont`, `architecture.md §3.3`).
+    /// IronCalc 0.7.1 has no `font.name`/absolute-size `update_range_style` path, so this uses
+    /// `on_paste_styles`: it points the engine's view selection at `range`, builds a row-major
+    /// grid of each cell's **resolved** style (`get_style_for_cell`) with the font overridden, and
+    /// pastes it back — one undoable diff-list. `family = Some("")` is "System Default" (reset to
+    /// `default_name`); `Some(name)` sets it; `None` leaves the family. `size_pt = Some(pt)` sets
+    /// `font.sz` (rounded to whole points — IronCalc stores an `i32`); `None` leaves the size.
+    /// Because it materialises the resolved style per cell, a whole column/row is clamped to the
+    /// used range by the caller first (no font bands — documented deviation).
+    pub(crate) fn set_font(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        family: Option<&str>,
+        size_pt: Option<f64>,
+        default_name: &str,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        // on_paste_styles pastes into the engine's view selection; the top-left anchor is on
+        // every range's edge, so this passes IronCalc's anchor-on-edge check.
+        self.set_view_selection(sheet_idx, range)?;
+        let model = self.model.get_model();
+        let mut styles: Vec<Vec<Style>> = Vec::with_capacity(range.rows().count());
+        for row in range.rows() {
+            let mut row_styles: Vec<Style> = Vec::with_capacity(range.cols().count());
+            for col in range.cols() {
+                let (r, c) = to_engine_coords(CellRef::new(row, col));
+                let mut style = model.get_style_for_cell(sheet_idx, r, c)?;
+                if let Some(pt) = size_pt {
+                    style.font.sz = pt.round() as i32;
+                }
+                if let Some(name) = family {
+                    style.font.name = if name.is_empty() {
+                        default_name.to_string()
+                    } else {
+                        name.to_string()
+                    };
+                }
+                row_styles.push(style);
+            }
+            styles.push(row_styles);
+        }
+        self.model.on_paste_styles(&styles)
+    }
+
+    /// Sets a contiguous run of rows `[row_start, row_end]` (0-based) to `px` **IronCalc pixels**
+    /// (one undoable diff-list) — the row auto-grow primitive behind `SetFont` (`architecture.md
+    /// §3.3`). Never called with unbounded ranges (the worker coalesces only rows that need
+    /// growing, within a clamped selection).
+    pub(crate) fn set_row_heights_run(
+        &mut self,
+        sheet_idx: u32,
+        row_start: u32,
+        row_end: u32,
+        px: f64,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .set_rows_height(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, px)
+    }
+
+    /// Clamps a **full-row / full-column / select-all** `range` to the sheet's used rectangle
+    /// (`worksheet.dimension()`), returning `None` when the intersection is empty (nothing to do).
+    /// A **bounded** selection is returned unchanged — it applies exactly as selected, even over
+    /// empty cells (`architecture.md §5.2`). Centralised here so `SetFont` (and Phase-7 clears)
+    /// never iterate a 1M-cell band.
+    pub(crate) fn clamp_to_used(
+        &self,
+        sheet_idx: u32,
+        range: CellRange,
+    ) -> Result<Option<CellRange>, String> {
+        use freecell_core::limits;
+        let spans_all_rows = range.start.row == 0 && range.end.row == limits::MAX_ROWS - 1;
+        let spans_all_cols = range.start.col == 0 && range.end.col == limits::MAX_COLS - 1;
+        if !(spans_all_rows || spans_all_cols) {
+            return Ok(Some(range));
+        }
+        let dim = self.worksheet(sheet_idx)?.dimension();
+        // dimension() is 1-based inclusive; convert to 0-based and intersect with the request.
+        let used_r0 = (dim.min_row.max(1) - 1) as u32;
+        let used_r1 = (dim.max_row.max(1) - 1) as u32;
+        let used_c0 = (dim.min_column.max(1) - 1) as u32;
+        let used_c1 = (dim.max_column.max(1) - 1) as u32;
+        let r0 = range.start.row.max(used_r0);
+        let r1 = range.end.row.min(used_r1);
+        let c0 = range.start.col.max(used_c0);
+        let c1 = range.end.col.min(used_c1);
+        if r1 < r0 || c1 < c0 {
+            return Ok(None); // the selected band lies entirely outside the used range
+        }
+        Ok(Some(CellRange::new(
+            CellRef::new(r0, c0),
+            CellRef::new(r1, c1),
+        )))
     }
 
     /// Appends a new sheet (`AddSheet`); IronCalc names + numbers it. Undoable.
@@ -1023,6 +1153,80 @@ mod tests {
         assert_eq!(fill.fg_color.as_deref(), Some("#FF0000"));
         let font = reopened.cell_style(0, CellRef::new(1, 1)).unwrap().font;
         assert_eq!(font.color.as_deref(), Some("#0000FF"));
+    }
+
+    #[test]
+    fn default_font_reads_workbook_default() {
+        // A fresh workbook's default is IronCalc's `Font::default()` — 13pt Calibri (NOT the
+        // 11pt the specs state; the cache detects "default" relative to this value).
+        let doc = WorkbookDocument::new_empty().unwrap();
+        let (sz, name) = doc.default_font();
+        assert_eq!(sz, 13);
+        assert_eq!(name, "Calibri");
+    }
+
+    #[test]
+    fn set_font_applies_family_and_size_and_system_default_clears() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        let b2 = CellRef::new(1, 1);
+        let range = CellRange::new(a1, b2);
+        doc.set_cell_input(0, a1, "x").unwrap();
+        doc.set_cell_input(0, b2, "y").unwrap();
+        let (_, default_name) = doc.default_font();
+
+        // Set Arial 20pt over A1:B2 (one on_paste_styles undo entry).
+        doc.set_font(0, range, Some("Arial"), Some(20.0), &default_name)
+            .unwrap();
+        for cell in [a1, b2] {
+            let style = doc.cell_style(0, cell).unwrap();
+            assert_eq!(style.font.name, "Arial");
+            assert_eq!(style.font.sz, 20);
+        }
+
+        // A size-only change leaves the family.
+        doc.set_font(0, CellRange::single(a1), None, Some(9.0), &default_name)
+            .unwrap();
+        let style = doc.cell_style(0, a1).unwrap();
+        assert_eq!(
+            style.font.name, "Arial",
+            "family untouched by a size-only set"
+        );
+        assert_eq!(style.font.sz, 9);
+
+        // System Default (family = Some("")) resets the family to the workbook default.
+        doc.set_font(0, CellRange::single(a1), Some(""), None, &default_name)
+            .unwrap();
+        assert_eq!(doc.cell_style(0, a1).unwrap().font.name, default_name);
+
+        // One undo reverts the last font op (on_paste_styles is a single diff-list).
+        doc.undo().unwrap();
+        assert_eq!(doc.cell_style(0, a1).unwrap().font.name, "Arial");
+    }
+
+    #[test]
+    fn clamp_to_used_clamps_bands_not_bounded() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "a").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 1), "b").unwrap(); // used range A1:B3
+                                                                 // A full column clamps to the used rows.
+        let full_col = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+        );
+        assert_eq!(
+            doc.clamp_to_used(0, full_col).unwrap(),
+            Some(CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)))
+        );
+        // A bounded selection is returned unchanged (applies even over empty cells).
+        let bounded = CellRange::new(CellRef::new(5, 5), CellRef::new(7, 7));
+        assert_eq!(doc.clamp_to_used(0, bounded).unwrap(), Some(bounded));
+        // A full column beyond the used columns → empty intersection.
+        let far_col = CellRange::new(
+            CellRef::new(0, 9),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 9),
+        );
+        assert_eq!(doc.clamp_to_used(0, far_col).unwrap(), None);
     }
 
     // ---- Range clipboard (`components/clipboard.md`) --------------------------------------

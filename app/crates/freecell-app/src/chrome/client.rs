@@ -29,6 +29,16 @@ pub trait ChromeClient {
     /// the number-format dropdown's category label + decimals ±. `None` = no resident cache for the
     /// sheet; a cell with no stored style resolves to `Some("general")` (the default format).
     fn num_fmt_code(&self, sheet: SheetId, cell: CellRef) -> Option<String>;
+
+    /// The resolved font-family name of a single cell (`components/action_bar.md`), for the font
+    /// family dropdown's active label. `None` = no resident cache for the sheet; a cell with no
+    /// stored family resolves to `Some("")` (the workbook default = "System Default").
+    fn font_family_name(&self, sheet: SheetId, cell: CellRef) -> Option<String>;
+
+    /// The workbook's default font size in **points** (`components/action_bar.md`), so the size box
+    /// can label a default cell (`font_size_q == 0`) with the real workbook default rather than a
+    /// hardcoded value. `None` = no resident cache / the default size is unknown.
+    fn default_font_size_pt(&self, sheet: SheetId) -> Option<f64>;
 }
 
 impl ChromeClient for DocumentClient {
@@ -59,6 +69,26 @@ impl ChromeClient for DocumentClient {
             .unwrap_or(0);
         Some(cache.num_fmt_code(id).to_string())
     }
+
+    fn font_family_name(&self, sheet: SheetId, cell: CellRef) -> Option<String> {
+        let caches = self.caches();
+        let guard = caches.read();
+        let cache = guard.get(sheet)?;
+        // A cell with no stored family resolves to the workbook default (index 0 → "").
+        let id = cache
+            .render_style(cell.row, cell.col)
+            .map(|s| s.font_family)
+            .unwrap_or(0);
+        Some(cache.font_family_name(id).to_string())
+    }
+
+    fn default_font_size_pt(&self, sheet: SheetId) -> Option<f64> {
+        let caches = self.caches();
+        let guard = caches.read();
+        let q = guard.get(sheet)?.default_font_size_q();
+        // `0` = unknown (a cache that never recorded it) → no label override.
+        (q != 0).then(|| q as f64 / 4.0)
+    }
 }
 
 /// A test/demo double for [`ChromeClient`]: records every sent [`Command`] and answers
@@ -69,6 +99,8 @@ pub struct RecordingClient {
     commands: RefCell<Vec<Command>>,
     styles: RefCell<HashMap<(SheetId, CellRef), RenderStyle>>,
     num_fmts: RefCell<HashMap<(SheetId, CellRef), String>>,
+    font_families: RefCell<HashMap<(SheetId, CellRef), String>>,
+    default_font_size_pt: RefCell<Option<f64>>,
 }
 
 impl RecordingClient {
@@ -87,6 +119,18 @@ impl RecordingClient {
         self.num_fmts
             .borrow_mut()
             .insert((sheet, cell), code.to_string());
+    }
+
+    /// Injects the font-family name `font_family_name` will return for `(sheet, cell)`.
+    pub fn set_font_family(&self, sheet: SheetId, cell: CellRef, name: &str) {
+        self.font_families
+            .borrow_mut()
+            .insert((sheet, cell), name.to_string());
+    }
+
+    /// Injects the workbook default font size (points) `default_font_size_pt` will return.
+    pub fn set_default_font_size_pt(&self, pt: f64) {
+        *self.default_font_size_pt.borrow_mut() = Some(pt);
     }
 
     /// Drains and returns every command recorded so far (clearing the log).
@@ -113,5 +157,20 @@ impl ChromeClient for RecordingClient {
                 .cloned()
                 .unwrap_or_else(|| "general".to_string()),
         )
+    }
+
+    fn font_family_name(&self, sheet: SheetId, cell: CellRef) -> Option<String> {
+        // Mirrors the real client: an injected family, else the workbook default ("").
+        Some(
+            self.font_families
+                .borrow()
+                .get(&(sheet, cell))
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn default_font_size_pt(&self, _sheet: SheetId) -> Option<f64> {
+        *self.default_font_size_pt.borrow()
     }
 }

@@ -27,7 +27,7 @@ judgment calls in a `DECISIONS_TO_REVIEW.md` here).
 - [x] **Phase 4 — Formatting controls**: `SetStylePath` command; text color,
       alignment, number-format dropdown + decimals ± ; action-bar layout rework
       (§3.1–3.2, ui_design §2).
-- [ ] **Phase 5 — Fonts**: `RenderStyle`/cache font fields + rendering; `SetFont` via
+- [x] **Phase 5 — Fonts**: `RenderStyle`/cache font fields + rendering; `SetFont` via
       on_paste_styles + clamps + row auto-grow; family/size dropdowns (§3.3).
 - [ ] **Phase 6 — Borders**: cache `BorderSpec` interning + edge rendering; presets
       menu via `set_area_with_border` (§3.4).

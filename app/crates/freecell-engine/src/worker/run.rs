@@ -218,6 +218,10 @@ impl Worker {
         // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
         // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
         let mut clipboard_ops: Vec<Command> = Vec::new();
+        // Font ops (`SetFont`) also run one-by-one: each emits a *variable* number of engine
+        // diff-lists (one style paste + K row-height runs), so the touch-set must stay 1:1 with
+        // the undo stack — they can't ride the generic coalesced edit path.
+        let mut font_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
         let mut shutdown = false;
 
@@ -241,6 +245,7 @@ impl Worker {
                 clip @ (Command::CopySelection { .. }
                 | Command::PasteInternal { .. }
                 | Command::PasteTsv { .. }) => clipboard_ops.push(clip),
+                font @ Command::SetFont { .. } => font_ops.push(font),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
@@ -275,6 +280,20 @@ impl Worker {
             self.emit(WorkerEvent::StyleCacheUpdated {
                 sheet: self.active_sheet,
             });
+        }
+
+        // Font ops after the edit batch (each is standalone: its own style paste + auto-grow +
+        // publish + touch-set entries).
+        for font in font_ops {
+            if let Command::SetFont {
+                sheet,
+                range,
+                family,
+                size_pt,
+            } = font
+            {
+                self.apply_set_font(sheet, range, family, size_pt);
+            }
         }
 
         // Clipboard ops after the edit batch (each is standalone; a paste carries its own eval +
@@ -678,6 +697,135 @@ impl Worker {
         });
     }
 
+    /// Apply a `SetFont` (`architecture.md §3.3`, `components/style_render.md`): materialise the
+    /// font family/size over the (clamped) selection via `on_paste_styles`, auto-grow rows too
+    /// small for a larger size, then mirror the touched cells + heights into the cache. Style-only
+    /// — no evaluation. Emits a **variable** number of engine diff-lists (one style paste + one per
+    /// contiguous grown-row run); it pushes exactly that many touch-set entries so the undo stack
+    /// stays 1:1 aligned (so undoing a font change is up to K+1 steps — accepted, DECISIONS).
+    fn apply_set_font(
+        &mut self,
+        sheet: SheetId,
+        range: CellRange,
+        family: Option<String>,
+        size_pt: Option<f64>,
+    ) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(idx) = self.resolve(sheet) else {
+            return; // the sheet vanished — nothing to do
+        };
+        // Full row/col/select-all clamps to the used range (no font bands); a bounded selection
+        // applies as-is. An empty intersection (band beyond the used range) is a no-op.
+        let clamped = match self.doc.clamp_to_used(idx, range) {
+            Ok(Some(r)) => r,
+            Ok(None) => return,
+            Err(msg) => {
+                tracing::debug!(%msg, "worker: SetFont clamp failed (ignored)");
+                return;
+            }
+        };
+        // Cap: on_paste_styles materialises one style per cell, so a pathological used-range is
+        // refused with a dialog-worthy message rather than churning millions of cells.
+        if range_area(&clamped) > MAX_REFRESH_CELLS {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Engine(
+                    "Selection too large for font changes".to_string(),
+                ),
+            });
+            return;
+        }
+
+        let default_name = self.doc.default_font().1;
+        self.emit(WorkerEvent::EvalStarted);
+        // Guarded (round-3 D belt-and-braces): the style paste + height writes run under
+        // catch_unwind on the worker's big stack. Count the diff-lists actually committed (a failed
+        // height run commits nothing — `set_rows_height` pushes atomically) so the touch-set stays
+        // aligned even under a (near-impossible) partial failure.
+        let outcome = {
+            let doc = &mut self.doc;
+            catch_unwind(AssertUnwindSafe(move || {
+                doc.pause_evaluation();
+                let set_res = doc.set_font(idx, clamped, family.as_deref(), size_pt, &default_name);
+                let mut height_runs = 0u64;
+                if set_res.is_ok() {
+                    if let Some(pt) = size_pt {
+                        // Auto-grow only on a size change (a family swap keeps the size, so the
+                        // row already fits). Work in IronCalc px (get_row_height's 28px-default
+                        // space) so the same 96/72 factor drives text size + row height.
+                        let needed = (pt * 96.0 / 72.0 * 1.25).ceil() + 4.0;
+                        let mut grow_rows: Vec<u32> = Vec::new();
+                        for row in clamped.rows() {
+                            if let Ok(cur) = doc.row_height_px(idx, row) {
+                                if needed > cur {
+                                    grow_rows.push(row);
+                                }
+                            }
+                        }
+                        // Coalesce contiguous rows into runs; one set_rows_height per run.
+                        let mut i = 0;
+                        while i < grow_rows.len() {
+                            let start = grow_rows[i];
+                            let mut end = start;
+                            while i + 1 < grow_rows.len() && grow_rows[i + 1] == end + 1 {
+                                i += 1;
+                                end = grow_rows[i];
+                            }
+                            if doc.set_row_heights_run(idx, start, end, needed).is_ok() {
+                                height_runs += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                doc.resume_evaluation();
+                (set_res, height_runs)
+            }))
+        };
+        self.emit(WorkerEvent::EvalFinished);
+
+        match outcome {
+            Ok((Ok(()), height_runs)) => {
+                let diff_lists = 1 + height_runs;
+                self.ops_seen += diff_lists;
+                self.shared
+                    .committed_ops
+                    .store(self.ops_seen, Ordering::Release);
+                self.publish();
+                self.emit(WorkerEvent::Published);
+                // One touch per committed diff-list (all covering the clamped range — re-reading it
+                // syncs both the styles and the row heights), and a fresh edit clears the redo side.
+                for _ in 0..diff_lists {
+                    self.undo_touches.push(Touch::Cells {
+                        sheet,
+                        range: clamped,
+                    });
+                }
+                self.redo_touches.clear();
+                for s in self.refresh_cache_cells(&[(sheet, clamped)]) {
+                    self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
+                }
+            }
+            // A clean engine error (near-unreachable for valid input): nothing committed → no touch.
+            Ok((Err(msg), _)) => self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Engine(msg),
+            }),
+            Err(_) => {
+                // Recover the pause flag (guarded — a poisoned model could panic on it too).
+                {
+                    let doc = &mut self.doc;
+                    let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                }
+                tracing::debug!("worker: caught panic in SetFont; entering recovery");
+                self.handle_caught_panic();
+            }
+        }
+    }
+
     /// Mirror a batch's applied ops into the resident cache (`components/style_cache.md
     /// §Lifecycle`): maintain the undo/redo touch-set stacks, reconcile the caches map when the
     /// sheet set changed, re-read the touched cells, and emit `StyleCacheUpdated` per changed
@@ -754,12 +902,20 @@ impl Worker {
                     continue;
                 }
             } else {
+                // Resolve the workbook default font once for the whole range (not per cell).
+                let (def_sz, def_name) = self.doc.default_font();
                 let mut guard = caches.write();
                 if let Some(cache) = guard.get_mut(*sheet) {
                     for row in range.rows() {
                         for col in range.cols() {
-                            let _ =
-                                cache::refresh_cell(cache, &self.doc, idx, CellRef::new(row, col));
+                            let _ = cache::refresh_cell(
+                                cache,
+                                &self.doc,
+                                idx,
+                                CellRef::new(row, col),
+                                def_sz,
+                                &def_name,
+                            );
                         }
                     }
                     // Mirror IronCalc's row-height auto-fit over the touched rows (one axis
@@ -1751,6 +1907,211 @@ mod tests {
             "color is untouched"
         );
         worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    /// Send a `SetFont` and drain — the font op runs standalone after any edit batch.
+    fn set_font(
+        sheet: SheetId,
+        range: CellRange,
+        family: Option<&str>,
+        size_pt: Option<f64>,
+    ) -> Command {
+        Command::SetFont {
+            sheet,
+            range,
+            family: family.map(str::to_string),
+            size_pt,
+        }
+    }
+
+    #[test]
+    fn set_font_grows_rows_and_reflects_cache() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "Big"),
+        ]);
+        let before_h = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(1);
+        drain_events(&rx);
+
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::single(CellRef::new(1, 1)),
+            None,
+            Some(24.0),
+        )]);
+
+        // The cache reflects the 24pt size (96 quarter-points) and the row grew.
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let rs = cache.render_style(1, 1).copied().expect("font cell stored");
+            assert_eq!(rs.font_size_q, 96);
+            assert!(
+                cache.row_height(1) > before_h,
+                "row 1 auto-grew for the larger font ({} → {})",
+                before_h,
+                cache.row_height(1)
+            );
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        // Style-only: no evaluate; a StyleCacheUpdated delta ships.
+        assert!(drain_events(&rx)
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+    }
+
+    #[test]
+    fn set_font_undo_reverts_size_and_height() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "x"),
+        ]);
+        let base_h = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(1);
+        // `ops_seen` is a monotonic dirty counter (undo increments it too), so capture how many
+        // diff-lists the SetFont committed and undo exactly that many (K+1 = style + row runs).
+        let ops_before = worker.ops_seen; // = 1 (the input)
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::single(CellRef::new(1, 1)),
+            Some("Arial"),
+            Some(28.0),
+        )]);
+        drain_events(&rx);
+        let font_diff_lists = worker.ops_seen - ops_before;
+        assert!(
+            font_diff_lists >= 2,
+            "SetFont committed a style + a height diff-list, got {font_diff_lists}"
+        );
+
+        // Undo every committed diff-list; the cache re-reads and agrees with the engine each step.
+        for _ in 0..font_diff_lists {
+            worker.process_batch(vec![Command::Undo]);
+            worker_cache_agrees(&worker, sheet, &rows, &cols);
+        }
+        let guard = worker.shared.caches.read();
+        let cache = guard.get(sheet).unwrap();
+        assert_eq!(
+            cache.render_style(1, 1).map(|s| s.font_size_q).unwrap_or(0),
+            0,
+            "undo restored the default size"
+        );
+        assert!(
+            (cache.row_height(1) - base_h).abs() < 1e-3,
+            "undo restored the original row height"
+        );
+    }
+
+    #[test]
+    fn set_font_full_column_clamps_to_used() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "1"),
+            set_input(sheet, 2, 0, "2"),
+        ]);
+        // A full-column SetFont clamps to the used rows (does NOT materialise 1M cells).
+        let full_col = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+        );
+        worker.process_batch(vec![set_font(sheet, full_col, Some("Arial"), None)]);
+        let guard = worker.shared.caches.read();
+        let cache = guard.get(sheet).unwrap();
+        assert_eq!(
+            cache.font_family_name(cache.render_style(0, 0).unwrap().font_family),
+            "Arial"
+        );
+        assert_eq!(
+            cache.font_family_name(cache.render_style(2, 0).unwrap().font_family),
+            "Arial"
+        );
+        // A row past the used range was not materialised.
+        assert!(cache.render_style(100, 0).is_none());
+    }
+
+    #[test]
+    fn set_font_too_large_selection_rejects() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Populate a corner so the used range spans a huge rectangle (>100k cells).
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "a"),
+            set_input(sheet, 999, 199, "b"), // used range 1000 × 200 = 200k cells
+        ]);
+        drain_events(&rx);
+        // Select-all clamps to the used rectangle (1000 × 200 = 200k cells) → over the 100k cap.
+        let select_all = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(
+                freecell_core::limits::MAX_ROWS - 1,
+                freecell_core::limits::MAX_COLS - 1,
+            ),
+        );
+        worker.process_batch(vec![set_font(sheet, select_all, None, Some(20.0))]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(m)
+                } if m.contains("too large")
+            )),
+            "a >100k clamped font selection is rejected with a dialog-worthy message"
+        );
+    }
+
+    #[test]
+    fn set_font_degraded_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::TestPanic]);
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(worker.degraded);
+        drain_events(&rx);
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            Some("Arial"),
+            Some(20.0),
+        )]);
+        assert!(drain_events(&rx).iter().any(|e| matches!(
+            e,
+            WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded
+            }
+        )));
     }
 
     #[test]

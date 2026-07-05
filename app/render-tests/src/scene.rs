@@ -36,6 +36,8 @@ enum Inject {
     FontColor(u32, u32, Rgb),
     ColWidth(u32, f32),
     RowHeight(u32, f32),
+    /// A per-cell font family (`None` = default) + size in quarter-points (`0` = default).
+    Font(u32, u32, Option<String>, u16),
 }
 
 /// A declarative render fixture. Build it fluently, then [`build_sources`] realizes it through
@@ -139,6 +141,16 @@ impl Scene {
     /// Sets a row height override in px (injected into the real cache — no worker command).
     pub fn row_height(mut self, row: u32, px: f32) -> Self {
         self.injects.push(Inject::RowHeight(row, px));
+        self
+    }
+
+    /// Sets a per-cell font family (`Some(name)` renders that family; `None` keeps the default) and
+    /// size in points (`Some(pt)` → `pt*4` quarter-points; `None` = default). Injected into the real
+    /// cache — no worker command (mirrors how the worker's `SetFont` materialises `RenderStyle`).
+    pub fn font(mut self, row: u32, col: u32, family: Option<&str>, pt: Option<f32>) -> Self {
+        let size_q = pt.map(|p| (p * 4.0).round() as u16).unwrap_or(0);
+        self.injects
+            .push(Inject::Font(row, col, family.map(str::to_string), size_q));
         self
     }
 
@@ -277,6 +289,22 @@ fn apply_injections(caches: &parking_lot::RwLock<SheetCaches>, sheet: SheetId, i
             }
             Inject::ColWidth(col, px) => cache.set_col_width(*col, *px),
             Inject::RowHeight(row, px) => cache.set_row_height(*row, *px),
+            Inject::Font(row, col, family, size_q) => {
+                let base = cache.render_style(*row, *col).copied().unwrap_or_default();
+                let font_family = family
+                    .as_deref()
+                    .map(|name| cache.intern_font_family(name))
+                    .unwrap_or(0);
+                cache.set_cell_style(
+                    *row,
+                    *col,
+                    RenderStyle {
+                        font_family,
+                        font_size_q: *size_q,
+                        ..base
+                    },
+                );
+            }
         }
     }
 }

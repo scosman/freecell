@@ -328,6 +328,27 @@ pub fn all() -> Vec<RenderCase> {
         )
         .selection(sel((1, 1), (1, 1)))
         .in_cell(1, 1, "=SUM(A1:A3)"),
+        // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
+        cell(
+            // A serif family (visibly distinct from the default sans) rendered per-cell. NOTE:
+            // this depends on a serif font being installed on the pinned runner — see DECISIONS.
+            "font_family_serif",
+            at(Scene::new()).font(1, 1, Some("DejaVu Serif"), None),
+        ),
+        cell(
+            // 24pt text in a row grown to fit it (the worker's auto-grow, simulated by the injected
+            // row height ≈ ceil(24*96/72*1.25)+4 IronCalc px → FreeCell px).
+            "font_size_24_row_grown",
+            at(Scene::new())
+                .font(1, 1, None, Some(24.0))
+                .row_height(1, 38.0),
+        ),
+        cell(
+            // A family the runner does not have → gpui falls back to the default font (display-only;
+            // the style is preserved). Guards that a missing family never blanks the cell.
+            "font_missing_family_fallback",
+            at(Scene::new()).font(1, 1, Some("NoSuchFontXYZ123"), None),
+        ),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

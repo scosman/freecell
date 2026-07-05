@@ -60,6 +60,19 @@ pub struct SheetCache {
     /// distinct formats per sheet), so interning is a linear scan; `Arc<str>` keeps `SheetCache`
     /// `Send + Sync` without pulling gpui into this headless crate.
     num_fmts: Vec<Arc<str>>,
+    /// Font-family names, indexed by [`RenderStyle::font_family`]. `[0]` is always `""` = the
+    /// workbook default (rendered in the grid's default family). Built worker-side alongside the
+    /// resolved-style table; the grid resolves a cell's family name from this for `.font_family`,
+    /// and the action bar reads it for the family dropdown's active label (`components/style_render.md`,
+    /// `components/action_bar.md`). Tiny (a handful of families per sheet) — same linear-scan
+    /// interning + `Arc<str>` rationale as `num_fmts`.
+    font_families: Vec<Arc<str>>,
+    /// The **workbook's default font size** in quarter-points (e.g. `52` = 13pt) — the size a cell
+    /// with `RenderStyle::font_size_q == 0` actually is. The action bar shows this in the size box
+    /// for a default cell (so the label reflects the real default, not a hardcoded value —
+    /// `components/action_bar.md`); the grid does not read it (default cells render at the grid's
+    /// own `CELL_FONT_PX`). `0` when unknown (a bare fixture cache that never set it).
+    default_font_size_q: u16,
 }
 
 /// The canonical default number-format code (IronCalc's `Style::default().num_fmt`, lowercase).
@@ -68,6 +81,35 @@ const DEFAULT_NUM_FMT: &str = "general";
 /// The `num_fmts` table every fresh cache/builder starts with: `[0] = "general"`.
 fn seed_num_fmts() -> Vec<Arc<str>> {
     vec![Arc::from(DEFAULT_NUM_FMT)]
+}
+
+/// The `font_families` table every fresh cache/builder starts with: `[0] = ""` (the workbook
+/// default font, rendered in the grid's default family).
+fn seed_font_families() -> Vec<Arc<str>> {
+    vec![Arc::from("")]
+}
+
+/// Interns a font-family `name` into `table`, returning its [`RenderStyle::font_family`] id. An
+/// empty name (the workbook default) always maps to `0`. Shares the `num_fmts` overflow guard:
+/// at the (unreachable) `u16::MAX` cap a further distinct name returns `u16::MAX`, which
+/// [`SheetCache::font_family_name`] resolves to the default `""` rather than wrapping to `0`.
+fn intern_font_family_into(table: &mut Vec<Arc<str>>, name: &str) -> u16 {
+    if name.is_empty() {
+        return 0;
+    }
+    if let Some(idx) = table.iter().position(|c| c.as_ref() == name) {
+        return idx as u16;
+    }
+    debug_assert!(
+        table.len() < u16::MAX as usize,
+        "font_families table overflow (>= u16::MAX distinct families)"
+    );
+    if table.len() >= u16::MAX as usize {
+        return u16::MAX;
+    }
+    let id = table.len() as u16;
+    table.push(Arc::from(name));
+    id
 }
 
 /// Interns a number-format `code` into `table`, returning its `u16` id. Case-insensitive
@@ -197,6 +239,36 @@ impl SheetCache {
             .unwrap_or(DEFAULT_NUM_FMT)
     }
 
+    /// Interns a font-family `name` into the side table, returning its [`RenderStyle::font_family`]
+    /// id (empty `name` → `0` = the workbook default). The worker's mirror path calls this before
+    /// storing a refreshed [`RenderStyle`] so the resident table carries every live family name.
+    pub fn intern_font_family(&mut self, name: &str) -> u16 {
+        intern_font_family_into(&mut self.font_families, name)
+    }
+
+    /// The font-family name for [`RenderStyle::font_family`] id `id`. `0` (or an out-of-range id,
+    /// defensively) → `""` = the workbook default (the grid renders its default family). The grid
+    /// resolves a cell's `.font_family` from this; the action bar reads it for the active cell's
+    /// family label.
+    pub fn font_family_name(&self, id: u16) -> &str {
+        self.font_families
+            .get(id as usize)
+            .map(|c| c.as_ref())
+            .unwrap_or("")
+    }
+
+    /// The full font-family side table — the grid snapshots this (cheap `Arc` clones) alongside the
+    /// visible styles so it can resolve each cell's `.font_family` after releasing the cache lock.
+    pub fn font_families(&self) -> &[Arc<str>] {
+        &self.font_families
+    }
+
+    /// The workbook's default font size in quarter-points (`0` = unknown). The action bar reads this
+    /// to label the size box for a default cell (`font_size_q == 0`) with the real workbook default.
+    pub fn default_font_size_q(&self) -> u16 {
+        self.default_font_size_q
+    }
+
     /// Interns `style` into the resolved table (equal styles share a [`StyleId`]).
     fn intern(&mut self, style: RenderStyle) -> StyleId {
         if let Some(&id) = self.style_ids.get(&style) {
@@ -320,6 +392,8 @@ pub struct SheetCacheBuilder {
     resolved: Vec<RenderStyle>,
     style_ids: HashMap<RenderStyle, StyleId>,
     num_fmts: Vec<Arc<str>>,
+    font_families: Vec<Arc<str>>,
+    default_font_size_q: u16,
 }
 
 impl SheetCacheBuilder {
@@ -338,7 +412,15 @@ impl SheetCacheBuilder {
             resolved: Vec::new(),
             style_ids: HashMap::new(),
             num_fmts: seed_num_fmts(),
+            font_families: seed_font_families(),
+            default_font_size_q: 0,
         }
+    }
+
+    /// Records the workbook's default font size (quarter-points) — the engine's build loop sets it
+    /// so the action bar can label a default cell with the real workbook default size.
+    pub fn set_default_font_size_q(&mut self, q: u16) {
+        self.default_font_size_q = q;
     }
 
     /// Interns a number-format `code` into the side table, returning its [`RenderStyle::num_fmt`]
@@ -346,6 +428,13 @@ impl SheetCacheBuilder {
     /// before pushing the resolved style.
     pub fn intern_num_fmt(&mut self, code: &str) -> u16 {
         intern_num_fmt_into(&mut self.num_fmts, code)
+    }
+
+    /// Interns a font-family `name` into the side table, returning its [`RenderStyle::font_family`]
+    /// id (empty `name` → `0` = the workbook default). The engine's build loop calls this per
+    /// cell/band before pushing the resolved style.
+    pub fn intern_font_family(&mut self, name: &str) -> u16 {
+        intern_font_family_into(&mut self.font_families, name)
     }
 
     /// Overrides the default row height / column width (px).
@@ -457,6 +546,8 @@ impl SheetCacheBuilder {
             resolved: self.resolved,
             style_ids: self.style_ids,
             num_fmts: self.num_fmts,
+            font_families: self.font_families,
+            default_font_size_q: self.default_font_size_q,
         }
     }
 }
@@ -641,6 +732,48 @@ mod tests {
             .build();
         assert_eq!(built.num_fmt_code(id), "m/d/yyyy");
         assert_eq!(built.render_style(0, 0).unwrap().num_fmt, id);
+    }
+
+    #[test]
+    fn font_family_interning_dedups_and_default_is_zero() {
+        let mut cache = SheetCacheBuilder::new(4, 4).build();
+        // A fresh cache resolves index 0 to "" (the workbook default family).
+        assert_eq!(cache.font_family_name(0), "");
+        // An empty name always maps to 0.
+        assert_eq!(cache.intern_font_family(""), 0);
+        // Distinct names get distinct, stable ids; equal names dedup.
+        let serif = cache.intern_font_family("Times New Roman");
+        let mono = cache.intern_font_family("Courier New");
+        assert_ne!(serif, 0);
+        assert_ne!(serif, mono);
+        assert_eq!(
+            cache.intern_font_family("Times New Roman"),
+            serif,
+            "equal names dedup"
+        );
+        // Round-trips back to the name.
+        assert_eq!(cache.font_family_name(serif), "Times New Roman");
+        assert_eq!(cache.font_family_name(mono), "Courier New");
+        // An out-of-range id falls back to "" (defensive, never panics).
+        assert_eq!(cache.font_family_name(9999), "");
+
+        // The builder interns identically, and the built cache carries the table.
+        let mut b = SheetCacheBuilder::new(2, 2);
+        let id = b.intern_font_family("Arial");
+        let built = b
+            .cell_style(
+                0,
+                0,
+                RenderStyle {
+                    font_family: id,
+                    ..RenderStyle::default()
+                },
+            )
+            .build();
+        assert_eq!(built.font_family_name(id), "Arial");
+        assert_eq!(built.render_style(0, 0).unwrap().font_family, id);
+        // The whole side table is exposed for the grid snapshot.
+        assert_eq!(built.font_families().len(), 2); // [""], ["Arial"]
     }
 
     #[test]

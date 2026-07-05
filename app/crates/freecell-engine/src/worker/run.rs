@@ -27,13 +27,14 @@ use std::collections::HashSet;
 
 use freecell_core::input_cap::validate_input;
 use freecell_core::sheet_name::validate_sheet_name;
+use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
 use crate::cache;
 use crate::document::{DocumentSource, FontFlag, WorkbookDocument};
 
 use super::client::Shared;
-use super::protocol::{Command, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent};
+use super::protocol::{Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr, WorkerEvent};
 
 /// Whether the loop should keep running after a batch.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,9 +64,33 @@ enum AppliedKind {
 enum Touch {
     /// A cell/style/clear edit touched `range` on `sheet`; re-read those cells to mirror it.
     Cells { sheet: SheetId, range: CellRange },
+    /// A paste touched one or more `(sheet, range)`s in a **single** undo entry (the pasted
+    /// destination plus, on a cut, the cleared source — possibly a different sheet). On
+    /// undo/redo, every listed range is re-read (`components/clipboard.md §Paste`).
+    Ranges(Vec<(SheetId, CellRange)>),
     /// A sheet add/rename/delete; on undo/redo, reconcile the caches map + rebuild the active
     /// sheet (a returning deleted sheet rebuilds lazily on next activation).
     Sheets,
+}
+
+/// The worker-held clipboard slot (`architecture.md §6`, `components/clipboard.md`): the engine
+/// `Clipboard` payload isn't nameable outside ironcalc_base, so `data` is its serialized
+/// `ClipboardData`. `sheet` is the **stable** source [`SheetId`] (resolved to an index at paste
+/// time, so a copy survives a sheet add/reorder); `range` is the engine's effective 1-based
+/// source rectangle; `cut` drives move-vs-copy semantics + single-use clearing.
+struct ClipboardSlot {
+    sheet: SheetId,
+    range: (i32, i32, i32, i32),
+    data: serde_json::Value,
+    cut: bool,
+}
+
+/// The outcome of a guarded paste (`run_guarded_paste`): applied (with the pasted 0-based
+/// rectangle the engine re-selected), a clean engine error, or a caught panic.
+enum PasteOutcome {
+    Applied(CellRange),
+    EngineError(String),
+    Panicked,
 }
 
 /// What one successfully-applied edit was, for post-eval cache bookkeeping. `Cells`/`Sheets`
@@ -104,6 +129,9 @@ pub(super) struct Worker {
     undo_touches: Vec<Touch>,
     /// The redo side of the touch-set history (mirrors IronCalc's redo stack).
     redo_touches: Vec<Touch>,
+    /// The range clipboard slot (`architecture.md §6`): `Some` after a copy/cut, replaced by the
+    /// next copy/cut, and cleared after a cut is pasted (single-use).
+    clipboard: Option<ClipboardSlot>,
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -143,6 +171,7 @@ impl Worker {
             panic_count: 0,
             undo_touches: Vec::new(),
             redo_touches: Vec::new(),
+            clipboard: None,
         };
 
         // Point the active sheet at the first sheet's real stable id, and seed an empty
@@ -186,6 +215,9 @@ impl Worker {
         let mut edits: Vec<Command> = Vec::new();
         let mut reads: Vec<(SheetId, CellRef, u64)> = Vec::new();
         let mut saves: Vec<(PathBuf, u64)> = Vec::new();
+        // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
+        // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
+        let mut clipboard_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
         let mut shutdown = false;
 
@@ -206,6 +238,9 @@ impl Worker {
                 } => reads.push((sheet, cell, req_id)),
                 Command::Save { path, req_id } => saves.push((path, req_id)),
                 Command::Shutdown => shutdown = true,
+                clip @ (Command::CopySelection { .. }
+                | Command::PasteInternal { .. }
+                | Command::PasteTsv { .. }) => clipboard_ops.push(clip),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
@@ -239,6 +274,12 @@ impl Worker {
             self.emit(WorkerEvent::StyleCacheUpdated {
                 sheet: self.active_sheet,
             });
+        }
+
+        // Clipboard ops after the edit batch (each is standalone; a paste carries its own eval +
+        // publish + one undo entry).
+        for clip in clipboard_ops {
+            self.apply_clipboard_op(clip);
         }
 
         for (sheet, cell, req_id) in reads {
@@ -401,6 +442,241 @@ impl Worker {
         }
     }
 
+    /// Dispatch one range-clipboard op (`components/clipboard.md`, `architecture.md §6`). Each is
+    /// standalone (never coalesced): copy/cut reply with the TSV; paste applies one undoable
+    /// diff + replies with the pasted range or a rejection.
+    fn apply_clipboard_op(&mut self, cmd: Command) {
+        match cmd {
+            Command::CopySelection { sheet, range, cut } => self.apply_copy(sheet, range, cut),
+            Command::PasteInternal { sheet, anchor } => self.apply_paste_internal(sheet, anchor),
+            Command::PasteTsv {
+                sheet,
+                anchor,
+                text,
+            } => self.apply_paste_tsv(sheet, anchor, &text),
+            // Only the three clipboard commands are bucketed here.
+            _ => {}
+        }
+    }
+
+    /// Copy (or cut) `range` to the engine clipboard slot and reply with the system-clipboard
+    /// TSV. Sets the engine's view selection first (the hidden-state dance) and stashes the
+    /// serialized payload; nothing evaluates and no undo entry is created (a copy is a read).
+    fn apply_copy(&mut self, sheet: SheetId, range: CellRange, cut: bool) {
+        let idx = match self.resolve(sheet) {
+            Some(i) => i,
+            None => return, // the sheet vanished — nothing to copy
+        };
+        // Guarded: the copy reads formatted values + styles; a poisoned model must not kill the
+        // thread. A failure just skips the reply (copy is never dialog-worthy).
+        let outcome = {
+            let doc = &mut self.doc;
+            catch_unwind(AssertUnwindSafe(move || doc.copy_range(idx, range)))
+        };
+        match outcome {
+            Ok(Ok(copied)) => {
+                self.clipboard = Some(ClipboardSlot {
+                    sheet,
+                    range: copied.range,
+                    data: copied.data,
+                    cut,
+                });
+                self.emit(WorkerEvent::CopyReady { tsv: copied.tsv });
+            }
+            Ok(Err(msg)) => {
+                tracing::debug!(%msg, "worker: copy_to_clipboard failed (ignored)");
+            }
+            Err(_) => {
+                let doc = &mut self.doc;
+                let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                self.handle_caught_panic();
+            }
+        }
+    }
+
+    /// Paste the engine clipboard slot at `anchor` on `dest` (`paste_from_clipboard`): full
+    /// fidelity, one undo entry, Excel ref-adjustment (copy) / move + source-clear (cut).
+    ///
+    /// Rejection order mirrors [`apply_paste_tsv`]: degraded → nothing-to-paste → overflow →
+    /// unresolved sheet. The slot is `take`n so its JSON is passed to the engine by reference
+    /// (no clone); a non-consuming early return / failed paste restores it, a successful copy
+    /// keeps it (repeatable), and a successful cut drops it (single-use).
+    fn apply_paste_internal(&mut self, dest: SheetId, anchor: CellRef) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(slot) = self.clipboard.take() else {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+        // A degenerate slot (an inverted range from an out-of-range copy, or no rows) has nothing
+        // to paste — reject at the worker rather than trusting the UI, and avoid the `as u32`
+        // wrap a `r1 < r0` range would produce below (Mild #3). It is junk, so it is not restored.
+        let (r0, c0, r1, c1) = slot.range;
+        if r1 < r0 || c1 < c0 || slot.data.as_object().is_none_or(|o| o.is_empty()) {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        }
+        // Overflow pre-check against the slot's effective (dimension-clamped) source dims.
+        let (width, height) = ((c1 - c0 + 1) as u32, (r1 - r0 + 1) as u32);
+        if !paste_fits(anchor, width, height) {
+            self.clipboard = Some(slot); // still valid — the user can retry at a smaller anchor
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::Overflow,
+            });
+            return;
+        }
+        let (Some(dest_idx), Some(source_idx)) = (self.resolve(dest), self.resolve(slot.sheet))
+        else {
+            // The destination or copied-from sheet was deleted — keep the copy (a sheet can
+            // return via undo-of-delete); this paste just can't run now.
+            self.clipboard = Some(slot);
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+
+        let source_range = slot.range;
+        let cut = slot.cut;
+        // Borrow the slot's JSON into the guarded paste (no clone). The closure's borrow ends when
+        // `run_guarded_paste` returns, freeing `slot` for the restore/drop decision below.
+        let outcome = {
+            let data = &slot.data;
+            self.run_guarded_paste(move |doc| {
+                doc.paste_clipboard(dest_idx, anchor, source_idx, source_range, data, cut)
+            })
+        };
+        match outcome {
+            PasteOutcome::Applied(pasted) => {
+                // The pasted destination, plus (on cut) the cleared source, form ONE undo entry.
+                let mut touched = vec![(dest, pasted)];
+                if cut {
+                    touched.push((slot.sheet, tuple_to_range(source_range)));
+                }
+                self.commit_paste(dest, pasted, touched);
+                if !cut {
+                    self.clipboard = Some(slot); // a copy is repeatable; a cut is consumed
+                }
+            }
+            PasteOutcome::EngineError(msg) => {
+                self.clipboard = Some(slot); // the paste didn't apply — keep the copy
+                self.emit(WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(msg),
+                });
+            }
+            // A caught panic degrades the model; the (now-suspect) slot is dropped.
+            PasteOutcome::Panicked => self.handle_caught_panic(),
+        }
+    }
+
+    /// Paste external tab-separated `text` at `anchor` on `dest` (`paste_csv_string`): each token
+    /// as user input, one undo entry.
+    fn apply_paste_tsv(&mut self, dest: SheetId, anchor: CellRef, text: &str) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let (width, height) = tsv_dims(text);
+        if width == 0 || height == 0 {
+            return; // empty clipboard text → nothing to paste (no-op)
+        }
+        if !paste_fits(anchor, width, height) {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::Overflow,
+            });
+            return;
+        }
+        let Some(dest_idx) = self.resolve(dest) else {
+            return;
+        };
+        let text = text.to_string();
+        match self.run_guarded_paste(move |doc| doc.paste_tsv(dest_idx, anchor, &text)) {
+            PasteOutcome::Applied(pasted) => {
+                self.commit_paste(dest, pasted, vec![(dest, pasted)]);
+            }
+            PasteOutcome::EngineError(msg) => self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Engine(msg),
+            }),
+            PasteOutcome::Panicked => self.handle_caught_panic(),
+        }
+    }
+
+    /// Run a paste mutation under the same paused-recompute + `catch_unwind` guard the edit batch
+    /// uses (round-3 D belt-and-braces: a pasted formula reaches the recursive parser). On
+    /// success the engine has re-selected the pasted rectangle; read it back as the outcome.
+    fn run_guarded_paste(
+        &mut self,
+        f: impl FnOnce(&mut WorkbookDocument) -> Result<(), String>,
+    ) -> PasteOutcome {
+        self.emit(WorkerEvent::EvalStarted);
+        let outcome = {
+            let doc = &mut self.doc;
+            catch_unwind(AssertUnwindSafe(move || {
+                doc.pause_evaluation();
+                let result = f(doc);
+                doc.resume_evaluation();
+                if result.is_ok() {
+                    doc.evaluate(); // the ONE coalesced recompute for this paste
+                }
+                result.map(|()| doc.selected_range_0based())
+            }))
+        };
+        self.emit(WorkerEvent::EvalFinished);
+        match outcome {
+            Ok(Ok(range)) => PasteOutcome::Applied(range),
+            Ok(Err(msg)) => PasteOutcome::EngineError(msg),
+            Err(_) => {
+                // Recover the pause flag (guarded — a poisoned model could panic on it too).
+                {
+                    let doc = &mut self.doc;
+                    let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                }
+                tracing::debug!("worker: caught panic in paste; entering recovery");
+                PasteOutcome::Panicked
+            }
+        }
+    }
+
+    /// Shared post-paste bookkeeping: count the eval + committed op, publish, push the single
+    /// undo touch-entry (clearing redo), refresh the touched cache ranges, and reply `Pasted`.
+    fn commit_paste(
+        &mut self,
+        dest: SheetId,
+        pasted: CellRange,
+        touched: Vec<(SheetId, CellRange)>,
+    ) {
+        self.eval_count += 1;
+        self.ops_seen += 1;
+        self.shared
+            .committed_ops
+            .store(self.ops_seen, Ordering::Release);
+        self.publish();
+        self.emit(WorkerEvent::Published);
+
+        // One paste = one engine undo entry → one touch-entry (possibly multi-range), and a
+        // fresh edit invalidates the redo stack.
+        self.undo_touches.push(Touch::Ranges(touched.clone()));
+        self.redo_touches.clear();
+        for sheet in self.refresh_cache_cells(&touched) {
+            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+
+        self.emit(WorkerEvent::Pasted {
+            sheet: dest,
+            range: pasted,
+        });
+    }
+
     /// Mirror a batch's applied ops into the resident cache (`components/style_cache.md
     /// §Lifecycle`): maintain the undo/redo touch-set stacks, reconcile the caches map when the
     /// sheet set changed, re-read the touched cells, and emit `StyleCacheUpdated` per changed
@@ -420,17 +696,13 @@ impl Worker {
                 }
                 AppliedOp::Undo => {
                     if let Some(touch) = self.undo_touches.pop() {
-                        if let Touch::Cells { sheet, range } = touch {
-                            refresh.push((sheet, range));
-                        }
+                        refresh.extend(touch_refresh_ranges(&touch));
                         self.redo_touches.push(touch);
                     }
                 }
                 AppliedOp::Redo => {
                     if let Some(touch) = self.redo_touches.pop() {
-                        if let Touch::Cells { sheet, range } = touch {
-                            refresh.push((sheet, range));
-                        }
+                        refresh.extend(touch_refresh_ranges(&touch));
                         self.undo_touches.push(touch);
                     }
                 }
@@ -802,6 +1074,23 @@ fn op_of(edit: &Command) -> AppliedOp {
     }
 }
 
+/// The `(sheet, range)`s to re-read when a touch-entry is undone/redone (a paste's
+/// `Touch::Ranges` fans out to several; `Touch::Sheets` reconciles the map instead of cells).
+fn touch_refresh_ranges(touch: &Touch) -> Vec<(SheetId, CellRange)> {
+    match touch {
+        Touch::Cells { sheet, range } => vec![(*sheet, *range)],
+        Touch::Ranges(ranges) => ranges.clone(),
+        Touch::Sheets => Vec::new(),
+    }
+}
+
+/// Converts a 1-based inclusive engine rectangle `(row0, col0, row1, col1)` to a 0-based
+/// [`CellRange`] (the clipboard slot stores the engine's tuple; the cache mirror wants a range).
+fn tuple_to_range((r0, c0, r1, c1): (i32, i32, i32, i32)) -> CellRange {
+    let cell = |r: i32, c: i32| CellRef::new(r.max(1) as u32 - 1, c.max(1) as u32 - 1);
+    CellRange::new(cell(r0, c0), cell(r1, c1))
+}
+
 /// The number of cells a [`CellRange`] covers (for the mirror's pathological-range guard).
 fn range_area(range: &CellRange) -> u64 {
     let rows = (range.end.row - range.start.row) as u64 + 1;
@@ -881,6 +1170,7 @@ mod tests {
             panic_count: 0,
             undo_touches: Vec::new(),
             redo_touches: Vec::new(),
+            clipboard: None,
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;
@@ -1593,5 +1883,412 @@ mod tests {
         assert!(worker.shared.generation.load(Ordering::Acquire) >= 1);
         let cells = worker.shared.publication.load_full().cells.len();
         assert!(cells <= (MAX_PUBLISH_ROWS * MAX_PUBLISH_COLS) as usize);
+    }
+
+    // ---- Range clipboard (`components/clipboard.md`) --------------------------------------
+
+    /// The displayed value of a cell on sheet index 0 (the only sheet in these tests).
+    fn value_at(worker: &Worker, row: u32, col: u32) -> String {
+        worker
+            .doc
+            .formatted_value(0, CellRef::new(row, col))
+            .unwrap_or_default()
+    }
+
+    /// Copy `range` on `sheet` (drains the `CopyReady` reply) and return its TSV.
+    fn do_copy(
+        worker: &mut Worker,
+        rx: &async_channel::Receiver<WorkerEvent>,
+        sheet: SheetId,
+        range: CellRange,
+        cut: bool,
+    ) -> String {
+        worker.process_batch(vec![Command::CopySelection { sheet, range, cut }]);
+        drain_events(rx)
+            .into_iter()
+            .find_map(|e| match e {
+                WorkerEvent::CopyReady { tsv } => Some(tsv),
+                _ => None,
+            })
+            .expect("CopySelection must reply CopyReady")
+    }
+
+    #[test]
+    fn copy_reply_carries_tab_separated_text() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "1"),
+            set_input(sheet, 0, 1, "2"),
+        ]);
+        drain_events(&rx);
+        let tsv = do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(0, 1)),
+            false,
+        );
+        assert_eq!(
+            tsv, "1\t2",
+            "the copy reply is the row's tab-separated values"
+        );
+    }
+
+    #[test]
+    fn copy_then_paste_internal_writes_values_and_selects() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "10"),
+            set_input(sheet, 1, 0, "20"),
+        ]);
+        drain_events(&rx);
+
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            false,
+        );
+        // Paste the A1:A2 payload with its top-left at C1 (row 0, col 2).
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 2),
+        }]);
+
+        assert_eq!(value_at(&worker, 0, 2), "10");
+        assert_eq!(value_at(&worker, 1, 2), "20");
+        // The reply carries the pasted rectangle (C1:C2) + a repaint + a style-cache delta.
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range }
+                    if *s == sheet
+                        && *range == CellRange::new(CellRef::new(0, 2), CellRef::new(1, 2))
+            )),
+            "paste replies with the pasted rectangle; got {events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { .. })));
+    }
+
+    #[test]
+    fn cut_slot_is_single_use() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "7"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            true,
+        );
+
+        // First paste moves the cut value to C1 and clears the source.
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 2),
+        }]);
+        assert_eq!(value_at(&worker, 0, 2), "7");
+        assert_eq!(value_at(&worker, 0, 0), "", "the cut source is cleared");
+        drain_events(&rx);
+
+        // The slot is consumed → a second paste has nothing to paste.
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 4),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::NothingToPaste
+                }
+            )),
+            "a cut is single-use; got {events:?}"
+        );
+        assert_eq!(
+            value_at(&worker, 0, 4),
+            "",
+            "the second paste wrote nothing"
+        );
+    }
+
+    #[test]
+    fn degenerate_slot_is_nothing_to_paste_not_overflow() {
+        // A slot with an inverted (clamped) range must reject as NothingToPaste — not wrap the
+        // `(r1 - r0 + 1) as u32` height into a spurious Overflow (Mild #3).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.clipboard = Some(ClipboardSlot {
+            sheet,
+            range: (5, 1, 2, 1), // r1 (2) < r0 (5): degenerate
+            data: serde_json::json!({ "5": { "1": { "text": "x", "style": {} } } }),
+            cut: false,
+        });
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 0),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::NothingToPaste
+                }
+            )),
+            "an inverted slot range is NothingToPaste; got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "it must NOT surface as Overflow"
+        );
+    }
+
+    #[test]
+    fn paste_internal_overflow_is_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "a"),
+            set_input(sheet, 1, 0, "b"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            false,
+        );
+        let ops_before = worker.ops_seen;
+
+        // A 2-row payload pasted onto the very last row spills past the sheet edge.
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(limits::MAX_ROWS - 1, 0),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an overflowing paste is rejected; got {events:?}"
+        );
+        assert_eq!(worker.ops_seen, ops_before, "nothing was applied");
+    }
+
+    #[test]
+    fn paste_tsv_writes_typed_cells() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::PasteTsv {
+            sheet,
+            anchor: CellRef::new(0, 0),
+            text: "1\t2\n=1+2\ttrue\n".to_string(),
+        }]);
+        assert_eq!(value_at(&worker, 0, 0), "1");
+        assert_eq!(value_at(&worker, 0, 1), "2");
+        assert_eq!(value_at(&worker, 1, 0), "3", "the =1+2 formula evaluated");
+        assert_eq!(value_at(&worker, 1, 1), "TRUE");
+        let events = drain_events(&rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Pasted { .. })),
+            "a TSV paste replies Pasted; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn paste_tsv_overflow_is_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::PasteTsv {
+            sheet,
+            anchor: CellRef::new(limits::MAX_ROWS - 1, 0),
+            text: "1\n2\n".to_string(), // two rows onto the last row → overflow
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an overflowing TSV paste is rejected; got {events:?}"
+        );
+        assert_eq!(worker.ops_seen, ops_before);
+    }
+
+    #[test]
+    fn paste_tsv_quoted_field_width_overflow_is_rejected() {
+        // CR Moderate (width): a quoted field with an embedded newline is a 3-wide record; pasted
+        // two columns from the right edge it spills — the guard must catch it, no partial write.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::PasteTsv {
+            sheet,
+            anchor: CellRef::new(0, limits::MAX_COLS - 2),
+            text: "a\t\"x\ny\"\tb".to_string(),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "a quoted 3-wide record near the right edge must overflow-reject; got {events:?}"
+        );
+        assert_eq!(worker.ops_seen, ops_before, "nothing written");
+    }
+
+    #[test]
+    fn copy_slot_survives_repeated_pastes() {
+        // A copy (not cut) is repeatable: the slot stays live across multiple pastes (Mild #4).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "42"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 2),
+        }]);
+        assert_eq!(value_at(&worker, 0, 2), "42");
+        assert!(
+            worker.clipboard.is_some(),
+            "a copy stays on the slot after the first paste"
+        );
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 4),
+        }]);
+        assert_eq!(value_at(&worker, 0, 4), "42", "the second paste also lands");
+        assert!(
+            worker.clipboard.is_some(),
+            "and the slot is still present after the second paste"
+        );
+    }
+
+    #[test]
+    fn engine_error_on_paste_restores_the_slot() {
+        // If the paste fails mid-flight (here: a slot whose JSON isn't valid `ClipboardData`, so
+        // the engine adapter errors before mutating), the copy is kept for a retry (Mild #4).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.clipboard = Some(ClipboardSlot {
+            sheet,
+            range: (1, 1, 1, 1), // valid 1×1 — passes the degenerate + overflow guards
+            data: serde_json::json!({ "not-an-i32-row": 1 }), // non-empty, but not ClipboardData
+            cut: false,
+        });
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 0),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(_)
+                }
+            )),
+            "a failed paste surfaces an engine rejection; got {events:?}"
+        );
+        assert!(
+            worker.clipboard.is_some(),
+            "the copy is kept after a failed paste (retryable)"
+        );
+    }
+
+    #[test]
+    fn paste_is_a_single_undo_step() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "5"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            anchor: CellRef::new(0, 2),
+        }]);
+        assert_eq!(value_at(&worker, 0, 2), "5");
+        drain_events(&rx);
+
+        // One undo removes the whole paste.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(value_at(&worker, 0, 2), "", "one undo reverts the paste");
+        assert_eq!(value_at(&worker, 0, 0), "5", "the copy source is untouched");
     }
 }

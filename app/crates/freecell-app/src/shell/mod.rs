@@ -18,6 +18,7 @@ pub mod menus;
 pub mod registry;
 
 mod app;
+mod clipboard;
 mod fonts;
 mod welcome;
 mod window;

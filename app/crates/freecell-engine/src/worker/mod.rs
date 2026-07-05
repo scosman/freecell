@@ -19,4 +19,4 @@ pub mod protocol;
 mod run;
 
 pub use client::{DocumentClient, WorkerEventReceiver, WORKER_STACK_SIZE};
-pub use protocol::{Command, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent};
+pub use protocol::{Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr, WorkerEvent};

@@ -27,6 +27,8 @@ use ironcalc_base::types::{CellType, Style, Worksheet};
 use ironcalc_base::Model;
 
 use crate::UserModel; // the crate's single canonical path to the IronCalc workbook type
+use ironcalc_base::ClipboardData;
+use serde::Deserialize;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -117,6 +119,18 @@ impl FontFlag {
             FontFlag::Underline => "font.u",
         }
     }
+}
+
+/// The result of copying a range to the engine clipboard (`components/clipboard.md §Copy /
+/// Cut`). Engine-free so it can cross back to the worker: `tsv` goes on the system clipboard,
+/// `data` is stashed (serialized — the concrete `ClipboardCell` type is private to
+/// ironcalc_base) for a later internal paste, and `range` is the engine's **effective**
+/// (dimension-clamped) source rectangle in 1-based inclusive `(row0, col0, row1, col1)` coords.
+#[derive(Debug, Clone)]
+pub(crate) struct CopiedRange {
+    pub tsv: String,
+    pub data: serde_json::Value,
+    pub range: (i32, i32, i32, i32),
 }
 
 /// The magic-byte family of a file, used to classify open failures into typed [`LoadError`]s
@@ -577,6 +591,121 @@ impl WorkbookDocument {
         self.model.redo()
     }
 
+    // ---- Range clipboard (`components/clipboard.md`, `architecture.md §6`) -----------------
+    //
+    // These are the ONLY feature routing through IronCalc's hidden view-selection state:
+    // `copy_to_clipboard` / `paste_from_clipboard` / `paste_csv_string` all read the engine's
+    // *selected view* (not their arguments) for the sheet + anchor, so each op first sets the
+    // selection, then calls the engine API. The selection is view-only (not undoable, no eval).
+
+    /// Point the engine's view selection at `range` (top-left as the anchor — always on the
+    /// range edge, so IronCalc's edge check passes even for full row/column/select-all ranges).
+    fn set_view_selection(&mut self, sheet_idx: u32, range: CellRange) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model.set_selected_sheet(sheet_idx)?;
+        let (r0, c0) = to_engine_coords(range.start);
+        let (r1, c1) = to_engine_coords(range.end);
+        // The selected cell must be set before the range (IronCalc validates the range against
+        // it); the top-left corner is on every range's edge.
+        self.model.set_selected_cell(r0, c0)?;
+        self.model.set_selected_range(r0, c0, r1, c1)?;
+        Ok(())
+    }
+
+    /// Copy `range` on `sheet_idx` to the engine clipboard (`copy_to_clipboard`, `common.rs:1765`).
+    /// The engine clamps the copied rectangle to `worksheet.dimension()`, so a full-column /
+    /// select-all copy is cheap; the returned `range` is that clamped extent. The `Clipboard`
+    /// struct isn't nameable outside ironcalc_base (private fields, not re-exported), so its
+    /// `csv` / `data` / `range` are read out of its `Serialize` form.
+    pub(crate) fn copy_range(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+    ) -> Result<CopiedRange, String> {
+        self.set_view_selection(sheet_idx, range)?;
+        crate::instrument::record_engine_call();
+        let clipboard = self.model.copy_to_clipboard()?;
+        let value = serde_json::to_value(&clipboard)
+            .map_err(|e| format!("failed to serialize clipboard: {e}"))?;
+        let tsv = value
+            .get("csv")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let data = value
+            .get("data")
+            .cloned()
+            .ok_or_else(|| "clipboard payload missing `data`".to_string())?;
+        let range = value
+            .get("range")
+            .cloned()
+            .ok_or_else(|| "clipboard payload missing `range`".to_string())
+            .and_then(|v| {
+                serde_json::from_value::<(i32, i32, i32, i32)>(v)
+                    .map_err(|e| format!("bad clipboard range: {e}"))
+            })?;
+        Ok(CopiedRange { tsv, data, range })
+    }
+
+    /// Paste a previously-copied engine payload at `anchor` on `dest_idx` (`paste_from_clipboard`,
+    /// `common.rs:1811`): Excel relative-reference adjustment on copy, move semantics + source
+    /// clear on cut, one undoable diff list, then the pasted area is re-selected. `source_idx` /
+    /// `source_range` are the copy-time sheet index + effective rectangle (the source cleared on
+    /// cut). The caller pauses evaluation around this (the batch's single recompute follows).
+    pub(crate) fn paste_clipboard(
+        &mut self,
+        dest_idx: u32,
+        anchor: CellRef,
+        source_idx: u32,
+        source_range: (i32, i32, i32, i32),
+        data_json: &serde_json::Value,
+        cut: bool,
+    ) -> Result<(), String> {
+        // Deserialize directly from the borrowed `Value` (no clone — `&Value` is a Deserializer).
+        let data = ClipboardData::deserialize(data_json)
+            .map_err(|e| format!("failed to deserialize clipboard data: {e}"))?;
+        // Set the destination selection to the single anchor cell (the paste tiles from it).
+        self.set_view_selection(dest_idx, CellRange::single(anchor))?;
+        crate::instrument::record_engine_call();
+        self.model
+            .paste_from_clipboard(source_idx, source_range, &data, cut)
+    }
+
+    /// Paste a tab-delimited TSV at `anchor` on `dest_idx` (`paste_csv_string`, `common.rs:1926`):
+    /// each field is applied as user input (numbers / booleans / `=formulas` / text), one
+    /// undoable diff list, then the pasted area is re-selected. Only `area.{sheet,row,column}`
+    /// are used by the engine (width/height are ignored — the reader derives them from the text).
+    pub(crate) fn paste_tsv(
+        &mut self,
+        dest_idx: u32,
+        anchor: CellRef,
+        text: &str,
+    ) -> Result<(), String> {
+        // Set the destination selection so the engine's end-of-paste re-select has a valid anchor.
+        self.set_view_selection(dest_idx, CellRange::single(anchor))?;
+        let (row, column) = to_engine_coords(anchor);
+        let area = Area {
+            sheet: dest_idx,
+            row,
+            column,
+            width: 1,
+            height: 1,
+        };
+        crate::instrument::record_engine_call();
+        self.model.paste_csv_string(&area, text)
+    }
+
+    /// The engine's current view selection as a 0-based [`CellRange`] — read back right after a
+    /// paste (both paste APIs re-select the pasted rectangle) to mirror it into FreeCell's
+    /// `SelectionModel`.
+    pub(crate) fn selected_range_0based(&self) -> CellRange {
+        crate::instrument::record_engine_call();
+        let [r0, c0, r1, c1] = self.model.get_selected_view().range;
+        // Engine coords are 1-based inclusive; clamp the `- 1` at 0 defensively.
+        let cell = |r: i32, c: i32| CellRef::new(r.max(1) as u32 - 1, c.max(1) as u32 - 1);
+        CellRange::new(cell(r0, c0), cell(r1, c1))
+    }
+
     /// Mutable reference to the owned model — the write seam used by the [`fixtures`] module
     /// to populate cells. In-crate only; the model is an `ironcalc` type and never leaves this
     /// crate. (The Phase-4 worker drives edits through the typed methods above, not this.)
@@ -877,5 +1006,189 @@ mod tests {
         assert_eq!(fill.fg_color.as_deref(), Some("#FF0000"));
         let font = reopened.cell_style(0, CellRef::new(1, 1)).unwrap().font;
         assert_eq!(font.color.as_deref(), Some("#0000FF"));
+    }
+
+    // ---- Range clipboard (`components/clipboard.md`) --------------------------------------
+
+    fn cell(row: u32, col: u32) -> CellRef {
+        CellRef::new(row, col)
+    }
+
+    /// Copy `range`, then paste its payload at `anchor` on `dest_idx` (copy semantics unless
+    /// `cut`). Returns the pasted 0-based range the engine re-selected.
+    fn copy_then_paste(
+        doc: &mut WorkbookDocument,
+        src_idx: u32,
+        range: CellRange,
+        dest_idx: u32,
+        anchor: CellRef,
+        cut: bool,
+    ) -> CellRange {
+        let copied = doc.copy_range(src_idx, range).unwrap();
+        doc.paste_clipboard(dest_idx, anchor, src_idx, copied.range, &copied.data, cut)
+            .unwrap();
+        doc.evaluate();
+        doc.selected_range_0based()
+    }
+
+    #[test]
+    fn copy_paste_roundtrips_values_and_styles() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "42").unwrap();
+        doc.set_font_flag(0, CellRange::single(a1), FontFlag::Bold, true)
+            .unwrap();
+        doc.set_fill(0, CellRange::single(a1), Some(Rgb::new(0xFF, 0, 0)))
+            .unwrap();
+        doc.evaluate();
+
+        let pasted = copy_then_paste(&mut doc, 0, CellRange::single(a1), 0, cell(0, 2), false);
+        assert_eq!(pasted, CellRange::single(cell(0, 2)));
+        // Value + both styles arrive at C1.
+        assert_eq!(doc.formatted_value(0, cell(0, 2)).unwrap(), "42");
+        let style = doc.cell_style(0, cell(0, 2)).unwrap();
+        assert!(style.font.b, "bold copied");
+        assert_eq!(
+            style.fill.fg_color.as_deref(),
+            Some("#FF0000"),
+            "fill copied"
+        );
+    }
+
+    #[test]
+    fn copy_paste_adjusts_relative_but_not_absolute_refs() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "10").unwrap(); // A1
+        doc.set_cell_input(0, cell(1, 0), "=A1").unwrap(); // A2 (relative)
+        doc.set_cell_input(0, cell(1, 1), "=$A$1").unwrap(); // B2 (absolute)
+        doc.evaluate();
+
+        // Copy A2 one row down → A3 should reference A2 (relative shift).
+        copy_then_paste(
+            &mut doc,
+            0,
+            CellRange::single(cell(1, 0)),
+            0,
+            cell(2, 0),
+            false,
+        );
+        assert_eq!(doc.cell_content(0, cell(2, 0)).unwrap(), "=A2");
+        // Copy B2 one row down → B3 keeps the absolute reference.
+        copy_then_paste(
+            &mut doc,
+            0,
+            CellRange::single(cell(1, 1)),
+            0,
+            cell(2, 1),
+            false,
+        );
+        assert_eq!(doc.cell_content(0, cell(2, 1)).unwrap(), "=$A$1");
+    }
+
+    #[test]
+    fn cut_paste_moves_value_and_clears_source() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "5").unwrap(); // A1
+        doc.set_cell_input(0, cell(1, 0), "=A1+1").unwrap(); // A2, a formula that moves with A1
+        doc.evaluate();
+
+        // Cut A1:A2 to C1 (so the internal reference A2→A1 stays within the moved block).
+        copy_then_paste(
+            &mut doc,
+            0,
+            CellRange::new(cell(0, 0), cell(1, 0)),
+            0,
+            cell(0, 2),
+            true,
+        );
+        // The block moved: C1 = 5, C2 = "=C1+1" (the intra-block reference followed the move).
+        assert_eq!(doc.formatted_value(0, cell(0, 2)).unwrap(), "5");
+        assert_eq!(doc.cell_content(0, cell(1, 2)).unwrap(), "=C1+1");
+        assert_eq!(doc.formatted_value(0, cell(1, 2)).unwrap(), "6");
+        // The source cells are cleared.
+        assert_eq!(
+            doc.formatted_value(0, cell(0, 0)).unwrap(),
+            "",
+            "A1 cleared"
+        );
+        assert_eq!(
+            doc.formatted_value(0, cell(1, 0)).unwrap(),
+            "",
+            "A2 cleared"
+        );
+    }
+
+    #[test]
+    fn full_column_copy_clamps_to_used_range() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "1").unwrap();
+        doc.set_cell_input(0, cell(1, 0), "2").unwrap();
+        doc.evaluate();
+        // Copy the entire column A (Excel-max rows) — the engine clamps to `dimension()`.
+        let full_col = CellRange::new(cell(0, 0), cell(freecell_core::limits::MAX_ROWS - 1, 0));
+        let copied = doc.copy_range(0, full_col).unwrap();
+        // The effective source range is 1-based rows 1..=2, NOT the whole column.
+        assert_eq!(copied.range, (1, 1, 2, 1), "copy clamped to the used range");
+    }
+
+    #[test]
+    fn cross_sheet_internal_paste() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "9").unwrap();
+        doc.add_sheet().unwrap(); // sheet index 1
+        doc.evaluate();
+
+        let copied = doc.copy_range(0, CellRange::single(cell(0, 0))).unwrap();
+        doc.paste_clipboard(1, cell(3, 3), 0, copied.range, &copied.data, false)
+            .unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(1, cell(3, 3)).unwrap(), "9");
+        // The source sheet is untouched (copy, not cut).
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "9");
+    }
+
+    #[test]
+    fn paste_tsv_writes_dims_and_types() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.paste_tsv(0, cell(0, 0), "1\t2\n=A1\ttrue\n").unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "1");
+        assert_eq!(doc.formatted_value(0, cell(0, 1)).unwrap(), "2");
+        // A2 got the literal "=A1" (paste is user-input; no ref adjustment) → evaluates to A1.
+        assert_eq!(doc.cell_content(0, cell(1, 0)).unwrap(), "=A1");
+        assert_eq!(doc.formatted_value(0, cell(1, 0)).unwrap(), "1");
+        assert_eq!(doc.formatted_value(0, cell(1, 1)).unwrap(), "TRUE");
+    }
+
+    #[test]
+    fn paste_tsv_tolerates_crlf_and_drops_ragged_rows() {
+        // CRLF-terminated, equal-width rows all land (each `\r\n` is one record terminator).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.paste_tsv(0, cell(0, 0), "1\t2\r\n3\t4\r\n").unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "1");
+        assert_eq!(doc.formatted_value(0, cell(0, 1)).unwrap(), "2");
+        assert_eq!(doc.formatted_value(0, cell(1, 0)).unwrap(), "3");
+        assert_eq!(doc.formatted_value(0, cell(1, 1)).unwrap(), "4");
+
+        // A ragged (narrower) middle row is DROPPED and later rows COMPACT up: with
+        // `flexible = false` the csv reader errors on the odd-width record and `paste_csv_string`
+        // skips it *without advancing the row*, so the wide row after it lands one row early.
+        // (DECISION #5 — accepted engine behaviour; NOT the "pad ⇒ skipped cells" of empty
+        // tokens within an equal-width row.)
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.paste_tsv(0, cell(0, 0), "a\tb\nc\nd\te\n").unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "a");
+        assert_eq!(doc.formatted_value(0, cell(0, 1)).unwrap(), "b");
+        // The ragged "c" row vanished — its cell is empty, not written…
+        assert_eq!(
+            doc.formatted_value(0, cell(1, 0)).unwrap(),
+            "d",
+            "the wide row compacts up into the dropped ragged row's slot"
+        );
+        assert_eq!(doc.formatted_value(0, cell(1, 1)).unwrap(), "e");
+        // …and nothing landed at what would have been row 3 (no `c` anywhere).
+        assert_eq!(doc.formatted_value(0, cell(2, 0)).unwrap(), "");
     }
 }

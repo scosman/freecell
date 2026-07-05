@@ -24,6 +24,7 @@ pub mod refs;
 pub mod selection;
 pub mod sheet_name;
 pub mod style;
+pub mod tsv;
 
 // The load-bearing types re-exported at the crate root for ergonomic downstream use
 // (the grid, engine, and shell all reach for these constantly).

@@ -573,3 +573,154 @@ fn style_edit_updates_public_cache_and_emits_delta() {
         "the style edit ships a StyleCacheUpdated delta"
     );
 }
+
+// ---- Range clipboard (`components/clipboard.md`, `functional_spec.md §2`) -----------------
+//
+// These drive the FULL public seam — spawn a real worker, send clipboard `Command`s, await the
+// `CopyReady` / `Pasted` / `PasteRejected` replies, and read the published values.
+
+/// Send a `CopySelection` and wait for its `CopyReady` reply, returning the TSV.
+fn copy_and_wait(
+    client: &DocumentClient,
+    rx: &WorkerEventReceiver,
+    sheet: SheetId,
+    range: CellRange,
+    cut: bool,
+) -> String {
+    client.send(Command::CopySelection { sheet, range, cut });
+    match wait_for(rx, |e| matches!(e, WorkerEvent::CopyReady { .. })) {
+        Some(WorkerEvent::CopyReady { tsv }) => tsv,
+        other => panic!("expected CopyReady, got {other:?}"),
+    }
+}
+
+#[test]
+fn copy_paste_through_worker_roundtrips_values() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    client.send(set_input(sheet, 0, 0, "10"));
+    client.send(set_input(sheet, 1, 0, "20"));
+    poll_until(
+        || published_text(&client, 0, 0) == "10" && published_text(&client, 1, 0) == "20",
+        "the seed values should publish",
+    );
+
+    let tsv = copy_and_wait(
+        &client,
+        &rx,
+        sheet,
+        CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+        false,
+    );
+    assert_eq!(tsv, "10\n20", "copy reply carries the column's TSV");
+
+    // Paste the A1:A2 payload at C1.
+    client.send(Command::PasteInternal {
+        sheet,
+        anchor: CellRef::new(0, 2),
+    });
+    let pasted = wait_for(&rx, |e| matches!(e, WorkerEvent::Pasted { .. }));
+    assert!(
+        matches!(
+            pasted,
+            Some(WorkerEvent::Pasted { sheet: s, range })
+                if s == sheet && range == CellRange::new(CellRef::new(0, 2), CellRef::new(1, 2))
+        ),
+        "paste replies with the pasted rectangle; got {pasted:?}"
+    );
+    poll_until(
+        || published_text(&client, 0, 2) == "10" && published_text(&client, 1, 2) == "20",
+        "the pasted values should publish",
+    );
+}
+
+#[test]
+fn paste_tsv_through_worker_writes_typed_cells() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+
+    client.send(Command::PasteTsv {
+        sheet,
+        anchor: CellRef::new(0, 0),
+        text: "1\t2\n=1+2\ttrue\n".to_string(),
+    });
+    assert!(
+        wait_for(&rx, |e| matches!(e, WorkerEvent::Pasted { .. })).is_some(),
+        "a TSV paste replies Pasted"
+    );
+    poll_until(
+        || {
+            published_text(&client, 0, 0) == "1"
+                && published_text(&client, 0, 1) == "2"
+                && published_text(&client, 1, 0) == "3"
+                && published_text(&client, 1, 1) == "TRUE"
+        },
+        "the TSV cells should publish with evaluated types",
+    );
+}
+
+#[test]
+fn paste_undo_is_a_single_step_through_worker() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    client.send(set_input(sheet, 0, 0, "5"));
+    poll_until(|| published_text(&client, 0, 0) == "5", "seed publishes");
+
+    copy_and_wait(
+        &client,
+        &rx,
+        sheet,
+        CellRange::single(CellRef::new(0, 0)),
+        false,
+    );
+    client.send(Command::PasteInternal {
+        sheet,
+        anchor: CellRef::new(0, 2),
+    });
+    poll_until(|| published_text(&client, 0, 2) == "5", "paste publishes");
+
+    // One undo reverts the whole paste; the source is untouched.
+    client.send(Command::Undo);
+    poll_until(
+        || published_text(&client, 0, 2).is_empty(),
+        "one undo reverts the paste",
+    );
+    assert_eq!(
+        published_text(&client, 0, 0),
+        "5",
+        "the copy source is intact"
+    );
+}
+
+#[test]
+fn overflow_paste_is_rejected_through_worker() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    client.send(set_input(sheet, 0, 0, "a"));
+    client.send(set_input(sheet, 1, 0, "b"));
+    poll_until(|| published_text(&client, 1, 0) == "b", "seed publishes");
+
+    copy_and_wait(
+        &client,
+        &rx,
+        sheet,
+        CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+        false,
+    );
+    // A 2-row payload pasted onto the last row spills past the sheet edge.
+    client.send(Command::PasteInternal {
+        sheet,
+        anchor: CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+    });
+    let rejected = wait_for(&rx, |e| matches!(e, WorkerEvent::PasteRejected { .. }));
+    assert!(
+        matches!(
+            rejected,
+            Some(WorkerEvent::PasteRejected {
+                reason: freecell_engine::PasteError::Overflow
+            })
+        ),
+        "an overflowing paste is rejected; got {rejected:?}"
+    );
+}

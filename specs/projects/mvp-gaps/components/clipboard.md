@@ -93,15 +93,28 @@ Worker `PasteInternal`:
 4. `slot.cut` → clear the slot (second paste of a cut is a no-op → `NothingToPaste`).
 
 Worker `PasteTsv`:
-1. Parse dims FreeCell-side (`freecell-core::tsv`): split on `\n` (strip one trailing
-   newline; `\r\n` tolerated), fields on `\t`; height = line count, width = max field
-   count (short rows pad with empty ⇒ skipped cells, not cleared cells).
+1. Parse dims FreeCell-side (`freecell-core::tsv::tsv_dims`) with the **same `csv` crate + reader
+   config the engine's `paste_csv_string` uses** (`ReaderBuilder`, delimiter `\t`, no headers,
+   default `Terminator::CRLF` — `\r`, `\n`, `\r\n` each terminate — default `"` quoting with `""`
+   escapes) rather than a hand-rolled scan, so the bound can never diverge from the engine's own
+   parse: a quoted field containing tabs/newlines is ONE field on ONE record, blank records are
+   skipped, mixed terminators honoured. `height` = record count, `width` = max field count. Read
+   with `flexible(true)` (so ragged records parse and are counted) — a **provable upper bound** on
+   BOTH dims: the engine (`flexible = false`) drops blank + ragged records (rows `<= height`) and
+   writes only the first record's width (columns `<= width`). `paste_fits` therefore never lets a
+   spill-over past the sheet edge reach the engine — a partial write would land outside the single
+   undo entry (§2.2 "no partial paste"). *(CR follow-ups: an earlier `\n`-only split undercounted
+   bare-`\r`; a physical-line scan undercounted quoted-newline widths — both bypassed the guard;
+   the shared-`csv`-parser approach fixes the whole divergence class.)*
 2. Overflow pre-check as above (dialog).
 3. Build `Area { sheet, row: anchor.0, column: anchor.1, width, height }` and call
-   `paste_csv_string(&area, &text)` (tab-delimited, values-as-user-input, undoable —
-   verified). Empty tokens are skipped by the engine (existing cells under them are
-   left untouched — Excel parity is "cleared"; accepted deviation, record in
-   DECISIONS_TO_REVIEW).
+   `paste_csv_string(&area, &text)` (tab-delimited, values-as-user-input, undoable — verified).
+   The engine (`flexible = false`) has two accepted behaviours (DECISIONS_TO_REVIEW §Phase 3 #5):
+   - **Empty tokens** within an equal-width row are **skipped** — the underlying cell is left
+     untouched (Excel *clears* it): accepted deviation.
+   - **Ragged rows** (a differing field count) error and are **dropped without advancing the
+     row**, so any following rows **compact up** into the gap: accepted engine behaviour, not
+     "pad with empty".
 4. Selection becomes the pasted area (shell, from the reply).
 
 ### Keymap & eval

@@ -13,7 +13,7 @@
 //! target, `.xlsx` enforcement, viewport overscan); this module performs them against real
 //! windows + panels + dialogs, and mediates the grid/chrome/worker seams.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -25,13 +25,14 @@ use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_core::{limits, SelectionModel, SheetId};
 use freecell_engine::{
-    Command, DocumentClient, DocumentSource, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent,
-    WorkerEventReceiver,
+    Command, DocumentClient, DocumentSource, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
+    WorkerEvent, WorkerEventReceiver,
 };
 
 use crate::chrome::{ChromeGridRequest, ChromeGridSink, ChromeView};
 use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView};
 
+use super::clipboard::ClipboardCoordinator;
 use super::lifecycle::{self, SaveTarget};
 use super::registry::WindowKey;
 use super::{
@@ -48,6 +49,9 @@ struct SinkShared {
     /// The last *accepted* selection — restored on the grid if a click-away commit is blocked by
     /// a cap-rejected pending edit (`functional_spec.md §3.3`).
     last_selection: Cell<SelectionModel>,
+    /// The range clipboard's UI state (`last_copy_text`), shared so the grid-sink copy/paste key
+    /// events and the window's `CopyReady` fold both reach it (`components/clipboard.md`).
+    clipboard: RefCell<ClipboardCoordinator>,
 }
 
 // --- Look constants (functional-POC greys, matching the chrome / grid) ---------------------
@@ -182,6 +186,7 @@ impl WorkbookWindow {
         let sink_shared = Rc::new(SinkShared {
             active_sheet: Cell::new(SheetId(0)),
             last_selection: Cell::new(SelectionModel::default()),
+            clipboard: RefCell::new(ClipboardCoordinator::new()),
         });
 
         // The grid needs the chrome handle and vice-versa; resolve both after construction via
@@ -385,6 +390,47 @@ impl WorkbookWindow {
                 self.degraded = Some(reason);
                 cx.notify();
             }
+            WorkerEvent::CopyReady { tsv } => {
+                // Write the copied TSV to the system clipboard + remember it (so our next paste
+                // routes internally). `cx` derefs to `&mut App` for the clipboard write.
+                self.sink_shared
+                    .clipboard
+                    .borrow_mut()
+                    .on_copy_ready(tsv, cx);
+            }
+            WorkerEvent::Pasted { sheet, range } => {
+                // Mirror the pasted rectangle into the selection (the pasted area becomes the new
+                // selection, `functional_spec.md §2.2`) — only if it landed on the active sheet.
+                if sheet == self.sink_shared.active_sheet.get() {
+                    let sel = SelectionModel {
+                        anchor: range.start,
+                        active: range.end,
+                    };
+                    self.sink_shared.last_selection.set(sel);
+                    self.grid.update(cx, |g, cx| g.set_selection(sel, cx));
+                    self.chrome
+                        .update(cx, |c, cx| c.on_selection_changed(sel, window, cx));
+                }
+            }
+            WorkerEvent::PasteRejected { reason } => match reason {
+                // Overflow is user-visible: a brief dialog, nothing pasted (`functional_spec.md §2.2`).
+                PasteError::Overflow => {
+                    if self.modal.is_none() {
+                        self.modal = Some(ActiveModal::Error {
+                            title: "Paste doesn't fit".into(),
+                            detail: "The copied range would extend past the edge of the sheet. \
+                                     Nothing was pasted."
+                                .into(),
+                            close_window_on_dismiss: false,
+                        });
+                        cx.notify();
+                    }
+                }
+                // A missing/consumed slot (e.g. the second paste of a cut) is log-only.
+                PasteError::NothingToPaste => {
+                    tracing::debug!("paste: nothing to paste (empty or consumed clipboard slot)");
+                }
+            },
         }
     }
 
@@ -1094,6 +1140,30 @@ fn make_grid_sink(
         GridEvent::InCellCancel => {
             if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
                 chrome.update(cx, |c, cx| c.cancel_incell(window, cx));
+            }
+        }
+        GridEvent::Copy { cut } => {
+            // Copy/cut operate on the current (last-accepted) selection.
+            shared.clipboard.borrow_mut().copy(
+                shared.active_sheet.get(),
+                shared.last_selection.get(),
+                *cut,
+                &client,
+            );
+        }
+        GridEvent::Paste => {
+            // Commit any pending edit first (Excel click-away rule); a cap-rejected edit blocks
+            // the paste and stays editing.
+            let committed = match chrome_slot.get().and_then(|w| w.upgrade()) {
+                Some(chrome) => chrome.update(cx, |c, cx| c.on_edit_commit_requested(window, cx)),
+                None => true,
+            };
+            if committed {
+                let anchor = shared.last_selection.get().range().start;
+                shared
+                    .clipboard
+                    .borrow_mut()
+                    .paste(shared.active_sheet.get(), anchor, &client, cx);
             }
         }
     })

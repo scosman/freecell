@@ -62,6 +62,25 @@ pub enum Command {
     Undo,
     /// Redo the last undone edit.
     Redo,
+    /// Copy (or cut) the selection to the engine clipboard slot (`components/clipboard.md`).
+    /// Replies with [`WorkerEvent::CopyReady`] carrying the tab-separated text to place on the
+    /// system clipboard. `cut` is recorded for the later paste (nothing clears at cut time).
+    CopySelection {
+        sheet: SheetId,
+        range: CellRange,
+        cut: bool,
+    },
+    /// Paste the engine clipboard slot at `anchor` (full-fidelity: values + adjusted formulas +
+    /// styles). Replies with [`WorkerEvent::Pasted`] (the pasted range) or
+    /// [`WorkerEvent::PasteRejected`].
+    PasteInternal { sheet: SheetId, anchor: CellRef },
+    /// Paste external tab-separated `text` at `anchor` (each token as user input). Replies with
+    /// [`WorkerEvent::Pasted`] or [`WorkerEvent::PasteRejected`].
+    PasteTsv {
+        sheet: SheetId,
+        anchor: CellRef,
+        text: String,
+    },
     /// Set the active sheet + overscanned viewport (already overscanned UI-side); triggers an
     /// immediate republish from current model state (no eval).
     SetViewport {
@@ -100,6 +119,18 @@ pub enum EditRejectedReason {
     /// The worker is degraded (a prior unrecoverable panic) and is refusing edits; the UI
     /// offers Save As + reopen.
     Degraded,
+}
+
+/// Why a paste was refused (carried by [`WorkerEvent::PasteRejected`]). `Overflow` is
+/// user-visible (a dialog — the copied range would spill past the sheet edge, so nothing is
+/// pasted); `NothingToPaste` is log-only (an internal paste with no live slot, e.g. the second
+/// paste of a cut).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteError {
+    /// The paste would extend past the Excel-max sheet edge (`functional_spec.md §2.2`).
+    Overflow,
+    /// An internal paste ran with no clipboard slot (empty, or a cut already consumed).
+    NothingToPaste,
 }
 
 /// Sheet metadata the worker publishes for the tab bar (`architecture.md §3`). `id` is stable
@@ -142,6 +173,14 @@ pub enum WorkerEvent {
     StyleCacheUpdated { sheet: SheetId },
     /// The sheet list changed (add / rename / delete) — the UI re-syncs its tab bar.
     SheetsChanged { sheets: Vec<SheetMeta> },
+    /// Reply to [`Command::CopySelection`]: the tab-separated text the UI writes to the system
+    /// clipboard (and remembers as its last copy, to route a later paste internally).
+    CopyReady { tsv: String },
+    /// Reply to a paste: it applied and the pasted rectangle (0-based) is now selected — the UI
+    /// mirrors it into its `SelectionModel`.
+    Pasted { sheet: SheetId, range: CellRange },
+    /// Reply to a paste that could not apply (`Overflow` → dialog; `NothingToPaste` → log).
+    PasteRejected { reason: PasteError },
     /// The worker hit an unrecoverable panic and is degraded: it keeps serving the last good
     /// publication + reads/save, but refuses edits. The UI shows the error bar + Save As.
     WorkerDegraded { reason: String },

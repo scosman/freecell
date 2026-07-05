@@ -8,6 +8,10 @@ publish = false
 description = "GPUI-free, IronCalc-free foundation for FreeCell: pure logic types (Axis, A1/ranges, selection, validators, palette, render-model read types). Builds and tests anywhere with no GPU/display."
 
 [dependencies]
+# Range-clipboard TSV paste dims (`tsv` module): the SAME csv parser the engine's
+# `paste_csv_string` uses, so `tsv_dims` is a quote-/terminator-aware upper bound that can't
+# diverge from the engine's own record/field parse (`components/clipboard.md §Paste-TSV`).
+csv.workspace = true
 
 [lints]
 workspace = true

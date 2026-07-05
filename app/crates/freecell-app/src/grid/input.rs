@@ -19,6 +19,12 @@ pub enum GridKeyCommand {
     Motion(Motion),
     /// Clear the current selection's cell contents (keep styles).
     ClearCells,
+    /// Cmd/Ctrl+C — copy the selection (`functional_spec.md §2.1`).
+    Copy,
+    /// Cmd/Ctrl+X — cut the selection (copy + pending-move; clears on paste).
+    Cut,
+    /// Cmd/Ctrl+V — paste at the selection anchor (`functional_spec.md §2.2`).
+    Paste,
 }
 
 /// Maps a platform keystroke — decomposed into plain data so this stays gpui-free — to a
@@ -50,6 +56,18 @@ pub fn command_for_key(
             (false, false) => Motion::Move(dir),
         };
         return Some(M(motion));
+    }
+
+    // Cmd/Ctrl+C/X/V — the range clipboard (grid focused only; the data-row / in-cell inputs
+    // never reach here, so they keep native text clipboard behaviour). Shift is reserved for
+    // future paste-special, so only the bare secondary chord binds (`functional_spec.md §2`).
+    if secondary && !shift {
+        match key {
+            "c" => return Some(GridKeyCommand::Copy),
+            "x" => return Some(GridKeyCommand::Cut),
+            "v" => return Some(GridKeyCommand::Paste),
+            _ => {}
+        }
     }
 
     match key {
@@ -212,5 +230,27 @@ mod tests {
         assert_eq!(command_for_key("a", false, false, PAGE), None);
         assert_eq!(command_for_key("escape", false, false, PAGE), None);
         assert_eq!(command_for_key("f5", true, true, PAGE), None);
+    }
+
+    #[test]
+    fn clipboard_chords_map_on_secondary_only() {
+        // Cmd/Ctrl + c/x/v map to the clipboard commands.
+        assert_eq!(
+            command_for_key("c", false, true, PAGE),
+            Some(GridKeyCommand::Copy)
+        );
+        assert_eq!(
+            command_for_key("x", false, true, PAGE),
+            Some(GridKeyCommand::Cut)
+        );
+        assert_eq!(
+            command_for_key("v", false, true, PAGE),
+            Some(GridKeyCommand::Paste)
+        );
+        // Without the secondary modifier, `c`/`x`/`v` are ordinary printable keys (type-to-replace).
+        assert_eq!(command_for_key("c", false, false, PAGE), None);
+        assert_eq!(command_for_key("v", false, false, PAGE), None);
+        // Shift is reserved (paste-special) → not bound here.
+        assert_eq!(command_for_key("v", true, true, PAGE), None);
     }
 }

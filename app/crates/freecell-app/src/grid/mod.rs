@@ -109,6 +109,12 @@ pub enum GridEvent {
     InCellCommitMove(Direction),
     /// Escape captured in the in-cell overlay — cancel the pending edit.
     InCellCancel,
+    /// Cmd/Ctrl+C (`cut: false`) / Cmd/Ctrl+X (`cut: true`) on the focused grid — copy/cut the
+    /// selection to the range clipboard (`functional_spec.md §2.1`). The window routes this to
+    /// the `ClipboardCoordinator`.
+    Copy { cut: bool },
+    /// Cmd/Ctrl+V on the focused grid — paste at the selection anchor (`functional_spec.md §2.2`).
+    Paste,
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

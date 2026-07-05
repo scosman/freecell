@@ -189,3 +189,94 @@ a human eyeball, per `render-tests/README.md`), so **no baseline PNGs were commi
 **Action needed:** on the pinned runner, `render-tests/scripts/render_tests.sh generate --only
 cell_mirror_typing` and `--only incell_editor_open`, eyeball, and commit the two PNGs. No
 existing baselines change (both cases are additive; no other rendered output changed).
+
+## Phase 3 — Range clipboard
+
+### 1. External TSV paste bypasses the input-cap security boundary (round-3 D surface)
+
+`SetCellInput` is re-validated against the input cap (length / nesting) worker-side *before*
+the recursive parser — the locked round-3 D mitigation. **External TSV paste** feeds arbitrary
+foreign clipboard text to `paste_csv_string` (each token as user input) **without** that
+per-token cap: replicating the cap correctly would mean re-implementing the `csv` crate's
+quoting to split tokens the same way the engine does, risking false rejections of valid data.
+Per `architecture.md §8` ("the existing catch_unwind + degraded-mode machinery … covers all new
+commands") the paste runs inside the same `catch_unwind` guard on the 64 MiB worker stack, which
+is the mitigation used for every other non-`SetCellInput` mutation (undo/redo of formulas,
+internal paste). **Residual risk:** a pathological deeply-nested formula pasted from another app
+could in principle overflow the stack (an *abort*, uncatchable) — the exact class the cap exists
+to kill. Flagged for owner review: if this is deemed unacceptable, add a token pre-scan that
+`validate_input`s each `\t`/`\n`-split field before pasting (accepting rare false rejections on
+exotic quoted TSV).
+
+### 2. `ClipboardSlot.sheet` stores the stable `SheetId`, not a worksheet index
+
+`architecture.md §6` / `components/clipboard.md` sketch `ClipboardSlot { sheet: u32 }`. We store
+the **stable `SheetId`** and resolve it to the volatile worksheet index at paste time, so a copy
+survives a sheet add / delete / reorder between copy and paste (matching the rest of the worker's
+id↔index discipline). If the source sheet is deleted before an internal paste, the paste replies
+`PasteRejected{NothingToPaste}` (the copy is stale).
+
+### 3. Protocol uses `SheetId` / `CellRef` / `CellRange`, not raw `u32` / `(i32,i32)`
+
+The component-doc interface writes `sheet: u32` and `anchor: (i32,i32)`. The real commands use
+the codebase's `SheetId` + `CellRef`/`CellRange` (0-based) like every other `Command`; the sole
+0→1-based conversion stays in the `document.rs` adapter (`to_engine_coords`). Same values, fewer
+ad-hoc coordinate types crossing the seam.
+
+### 4. Cut-paste updates only **intra-block** references, not external refs into the cut area
+
+`functional_spec.md §2.2` says a cut-paste's "refs into the moved area follow it". IronCalc
+0.7.1's `paste_from_clipboard` adjusts references **within** the moved block (a formula inside
+the cut rectangle that points at another cell inside it follows the move — verified + tested),
+but does **not** rewrite a formula *outside* the cut area that points *into* it (e.g. `B1=A1`
+after cutting `A1` to `C1`: `B1` stays `=A1` and now reads the emptied `A1`). This is an engine
+limitation at the pinned rev, not a FreeCell choice; matching full Excel move-with-reference
+tracking would require engine changes. Accepted for MVP.
+
+### 5. TSV paste — empty tokens skipped; **ragged rows dropped + compacted** (corrected)
+
+The engine's `paste_csv_string` (csv reader, `flexible = false`) has two behaviours, verified
+empirically against IronCalc 0.7.1 and tested in `paste_tsv_tolerates_crlf_and_drops_ragged_rows`:
+
+- **Empty tokens** within an *equal-width* row are applied as empty user input, which the engine
+  **skips** — the underlying cell is left untouched. Excel *clears* those cells. Accepted
+  deviation.
+- **Ragged rows** (a row whose field count differs from the first record) raise `UnequalLengths`;
+  `paste_csv_string` does `continue` **without incrementing the row**, so the ragged row is
+  **dropped entirely** and every following row **compacts up** by one. E.g. `"a\tb\nc\nd\te\n"`
+  writes `a b` at row 0 and `d e` at row 1 (the `c` row vanishes; `d e` does *not* land at row 2).
+  This is engine-owned behaviour — matching the spec's "pad ⇒ skipped cells" would require
+  re-serializing the TSV worker-side, which cannot be done without risking divergence from the
+  csv crate's quoting rules, so the real (drop + compaction) behaviour is documented instead.
+  Corrected in `components/clipboard.md §Paste-TSV` (the earlier "pad with empty ⇒ skipped cells"
+  wording conflated these two cases).
+
+*(Related fix, no deviation: `tsv_dims` is now computed with the **same `csv` crate + reader
+config the engine's `paste_csv_string` uses** (delimiter `\t`, default `Terminator::CRLF`
+quoting, `flexible(true)` so ragged records are counted), instead of a hand-rolled scan. Two
+successive CR findings — an `\n`-only split that undercounted bare-`\r` line endings (height), and
+a physical-line scan that undercounted quoted-newline field widths (width) — each could let a
+spill-over past the sheet edge slip through `paste_fits` into a partial, un-undoable write.
+Sharing the engine's parser eliminates the entire divergence class in both dimensions; the bound
+is a provable upper bound (engine drops blank/ragged records → fewer rows; writes only the first
+record's width → fewer columns). Fixed + regression-tested, incl. the reported `a\t"x\ny"\tb`
+quoted-newline payload.)*
+
+### 6. `serde` + `serde_json` (freecell-engine) and `csv` (freecell-core) dependencies added
+
+`components/clipboard.md` says serde_json is "already a workspace dep via open_fixups" — it is a
+`[workspace.dependencies]` pin, but `freecell-engine` did not actually depend on it. Added
+`serde_json.workspace = true` + `serde.workspace = true` to `freecell-engine` (to `to_value` the
+un-nameable `Clipboard` on copy and `ClipboardData::deserialize(&Value)` on internal paste — no
+clone; the engine's clipboard structs are not nameable outside `ironcalc_base`). Added a new
+`[workspace.dependencies]` pin `csv = "1"` (already 1.4.0 in the tree via `ironcalc_base`) and
+`csv.workspace = true` to `freecell-core`, so `tsv_dims` parses through the exact same crate the
+engine uses (§5 above). `csv` is a pure-Rust parser — no GPU/IronCalc — so it respects
+`freecell-core`'s headless-foundation constraint.
+
+### 7. Render baselines — no new cases needed (no code change)
+
+Paste changes cell values + styles, but it reuses the **existing** publication + resident
+style-cache render path (no new `RenderCase` fields, no new rendered constructs). No render cases
+were added and **no baseline PNGs change**; `cargo test --workspace` (without `FREECELL_RENDER`)
+is green. Nothing to regenerate on the pinned runner for this phase.

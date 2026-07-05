@@ -928,6 +928,14 @@ impl GridView {
                 let range = self.selection().range();
                 self.events.emit(&GridEvent::ClearCells(range), window, cx);
             }
+            // Copy/cut/paste route to the window's `ClipboardCoordinator`. Reaching here means the
+            // grid is focused and no in-cell edit is open (the early return above), so the data-row
+            // / in-cell inputs keep their native text clipboard.
+            GridKeyCommand::Copy => self
+                .events
+                .emit(&GridEvent::Copy { cut: false }, window, cx),
+            GridKeyCommand::Cut => self.events.emit(&GridEvent::Copy { cut: true }, window, cx),
+            GridKeyCommand::Paste => self.events.emit(&GridEvent::Paste, window, cx),
         }
     }
 

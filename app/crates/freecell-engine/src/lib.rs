@@ -36,7 +36,7 @@ pub use document::{
 };
 pub use instrument::{engine_call_count, reset_engine_call_count};
 pub use worker::{
-    Command, DocumentClient, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent,
+    Command, DocumentClient, EditRejectedReason, PasteError, SheetMeta, StyleAttr, WorkerEvent,
     WorkerEventReceiver, WORKER_STACK_SIZE,
 };
 

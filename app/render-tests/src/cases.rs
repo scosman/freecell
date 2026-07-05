@@ -459,6 +459,33 @@ pub fn all() -> Vec<RenderCase> {
             "border_none_clear",
             at(Scene::new()).border(1, 1, BorderSpec::NONE),
         ),
+        // ---- Structure (Phase 7): resized geometry + header selection -------------------
+        cell(
+            // A number in a column narrowed to 20 px — the value clips (resize geometry honored
+            // end-to-end through the cache, `components/grid_structure.md §5.1`).
+            "col_resized_narrow_clips_text",
+            Scene::new().input(1, 1, "1234567").col_width(1, 20.0),
+        ),
+        cell(
+            // A row grown to 48 px — the tall row's geometry reflows the grid below it.
+            "row_resized_tall",
+            at(Scene::new()).row_height(1, 48.0),
+        ),
+        RenderCase::new(
+            // A full-column header selection (`functional_spec.md §5.2`): the whole column is tinted
+            // and its header selected. The overlay is viewport-clamped (the range spans all rows).
+            "header_full_column_selected",
+            Scene::new().input(0, 1, "B1").input(2, 1, "B3"),
+            GRID_VP,
+        )
+        .selection(sel((0, 1), (freecell_core::limits::MAX_ROWS - 1, 1))),
+        RenderCase::new(
+            // A full-row header selection: the whole row is tinted, its header selected.
+            "header_full_row_selected",
+            Scene::new().input(2, 0, "A3").input(2, 2, "C3"),
+            GRID_VP,
+        )
+        .selection(sel((2, 0), (2, freecell_core::limits::MAX_COLS - 1))),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

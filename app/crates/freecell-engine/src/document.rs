@@ -511,13 +511,120 @@ impl WorkbookDocument {
 
     /// Clears a range's **contents only** (keeps styles) — `ClearCells`. One undoable engine
     /// op over the rectangle. Auto-evaluates unless paused.
+    ///
+    /// `range_clear_contents` has **no band fast path** — a full-column Area would iterate
+    /// 1,048,576 cells (`architecture.md §5.2` clamping rule). So a full-row/col/select-all range
+    /// (a header-selection Delete) is clamped to the used rectangle first; a bounded selection is
+    /// unchanged. An empty intersection (nothing used) is a no-op.
     pub(crate) fn clear_contents(
         &mut self,
         sheet_idx: u32,
         range: CellRange,
     ) -> Result<(), String> {
         crate::instrument::record_engine_call();
-        self.model.range_clear_contents(&area_of(sheet_idx, range))
+        let clamped = match self.clamp_to_used(sheet_idx, range)? {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        self.model
+            .range_clear_contents(&area_of(sheet_idx, clamped))
+    }
+
+    /// Sets the width (device px) of the inclusive column run `[col_start, col_end]` (0-based) —
+    /// `SetColumnWidths`. One undoable diff-list (`set_columns_width`, `common.rs:1055`). Device px
+    /// are converted to IronCalc px at this boundary (the grid speaks device px). Called only over
+    /// a bounded run (a resize target / selected header run), never an unbounded range.
+    pub(crate) fn set_column_widths(
+        &mut self,
+        sheet_idx: u32,
+        col_start: u32,
+        col_end: u32,
+        device_px: f64,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let px = crate::cache::col_ironcalc_px(device_px);
+        self.model
+            .set_columns_width(sheet_idx, col_start as i32 + 1, col_end as i32 + 1, px)
+    }
+
+    /// Sets the height (device px) of the inclusive row run `[row_start, row_end]` (0-based) —
+    /// `SetRowHeights`. One undoable diff-list (`set_rows_height`, `common.rs:1081`). Device px are
+    /// converted to IronCalc px here (cf. [`set_column_widths`](Self::set_column_widths)).
+    pub(crate) fn set_row_heights_px(
+        &mut self,
+        sheet_idx: u32,
+        row_start: u32,
+        row_end: u32,
+        device_px: f64,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let px = crate::cache::row_ironcalc_px(device_px);
+        self.model
+            .set_rows_height(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, px)
+    }
+
+    /// Inserts `count` blank rows so new rows appear at 0-based `row` (`InsertRows`); everything at/
+    /// after `row` shifts down and formulas adjust (`insert_rows`, `common.rs:882`; undoable). A
+    /// shift that would push used cells past the last row returns `Err(String)` (→ dialog).
+    pub(crate) fn insert_rows(
+        &mut self,
+        sheet_idx: u32,
+        row: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .insert_rows(sheet_idx, row as i32 + 1, count as i32)
+    }
+
+    /// Inserts `count` blank columns at 0-based `col` (`InsertColumns`, `common.rs:907`; undoable).
+    pub(crate) fn insert_columns(
+        &mut self,
+        sheet_idx: u32,
+        col: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .insert_columns(sheet_idx, col as i32 + 1, count as i32)
+    }
+
+    /// Deletes `count` rows starting at 0-based `row` (`DeleteRows`, `common.rs:932`; undoable —
+    /// the removed data + heights + band styles are snapshotted for undo; formulas adjust).
+    pub(crate) fn delete_rows(
+        &mut self,
+        sheet_idx: u32,
+        row: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .delete_rows(sheet_idx, row as i32 + 1, count as i32)
+    }
+
+    /// Deletes `count` columns starting at 0-based `col` (`DeleteColumns`, `common.rs:974`;
+    /// undoable).
+    pub(crate) fn delete_columns(
+        &mut self,
+        sheet_idx: u32,
+        col: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .delete_columns(sheet_idx, col as i32 + 1, count as i32)
+    }
+
+    /// The sheet's file-loaded merged ranges (0-based), parsed from `worksheet.merge_cells`
+    /// (`Vec<String>` A1 ranges). Unparseable entries are skipped (defensive). The worker's merge
+    /// guard reads this before an insert/delete (`components/grid_structure.md §5.3`).
+    pub(crate) fn merge_ranges(&self, sheet_idx: u32) -> Result<Vec<CellRange>, String> {
+        let ws = self.worksheet(sheet_idx)?;
+        Ok(ws
+            .merge_cells
+            .iter()
+            .filter_map(|m| CellRange::from_a1(m))
+            .collect())
     }
 
     /// Whether `cell` currently has the given character-format flag set (the per-cell read the

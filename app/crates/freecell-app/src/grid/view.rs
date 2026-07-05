@@ -30,7 +30,8 @@ use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
-    apply_motion, effective_edge, Align, Axis, BorderSpec, CellRef, Edge, RenderStyle,
+    apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
+    is_full_row_selection, Align, Axis, BorderSpec, CellRange, CellRef, Edge, RenderStyle,
     SelectionModel, SheetDims,
 };
 
@@ -39,11 +40,18 @@ use super::layout::{
     self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
 };
 use super::{
-    GridEvent, GridEventSink, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX, CELL_H_PAD,
-    CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, GRIDLINE, HEADER_BG,
-    HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT, SCROLLBAR_FADE_SECS,
-    SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
+    GridEvent, GridEventSink, RowOrCol, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX,
+    CELL_H_PAD, CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, GRIDLINE,
+    HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT,
+    SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
 };
+
+/// Half-width (px) of a divider resize hotspot (`ui_design.md §3`: a 6 px zone centered on the
+/// divider). Also the ±3 px within which the resize cursor shows (`functional_spec.md §5.1`).
+const RESIZE_HOTSPOT_HALF: f32 = 3.0;
+/// Minimum column width / row height a resize drag clamps to (`functional_spec.md §5.1`).
+const MIN_COL_WIDTH_PX: f32 = 8.0;
+const MIN_ROW_HEIGHT_PX: f32 = 12.0;
 
 /// The worker-written / UI-read data the grid renders from (`components/grid.md §Public
 /// interface`). In Phase 6 these are built from hand fixtures ([`super::fixtures`]); the
@@ -59,12 +67,52 @@ pub struct GridDataSources {
     pub caches: Arc<RwLock<SheetCaches>>,
 }
 
+/// What a mouse drag extends: an ordinary cell range, or a header selection (full column / full
+/// row), which extends only the active track (`components/grid_structure.md §5.2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragMode {
+    Cell,
+    ColHeader,
+    RowHeader,
+}
+
 /// An in-flight mouse drag-selection (`components/grid.md §State`: "anchor cell + last hovered
 /// cell"). The anchor is the fixed corner the range extends from; the hovered cell is recomputed
 /// from the pointer each move, so only the anchor is retained.
 #[derive(Debug, Clone, Copy)]
 struct DragState {
     anchor: CellRef,
+    mode: DragMode,
+}
+
+/// The open insert/delete header context menu (`functional_spec.md §5.3`). Grid-owned (it holds
+/// the cache's merge list for the guard + renders overlays already). `x`/`y` are grid-local; the
+/// `*_blocked` flags disable the corresponding item when the op would displace a file-loaded merge.
+#[derive(Debug, Clone, Copy)]
+struct HeaderMenu {
+    axis: RowOrCol,
+    /// The inclusive selected header run the ops apply to (sets the count `N`).
+    run: (u32, u32),
+    x: f32,
+    y: f32,
+    insert_before_blocked: bool,
+    insert_after_blocked: bool,
+    delete_blocked: bool,
+}
+
+/// A live row/column resize (`components/grid_structure.md §5.1`). `start_px` is the dragged
+/// track's size at mouse-down and `current_px` its clamped live size; `run` is the inclusive
+/// 0-based track run the release applies to (the dragged index alone, or the selected header run);
+/// `origin_coord` is the grid-local pointer coordinate (x for a column, y for a row) at mouse-down,
+/// so the delta is measured from the grab point.
+#[derive(Debug, Clone, Copy)]
+struct ResizeDrag {
+    axis: RowOrCol,
+    index: u32,
+    start_px: f32,
+    current_px: f32,
+    run: (u32, u32),
+    origin_coord: f32,
 }
 
 /// The custom virtualized grid view.
@@ -94,6 +142,15 @@ pub struct GridView {
     pending_reveal: Option<(u32, u32)>,
     /// The in-flight mouse drag-selection, if any (`None` = not dragging).
     drag: Option<DragState>,
+    /// The in-flight row/column resize, if any (updates on every mouse-move; `None` = not
+    /// resizing). Drives the live preview geometry + guide line + tooltip.
+    resize_drag: Option<ResizeDrag>,
+    /// A committed resize kept as a **frozen** preview after release, so the grid keeps showing the
+    /// new geometry until the worker's cache rebuild republishes it (no flicker back to the old
+    /// size). Cleared on the next `StyleCacheUpdated` (window), a new mouse-down, or Escape.
+    resize_preview: Option<ResizeDrag>,
+    /// The open header insert/delete context menu, if any (`functional_spec.md §5.3`).
+    header_menu: Option<HeaderMenu>,
     /// Whether the edge auto-scroll timer loop is currently running.
     autoscrolling: bool,
     /// Monotonic epoch; a running auto-scroll loop stops as soon as this changes (drag end /
@@ -130,10 +187,76 @@ pub struct GridView {
     incell_cap: Option<SharedString>,
 }
 
-/// The per-frame geometry resolved under the (briefly held) caches read lock.
+/// A live-resize preview applied to **one** axis as a cheap **O(1) per-track delta**, NOT a
+/// rebuilt axis (`components/grid_structure.md §5.1`): the committed prefix sums are reused, the
+/// dragged track reports `new_px`, and every track after it shifts by `delta = new_px - base_px`
+/// (`base_px` is the track's committed size, captured at grab). All reads are O(log + block) on the
+/// shared axis; nothing loops over the sheet, so a drag frame stays O(visible tracks) even at
+/// Excel-max — the §4 "zero work proportional to sheet size" gate.
+#[derive(Debug, Clone, Copy)]
+struct AxisPreview {
+    index: u32,
+    new_px: f32,
+    base_px: f32,
+}
+
+impl AxisPreview {
+    /// The signed size change of the dragged track (negative when shrinking).
+    fn delta(&self) -> f64 {
+        (self.new_px - self.base_px) as f64
+    }
+
+    /// The track's previewed size: `new_px` for the dragged index, else the committed size.
+    fn size(&self, base: &Axis, i: u32) -> f32 {
+        if i == self.index {
+            self.new_px
+        } else {
+            base.size_of(i)
+        }
+    }
+
+    /// The track's previewed start offset: committed offset, shifted by `delta` for tracks after
+    /// the dragged index (which move as it resizes). O(1) over the committed offset — no rebuild.
+    fn offset(&self, base: &Axis, i: u32) -> f64 {
+        let raw = base.offset_of(i);
+        if i > self.index {
+            raw + self.delta()
+        } else {
+            raw
+        }
+    }
+
+    /// The previewed total extent = committed total + `delta` (O(1)).
+    fn total(&self, base: &Axis) -> f64 {
+        base.total() + self.delta()
+    }
+
+    /// Extra viewport extent (px) at the **far** (bottom/right) edge: a **shrink** pulls tracks after
+    /// the dragged index toward the origin, so `|delta|` more px of the axis enter the viewport at
+    /// the far edge (a grow reveals nothing there). Widens the queried extent so those tracks draw.
+    fn shrink_extent(&self) -> f64 {
+        (-self.delta()).max(0.0)
+    }
+
+    /// Extra viewport extent (px) at the **near** (top/left) edge. A **grow** shifts tracks after the
+    /// dragged index *away* from the origin by `delta`, so when the dragged index is scrolled off the
+    /// near edge (e.g. a frozen preview scrolled past) the previewed content at a given scroll maps
+    /// to *earlier* raw indices — the query must start `delta` px earlier so those grown tracks are
+    /// fetched (else a blank strip up to `delta` px). A shrink needs no near widening.
+    fn grow_extent(&self) -> f64 {
+        self.delta().max(0.0)
+    }
+}
+
+/// The per-frame geometry resolved under the (briefly held) caches read lock. `row_axis`/`col_axis`
+/// are the **committed** prefix-sum axes (never rebuilt per frame); an active resize is applied as
+/// a cheap [`AxisPreview`] delta through the `*_offset` / `*_size` accessors.
 struct Frame {
     row_axis: Arc<Axis>,
     col_axis: Arc<Axis>,
+    /// A live/frozen row resize preview (at most one of `row_preview`/`col_preview` is `Some`).
+    row_preview: Option<AxisPreview>,
+    col_preview: Option<AxisPreview>,
     total_w: f64,
     total_h: f64,
     rows: Range<u32>,
@@ -143,6 +266,37 @@ struct Frame {
     content_h: f64,
     scroll_x: f64,
     scroll_y: f64,
+}
+
+impl Frame {
+    /// Previewed column start offset (content-local, pre-scroll).
+    fn col_offset(&self, c: u32) -> f64 {
+        match self.col_preview {
+            Some(p) => p.offset(&self.col_axis, c),
+            None => self.col_axis.offset_of(c),
+        }
+    }
+    /// Previewed column width.
+    fn col_size(&self, c: u32) -> f32 {
+        match self.col_preview {
+            Some(p) => p.size(&self.col_axis, c),
+            None => self.col_axis.size_of(c),
+        }
+    }
+    /// Previewed row start offset.
+    fn row_offset(&self, r: u32) -> f64 {
+        match self.row_preview {
+            Some(p) => p.offset(&self.row_axis, r),
+            None => self.row_axis.offset_of(r),
+        }
+    }
+    /// Previewed row height.
+    fn row_size(&self, r: u32) -> f32 {
+        match self.row_preview {
+            Some(p) => p.size(&self.row_axis, r),
+            None => self.row_axis.size_of(r),
+        }
+    }
 }
 
 /// Optional per-frame timing captured by [`GridView::build_grid_layers`] for the Phase-12
@@ -182,6 +336,9 @@ impl GridView {
             last_viewport: None,
             pending_reveal: None,
             drag: None,
+            resize_drag: None,
+            resize_preview: None,
+            header_menu: None,
             autoscrolling: false,
             autoscroll_epoch: 0,
             cell_index: HashMap::new(),
@@ -217,6 +374,15 @@ impl GridView {
         self.incell_open = incell_open;
         self.incell_cap = incell_cap;
         cx.notify();
+    }
+
+    /// Clears the frozen resize preview once the worker's cache rebuild has landed (the window
+    /// calls this on `StyleCacheUpdated`) — the committed geometry now comes from the resident
+    /// cache, so the preview is no longer needed (`components/grid_structure.md §5.1`).
+    pub fn clear_resize_preview(&mut self, cx: &mut Context<Self>) {
+        if self.resize_preview.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The mirror's raw text for `(sheet, cell)` if a pending edit is mirrored there on this sheet
@@ -264,6 +430,10 @@ impl GridView {
         self.mirror = None;
         self.incell_open = None;
         self.incell_cap = None;
+        // Structural interactions are anchored to the previous sheet's geometry — drop them.
+        self.resize_drag = None;
+        self.resize_preview = None;
+        self.header_menu = None;
         cx.notify();
     }
 
@@ -323,18 +493,56 @@ impl GridView {
 
         let caches = self.sources.caches.read();
         let cache = caches.get(active)?;
+        // Keep the COMMITTED axes (never rebuilt per frame). A live/just-committed resize is applied
+        // as a cheap O(1)-per-track `AxisPreview` delta, so a drag stays O(visible) even at
+        // Excel-max (`components/grid_structure.md §5.1`; the §4 "no work proportional to sheet
+        // size" gate). `visible_range` runs on the raw prefix sums; a shrinking track pulls later
+        // tracks into view, so its `shrink_extent` widens the queried extent to draw them.
         let (row_axis, col_axis) = cache.axes();
-        let total_w = cache.total_width();
-        let total_h = cache.total_height();
+        let (row_preview, col_preview) = match self.resize_drag.or(self.resize_preview) {
+            Some(rd) => {
+                let p = AxisPreview {
+                    index: rd.index,
+                    new_px: rd.current_px,
+                    base_px: rd.start_px,
+                };
+                match rd.axis {
+                    RowOrCol::Row => (Some(p), None),
+                    RowOrCol::Col => (None, Some(p)),
+                }
+            }
+            None => (None, None),
+        };
+        let total_w = col_preview.map_or_else(|| col_axis.total(), |p| p.total(&col_axis));
+        let total_h = row_preview.map_or_else(|| row_axis.total(), |p| p.total(&row_axis));
+        // Over-render both ends of the queried window under a preview: `grow_extent` widens the
+        // NEAR (top/left) end so a grow whose dragged index is scrolled off the near edge still
+        // fetches the shifted-in tracks (else a blank strip); `shrink_extent` widens the FAR
+        // (bottom/right) end so a shrink's revealed tracks draw. Only one is ever non-zero (delta is
+        // one sign); both are bounded by |delta|, so this stays O(visible).
+        let (row_near, row_far) =
+            row_preview.map_or((0.0, 0.0), |p| (p.grow_extent(), p.shrink_extent()));
+        let (col_near, col_far) =
+            col_preview.map_or((0.0, 0.0), |p| (p.grow_extent(), p.shrink_extent()));
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
         // Compute visible ranges + gutter width for a given scroll (the gutter width depends
-        // on the deepest visible row, which depends on scroll — hence a small closure).
+        // on the deepest visible row, which depends on scroll — hence a small closure). The preview
+        // over-render (near + far) is folded into the queried start + extent so every previewed-
+        // visible track is fetched (`index_at` clamps a negative start to 0).
         let ranges = |sx: f64, sy: f64| -> (Range<u32>, f32, f64, Range<u32>) {
-            let rows = row_axis.visible_range(sy, content_h, RENDER_OVERSCAN);
+            let rows = row_axis.visible_range(
+                sy - row_near,
+                content_h + row_near + row_far,
+                RENDER_OVERSCAN,
+            );
             let row_header_w = layout::row_header_width(rows.end.saturating_sub(1));
             let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            let cols = col_axis.visible_range(sx, content_w, RENDER_OVERSCAN);
+            let cols = col_axis.visible_range(
+                sx - col_near,
+                content_w + col_near + col_far,
+                RENDER_OVERSCAN,
+            );
             (rows, row_header_w, content_w, cols)
         };
 
@@ -390,6 +598,8 @@ impl GridView {
         Some(Frame {
             row_axis,
             col_axis,
+            row_preview,
+            col_preview,
             total_w,
             total_h,
             rows,
@@ -539,16 +749,24 @@ impl GridView {
         layout::row_header_width(rows.end.saturating_sub(1))
     }
 
-    /// Mouse down: claim keyboard focus, hit-test, and (on a data cell) set the selection —
-    /// shift-click extends from the current anchor, a plain click selects the single cell — then
-    /// begin a drag from the resulting anchor. Header / corner clicks are a no-op in the MVP
-    /// (`components/grid.md §Input`).
+    /// Mouse down: claim keyboard focus, hit-test, and act by region — a data cell sets/extends the
+    /// selection and begins a cell drag; a column/row header selects the full column/row and begins
+    /// a header drag; the corner selects the whole sheet (`components/grid_structure.md §5.2`).
+    /// Divider resize hotspots handle their own mouse-down (and stop propagation) before this.
     fn handle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A hotspot already started a resize (and stopped propagation); defensively, never treat
+        // this as a selection click.
+        if self.resize_drag.is_some() {
+            return;
+        }
+        // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op).
+        self.resize_preview = None;
+
         // Focus the grid so arrow keys route here (the window arranges focus after commits).
         let handle = self.focus_handle.clone();
         window.focus(&handle, cx);
@@ -576,10 +794,42 @@ impl GridView {
                 &col_axis,
             )
         };
-        let GridHit::Cell { row, col } = hit else {
-            return; // header / corner: no-op in MVP (row/col selection is a P2 feature)
-        };
+        match hit {
+            GridHit::Cell { row, col } => self.mouse_down_cell(row, col, event, window, cx),
+            GridHit::ColHeader { col } => {
+                self.select_column(col, event.modifiers.shift, window, cx);
+                self.drag = Some(DragState {
+                    anchor: self.selection().anchor,
+                    mode: DragMode::ColHeader,
+                });
+                cx.notify();
+            }
+            GridHit::RowHeader { row } => {
+                self.select_row(row, event.modifiers.shift, window, cx);
+                self.drag = Some(DragState {
+                    anchor: self.selection().anchor,
+                    mode: DragMode::RowHeader,
+                });
+                cx.notify();
+            }
+            GridHit::Corner => {
+                self.select_all(window, cx);
+                cx.notify();
+            }
+        }
+    }
 
+    /// The data-cell branch of [`handle_mouse_down`]: set/extend the selection (shift extends the
+    /// range from the existing anchor), open the in-cell editor on a double-click, and begin a
+    /// cell drag.
+    fn mouse_down_cell(
+        &mut self,
+        row: u32,
+        col: u32,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cell = CellRef::new(row, col);
         let selection = if event.modifiers.shift {
             // Shift-click extends the range from the existing anchor.
@@ -606,34 +856,108 @@ impl GridView {
         // Begin a drag from the (kept or new) anchor; subsequent moves extend to the hovered cell.
         self.drag = Some(DragState {
             anchor: selection.anchor,
+            mode: DragMode::Cell,
         });
         cx.notify();
     }
 
-    /// Mouse move: while dragging, extend the selection to the hovered cell and — when the
-    /// pointer is past a viewport edge — kick off the edge auto-scroll loop.
+    /// The full-column range for column `col` (anchor row 0 → active last row). Shift keeps the
+    /// column anchor of an existing full-column selection (extend the run); a plain click anchors
+    /// on `col`.
+    fn select_column(
+        &mut self,
+        col: u32,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dims) = self.sheet_dims() else {
+            return;
+        };
+        let anchor_col = if shift && is_full_column_selection(self.selection()) {
+            self.selection().anchor.col
+        } else {
+            col
+        };
+        let sel = SelectionModel {
+            anchor: CellRef::new(0, anchor_col),
+            active: CellRef::new(dims.rows.saturating_sub(1), col),
+        };
+        self.set_selection_and_emit(sel, window, cx);
+    }
+
+    /// The full-row range for row `row` (row analog of [`select_column`](Self::select_column)).
+    fn select_row(&mut self, row: u32, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dims) = self.sheet_dims() else {
+            return;
+        };
+        let anchor_row = if shift && is_full_row_selection(self.selection()) {
+            self.selection().anchor.row
+        } else {
+            row
+        };
+        let sel = SelectionModel {
+            anchor: CellRef::new(anchor_row, 0),
+            active: CellRef::new(row, dims.cols.saturating_sub(1)),
+        };
+        self.set_selection_and_emit(sel, window, cx);
+    }
+
+    /// Selects the whole sheet (`A1:XFD1048576`) — the corner button and Cmd/Ctrl+A
+    /// (`functional_spec.md §5.2`).
+    fn select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dims) = self.sheet_dims() else {
+            return;
+        };
+        let sel = SelectionModel {
+            anchor: CellRef::new(0, 0),
+            active: CellRef::new(dims.rows.saturating_sub(1), dims.cols.saturating_sub(1)),
+        };
+        self.set_selection_and_emit(sel, window, cx);
+    }
+
+    /// Mouse move: update a live resize, or extend the drag selection (cell or header) and — for a
+    /// cell drag past a viewport edge — kick off the edge auto-scroll loop.
     fn handle_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (local_x, local_y) = self.event_local(event.position);
+        if self.resize_drag.is_some() {
+            self.update_resize(local_x, local_y, cx);
+            return;
+        }
         let Some(drag) = self.drag else {
             return; // not dragging — nothing to do
         };
-        let (local_x, local_y) = self.event_local(event.position);
-        self.extend_drag_to_point(drag.anchor, local_x, local_y, window, cx);
-        self.maybe_start_autoscroll(window, cx);
+        match drag.mode {
+            DragMode::Cell => {
+                self.extend_drag_to_point(drag.anchor, local_x, local_y, window, cx);
+                self.maybe_start_autoscroll(window, cx);
+            }
+            DragMode::ColHeader => {
+                self.extend_header_drag(drag.anchor, RowOrCol::Col, local_x, local_y, window, cx)
+            }
+            DragMode::RowHeader => {
+                self.extend_header_drag(drag.anchor, RowOrCol::Row, local_x, local_y, window, cx)
+            }
+        }
     }
 
-    /// Mouse up: end the drag (stopping any auto-scroll loop via the epoch) and let the
-    /// scrollbars fade if a drag-scroll had shown them.
+    /// Mouse up: commit a live resize, or end the selection drag (stopping any auto-scroll loop via
+    /// the epoch) and let the scrollbars fade if a drag-scroll had shown them.
     fn handle_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(rd) = self.resize_drag.take() {
+            self.commit_resize(rd, window, cx);
+            return;
+        }
         if self.drag.take().is_some() {
             // Bump the epoch to stop the loop, but deliberately DON'T clear `autoscrolling` here:
             // the running loop still clears it itself on its next tick (≤ AUTOSCROLL_INTERVAL_MS).
@@ -645,6 +969,262 @@ impl GridView {
             if self.scrollbars_visible {
                 self.mark_scrollbars_active(cx); // schedule the fade-out
             }
+        }
+    }
+
+    /// Begin a row/column resize from a divider hotspot mouse-down (`components/grid_structure.md
+    /// §5.1`). Records the dragged track's start size + the grid-local grab coordinate; the run is
+    /// the whole selected header run when the dragged index sits inside a header selection of that
+    /// axis, else the dragged index alone (so a drag inside a 3-column header selection resizes all
+    /// three).
+    fn begin_resize(
+        &mut self,
+        axis: RowOrCol,
+        index: u32,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Focus the grid so Escape (cancel) routes here.
+        let handle = self.focus_handle.clone();
+        window.focus(&handle, cx);
+        let (local_x, local_y) = self.event_local(event.position);
+
+        let active = self.active_sheet;
+        let start_px = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            match axis {
+                RowOrCol::Row => cache.row_height(index),
+                RowOrCol::Col => cache.col_width(index),
+            }
+        };
+        let run = self.resize_run_for(axis, index);
+        let origin_coord = match axis {
+            RowOrCol::Col => local_x,
+            RowOrCol::Row => local_y,
+        };
+        self.resize_preview = None;
+        self.drag = None; // a resize is never also a selection drag
+        self.resize_drag = Some(ResizeDrag {
+            axis,
+            index,
+            start_px,
+            current_px: start_px,
+            run,
+            origin_coord,
+        });
+        cx.notify();
+    }
+
+    /// The inclusive track run a resize applies to: the whole contiguous selected header run when
+    /// the dragged `index` is inside a header selection of `axis`, else `(index, index)`
+    /// (`functional_spec.md §5.1`).
+    ///
+    /// Select-all resize is intentionally bounded-but-wide: it is classified as a **full-column**
+    /// selection (`is_full_column_selection` is true for the whole sheet), so a **column** divider
+    /// drag under select-all resizes all 16,384 columns in one `SetColumnWidths` op — bounded,
+    /// one-time at commit, and Excel-parity. The dangerous **row** analog (a 1,048,576-row
+    /// `SetRowHeights`) is deliberately avoided: select-all is NOT a full-row selection, so a **row**
+    /// divider drag under it stays a single track `(index, index)` (the `RowOrCol::Row` arm's
+    /// `is_full_row_selection` guard is false for the whole sheet).
+    fn resize_run_for(&self, axis: RowOrCol, index: u32) -> (u32, u32) {
+        let range = self.selection().range();
+        match axis {
+            RowOrCol::Col
+                if is_full_column_selection(self.selection())
+                    && index >= range.start.col
+                    && index <= range.end.col =>
+            {
+                (range.start.col, range.end.col)
+            }
+            RowOrCol::Row
+                if is_full_row_selection(self.selection())
+                    && index >= range.start.row
+                    && index <= range.end.row =>
+            {
+                (range.start.row, range.end.row)
+            }
+            _ => (index, index),
+        }
+    }
+
+    /// Update a live resize from the current pointer: `current_px = clamp(start_px + delta, MIN)`,
+    /// where `delta` is the pointer's movement along the drag axis from the grab point.
+    fn update_resize(&mut self, local_x: f32, local_y: f32, cx: &mut Context<Self>) {
+        let Some(rd) = self.resize_drag.as_mut() else {
+            return;
+        };
+        let coord = match rd.axis {
+            RowOrCol::Col => local_x,
+            RowOrCol::Row => local_y,
+        };
+        let min = match rd.axis {
+            RowOrCol::Col => MIN_COL_WIDTH_PX,
+            RowOrCol::Row => MIN_ROW_HEIGHT_PX,
+        };
+        rd.current_px = (rd.start_px + (coord - rd.origin_coord)).max(min);
+        cx.notify();
+    }
+
+    /// Commit a live resize on release: freeze the preview (so the grid keeps the new geometry
+    /// until the worker's rebuild republishes it) and emit `ResizeCommitted` over the run
+    /// (`components/grid_structure.md §5.1`).
+    fn commit_resize(&mut self, rd: ResizeDrag, window: &mut Window, cx: &mut Context<Self>) {
+        self.resize_preview = Some(rd);
+        self.events.emit(
+            &GridEvent::ResizeCommitted {
+                axis: rd.axis,
+                start: rd.run.0,
+                end: rd.run.1,
+                px: rd.current_px,
+            },
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Extend a header drag: map the pointer to a track on `axis` and move the selection's active
+    /// track there, keeping the full extent (`components/grid_structure.md §5.2`).
+    fn extend_header_drag(
+        &mut self,
+        anchor: CellRef,
+        axis: RowOrCol,
+        local_x: f32,
+        local_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let (Some(dims), point_cell) = ({
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            let cell = layout::cell_at_point(
+                local_x,
+                local_y,
+                row_header_w,
+                scroll_x,
+                scroll_y,
+                &row_axis,
+                &col_axis,
+                content_w,
+                content_h,
+            );
+            (
+                Some(SheetDims::new(row_axis.count(), col_axis.count())),
+                cell,
+            )
+        }) else {
+            return;
+        };
+        // Full extent on the fixed axis; the active track follows the pointer.
+        let active_cell = match axis {
+            RowOrCol::Col => CellRef::new(dims.rows.saturating_sub(1), point_cell.col),
+            RowOrCol::Row => CellRef::new(point_cell.row, dims.cols.saturating_sub(1)),
+        };
+        let selection = SelectionModel {
+            anchor,
+            active: active_cell,
+        };
+        if *self.selection() != selection {
+            self.set_selection_and_emit(selection, window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Right mouse-down on a header opens the insert/delete context menu (`functional_spec.md
+    /// §5.3`). A right-click outside the current header selection first selects that single header
+    /// (Excel behaviour); the menu's item-disable flags come from the sheet's file-loaded merges.
+    fn handle_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (local_x, local_y) = self.event_local(event.position);
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (_, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        // Hit-test + read the merge list under one lock.
+        let (hit, merges) = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let hit = layout::hit_test(
+                local_x,
+                local_y,
+                row_header_w,
+                scroll_x,
+                scroll_y,
+                &row_axis,
+                &col_axis,
+            );
+            (hit, cache.merges().to_vec())
+        };
+        let (axis, index) = match hit {
+            GridHit::ColHeader { col } => (RowOrCol::Col, col),
+            GridHit::RowHeader { row } => (RowOrCol::Row, row),
+            _ => {
+                // A right-click off the headers dismisses any open menu.
+                if self.header_menu.take().is_some() {
+                    cx.notify();
+                }
+                return;
+            }
+        };
+        // If the clicked header isn't inside the current header selection of that axis, select it
+        // (so the op targets what the user clicked); the run then reflects the selection.
+        let inside = match axis {
+            RowOrCol::Col => {
+                is_full_column_selection(self.selection())
+                    && index >= self.selection().range().start.col
+                    && index <= self.selection().range().end.col
+            }
+            RowOrCol::Row => {
+                is_full_row_selection(self.selection())
+                    && index >= self.selection().range().start.row
+                    && index <= self.selection().range().end.row
+            }
+        };
+        if !inside {
+            match axis {
+                RowOrCol::Col => self.select_column(index, false, window, cx),
+                RowOrCol::Row => self.select_row(index, false, window, cx),
+            }
+        }
+        let run = self.resize_run_for(axis, index);
+        let (before, after, delete) = merge_block_flags(axis, run, &merges);
+        self.header_menu = Some(HeaderMenu {
+            axis,
+            run,
+            x: local_x,
+            y: local_y,
+            insert_before_blocked: before,
+            insert_after_blocked: after,
+            delete_blocked: delete,
+        });
+        cx.notify();
+    }
+
+    /// Closes the header context menu (click-away / Escape / after an item runs).
+    fn close_header_menu(&mut self, cx: &mut Context<Self>) {
+        if self.header_menu.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -920,6 +1500,20 @@ impl GridView {
 
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
+        // Escape cancels a live resize (no command sent) — the preview clears, geometry reverts
+        // (`functional_spec.md §5.1`) — clears a lingering frozen preview (e.g. a degraded-mode
+        // post-commit preview), or closes the header context menu.
+        if key == "escape"
+            && (self.resize_drag.is_some()
+                || self.resize_preview.is_some()
+                || self.header_menu.is_some())
+        {
+            self.resize_drag = None;
+            self.resize_preview = None;
+            self.header_menu = None;
+            cx.notify();
+            return;
+        }
         // F2 opens the in-cell editor on a single-cell selection (`functional_spec.md §1.3`).
         if key == "f2" && !modifiers.modified() && self.selection().is_single() {
             let active = self.selection().active;
@@ -959,6 +1553,7 @@ impl GridView {
                 .emit(&GridEvent::Copy { cut: false }, window, cx),
             GridKeyCommand::Cut => self.events.emit(&GridEvent::Copy { cut: true }, window, cx),
             GridKeyCommand::Paste => self.events.emit(&GridEvent::Paste, window, cx),
+            GridKeyCommand::SelectAll => self.select_all(window, cx),
         }
     }
 
@@ -1216,8 +1811,8 @@ impl GridView {
         // Column-header strip.
         let mut col_children: Vec<AnyElement> = Vec::new();
         for c in frame.cols.clone() {
-            let x = (frame.col_axis.offset_of(c) - frame.scroll_x) as f32;
-            let w = frame.col_axis.size_of(c);
+            let x = (frame.col_offset(c) - frame.scroll_x) as f32;
+            let w = frame.col_size(c);
             let selected = c >= sel_c0 && c <= sel_c1;
             col_children.push(header_element(
                 x,
@@ -1253,8 +1848,8 @@ impl GridView {
         // Row-header gutter.
         let mut row_children: Vec<AnyElement> = Vec::new();
         for r in frame.rows.clone() {
-            let y = (frame.row_axis.offset_of(r) - frame.scroll_y) as f32;
-            let h = frame.row_axis.size_of(r);
+            let y = (frame.row_offset(r) - frame.scroll_y) as f32;
+            let h = frame.row_size(r);
             let selected = r >= sel_r0 && r <= sel_r1;
             row_children.push(header_element(
                 0.0,
@@ -1342,7 +1937,244 @@ impl GridView {
             }
         }
 
+        // ---- Resize guide line + size tooltip (only during a live drag, `ui_design.md §3`) ----
+        if let Some(rd) = self.resize_drag {
+            let grid_h = COL_HEADER_H + frame.content_h as f32;
+            let grid_w = frame.row_header_w + frame.content_w as f32;
+            match rd.axis {
+                RowOrCol::Col => {
+                    // The drag edge = the dragged column's previewed right boundary.
+                    let edge = frame.row_header_w
+                        + (frame.col_offset(rd.index) + frame.col_size(rd.index) as f64
+                            - frame.scroll_x) as f32;
+                    root_children.push(
+                        rect_div(edge - 0.5, 0.0, 1.0, grid_h)
+                            .bg(rgb(ACCENT))
+                            .into_any_element(),
+                    );
+                    root_children.push(resize_tooltip(
+                        edge + 4.0,
+                        2.0,
+                        format!("Width: {}", rd.current_px.round() as i32),
+                    ));
+                }
+                RowOrCol::Row => {
+                    let edge = COL_HEADER_H
+                        + (frame.row_offset(rd.index) + frame.row_size(rd.index) as f64
+                            - frame.scroll_y) as f32;
+                    root_children.push(
+                        rect_div(0.0, edge - 0.5, grid_w, 1.0)
+                            .bg(rgb(ACCENT))
+                            .into_any_element(),
+                    );
+                    root_children.push(resize_tooltip(
+                        2.0,
+                        edge + 4.0,
+                        format!("Height: {}", rd.current_px.round() as i32),
+                    ));
+                }
+            }
+        }
+
         root_children
+    }
+
+    /// The divider resize hotspots — a 6 px `col-resize` / `row-resize` zone centered on each
+    /// visible divider, painted over the header strips (hit priority) with a mouse-down that begins
+    /// a resize and stops propagation so header-selection never fires (`components/grid_structure.md
+    /// §5.1`). Built in `render` (not `build_grid_layers`) because the listeners need `cx`.
+    fn resize_hotspots(&self, frame: &Frame, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out: Vec<AnyElement> = Vec::new();
+        let content_right = frame.row_header_w + frame.content_w as f32;
+        let content_bottom = COL_HEADER_H + frame.content_h as f32;
+        // Column dividers (drag a column's RIGHT edge → resize that column).
+        for c in frame.cols.clone() {
+            let edge = frame.row_header_w
+                + (frame.col_offset(c) + frame.col_size(c) as f64 - frame.scroll_x) as f32;
+            if edge <= frame.row_header_w || edge > content_right {
+                continue; // divider off the visible header strip
+            }
+            out.push(
+                rect_div(
+                    edge - RESIZE_HOTSPOT_HALF,
+                    0.0,
+                    RESIZE_HOTSPOT_HALF * 2.0,
+                    COL_HEADER_H,
+                )
+                .cursor_col_resize()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.begin_resize(RowOrCol::Col, c, event, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .into_any_element(),
+            );
+        }
+        // Row dividers (drag a row's BOTTOM edge → resize that row).
+        for r in frame.rows.clone() {
+            let edge = COL_HEADER_H
+                + (frame.row_offset(r) + frame.row_size(r) as f64 - frame.scroll_y) as f32;
+            if edge <= COL_HEADER_H || edge > content_bottom {
+                continue;
+            }
+            out.push(
+                rect_div(
+                    0.0,
+                    edge - RESIZE_HOTSPOT_HALF,
+                    frame.row_header_w,
+                    RESIZE_HOTSPOT_HALF * 2.0,
+                )
+                .cursor_row_resize()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.begin_resize(RowOrCol::Row, r, event, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .into_any_element(),
+            );
+        }
+        out
+    }
+
+    /// The header insert/delete context menu overlay: a click-away backdrop + a small card of items
+    /// (`functional_spec.md §5.3`). Items whose op would displace a merge are disabled + a footnote
+    /// explains why. Built in `render` (needs `cx` for the item listeners).
+    fn header_menu_elements(&self, menu: HeaderMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let count = menu.run.1 - menu.run.0 + 1;
+        let (unit, before_word, after_word) = match menu.axis {
+            RowOrCol::Row => ("row", "above", "below"),
+            RowOrCol::Col => ("column", "left", "right"),
+        };
+        let plural = if count == 1 { "" } else { "s" };
+        let n = |verb: &str, side: &str| format!("{verb} {count} {unit}{plural} {side}");
+
+        // The three items: (label, disabled, event).
+        let (start, end) = (menu.run.0, menu.run.1);
+        let after_at = end.saturating_add(1);
+        let items: [(String, bool, GridEvent); 3] = match menu.axis {
+            RowOrCol::Row => [
+                (
+                    n("Insert", before_word),
+                    menu.insert_before_blocked,
+                    GridEvent::InsertRows { at: start, count },
+                ),
+                (
+                    n("Insert", after_word),
+                    menu.insert_after_blocked,
+                    GridEvent::InsertRows {
+                        at: after_at,
+                        count,
+                    },
+                ),
+                (
+                    format!("Delete {count} {unit}{plural}"),
+                    menu.delete_blocked,
+                    GridEvent::DeleteRows { at: start, count },
+                ),
+            ],
+            RowOrCol::Col => [
+                (
+                    n("Insert", before_word),
+                    menu.insert_before_blocked,
+                    GridEvent::InsertColumns { at: start, count },
+                ),
+                (
+                    n("Insert", after_word),
+                    menu.insert_after_blocked,
+                    GridEvent::InsertColumns {
+                        at: after_at,
+                        count,
+                    },
+                ),
+                (
+                    format!("Delete {count} {unit}{plural}"),
+                    menu.delete_blocked,
+                    GridEvent::DeleteColumns { at: start, count },
+                ),
+            ],
+        };
+        let any_blocked = items.iter().any(|(_, blocked, _)| *blocked);
+
+        let mut card = div()
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .flex()
+            .flex_col()
+            .p(px(4.0))
+            .bg(rgb(CELL_BG))
+            .border_1()
+            .border_color(rgb(HEADER_HAIRLINE))
+            .rounded_md()
+            .shadow_md()
+            .text_size(px(CELL_FONT_PX))
+            .min_w(px(180.0));
+        for (label, blocked, event) in items {
+            let mut item = div()
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded_sm()
+                .whitespace_nowrap()
+                .child(label);
+            if blocked {
+                item = item.text_color(rgb(HEADER_TEXT)).opacity(0.4);
+            } else {
+                item = item
+                    .cursor_pointer()
+                    .text_color(rgb(CELL_TEXT))
+                    .hover(|s| s.bg(rgb(HEADER_SELECTED_BG)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                            this.events.emit(&event, window, cx);
+                            this.close_header_menu(cx);
+                            cx.stop_propagation();
+                        }),
+                    );
+            }
+            card = card.child(item);
+        }
+        if any_blocked {
+            card = card.child(
+                div()
+                    .px(px(10.0))
+                    .py(px(3.0))
+                    .text_size(px(11.0))
+                    .text_color(rgb(HEADER_TEXT))
+                    .max_w(px(220.0))
+                    .child("Sheet has merged cells — not yet supported here."),
+            );
+        }
+
+        // A transparent full-grid backdrop closes the menu on any click outside it (and swallows
+        // the click so it doesn't also start a selection — the menu is modal while open).
+        let backdrop = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
+                    this.close_header_menu(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
+                    this.close_header_menu(cx);
+                    cx.stop_propagation();
+                }),
+            );
+        vec![
+            deferred(backdrop).into_any_element(),
+            deferred(card).into_any_element(),
+        ]
     }
 
     /// The resolved [`BorderSpec`] for a visible cell, from the per-frame snapshot: its
@@ -1465,22 +2297,43 @@ fn to_rgba(c: Rgb) -> Rgba {
     rgb(c.to_hex())
 }
 
+/// The `(insert_before, insert_after, delete)` merge-guard block flags for a header run
+/// (`components/grid_structure.md §5.3`). Insert-before / delete affect the run's start index;
+/// insert-after affects one past the run's end. `true` = the op would displace a merge → disabled.
+fn merge_block_flags(axis: RowOrCol, run: (u32, u32), merges: &[CellRange]) -> (bool, bool, bool) {
+    let (start, end) = run;
+    let after = end.saturating_add(1);
+    match axis {
+        RowOrCol::Row => (
+            blocks_row_op(merges, start),
+            blocks_row_op(merges, after),
+            blocks_row_op(merges, start),
+        ),
+        RowOrCol::Col => (
+            blocks_col_op(merges, start),
+            blocks_col_op(merges, after),
+            blocks_col_op(merges, start),
+        ),
+    }
+}
+
 /// A cell's px rectangle in **content-local** coordinates (origin at the content area's
-/// top-left, before the scroll offset is applied via the axis offsets).
+/// top-left, before the scroll offset is applied via the axis offsets). Reads through the frame's
+/// preview accessors, so a live resize reflows it with no axis rebuild.
 fn cell_rect(row: u32, col: u32, frame: &Frame) -> (f32, f32, f32, f32) {
-    let x = (frame.col_axis.offset_of(col) - frame.scroll_x) as f32;
-    let y = (frame.row_axis.offset_of(row) - frame.scroll_y) as f32;
-    let w = frame.col_axis.size_of(col);
-    let h = frame.row_axis.size_of(row);
+    let x = (frame.col_offset(col) - frame.scroll_x) as f32;
+    let y = (frame.row_offset(row) - frame.scroll_y) as f32;
+    let w = frame.col_size(col);
+    let h = frame.row_size(row);
     (x, y, w, h)
 }
 
 /// The px rectangle spanning an index range `[c0, c1) × [r0, r1)` in content-local coords.
 fn span_rect(rows: Range<u32>, cols: Range<u32>, frame: &Frame) -> (f32, f32, f32, f32) {
-    let x0 = frame.col_axis.offset_of(cols.start) - frame.scroll_x;
-    let x1 = frame.col_axis.offset_of(cols.end) - frame.scroll_x;
-    let y0 = frame.row_axis.offset_of(rows.start) - frame.scroll_y;
-    let y1 = frame.row_axis.offset_of(rows.end) - frame.scroll_y;
+    let x0 = frame.col_offset(cols.start) - frame.scroll_x;
+    let x1 = frame.col_offset(cols.end) - frame.scroll_x;
+    let y0 = frame.row_offset(rows.start) - frame.scroll_y;
+    let y1 = frame.row_offset(rows.end) - frame.scroll_y;
     (x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
 }
 
@@ -1605,6 +2458,25 @@ fn header_element(x: f32, y: f32, w: f32, h: f32, label: String, selected: bool)
 /// range fill + header edges are solid).
 fn rect_div(x: f32, y: f32, w: f32, h: f32) -> gpui::Div {
     div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h))
+}
+
+/// The live-resize size tooltip (`Width: N` / `Height: N`) anchored at grid-local `(x, y)`
+/// (`ui_design.md §3`). A small dark chip matching the app tooltip style.
+fn resize_tooltip(x: f32, y: f32, label: String) -> AnyElement {
+    div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .px_2()
+        .py_1()
+        .bg(rgb(IN_CELL_TOOLTIP_BG))
+        .text_color(rgb(IN_CELL_TOOLTIP_TEXT))
+        .text_size(px(11.0))
+        .rounded_md()
+        .shadow_md()
+        .whitespace_nowrap()
+        .child(label)
+        .into_any_element()
 }
 
 /// The in-cell editor overlay's minimum width (px) — grows rightward over neighbours for narrow
@@ -1735,6 +2607,13 @@ impl Render for GridView {
             }
 
             root_children.extend(self.build_grid_layers(&frame, None));
+            // Divider resize hotspots paint last (over the header strips) so they win the hit-test.
+            root_children.extend(self.resize_hotspots(&frame, cx));
+        }
+
+        // Header insert/delete context menu (deferred → above everything but the loading overlay).
+        if let Some(menu) = self.header_menu {
+            root_children.extend(self.header_menu_elements(menu, cx));
         }
 
         // ---- Loading overlay (over everything) ------------------------------------------
@@ -1789,6 +2668,12 @@ impl Render for GridView {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.handle_mouse_down(event, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.handle_right_mouse_down(event, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -1996,5 +2881,251 @@ mod tests {
             "the in-cell overlay must own the keyboard: {:?}",
             events.borrow()
         );
+    }
+
+    // ---- Phase 7: structure (resize, header selection, merge-menu) ------------------------
+
+    /// A left mouse-down at grid-local `(x, y)` with no modifiers.
+    fn mouse_ev(button: MouseButton, x: f32, y: f32) -> MouseDownEvent {
+        MouseDownEvent {
+            button,
+            position: gpui::point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }
+    }
+
+    #[test]
+    fn axis_preview_is_o_visible_over_a_huge_axis() {
+        // A live-resize preview must NOT rebuild the axis (that would be O(sheet) per drag frame,
+        // blowing the §4 budget). `AxisPreview` reads through the COMMITTED prefix sums with an
+        // O(1)-per-track delta — verify over an Excel-max axis (built once here, never per read).
+        let axis = Axis::new(freecell_core::limits::MAX_ROWS, |i| {
+            if i == 100 {
+                40.0
+            } else {
+                24.0
+            }
+        });
+        // Grow track 100 from 40 → 60 px (delta +20).
+        let grow = AxisPreview {
+            index: 100,
+            new_px: 60.0,
+            base_px: 40.0,
+        };
+        assert_eq!(grow.size(&axis, 100), 60.0); // dragged track reports the new size
+        assert_eq!(grow.size(&axis, 101), 24.0); // neighbour unchanged
+                                                 // Offsets: up to/at the index unchanged; after the index shifted by +20.
+        assert!((grow.offset(&axis, 100) - axis.offset_of(100)).abs() < 1e-6);
+        assert!((grow.offset(&axis, 101) - (axis.offset_of(101) + 20.0)).abs() < 1e-6);
+        // A deep track (near the end) also shifts by exactly the delta — O(1), no rebuild.
+        let deep = freecell_core::limits::MAX_ROWS - 5;
+        assert!((grow.offset(&axis, deep) - (axis.offset_of(deep) + 20.0)).abs() < 1e-6);
+        // Total is the committed total + delta (O(1)).
+        assert!((grow.total(&axis) - (axis.total() + 20.0)).abs() < 1e-6);
+        // A grow widens the NEAR end (not the far end): when the dragged index is scrolled off the
+        // top, the grown tracks map to earlier raw indices, so the query starts `delta` earlier.
+        assert_eq!(grow.grow_extent(), 20.0);
+        assert_eq!(grow.shrink_extent(), 0.0);
+        // A shrink pulls later tracks into view → its FAR extent widens by |delta| (no near widen).
+        let shrink = AxisPreview {
+            index: 100,
+            new_px: 10.0,
+            base_px: 40.0,
+        };
+        assert_eq!(shrink.shrink_extent(), 30.0);
+        assert_eq!(shrink.grow_extent(), 0.0);
+        assert!((shrink.offset(&axis, 101) - (axis.offset_of(101) - 30.0)).abs() < 1e-6);
+    }
+
+    #[gpui::test]
+    fn grow_preview_scrolled_past_index_widens_near_end(cx: &mut TestAppContext) {
+        // Regression: a GROW frozen preview whose dragged track scrolls off the top must not blank
+        // the near edge. A grow shifts later tracks away from the origin, so at a given scroll the
+        // top of the viewport shows EARLIER raw indices than the un-previewed range — the query must
+        // start earlier (the near-widening). Verified by comparing the fetched start with/without the
+        // preview at the same deep scroll (robust to the demo's row sizes).
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, _cx| {
+                    let sheet = grid.active_sheet();
+                    // Scroll well past a shallow row, no preview → the baseline range.
+                    grid.scroll.insert(sheet, (0.0, 300.0));
+                    let baseline = grid.resolve_frame(1200.0, 800.0).expect("resolves").rows;
+                    // Same scroll, but a large grow frozen at row 2 → the near-widening must pull the
+                    // fetched start EARLIER so the grown tracks shifted into view at the top are drawn.
+                    grid.resize_preview = Some(ResizeDrag {
+                        axis: RowOrCol::Row,
+                        index: 2,
+                        start_px: 24.0,
+                        current_px: 200.0,
+                        run: (2, 2),
+                        origin_coord: 0.0,
+                    });
+                    let with_grow = grid.resolve_frame(1200.0, 800.0).expect("resolves").rows;
+                    assert!(
+                        with_grow.start < baseline.start,
+                        "grow near-widening must fetch earlier tracks: {with_grow:?} vs baseline {baseline:?}"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn merge_block_flags_match_predicate() {
+        use freecell_core::{CellRange, CellRef};
+        // A merge over columns 2..=4 (0-based): a column op at/before 4 blocks, past 4 allows.
+        let merges = [CellRange::new(CellRef::new(0, 2), CellRef::new(0, 4))];
+        // Run (0,1): insert-before at 0 → blocked (merge extends to 4 >= 0); insert-after at 2 →
+        // blocked; delete at 0 → blocked.
+        assert_eq!(
+            merge_block_flags(RowOrCol::Col, (0, 1), &merges),
+            (true, true, true)
+        );
+        // Run (5,6): insert-before at 5 (past the merge) → allowed; after at 7 → allowed.
+        assert_eq!(
+            merge_block_flags(RowOrCol::Col, (5, 6), &merges),
+            (false, false, false)
+        );
+        // No merges → nothing blocked.
+        assert_eq!(
+            merge_block_flags(RowOrCol::Row, (0, 0), &[]),
+            (false, false, false)
+        );
+    }
+
+    #[gpui::test]
+    fn header_clicks_and_select_all(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // A column header click selects the full column (band form).
+                    grid.select_column(3, false, window, cx);
+                    assert!(is_full_column_selection(grid.selection()));
+                    assert_eq!(grid.selection().range().start.col, 3);
+                    assert_eq!(grid.selection().range().end.col, 3);
+
+                    // Shift extends the column run (anchor stays at col 3).
+                    grid.select_column(5, true, window, cx);
+                    assert!(is_full_column_selection(grid.selection()));
+                    assert_eq!(grid.selection().range().start.col, 3);
+                    assert_eq!(grid.selection().range().end.col, 5);
+
+                    // A row header click selects the full row.
+                    grid.select_row(2, false, window, cx);
+                    assert!(is_full_row_selection(grid.selection()));
+                    assert_eq!(grid.selection().range().start.row, 2);
+
+                    // Select-all covers the whole sheet.
+                    grid.select_all(window, cx);
+                    assert!(is_full_column_selection(grid.selection()));
+                    assert_eq!(grid.selection().range().start, CellRef::new(0, 0));
+                    assert_eq!(
+                        grid.selection().range().end,
+                        CellRef::new(
+                            freecell_core::limits::MAX_ROWS - 1,
+                            freecell_core::limits::MAX_COLS - 1
+                        )
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn resize_run_uses_selection_and_clamps(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Select full columns 1..=3, then a resize inside that run applies to all three.
+                    grid.select_column(1, false, window, cx);
+                    grid.select_column(3, true, window, cx);
+                    assert_eq!(grid.resize_run_for(RowOrCol::Col, 2), (1, 3));
+                    // Outside the run → just that column.
+                    assert_eq!(grid.resize_run_for(RowOrCol::Col, 7), (7, 7));
+
+                    // A live resize clamps to the minimum column width.
+                    grid.resize_drag = Some(ResizeDrag {
+                        axis: RowOrCol::Col,
+                        index: 2,
+                        start_px: 100.0,
+                        current_px: 100.0,
+                        run: (1, 3),
+                        origin_coord: 100.0,
+                    });
+                    grid.update_resize(-100.0, 0.0, cx); // dragged 200 px left → below the 8 px min
+                    assert_eq!(grid.resize_drag.unwrap().current_px, MIN_COL_WIDTH_PX);
+
+                    // Committing emits ResizeCommitted over the whole run and freezes the preview.
+                    let rd = grid.resize_drag.take().unwrap();
+                    events.borrow_mut().clear();
+                    grid.commit_resize(rd, window, cx);
+                    assert!(grid.resize_preview.is_some());
+                    assert!(events.borrow().iter().any(|e| matches!(
+                        e,
+                        GridEvent::ResizeCommitted {
+                            axis: RowOrCol::Col,
+                            start: 1,
+                            end: 3,
+                            ..
+                        }
+                    )));
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn resize_escape_cancels(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.resize_drag = Some(ResizeDrag {
+                        axis: RowOrCol::Row,
+                        index: 4,
+                        start_px: 24.0,
+                        current_px: 40.0,
+                        run: (4, 4),
+                        origin_coord: 0.0,
+                    });
+                    grid.handle_key_down(&key_ev("escape", None, false), window, cx);
+                    assert!(grid.resize_drag.is_none(), "Escape cancels a live resize");
+                    assert!(grid.resize_preview.is_none());
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn right_click_column_header_opens_menu(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Bounds are uncaptured in a headless test, so grid-local == window coords: a
+                    // point in the column-header strip (y < 24) past the gutter (x > 48).
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 60.0, 10.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid
+                        .header_menu
+                        .expect("a header right-click opens the menu");
+                    assert_eq!(menu.axis, RowOrCol::Col);
+                    // The demo sheet has no merges → nothing blocked.
+                    assert!(!menu.insert_before_blocked && !menu.delete_blocked);
+                    // Escape closes it.
+                    grid.handle_key_down(&key_ev("escape", None, false), window, cx);
+                    assert!(grid.header_menu.is_none());
+                });
+            })
+            .unwrap();
     }
 }

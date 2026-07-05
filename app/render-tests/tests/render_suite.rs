@@ -197,6 +197,9 @@ render_cases! {
     // Borders (Phase 6): edge paint, presets, shared-edge precedence
     border_all_thin, border_outer_medium, border_heavier_edge_wins, border_over_fill,
     border_shared_edge_adjacent, border_none_clear,
+    // Structure (Phase 7): resized geometry + header selection
+    col_resized_narrow_clips_text, row_resized_tall,
+    header_full_column_selected, header_full_row_selected,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

@@ -154,6 +154,51 @@ pub enum Command {
         range: CellRange,
         preset: BorderPreset,
     },
+    /// Set the width of an inclusive column run `[col_start, col_end]` (0-based) to `px`
+    /// **device px** (`functional_spec.md §5.1`). Geometry-only (no evaluation): applied via
+    /// `set_columns_width` (one undoable diff-list), then the active sheet's cache is rebuilt.
+    /// Sent over a **bounded** run only (a resize target / selected header run).
+    SetColumnWidths {
+        sheet: SheetId,
+        col_start: u32,
+        col_end: u32,
+        px: f64,
+    },
+    /// Set the height of an inclusive row run `[row_start, row_end]` (0-based) to `px` **device
+    /// px** (`functional_spec.md §5.1`). Geometry-only (no evaluation); cf. [`Command::SetColumnWidths`].
+    SetRowHeights {
+        sheet: SheetId,
+        row_start: u32,
+        row_end: u32,
+        px: f64,
+    },
+    /// Insert `count` blank rows so new rows appear at 0-based `row` (`functional_spec.md §5.3`);
+    /// content at/after `row` shifts down and formulas adjust. Undoable; needs evaluation. The
+    /// worker **merge-guards** it first (a merge at/after `row` → [`EditRejectedReason::MergedCells`]
+    /// dialog); a shift past the sheet edge returns an engine error → dialog.
+    InsertRows {
+        sheet: SheetId,
+        row: u32,
+        count: u32,
+    },
+    /// Insert `count` blank columns at 0-based `col` (column analog of [`Command::InsertRows`]).
+    InsertColumns {
+        sheet: SheetId,
+        col: u32,
+        count: u32,
+    },
+    /// Delete `count` rows starting at 0-based `row` (row analog; merge-guarded + undoable).
+    DeleteRows {
+        sheet: SheetId,
+        row: u32,
+        count: u32,
+    },
+    /// Delete `count` columns starting at 0-based `col` (column analog).
+    DeleteColumns {
+        sheet: SheetId,
+        col: u32,
+        count: u32,
+    },
     /// Append a new sheet.
     AddSheet,
     /// Rename a sheet (re-validated against the other sheet names here).
@@ -216,6 +261,10 @@ pub enum EditRejectedReason {
     InvalidSheetName(SheetNameError),
     /// IronCalc returned a typed error for the edit (message preserved).
     Engine(String),
+    /// An insert/delete rows/columns was blocked because the sheet has merged cells the op would
+    /// displace (`functional_spec.md §5.3`). Merged cells aren't yet supported, so the op is
+    /// refused and the UI shows the merge-guard dialog. Carries no payload (fixed message).
+    MergedCells,
     /// The apply panicked and was caught (`catch_unwind`); the batch was dropped.
     EnginePanic,
     /// The worker is degraded (a prior unrecoverable panic) and is refusing edits; the UI

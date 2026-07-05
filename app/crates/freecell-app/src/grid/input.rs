@@ -25,6 +25,9 @@ pub enum GridKeyCommand {
     Cut,
     /// Cmd/Ctrl+V — paste at the selection anchor (`functional_spec.md §2.2`).
     Paste,
+    /// Cmd/Ctrl+A — select the whole sheet (`functional_spec.md §5.2`; first press, no
+    /// expand-to-region subtlety).
+    SelectAll,
 }
 
 /// Maps a platform keystroke — decomposed into plain data so this stays gpui-free — to a
@@ -66,6 +69,7 @@ pub fn command_for_key(
             "c" => return Some(GridKeyCommand::Copy),
             "x" => return Some(GridKeyCommand::Cut),
             "v" => return Some(GridKeyCommand::Paste),
+            "a" => return Some(GridKeyCommand::SelectAll),
             _ => {}
         }
     }
@@ -252,5 +256,17 @@ mod tests {
         assert_eq!(command_for_key("v", false, false, PAGE), None);
         // Shift is reserved (paste-special) → not bound here.
         assert_eq!(command_for_key("v", true, true, PAGE), None);
+    }
+
+    #[test]
+    fn select_all_chord_maps_on_secondary_only() {
+        // Cmd/Ctrl+A → select all; the bare `a` is an ordinary printable key (type-to-replace).
+        assert_eq!(
+            command_for_key("a", false, true, PAGE),
+            Some(GridKeyCommand::SelectAll)
+        );
+        assert_eq!(command_for_key("a", false, false, PAGE), None);
+        // Shift+Cmd/Ctrl+A is not bound (reserved).
+        assert_eq!(command_for_key("a", true, true, PAGE), None);
     }
 }

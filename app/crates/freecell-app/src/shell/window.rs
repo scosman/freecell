@@ -30,7 +30,7 @@ use freecell_engine::{
 };
 
 use crate::chrome::{ChromeGridRequest, ChromeGridSink, ChromeView};
-use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView};
+use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView, RowOrCol};
 
 use super::clipboard::ClipboardCoordinator;
 use super::lifecycle::{self, SaveTarget};
@@ -327,8 +327,13 @@ impl WorkbookWindow {
             }
             WorkerEvent::StyleCacheUpdated { sheet } => {
                 // Styles/geometry changed — repaint the grid and refresh the action-row toggles
-                // for the active sheet (`components/app_shell.md §Action row`).
-                self.grid.update(cx, |_g, cx| cx.notify());
+                // for the active sheet (`components/app_shell.md §Action row`). A resize's rebuild
+                // lands here, so clear the grid's frozen resize preview (the committed geometry now
+                // comes from the resident cache — `components/grid_structure.md §5.1`).
+                self.grid.update(cx, |g, cx| {
+                    g.clear_resize_preview(cx);
+                    cx.notify();
+                });
                 if sheet == self.sink_shared.active_sheet.get() {
                     self.chrome.update(cx, |c, cx| c.refresh_active_style(cx));
                 }
@@ -462,6 +467,20 @@ impl WorkbookWindow {
                     self.modal = Some(ActiveModal::Error {
                         title: "That change couldn't be applied".into(),
                         detail,
+                        close_window_on_dismiss: false,
+                    });
+                    cx.notify();
+                }
+            }
+            // The insert/delete merge guard (`functional_spec.md §5.3`): an OK-only dialog, nothing
+            // changed.
+            EditRejectedReason::MergedCells => {
+                if self.modal.is_none() {
+                    self.modal = Some(ActiveModal::Error {
+                        title: "Merged cells not supported".into(),
+                        detail: "This sheet contains merged cells (not yet supported); \
+                                 inserting or deleting here would corrupt them."
+                            .into(),
                         close_window_on_dismiss: false,
                     });
                     cx.notify();
@@ -1168,6 +1187,51 @@ fn make_grid_sink(
                     .paste(shared.active_sheet.get(), anchor, &client, cx);
             }
         }
+        // Structure ops (`functional_spec.md §5`): resize + insert/delete route straight to the
+        // worker (the worker merge-guards insert/delete authoritatively).
+        GridEvent::ResizeCommitted {
+            axis,
+            start,
+            end,
+            px,
+        } => {
+            let sheet = shared.active_sheet.get();
+            let cmd = match axis {
+                RowOrCol::Col => Command::SetColumnWidths {
+                    sheet,
+                    col_start: *start,
+                    col_end: *end,
+                    px: *px as f64,
+                },
+                RowOrCol::Row => Command::SetRowHeights {
+                    sheet,
+                    row_start: *start,
+                    row_end: *end,
+                    px: *px as f64,
+                },
+            };
+            client.send(cmd);
+        }
+        GridEvent::InsertRows { at, count } => client.send(Command::InsertRows {
+            sheet: shared.active_sheet.get(),
+            row: *at,
+            count: *count,
+        }),
+        GridEvent::InsertColumns { at, count } => client.send(Command::InsertColumns {
+            sheet: shared.active_sheet.get(),
+            col: *at,
+            count: *count,
+        }),
+        GridEvent::DeleteRows { at, count } => client.send(Command::DeleteRows {
+            sheet: shared.active_sheet.get(),
+            row: *at,
+            count: *count,
+        }),
+        GridEvent::DeleteColumns { at, count } => client.send(Command::DeleteColumns {
+            sheet: shared.active_sheet.get(),
+            col: *at,
+            count: *count,
+        }),
     })
 }
 

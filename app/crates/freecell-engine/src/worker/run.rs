@@ -26,6 +26,7 @@ use std::time::Instant;
 use std::collections::HashSet;
 
 use freecell_core::input_cap::validate_input;
+use freecell_core::merge_guard::{blocks_col_op, blocks_row_op};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
@@ -55,6 +56,12 @@ enum AppliedKind {
     /// An add/rename/delete sheet — needs a recompute (can affect formulas) and also emits
     /// `SheetsChanged`.
     SheetOp,
+    /// A row/column resize — geometry only (no recompute), but the whole active sheet's cache is
+    /// rebuilt (the axis geometry changed; `components/grid_structure.md §5.1`).
+    GeometryOnly,
+    /// An insert/delete rows/columns — content + geometry + formulas shift, so it needs a
+    /// recompute **and** a full active-sheet cache rebuild (`components/grid_structure.md §5.3`).
+    Structure,
 }
 
 /// The cache **touch-set** of one applied undoable op, recorded so `Undo`/`Redo` can re-read the
@@ -71,6 +78,11 @@ enum Touch {
     /// A sheet add/rename/delete; on undo/redo, reconcile the caches map + rebuild the active
     /// sheet (a returning deleted sheet rebuilds lazily on next activation).
     Sheets,
+    /// A geometry resize or a structural insert/delete on `sheet`. The touched region is
+    /// unbounded (everything at/after the edit shifts) + the axis geometry changed, so on
+    /// undo/redo the sheet's cache is **rebuilt** wholesale (`build_and_store_cache`) rather than
+    /// re-reading a cell range (`components/grid_structure.md §5.1, §5.3`).
+    Rebuild { sheet: SheetId },
 }
 
 /// The worker-held clipboard slot (`architecture.md §6`, `components/clipboard.md`): the engine
@@ -96,8 +108,16 @@ enum PasteOutcome {
 /// What one successfully-applied edit was, for post-eval cache bookkeeping. `Cells`/`Sheets`
 /// push a [`Touch`]; `Undo`/`Redo` pop/move one (they consume history, don't create it).
 enum AppliedOp {
-    Cells { sheet: SheetId, range: CellRange },
+    Cells {
+        sheet: SheetId,
+        range: CellRange,
+    },
     Sheets,
+    /// A resize / insert / delete on `sheet` → the sheet cache is fully rebuilt (see
+    /// [`Touch::Rebuild`]).
+    Rebuild {
+        sheet: SheetId,
+    },
     Undo,
     Redo,
 }
@@ -251,6 +271,12 @@ impl Worker {
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
+                | Command::SetColumnWidths { .. }
+                | Command::SetRowHeights { .. }
+                | Command::InsertRows { .. }
+                | Command::InsertColumns { .. }
+                | Command::DeleteRows { .. }
+                | Command::DeleteColumns { .. }
                 | Command::AddSheet
                 | Command::RenameSheet { .. }
                 | Command::DeleteSheet { .. }
@@ -387,6 +413,17 @@ impl Worker {
                             applied_ops.push(op_of(edit));
                         }
                         Ok(AppliedKind::SheetOp) => {
+                            applied += 1;
+                            needs_eval = true;
+                            applied_ops.push(op_of(edit));
+                        }
+                        // A resize is geometry-only (no recompute); a structural insert/delete
+                        // shifts formulas (recompute). Both fully rebuild the sheet cache.
+                        Ok(AppliedKind::GeometryOnly) => {
+                            applied += 1;
+                            applied_ops.push(op_of(edit));
+                        }
+                        Ok(AppliedKind::Structure) => {
                             applied += 1;
                             needs_eval = true;
                             applied_ops.push(op_of(edit));
@@ -833,6 +870,9 @@ impl Worker {
     /// sheet. Runs after the eval + publish (styles don't depend on the recompute).
     fn mirror_applied_ops(&mut self, applied_ops: Vec<AppliedOp>, sheets_before: &[SheetMeta]) {
         let mut refresh: Vec<(SheetId, CellRange)> = Vec::new();
+        // Sheets whose whole cache must be rebuilt (a resize / insert / delete, or the undo/redo
+        // of one — the region touched is unbounded so a per-cell mirror can't express it).
+        let mut rebuild: Vec<SheetId> = Vec::new();
         for op in applied_ops {
             match op {
                 AppliedOp::Cells { sheet, range } => {
@@ -844,15 +884,22 @@ impl Worker {
                     self.undo_touches.push(Touch::Sheets);
                     self.redo_touches.clear();
                 }
+                AppliedOp::Rebuild { sheet } => {
+                    self.undo_touches.push(Touch::Rebuild { sheet });
+                    self.redo_touches.clear();
+                    rebuild.push(sheet);
+                }
                 AppliedOp::Undo => {
                     if let Some(touch) = self.undo_touches.pop() {
                         refresh.extend(touch_refresh_ranges(&touch));
+                        rebuild.extend(touch_rebuild_sheets(&touch));
                         self.redo_touches.push(touch);
                     }
                 }
                 AppliedOp::Redo => {
                     if let Some(touch) = self.redo_touches.pop() {
                         refresh.extend(touch_refresh_ranges(&touch));
+                        rebuild.extend(touch_rebuild_sheets(&touch));
                         self.undo_touches.push(touch);
                     }
                 }
@@ -872,6 +919,17 @@ impl Worker {
 
         for sheet in self.refresh_cache_cells(&refresh) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+
+        // Full rebuilds for resize / insert / delete (and their undo/redo). Only resident sheets
+        // rebuild — an absent sheet rebuilds lazily on its next activation. Deduped so a batch that
+        // resizes the same sheet twice rebuilds once.
+        rebuild.sort_unstable();
+        rebuild.dedup();
+        for sheet in rebuild {
+            if self.shared.caches.read().contains(sheet) && self.build_and_store_cache(sheet) {
+                self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+            }
         }
     }
 
@@ -1025,6 +1083,34 @@ impl Worker {
                     .collect();
                 validate_sheet_name(name, &existing).map_err(EditRejectedReason::InvalidSheetName)
             }
+            // Merge guard (authoritative layer, `components/grid_structure.md §5.3`): block an
+            // insert/delete that would displace a file-loaded merge. A merge at/after the affected
+            // 0-based index blocks (the UI also disables the menu item; this covers staleness). If
+            // the sheet doesn't resolve, let the apply path surface the error.
+            Command::InsertRows { sheet, row, .. } | Command::DeleteRows { sheet, row, .. } => {
+                self.merge_guard(*sheet, |merges| blocks_row_op(merges, *row))
+            }
+            Command::InsertColumns { sheet, col, .. }
+            | Command::DeleteColumns { sheet, col, .. } => {
+                self.merge_guard(*sheet, |merges| blocks_col_op(merges, *col))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Runs the merge-guard predicate against `sheet`'s file-loaded merges, returning
+    /// `Err(MergedCells)` when `blocked` is true. A sheet that doesn't resolve (or whose merges
+    /// can't be read) passes the guard — the apply path then surfaces its own error.
+    fn merge_guard(
+        &self,
+        sheet: SheetId,
+        blocked: impl Fn(&[CellRange]) -> bool,
+    ) -> Result<(), EditRejectedReason> {
+        let Some(idx) = self.resolve(sheet) else {
+            return Ok(());
+        };
+        match self.doc.merge_ranges(idx) {
+            Ok(merges) if blocked(&merges) => Err(EditRejectedReason::MergedCells),
             _ => Ok(()),
         }
     }
@@ -1160,6 +1246,46 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             // Borders never change values → no recompute.
             Ok(AppliedKind::StyleOnly)
         }
+        Command::SetColumnWidths {
+            sheet,
+            col_start,
+            col_end,
+            px,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_column_widths(idx, *col_start, *col_end, *px)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
+        Command::SetRowHeights {
+            sheet,
+            row_start,
+            row_end,
+            px,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_row_heights_px(idx, *row_start, *row_end, *px)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
+        Command::InsertRows { sheet, row, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.insert_rows(idx, *row, *count)?;
+            Ok(AppliedKind::Structure)
+        }
+        Command::InsertColumns { sheet, col, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.insert_columns(idx, *col, *count)?;
+            Ok(AppliedKind::Structure)
+        }
+        Command::DeleteRows { sheet, row, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.delete_rows(idx, *row, *count)?;
+            Ok(AppliedKind::Structure)
+        }
+        Command::DeleteColumns { sheet, col, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.delete_columns(idx, *col, *count)?;
+            Ok(AppliedKind::Structure)
+        }
         Command::AddSheet => {
             doc.add_sheet()?;
             Ok(AppliedKind::SheetOp)
@@ -1254,6 +1380,14 @@ fn op_of(edit: &Command) -> AppliedOp {
             sheet: *sheet,
             range: expand_by_one_cell(*range),
         },
+        // Resize / insert / delete: the touched region is unbounded (geometry + shifted content),
+        // so the whole sheet cache is rebuilt on apply and on undo/redo.
+        Command::SetColumnWidths { sheet, .. }
+        | Command::SetRowHeights { sheet, .. }
+        | Command::InsertRows { sheet, .. }
+        | Command::InsertColumns { sheet, .. }
+        | Command::DeleteRows { sheet, .. }
+        | Command::DeleteColumns { sheet, .. } => AppliedOp::Rebuild { sheet: *sheet },
         Command::AddSheet | Command::RenameSheet { .. } | Command::DeleteSheet { .. } => {
             AppliedOp::Sheets
         }
@@ -1269,7 +1403,16 @@ fn touch_refresh_ranges(touch: &Touch) -> Vec<(SheetId, CellRange)> {
     match touch {
         Touch::Cells { sheet, range } => vec![(*sheet, *range)],
         Touch::Ranges(ranges) => ranges.clone(),
-        Touch::Sheets => Vec::new(),
+        Touch::Sheets | Touch::Rebuild { .. } => Vec::new(),
+    }
+}
+
+/// The sheet(s) to fully rebuild when a touch-entry is undone/redone — only a
+/// [`Touch::Rebuild`] (a resize / insert / delete), whose region is unbounded.
+fn touch_rebuild_sheets(touch: &Touch) -> Vec<SheetId> {
+    match touch {
+        Touch::Rebuild { sheet } => vec![*sheet],
+        Touch::Cells { .. } | Touch::Ranges(_) | Touch::Sheets => Vec::new(),
     }
 }
 
@@ -2907,5 +3050,282 @@ mod tests {
         worker.process_batch(vec![Command::Undo]);
         assert_eq!(value_at(&worker, 0, 2), "", "one undo reverts the paste");
         assert_eq!(value_at(&worker, 0, 0), "5", "the copy source is untouched");
+    }
+
+    // ---- Phase 7: structure (resize, insert/delete, clamp, merge guard) --------------------
+
+    /// A resident cache's device-px column width for `col`.
+    fn col_w(worker: &Worker, sheet: SheetId, col: u32) -> f32 {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .col_width(col)
+    }
+    /// A resident cache's device-px row height for `row`.
+    fn row_h(worker: &Worker, sheet: SheetId, row: u32) -> f32 {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(row)
+    }
+
+    #[test]
+    fn set_columns_width_range_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetColumnWidths {
+            sheet,
+            col_start: 1,
+            col_end: 2,
+            px: 200.0,
+        }]);
+        // The resize round-trips device px through the engine (device → IronCalc → device) and the
+        // cache is rebuilt to reflect it; the untouched column stays at the default.
+        assert!(
+            (col_w(&worker, sheet, 1) - 200.0).abs() < 1.0,
+            "col 1 = {}",
+            col_w(&worker, sheet, 1)
+        );
+        assert!((col_w(&worker, sheet, 2) - 200.0).abs() < 1.0);
+        assert!(
+            (col_w(&worker, sheet, 0) - 100.0).abs() < 1.0,
+            "col 0 default"
+        );
+        // Undo is one step and restores the default width.
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            (col_w(&worker, sheet, 1) - 100.0).abs() < 1.0,
+            "after undo col 1 = {}",
+            col_w(&worker, sheet, 1)
+        );
+    }
+
+    #[test]
+    fn set_rows_height_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetRowHeights {
+            sheet,
+            row_start: 3,
+            row_end: 3,
+            px: 60.0,
+        }]);
+        assert!(
+            (row_h(&worker, sheet, 3) - 60.0).abs() < 1.0,
+            "row 3 = {}",
+            row_h(&worker, sheet, 3)
+        );
+        assert!(
+            (row_h(&worker, sheet, 0) - 24.0).abs() < 1.0,
+            "row 0 default"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            (row_h(&worker, sheet, 3) - 24.0).abs() < 1.0,
+            "after undo row 3 default"
+        );
+    }
+
+    #[test]
+    fn insert_rows_shifts_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..10,
+            cols: 0..3,
+        }]);
+        worker.process_batch(vec![set_input(sheet, 2, 0, "42")]); // A3 = 42
+                                                                  // Insert one row at the top → A3's content shifts down to A4.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+        assert_eq!(
+            value_at(&worker, 3, 0),
+            "42",
+            "content shifted down one row"
+        );
+        assert_eq!(value_at(&worker, 2, 0), "", "the vacated row is empty");
+        // Undo restores the original position.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            value_at(&worker, 2, 0),
+            "42",
+            "undo restores the pre-insert layout"
+        );
+    }
+
+    #[test]
+    fn delete_columns_shifts_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..3,
+            cols: 0..5,
+        }]);
+        worker.process_batch(vec![set_input(sheet, 0, 2, "z")]); // C1 = z
+                                                                 // Delete column A → C1's content shifts left to B1.
+        worker.process_batch(vec![Command::DeleteColumns {
+            sheet,
+            col: 0,
+            count: 1,
+        }]);
+        assert_eq!(
+            value_at(&worker, 0, 1),
+            "z",
+            "content shifted left one column"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            value_at(&worker, 0, 2),
+            "z",
+            "undo restores the deleted column"
+        );
+    }
+
+    #[test]
+    fn clear_contents_clamps_full_column() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 5, 1, "x")]); // B6
+                                                                 // Delete over the WHOLE column B (all 1,048,576 rows). The clamp keeps this from iterating
+                                                                 // the full band — it clears only the used cell and returns promptly.
+        let full_col_b = CellRange::new(CellRef::new(0, 1), CellRef::new(limits::MAX_ROWS - 1, 1));
+        worker.process_batch(vec![Command::ClearCells {
+            sheet,
+            range: full_col_b,
+        }]);
+        assert_eq!(
+            value_at(&worker, 5, 1),
+            "",
+            "the used cell in the column was cleared"
+        );
+    }
+
+    /// Builds a merged-cell fixture xlsx (`K7:L10`) by saving a fresh workbook and injecting a
+    /// `<mergeCells>` element into its sheet XML — IronCalc has no merge-creation API at 0.7.1, but
+    /// its importer reads `mergeCells` from the file (`import/worksheets.rs:load_merge_cells`).
+    fn merged_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::{Read, Write};
+        let base = dir.join("base.xlsx");
+        WorkbookDocument::new_empty().unwrap().save(&base).unwrap();
+        let bytes = std::fs::read(&base).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let out = dir.join("merged.xlsx");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&out).unwrap());
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut content = Vec::new();
+            f.read_to_end(&mut content).unwrap();
+            if name.contains("worksheets/sheet1.xml") {
+                let s = String::from_utf8(content).unwrap().replace(
+                    "</worksheet>",
+                    "<mergeCells count=\"1\"><mergeCell ref=\"K7:L10\"/></mergeCells></worksheet>",
+                );
+                content = s.into_bytes();
+            }
+            writer.start_file(name, opts).unwrap();
+            writer.write_all(&content).unwrap();
+        }
+        writer.finish().unwrap();
+        out
+    }
+
+    /// A worker over an already-opened document (the merged fixture), with its active-sheet cache
+    /// built — mirrors `test_worker` but takes the document.
+    fn worker_over(doc: WorkbookDocument) -> (Worker, async_channel::Receiver<WorkerEvent>) {
+        let (tx, rx) = async_channel::unbounded();
+        let shared = Arc::new(Shared::new(SheetId(0)));
+        let mut worker = Worker {
+            doc,
+            shared,
+            event_tx: tx,
+            active_sheet: SheetId(0),
+            viewport: None,
+            ops_seen: 0,
+            eval_count: 0,
+            degraded: false,
+            panic_count: 0,
+            undo_touches: Vec::new(),
+            redo_touches: Vec::new(),
+            clipboard: None,
+        };
+        if let Some(first) = worker.sheet_metas().first() {
+            worker.active_sheet = first.id;
+        }
+        worker.build_and_store_cache(worker.active_sheet);
+        (worker, rx)
+    }
+
+    #[test]
+    fn merge_guard_blocks_and_allows_on_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = merged_fixture(dir.path());
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        // The merge parses into a 0-based range (K7:L10 → rows 6..=9, cols 10..=11)…
+        let merge = CellRange::new(CellRef::new(6, 10), CellRef::new(9, 11));
+        assert_eq!(doc.merge_ranges(0).unwrap(), vec![merge]);
+        let (mut worker, rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+        // …and rides into the resident cache for the UI guard layer.
+        assert_eq!(
+            worker.shared.caches.read().get(sheet).unwrap().merges(),
+            &[merge]
+        );
+
+        // Inserting ABOVE the merge (0-based row 6 = 1-based 7) is blocked with the typed dialog
+        // reason, and nothing changes.
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 6,
+            count: 1,
+        }]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "insert above a merge must be refused with MergedCells"
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "a blocked insert commits nothing"
+        );
+
+        // Inserting BELOW every merge (0-based row 10 = 1-based 11) is allowed and commits.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 10,
+            count: 1,
+        }]);
+        assert!(
+            worker.ops_seen > ops_before,
+            "an insert below all merges must apply"
+        );
+        let deleting_col_left_of_merge = drain_events(&rx);
+        assert!(
+            !deleting_col_left_of_merge.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "an op below all merges must not be merge-blocked"
+        );
     }
 }

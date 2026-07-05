@@ -31,7 +31,7 @@ judgment calls in a `DECISIONS_TO_REVIEW.md` here).
       on_paste_styles + clamps + row auto-grow; family/size dropdowns (§3.3).
 - [x] **Phase 6 — Borders**: cache `BorderSpec` interning + edge rendering; presets
       menu via `set_area_with_border` (§3.4).
-- [ ] **Phase 7 — Structure**: resize hotspots/cursors/preview/commit (§5.1); header
+- [x] **Phase 7 — Structure**: resize hotspots/cursors/preview/commit (§5.1); header
       selection + select-all + clamping rule (§5.2); insert/delete menu + merge
       guard (§5.3).
 - [ ] **Phase 8 — Titlebar (macOS) + closeout**: on-device smoke first, then

@@ -1297,9 +1297,10 @@ impl ChromeView {
 
     // ---- Read accessors (tests + render) --------------------------------------------------
 
-    /// The ref box text (`B7` / `B2:D9`).
+    /// The ref box text: `B7` / `B2:D9` for cells, and the band forms `C:C` / `3:7` / `A:XFD`
+    /// for header selections (`components/grid_structure.md §5.2`).
     pub fn ref_box_text(&self) -> String {
-        self.selection.to_a1()
+        freecell_core::format_selection_ref(&self.selection)
     }
 
     /// The content field's current text.

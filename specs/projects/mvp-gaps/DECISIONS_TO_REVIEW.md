@@ -578,3 +578,156 @@ border" visibly does nothing. This is engine-owned and geometrically defensible 
 perpendicular edge). Recorded so it isn't later mistaken for a bug. NOT fixed by disabling those
 presets for band selections — that gating is gold-plating the MVP doesn't need (`All`/`Outer`/`Inner`/
 the axis-matching edge presets all still work on bands).
+
+## Phase 7 — Structure (resize, header selection, insert/delete + merge guard)
+
+### 1. Merge guard uses a typed `EditRejectedReason::MergedCells`, not a new `WorkerError` type
+
+`components/grid_structure.md` / `architecture.md §5.3` sketch insert/delete replying `Result<(),
+WorkerError>` with `WorkerError::MergesInWay`. The codebase already surfaces dialog-worthy worker
+refusals through `WorkerEvent::EditRejected { reason: EditRejectedReason }`, so I added an
+`EditRejectedReason::MergedCells` variant (no payload — fixed §5.3 message) rather than introducing a
+parallel `WorkerError` reply channel. The window renders it as the OK-only dialog "Merged cells not
+supported / This sheet contains merged cells (not yet supported); inserting or deleting here would
+corrupt them." Insert/delete **bounds** errors (shift past the sheet edge) ride the existing
+`EditRejectedReason::Engine(msg)` path → the generic "That change couldn't be applied" dialog with the
+engine message. Same behaviour, no new seam type. Confirm the wording split is acceptable.
+
+### 2. The header insert/delete context menu is GRID-owned + grid-rendered, not shell-owned (deviation)
+
+`functional_spec.md §5.3` / `components/grid_structure.md` say "the shell opens a gpui-component context
+menu". I render it in the **grid** instead. Rationale: the grid's event sink runs from inside the grid's
+own `update` and the established rule (`shell/window.rs` header comment) is that a sink must **never
+lease the `WorkbookWindow` entity** from a sibling's update — so the grid cannot poke window state to
+open a window-owned menu without a deferred round-trip. The grid already (a) owns and renders overlays
+(the in-cell editor), and (b) holds the resident `SheetCache` carrying the parsed `merges()` the guard
+needs. So the grid computes the per-item merge-block flags (via the shared `blocks_row_op`/`blocks_col_op`
+predicate), renders a small card overlay (hand-rolled clickable divs + a click-away backdrop, **not**
+gpui-component `ContextMenu`), and on an item click emits new `GridEvent::{InsertRows,InsertColumns,
+DeleteRows,DeleteColumns}{at,count}` the window forwards to the worker. Disabled items are dimmed with a
+footnote ("Sheet has merged cells — not yet supported here.") rather than a per-item hover tooltip (the
+grid isn't a full toolkit; the footnote conveys the same reason). `GridEvent::HeaderContextMenu` +
+`HeaderMenuRequest` were therefore **not** added. Please confirm the grid-owned menu is acceptable.
+
+### 3. Resize AND insert/delete mirror the cache with a full sheet **rebuild** (`Touch::Rebuild`)
+
+`architecture.md §5.1` suggested resize reuse the targeted `set_row_heights` geometry-batch cache path.
+I unified resize + insert/delete onto a single new `AppliedKind::{GeometryOnly,Structure}` →
+`AppliedOp::Rebuild{sheet}` → `Touch::Rebuild{sheet}`, which **rebuilds the whole active-sheet cache**
+(`build_and_store_cache`) on apply and on undo/redo. Rationale: insert/delete shifts the entire sheet
+below/right of the edit (an unbounded touch a per-cell mirror can't express) and moves geometry + band
+styles, so a full rebuild is required regardless; using the same path for a resize is simpler and the
+rebuild is ms-scale (bounded by populated cells + custom sizes, not sheet size). Geometry-only resizes
+skip evaluation; structural insert/delete evaluate once (formulas adjust). Verified by
+`set_columns_width_range_and_undo`, `set_rows_height_and_undo`, `insert_rows_shifts_and_undo`,
+`delete_columns_shifts_and_undo`.
+
+### 4. Resize preview is O(visible) delta-adjustment (spec-compliant; SUPERSEDES the earlier rebuild)
+
+**Resolved (CR fix).** The first cut rebuilt a whole preview `Axis` each drag frame — O(sheet) prefix-sum
+work a code-review perf pass measured at ~1.4 ms (1M rows / 0 overrides) up to ~27 ms (1M / 5000
+overrides), blowing the `architecture.md §4` frame budget (p99 ≤ 8.33 ms, "zero work proportional to
+sheet size"). It is now implemented per `components/grid_structure.md §5.1` as an **O(visible)
+delta-adjustment**: the committed prefix-sum axes are **never rebuilt** during a drag. A new
+`AxisPreview { index, new_px, base_px }` reads through the shared committed `Axis` with an O(1)-per-track
+delta — `size(i)` = `new_px` at the dragged index else the committed size; `offset(i)` = committed offset
+`+ (new_px − base_px)` for tracks after the index; `total` = committed total + delta. The `Frame` carries
+`row_preview`/`col_preview: Option<AxisPreview>` and every geometry consumer reads through the
+`frame.{col,row}_{offset,size}` accessors. `visible_range` runs on the raw prefix sums; a **shrink**
+widens the queried extent by `shrink_extent() = |delta|` so newly-revealed tracks at the far edge draw (a
+grow reveals nothing — the committed range is a superset). Per-frame work is now O(visible tracks) for
+both axes even at Excel-max; guarded by `axis_preview_is_o_visible_over_a_huge_axis` (asserts correct
+geometry over a 1,048,576-row axis with reads that never rebuild it). The prior full-rebuild deviation no
+longer applies.
+
+**Over-render, both ends (CR-review fix):** the visible-range query widens on BOTH ends under a preview,
+not just the far end. `shrink_extent()` widens the FAR (bottom/right) end so a **shrink**'s revealed
+tracks draw; `grow_extent()` widens the NEAR (top/left) end so a **grow** whose dragged index has
+scrolled off the near edge (a frozen preview scrolled past) still fetches the grown tracks that shifted
+into view at the top — else a blank strip up to `delta` px. Only one is ever non-zero (delta has one
+sign); both are bounded by `|delta|`, so the query stays O(visible). Guarded by
+`grow_preview_scrolled_past_index_widens_near_end` (a grow's fetched range starts earlier than the
+un-previewed baseline at the same deep scroll).
+
+**Residual (accepted, unchanged):** the preview still adjusts only the **single dragged track**, so a
+multi-track header-run resize previews one divider and snaps the whole run to the new size on release (the
+committed `SetColumnWidths`/`SetRowHeights` over the run + the worker rebuild). CR note #4 flags this as an
+acceptable minor fidelity gap vs §5.1 "live reflow"; extending the delta to preview the whole run's live
+reflow is a follow-up, not done here.
+
+### 4a. Select-all column resize is bounded-but-wide (Excel parity); the 1M-row analog is prevented
+
+`resize_run_for` under a select-all (whole-sheet) selection returns `(0, 16383)` for a **column** divider
+drag → one `SetColumnWidths` over all 16,384 columns (bounded, one-time at commit, Excel-parity). The
+dangerous **row** analog is deliberately avoided: select-all is classified `is_full_column_selection` but
+**not** `is_full_row_selection`, so a **row** divider drag under select-all stays a single track
+`(index, index)` — never a 1,048,576-row `SetRowHeights`. Documented in a `resize_run_for` code comment.
+
+### 5. Resize commit round-trips device px; releasing at exactly the engine default clears the override
+
+The grid speaks **device px**; `SetColumnWidths`/`SetRowHeights` carry device px and the document
+converts to IronCalc px at the boundary (inverse of `cache::{col_px,row_px}`). IronCalc's
+`set_column_width` marks a track custom only when `width != DEFAULT_COLUMN_WIDTH`, so a column dragged to
+exactly 100 device px (= IronCalc's 125 px default) becomes **non-custom** and the rebuild renders it at
+the default — consistent (default width = no override), noted so it isn't mistaken for a lost resize.
+
+### 6. `ClearCells` now clamps full-row/col/select-all to the used range (§5.2 clamping rule)
+
+`range_clear_contents` has no band fast path, so a header-selection **Delete** (a full-column range)
+would iterate 1,048,576 cells. `document.clear_contents` now clamps a full-row/col/select-all range to
+`worksheet.dimension()` first (empty intersection → no-op); a bounded selection is unchanged. Behaviour
+is identical for ordinary selections; only the pathological band is bounded. `op_of` still returns the
+original range for the mirror (band-creating → full rebuild, which correctly reflects the cleared cells).
+Verified by `clear_contents_clamps_full_column`.
+
+### 7. Select-all reference form is `A:XFD` (column form), reconciling §5.2 vs the component doc
+
+`functional_spec.md §5.2` writes select-all as `A1:XFD1048576`; the `components/grid_structure.md`
+`format_selection_ref` table (the primary spec for this phase) writes it as `A:XFD`. `format_selection_ref`
+follows the component doc: a whole-sheet selection spans all rows → the column band form `A:XFD`. Full
+columns → `C:C`/`C:E`, full rows → `3:3`/`3:7`, bounded → `A1`/`B2:D9`. The ref box now uses this.
+
+### 8. Degraded-worker mode: resize **commit** is a silent no-op; the preview + selection still work
+
+`functional_spec.md §6` lists "resize/selection/copy still work" under degraded mode. Selection and copy
+do (they don't route through the edit path). A resize's **live preview** (UI-only) also works during the
+drag. But the **commit** (`SetColumnWidths`/`SetRowHeights`) rides the coalesced edit path, which a
+degraded worker refuses (`EditRejectedReason::Degraded`, no dialog) — the engine may be poisoned, so
+writing geometry is unsafe. The frozen preview then never receives a `StyleCacheUpdated`, so it is
+cleared instead by **Escape** (the Escape handler's guard now includes a `resize_preview`-only state — a
+CR-review fix), the next mouse-down, or a sheet switch. Net: in degraded mode a resize drag previews but
+the release changes nothing. Accepted (data safety over convenience).
+
+### 9. Merge-guard testing: fixture generated at test time (IronCalc has no merge-creation API at 0.7.1)
+
+ironcalc_base 0.7.1 exposes `worksheet.merge_cells: Vec<String>` (A1 ranges) but **no API to create a
+merge** on a live model (`model` is `pub(crate)`; only file import populates merges via
+`import/worksheets.rs::load_merge_cells`). To test the guard end-to-end, `merged_fixture` saves a fresh
+workbook, injects `<mergeCells count="1"><mergeCell ref="K7:L10"/></mergeCells>` into its sheet XML with
+the `zip` crate, and reopens it — the importer reads it back. Verified: `merge_ranges` parses it, the
+resident cache carries it, insert **above** the merge is blocked (`MergedCells`), insert **below** all
+merges applies. Also confirmed the engine's `insert_rows` does **not** shift `merge_cells` — which is
+exactly why the guard is required (a blocked op never reaches that corruption).
+
+### 10. Render baselines to regenerate on the pinned runner (ALL ADDITIVE — no existing baseline changes)
+
+Four **new** additive render cases (registered in both `cases::all()` and the `render_cases!` list, so
+`case_names_match_table` stays green; `cargo test --workspace` without `FREECELL_RENDER` is green). This
+container cannot run the Xvfb + lavapipe capture stack, so **no baseline PNGs were committed** — generate
++ eyeball each on the pinned runner (`app/render-tests/README.md`):
+
+- `col_resized_narrow_clips_text` — a 7-digit number in a 20 px column (resize geometry clips text).
+- `row_resized_tall` — a cell in a 48 px-tall row (resize geometry reflows below).
+- `header_full_column_selected` — a full-column header selection (whole column tinted, header
+  selected, viewport-clamped overlay).
+- `header_full_row_selected` — a full-row header selection.
+
+**None modify** an existing baseline (resize geometry only affects the two new cases; a full-extent
+selection is a new selection shape, and no prior case selects one).
+
+**Interactive constructs deliberately NOT baselined** (not in the static capture surface): the divider
+resize **cursors** (`col-resize`/`row-resize`) and hover hotspots; the live-drag **guide line + size
+tooltip** (needs an active mouse drag the static scene can't set up); and the **header context menu**
+(opened by a right-click). These are exercised by the grid unit tests, not the pixel suite. The
+insert/delete **content shift** needs no new render case — a shifted cell renders through the existing
+publication path (ordinary cell rendering at new coordinates), no new rendered construct.

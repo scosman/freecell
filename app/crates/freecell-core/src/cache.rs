@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::axis::Axis;
 use crate::border::BorderSpec;
-use crate::refs::SheetId;
+use crate::refs::{CellRange, SheetId};
 use crate::style::RenderStyle;
 
 /// Default column width in px when the file specifies no override (`ui_design.md §3.3`).
@@ -81,6 +81,11 @@ pub struct SheetCache {
     /// `components/action_bar.md`); the grid does not read it (default cells render at the grid's
     /// own `CELL_FONT_PX`). `0` when unknown (a bare fixture cache that never set it).
     default_font_size_q: u16,
+    /// The sheet's file-loaded merged ranges (0-based), parsed once at cache build from
+    /// `worksheet().merge_cells` (`components/grid_structure.md §5.3`). Consumed by the insert/
+    /// delete **merge guard**: the UI disables a menu item whose op would displace a merge. Merged
+    /// cells are otherwise unsupported (a deferred project), so the grid does not render them.
+    merges: Vec<CellRange>,
 }
 
 /// The canonical default number-format code (IronCalc's `Style::default().num_fmt`, lowercase).
@@ -328,6 +333,12 @@ impl SheetCache {
         self.default_font_size_q
     }
 
+    /// The sheet's file-loaded merged ranges (0-based). The grid reads these to gate the insert/
+    /// delete context-menu items behind the merge guard (`components/grid_structure.md §5.3`).
+    pub fn merges(&self) -> &[CellRange] {
+        &self.merges
+    }
+
     /// Interns `style` into the resolved table (equal styles share a [`StyleId`]).
     fn intern(&mut self, style: RenderStyle) -> StyleId {
         if let Some(&id) = self.style_ids.get(&style) {
@@ -454,6 +465,7 @@ pub struct SheetCacheBuilder {
     font_families: Vec<Arc<str>>,
     border_specs: Vec<BorderSpec>,
     default_font_size_q: u16,
+    merges: Vec<CellRange>,
 }
 
 impl SheetCacheBuilder {
@@ -475,6 +487,7 @@ impl SheetCacheBuilder {
             font_families: seed_font_families(),
             border_specs: seed_border_specs(),
             default_font_size_q: 0,
+            merges: Vec::new(),
         }
     }
 
@@ -482,6 +495,18 @@ impl SheetCacheBuilder {
     /// so the action bar can label a default cell with the real workbook default size.
     pub fn set_default_font_size_q(&mut self, q: u16) {
         self.default_font_size_q = q;
+    }
+
+    /// Records a file-loaded merged range (0-based) — the engine's build loop pushes one per parsed
+    /// `worksheet().merge_cells` entry, for the insert/delete merge guard.
+    pub fn push_merge(&mut self, range: CellRange) {
+        self.merges.push(range);
+    }
+
+    /// Records a merged range (consuming/fluent form for hand-built fixtures/tests).
+    pub fn merge(mut self, range: CellRange) -> Self {
+        self.push_merge(range);
+        self
     }
 
     /// Interns a number-format `code` into the side table, returning its [`RenderStyle::num_fmt`]
@@ -617,6 +642,7 @@ impl SheetCacheBuilder {
             font_families: self.font_families,
             border_specs: self.border_specs,
             default_font_size_q: self.default_font_size_q,
+            merges: self.merges,
         }
     }
 }
@@ -896,6 +922,18 @@ mod tests {
         assert_eq!(built.render_style(0, 0).unwrap().border, id);
         assert_eq!(built.resolved.len(), 2, "border distinguishes StyleIds");
         assert_eq!(built.border_specs().len(), 2); // [NONE, all_thin]
+    }
+
+    #[test]
+    fn merges_round_trip_through_builder() {
+        use crate::refs::{CellRange, CellRef};
+        // A fresh cache carries no merges.
+        assert!(SheetCacheBuilder::new(4, 4).build().merges().is_empty());
+        // Pushed merges survive the build in order.
+        let a = CellRange::new(CellRef::new(6, 10), CellRef::new(9, 11)); // K7:L10
+        let b = CellRange::single(CellRef::new(0, 0)); // A1
+        let cache = SheetCacheBuilder::new(20, 20).merge(a).merge(b).build();
+        assert_eq!(cache.merges(), &[a, b]);
     }
 
     #[test]

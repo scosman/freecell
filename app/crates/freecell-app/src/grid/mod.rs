@@ -81,6 +81,14 @@ pub const AUTOSCROLL_INTERVAL_MS: u64 = 16;
 /// place so a future font pass names the family here and at the `grid/view.rs` text sites.
 pub const GRID_FONT_FAMILY: &str = "Inter";
 
+/// Which axis a structural interaction targets — a resize / insert / delete of rows or columns
+/// (`components/grid_structure.md §5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOrCol {
+    Row,
+    Col,
+}
+
 /// Events the grid raises to its owner (`WorkbookWindow`, Phase 11). Phase 8 drives
 /// [`GridEvent::SelectionChanged`] (mouse + keyboard), [`GridEvent::ViewportChanged`]
 /// (scroll / keyboard reveal / edge auto-scroll), and [`GridEvent::ClearCells`]
@@ -115,6 +123,25 @@ pub enum GridEvent {
     Copy { cut: bool },
     /// Cmd/Ctrl+V on the focused grid — paste at the selection anchor (`functional_spec.md §2.2`).
     Paste,
+    /// A row/column resize was committed on release (`functional_spec.md §5.1`). `start..=end` is
+    /// the inclusive 0-based track run — the dragged index alone, or the whole selected header run
+    /// when the dragged header sits inside a header selection; `px` is the released device-px size.
+    /// The window forwards it as `SetColumnWidths` / `SetRowHeights`.
+    ResizeCommitted {
+        axis: RowOrCol,
+        start: u32,
+        end: u32,
+        px: f32,
+    },
+    /// Insert `count` rows so new rows appear at 0-based `at` (`functional_spec.md §5.3`, chosen
+    /// from the header context menu). The window forwards it as `Command::InsertRows`.
+    InsertRows { at: u32, count: u32 },
+    /// Insert `count` columns at 0-based `at`.
+    InsertColumns { at: u32, count: u32 },
+    /// Delete `count` rows starting at 0-based `at`.
+    DeleteRows { at: u32, count: u32 },
+    /// Delete `count` columns starting at 0-based `at`.
+    DeleteColumns { at: u32, count: u32 },
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

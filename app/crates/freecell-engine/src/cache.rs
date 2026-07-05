@@ -49,6 +49,17 @@ pub(crate) fn row_px(ironcalc_px: f64) -> f32 {
     (ironcalc_px * (DEFAULT_ROW_HEIGHT_PX as f64 / IRONCALC_DEFAULT_ROW_HEIGHT_PX)) as f32
 }
 
+/// Converts a FreeCell device-px column width back to IronCalc pixels — the inverse of [`col_px`],
+/// used to write a user resize (the grid speaks device px; the engine stores IronCalc px).
+pub(crate) fn col_ironcalc_px(device_px: f64) -> f64 {
+    device_px * (IRONCALC_DEFAULT_COL_WIDTH_PX / DEFAULT_COL_WIDTH_PX as f64)
+}
+
+/// Converts a FreeCell device-px row height back to IronCalc pixels — the inverse of [`row_px`].
+pub(crate) fn row_ironcalc_px(device_px: f64) -> f64 {
+    device_px * (IRONCALC_DEFAULT_ROW_HEIGHT_PX / DEFAULT_ROW_HEIGHT_PX as f64)
+}
+
 /// The FreeCell-px row-height **override** for `row` (0-based): `Some(px)` when the engine reports
 /// a non-default height (a custom or auto-fit row), `None` when it is at the IronCalc default (so
 /// the cache uses its own default). The worker's mirror path uses this to reflect IronCalc's
@@ -269,6 +280,16 @@ pub(crate) fn build_sheet_cache(
                     band_rows.insert(r0);
                 }
             }
+        }
+    }
+
+    // Merged ranges: parse the sheet's file-loaded A1 merge strings once (0-based) for the
+    // insert/delete merge guard (`components/grid_structure.md §5.3`). A hostile/unparseable
+    // entry is skipped + logged (never panics — defensive against malformed files).
+    for m in &ws.merge_cells {
+        match freecell_core::CellRange::from_a1(m) {
+            Some(range) => builder.push_merge(range),
+            None => tracing::debug!(merge = %m, "cache: skipping unparseable merge range"),
         }
     }
 

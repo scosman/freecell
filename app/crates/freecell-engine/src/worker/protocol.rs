@@ -28,6 +28,33 @@ pub enum StyleAttr {
     Fill(Option<Rgb>),
 }
 
+/// A direct-set style attribute addressed by IronCalc's `update_range_style` path
+/// (`architecture.md §3.1`, `components/action_bar.md`). Typed (instead of a raw path string) so
+/// the UI can only ever address the three formatting paths this project owns — the value carried by
+/// [`Command::SetStylePath`] is what varies. No IronCalc type crosses the seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StylePath {
+    /// `font.color` — `#RRGGBB` sets, `""` clears (→ Automatic).
+    FontColor,
+    /// `alignment.horizontal` — `left|center|right` sets, `general` clears horizontal only
+    /// (leaving any file-loaded vertical/wrap alignment intact).
+    AlignHorizontal,
+    /// `num_fmt` — the raw number-format code (one of the dropdown codes, or a decimals-adjusted
+    /// derivative).
+    NumFmt,
+}
+
+impl StylePath {
+    /// The IronCalc `update_range_style` path string for this attribute.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StylePath::FontColor => "font.color",
+            StylePath::AlignHorizontal => "alignment.horizontal",
+            StylePath::NumFmt => "num_fmt",
+        }
+    }
+}
+
 /// A command the UI hands the worker over the (unbounded, non-blocking) command channel.
 /// Undoable edits trigger a coalesced eval + publish; reads/control do not
 /// (`components/engine_worker.md §Public interface` — the authoritative semantics table).
@@ -51,6 +78,16 @@ pub enum Command {
         sheet: SheetId,
         range: CellRange,
         attr: StyleAttr,
+    },
+    /// Set a direct style attribute (text color, horizontal alignment, or number format) over a
+    /// range via IronCalc's `update_range_style` path (`architecture.md §3.1`). Style-only: no
+    /// evaluation, cache rebuild + publish only. Fire-and-forget (log-only on engine rejection —
+    /// the UI only ever sends valid paths/values).
+    SetStylePath {
+        sheet: SheetId,
+        range: CellRange,
+        path: StylePath,
+        value: String,
     },
     /// Append a new sheet.
     AddSheet,

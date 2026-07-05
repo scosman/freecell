@@ -260,7 +260,6 @@ fn apply_injections(caches: &parking_lot::RwLock<SheetCaches>, sheet: SheetId, i
                     *col,
                     RenderStyle {
                         h_align: Some(*align),
-                        num_format_is_default: base.num_format_is_default,
                         ..base
                     },
                 );

@@ -20,7 +20,10 @@ pub enum Align {
 /// paints; anything the engine models but the grid ignores (borders, font family/size,
 /// strikethrough, wrap, …) is intentionally absent — it is preserved in the engine and on
 /// save, never in this render form (`functional_spec.md §3.6`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Default` (all fields zero/`None`/`false`) is the plain cell whose `num_fmt` index `0` resolves
+/// to `"general"` — so a default cell interns to the default style and resolves to `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct RenderStyle {
     pub bold: bool,
     pub italic: bool,
@@ -32,23 +35,13 @@ pub struct RenderStyle {
     pub font_color: Option<Rgb>,
     /// Explicit horizontal alignment (`None` = engine default by cell type).
     pub h_align: Option<Align>,
-    /// Whether the cell uses the default (`General`) number format. `false` marks a
-    /// custom format so the grid/engine display path knows the string is engine-formatted.
-    pub num_format_is_default: bool,
-}
-
-impl Default for RenderStyle {
-    fn default() -> Self {
-        Self {
-            bold: false,
-            italic: false,
-            underline: false,
-            fill: None,
-            font_color: None,
-            h_align: None,
-            num_format_is_default: true,
-        }
-    }
+    /// Index into the owning [`SheetCache`](crate::SheetCache)'s `num_fmts` side table for
+    /// this cell's number-format code string; `0` = the default `"general"`. The grid does
+    /// not render from this (display text is engine-formatted in the publication) — it is the
+    /// action bar's source for the number-format category + decimals ± (`components/action_bar.md`,
+    /// `components/style_render.md`). It still participates in interning identity, so cells that
+    /// differ only by format get distinct [`StyleId`](crate::StyleId)s.
+    pub num_fmt: u16,
 }
 
 #[cfg(test)]
@@ -62,9 +55,9 @@ mod tests {
         assert_eq!(s.fill, None);
         assert_eq!(s.font_color, None);
         assert_eq!(s.h_align, None);
-        assert!(
-            s.num_format_is_default,
-            "a default cell uses the General format"
+        assert_eq!(
+            s.num_fmt, 0,
+            "a default cell uses the General format (index 0)"
         );
     }
 }

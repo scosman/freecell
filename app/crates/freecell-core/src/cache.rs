@@ -54,6 +54,47 @@ pub struct SheetCache {
     /// render form). Entries are never removed; the resolved table only grows, bounded by the
     /// (small) number of distinct styles a sheet uses.
     style_ids: HashMap<RenderStyle, StyleId>,
+    /// Number-format code strings, indexed by [`RenderStyle::num_fmt`]. `[0]` is always
+    /// `"general"`. Built worker-side alongside the resolved-style table and read by the action
+    /// bar for category display + decimals ± (`components/action_bar.md`). Tiny (a handful of
+    /// distinct formats per sheet), so interning is a linear scan; `Arc<str>` keeps `SheetCache`
+    /// `Send + Sync` without pulling gpui into this headless crate.
+    num_fmts: Vec<Arc<str>>,
+}
+
+/// The canonical default number-format code (IronCalc's `Style::default().num_fmt`, lowercase).
+const DEFAULT_NUM_FMT: &str = "general";
+
+/// The `num_fmts` table every fresh cache/builder starts with: `[0] = "general"`.
+fn seed_num_fmts() -> Vec<Arc<str>> {
+    vec![Arc::from(DEFAULT_NUM_FMT)]
+}
+
+/// Interns a number-format `code` into `table`, returning its `u16` id. Case-insensitive
+/// `"general"` always maps to `0` (so a plain cell interns to the default `RenderStyle`).
+///
+/// Ids are `u16`, so the table holds at most `u16::MAX` (65535) distinct formats — orders of
+/// magnitude beyond the few dozen a real sheet uses. At that (unreachable) cap a further distinct
+/// code is **not** interned: it returns `u16::MAX`, which [`SheetCache::num_fmt_code`] resolves to
+/// the general fallback (out of range), rather than letting `len() as u16` wrap to `0` and collide
+/// with `"general"`.
+fn intern_num_fmt_into(table: &mut Vec<Arc<str>>, code: &str) -> u16 {
+    if code.eq_ignore_ascii_case(DEFAULT_NUM_FMT) {
+        return 0;
+    }
+    if let Some(idx) = table.iter().position(|c| c.as_ref() == code) {
+        return idx as u16;
+    }
+    debug_assert!(
+        table.len() < u16::MAX as usize,
+        "num_fmts table overflow (>= u16::MAX distinct formats)"
+    );
+    if table.len() >= u16::MAX as usize {
+        return u16::MAX;
+    }
+    let id = table.len() as u16;
+    table.push(Arc::from(code));
+    id
 }
 
 impl SheetCache {
@@ -137,6 +178,23 @@ impl SheetCache {
     /// the sheet data uses its own style, even the default, over any band).
     pub fn is_on_band(&self, row: u32, col: u32) -> bool {
         self.row_styles.contains_key(&row) || self.col_styles.contains_key(&col)
+    }
+
+    /// Interns a number-format `code` into the side table, returning its [`RenderStyle::num_fmt`]
+    /// id. Case-insensitive `"general"` → `0`. The worker's mirror path calls this before storing
+    /// a refreshed [`RenderStyle`] so the resident table carries every live format string.
+    pub fn intern_num_fmt(&mut self, code: &str) -> u16 {
+        intern_num_fmt_into(&mut self.num_fmts, code)
+    }
+
+    /// The number-format code string for [`RenderStyle::num_fmt`] id `id`. `0` (or an out-of-range
+    /// id, defensively) → the default `"general"`. The action bar reads this for the active cell's
+    /// format category + decimals ±.
+    pub fn num_fmt_code(&self, id: u16) -> &str {
+        self.num_fmts
+            .get(id as usize)
+            .map(|c| c.as_ref())
+            .unwrap_or(DEFAULT_NUM_FMT)
     }
 
     /// Interns `style` into the resolved table (equal styles share a [`StyleId`]).
@@ -261,6 +319,7 @@ pub struct SheetCacheBuilder {
     col_styles: BTreeMap<u32, StyleId>,
     resolved: Vec<RenderStyle>,
     style_ids: HashMap<RenderStyle, StyleId>,
+    num_fmts: Vec<Arc<str>>,
 }
 
 impl SheetCacheBuilder {
@@ -278,7 +337,15 @@ impl SheetCacheBuilder {
             col_styles: BTreeMap::new(),
             resolved: Vec::new(),
             style_ids: HashMap::new(),
+            num_fmts: seed_num_fmts(),
         }
+    }
+
+    /// Interns a number-format `code` into the side table, returning its [`RenderStyle::num_fmt`]
+    /// id (case-insensitive `"general"` → `0`). The engine's build loop calls this per cell/band
+    /// before pushing the resolved style.
+    pub fn intern_num_fmt(&mut self, code: &str) -> u16 {
+        intern_num_fmt_into(&mut self.num_fmts, code)
     }
 
     /// Overrides the default row height / column width (px).
@@ -389,6 +456,7 @@ impl SheetCacheBuilder {
             col_styles: self.col_styles,
             resolved: self.resolved,
             style_ids: self.style_ids,
+            num_fmts: self.num_fmts,
         }
     }
 }
@@ -536,6 +604,43 @@ mod tests {
             .cell_style(0, 1, RenderStyle::default())
             .build();
         assert_eq!(c2.resolved.len(), 2);
+    }
+
+    #[test]
+    fn num_fmt_interning_dedups_and_general_is_zero() {
+        let mut cache = SheetCacheBuilder::new(4, 4).build();
+        // A fresh cache resolves index 0 to "general".
+        assert_eq!(cache.num_fmt_code(0), "general");
+        // Case-insensitive "general" always maps to 0 (so plain cells stay the default style).
+        assert_eq!(cache.intern_num_fmt("general"), 0);
+        assert_eq!(cache.intern_num_fmt("General"), 0);
+        // Distinct codes get distinct, stable ids; equal codes dedup.
+        let cur = cache.intern_num_fmt("$#,##0.00");
+        let pct = cache.intern_num_fmt("0.00%");
+        assert_ne!(cur, 0);
+        assert_ne!(cur, pct);
+        assert_eq!(cache.intern_num_fmt("$#,##0.00"), cur, "equal codes dedup");
+        // Round-trips back to the string.
+        assert_eq!(cache.num_fmt_code(cur), "$#,##0.00");
+        assert_eq!(cache.num_fmt_code(pct), "0.00%");
+        // An out-of-range id falls back to "general" (defensive, never panics).
+        assert_eq!(cache.num_fmt_code(9999), "general");
+
+        // The builder interns identically, and the built cache carries the table.
+        let mut b = SheetCacheBuilder::new(2, 2);
+        let id = b.intern_num_fmt("m/d/yyyy");
+        let built = b
+            .cell_style(
+                0,
+                0,
+                RenderStyle {
+                    num_fmt: id,
+                    ..RenderStyle::default()
+                },
+            )
+            .build();
+        assert_eq!(built.num_fmt_code(id), "m/d/yyyy");
+        assert_eq!(built.render_style(0, 0).unwrap().num_fmt, id);
     }
 
     #[test]

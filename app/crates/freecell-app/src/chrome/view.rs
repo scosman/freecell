@@ -30,13 +30,14 @@ use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
+use freecell_core::format_ui::{adjust_decimals, num_fmt_category, Category, DROPDOWN_FORMATS};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
+use freecell_core::{Align, CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
 
-use freecell_engine::{Command, EditRejectedReason, StyleAttr, WorkerEvent};
+use freecell_engine::{Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent};
 
 use super::{
     ChromeClient, ChromeGridRequest, ChromeGridSink, EditController, EditOrigin, SheetTab,
@@ -60,6 +61,12 @@ const TOOLTIP_BG: u32 = 0x2B2B2B;
 const TOOLTIP_TEXT: u32 = 0xF5F5F5;
 
 const ACTION_ROW_H: f32 = 36.0;
+/// The action row's natural (uncompressed) width for the Phase-4 control set — B/I/U, text
+/// color + fill, alignment, number format + decimals — with its dividers. The row never wraps
+/// (`ui_design.md §2`: raise the window's min width instead), so it holds this min width; the
+/// document window (1200 px) is far wider. Grows in Phase 5 (fonts) / 6 (borders). Recorded in
+/// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it ever clips.
+const ACTION_ROW_MIN_W: f32 = 620.0;
 const DATA_ROW_H: f32 = 32.0;
 const TAB_BAR_H: f32 = 30.0;
 const REF_BOX_W: f32 = 72.0;
@@ -80,6 +87,13 @@ pub struct ChromeView {
     selection: SelectionModel,
     /// The active cell's resolved style, cached at selection-change time for the toggles.
     active_style: Option<RenderStyle>,
+    /// The active cell's number-format code, cached alongside `active_style` — drives the
+    /// number-format dropdown's category label + the decimals ± enabled/computed state
+    /// (`components/action_bar.md`). `None` on a multi-cell selection (matches `active_style`).
+    active_num_fmt: Option<String>,
+    /// Whether the worker is degraded (read-only): every mutating action-bar control disables
+    /// (`functional_spec.md §6`). Set by the window on `WorkerDegraded`.
+    degraded: bool,
 
     /// The formula-bar state machine (`freecell-core`).
     data_row: DataRow,
@@ -111,6 +125,13 @@ pub struct ChromeView {
     fill_open: bool,
     /// The stock color picker for the fill popover's "Custom…" entry.
     color_picker: Entity<ColorPickerState>,
+    /// The text-color popover's open state (mirrors the fill popover, with "Automatic" in place
+    /// of "No fill" — `components/action_bar.md`).
+    text_color_open: bool,
+    /// The stock color picker for the text-color popover's "Custom…" entry.
+    text_color_picker: Entity<ColorPickerState>,
+    /// The number-format dropdown's open state (a `ChromeView`-owned menu panel).
+    num_fmt_open: bool,
 
     /// The sheet tabs (the chrome's mirror of the worker's sheet list).
     sheets: Vec<SheetTab>,
@@ -149,12 +170,14 @@ impl ChromeView {
         let in_cell_input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
+        let text_color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
 
         let subscriptions = vec![
             cx.subscribe_in(&content_input, window, Self::on_content_event),
             cx.subscribe_in(&in_cell_input, window, Self::on_incell_event),
             cx.subscribe_in(&rename_input, window, Self::on_rename_event),
             cx.subscribe_in(&color_picker, window, Self::on_color_picker_event),
+            cx.subscribe_in(&text_color_picker, window, Self::on_text_color_picker_event),
         ];
 
         Self {
@@ -164,6 +187,8 @@ impl ChromeView {
             active_sheet,
             selection: SelectionModel::default(),
             active_style: None,
+            active_num_fmt: None,
+            degraded: false,
             data_row: DataRow::default(),
             content_input,
             edit: EditController::new(in_cell_input),
@@ -173,6 +198,9 @@ impl ChromeView {
             eval: EvalIndicator::default(),
             fill_open: false,
             color_picker,
+            text_color_open: false,
+            text_color_picker,
+            num_fmt_open: false,
             sheets,
             rename_target: None,
             rename_input,
@@ -195,12 +223,14 @@ impl ChromeView {
     /// disturbing the data row — for a `StyleCacheUpdated` after a formatting edit that didn't
     /// move the selection (`components/app_shell.md §Action row`).
     pub fn refresh_active_style(&mut self, cx: &mut Context<Self>) {
-        self.active_style = if self.selection.is_single() {
-            self.client
-                .render_style(self.active_sheet, self.selection.active)
+        if self.selection.is_single() {
+            let cell = self.selection.active;
+            self.active_style = self.client.render_style(self.active_sheet, cell);
+            self.active_num_fmt = self.client.num_fmt_code(self.active_sheet, cell);
         } else {
-            None
-        };
+            self.active_style = None;
+            self.active_num_fmt = None;
+        }
         cx.notify();
     }
 
@@ -222,12 +252,17 @@ impl ChromeView {
         if !selection.is_single() {
             self.committed_cell = None;
         }
-        self.active_style = if selection.is_single() {
-            self.client
-                .render_style(self.active_sheet, selection.active)
+        if selection.is_single() {
+            self.active_style = self
+                .client
+                .render_style(self.active_sheet, selection.active);
+            self.active_num_fmt = self
+                .client
+                .num_fmt_code(self.active_sheet, selection.active);
         } else {
-            None
-        };
+            self.active_style = None;
+            self.active_num_fmt = None;
+        }
         let effects = self.data_row.reduce(DataRowEvent::SelectionChanged {
             single: selection.is_single(),
         });
@@ -766,6 +801,122 @@ impl ChromeView {
         }
     }
 
+    // ---- Action row: SetStylePath (text color, alignment, number format) ------------------
+
+    /// Sends one `SetStylePath` over the selection after committing any pending edit (the same
+    /// rule as clicking another cell). Fire-and-forget: a cap-rejected pending edit blocks it, and
+    /// the worker logs any engine rejection (the UI only ever sends valid paths/values).
+    fn apply_style_path(
+        &mut self,
+        path: StylePath,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // No mutating control may dispatch while degraded/read-only (`functional_spec.md §6`) — a
+        // backstop to the disabled buttons, covering a swatch/entry clicked in a popover that was
+        // open at the instant of degradation (also closed by `set_degraded`).
+        if self.degraded {
+            return;
+        }
+        if !self.commit_pending_edit(window, cx) {
+            return;
+        }
+        self.client.send(Command::SetStylePath {
+            sheet: self.active_sheet,
+            range: self.selection.range(),
+            path,
+            value,
+        });
+        cx.notify();
+    }
+
+    /// Applies a text colour (`Some`) or clears it to Automatic (`None`, value `""`), closing the
+    /// text-color popover.
+    pub fn apply_text_color(
+        &mut self,
+        color: Option<Rgb>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_color_open = false;
+        let value = match color {
+            Some(rgb) => format!("#{:06X}", rgb.to_hex()),
+            None => String::new(),
+        };
+        self.apply_style_path(StylePath::FontColor, value, window, cx);
+    }
+
+    /// Applies a horizontal alignment; re-pressing the active one clears the explicit alignment
+    /// back to the type default (value `"general"` — clears horizontal only, never wrap/vertical).
+    pub fn apply_alignment(&mut self, align: Align, window: &mut Window, cx: &mut Context<Self>) {
+        let value = if self.align_active(align) {
+            "general".to_string()
+        } else {
+            match align {
+                Align::Left => "left",
+                Align::Center => "center",
+                Align::Right => "right",
+            }
+            .to_string()
+        };
+        self.apply_style_path(StylePath::AlignHorizontal, value, window, cx);
+    }
+
+    /// Applies a number-format code over the selection, closing the number-format dropdown.
+    pub fn apply_num_fmt(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.num_fmt_open = false;
+        self.apply_style_path(StylePath::NumFmt, code.to_string(), window, cx);
+    }
+
+    /// Adjusts the active cell's number of decimal places by `delta` (`+1` / `-1`). Computed
+    /// UI-side from the cached format string; a no-op format (`adjust_decimals` → `None`) does
+    /// nothing (the buttons also render disabled in that case).
+    pub fn bump_decimals(&mut self, delta: i8, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.active_num_fmt.clone();
+        if let Some(new_code) = current.as_deref().and_then(|c| adjust_decimals(c, delta)) {
+            self.apply_num_fmt(&new_code, window, cx);
+        }
+    }
+
+    fn toggle_text_color_popover(&mut self, cx: &mut Context<Self>) {
+        self.text_color_open = !self.text_color_open;
+        cx.notify();
+    }
+
+    fn toggle_num_fmt_popover(&mut self, cx: &mut Context<Self>) {
+        self.num_fmt_open = !self.num_fmt_open;
+        cx.notify();
+    }
+
+    fn on_text_color_picker_event(
+        &mut self,
+        _picker: &Entity<ColorPickerState>,
+        event: &ColorPickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ColorPickerEvent::Change(color) = event;
+        if let Some(hsla) = color {
+            self.apply_text_color(Some(hsla_to_rgb(*hsla)), window, cx);
+        }
+    }
+
+    /// Marks the worker degraded/read-only (or clears it) — disables every mutating action-bar
+    /// control (`functional_spec.md §6`). Called by the window on `WorkerDegraded`. Closes any open
+    /// formatting popover so a swatch/entry can't be clicked after the controls lock.
+    pub fn set_degraded(&mut self, degraded: bool, cx: &mut Context<Self>) {
+        if self.degraded != degraded {
+            self.degraded = degraded;
+            if degraded {
+                self.fill_open = false;
+                self.text_color_open = false;
+                self.num_fmt_open = false;
+            }
+            cx.notify();
+        }
+    }
+
     // ---- Sheet tab bar --------------------------------------------------------------------
 
     /// Replaces the tab list + active sheet (fixtures / Phase-11 init).
@@ -999,6 +1150,57 @@ impl ChromeView {
         self.active_style.map(|s| s.underline).unwrap_or(false)
     }
 
+    /// Whether an alignment button is pressed — the **explicit** alignment only (a number aligned
+    /// right by type default shows no pressed button, matching Excel; `components/action_bar.md`).
+    pub fn align_active(&self, align: Align) -> bool {
+        self.active_style.and_then(|s| s.h_align) == Some(align)
+    }
+
+    /// The active cell's number-format [`Category`] (General on a multi-cell selection / no cache).
+    pub fn num_fmt_category(&self) -> Category {
+        num_fmt_category(self.active_num_fmt.as_deref().unwrap_or("general"))
+    }
+
+    /// The number-format dropdown's button label (the active cell's category name).
+    pub fn num_fmt_category_label(&self) -> &'static str {
+        self.num_fmt_category().label()
+    }
+
+    /// Whether the "increase decimals" button is enabled (not degraded, single cell, and the
+    /// active format has an adjustable decimal group).
+    pub fn increase_decimals_enabled(&self) -> bool {
+        self.decimals_enabled(1)
+    }
+
+    /// Whether the "decrease decimals" button is enabled.
+    pub fn decrease_decimals_enabled(&self) -> bool {
+        self.decimals_enabled(-1)
+    }
+
+    fn decimals_enabled(&self, delta: i8) -> bool {
+        !self.degraded
+            && self
+                .active_num_fmt
+                .as_deref()
+                .map(|c| adjust_decimals(c, delta).is_some())
+                .unwrap_or(false)
+    }
+
+    /// Whether the worker is degraded (read-only) — all mutating action-bar controls disable.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Whether the text-color popover is open.
+    pub fn text_color_open(&self) -> bool {
+        self.text_color_open
+    }
+
+    /// Whether the number-format dropdown is open.
+    pub fn num_fmt_open(&self) -> bool {
+        self.num_fmt_open
+    }
+
     /// Whether the evaluating spinner is shown.
     pub fn eval_spinner_visible(&self) -> bool {
         self.eval.spinner()
@@ -1069,6 +1271,11 @@ fn hsla_to_rgb(hsla: Hsla) -> Rgb {
     )
 }
 
+/// A vertical divider between action-row control groups (`ui_design.md §2`, existing styling).
+fn action_divider() -> gpui::Div {
+    div().w(px(1.0)).h(px(20.0)).mx_1().bg(rgb(DIVIDER))
+}
+
 impl Focusable for ChromeView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1100,6 +1307,9 @@ impl Render for ChromeView {
 
 impl ChromeView {
     fn render_action_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every mutating control disables in degraded/read-only mode (`functional_spec.md §6`).
+        let disabled = self.degraded;
+
         let toggle = |id: &'static str,
                       label: &'static str,
                       tooltip: &'static str,
@@ -1111,9 +1321,28 @@ impl ChromeView {
                 .tooltip(tooltip)
                 .ghost()
                 .small()
+                .disabled(disabled)
                 .selected(pressed)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.toggle_style(attr, window, cx);
+                }))
+        };
+
+        // An alignment toggle (pressed = the cell's *explicit* alignment).
+        let align_btn = |id: &'static str,
+                         tooltip: &'static str,
+                         align: Align,
+                         glyph: &'static str,
+                         cx: &mut Context<Self>| {
+            Button::new(id)
+                .label(glyph)
+                .tooltip(tooltip)
+                .ghost()
+                .small()
+                .disabled(disabled)
+                .selected(self.align_active(align))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_alignment(align, window, cx);
                 }))
         };
 
@@ -1123,10 +1352,13 @@ impl ChromeView {
             .gap_1()
             .w_full()
             .h(px(ACTION_ROW_H))
+            // The row's groups don't wrap; the window's min width holds them (`ui_design.md §2`).
+            .min_w(px(ACTION_ROW_MIN_W))
             .px_2()
             .bg(rgb(CHROME_BG))
             .border_b_1()
             .border_color(rgb(HAIRLINE))
+            // [Font family/size land in Phase 5 here.] B I U:
             .child(toggle(
                 "bold",
                 "B",
@@ -1151,16 +1383,84 @@ impl ChromeView {
                 StyleAttr::Underline,
                 cx,
             ))
-            .child(div().w(px(1.0)).h(px(20.0)).mx_1().bg(rgb(DIVIDER)))
+            .child(action_divider())
+            // Text color · Fill:
+            .child(
+                Button::new("text-color")
+                    .label("A ▾")
+                    .tooltip("Text color")
+                    .ghost()
+                    .small()
+                    .disabled(disabled)
+                    .selected(self.text_color_open)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_text_color_popover(cx);
+                    })),
+            )
             .child(
                 Button::new("fill")
                     .label("Fill ▾")
                     .tooltip("Fill color")
                     .ghost()
                     .small()
+                    .disabled(disabled)
                     .selected(self.fill_open)
                     .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.toggle_fill_popover(cx);
+                    })),
+            )
+            // [Borders land in Phase 6 here.]
+            .child(action_divider())
+            // Alignment L / C / R:
+            .child(align_btn("align-left", "Align left", Align::Left, "⇤", cx))
+            .child(align_btn(
+                "align-center",
+                "Align center",
+                Align::Center,
+                "≡",
+                cx,
+            ))
+            .child(align_btn(
+                "align-right",
+                "Align right",
+                Align::Right,
+                "⇥",
+                cx,
+            ))
+            .child(action_divider())
+            // Number format dropdown + decimals ±:
+            .child(
+                Button::new("num-fmt")
+                    .label(format!("{} ▾", self.num_fmt_category_label()))
+                    .tooltip("Number format")
+                    .ghost()
+                    .small()
+                    .disabled(disabled)
+                    .selected(self.num_fmt_open)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_num_fmt_popover(cx);
+                    })),
+            )
+            .child(
+                Button::new("decimals-inc")
+                    .label(".00→")
+                    .tooltip("Increase decimals")
+                    .ghost()
+                    .small()
+                    .disabled(!self.increase_decimals_enabled())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.bump_decimals(1, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("decimals-dec")
+                    .label("→.00")
+                    .tooltip("Decrease decimals")
+                    .ghost()
+                    .small()
+                    .disabled(!self.decrease_decimals_enabled())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.bump_decimals(-1, window, cx);
                     })),
             )
             // Right-aligned evaluating spinner (`ui_design.md §3.1`).
@@ -1327,6 +1627,12 @@ impl ChromeView {
         if self.fill_open {
             overlays.push(self.render_fill_popover(cx));
         }
+        if self.text_color_open {
+            overlays.push(self.render_text_color_popover(cx));
+        }
+        if self.num_fmt_open {
+            overlays.push(self.render_num_fmt_popover(cx));
+        }
         if let Some(id) = self.context_menu {
             overlays.push(self.render_context_menu(id, cx));
         }
@@ -1444,6 +1750,134 @@ impl ChromeView {
                             )
                             .child(ColorPicker::new(&self.color_picker).small()),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// The text-color popover: the same palette as Fill, with **Automatic** (clear) in place of
+    /// "No fill" (`components/action_bar.md`, `ui_design.md §2`).
+    fn render_text_color_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut grid = div().flex().flex_col().gap_1();
+        for chunk in FILL_PALETTE.chunks(5) {
+            let mut r = div().flex().gap_1();
+            for swatch in chunk {
+                let color = swatch.rgb;
+                r = r.child(
+                    div()
+                        .id(gpui::ElementId::Name(
+                            format!("text-swatch-{}", swatch.name).into(),
+                        ))
+                        .w(px(20.0))
+                        .h(px(20.0))
+                        .rounded_sm()
+                        .bg(rgb(color.to_hex()))
+                        .border_1()
+                        .border_color(rgb(HAIRLINE))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                this.apply_text_color(Some(color), window, cx);
+                            }),
+                        ),
+                );
+            }
+            grid = grid.child(r);
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                self.backdrop(|this, _w, _cx| this.text_color_open = false, cx)
+                    .child(div()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(ACTION_ROW_H))
+                    .left(px(180.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_2()
+                    .bg(rgb(ACTIVE_TAB_BG))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded_md()
+                    .shadow_md()
+                    .child(grid)
+                    .child(
+                        Button::new("text-automatic")
+                            .label("Automatic")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.apply_text_color(None, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(MUTED_TEXT))
+                                    .child("Custom…"),
+                            )
+                            .child(ColorPicker::new(&self.text_color_picker).small()),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The number-format dropdown: a plain scrolling menu of the seven categories, the active
+    /// cell's category highlighted (`components/action_bar.md`, `architecture.md §3.1`).
+    fn render_num_fmt_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let active = self.num_fmt_category();
+        let mut menu = div().flex().flex_col().gap(px(2.0));
+        for (category, code) in DROPDOWN_FORMATS {
+            let code = code.to_string();
+            menu = menu.child(
+                Button::new(gpui::ElementId::Name(
+                    format!("numfmt-{}", category.label()).into(),
+                ))
+                .label(category.label())
+                .ghost()
+                .small()
+                .selected(category == active)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_num_fmt(&code, window, cx);
+                })),
+            );
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                self.backdrop(|this, _w, _cx| this.num_fmt_open = false, cx)
+                    .child(div()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(ACTION_ROW_H))
+                    .left(px(360.0))
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    .bg(rgb(ACTIVE_TAB_BG))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded_md()
+                    .shadow_md()
+                    .child(menu),
             )
             .into_any_element()
     }
@@ -2029,6 +2463,173 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // ---- Action row: SetStylePath (text color, alignment, number format) ------------------
+
+    /// Select `cell` as a single-cell selection and drain the resulting fetch command.
+    fn select_single(h: &Harness, cx: &mut TestAppContext, r: u32, c: u32) {
+        upd(h, cx, |chrome, window, cx| {
+            chrome.on_selection_changed(SelectionModel::single(cell(r, c)), window, cx)
+        });
+        h.client.take_commands();
+    }
+
+    #[gpui::test]
+    fn alignment_toggle_emits_clear_on_repress(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // The active cell is explicitly right-aligned.
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                h_align: Some(Align::Right),
+                ..Default::default()
+            },
+        );
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.align_active(Align::Right)));
+
+        // Re-pressing the pressed alignment clears horizontal only (value "general").
+        upd(&h, cx, |c, window, cx| {
+            c.apply_alignment(Align::Right, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::AlignHorizontal, value, .. }] if value == "general"
+            ),
+            "re-press clears with general, got {cmds:?}"
+        );
+
+        // Pressing a different (unpressed) alignment sets it directly.
+        upd(&h, cx, |c, window, cx| {
+            c.apply_alignment(Align::Left, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetStylePath { path: StylePath::AlignHorizontal, value, .. }] if value == "left"
+        ));
+    }
+
+    #[gpui::test]
+    fn text_color_automatic_and_swatch(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+
+        // Automatic clears the color (empty value).
+        upd(&h, cx, |c, window, cx| c.apply_text_color(None, window, cx));
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::FontColor, value, .. }] if value.is_empty()
+            ),
+            "Automatic clears color, got {cmds:?}"
+        );
+
+        // A swatch sends its #RRGGBB hex.
+        upd(&h, cx, |c, window, cx| {
+            c.apply_text_color(Some(Rgb::from_hex(0xFF0000)), window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetStylePath { path: StylePath::FontColor, value, .. }] if value == "#FF0000"
+        ));
+    }
+
+    #[gpui::test]
+    fn num_fmt_pick_emits_code_and_category_reflects_active_cell(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00%");
+        select_single(&h, cx, 1, 1);
+        // The dropdown label reflects the active cell's format category.
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_category_label()),
+            "Percent"
+        );
+
+        upd(&h, cx, |c, window, cx| {
+            c.apply_num_fmt("$#,##0.00", window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "$#,##0.00"
+        ));
+    }
+
+    #[gpui::test]
+    fn decimals_buttons_emit_adjusted_code(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "#,##0.00");
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.increase_decimals_enabled()));
+        assert!(upd(&h, cx, |c, _w, _cx| c.decrease_decimals_enabled()));
+
+        upd(&h, cx, |c, window, cx| c.bump_decimals(1, window, cx));
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "#,##0.000"
+            ),
+            "increase decimals rewrites the code, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn decimals_disabled_for_date_format(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "m/d/yyyy");
+        select_single(&h, cx, 1, 1);
+        // A date format has no adjustable decimal group → both buttons disabled + no-op.
+        assert!(!upd(&h, cx, |c, _w, _cx| c.increase_decimals_enabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.decrease_decimals_enabled()));
+        upd(&h, cx, |c, window, cx| c.bump_decimals(1, window, cx));
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a no-op decimals adjust sends nothing"
+        );
+    }
+
+    #[gpui::test]
+    fn controls_disabled_in_degraded_mode(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "#,##0.00");
+        select_single(&h, cx, 1, 1);
+        // Enabled before degradation.
+        assert!(!upd(&h, cx, |c, _w, _cx| c.is_degraded()));
+        assert!(upd(&h, cx, |c, _w, _cx| c.increase_decimals_enabled()));
+
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.is_degraded()));
+        // The decimals gate folds in the degraded flag (the other controls disable via
+        // `.disabled(self.is_degraded())` in the render path).
+        assert!(!upd(&h, cx, |c, _w, _cx| c.increase_decimals_enabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.decrease_decimals_enabled()));
+    }
+
+    #[gpui::test]
+    fn degraded_closes_popovers_and_blocks_dispatch(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        // Open the text-color popover, then degrade.
+        upd(&h, cx, |c, _w, cx| c.toggle_text_color_popover(cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.text_color_open()));
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        // The popover is force-closed and a swatch click can no longer dispatch a command.
+        assert!(!upd(&h, cx, |c, _w, _cx| c.text_color_open()));
+        upd(&h, cx, |c, window, cx| {
+            c.apply_text_color(Some(Rgb::from_hex(0xFF0000)), window, cx)
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "no SetStylePath dispatches while degraded"
+        );
     }
 
     // ---- Action row / data row: the two 250 ms spinners -----------------------------------

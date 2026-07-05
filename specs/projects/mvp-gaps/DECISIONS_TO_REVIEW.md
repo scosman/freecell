@@ -280,3 +280,92 @@ Paste changes cell values + styles, but it reuses the **existing** publication +
 style-cache render path (no new `RenderCase` fields, no new rendered constructs). No render cases
 were added and **no baseline PNGs change**; `cargo test --workspace` (without `FREECELL_RENDER`)
 is green. Nothing to regenerate on the pinned runner for this phase.
+
+## Phase 4 — Formatting controls (SetStylePath, text color, alignment, number formats)
+
+### 1. `RenderStyle.num_format_is_default: bool` **replaced** by `num_fmt: u16`
+
+`style_render.md`'s final shape carries `num_fmt: u16` (an index into a per-cache `num_fmts`
+side table) and drops the Phase-1 `num_format_is_default` bool. Nothing in the render path read
+the old bool (grep: only the cache build set it and the render-test scene copied it — it was pure
+interning identity), and the action bar needs the actual code string (Currency vs Percent), so the
+index is strictly more informative. `RenderStyle::Default` now derives (all fields zero/`None`),
+`num_fmt: 0` → `"general"`. Only the num-fmt field + `num_fmts` side table land this phase; the
+font/border fields + their side tables stay in Phases 5/6 per the implementation plan's phasing.
+
+### 2. `num_fmts` side table is `Vec<Arc<str>>`, not `SharedString`
+
+`style_render.md` sketches `Vec<SharedString>`, but `freecell-core` is deliberately gpui-free
+(no `SharedString`). `Arc<str>` is the headless analog — cheap to clone, immutable, `Send + Sync`
+(the `SheetCache` Send+Sync compile-time guard still holds). The action bar only ever reads `&str`
+from it (category lookup + `adjust_decimals`), so no conversion is needed at the UI boundary.
+
+### 3. `SetStylePath` uses a typed `StylePath` enum, not the architecture's `path: String`
+
+Architecture §2 lists `SetStylePath { … path: String, value: String }`. Implemented `path` as a
+typed `enum StylePath { FontColor, AlignHorizontal, NumFmt }` (→ its IronCalc path string
+worker-side). Safer and self-documenting: the UI can only ever address the three formatting paths
+this project owns, and no IronCalc type crosses the seam. `value` stays a `String` (the payload —
+hex color, alignment keyword, or format code — is what varies).
+
+### 4. Degraded/read-only disable: added a `degraded` flag to the chrome + window wiring
+
+`action_bar.md` says degraded mode disables mutating controls "via the existing flag", but no such
+flag reached the chrome — degraded state lived only on the window, and the existing B/I/U/Fill
+controls did **not** disable. Added `ChromeView.degraded` + `set_degraded`, wired from the window's
+`WorkerDegraded` handler, and applied `.disabled(self.degraded)` to **every** mutating action-bar
+control (new and existing). This closes the pre-existing gap for the action bar (the window's
+read-only bar + edit refusal were already in place; this just also greys the toolbar).
+
+### 5. Multi-cell selection reflects nothing (matches existing B/I/U), not "the anchor"
+
+`action_bar.md §State derivation` says multi-cell state "reflects the anchor". The shipped code sets
+`active_style = None` on a multi-cell selection (B/I/U show unpressed), so the new controls follow
+suit: `active_num_fmt = None` → the number-format label shows General and decimals ± disable on a
+multi-cell selection. Commands still apply to the **full** selection. This keeps all action-bar
+controls consistent with the shipped behavior; revisit if the anchor-reflect rule is wanted for all.
+
+**CR follow-up (reconciled):** `functional_spec.md §3` and `components/action_bar.md §State
+derivation` were updated to describe this shipped behavior (single selection → active cell;
+multi-cell → nothing), so the docs no longer contradict the code. This entry stays as the
+human-review flag for whether a *uniform* anchor-reflect across **all** action-bar controls
+(including B/I/U) is wanted later — that would need a spec-owner decision and a change to the shared
+`active_style`/`active_num_fmt` derivation, done without engine calls (read the anchor's cached
+`RenderStyle`), not a per-new-control special case.
+
+### 6. Decimals ± enable is per-direction
+
+`action_bar.md` says decimals ± disables "when `adjust_decimals` returns `None`" (singular). Each
+button is gated independently on its own direction: e.g. a bare `0` format enables increase (→`0.0`)
+but disables decrease (already zero decimals). More correct than a single shared flag; both disable
+for General/Text/Date/Time (no `0` group) and in degraded mode.
+
+### 7. `ACTION_ROW_MIN_W = 620.0` is an estimate; window min-width not enforced at the OS level
+
+The action row sets `min_w(px(620.0))` so its groups don't compress (`ui_design.md §2`: no wrap —
+raise the window min width). The value is estimated from the control set, **not** render-measured
+(this container can't run the GPU app). The document window opens at 1200 px, far wider, so it never
+clips in practice; gpui `WindowOptions` has no simple cross-platform min-size, so no OS-level min was
+set. Re-measure/raise on a real device if the row ever clips (it grows in Phases 5/6).
+
+### 8. Render baselines — no new cases, nothing to regenerate this phase
+
+Phase 4 adds the *controls* + the `SetStylePath` command; the *rendered* cell effects (text color,
+alignment, engine-formatted numbers, `[Red]` negatives) were written and pixel-baselined in Phase 1
+(`cell_fill_dark_text_contrast`, `cell_align_*`, `cell_number_currency/percent/thousands`,
+`cell_number_negative_red`). The `RenderStyle` field rename is render-neutral (`num_fmt` never
+reaches the paint path — display text is engine-formatted in the publication). The action bar is
+chrome, excluded from the cell render suite (`action_bar.md`). So **no render cases were added and no
+baseline PNGs need regeneration**; `cargo test --workspace` (without `FREECELL_RENDER`) is green.
+
+### 9. Decimals ± gated off for custom multi-section / scientific / quoted formats (CR fix)
+
+`adjust_decimals` now returns `None` (buttons disable, no-op) for any format containing a section
+separator `;`, an exponent `E`/`e`, or a quoted/escaped literal (`"…"`, `\`) — the last-`0`-group
+scan can't edit those safely (it would target the exponent's `0`, diverge sibling sections, or
+mangle a literal, and IronCalc stores the code unvalidated so a malformed result would corrupt the
+cell's display). The ± remains active for the clean single-section Number/Currency/Percent/thousands
+formats. `functional_spec.md §3.4` only guarantees the dropdown-native numeric formats, so this is a
+scope-honest limitation, not a regression: a file-authored custom format is never one-click-broken;
+its exact decimal count is edited by re-authoring the format string (out of scope — no custom-code
+editor in this project).

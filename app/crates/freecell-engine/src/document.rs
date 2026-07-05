@@ -559,6 +559,23 @@ impl WorkbookDocument {
             .update_range_style(&area_of(sheet_idx, range), "fill.fg_color", &value)
     }
 
+    /// Sets a direct style attribute over a range via IronCalc's `update_range_style` path — the
+    /// generic pass-through behind `SetStylePath` (text color / horizontal alignment / number
+    /// format, `architecture.md §3.1`). One undoable range-style op; the band fast path engages
+    /// automatically when `range` is a full row/column (`common.rs:1274`). `path` is one of the
+    /// three typed [`StylePath`](crate::StylePath) strings, `value` its already-formatted payload.
+    pub(crate) fn update_style_path(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        path: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .update_range_style(&area_of(sheet_idx, range), path, value)
+    }
+
     /// Appends a new sheet (`AddSheet`); IronCalc names + numbers it. Undoable.
     pub(crate) fn add_sheet(&mut self) -> Result<(), String> {
         crate::instrument::record_engine_call();

@@ -388,6 +388,8 @@ impl WorkbookWindow {
             }
             WorkerEvent::WorkerDegraded { reason } => {
                 self.degraded = Some(reason);
+                // Disable the action-bar's mutating controls (`functional_spec.md §6`).
+                self.chrome.update(cx, |c, cx| c.set_degraded(true, cx));
                 cx.notify();
             }
             WorkerEvent::CopyReady { tsv } => {

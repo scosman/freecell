@@ -24,7 +24,7 @@ judgment calls in a `DECISIONS_TO_REVIEW.md` here).
       popover on the in-cell editor.
 - [x] **Phase 3 — Range clipboard**: worker commands + slot, copy/cut/paste internal,
       TSV out/in, keymap (§6).
-- [ ] **Phase 4 — Formatting controls**: `SetStylePath` command; text color,
+- [x] **Phase 4 — Formatting controls**: `SetStylePath` command; text color,
       alignment, number-format dropdown + decimals ± ; action-bar layout rework
       (§3.1–3.2, ui_design §2).
 - [ ] **Phase 5 — Fonts**: `RenderStyle`/cache font fields + rendering; `SetFont` via

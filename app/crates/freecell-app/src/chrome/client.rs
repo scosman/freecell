@@ -24,6 +24,11 @@ pub trait ChromeClient {
     /// bold/italic/underline toggles + the fill indicator. `None` = no resident cache entry
     /// (the default, plain style).
     fn render_style(&self, sheet: SheetId, cell: CellRef) -> Option<RenderStyle>;
+
+    /// The resolved number-format code string of a single cell (`components/action_bar.md`), for
+    /// the number-format dropdown's category label + decimals ±. `None` = no resident cache for the
+    /// sheet; a cell with no stored style resolves to `Some("general")` (the default format).
+    fn num_fmt_code(&self, sheet: SheetId, cell: CellRef) -> Option<String>;
 }
 
 impl ChromeClient for DocumentClient {
@@ -42,6 +47,18 @@ impl ChromeClient for DocumentClient {
             .and_then(|cache| cache.render_style(cell.row, cell.col))
             .copied()
     }
+
+    fn num_fmt_code(&self, sheet: SheetId, cell: CellRef) -> Option<String> {
+        let caches = self.caches();
+        let guard = caches.read();
+        let cache = guard.get(sheet)?;
+        // A cell with no stored style resolves to the default "general" (index 0).
+        let id = cache
+            .render_style(cell.row, cell.col)
+            .map(|s| s.num_fmt)
+            .unwrap_or(0);
+        Some(cache.num_fmt_code(id).to_string())
+    }
 }
 
 /// A test/demo double for [`ChromeClient`]: records every sent [`Command`] and answers
@@ -51,6 +68,7 @@ impl ChromeClient for DocumentClient {
 pub struct RecordingClient {
     commands: RefCell<Vec<Command>>,
     styles: RefCell<HashMap<(SheetId, CellRef), RenderStyle>>,
+    num_fmts: RefCell<HashMap<(SheetId, CellRef), String>>,
 }
 
 impl RecordingClient {
@@ -62,6 +80,13 @@ impl RecordingClient {
     /// Injects the resolved style `render_style` will return for `(sheet, cell)`.
     pub fn set_style(&self, sheet: SheetId, cell: CellRef, style: RenderStyle) {
         self.styles.borrow_mut().insert((sheet, cell), style);
+    }
+
+    /// Injects the number-format code `num_fmt_code` will return for `(sheet, cell)`.
+    pub fn set_num_fmt(&self, sheet: SheetId, cell: CellRef, code: &str) {
+        self.num_fmts
+            .borrow_mut()
+            .insert((sheet, cell), code.to_string());
     }
 
     /// Drains and returns every command recorded so far (clearing the log).
@@ -77,5 +102,16 @@ impl ChromeClient for RecordingClient {
 
     fn render_style(&self, sheet: SheetId, cell: CellRef) -> Option<RenderStyle> {
         self.styles.borrow().get(&(sheet, cell)).copied()
+    }
+
+    fn num_fmt_code(&self, sheet: SheetId, cell: CellRef) -> Option<String> {
+        // Mirrors the real client: a cell with an injected code returns it, else the default.
+        Some(
+            self.num_fmts
+                .borrow()
+                .get(&(sheet, cell))
+                .cloned()
+                .unwrap_or_else(|| "general".to_string()),
+        )
     }
 }

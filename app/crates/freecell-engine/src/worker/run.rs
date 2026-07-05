@@ -244,6 +244,7 @@ impl Worker {
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
+                | Command::SetStylePath { .. }
                 | Command::AddSheet
                 | Command::RenameSheet { .. }
                 | Command::DeleteSheet { .. }
@@ -981,6 +982,17 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             // Styles don't affect values → no recompute needed (component-doc command table).
             Ok(AppliedKind::StyleOnly)
         }
+        Command::SetStylePath {
+            sheet,
+            range,
+            path,
+            value,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.update_style_path(idx, *range, path.as_str(), value)?;
+            // Text color / alignment / number format never change values → no recompute.
+            Ok(AppliedKind::StyleOnly)
+        }
         Command::AddSheet => {
             doc.add_sheet()?;
             Ok(AppliedKind::SheetOp)
@@ -1061,10 +1073,12 @@ fn op_of(edit: &Command) -> AppliedOp {
             sheet: *sheet,
             range: *range,
         },
-        Command::SetStyleAttr { sheet, range, .. } => AppliedOp::Cells {
-            sheet: *sheet,
-            range: *range,
-        },
+        Command::SetStyleAttr { sheet, range, .. } | Command::SetStylePath { sheet, range, .. } => {
+            AppliedOp::Cells {
+                sheet: *sheet,
+                range: *range,
+            }
+        }
         Command::AddSheet | Command::RenameSheet { .. } | Command::DeleteSheet { .. } => {
             AppliedOp::Sheets
         }
@@ -1149,6 +1163,7 @@ fn clamp_span(range: std::ops::Range<u32>, sheet_max: u32, max_len: u32) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::protocol::StylePath;
     use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
     use freecell_core::Rgb;
 
@@ -1624,6 +1639,118 @@ mod tests {
                 .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
             "a style edit ships a StyleCacheUpdated delta"
         );
+    }
+
+    #[test]
+    fn set_style_path_num_fmt_applies_and_cache_reflects() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "1234.5"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::SetStylePath {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            path: StylePath::NumFmt,
+            value: "$#,##0.00".to_string(),
+        }]);
+
+        // The cache's num-fmt side table now resolves the cell to the Currency code.
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let rs = cache
+                .render_style(1, 1)
+                .copied()
+                .expect("format-only cell stored");
+            assert_eq!(cache.num_fmt_code(rs.num_fmt), "$#,##0.00");
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        // Style-only: it ships a StyleCacheUpdated delta (the coalesced `evaluate()` is skipped
+        // for a format change, verified structurally by `AppliedKind::StyleOnly`; the spinner's
+        // EvalStarted still fires for the batch, as with any other style edit).
+        assert!(drain_events(&rx)
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+    }
+
+    #[test]
+    fn set_style_path_align_and_color_apply() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "hi"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![
+            Command::SetStylePath {
+                sheet,
+                range: CellRange::single(CellRef::new(1, 1)),
+                path: StylePath::AlignHorizontal,
+                value: "right".to_string(),
+            },
+            Command::SetStylePath {
+                sheet,
+                range: CellRange::single(CellRef::new(1, 1)),
+                path: StylePath::FontColor,
+                value: "#FF0000".to_string(),
+            },
+        ]);
+
+        let rs = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(1, 1)
+            .copied()
+            .unwrap();
+        assert_eq!(rs.h_align, Some(freecell_core::Align::Right));
+        assert_eq!(rs.font_color, Some(Rgb::from_hex(0xFF0000)));
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+
+        // Re-pressing the alignment clears horizontal only (value "general") → back to default.
+        worker.process_batch(vec![Command::SetStylePath {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            path: StylePath::AlignHorizontal,
+            value: "general".to_string(),
+        }]);
+        let rs = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(1, 1)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            rs.h_align, None,
+            "general clears the explicit horizontal alignment"
+        );
+        assert_eq!(
+            rs.font_color,
+            Some(Rgb::from_hex(0xFF0000)),
+            "color is untouched"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
     }
 
     #[test]

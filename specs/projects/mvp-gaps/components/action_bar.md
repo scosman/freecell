@@ -30,13 +30,20 @@ Derivation helpers (unit-testable, `freecell-core/src/format_ui.rs`):
 pub fn num_fmt_category(code: &str) -> Category;   // exact-match table → General/Number/
                                                    // Currency/Percent/Date/Time/Text/Custom
 pub fn adjust_decimals(code: &str, delta: i8) -> Option<String>;
-    // regex on the LAST `0(\.0+)?` group: +1 appends a 0 (creating ".0" if none),
+    // scans the LAST `0(\.0+)?` group: +1 appends a 0 (creating ".0" if none),
     // -1 removes one (dropping the "." when empty); None (no-op) for General/Text/
-    // Date/Time/Custom-without-decimal-group; min 0 decimals.
+    // Date/Time/Custom-without-decimal-group; min 0 decimals. Also None (gate off) for
+    // any format the last-group scan can't safely edit: multi-section (`;`), scientific
+    // (`E`/`e`), or quoted/escaped (`"…"`, `\`) — editing those would corrupt the code
+    // (functional_spec §3.4 only guarantees the dropdown-native numeric formats).
 pub fn font_size_display(q: u16) -> String;        // 0 → "11"; else q/4 (trim .0)
 ```
 
-Multi-cell selections: state reflects the anchor (MVP §3.5 rule, unchanged).
+Multi-cell selections: state reflects **nothing** (toggles unpressed, number format shows
+General, decimals ± disabled), matching the shipped B/I/U toggles' multi-select behavior —
+the derived state clears when the selection isn't a single cell. Commands still apply to the
+full selection. (Reconciled with the shipped-consistent behavior; DECISIONS_TO_REVIEW #5
+flags whether a uniform anchor-reflect for *all* action-bar controls is wanted later.)
 
 ## Command emission (control → worker)
 

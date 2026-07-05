@@ -108,9 +108,10 @@ pub(crate) fn render_style_from(style: &Style) -> RenderStyle {
             .and_then(parse_color)
             .filter(|rgb| *rgb != Rgb::new(0, 0, 0)),
         h_align: h_align_of(style),
-        // The grid only distinguishes "General" (its own type-based alignment / passthrough) from
-        // an explicit format; IronCalc's default is the lowercase "general".
-        num_format_is_default: style.num_fmt.eq_ignore_ascii_case("general"),
+        // `num_fmt` is a side-table index resolved by the caller (build/refresh), which has the
+        // interning table; a bare conversion carries `0` (= "general"). The caller overrides it via
+        // `intern_num_fmt(&style.num_fmt)` before the default-check so a format-only cell is stored.
+        num_fmt: 0,
     }
 }
 
@@ -155,7 +156,8 @@ pub(crate) fn build_sheet_cache(
         }
         if col.style.is_some() {
             if let Some(style) = doc.col_band_style(sheet_idx, (col.min - 1) as u32)? {
-                let rs = render_style_from(&style);
+                let mut rs = render_style_from(&style);
+                rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 if rs != RenderStyle::default() {
                     for c in col.min..=col.max {
                         let c0 = (c - 1) as u32;
@@ -177,7 +179,8 @@ pub(crate) fn build_sheet_cache(
         }
         if r.custom_format && r.s != 0 {
             if let Some(style) = doc.row_band_style(sheet_idx, r0)? {
-                let rs = render_style_from(&style);
+                let mut rs = render_style_from(&style);
+                rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 if rs != RenderStyle::default() {
                     builder.push_row_style(r0, rs);
                     band_rows.insert(r0);
@@ -193,7 +196,8 @@ pub(crate) fn build_sheet_cache(
             let col0 = (*col_1 - 1) as u32;
             let cell = CellRef::new(row0, col0);
             if let Some(style) = doc.cell_own_style(sheet_idx, cell)? {
-                let rs = render_style_from(&style);
+                let mut rs = render_style_from(&style);
+                rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 // `band_rows`/`band_cols` hold only *non-default* bands. A populated cell with a
                 // default own style on such a band gets an explicit default entry to shadow it.
                 // MICRO-EDGE (DECISIONS_TO_REVIEW, Phase 5): a `custom_format` row whose style
@@ -225,7 +229,8 @@ pub(crate) fn refresh_cell(
 ) -> Result<(), String> {
     match doc.cell_own_style(sheet_idx, cell)? {
         Some(style) => {
-            let rs = render_style_from(&style);
+            let mut rs = render_style_from(&style);
+            rs.num_fmt = cache.intern_num_fmt(&style.num_fmt);
             if rs != RenderStyle::default() {
                 cache.set_cell_style(cell.row, cell.col, rs);
             } else if cache.is_on_band(cell.row, cell.col) {
@@ -257,11 +262,32 @@ pub(crate) fn assert_cache_agrees(
     for &r in rows_probe {
         for &c in cols_probe {
             let cached = cache.render_style(r, c).copied().unwrap_or_default();
-            let engine =
-                render_style_from(&doc.resolved_cell_style(sheet_idx, CellRef::new(r, c))?);
-            if cached != engine {
+            let engine_style = doc.resolved_cell_style(sheet_idx, CellRef::new(r, c))?;
+            // Structural compare ignores `num_fmt` (a cache-local index, meaningless across a fresh
+            // convert); `render_style_from` yields `num_fmt: 0`, so zero the cached side to match.
+            let engine = render_style_from(&engine_style);
+            let cached_structural = RenderStyle {
+                num_fmt: 0,
+                ..cached
+            };
+            if cached_structural != engine {
                 return Err(format!(
                     "style mismatch at ({r},{c}): cache={cached:?} engine={engine:?}"
+                ));
+            }
+            // The num-fmt agreement is over the resolved *string* (general normalized).
+            let cached_code = cache.num_fmt_code(cached.num_fmt);
+            let engine_general = engine_style.num_fmt.eq_ignore_ascii_case("general");
+            let cached_general = cached_code.eq_ignore_ascii_case("general");
+            let code_ok = if engine_general {
+                cached_general
+            } else {
+                cached_code == engine_style.num_fmt
+            };
+            if !code_ok {
+                return Err(format!(
+                    "num_fmt mismatch at ({r},{c}): cache={cached_code:?} engine={:?}",
+                    engine_style.num_fmt
                 ));
             }
         }
@@ -353,9 +379,41 @@ mod tests {
             render_style_from(&style_with("alignment.horizontal", "center")).h_align,
             Some(Align::Center)
         );
-        // A custom number format flips num_format_is_default off.
-        assert!(!render_style_from(&style_with("num_fmt", "0.00%")).num_format_is_default);
-        assert!(render_style_from(&Style::default()).num_format_is_default);
+        // `render_style_from` never resolves the num-fmt index itself (the caller does, via the
+        // interning table); it always carries the default 0.
+        assert_eq!(
+            render_style_from(&style_with("num_fmt", "0.00%")).num_fmt,
+            0
+        );
+        assert_eq!(render_style_from(&Style::default()).num_fmt, 0);
+    }
+
+    #[test]
+    fn build_carries_num_fmt_from_file() {
+        // A cell whose ONLY styling is a custom number format is still stored (num_fmt != 0), and
+        // its resolved string round-trips through the side table; a plain cell stays default.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let area = ironcalc_base::expressions::types::Area {
+            sheet: 0,
+            row: 1,
+            column: 1,
+            width: 1,
+            height: 1,
+        };
+        doc.user_model_mut()
+            .update_range_style(&area, "num_fmt", "$#,##0.00")
+            .unwrap();
+
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let formatted = cache
+            .render_style(0, 0)
+            .expect("format-only cell is stored");
+        assert_ne!(formatted.num_fmt, 0);
+        assert_eq!(cache.num_fmt_code(formatted.num_fmt), "$#,##0.00");
+        // The plain number cell resolves to the default (general) — no stored style, index 0.
+        assert!(cache.render_style(1, 0).is_none());
     }
 
     #[test]

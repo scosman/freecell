@@ -45,5 +45,5 @@ Write-Host "package.ps1: packaging formats '$formats' -> $outDir"
 cargo packager --release --packages freecell-app --formats $formats --out-dir $outDir @args
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "`npackage.ps1: done. Packages in $outDir:"
+Write-Host "`npackage.ps1: done. Packages in ${outDir}:"
 Get-ChildItem $outDir

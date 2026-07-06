@@ -99,7 +99,7 @@ const ACTION_ROW_MIN_W: f32 = 896.0;
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
 /// The top "clear the family override" entry in the font-family dropdown (`ui_design.md §2`).
-const SYSTEM_DEFAULT_FAMILY: &str = "System Default";
+const SYSTEM_DEFAULT_FAMILY: &str = "Default (Inter)";
 const DATA_ROW_H: f32 = 32.0;
 const TAB_BAR_H: f32 = 30.0;
 const REF_BOX_W: f32 = 72.0;
@@ -124,7 +124,7 @@ pub struct ChromeView {
     /// number-format dropdown's category label + the decimals ± enabled/computed state
     /// (`components/action_bar.md`). `None` on a multi-cell selection (matches `active_style`).
     active_num_fmt: Option<String>,
-    /// The active cell's font-family name (`""` = the workbook default = "System Default"), cached
+    /// The active cell's font-family name (`""` = the workbook default = "Default (Inter)"), cached
     /// alongside `active_style` for the family dropdown's label. `None` on a multi-cell selection.
     active_font_family: Option<String>,
     /// The active cell's evaluated kind + displayed value from the latest publication, cached
@@ -180,7 +180,7 @@ pub struct ChromeView {
     /// The number-format dropdown's open state (a `ChromeView`-owned menu panel).
     num_fmt_open: bool,
     /// The installed font-family names for the family dropdown, fetched once at build
-    /// (`cx.text_system().all_font_names()`), sorted-unique with "System Default" prepended
+    /// (`cx.text_system().all_font_names()`), sorted-unique with "Default (Inter)" prepended
     /// (`components/action_bar.md`). `Rc` so the render closure can clone it cheaply.
     font_names: Rc<Vec<SharedString>>,
     /// The font-family dropdown's open state (a `ChromeView`-owned scrolling menu panel).
@@ -235,7 +235,7 @@ impl ChromeView {
         let text_color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
 
         // Installed font families for the dropdown, fetched once (`all_font_names` is verified
-        // available). "System Default" is prepended as the clear-the-override entry.
+        // available). "Default (Inter)" is prepended as the clear-the-override entry.
         let mut names: Vec<SharedString> =
             std::iter::once(SharedString::from(SYSTEM_DEFAULT_FAMILY))
                 .chain(
@@ -1021,7 +1021,7 @@ impl ChromeView {
         cx.notify();
     }
 
-    /// Applies a font family over the selection, closing the family dropdown. "System Default"
+    /// Applies a font family over the selection, closing the family dropdown. "Default (Inter)"
     /// clears the override (sent as `Some("")`); any other name sets it.
     pub fn apply_font_family(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.font_family_open = false;
@@ -1085,7 +1085,7 @@ impl ChromeView {
         self.borders_open
     }
 
-    /// The font-family dropdown's active label: the active cell's family, or "System Default" for a
+    /// The font-family dropdown's active label: the active cell's family, or "Default (Inter)" for a
     /// default-font (or multi-cell) selection (`components/action_bar.md`).
     pub fn font_family_label(&self) -> &str {
         match self.active_font_family.as_deref() {
@@ -2261,7 +2261,7 @@ impl ChromeView {
     }
 
     /// The font-family dropdown: a scrolling menu of the installed families (fetched once at build),
-    /// "System Default" first, the active cell's family highlighted (`components/action_bar.md`).
+    /// "Default (Inter)" first, the active cell's family highlighted (`components/action_bar.md`).
     fn render_font_family_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let active = self.font_family_label().to_string();
         let names = Rc::clone(&self.font_names);
@@ -3507,7 +3507,7 @@ mod tests {
     fn font_family_click_applies_and_closes(cx: &mut TestAppContext) {
         let h = tall_sheet(cx);
         select_single(&h, cx, 1, 1);
-        // Item 0 is always "System Default" → clears the family override (sent as `Some("")`).
+        // Item 0 is always "Default (Inter)" → clears the family override (sent as `Some("")`).
         let cmds = press_popover_button(
             &h,
             cx,
@@ -3517,7 +3517,7 @@ mod tests {
         );
         assert!(
             matches!(cmds.as_slice(), [Command::SetFont { family: Some(f), size_pt: None, .. }] if f.is_empty()),
-            "System Default must clear the font family, got {cmds:?}"
+            "Default (Inter) must clear the font family, got {cmds:?}"
         );
         assert!(!upd(&h, cx, |c, _w, _cx| c.font_family_open));
     }
@@ -3703,7 +3703,7 @@ mod tests {
             "family pick emits SetFont, got {cmds:?}"
         );
 
-        // "System Default" clears the override (family = Some("")).
+        // "Default (Inter)" clears the override (family = Some("")).
         upd(&h, cx, |c, window, cx| {
             c.apply_font_family(SYSTEM_DEFAULT_FAMILY, window, cx)
         });

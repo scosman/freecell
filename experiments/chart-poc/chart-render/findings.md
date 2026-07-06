@@ -293,3 +293,83 @@ problems — stacked *area* (scalar-baseline `Area` primitive) and the pie *no-a
 - `scenes`: the eight new scenes are name-lookupable with the expected `ChartKind`. (36 unit
   tests total across the workspace, all passing.)
 - The **9 PNGs + single-agent review** in `results/` are the real Gate-2 evidence.
+
+---
+
+# Phase 3 (Gate 3 — scatter): two numeric axes + dots
+
+Goal (functional_spec §4, §7): a **single-series** and a **multi-series scatter** (two numeric
+axes + dots) from `chart-model`, reusing the Phase 1/2 title / axis-title / legend / nice-tick /
+palette scaffolding. Single-agent review each. The spec's core question: **is scatter a modest
+addition once the axis/legend scaffolding exists, or does the category-vs-value orientation baked
+into the primitives make it painful?**
+
+## Result: GATE 3 PASS (2/2 scenes PASS) — scatter is IN-scope for the follow-on
+
+`results/scatter_single.png` (640×440, Ad spend vs Revenue, 10 points) and
+`results/scatter_multi.png` (720×460, three iris-style species clusters — Setosa/Versicolor/
+Virginica, petal length vs width). Two fresh single-agent reviewers each returned **PASS** with
+YES on all seven §6 rubric points (`results/review.md`): standalone dots (not lines) on **two**
+numeric axes with nice ticks + gridlines, chart title + **both** numeric axis titles, and a
+legend whose swatch colors match the dot colors. **No scatter FAIL → scatter is recorded
+IN-scope for the follow-on**, not out-of-scope.
+
+## The answer: a MODEST addition, not a swamp
+
+Scatter was the cheapest new type of the whole PoC. `scatter.rs` is the smallest chart module
+(one `ScatterPlot` + a paint method), and it is **almost entirely reuse**:
+
+- **The "second numeric axis" is not new machinery — it is the *value* axis applied twice.** The
+  research framed scatter's risk as "the primitives are category-vs-value oriented, X is a
+  `ScaleBand`/`ScalePoint`." But nothing forces X to be a band scale: `ScaleLinear` is a plain
+  domain→pixel map with no notion of "category" or "value," so the X axis is just a *second*
+  `ScaleLinear` built exactly like the Y value axis line/area already own — `ScaleLinear::new([
+  x_scale.min, x_scale.max], [plot_left, plot_right])`. The category-vs-value orientation lives
+  in the stock chart **structs** (and in `ScaleBand`), not in the primitives we build on, so it
+  never bit us. Both axes share the same `NiceScale` + `ScaleLinear` + `PlotAxis` + `Grid` code
+  the value axis has used since Phase 0.
+- **The shared X/Y domains are the exact Gate-1 `spanning` reuse.** X domain = `NiceScale::
+  spanning` over the union of every series' x-values; Y domain = the same over all y-values —
+  the same "one shared domain over the union of all series" pattern Gate 1 introduced for the
+  multi-series line value axis, now applied to two axes instead of one. `spanning` (not
+  `for_values`) matches Excel's scatter auto-ranging (axes zoom to the data, not forced to zero).
+  A unit test asserts both shared domains cover every point of every series.
+- **The dot mark is a one-liner borrowed from the `Line` primitive.** gpui-component's `Line`
+  already paints its optional dot markers as a rounded quad whose corner radius = half its side
+  (a filled circle, `plot/shape/line.rs::paint_dot`). Scatter wants those dots *without* the
+  connecting path, so `ScatterPlot::paint` hand-draws the same `window.paint_quad(quad(...))` per
+  `(x_axis.tick(x), y_axis.tick(y))` — no path builder, no `Line` at all. This is the
+  research-anticipated "just draw some dots," and it was: ~10 lines, no fork, no patch.
+- **Chrome + legend + palette carried over with ZERO changes.** `chart_frame` already puts the
+  `val_axis` title above the plot and the `cat_axis` title below (for non-horizontal kinds), so
+  storing the Y-axis title in `val_axis` and the X-axis title in `cat_axis` renders **both**
+  numeric axis titles with no chrome edit. The legend enumerates series with `series_color(i)`;
+  the dots resolve color the identical way at the same index, so swatch↔dot-cloud mapping is
+  correct by construction — `lib.rs::chart_element` just gained a `ChartKind::Scatter` arm.
+
+## What was notable (all minor)
+
+- **No pixel inset needed for dot breathing room.** `NiceScale`'s outward rounding already pads
+  the data inside each domain (e.g. x 5..41 → nice [0, 50]), so dots land inset from the frame
+  while the ticks/grid stay exactly at the domain edges — mapping the domain straight to
+  `[plot_left, plot_right]` (no `POINT_INSET` like the line/area category axis) is both simpler
+  and correct here.
+- **A worst-case dot on a domain edge is not clipped.** Even a point exactly at a domain bound
+  centers on the frame line, so at most half a 7px dot overhangs into the (empty) axis gutter /
+  top/right gap — no clipping. So no special edge handling is required.
+- **`ScaleLinear`'s `f64`-only value type is a non-issue** (same as bars): the model already
+  stores x/y as `f64`.
+
+## Tests added (light, per relaxed rigor)
+
+- `scatter::shared_domains_cover_all_points` — both shared domains contain every x / every y of
+  every series (the core two-shared-numeric-axis property).
+- `scatter::point_count_matches_data` — the plotted dot count equals the total xy pairs across
+  all series.
+- `scatter::multi_series_has_distinct_colors` — the series resolve to distinct palette colors.
+- `scatter::rejects_non_scatter_and_empty` — `from_chart` returns `None` for a non-scatter chart
+  / a scatter with no xy series.
+- `scenes::gate3_scatter_scenes` — `scatter_single` is a Scatter with one xy series;
+  `scatter_multi` is a Scatter with ≥2 xy series; all series carry `SeriesData::Xy`. (41 unit
+  tests total across the workspace, all passing.)
+- The **2 PNGs + single-agent review** in `results/` are the real Gate-3 evidence.

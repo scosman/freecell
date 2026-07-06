@@ -64,5 +64,17 @@
     "png": "doughnut.png",
     "description": "A single-series doughnut chart (pie with a center hole) of market share across five companies, distinct per-slice colors, on-slice percentage labels, a title, and a slice→color legend.",
     "expectation": "A doughnut ring (a pie with a hollow center) divided into five arcs of differing sizes in five DISTINCT colors, each arc labeled with its percentage; a chart title; a legend mapping each company to its arc color. Non-blank, no clipping. (No numeric value axis — expected for a doughnut.)"
+  },
+  {
+    "name": "scatter_single",
+    "png": "scatter_single.png",
+    "description": "A single-series scatter plot of ad spend (X) vs revenue (Y), ten points trending up-and-to-the-right, on two numeric axes, with a title, both axis titles, and a legend.",
+    "expectation": "About ten dots scattered up-and-to-the-right (a clear positive trend), plotted against a numeric X axis along the bottom (ad spend, e.g. 0/10/20/30/40/50) and a numeric Y axis on the left (revenue, e.g. 20/40/60/80/100), each with readable evenly spaced tick labels and gridlines; a chart title ('Ad Spend vs Revenue'); an X-axis title and a Y-axis title; and a one-entry legend. Dots (not a connected line). Non-blank, no clipping."
+  },
+  {
+    "name": "scatter_multi",
+    "png": "scatter_multi.png",
+    "description": "A three-series scatter plot of iris petal length (X) vs petal width (Y) for three species (Setosa/Versicolor/Virginica), each a distinct-colored cluster of dots, on two numeric axes, with a title, both axis titles, and a legend.",
+    "expectation": "Three visually separated clusters of dots in THREE distinct colors — a low-left cluster (Setosa), a middle cluster (Versicolor), and an upper-right cluster (Virginica) — all plotted against a shared numeric X axis along the bottom (petal length, e.g. 0/2/4/6/8) and a shared numeric Y axis on the left (petal width, e.g. 0/1/2/3), each with readable tick labels and gridlines; a chart title ('Petal Size by Species'); an X-axis title and a Y-axis title; and a legend whose three swatch colors match the three dot-cluster colors. Dots, not lines. Non-blank, no clipping."
   }
 ]

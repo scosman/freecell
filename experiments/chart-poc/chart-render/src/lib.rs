@@ -17,6 +17,7 @@ pub mod chrome;
 pub mod line;
 pub mod pie;
 pub mod render;
+pub mod scatter;
 pub mod style;
 
 use chart_model::{Chart, ChartKind};
@@ -29,6 +30,6 @@ pub fn chart_element(chart: &Chart) -> Option<gpui::AnyElement> {
         ChartKind::Bar { .. } => bar::bar_element(chart),
         ChartKind::Area { .. } => area::area_element(chart),
         ChartKind::Pie { .. } => pie::pie_element(chart),
-        _ => None,
+        ChartKind::Scatter => scatter::scatter_element(chart),
     }
 }

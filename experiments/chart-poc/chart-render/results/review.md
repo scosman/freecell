@@ -130,3 +130,46 @@ three groupings), hand-rolled stacked/percent **area**, and the synthesized-pale
 is a horizontal caption above/below the plot rather than a rotated vertical axis title. It is
 legible and correctly associated, so no rubric point was docked; a ship-quality follow-on could
 rotate it. Not worth it for the PoC.
+
+---
+
+# Phase 3 — Gate 3: scatter (single-agent verdicts)
+
+Gate 3 (functional_spec §4, §7) tests scatter — the one type the research flagged as a genuine
+step-change, because it needs **two numeric axes** (X is a `ScaleLinear`, not a band/point
+category scale) and **standalone dot marks** from `c:xVal`/`c:yVal` pairs. Per §10 decision #3
+this uses a **single** reviewer verdict per image. Each image below was reviewed by an
+independent, fresh sub-agent that viewed the actual pixels and judged against the §6 seven-point
+rubric. Checkpoint semantics are lower-stakes: a FAIL would record scatter *out-of-scope for the
+follow-on*, not a whole-project NO-GO.
+
+## Gate 3 verdict table
+
+| Scene | Type | Verdict |
+|---|---|---|
+| `scatter_single` | single-series scatter, 10 points | **PASS** |
+| `scatter_multi` | multi-series scatter, 3 species clusters | **PASS** |
+
+**Both Gate-3 images PASS.** Scatter renders as a chart a user would accept, on two numeric axes
+with dots, reusing the Gate 1/2 title / axis-title / legend / nice-tick / palette scaffolding.
+→ **Scatter is IN-scope for the follow-on.**
+
+## Per-scene notes
+
+- **`scatter_single`** (Ad spend vs Revenue, 10 points): PASS on all 7 points. Standalone dots
+  (no connecting line) trending clearly up-and-to-the-right; a numeric **X** axis along the
+  bottom (0/10/20/30/40/50) *and* a numeric **Y** axis on the left (20/40/60/80/100), each with
+  evenly spaced readable ticks and dashed gridlines; chart title plus **both** axis titles
+  ("Ad spend (USD thousands)" / "Revenue (USD thousands)"); one-entry legend whose blue swatch
+  matches the dots. No clipping. The reviewer confirmed it reads as a legitimate scatter of the
+  data.
+- **`scatter_multi`** (iris petal length vs width, Setosa/Versicolor/Virginica): PASS on all 7
+  points — the graded Gate-3 case. Three **distinct-colored** dot clusters (blue low-left,
+  orange middle, green upper-right), all sharing ONE pair of numeric axes (X 0/2/4/6/8, Y 0/1/2/3
+  with gridlines); chart title plus both numeric axis titles; a three-entry legend whose swatch
+  colors match the three clusters exactly. Dots, not lines; no clipping. The multi-series color
+  cycle + legend mapping carry over to two-numeric-axis dot marks unchanged.
+
+**Cosmetic non-defect (carried from Gates 1–2):** the value-axis title is a horizontal caption
+rather than a rotated vertical title — legible and correctly associated, not docked. Neither
+reviewer flagged any new scatter-specific defect.

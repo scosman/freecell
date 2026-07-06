@@ -45,6 +45,9 @@ pub fn all() -> Vec<Scene> {
         area_percent_stacked(),
         pie(),
         doughnut(),
+        // Phase 3 — Gate 3 scatter.
+        scatter_single(),
+        scatter_multi(),
     ]
 }
 
@@ -447,6 +450,86 @@ fn doughnut() -> Scene {
     }
 }
 
+/// Gate 3 — **single-series scatter** (functional_spec §4): paired numeric (X, Y) points on
+/// TWO numeric value axes, showing a positive Ad-spend → Revenue relationship. The baseline
+/// "just draw dots on two ScaleLinear axes" case, reusing the title/axis-title/legend chrome.
+fn scatter_single() -> Scene {
+    let chart = Chart {
+        title: Some("Ad Spend vs Revenue".into()),
+        kind: ChartKind::Scatter,
+        series: vec![Series::xy(
+            Some("Campaigns"),
+            vec![5.0, 9.0, 12.0, 16.0, 20.0, 24.0, 28.0, 33.0, 37.0, 41.0],
+            vec![22.0, 30.0, 41.0, 38.0, 55.0, 60.0, 72.0, 68.0, 85.0, 96.0],
+        )],
+        cat_axis: Axis::titled("Ad spend (USD thousands)"),
+        val_axis: Axis::titled("Revenue (USD thousands)"),
+        legend: Some(Legend::default()),
+    };
+    Scene {
+        name: "scatter_single",
+        description: "A single-series scatter plot of ad spend (X) vs revenue (Y), ten points \
+                      trending up-and-to-the-right, on two numeric axes, with a title, both \
+                      axis titles, and a legend.",
+        expectation: "About ten dots scattered up-and-to-the-right (a clear positive trend), \
+                      plotted against a numeric X axis along the bottom (ad spend, e.g. \
+                      0/10/20/30/40/50) and a numeric Y axis on the left (revenue, e.g. \
+                      20/40/60/80/100), each with readable evenly spaced tick labels and \
+                      gridlines; a chart title ('Ad Spend vs Revenue'); an X-axis title and a \
+                      Y-axis title; and a one-entry legend. Dots (not a connected line). \
+                      Non-blank, no clipping.",
+        viewport: DEFAULT_VP,
+        chart,
+    }
+}
+
+/// Gate 3 — **multi-series scatter** (functional_spec §4, the graded case): three iris-style
+/// species clusters (petal length vs petal width) in distinct colors with a legend. Proves the
+/// multi-series color cycle + legend mapping carry over to two-numeric-axis dot marks.
+fn scatter_multi() -> Scene {
+    let chart = Chart {
+        title: Some("Petal Size by Species".into()),
+        kind: ChartKind::Scatter,
+        series: vec![
+            Series::xy(
+                Some("Setosa"),
+                vec![1.4, 1.3, 1.5, 1.7, 1.4, 1.5, 1.6, 1.2],
+                vec![0.2, 0.2, 0.4, 0.3, 0.2, 0.1, 0.4, 0.2],
+            ),
+            Series::xy(
+                Some("Versicolor"),
+                vec![4.7, 4.5, 4.9, 4.0, 4.6, 3.9, 5.1, 4.2],
+                vec![1.4, 1.5, 1.5, 1.3, 1.5, 1.4, 1.6, 1.5],
+            ),
+            Series::xy(
+                Some("Virginica"),
+                vec![6.0, 5.9, 5.6, 6.6, 5.8, 6.4, 5.5, 6.7],
+                vec![2.5, 2.1, 1.8, 2.1, 2.2, 2.3, 1.9, 2.4],
+            ),
+        ],
+        cat_axis: Axis::titled("Petal length (cm)"),
+        val_axis: Axis::titled("Petal width (cm)"),
+        legend: Some(Legend::default()),
+    };
+    Scene {
+        name: "scatter_multi",
+        description: "A three-series scatter plot of iris petal length (X) vs petal width (Y) \
+                      for three species (Setosa/Versicolor/Virginica), each a distinct-colored \
+                      cluster of dots, on two numeric axes, with a title, both axis titles, and \
+                      a legend.",
+        expectation: "Three visually separated clusters of dots in THREE distinct colors — a \
+                      low-left cluster (Setosa), a middle cluster (Versicolor), and an \
+                      upper-right cluster (Virginica) — all plotted against a shared numeric X \
+                      axis along the bottom (petal length, e.g. 0/2/4/6/8) and a shared numeric \
+                      Y axis on the left (petal width, e.g. 0/1/2/3), each with readable tick \
+                      labels and gridlines; a chart title ('Petal Size by Species'); an X-axis \
+                      title and a Y-axis title; and a legend whose three swatch colors match the \
+                      three dot-cluster colors. Dots, not lines. Non-blank, no clipping.",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +629,32 @@ mod tests {
                 doughnut_hole: Some(_)
             }
         ));
+    }
+
+    #[test]
+    fn gate3_scatter_scenes() {
+        // Single-series scatter: one xy series.
+        let single = get("scatter_single").expect("scatter_single scene");
+        assert_eq!(single.chart.kind, ChartKind::Scatter);
+        assert_eq!(single.chart.series.len(), 1);
+        assert!(matches!(
+            single.chart.series[0].data,
+            chart_model::SeriesData::Xy { .. }
+        ));
+
+        // Multi-series scatter: three xy series (the graded Gate-3 case).
+        let multi = get("scatter_multi").expect("scatter_multi scene");
+        assert_eq!(multi.chart.kind, ChartKind::Scatter);
+        assert!(
+            multi.chart.series.len() >= 2,
+            "Gate 3 needs a multi-series scatter, got {}",
+            multi.chart.series.len()
+        );
+        for s in &multi.chart.series {
+            assert!(
+                matches!(s.data, chart_model::SeriesData::Xy { .. }),
+                "scatter series must carry xy data"
+            );
+        }
     }
 }

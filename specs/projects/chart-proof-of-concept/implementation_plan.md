@@ -102,7 +102,7 @@ not grind through later phases once a core capability is shown unachievable.**
   **pie** + **doughnut** with synthesized palette. Capture + single-agent review each.
   *Checkpoint: wholesale grouped/stacked FAIL → lean PARTIAL-GO (e.g. "single-series only").*
 
-- [ ] **Phase 3 — Gate 3: scatter.** Single- and multi-series **scatter** (two numeric axes
+- [x] **Phase 3 — Gate 3: scatter.** Single- and multi-series **scatter** (two numeric axes
   + dots), reusing the Phase 1/2 title/axis/legend scaffolding. Capture + review.
   *Checkpoint: FAIL → scatter recorded out-of-scope for the follow-on (not a whole NO-GO).*
 

@@ -101,6 +101,11 @@ const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 2
 /// The top "clear the family override" entry in the font-family dropdown (`ui_design.md §2`).
 const SYSTEM_DEFAULT_FAMILY: &str = "Default (Inter)";
 const DATA_ROW_H: f32 = 32.0;
+/// The formula-bar content entry's height: [`DATA_ROW_H`] minus 2 px breathing room above **and**
+/// below (BUG C), so the row's `items_center` insets the entry within the bar without changing the
+/// bar height. gpui-component's single-line `Input` otherwise renders at its fixed control height
+/// (`Size::Medium` → 32 px) and fills the row edge-to-edge, which reads as cramped.
+const DATA_ROW_FIELD_H: f32 = DATA_ROW_H - 4.0;
 const TAB_BAR_H: f32 = 30.0;
 const REF_BOX_W: f32 = 72.0;
 /// The content field's left edge inside the data row = padding + ref box + gap + divider +
@@ -1813,7 +1818,17 @@ impl ChromeView {
         let disabled = self.data_row.mode() == FieldMode::Disabled;
         let cap_error = self.cap_error_visible();
 
-        let mut content = Input::new(&self.content_input).disabled(disabled).w_full();
+        // Inset the entry to `DATA_ROW_H - 4` so the row's `items_center` leaves 2 px above and
+        // below it (BUG C), without shrinking the 32 px bar. gpui-component's single-line `Input`
+        // pins a fixed 32 px control height (`Size::Medium` → `h_8`) that otherwise fills the row
+        // edge-to-edge; `Input::h()` is multi-line-only, so pin the single-line control via
+        // `min_h`/`max_h` (applied after `input_h` through `refine_style`). The 20 px line box fits
+        // the 28 px control, so the normal-size text stays centered and un-clipped.
+        let mut content = Input::new(&self.content_input)
+            .disabled(disabled)
+            .w_full()
+            .min_h(px(DATA_ROW_FIELD_H))
+            .max_h(px(DATA_ROW_FIELD_H));
         if self.fetch_spinner_visible() {
             content = content.suffix(Spinner::new().small());
         }
@@ -1865,10 +1880,12 @@ impl ChromeView {
                     .child(self.ref_box_text()),
             )
             .child(div().w(px(1.0)).h(px(20.0)).bg(rgb(DIVIDER)))
-            // Content field (danger border on cap reject).
+            // Content field (danger border on cap reject). The row's `items_center` centers this
+            // (input-height) field so the 28 px entry sits 2 px inside the 32 px bar (BUG C).
             .child(
                 div()
                     .flex_1()
+                    .debug_selector(|| "data-content-field".into())
                     .when(cap_error, |d| {
                         d.border_1().border_color(rgb(DANGER)).rounded_md()
                     })
@@ -2072,8 +2089,14 @@ impl ChromeView {
             .left_0()
             .size_full()
             .child(
-                self.backdrop(|this, _w, _cx| this.fill_open = false, cx)
-                    .child(div()),
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.fill_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
             )
             .child(
                 div()
@@ -2161,8 +2184,14 @@ impl ChromeView {
             .left_0()
             .size_full()
             .child(
-                self.backdrop(|this, _w, _cx| this.text_color_open = false, cx)
-                    .child(div()),
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.text_color_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
             )
             .child(
                 div()
@@ -2236,8 +2265,14 @@ impl ChromeView {
             .left_0()
             .size_full()
             .child(
-                self.backdrop(|this, _w, _cx| this.num_fmt_open = false, cx)
-                    .child(div()),
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.num_fmt_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
             )
             .child(
                 div()
@@ -2290,8 +2325,14 @@ impl ChromeView {
             .left_0()
             .size_full()
             .child(
-                self.backdrop(|this, _w, _cx| this.font_family_open = false, cx)
-                    .child(div()),
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.font_family_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
             )
             .child(
                 div()
@@ -2342,8 +2383,14 @@ impl ChromeView {
             .left_0()
             .size_full()
             .child(
-                self.backdrop(|this, _w, _cx| this.font_size_open = false, cx)
-                    .child(div()),
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.font_size_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
             )
             .child(
                 div()
@@ -2412,8 +2459,14 @@ impl ChromeView {
             .left_0()
             .size_full()
             .child(
-                self.backdrop(|this, _w, _cx| this.borders_open = false, cx)
-                    .child(div()),
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.borders_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
             )
             .child(
                 div()
@@ -2756,6 +2809,33 @@ mod tests {
     }
 
     // ---- Data row: fetch / reply / disable -------------------------------------------------
+
+    #[gpui::test]
+    fn data_row_content_field_is_inset_within_bar(cx: &mut TestAppContext) {
+        // BUG C: the formula-bar content entry must sit 2 px inside the 32 px bar (top and bottom)
+        // — i.e. render at `DATA_ROW_H - 4` = 28 px — without changing the bar height. The field
+        // wrapper hugs the hosted `Input`'s height (the bar is `items_center`, not stretch), so its
+        // painted height is the control height. Without the `min_h`/`max_h` inset on the `Input`
+        // the control renders at gpui-component's fixed 32 px and fills the bar edge-to-edge; this
+        // asserts 28 px and fails if the inset is removed (verified fail-without / pass-with).
+        let h = one_sheet(cx);
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let field = vcx
+            .debug_bounds("data-content-field")
+            .expect("the data-row content field was painted");
+        let field_h = f32::from(field.size.height);
+        assert!(
+            (field_h - DATA_ROW_FIELD_H).abs() < 0.5,
+            "content field must render at DATA_ROW_H - 4 = {DATA_ROW_FIELD_H}px, got {field_h}"
+        );
+        // The inset must not have changed the bar height.
+        assert_eq!(DATA_ROW_H, 32.0, "the data-row bar height must stay 32px");
+        assert!(
+            field_h + 3.5 < DATA_ROW_H,
+            "the field must be shorter than the bar so items_center leaves breathing room"
+        );
+    }
 
     #[gpui::test]
     fn selection_single_fetches_content(cx: &mut TestAppContext) {
@@ -3603,6 +3683,56 @@ mod tests {
         assert!(
             h.client.take_commands().is_empty(),
             "dismissing via the backdrop dispatches no command"
+        );
+    }
+
+    #[gpui::test]
+    fn popover_outside_click_removes_card_on_next_render_without_hover(cx: &mut TestAppContext) {
+        // BUG B: the backdrop's dismiss closure must `cx.notify()` so the view repaints on the
+        // very next frame. Without the notify the open-flag flips false but the view is never
+        // marked dirty, so the popover card stays painted until some *unrelated* later event (a
+        // hover/mouse-move) happens to repaint it — exactly the reported "won't close until the
+        // mouse moves" symptom.
+        //
+        // The element-level discriminator: `debug_bounds` reads `window.rendered_frame`, which
+        // only changes on an actual draw, and `simulate_event` ends in `run_until_parked`, which
+        // redraws a window ONLY if something marked it dirty. So a single outside mouse-DOWN that
+        // clears the flag but does not notify leaves the *previous* frame — card still present —
+        // standing, with no intervening mouse-move. This asserts the card is GONE on that next
+        // frame. Reverting the `cx.notify()` in `render_num_fmt_popover`'s backdrop closure makes
+        // this fail (card still painted on the next render). Verified fail-without / pass-with.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        h.client.take_commands();
+
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let card = vcx
+            .debug_bounds("numfmt-card")
+            .expect("the number-format card was painted while open");
+        // A point on the backdrop but clear of the card (top strip, far left of the right-anchored
+        // card) — same geometry the sibling outside-click test uses.
+        let outside = gpui::point(px(10.0), card.origin.y + px(4.0));
+        assert!(
+            !card.contains(&outside),
+            "test point must be outside the card, card = {card:?}"
+        );
+
+        // A single mouse-DOWN on the backdrop, and crucially NO following mouse-move / hover.
+        vcx.simulate_mouse_down(outside, MouseButton::Left, gpui::Modifiers::default());
+
+        // The flag flipped false...
+        assert!(
+            !vcx.update(|_w, cx| h.chrome.read(cx).num_fmt_open),
+            "the outside press must clear the open flag"
+        );
+        // ...AND the dismiss notified, so the view repainted on the very next frame and the card
+        // element is gone — no intervening hover needed. This is the assertion that fails without
+        // the `cx.notify()`.
+        assert!(
+            vcx.debug_bounds("numfmt-card").is_none(),
+            "the popover card must be gone on the very next render (the dismiss must cx.notify)"
         );
     }
 

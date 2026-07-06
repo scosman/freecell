@@ -2529,6 +2529,50 @@ const IN_CELL_DANGER: u32 = 0xDC2626;
 /// Dark tooltip fill + text for the in-cell cap-error popover (`ui_design.md §4`, matching chrome).
 const IN_CELL_TOOLTIP_BG: u32 = 0x2B2B2B;
 const IN_CELL_TOOLTIP_TEXT: u32 = 0xF5F5F5;
+/// The in-cell editor wrapper's total vertical border: `border_2` = 2 px top + 2 px bottom. The
+/// hosted input's height is the cell height minus this, floored at the line box (see
+/// [`incell_input_geometry`]).
+const IN_CELL_BORDER_TOTAL_PX: f32 = 4.0;
+/// Line-box factor for the in-cell editor's hosted input, applied to the font px so the line box
+/// scales with the font instead of gpui-component's fixed `Rems(1.25)` (= 20 px at the 16 px rem).
+/// Numerically the same `1.25` the engine's row auto-grow uses (`worker/run.rs`:
+/// `ceil(font_px * 1.25) + 4`) — but that height is in IronCalc space and is scaled ×24/28 to
+/// device px before it reaches the render path, so the two do NOT cancel (see below).
+const IN_CELL_LINE_HEIGHT_FACTOR: f32 = 1.25;
+
+/// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
+/// clipped vertically (BUG A): `(control_height, line_height)` in **device** px.
+///
+/// - `line_height` = `font_px * 1.25` — font-relative, so the line box scales with the glyph.
+/// - `control_height` = `(h - 4).max(line_height)` — the wrapper's inner box (cell height `h` minus
+///   the 2 px top+bottom accent border), **floored at the line box**.
+///
+/// gpui-component's single-line `Input` otherwise pins a FIXED control height (`Size::Medium` →
+/// `h_8` = 32 px, `input.rs`) and a FIXED line height (`const LINE_HEIGHT: Rems = Rems(1.25)` =
+/// 20 px, `input.rs`), both independent of the applied `text_size`. A 24 pt (= 32 px) glyph then
+/// overflows the 20 px line box inside the 32 px control and is cut off — while the committed cell
+/// (`cell_element`, a plain `div().h(px(h)).text_size(..)` whose line height scales with the font)
+/// renders it fine.
+///
+/// Why the floor is needed (unit spaces do NOT cancel): `h` arrives in device px — it is the row
+/// auto-grow height, which the engine computes in IronCalc space (`worker/run.rs`:
+/// `ceil(font_px * 1.25) + 4`, in the 28 px-default IronCalc space) and then scales to device px by
+/// ×24/28 (`freecell-engine::cache::row_px`). But the glyph renders at pure device px
+/// (`pt * 96/72`, no 24/28). So for an auto-grown large font `h - 4` lands ~15 % *below*
+/// `line_height` (e.g. 24 pt: device `h ≈ 44 * 24/28 ≈ 37.7`, `h - 4 ≈ 33.7 < 40`). The
+/// `.max(line_height)` floor keeps the control at least as tall as its own line box, so the glyph
+/// is never clipped; when `h - 4 < line_height` the `Input` simply overflows the cell wrapper by a
+/// few px (single-line `Input` has only `overflow_x_hidden` — no vertical mask — so the overflow
+/// stays visible and vertically centered, not cut off). Pure so it is unit-testable; the on-screen
+/// result (that the `Input` honours these) is the owner's Mac check.
+fn incell_input_geometry(h: f32, font_px: f32) -> (f32, f32) {
+    let line_h = font_px * IN_CELL_LINE_HEIGHT_FACTOR;
+    // Floor at the line box so `line_h <= control_h` in ALL cases (auto-grown large fonts, default
+    // cells, and short/min-height rows). `.max(0.0)` keeps a torn/negative `h` from underflowing;
+    // `.max(line_h)` (line_h >= 0) subsumes it but the guard is kept for robustness.
+    let control_h = (h - IN_CELL_BORDER_TOTAL_PX).max(0.0).max(line_h);
+    (control_h, line_h)
+}
 
 /// The in-cell editor's resolved text attributes for a cell — the WYSIWYG font the overlay renders
 /// (BUG #4). Mirrors [`cell_element`]'s resolution so editing looks like the committed cell.
@@ -2600,11 +2644,23 @@ impl GridView {
             self.visible_styles.get(&(cell.row, cell.col)).copied(),
             &self.visible_font_families,
         );
+        // Size the hosted input to (at least) its own font-scaled line box so a large font is not
+        // clipped vertically (BUG A). gpui-component's single-line `Input` pins a fixed 32 px
+        // control height (`Size::Medium` → `h_8`) and a fixed 20 px line height (`Rems(1.25)`)
+        // regardless of `text_size`; `Input::h()`/`h_full()` only affect multi-line mode, so pin
+        // the single-line control height via `min_h`/`max_h` (both applied after gpui-component's
+        // `input_h` via `refine_style`) and override the line box. `incell_input_geometry` fills the
+        // cell inner height where it can and floors at the line box otherwise (the control may then
+        // overflow the cell wrapper a few px — visible, not clipped; see its doc).
+        let (control_h, line_h) = incell_input_geometry(h, font_px);
         let mut input_el = Input::new(input)
             .appearance(false)
             .text_size(px(font_px))
             .px_0()
-            .w_full();
+            .w_full()
+            .min_h(px(control_h))
+            .max_h(px(control_h))
+            .line_height(px(line_h));
         if let Some(name) = family {
             input_el = input_el.font_family(name);
         }
@@ -3597,6 +3653,58 @@ mod tests {
         assert!(r.bold, "bold resolved");
         assert!(r.italic, "italic resolved");
         assert!(r.underline, "underline resolved (was previously dropped)");
+    }
+
+    #[test]
+    fn incell_input_floors_control_at_line_box() {
+        // BUG A: the hosted single-line `Input` must never be shorter than its own font-scaled line
+        // box, else a large glyph is clipped. The subtlety the floor guards: `h` arrives in DEVICE
+        // px — the row auto-grow height, computed by the engine in IronCalc space
+        // (`worker/run.rs`: ceil(font_px*1.25)+4) and scaled ×24/28 to device px
+        // (`freecell-engine::cache::row_px`) — while the glyph renders at pure device px
+        // (pt*96/72, no 24/28). So for an auto-grown large font `h - 4` lands ~15 % *below*
+        // `line_h = font_px*1.25`; `.max(line_h)` is what keeps the line box inside the control.
+        // This pins the geometry the render path feeds the `Input`; the on-screen result (that the
+        // `Input` honours it) is the owner's Mac check.
+        let font_px: f32 = 24.0 * 96.0 / 72.0; // 24 pt -> 32 px, as in resolve_incell_font.
+        let line_expect = font_px * 1.25; // 40 px
+
+        // The DEVICE-px row height the app actually feeds us: the IronCalc-space auto-grow height
+        // (ceil(font_px*1.25)+4 = 44) scaled ×24/28 ≈ 37.7 px — NOT 44.
+        let needed_ic = (font_px * 1.25).ceil() + 4.0; // 44 px, IronCalc space
+        let h = needed_ic * 24.0 / 28.0; // ≈ 37.7 px device
+        assert!(
+            h - 4.0 < line_expect,
+            "precondition: without the floor control_h would be h-4 = {} px, below the line box {line_expect} px",
+            h - 4.0
+        );
+
+        let (control_h, line_h) = incell_input_geometry(h, font_px);
+        assert!((line_h - line_expect).abs() < 1e-4, "line_h = {line_h}");
+        // The floor engages: the control is lifted to the line box (≈40), NOT left at h-4 (≈33.7).
+        // Dropping `.max(line_h)` from `incell_input_geometry` makes THIS assertion fail
+        // (control_h would be ≈33.7 < 40) — it is the floor-discriminating check.
+        assert!(
+            (control_h - line_h).abs() < 1e-4,
+            "floor must lift control_h to the line box, got {control_h} (line box {line_h})"
+        );
+        assert!(line_h <= control_h + 1e-4);
+
+        // A tall/plain cell where h-4 exceeds the line box keeps the full inner height (no floor).
+        let (tall_c, tall_l) = incell_input_geometry(80.0, font_px);
+        assert!((tall_c - 76.0).abs() < 1e-6, "tall control_h = {tall_c}");
+        assert!(
+            tall_l <= tall_c,
+            "line box ({tall_l}) must fit the tall control ({tall_c})"
+        );
+
+        // A default-font cell (13 px in a 24 px row): inner height 20 > line box 16.25 → no floor.
+        let (dc, dl) = incell_input_geometry(24.0, 13.0);
+        assert!((dc - 20.0).abs() < 1e-6, "default control_h = {dc}");
+        assert!(
+            dl <= dc,
+            "default line box ({dl}) must fit the default control ({dc})"
+        );
     }
 
     #[gpui::test]

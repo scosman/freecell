@@ -1205,11 +1205,11 @@ fn make_grid_sink(
                 None => true,
             };
             if committed {
-                let anchor = shared.last_selection.get().range().start;
+                let target = shared.last_selection.get().range();
                 shared
                     .clipboard
                     .borrow_mut()
-                    .paste(shared.active_sheet.get(), anchor, &client, cx);
+                    .paste(shared.active_sheet.get(), target, &client, cx);
             }
         }
         // Structure ops (`functional_spec.md §5`): resize + insert/delete route straight to the

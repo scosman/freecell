@@ -506,7 +506,7 @@ impl Worker {
     fn apply_clipboard_op(&mut self, cmd: Command) {
         match cmd {
             Command::CopySelection { sheet, range, cut } => self.apply_copy(sheet, range, cut),
-            Command::PasteInternal { sheet, anchor } => self.apply_paste_internal(sheet, anchor),
+            Command::PasteInternal { sheet, target } => self.apply_paste_internal(sheet, target),
             Command::PasteTsv {
                 sheet,
                 anchor,
@@ -559,7 +559,8 @@ impl Worker {
     /// unresolved sheet. The slot is `take`n so its JSON is passed to the engine by reference
     /// (no clone); a non-consuming early return / failed paste restores it, a successful copy
     /// keeps it (repeatable), and a successful cut drops it (single-use).
-    fn apply_paste_internal(&mut self, dest: SheetId, anchor: CellRef) {
+    fn apply_paste_internal(&mut self, dest: SheetId, target: CellRange) {
+        let anchor = target.start;
         if self.degraded {
             self.emit(WorkerEvent::EditRejected {
                 reason: EditRejectedReason::Degraded,
@@ -582,7 +583,28 @@ impl Worker {
             });
             return;
         }
-        // Overflow pre-check against the slot's effective (dimension-clamped) source dims.
+        // A single-cell / exact-divisor COPY into a larger selection fills the whole target (BUG 4);
+        // values + styles fill exactly, formula refs get one uniform (not per-cell) shift (accepted
+        // limitation U2 in `GAPS.md`). Cap the fill at the same size guard font edits use so a 1-cell
+        // paste into a full-column selection can't materialise a million cells — reject it as
+        // Overflow (nothing pasted). The fill target is itself a valid on-sheet selection, so no
+        // sheet-edge overflow is possible.
+        let fill = if slot.cut {
+            None
+        } else {
+            crate::document::fill_target_dims(slot.range, target)
+        };
+        if let Some((tw, th)) = fill {
+            if tw as u64 * th as u64 > MAX_REFRESH_CELLS {
+                self.clipboard = Some(slot); // still valid — the user can retry on a smaller target
+                self.emit(WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow,
+                });
+                return;
+            }
+        }
+        // Overflow pre-check against the slot's effective (dimension-clamped) source dims. When
+        // filling, the source is a divisor of the (valid) target, so its top-left tile fits too.
         let (width, height) = ((c1 - c0 + 1) as u32, (r1 - r0 + 1) as u32);
         if !paste_fits(anchor, width, height) {
             self.clipboard = Some(slot); // still valid — the user can retry at a smaller anchor
@@ -609,7 +631,7 @@ impl Worker {
         let outcome = {
             let data = &slot.data;
             self.run_guarded_paste(move |doc| {
-                doc.paste_clipboard(dest_idx, anchor, source_idx, source_range, data, cut)
+                doc.paste_clipboard(dest_idx, source_idx, source_range, data, cut, target)
             })
         };
         match outcome {
@@ -2720,7 +2742,7 @@ mod tests {
         // Paste the A1:A2 payload with its top-left at C1 (row 0, col 2).
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 2),
+            target: CellRange::single(CellRef::new(0, 2)),
         }]);
 
         assert_eq!(value_at(&worker, 0, 2), "10");
@@ -2765,7 +2787,7 @@ mod tests {
         // First paste moves the cut value to C1 and clears the source.
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 2),
+            target: CellRange::single(CellRef::new(0, 2)),
         }]);
         assert_eq!(value_at(&worker, 0, 2), "7");
         assert_eq!(value_at(&worker, 0, 0), "", "the cut source is cleared");
@@ -2774,7 +2796,7 @@ mod tests {
         // The slot is consumed → a second paste has nothing to paste.
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 4),
+            target: CellRange::single(CellRef::new(0, 4)),
         }]);
         let events = drain_events(&rx);
         assert!(
@@ -2807,7 +2829,7 @@ mod tests {
         });
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 0),
+            target: CellRange::single(CellRef::new(0, 0)),
         }]);
         let events = drain_events(&rx);
         assert!(
@@ -2851,7 +2873,7 @@ mod tests {
         // A 2-row payload pasted onto the very last row spills past the sheet edge.
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(limits::MAX_ROWS - 1, 0),
+            target: CellRange::single(CellRef::new(limits::MAX_ROWS - 1, 0)),
         }]);
         let events = drain_events(&rx);
         assert!(
@@ -2967,7 +2989,7 @@ mod tests {
 
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 2),
+            target: CellRange::single(CellRef::new(0, 2)),
         }]);
         assert_eq!(value_at(&worker, 0, 2), "42");
         assert!(
@@ -2978,7 +3000,7 @@ mod tests {
 
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 4),
+            target: CellRange::single(CellRef::new(0, 4)),
         }]);
         assert_eq!(value_at(&worker, 0, 4), "42", "the second paste also lands");
         assert!(
@@ -3001,7 +3023,7 @@ mod tests {
         });
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 0),
+            target: CellRange::single(CellRef::new(0, 0)),
         }]);
         let events = drain_events(&rx);
         assert!(
@@ -3041,7 +3063,7 @@ mod tests {
         );
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
-            anchor: CellRef::new(0, 2),
+            target: CellRange::single(CellRef::new(0, 2)),
         }]);
         assert_eq!(value_at(&worker, 0, 2), "5");
         drain_events(&rx);
@@ -3050,6 +3072,96 @@ mod tests {
         worker.process_batch(vec![Command::Undo]);
         assert_eq!(value_at(&worker, 0, 2), "", "one undo reverts the paste");
         assert_eq!(value_at(&worker, 0, 0), "5", "the copy source is untouched");
+    }
+
+    #[test]
+    fn single_cell_paste_fills_the_whole_target_selection_in_one_undo() {
+        // BUG 4: copy one cell, paste onto a 3×3 selection → all nine cells fill, one undo step.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "7"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        // Paste onto C1:E3 (rows 0..=2, cols 2..=4) — a 3×3 target, anchor at C1.
+        let target = CellRange::new(CellRef::new(0, 2), CellRef::new(2, 4));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(
+                    value_at(&worker, r, c),
+                    "7",
+                    "cell ({r},{c}) should be filled by the single-cell paste"
+                );
+            }
+        }
+        // The reply carries the FULL filled rectangle (C1:E3), and one undo clears all nine cells.
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == target
+            )),
+            "fill reply carries the whole target; got {events:?}"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(
+                    value_at(&worker, r, c),
+                    "",
+                    "one undo must clear the entire fill at ({r},{c})"
+                );
+            }
+        }
+        assert_eq!(value_at(&worker, 0, 0), "7", "the copy source is untouched");
+    }
+
+    #[test]
+    fn single_cell_paste_into_oversized_selection_is_rejected() {
+        // A 1-cell paste into a full-column selection would fill > 100k cells — reject as Overflow
+        // (the fill cap), nothing pasted, and the copy is preserved for a retry.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "9")]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        // A whole column A (Excel-max rows) as the target.
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(limits::MAX_ROWS - 1, 0));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an oversized fill is rejected; got {events:?}"
+        );
+        assert!(
+            worker.clipboard.is_some(),
+            "the copy is preserved after a rejected fill"
+        );
     }
 
     // ---- Phase 7: structure (resize, insert/delete, clamp, merge guard) --------------------

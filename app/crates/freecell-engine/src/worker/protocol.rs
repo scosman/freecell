@@ -217,10 +217,15 @@ pub enum Command {
         range: CellRange,
         cut: bool,
     },
-    /// Paste the engine clipboard slot at `anchor` (full-fidelity: values + adjusted formulas +
-    /// styles). Replies with [`WorkerEvent::Pasted`] (the pasted range) or
-    /// [`WorkerEvent::PasteRejected`].
-    PasteInternal { sheet: SheetId, anchor: CellRef },
+    /// Paste the engine clipboard slot into `target` — the destination selection (full-fidelity:
+    /// values + adjusted formulas + styles). The paste anchors at `target.start`; when the copied
+    /// source is a single cell (or an exact divisor of the target) and `target` is larger, the
+    /// source is **tiled/filled** across the whole selection as one undo step (BUG 4). Values and
+    /// styles fill exactly; a **formula** gets the top-left cell's `anchor − source` reference shift
+    /// applied uniformly to every filled cell — NOT Excel's per-cell relative fill (accepted
+    /// limitation U2 in `GAPS.md`, to keep the fill one undo step). Replies with
+    /// [`WorkerEvent::Pasted`] (the pasted range) or [`WorkerEvent::PasteRejected`].
+    PasteInternal { sheet: SheetId, target: CellRange },
     /// Paste external tab-separated `text` at `anchor` (each token as user input). Replies with
     /// [`WorkerEvent::Pasted`] or [`WorkerEvent::PasteRejected`].
     PasteTsv {

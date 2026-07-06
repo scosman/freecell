@@ -617,7 +617,7 @@ fn copy_paste_through_worker_roundtrips_values() {
     // Paste the A1:A2 payload at C1.
     client.send(Command::PasteInternal {
         sheet,
-        anchor: CellRef::new(0, 2),
+        target: CellRange::single(CellRef::new(0, 2)),
     });
     let pasted = wait_for(&rx, |e| matches!(e, WorkerEvent::Pasted { .. }));
     assert!(
@@ -676,7 +676,7 @@ fn paste_undo_is_a_single_step_through_worker() {
     );
     client.send(Command::PasteInternal {
         sheet,
-        anchor: CellRef::new(0, 2),
+        target: CellRange::single(CellRef::new(0, 2)),
     });
     poll_until(|| published_text(&client, 0, 2) == "5", "paste publishes");
 
@@ -711,7 +711,7 @@ fn overflow_paste_is_rejected_through_worker() {
     // A 2-row payload pasted onto the last row spills past the sheet edge.
     client.send(Command::PasteInternal {
         sheet,
-        anchor: CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+        target: CellRange::single(CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0)),
     });
     let rejected = wait_for(&rx, |e| matches!(e, WorkerEvent::PasteRejected { .. }));
     assert!(

@@ -161,6 +161,16 @@ impl CellRange {
         self.start == self.end
     }
 
+    /// The range's width in columns (inclusive; `>= 1` for a normalized range).
+    pub fn width(&self) -> u32 {
+        self.end.col - self.start.col + 1
+    }
+
+    /// The range's height in rows (inclusive; `>= 1` for a normalized range).
+    pub fn height(&self) -> u32 {
+        self.end.row - self.start.row + 1
+    }
+
     /// Inclusive row span.
     pub fn rows(&self) -> std::ops::RangeInclusive<u32> {
         self.start.row..=self.end.row
@@ -273,6 +283,15 @@ mod tests {
         assert_eq!(r.end, CellRef::new(9, 3));
         assert!(!r.is_single());
         assert!(CellRange::single(CellRef::new(4, 4)).is_single());
+    }
+
+    #[test]
+    fn cell_range_width_and_height() {
+        let r = CellRange::new(CellRef::new(2, 1), CellRef::new(9, 3)); // rows 2..=9, cols 1..=3
+        assert_eq!(r.height(), 8);
+        assert_eq!(r.width(), 3);
+        let one = CellRange::single(CellRef::new(4, 4));
+        assert_eq!((one.width(), one.height()), (1, 1));
     }
 
     #[test]

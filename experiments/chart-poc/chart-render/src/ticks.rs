@@ -77,6 +77,27 @@ impl NiceScale {
         Self::new(lo, hi, target_ticks)
     }
 
+    /// A nice scale spanning the data's actual `min..max` — **not** forced to include zero.
+    /// This is Excel's auto-ranging value axis for line/scatter charts
+    /// (`research/compare-line.md`: the value axis auto-ranges to the data range with padding
+    /// and does not force zero), and is the SHARED value domain a multi-series line draws all
+    /// its series against. Empty / all-non-finite input falls back to a unit scale.
+    pub fn spanning(values: impl IntoIterator<Item = f64>, target_ticks: usize) -> Self {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for v in values {
+            if !v.is_finite() {
+                continue;
+            }
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if !lo.is_finite() || !hi.is_finite() {
+            return Self::new(0.0, 1.0, target_ticks);
+        }
+        Self::new(lo, hi, target_ticks)
+    }
+
     /// The tick positions from `min` to `max` inclusive, spaced by `step`.
     pub fn ticks(&self) -> Vec<f64> {
         let mut ticks = Vec::new();
@@ -207,6 +228,23 @@ mod tests {
         // Non-finite.
         let n = NiceScale::new(f64::NAN, f64::INFINITY, 5);
         assert!(n.step.is_finite() && n.step > 0.0);
+    }
+
+    #[test]
+    fn spanning_covers_data_without_forcing_zero() {
+        // Data far from zero: the axis zooms to the data range instead of snapping to 0
+        // (Excel's line value-axis behavior), while still covering both ends.
+        let s = NiceScale::spanning([32.0, 91.0, 55.0], 5);
+        assert!(s.min <= 32.0, "min {} should cover the data floor", s.min);
+        assert!(s.max >= 91.0, "max {} should cover the data ceiling", s.max);
+        assert!(s.min > 0.0, "min {} should not be forced to zero", s.min);
+        let ticks = s.ticks();
+        assert!(ticks.len() >= 2);
+        assert_eq!(*ticks.first().unwrap(), s.min);
+        assert_eq!(*ticks.last().unwrap(), s.max);
+        // Empty input is a safe unit scale, not a panic.
+        let e = NiceScale::spanning([], 5);
+        assert!(e.step > 0.0 && !e.ticks().is_empty());
     }
 
     #[test]

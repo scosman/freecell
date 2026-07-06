@@ -104,3 +104,91 @@ chart, non-blank"); Gate 1 upgrades this to a 3-agent majority panel on the make
 - `scenes`: every scene is name-lookupable with non-empty metadata; the Phase-0 scene is a
   single-series column.
 - The **PNG + agent review** in `results/` is the real evidence, not test coverage.
+
+---
+
+# Phase 1 (Gate 1 — MAKE-OR-BREAK): multi-series line
+
+Goal: the whole bet (functional_spec §3, §7) — a **multi-series line chart (2–4 series)** from
+`chart-model` that a user would accept, with a chart title + both axis titles, a numeric value
+axis with nice ticks, a category axis, a legend (correct series→color mapping), and a
+multi-series color cycle. Built on the raw `Line` primitive over **one shared `ScaleLinear`**,
+straight segments (`.linear()`), owning the wrapper the way `bar.rs` does.
+
+## Result: GATE 1 PASS
+
+`results/line_multi.png` (720×460) — a 3-series line (North/South/West over Jan–Jun) whose
+lines cross, on one shared 20–100 value axis. The **3-agent majority panel** (three independent
+fresh reviewers, §10 decision #3) returned **PASS / PASS / PASS → majority PASS**; all three
+agreed YES on every one of the §6 seven rubric points (see `results/review.md`). Supporting
+`line_single.png` (single line) also reads cleanly. **The make-or-break question is answered
+yes: acceptable multi-series line charts are buildable on the primitives. The PoC proceeds to
+Gate 2 — it is not a NO-GO.**
+
+## What worked
+
+- **The raw `Line` primitive shares a scale trivially.** The research trap ("each stock
+  `LineChart` normalizes its own y-domain, so overlays don't share a scale") only bites the
+  `LineChart` *struct*. The `plot::shape::Line` primitive takes plain `x`/`y` accessor
+  closures (`Fn(&T) -> Option<f32>`) and draws whatever pixels you hand it — it has **no
+  domain of its own**. So multi-series-on-one-scale is just: compute one shared value domain,
+  build one `ScaleLinear` from it, and give every series' `Line` the *same* `value_scale`
+  closure. `LinePlot::paint` loops the series and paints N `Line`s against the shared scale.
+  No fork, no patch — the primitive composes as hoped.
+- **The shared value domain is `NiceScale::spanning` over the union of ALL series' values.**
+  New in `ticks.rs`: unlike the bars' `for_values` (which forces zero, correct for bars),
+  `spanning` snaps to the data's actual min..max — Excel's auto-ranging line value axis
+  (`research/compare-line.md`), and it zooms the axis to where the data is (our data 32–91 →
+  a clean 20–100 with 20/40/60/80/100 ticks). A unit test asserts the shared domain covers
+  every value of every series — the core Gate-1 property.
+- **Straight segments = `StrokeStyle::Linear`.** The primitive defaults to `Natural` (a
+  Catmull-Rom spline — the *curved* look). Excel's default line is straight, so we pass
+  `.stroke_style(StrokeStyle::Linear)`. The panel confirmed straight, non-smoothed segments.
+- **`ScalePoint` for the category axis — no `ScaleBand` gutter bug here.** The Phase-0 gotcha
+  (`ScaleBand::tick` ignores its range start) does **not** apply: `ScalePoint` *does* honor its
+  range start (`range_start + i*range_tick`), so we hand it the true `[plot_left+inset,
+  plot_right-inset]` pixel range directly and the points land correctly. A small `POINT_INSET`
+  keeps the first/last dots + their centered labels off the axis line / frame edge.
+- **Legend↔mark mapping correct by construction.** Both the legend (in `chrome.rs`) and each
+  line resolve color the same way: `series[i].color.unwrap_or(series_color(i))`. Same index,
+  same source → the swatch is always the line's color. All three reviewers confirmed the
+  mapping. `series_color` is the Tableau-style categorical cycle from Phase 0 (NOT the
+  monochrome-blue `chart_1..5`), so the three lines are genuinely distinct hues.
+- **Shared chrome, one dispatch point.** Extracted the title/axis-title/legend frame out of
+  `bar.rs` into `chrome::chart_frame(chart, plot_element)` and the colors into `style.rs`, so
+  bar and line render identical chrome. `lib.rs::chart_element` dispatches on `ChartKind`
+  (Line → line, Bar → bar); `render.rs` calls that one entry point. Phase 0's bar path is
+  unchanged (its scene still captures + passes).
+
+## What was hard / notable
+
+- **`Line::paint` vs `Bar::paint` signature mismatch.** `Bar::paint(&bounds, window, cx)` takes
+  the `App`; `Line::paint(&bounds, window)` does **not** (it only paints a path + dot quads).
+  Minor, but you can't copy the bar call shape verbatim.
+- **`'static` accessor closures, as in Phase 0.** `Line`'s `x`/`y` are `'static`, so each
+  series' closures must own their data. We precompute the per-category x pixels **once**
+  (`xs: Vec<f32>`, shared across series) and move a clone of `xs` + the series `values` + the
+  cloned `value_scale` into each `Line`'s closures. Clean and avoids a per-point category
+  lookup.
+- **Value-axis title orientation (cosmetic, non-defect).** Two reviewers noted the value-axis
+  title sits horizontally *above* the axis rather than rotated vertically alongside it. gpui
+  text has no cheap rotation here, and the horizontal caption is legible and correctly
+  associated (no rubric point docked). A follow-on ship-quality project could rotate it; not
+  worth it for the PoC.
+- **Axis not forced to zero — deliberate.** A line value axis starting at 20 (not 0) is Excel's
+  behavior and reads fine; reviewers accepted it. (Bars still force zero, which *is* correct
+  for bars — the two kinds legitimately want different value domains, hence `spanning` vs
+  `for_values`.)
+
+## Tests added (light, per relaxed rigor)
+
+- `ticks::spanning_covers_data_without_forcing_zero` — `spanning` covers both data ends and does
+  NOT snap to zero when data is far from it; empty input is a safe unit scale.
+- `line::shared_scale_covers_all_series` — the one shared domain contains every value of every
+  series (and is zoomed, not zero-forced).
+- `line::multi_series_reads_all_series_and_categories` — all 3 series + all categories kept;
+  series colors distinct.
+- `line::rejects_non_line_and_empty` — `multi_series` returns `None` for a bar chart / no series.
+- `scenes::gate1_line_scene_is_multi_series_line` — `line_multi` is a Line, ≥2 series, shared
+  category count. (21 unit tests total across the crate + `chart-model`, all passing.)
+- The **`line_multi.png` + 3-agent panel** in `results/` is the real Gate-1 evidence.

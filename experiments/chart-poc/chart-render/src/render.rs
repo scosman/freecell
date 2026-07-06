@@ -15,7 +15,6 @@ use gpui_platform::application;
 
 use chart_model::Chart;
 
-use crate::bar;
 use crate::scenes;
 
 /// A gpui view that renders one chart full-window. gpui-component requires the top-level
@@ -26,7 +25,7 @@ struct ChartView {
 
 impl Render for ChartView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        bar::chart_element(&self.chart)
+        crate::chart_element(&self.chart)
             .unwrap_or_else(|| div().size_full().bg(rgb(0xFFFFFF)).into_any_element())
     }
 }

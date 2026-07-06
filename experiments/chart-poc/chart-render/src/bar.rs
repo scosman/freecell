@@ -1,41 +1,29 @@
-//! The FreeCell-owned chart widget, built over gpui-component's `plot/` **primitives**
-//! (`Bar` + `ScaleBand` + `ScaleLinear` + `PlotAxis` + `Grid`) rather than the stock chart
-//! structs — the approach the make-or-break Gate 1 needs (`research/gpui-component-charts.md`:
-//! the structs have no numeric value axis, no legend, no title).
+//! The FreeCell-owned single-series **column** widget, built over gpui-component's `plot/`
+//! **primitives** (`Bar` + `ScaleBand` + `ScaleLinear` + `PlotAxis` + `Grid`) rather than the
+//! stock chart structs — the approach Gate 1 needs (`research/gpui-component-charts.md`: the
+//! structs have no numeric value axis, no legend, no title).
 //!
-//! Phase 0 renders one trivial single-series column chart. The pieces FreeCell owns and this
-//! module proves it can build:
-//! - a **numeric value axis** with readable "nice" tick labels + gridlines, using our own
-//!   [`crate::ticks::NiceScale`] as the value domain so the bars and the ticks share one
-//!   scale (the stock charts normalize their own domain and expose no nice ticks);
-//! - a **chart title** + **axis titles**;
-//! - a **legend** (swatch + series name) driven by our palette.
+//! The title / axis-titles / legend chrome lives in [`crate::chrome`] (shared with the line
+//! widget); this module owns the plot itself: a **numeric value axis** with readable "nice"
+//! tick labels + gridlines (our [`NiceScale`] as the value domain, so the bars and ticks share
+//! one scale — the stock charts normalize their own domain and expose no nice ticks).
 //!
-//! Colors are chosen explicitly (not from the gpui-component theme) so the headless capture
-//! is deterministic and high-contrast regardless of the ambient light/dark theme.
+//! Colors are chosen explicitly (see [`crate::style`]) so the headless capture is deterministic
+//! regardless of the ambient light/dark theme.
 
-use gpui::{
-    div, px, rgb, Background, Bounds, Corners, FontWeight, Hsla, IntoElement, ParentElement,
-    Pixels, SharedString, Styled, TextAlign, Window,
-};
+use gpui::{px, Background, Bounds, Corners, IntoElement, Pixels, SharedString, TextAlign, Window};
 use gpui_component::plot::{
     scale::{Scale, ScaleBand, ScaleLinear},
     shape::{Bar, BarAlignment},
     AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, AXIS_GAP,
 };
 
-use chart_model::{BarDir, Chart, ChartKind, Color as ModelColor, SeriesData};
+use chart_model::{BarDir, Chart, ChartKind, SeriesData};
 
+use crate::chrome::chart_frame;
 use crate::palette::series_color;
+use crate::style::{hsla, model_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
 use crate::ticks::{format_tick, NiceScale};
-
-// Explicit, theme-independent colors (see module docs).
-const BACKGROUND: u32 = 0xFFFFFF;
-const TITLE_TEXT: u32 = 0x1A1A1A;
-const AXIS_TITLE_TEXT: u32 = 0x374151;
-const MUTED_TEXT: u32 = 0x6B7280;
-const AXIS_STROKE: u32 = 0x9CA3AF;
-const GRID_STROKE: u32 = 0xE5E7EB;
 
 /// Pixels reserved at the left of the plot for value-axis tick labels.
 const VALUE_AXIS_GUTTER: f32 = 46.0;
@@ -46,15 +34,6 @@ const PLOT_RIGHT_GAP: f32 = 12.0;
 /// Roughly how many value-axis ticks to aim for.
 const TARGET_TICKS: usize = 5;
 
-fn hsla(hex: u32) -> Hsla {
-    Hsla::from(rgb(hex))
-}
-
-/// Convert a model color to a gpui `Hsla`.
-fn model_hsla(color: ModelColor) -> Hsla {
-    Hsla::from(rgb(color.to_hex()))
-}
-
 /// A single-series vertical bar (column) plot over the raw `Bar` primitive, with a numeric
 /// value axis we control via [`NiceScale`].
 #[derive(IntoPlot)]
@@ -62,7 +41,7 @@ pub struct BarPlot {
     categories: Vec<SharedString>,
     values: Vec<f64>,
     scale: NiceScale,
-    bar_color: Hsla,
+    bar_color: gpui::Hsla,
 }
 
 impl BarPlot {
@@ -180,114 +159,9 @@ impl Plot for BarPlot {
     }
 }
 
-/// Build the full chart element for a [`Chart`]: title, axis titles, the plot, and a legend.
-/// Returns `None` for a chart this phase can't render.
-pub fn chart_element(chart: &Chart) -> Option<gpui::AnyElement> {
+/// Build the full single-series column chart element (title, axis titles, plot, legend).
+/// Returns `None` for a chart this widget can't render.
+pub fn bar_element(chart: &Chart) -> Option<gpui::AnyElement> {
     let plot = BarPlot::single_series(chart)?;
-
-    let title = chart.title.clone().unwrap_or_default();
-    let value_axis_title = chart.val_axis.title.clone().unwrap_or_default();
-    let category_axis_title = chart.cat_axis.title.clone().unwrap_or_default();
-
-    // Legend swatches follow the same series colors the bars use.
-    //
-    // KNOWN single-series limitation (Phase 0): `BarPlot::single_series` draws only
-    // `series[0]`, but this legend lists ALL series. With one series (Phase 0 scope) they
-    // agree. When the widget grows to multi-series in Phase 1 (grouped/stacked bars,
-    // multi-line), the plot must draw every series so the legend and the marks stay in sync —
-    // resolve this together with that work, not by trimming the legend to `series[0]` here.
-    let legend_items: Vec<gpui::AnyElement> = chart
-        .series
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let color = s.color.unwrap_or_else(|| series_color(i));
-            let name = s
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("Series {}", i + 1));
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1p5()
-                .child(
-                    div()
-                        .w(px(11.))
-                        .h(px(11.))
-                        .rounded(px(2.))
-                        .bg(rgb(color.to_hex())),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(TITLE_TEXT))
-                        .text_size(px(11.))
-                        .child(SharedString::from(name)),
-                )
-                .into_any_element()
-        })
-        .collect();
-
-    let legend = div()
-        .flex()
-        .flex_col()
-        .justify_center()
-        .gap_1()
-        .pl_2()
-        .children(legend_items);
-
-    let body = div()
-        .flex_1()
-        .min_h(px(0.))
-        .flex()
-        .flex_col()
-        // Value-axis title (compact caption above the axis gutter).
-        .child(
-            div().pl(px(6.)).child(
-                div()
-                    .text_color(rgb(AXIS_TITLE_TEXT))
-                    .text_size(px(11.))
-                    .child(SharedString::from(value_axis_title)),
-            ),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .flex_row()
-                .child(div().flex_1().min_w(px(0.)).child(plot))
-                .child(legend),
-        );
-
-    Some(
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(BACKGROUND))
-            .p_3()
-            .gap_1()
-            // Chart title.
-            .child(
-                div().w_full().flex().justify_center().child(
-                    div()
-                        .text_color(rgb(TITLE_TEXT))
-                        .text_size(px(16.))
-                        .font_weight(FontWeight::BOLD)
-                        .child(SharedString::from(title)),
-                ),
-            )
-            .child(body)
-            // Category-axis title.
-            .child(
-                div().w_full().flex().justify_center().child(
-                    div()
-                        .text_color(rgb(AXIS_TITLE_TEXT))
-                        .text_size(px(11.))
-                        .child(SharedString::from(category_axis_title)),
-                ),
-            )
-            .into_any_element(),
-    )
+    Some(chart_frame(chart, plot.into_any_element()))
 }

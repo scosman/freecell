@@ -4,5 +4,17 @@
     "png": "bar_single.png",
     "description": "A single-series vertical bar (column) chart of quarterly revenue with four bars (Q1-Q4), a title, axis titles, a numeric value axis, and a legend.",
     "expectation": "A vertical bar chart with four upright bars of differing heights, a readable numeric value axis on the left, category labels Q1-Q4 along the bottom, a chart title, and a legend. Non-blank."
+  },
+  {
+    "name": "line_single",
+    "png": "line_single.png",
+    "description": "A single-series line chart of monthly website visitors (Jan-Jun) with a title, axis titles, a numeric value axis, and a legend.",
+    "expectation": "One straight-segment line rising left-to-right across six months (Jan-Jun), with dot markers at each point, a readable numeric value axis on the left, a chart title, axis titles, and a one-entry legend. Non-blank."
+  },
+  {
+    "name": "line_multi",
+    "png": "line_multi.png",
+    "description": "A three-series line chart of regional sales (North/South/West) over six months (Jan-Jun): three straight-segment lines in distinct colors sharing one value axis, with a title, axis titles, a numeric value axis, and a legend.",
+    "expectation": "Three distinctly colored straight-segment lines (North, South, West) that cross over six months (Jan-Jun), all measured against ONE shared numeric value axis on the left with readable, evenly spaced tick labels; dot markers at each data point; a chart title ('Regional Sales by Month'); a value-axis title and a 'Month' category-axis title; and a legend whose three swatch colors match the three line colors. No clipping or overlap. Non-blank."
   }
 ]

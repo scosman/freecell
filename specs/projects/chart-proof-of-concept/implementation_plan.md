@@ -93,7 +93,7 @@ not grind through later phases once a core capability is shown unachievable.**
   single-series bar → non-blank PNG, reviewer agent confirms "a bar chart." *Exit: the
   harness works; if capture can't be made to work headless, that itself is an early finding.*
 
-- [ ] **Phase 1 — Gate 1: MAKE-OR-BREAK.** Multi-series **line** (2–4 series) with title +
+- [x] **Phase 1 — Gate 1: MAKE-OR-BREAK.** Multi-series **line** (2–4 series) with title +
   axis titles + numeric value-axis (nice ticks) + category axis + **legend**. Capture +
   **3-agent panel** review. **STOP: if panel FAIL → write NO-GO `SYNTHESIS.md` and end.**
 

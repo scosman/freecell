@@ -28,7 +28,7 @@ const DEFAULT_VP: (u32, u32) = (640, 440);
 
 /// Every scene, rebuilt fresh per call (the `render_scene` bin looks one up by name).
 pub fn all() -> Vec<Scene> {
-    vec![bar_single()]
+    vec![bar_single(), line_single(), line_multi()]
 }
 
 /// Look a scene up by name.
@@ -71,6 +71,94 @@ fn bar_single() -> Scene {
     }
 }
 
+/// The six months the line scenes share as their category axis.
+fn months() -> Vec<Category> {
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
+        .into_iter()
+        .map(|m| Category::Text(m.into()))
+        .collect()
+}
+
+/// Phase 1 supporting sanity scene — a single line, to confirm the line widget's axis / grid /
+/// marker scaffolding reads cleanly on its own before the multi-series case.
+fn line_single() -> Scene {
+    let chart = Chart {
+        title: Some("Website Visitors".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![Series::category_value(
+            Some("Visitors"),
+            months(),
+            vec![42.0, 55.0, 51.0, 68.0, 74.0, 90.0],
+        )],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Visitors (thousands)"),
+        legend: Some(Legend::default()),
+    };
+    Scene {
+        name: "line_single",
+        description: "A single-series line chart of monthly website visitors (Jan-Jun) with a \
+                      title, axis titles, a numeric value axis, and a legend.",
+        expectation: "One straight-segment line rising left-to-right across six months \
+                      (Jan-Jun), with dot markers at each point, a readable numeric value axis \
+                      on the left, a chart title, axis titles, and a one-entry legend. Non-blank.",
+        viewport: DEFAULT_VP,
+        chart,
+    }
+}
+
+/// Phase 1 — GATE 1, the make-or-break scene (functional_spec §3, §7): a **multi-series** line
+/// chart (three regions over six months) whose lines cross, drawn against ONE shared value
+/// scale, with a title, both axis titles, a numeric value axis with nice ticks, a category
+/// axis, and a legend mapping each region to its line color.
+fn line_multi() -> Scene {
+    let chart = Chart {
+        title: Some("Regional Sales by Month".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("North"),
+                months(),
+                vec![32.0, 41.0, 55.0, 62.0, 78.0, 91.0],
+            ),
+            Series::category_value(
+                Some("South"),
+                months(),
+                vec![74.0, 60.0, 48.0, 52.0, 63.0, 85.0],
+            ),
+            Series::category_value(
+                Some("West"),
+                months(),
+                vec![50.0, 54.0, 49.0, 58.0, 61.0, 66.0],
+            ),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Units (thousands)"),
+        legend: Some(Legend::default()),
+    };
+    Scene {
+        name: "line_multi",
+        description: "A three-series line chart of regional sales (North/South/West) over six \
+                      months (Jan-Jun): three straight-segment lines in distinct colors sharing \
+                      one value axis, with a title, axis titles, a numeric value axis, and a \
+                      legend.",
+        expectation: "Three distinctly colored straight-segment lines (North, South, West) that \
+                      cross over six months (Jan-Jun), all measured against ONE shared numeric \
+                      value axis on the left with readable, evenly spaced tick labels; dot \
+                      markers at each data point; a chart title ('Regional Sales by Month'); a \
+                      value-axis title and a 'Month' category-axis title; and a legend whose \
+                      three swatch colors match the three line colors. No clipping or overlap. \
+                      Non-blank.",
+        viewport: (720, 460),
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +173,26 @@ mod tests {
             assert!(!s.expectation.is_empty());
             assert!(s.viewport.0 > 0 && s.viewport.1 > 0);
             assert!(!s.chart.series.is_empty());
+        }
+    }
+
+    #[test]
+    fn gate1_line_scene_is_multi_series_line() {
+        let s = get("line_multi").expect("line_multi scene");
+        assert!(matches!(
+            s.chart.kind,
+            ChartKind::Line { smooth: false, .. }
+        ));
+        assert!(
+            s.chart.series.len() >= 2,
+            "Gate 1 needs a multi-series line, got {}",
+            s.chart.series.len()
+        );
+        // Every series shares the same category count (one point per month).
+        let cats = s.chart.series[0].len();
+        assert!(cats > 0);
+        for series in &s.chart.series {
+            assert_eq!(series.len(), cats, "series must share the category axis");
         }
     }
 

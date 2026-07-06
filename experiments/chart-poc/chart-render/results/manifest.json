@@ -1,0 +1,80 @@
+[
+  {
+    "name": "bar_single",
+    "png": "bar_single.png",
+    "description": "A single-series vertical bar (column) chart of quarterly revenue with four bars (Q1-Q4), a title, axis titles, a numeric value axis, and a legend.",
+    "expectation": "A vertical bar chart with four upright bars of differing heights, a readable numeric value axis on the left, category labels Q1-Q4 along the bottom, a chart title, and a legend. Non-blank."
+  },
+  {
+    "name": "line_single",
+    "png": "line_single.png",
+    "description": "A single-series line chart of monthly website visitors (Jan-Jun) with a title, axis titles, a numeric value axis, and a legend.",
+    "expectation": "One straight-segment line rising left-to-right across six months (Jan-Jun), with dot markers at each point, a readable numeric value axis on the left, a chart title, axis titles, and a one-entry legend. Non-blank."
+  },
+  {
+    "name": "line_multi",
+    "png": "line_multi.png",
+    "description": "A three-series line chart of regional sales (North/South/West) over six months (Jan-Jun): three straight-segment lines in distinct colors sharing one value axis, with a title, axis titles, a numeric value axis, and a legend.",
+    "expectation": "Three distinctly colored straight-segment lines (North, South, West) that cross over six months (Jan-Jun), all measured against ONE shared numeric value axis on the left with readable, evenly spaced tick labels; dot markers at each data point; a chart title ('Regional Sales by Month'); a value-axis title and a 'Month' category-axis title; and a legend whose three swatch colors match the three line colors. No clipping or overlap. Non-blank."
+  },
+  {
+    "name": "bar_horizontal",
+    "png": "bar_horizontal.png",
+    "description": "A single-series horizontal bar chart of revenue by region (five regions), category labels down the left, a numeric value axis along the bottom, a title, and a legend.",
+    "expectation": "Five horizontal bars of differing lengths growing left-to-right from a value axis on the LEFT, region names (North/South/East/West/Central) down the left as category labels, readable numeric tick labels along the bottom, a chart title, and a one-entry legend. Non-blank, no clipping."
+  },
+  {
+    "name": "bar_grouped",
+    "png": "bar_grouped.png",
+    "description": "A grouped (clustered) column chart: three product series (Widgets/Gadgets/Gizmos) drawn side-by-side within each of four quarters, with a title, numeric value axis, and a legend.",
+    "expectation": "Four quarter groups (Q1-Q4), each containing THREE side-by-side columns in three distinct colors (one per product), all measured against one numeric value axis on the left with readable tick labels; a chart title; a legend whose three swatch colors match the three column colors. Bars within a group do not overlap. Non-blank, no clipping."
+  },
+  {
+    "name": "bar_stacked",
+    "png": "bar_stacked.png",
+    "description": "A stacked column chart: three product series stacked into one column per quarter (four quarters), value axis reflecting the stacked totals, with a title and legend.",
+    "expectation": "Four single columns (Q1-Q4), each split into THREE stacked colored segments (one per product, same color order as the legend), the segments summing to the column total; a numeric value axis on the left whose top covers the tallest stack; a chart title and a three-entry legend with matching colors. Non-blank, no clipping."
+  },
+  {
+    "name": "bar_percent_stacked",
+    "png": "bar_percent_stacked.png",
+    "description": "A 100%-stacked column chart: each quarter's three product series normalized so the column fills 0-100%, with a percentage value axis, title, and legend.",
+    "expectation": "Four equal-height full columns (Q1-Q4), each divided into THREE colored segments whose sizes are each product's SHARE of that quarter (segments sum to a full column); a value axis labeled 0%/20%/…/100% on the left; a chart title and a three-entry legend with matching colors. Non-blank, no clipping."
+  },
+  {
+    "name": "area_stacked",
+    "png": "area_stacked.png",
+    "description": "A stacked area chart: three traffic-source series (Direct/Search/Social) stacked as filled bands over four quarters, value axis reflecting the stacked totals, with a title and legend.",
+    "expectation": "Three filled area bands stacked on top of one another (each band sitting on the cumulative top of the ones below, NOT all from zero) across four quarters (Q1-Q4), in three distinct colors matching the legend; a numeric value axis on the left covering the stacked total; straight segments; a chart title and a three-entry legend. Non-blank, no clipping."
+  },
+  {
+    "name": "area_percent_stacked",
+    "png": "area_percent_stacked.png",
+    "description": "A 100%-stacked area chart: three traffic-source series normalized so each quarter's bands fill 0-100%, with a percentage value axis, title, and legend.",
+    "expectation": "Three filled area bands that together fill the full plot height at every quarter (Q1-Q4), each band's thickness = that source's SHARE of the quarter; a value axis labeled 0%/20%/…/100% on the left; three distinct colors matching the legend; a chart title and a three-entry legend. Non-blank."
+  },
+  {
+    "name": "pie",
+    "png": "pie.png",
+    "description": "A single-series pie chart of market share across five companies, each slice a distinct synthesized color, with on-slice percentage labels, a title, and a slice→color legend.",
+    "expectation": "A round pie divided into five wedges of differing sizes in five DISTINCT colors (NOT a monochrome disc), each wedge labeled with its percentage; a chart title ('Market Share'); a legend mapping each company (Alpha/Beta/Gamma/Delta/Other) to its slice color. Non-blank, no clipping. (A pie has no numeric value axis — this is expected.)"
+  },
+  {
+    "name": "doughnut",
+    "png": "doughnut.png",
+    "description": "A single-series doughnut chart (pie with a center hole) of market share across five companies, distinct per-slice colors, on-slice percentage labels, a title, and a slice→color legend.",
+    "expectation": "A doughnut ring (a pie with a hollow center) divided into five arcs of differing sizes in five DISTINCT colors, each arc labeled with its percentage; a chart title; a legend mapping each company to its arc color. Non-blank, no clipping. (No numeric value axis — expected for a doughnut.)"
+  },
+  {
+    "name": "scatter_single",
+    "png": "scatter_single.png",
+    "description": "A single-series scatter plot of ad spend (X) vs revenue (Y), ten points trending up-and-to-the-right, on two numeric axes, with a title, both axis titles, and a legend.",
+    "expectation": "About ten dots scattered up-and-to-the-right (a clear positive trend), plotted against a numeric X axis along the bottom (ad spend, e.g. 0/10/20/30/40/50) and a numeric Y axis on the left (revenue, e.g. 20/40/60/80/100), each with readable evenly spaced tick labels and gridlines; a chart title ('Ad Spend vs Revenue'); an X-axis title and a Y-axis title; and a one-entry legend. Dots (not a connected line). Non-blank, no clipping."
+  },
+  {
+    "name": "scatter_multi",
+    "png": "scatter_multi.png",
+    "description": "A three-series scatter plot of iris petal length (X) vs petal width (Y) for three species (Setosa/Versicolor/Virginica), each a distinct-colored cluster of dots, on two numeric axes, with a title, both axis titles, and a legend.",
+    "expectation": "Three visually separated clusters of dots in THREE distinct colors — a low-left cluster (Setosa), a middle cluster (Versicolor), and an upper-right cluster (Virginica) — all plotted against a shared numeric X axis along the bottom (petal length, e.g. 0/2/4/6/8) and a shared numeric Y axis on the left (petal width, e.g. 0/1/2/3), each with readable tick labels and gridlines; a chart title ('Petal Size by Species'); an X-axis title and a Y-axis title; and a legend whose three swatch colors match the three dot-cluster colors. Dots, not lines. Non-blank, no clipping."
+  }
+]

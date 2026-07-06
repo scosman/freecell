@@ -11,11 +11,15 @@
 //! (`architecture.md §1, §3`; enforced by `tests/dependency_rule.rs`).
 
 pub mod axis;
+pub mod border;
 pub mod cache;
 pub mod color;
 pub mod data_row;
 pub mod eval_indicator;
+pub mod format_color;
+pub mod format_ui;
 pub mod input_cap;
+pub mod merge_guard;
 pub mod palette;
 pub mod perf;
 pub mod publication;
@@ -23,15 +27,22 @@ pub mod refs;
 pub mod selection;
 pub mod sheet_name;
 pub mod style;
+pub mod tsv;
 
 // The load-bearing types re-exported at the crate root for ergonomic downstream use
 // (the grid, engine, and shell all reach for these constantly).
 pub use axis::Axis;
+pub use border::{effective_edge, BorderSpec, Edge};
 pub use cache::{SheetCache, SheetCacheBuilder, SheetCaches, StyleId};
 pub use color::Rgb;
-pub use publication::{Publication, PublishedCell};
+pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};
+pub use merge_guard::{blocks_col_op, blocks_row_op};
+pub use publication::{CellKind, Publication, PublishedCell};
 pub use refs::{CellRange, CellRef, SheetId};
-pub use selection::{apply_motion, Direction, Motion, SelectionModel, SheetDims};
+pub use selection::{
+    apply_motion, format_selection_ref, is_full_column_selection, is_full_row_selection, Direction,
+    Motion, SelectionModel, SheetDims,
+};
 pub use style::{Align, RenderStyle};
 
 /// The Excel-max grid dimensions FreeCell targets (`CLAUDE.md`): the engine, geometry

@@ -97,9 +97,13 @@ Styles/HTML flavors to other apps, paste-special, marching-ants overlay, tiling 
 ## 3. Formatting
 
 All actions apply to the full selection, are one undo step, and follow MVP §3.5
-semantics (button state reflects the active cell). Whole-row/col selections use the
-engine's band styles — **exception:** font family/size (§3.2) clamps to the used
-range on full-row/col selections (engine limitation; documented deviation).
+semantics. Action-bar control state (toggles pressed, text-color/number-format displayed,
+decimals ± enabled) reflects the **active cell for a single-cell selection**; a multi-cell
+selection reflects **nothing** (toggles unpressed, number format shows General, decimals ±
+disabled) — consistent with the shipped B/I/U toggles. Commands still apply to the full
+selection regardless. Whole-row/col selections use the engine's band styles —
+**exception:** font family/size (§3.2) clamps to the used range on full-row/col selections
+(engine limitation; documented deviation).
 
 ### 3.1 Action-bar additions
 

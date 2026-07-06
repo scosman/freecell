@@ -61,6 +61,10 @@ async-channel = "2"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `csv` (the same crate ironcalc_base's `paste_csv_string` uses) computes TSV paste dims in
+# `freecell-core::tsv` with the engine's exact reader config, so the overflow-guard bound is
+# quote-/terminator-aware and can never diverge from the engine's own parse.
+csv = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 png = "0.17"
 tracing = "0.1"

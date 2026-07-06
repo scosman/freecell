@@ -16,13 +16,15 @@
 //! `DocumentClient` + `GridView`.
 
 pub mod client;
+mod edit;
 mod view;
 
 use freecell_core::selection::Motion;
-use freecell_core::SheetId;
-use gpui::{App, Window};
+use freecell_core::{CellRef, SheetId};
+use gpui::{App, SharedString, Window};
 
 pub use client::{ChromeClient, RecordingClient};
+pub use edit::{EditController, EditOrigin};
 pub use view::ChromeView;
 
 /// One sheet as the tab bar mirrors it. The chrome's own view-model of the worker's
@@ -68,6 +70,18 @@ pub enum ChromeGridRequest {
     FocusGrid,
     /// Switch the grid to `sheet` (tab click).
     SetActiveSheet(SheetId),
+    /// Push the current edit's grid-facing state after every edit transition
+    /// (`components/edit_controller.md §4.3–4.4`): the live cell **mirror** (raw text under the
+    /// pending cell), the open **in-cell** overlay cell, and the in-cell **cap** popover message.
+    /// `None`s clear the corresponding grid overlay (edit committed / cancelled).
+    EditState {
+        /// The mirror: raw pending text to paint in `(sheet, cell)` instead of its published value.
+        mirror: Option<(SheetId, CellRef, SharedString)>,
+        /// The in-cell overlay's open cell (the overlay is rendered only while `Some`).
+        in_cell: Option<CellRef>,
+        /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
+        cap: Option<SharedString>,
+    },
 }
 
 /// The owner's [`ChromeGridRequest`] handler (boxed like the grid's `GridEventHandler`).

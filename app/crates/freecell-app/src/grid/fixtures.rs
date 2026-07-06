@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
 use freecell_core::color::Rgb;
 use freecell_core::limits;
-use freecell_core::publication::{Publication, PublishedCell};
+use freecell_core::publication::{CellKind, Publication, PublishedCell};
 use freecell_core::refs::{CellRef, SheetId};
 use freecell_core::style::{Align, RenderStyle};
 use freecell_core::SelectionModel;
@@ -61,6 +61,7 @@ fn cell(row: u32, col: u32, text: &str) -> PublishedCell {
         row,
         col,
         display_text: text.to_string(),
+        kind: CellKind::Text,
         text_color: None,
     }
 }

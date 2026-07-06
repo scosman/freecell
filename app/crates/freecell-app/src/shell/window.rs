@@ -13,7 +13,7 @@
 //! target, `.xlsx` enforcement, viewport overscan); this module performs them against real
 //! windows + panels + dialogs, and mediates the grid/chrome/worker seams.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -25,15 +25,17 @@ use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_core::{limits, SelectionModel, SheetId};
 use freecell_engine::{
-    Command, DocumentClient, DocumentSource, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent,
-    WorkerEventReceiver,
+    Command, DocumentClient, DocumentSource, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
+    WorkerEvent, WorkerEventReceiver,
 };
 
 use crate::chrome::{ChromeGridRequest, ChromeGridSink, ChromeView};
-use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView};
+use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView, RowOrCol};
 
+use super::clipboard::ClipboardCoordinator;
 use super::lifecycle::{self, SaveTarget};
 use super::registry::WindowKey;
+use super::titlebar;
 use super::{
     CloseWindow, FreeCellApp, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
 };
@@ -48,6 +50,9 @@ struct SinkShared {
     /// The last *accepted* selection — restored on the grid if a click-away commit is blocked by
     /// a cap-rejected pending edit (`functional_spec.md §3.3`).
     last_selection: Cell<SelectionModel>,
+    /// The range clipboard's UI state (`last_copy_text`), shared so the grid-sink copy/paste key
+    /// events and the window's `CopyReady` fold both reach it (`components/clipboard.md`).
+    clipboard: RefCell<ClipboardCoordinator>,
 }
 
 // --- Look constants (functional-POC greys, matching the chrome / grid) ---------------------
@@ -97,6 +102,10 @@ pub struct WorkbookWindow {
 
     /// The file's canonical path, or `None` for an unsaved (`Untitled`) workbook.
     path: Option<PathBuf>,
+    /// The disk path this document was opened from (`None` for a new workbook), captured at
+    /// construction and never changed by Save-As — the `.back` backup gate
+    /// (`functional_spec.md §7.3`).
+    opened_from: Option<PathBuf>,
     /// `Some(file_name)` renders the "Opening <name>…" loading state (`functional_spec.md
     /// §5.1`); `None` once the document has loaded.
     loading: Option<String>,
@@ -178,6 +187,7 @@ impl WorkbookWindow {
         let sink_shared = Rc::new(SinkShared {
             active_sheet: Cell::new(SheetId(0)),
             last_selection: Cell::new(SelectionModel::default()),
+            clipboard: RefCell::new(ClipboardCoordinator::new()),
         });
 
         // The grid needs the chrome handle and vice-versa; resolve both after construction via
@@ -223,6 +233,11 @@ impl WorkbookWindow {
         let grid_view: AnyView = grid.clone().into();
         chrome.update(cx, |c, cx| c.set_grid_body(grid_view, cx));
 
+        // Hand the grid the reused in-cell editor input the chrome owns, so it can render the
+        // in-cell overlay (`components/edit_controller.md §4.4`).
+        let in_cell_input = chrome.read(cx).in_cell_input();
+        grid.update(cx, |g, cx| g.set_incell_input(in_cell_input, cx));
+
         // An `OpenFile` window shows the "Opening name…" overlay over the grid until `Loaded`.
         if let Some(name) = loading.clone() {
             grid.update(cx, |g, cx| g.set_loading(Some(name), cx));
@@ -243,6 +258,9 @@ impl WorkbookWindow {
             sink_shared,
             sheets: Vec::new(),
             focus_handle,
+            // The disk path this document was opened from (captured before any Save-As can
+            // mutate `path`) — gates the one-time `.back` backup (`functional_spec.md §7.3`).
+            opened_from: path.clone(),
             path,
             loading,
             degraded: None,
@@ -310,8 +328,13 @@ impl WorkbookWindow {
             }
             WorkerEvent::StyleCacheUpdated { sheet } => {
                 // Styles/geometry changed — repaint the grid and refresh the action-row toggles
-                // for the active sheet (`components/app_shell.md §Action row`).
-                self.grid.update(cx, |_g, cx| cx.notify());
+                // for the active sheet (`components/app_shell.md §Action row`). A resize's rebuild
+                // lands here, so clear the grid's frozen resize preview (the committed geometry now
+                // comes from the resident cache — `components/grid_structure.md §5.1`).
+                self.grid.update(cx, |g, cx| {
+                    g.clear_resize_preview(cx);
+                    cx.notify();
+                });
                 if sheet == self.sink_shared.active_sheet.get() {
                     self.chrome.update(cx, |c, cx| c.refresh_active_style(cx));
                 }
@@ -371,8 +394,51 @@ impl WorkbookWindow {
             }
             WorkerEvent::WorkerDegraded { reason } => {
                 self.degraded = Some(reason);
+                // Disable the action-bar's mutating controls (`functional_spec.md §6`).
+                self.chrome.update(cx, |c, cx| c.set_degraded(true, cx));
                 cx.notify();
             }
+            WorkerEvent::CopyReady { tsv } => {
+                // Write the copied TSV to the system clipboard + remember it (so our next paste
+                // routes internally). `cx` derefs to `&mut App` for the clipboard write.
+                self.sink_shared
+                    .clipboard
+                    .borrow_mut()
+                    .on_copy_ready(tsv, cx);
+            }
+            WorkerEvent::Pasted { sheet, range } => {
+                // Mirror the pasted rectangle into the selection (the pasted area becomes the new
+                // selection, `functional_spec.md §2.2`) — only if it landed on the active sheet.
+                if sheet == self.sink_shared.active_sheet.get() {
+                    let sel = SelectionModel {
+                        anchor: range.start,
+                        active: range.end,
+                    };
+                    self.sink_shared.last_selection.set(sel);
+                    self.grid.update(cx, |g, cx| g.set_selection(sel, cx));
+                    self.chrome
+                        .update(cx, |c, cx| c.on_selection_changed(sel, window, cx));
+                }
+            }
+            WorkerEvent::PasteRejected { reason } => match reason {
+                // Overflow is user-visible: a brief dialog, nothing pasted (`functional_spec.md §2.2`).
+                PasteError::Overflow => {
+                    if self.modal.is_none() {
+                        self.modal = Some(ActiveModal::Error {
+                            title: "Paste doesn't fit".into(),
+                            detail: "The copied range would extend past the edge of the sheet. \
+                                     Nothing was pasted."
+                                .into(),
+                            close_window_on_dismiss: false,
+                        });
+                        cx.notify();
+                    }
+                }
+                // A missing/consumed slot (e.g. the second paste of a cut) is log-only.
+                PasteError::NothingToPaste => {
+                    tracing::debug!("paste: nothing to paste (empty or consumed clipboard slot)");
+                }
+            },
         }
     }
 
@@ -402,6 +468,20 @@ impl WorkbookWindow {
                     self.modal = Some(ActiveModal::Error {
                         title: "That change couldn't be applied".into(),
                         detail,
+                        close_window_on_dismiss: false,
+                    });
+                    cx.notify();
+                }
+            }
+            // The insert/delete merge guard (`functional_spec.md §5.3`): an OK-only dialog, nothing
+            // changed.
+            EditRejectedReason::MergedCells => {
+                if self.modal.is_none() {
+                    self.modal = Some(ActiveModal::Error {
+                        title: "Merged cells not supported".into(),
+                        detail: "This sheet contains merged cells (not yet supported); \
+                                 inserting or deleting here would corrupt them."
+                            .into(),
                         close_window_on_dismiss: false,
                     });
                     cx.notify();
@@ -607,13 +687,34 @@ impl WorkbookWindow {
     }
 
     /// Sends the atomic `Save` command (`functional_spec.md §5.2` — the Phase-3 temp+rename
-    /// write); `Saved`/`SaveFailed` drive the rest.
+    /// write); `Saved`/`SaveFailed` drive the rest. Before the write, a disk-opened file gets
+    /// a one-time `.back` backup of its original bytes (`§7.3`); a backup failure aborts the
+    /// save with a dialog — data safety wins over convenience.
     fn send_save(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(backup) = lifecycle::backup_target(self.opened_from.as_deref(), &path) {
+            if let Err(err) = std::fs::copy(&path, &backup) {
+                self.abort_save_with_backup_error(err, cx);
+                return;
+            }
+        }
         let req_id = self.next_req_id;
         self.next_req_id += 1;
         self.pending_save_req = Some(req_id);
         self.pending_save_path = Some(path.clone());
         self.client.send(Command::Save { path, req_id });
+        cx.notify();
+    }
+
+    /// Aborts a save whose pre-write `.back` backup couldn't be created (`§7.3`): the write is
+    /// never dispatched, any close/quit follow-up is cancelled, and a dialog explains it.
+    fn abort_save_with_backup_error(&mut self, err: std::io::Error, cx: &mut Context<Self>) {
+        self.close_after_save = false;
+        FreeCellApp::note_prompt_cancelled(cx);
+        self.modal = Some(ActiveModal::Error {
+            title: "Couldn't create backup".into(),
+            detail: format!("File not saved. The backup copy could not be written: {err}"),
+            close_window_on_dismiss: false,
+        });
         cx.notify();
     }
 
@@ -650,6 +751,15 @@ impl WorkbookWindow {
             self.dirty,
             title_uses_suffix(),
         )
+    }
+
+    /// The text drawn in the macOS custom titlebar row (§7.1 / `ui_design.md §1`): the document
+    /// name, **always** with the `— Edited` suffix when dirty. Unlike the native window title
+    /// (which drops the suffix on macOS in favor of the traffic-light edited dot — see
+    /// [`title_uses_suffix`]), the custom row shows the edited state textually, so the user sees
+    /// it in the row we draw. `set_window_edited` still lights the dot too.
+    fn titlebar_title(&self) -> String {
+        titlebar_title_text(&lifecycle::document_name(self.path.as_deref()), self.dirty)
     }
 
     /// Test seam: force the dirty flag (mirrors the registry) without a worker round-trip.
@@ -808,6 +918,12 @@ impl Render for WorkbookWindow {
             .on_action(cx.listener(|this, _: &ToggleUnderline, window, cx| {
                 this.toggle_style(StyleAttr::Underline, window, cx)
             }))
+            // macOS custom titlebar (§7.1): the very top row, drawn only when the master switch
+            // is on (Linux omits it → server decorations, unaffected). Its native integration is
+            // the on-device smoke gate.
+            .children(
+                titlebar::MACOS_TITLEBAR.then(|| titlebar::titlebar_row(self.titlebar_title())),
+            )
             .children(
                 self.degraded
                     .clone()
@@ -903,6 +1019,15 @@ impl WorkbookWindow {
 /// (`functional_spec.md §2.3`).
 fn title_uses_suffix() -> bool {
     !cfg!(target_os = "macos")
+}
+
+/// The macOS custom-titlebar text (§7.1 / `ui_design.md §1`): the document `name` with the
+/// `— Edited` suffix **always** applied when `dirty` — deliberately independent of
+/// [`title_uses_suffix`]. The native window title drops the suffix on macOS (the traffic-light
+/// dot carries dirtiness), but the row we draw shows the edited state textually. Pure so the
+/// "always suffix" contract is directly unit-tested.
+fn titlebar_title_text(name: &str, dirty: bool) -> String {
+    lifecycle::window_title(name, dirty, /* use_edited_suffix = */ true)
 }
 
 /// A small modal card: title, body text, and a right-aligned button row.
@@ -1038,12 +1163,110 @@ fn make_grid_sink(
         // The grid commits click-aways via the `SelectionChanged` path above, so it never emits
         // this variant; kept exhaustive so a future emit is a conscious wiring change.
         GridEvent::EditCommitRequested => {}
+        // Type-to-replace / in-cell-editor triggers are routed to the chrome (the single
+        // pending-edit owner, `components/edit_controller.md`).
+        GridEvent::TypeToEdit(text) => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let text = text.clone();
+                chrome.update(cx, |c, cx| c.begin_typed(&text, window, cx));
+            }
+        }
+        GridEvent::OpenInCellEditor(cell) => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let cell = *cell;
+                chrome.update(cx, |c, cx| c.begin_in_cell(cell, window, cx));
+            }
+        }
+        GridEvent::InCellCommitMove(dir) => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let dir = *dir;
+                chrome.update(cx, |c, cx| c.commit_incell_move(dir, window, cx));
+            }
+        }
+        GridEvent::InCellCancel => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                chrome.update(cx, |c, cx| c.cancel_incell(window, cx));
+            }
+        }
+        GridEvent::Copy { cut } => {
+            // Copy/cut operate on the current (last-accepted) selection.
+            shared.clipboard.borrow_mut().copy(
+                shared.active_sheet.get(),
+                shared.last_selection.get(),
+                *cut,
+                &client,
+            );
+        }
+        GridEvent::Paste => {
+            // Commit any pending edit first (Excel click-away rule); a cap-rejected edit blocks
+            // the paste and stays editing.
+            let committed = match chrome_slot.get().and_then(|w| w.upgrade()) {
+                Some(chrome) => chrome.update(cx, |c, cx| c.on_edit_commit_requested(window, cx)),
+                None => true,
+            };
+            if committed {
+                let target = shared.last_selection.get().range();
+                shared
+                    .clipboard
+                    .borrow_mut()
+                    .paste(shared.active_sheet.get(), target, &client, cx);
+            }
+        }
+        // Structure ops (`functional_spec.md §5`): resize + insert/delete route straight to the
+        // worker (the worker merge-guards insert/delete authoritatively).
+        GridEvent::ResizeCommitted {
+            axis,
+            start,
+            end,
+            px,
+        } => {
+            let sheet = shared.active_sheet.get();
+            let cmd = match axis {
+                RowOrCol::Col => Command::SetColumnWidths {
+                    sheet,
+                    col_start: *start,
+                    col_end: *end,
+                    px: *px as f64,
+                },
+                RowOrCol::Row => Command::SetRowHeights {
+                    sheet,
+                    row_start: *start,
+                    row_end: *end,
+                    px: *px as f64,
+                },
+            };
+            client.send(cmd);
+        }
+        GridEvent::InsertRows { at, count } => client.send(Command::InsertRows {
+            sheet: shared.active_sheet.get(),
+            row: *at,
+            count: *count,
+        }),
+        GridEvent::InsertColumns { at, count } => client.send(Command::InsertColumns {
+            sheet: shared.active_sheet.get(),
+            col: *at,
+            count: *count,
+        }),
+        GridEvent::DeleteRows { at, count } => client.send(Command::DeleteRows {
+            sheet: shared.active_sheet.get(),
+            row: *at,
+            count: *count,
+        }),
+        GridEvent::DeleteColumns { at, count } => client.send(Command::DeleteColumns {
+            sheet: shared.active_sheet.get(),
+            col: *at,
+            count: *count,
+        }),
     })
 }
 
-/// Builds the chrome→grid [`ChromeGridSink`]. `FocusGrid` is direct (the grid is a sibling, not
-/// leased); `MoveActive` / `SetActiveSheet` are deferred because applying them makes the grid
-/// re-emit into the chrome, which is mid-`update` as the emitter.
+/// Builds the chrome→grid [`ChromeGridSink`]. Every request that touches the grid is deferred:
+/// applying it re-emits into or re-focuses the grid, which may be mid-`update` as the emitter.
+/// `FocusGrid` in particular is reachable from a focused-in-cell key command (Tab/Escape), which
+/// commits/cancels from *inside* the grid's own `capture_key_down` listener — i.e. while the grid
+/// entity is already leased — so focusing it synchronously would re-enter that update and abort
+/// (`entity_map` re-entrant-update panic, BUG #5). `MoveActive` / `SetActiveSheet` are deferred for
+/// the same reason (they re-emit into the chrome, mid-`update` as the emitter).
 fn make_chrome_grid_sink(
     grid_slot: Rc<OnceCell<WeakEntity<GridView>>>,
     chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>>,
@@ -1056,9 +1279,16 @@ fn make_chrome_grid_sink(
         };
         match request {
             ChromeGridRequest::FocusGrid => {
-                if let Some(grid) = grid.upgrade() {
-                    grid.update(cx, |g, cx| g.focus_self(window, cx));
-                }
+                // Deferred (BUG #5): a focused in-cell key command (Tab/Escape) reaches this from
+                // inside the grid's `capture_key_down` listener — the grid entity is already leased
+                // (`cx.listener` runs the callback inside `grid.update`). Focusing it synchronously
+                // here would re-enter that update and hit the `entity_map` re-entrant-update abort.
+                // One deferred cycle lands the focus after the grid's update completes.
+                window.defer(cx, move |window, cx| {
+                    if let Some(grid) = grid.upgrade() {
+                        grid.update(cx, |g, cx| g.focus_self(window, cx));
+                    }
+                });
             }
             ChromeGridRequest::MoveActive(motion) => {
                 let motion = *motion;
@@ -1078,6 +1308,23 @@ fn make_chrome_grid_sink(
                         return;
                     };
                     switch_grid_to_sheet(&grid, chrome.as_ref(), &client, &shared, id, window, cx);
+                });
+            }
+            ChromeGridRequest::EditState {
+                mirror,
+                in_cell,
+                cap,
+            } => {
+                // Deferred: the chrome may be emitting this from inside the grid's own `update`
+                // (a grid-originated type-to-replace / in-cell trigger), so touching the grid now
+                // would re-enter it. A one-cycle defer is imperceptible for the live mirror.
+                let mirror = mirror.clone();
+                let in_cell = *in_cell;
+                let cap = cap.clone();
+                window.defer(cx, move |_window, cx| {
+                    if let Some(grid) = grid.upgrade() {
+                        grid.update(cx, |g, cx| g.set_edit_state(mirror, in_cell, cap, cx));
+                    }
                 });
             }
         }
@@ -1131,5 +1378,37 @@ pub(super) fn open_panel_options() -> PathPromptOptions {
         directories: false,
         multiple: false,
         prompt: Some("Open".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The macOS custom titlebar (§7.1 / `ui_design.md §1`) shows the edited state **textually**
+    /// and **always** — its distinguishing contract vs the native window title, which drops the
+    /// `— Edited` suffix on macOS (`title_uses_suffix()` is `false` there, the traffic-light dot
+    /// carrying dirtiness). This locks that in: a regression making `titlebar_title_text` defer to
+    /// `title_uses_suffix()` would, on macOS, drop the suffix and fail the `assert_ne!` below.
+    #[test]
+    fn titlebar_title_always_suffixes_when_dirty() {
+        // Dirty → suffix; clean → bare name.
+        assert_eq!(
+            titlebar_title_text("Budget.xlsx", true),
+            "Budget.xlsx — Edited"
+        );
+        assert_eq!(titlebar_title_text("Budget.xlsx", false), "Budget.xlsx");
+
+        // It must equal the ALWAYS-suffix form (use_edited_suffix = true) and must NOT match the
+        // native-title rule where the suffix is suppressed (use_edited_suffix = false) — so a
+        // future change routing it through `title_uses_suffix()` (false on macOS) is caught.
+        assert_eq!(
+            titlebar_title_text("Budget.xlsx", true),
+            lifecycle::window_title("Budget.xlsx", true, true),
+        );
+        assert_ne!(
+            titlebar_title_text("Budget.xlsx", true),
+            lifecycle::window_title("Budget.xlsx", true, false),
+        );
     }
 }

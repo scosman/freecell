@@ -59,13 +59,13 @@ registry: each entry is a short description plus a pointer to a design note unde
   resident style cache above); invalidate on recompute. Optional — SP4 showed uncached
   value reads are cheap. → [`projects/viewport-cache.md`](projects/viewport-cache.md)
 
-- **Bundled Inter Font** — *Future (deferred from MVP Phase 13, 2026-07-04).*
-  Ship Inter (SIL OFL) via GPUI `add_fonts` at startup (`ui_design.md §3.3`) for a clean
-  face + baselines portable across font environments. Deferred: the MVP's baseline
-  stability is already delivered by pinning the render-suite runner image, so Inter is a
-  portability/robustness upgrade, not a functional gap — and changing the render font
-  means regenerating + re-eyeballing all 48 pixel baselines. App runs on the default font.
-  → [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md)
+- **Bundled Inter Font** — *Implemented (2026-07-06).*
+  Inter (SIL OFL) is now vendored (`crates/freecell-app/assets/fonts/inter/`) and registered
+  at startup via GPUI `add_fonts` (`shell/fonts.rs`); the grid + chrome render Inter on every
+  platform. This closed a real bug — the deferral assumed baseline stability was "already
+  delivered" by pinning the runner, but on Linux the default font silently rendered bold/italic
+  as regular, so baselines were untrustworthy. Bundling fixed bold/italic and made macOS, Linux,
+  and CI render the same font. → [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md)
 
 - **Type-Aware Default Cell Alignment (+ number-format text color)** — *Future (deferred
   from MVP Phase 13).* Render Excel's type-based default alignment (numbers/dates right,

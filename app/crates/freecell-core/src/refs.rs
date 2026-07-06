@@ -161,6 +161,16 @@ impl CellRange {
         self.start == self.end
     }
 
+    /// The range's width in columns (inclusive; `>= 1` for a normalized range).
+    pub fn width(&self) -> u32 {
+        self.end.col - self.start.col + 1
+    }
+
+    /// The range's height in rows (inclusive; `>= 1` for a normalized range).
+    pub fn height(&self) -> u32 {
+        self.end.row - self.start.row + 1
+    }
+
     /// Inclusive row span.
     pub fn rows(&self) -> std::ops::RangeInclusive<u32> {
         self.start.row..=self.end.row
@@ -185,6 +195,19 @@ impl CellRange {
             self.start.to_a1()
         } else {
             format!("{}:{}", self.start.to_a1(), self.end.to_a1())
+        }
+    }
+
+    /// Parses an A1-notation rectangle: `"B2:D9"` (two corners), or a single `"A1"`. Corners
+    /// are normalized to top-left / bottom-right. Case-insensitive; absolute `$` markers are
+    /// accepted and ignored (via [`CellRef::from_a1`]). Returns `None` for anything malformed or
+    /// out of the Excel-max range. The shared parser for the file's merge ranges (the cache build
+    /// + the worker's merge guard both read `worksheet.merge_cells`, which are A1 strings).
+    pub fn from_a1(text: &str) -> Option<Self> {
+        let s = text.trim();
+        match s.split_once(':') {
+            Some((a, b)) => Some(Self::new(CellRef::from_a1(a)?, CellRef::from_a1(b)?)),
+            None => Some(Self::single(CellRef::from_a1(s)?)),
         }
     }
 }
@@ -263,6 +286,15 @@ mod tests {
     }
 
     #[test]
+    fn cell_range_width_and_height() {
+        let r = CellRange::new(CellRef::new(2, 1), CellRef::new(9, 3)); // rows 2..=9, cols 1..=3
+        assert_eq!(r.height(), 8);
+        assert_eq!(r.width(), 3);
+        let one = CellRange::single(CellRef::new(4, 4));
+        assert_eq!((one.width(), one.height()), (1, 1));
+    }
+
+    #[test]
     fn cell_range_contains() {
         let r = CellRange::new(CellRef::new(2, 1), CellRef::new(9, 3));
         assert!(r.contains(CellRef::new(2, 1)));
@@ -277,5 +309,45 @@ mod tests {
         assert_eq!(CellRange::single(CellRef::new(6, 1)).to_a1(), "B7");
         let r = CellRange::new(CellRef::new(1, 1), CellRef::new(8, 3));
         assert_eq!(r.to_a1(), "B2:D9");
+    }
+
+    #[test]
+    fn range_from_a1_valid_and_hostile() {
+        // A single cell parses to a single-cell range.
+        assert_eq!(
+            CellRange::from_a1("A1"),
+            Some(CellRange::single(CellRef::new(0, 0)))
+        );
+        // A rectangle; K7:L10 → rows 6..=9, cols 10..=11 (the merge-guard fixture).
+        assert_eq!(
+            CellRange::from_a1("K7:L10"),
+            Some(CellRange::new(CellRef::new(6, 10), CellRef::new(9, 11)))
+        );
+        // Reversed / mixed corners normalize.
+        assert_eq!(
+            CellRange::from_a1("D9:B2"),
+            Some(CellRange::new(CellRef::new(1, 1), CellRef::new(8, 3)))
+        );
+        // Full-sheet range round-trips within Excel-max.
+        assert_eq!(
+            CellRange::from_a1("A1:XFD1048576"),
+            Some(CellRange::new(
+                CellRef::new(0, 0),
+                CellRef::new(limits::MAX_ROWS - 1, limits::MAX_COLS - 1)
+            ))
+        );
+        // Hostile / malformed inputs never panic → None.
+        for bad in [
+            "",
+            "A",
+            "1:2",
+            "A1:",
+            ":B2",
+            "A1:B2:C3",
+            "ZZZ9:A1",
+            "A1048577:B2",
+        ] {
+            assert_eq!(CellRange::from_a1(bad), None, "should reject {bad:?}");
+        }
     }
 }

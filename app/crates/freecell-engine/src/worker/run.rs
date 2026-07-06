@@ -26,14 +26,16 @@ use std::time::Instant;
 use std::collections::HashSet;
 
 use freecell_core::input_cap::validate_input;
+use freecell_core::merge_guard::{blocks_col_op, blocks_row_op};
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{limits, CellRange, CellRef, Publication, PublishedCell, SheetId};
+use freecell_core::tsv::{paste_fits, tsv_dims};
+use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
 use crate::cache;
 use crate::document::{DocumentSource, FontFlag, WorkbookDocument};
 
 use super::client::Shared;
-use super::protocol::{Command, EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent};
+use super::protocol::{Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr, WorkerEvent};
 
 /// Whether the loop should keep running after a batch.
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +56,12 @@ enum AppliedKind {
     /// An add/rename/delete sheet — needs a recompute (can affect formulas) and also emits
     /// `SheetsChanged`.
     SheetOp,
+    /// A row/column resize — geometry only (no recompute), but the whole active sheet's cache is
+    /// rebuilt (the axis geometry changed; `components/grid_structure.md §5.1`).
+    GeometryOnly,
+    /// An insert/delete rows/columns — content + geometry + formulas shift, so it needs a
+    /// recompute **and** a full active-sheet cache rebuild (`components/grid_structure.md §5.3`).
+    Structure,
 }
 
 /// The cache **touch-set** of one applied undoable op, recorded so `Undo`/`Redo` can re-read the
@@ -63,16 +71,53 @@ enum AppliedKind {
 enum Touch {
     /// A cell/style/clear edit touched `range` on `sheet`; re-read those cells to mirror it.
     Cells { sheet: SheetId, range: CellRange },
+    /// A paste touched one or more `(sheet, range)`s in a **single** undo entry (the pasted
+    /// destination plus, on a cut, the cleared source — possibly a different sheet). On
+    /// undo/redo, every listed range is re-read (`components/clipboard.md §Paste`).
+    Ranges(Vec<(SheetId, CellRange)>),
     /// A sheet add/rename/delete; on undo/redo, reconcile the caches map + rebuild the active
     /// sheet (a returning deleted sheet rebuilds lazily on next activation).
     Sheets,
+    /// A geometry resize or a structural insert/delete on `sheet`. The touched region is
+    /// unbounded (everything at/after the edit shifts) + the axis geometry changed, so on
+    /// undo/redo the sheet's cache is **rebuilt** wholesale (`build_and_store_cache`) rather than
+    /// re-reading a cell range (`components/grid_structure.md §5.1, §5.3`).
+    Rebuild { sheet: SheetId },
+}
+
+/// The worker-held clipboard slot (`architecture.md §6`, `components/clipboard.md`): the engine
+/// `Clipboard` payload isn't nameable outside ironcalc_base, so `data` is its serialized
+/// `ClipboardData`. `sheet` is the **stable** source [`SheetId`] (resolved to an index at paste
+/// time, so a copy survives a sheet add/reorder); `range` is the engine's effective 1-based
+/// source rectangle; `cut` drives move-vs-copy semantics + single-use clearing.
+struct ClipboardSlot {
+    sheet: SheetId,
+    range: (i32, i32, i32, i32),
+    data: serde_json::Value,
+    cut: bool,
+}
+
+/// The outcome of a guarded paste (`run_guarded_paste`): applied (with the pasted 0-based
+/// rectangle the engine re-selected), a clean engine error, or a caught panic.
+enum PasteOutcome {
+    Applied(CellRange),
+    EngineError(String),
+    Panicked,
 }
 
 /// What one successfully-applied edit was, for post-eval cache bookkeeping. `Cells`/`Sheets`
 /// push a [`Touch`]; `Undo`/`Redo` pop/move one (they consume history, don't create it).
 enum AppliedOp {
-    Cells { sheet: SheetId, range: CellRange },
+    Cells {
+        sheet: SheetId,
+        range: CellRange,
+    },
     Sheets,
+    /// A resize / insert / delete on `sheet` → the sheet cache is fully rebuilt (see
+    /// [`Touch::Rebuild`]).
+    Rebuild {
+        sheet: SheetId,
+    },
     Undo,
     Redo,
 }
@@ -104,6 +149,9 @@ pub(super) struct Worker {
     undo_touches: Vec<Touch>,
     /// The redo side of the touch-set history (mirrors IronCalc's redo stack).
     redo_touches: Vec<Touch>,
+    /// The range clipboard slot (`architecture.md §6`): `Some` after a copy/cut, replaced by the
+    /// next copy/cut, and cleared after a cut is pasted (single-use).
+    clipboard: Option<ClipboardSlot>,
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -143,6 +191,7 @@ impl Worker {
             panic_count: 0,
             undo_touches: Vec::new(),
             redo_touches: Vec::new(),
+            clipboard: None,
         };
 
         // Point the active sheet at the first sheet's real stable id, and seed an empty
@@ -186,6 +235,13 @@ impl Worker {
         let mut edits: Vec<Command> = Vec::new();
         let mut reads: Vec<(SheetId, CellRef, u64)> = Vec::new();
         let mut saves: Vec<(PathBuf, u64)> = Vec::new();
+        // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
+        // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
+        let mut clipboard_ops: Vec<Command> = Vec::new();
+        // Font ops (`SetFont`) also run one-by-one: each emits a *variable* number of engine
+        // diff-lists (one style paste + K row-height runs), so the touch-set must stay 1:1 with
+        // the undo stack — they can't ride the generic coalesced edit path.
+        let mut font_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
         let mut shutdown = false;
 
@@ -206,9 +262,21 @@ impl Worker {
                 } => reads.push((sheet, cell, req_id)),
                 Command::Save { path, req_id } => saves.push((path, req_id)),
                 Command::Shutdown => shutdown = true,
+                clip @ (Command::CopySelection { .. }
+                | Command::PasteInternal { .. }
+                | Command::PasteTsv { .. }) => clipboard_ops.push(clip),
+                font @ Command::SetFont { .. } => font_ops.push(font),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
+                | Command::SetStylePath { .. }
+                | Command::SetBorders { .. }
+                | Command::SetColumnWidths { .. }
+                | Command::SetRowHeights { .. }
+                | Command::InsertRows { .. }
+                | Command::InsertColumns { .. }
+                | Command::DeleteRows { .. }
+                | Command::DeleteColumns { .. }
                 | Command::AddSheet
                 | Command::RenameSheet { .. }
                 | Command::DeleteSheet { .. }
@@ -239,6 +307,26 @@ impl Worker {
             self.emit(WorkerEvent::StyleCacheUpdated {
                 sheet: self.active_sheet,
             });
+        }
+
+        // Font ops after the edit batch (each is standalone: its own style paste + auto-grow +
+        // publish + touch-set entries).
+        for font in font_ops {
+            if let Command::SetFont {
+                sheet,
+                range,
+                family,
+                size_pt,
+            } = font
+            {
+                self.apply_set_font(sheet, range, family, size_pt);
+            }
+        }
+
+        // Clipboard ops after the edit batch (each is standalone; a paste carries its own eval +
+        // publish + one undo entry).
+        for clip in clipboard_ops {
+            self.apply_clipboard_op(clip);
         }
 
         for (sheet, cell, req_id) in reads {
@@ -329,6 +417,17 @@ impl Worker {
                             needs_eval = true;
                             applied_ops.push(op_of(edit));
                         }
+                        // A resize is geometry-only (no recompute); a structural insert/delete
+                        // shifts formulas (recompute). Both fully rebuild the sheet cache.
+                        Ok(AppliedKind::GeometryOnly) => {
+                            applied += 1;
+                            applied_ops.push(op_of(edit));
+                        }
+                        Ok(AppliedKind::Structure) => {
+                            applied += 1;
+                            needs_eval = true;
+                            applied_ops.push(op_of(edit));
+                        }
                         Err(msg) => engine_errors.push(msg),
                     }
                 }
@@ -401,12 +500,401 @@ impl Worker {
         }
     }
 
+    /// Dispatch one range-clipboard op (`components/clipboard.md`, `architecture.md §6`). Each is
+    /// standalone (never coalesced): copy/cut reply with the TSV; paste applies one undoable
+    /// diff + replies with the pasted range or a rejection.
+    fn apply_clipboard_op(&mut self, cmd: Command) {
+        match cmd {
+            Command::CopySelection { sheet, range, cut } => self.apply_copy(sheet, range, cut),
+            Command::PasteInternal { sheet, target } => self.apply_paste_internal(sheet, target),
+            Command::PasteTsv {
+                sheet,
+                anchor,
+                text,
+            } => self.apply_paste_tsv(sheet, anchor, &text),
+            // Only the three clipboard commands are bucketed here.
+            _ => {}
+        }
+    }
+
+    /// Copy (or cut) `range` to the engine clipboard slot and reply with the system-clipboard
+    /// TSV. Sets the engine's view selection first (the hidden-state dance) and stashes the
+    /// serialized payload; nothing evaluates and no undo entry is created (a copy is a read).
+    fn apply_copy(&mut self, sheet: SheetId, range: CellRange, cut: bool) {
+        let idx = match self.resolve(sheet) {
+            Some(i) => i,
+            None => return, // the sheet vanished — nothing to copy
+        };
+        // Guarded: the copy reads formatted values + styles; a poisoned model must not kill the
+        // thread. A failure just skips the reply (copy is never dialog-worthy).
+        let outcome = {
+            let doc = &mut self.doc;
+            catch_unwind(AssertUnwindSafe(move || doc.copy_range(idx, range)))
+        };
+        match outcome {
+            Ok(Ok(copied)) => {
+                self.clipboard = Some(ClipboardSlot {
+                    sheet,
+                    range: copied.range,
+                    data: copied.data,
+                    cut,
+                });
+                self.emit(WorkerEvent::CopyReady { tsv: copied.tsv });
+            }
+            Ok(Err(msg)) => {
+                tracing::debug!(%msg, "worker: copy_to_clipboard failed (ignored)");
+            }
+            Err(_) => {
+                let doc = &mut self.doc;
+                let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                self.handle_caught_panic();
+            }
+        }
+    }
+
+    /// Paste the engine clipboard slot at `anchor` on `dest` (`paste_from_clipboard`): full
+    /// fidelity, one undo entry, Excel ref-adjustment (copy) / move + source-clear (cut).
+    ///
+    /// Rejection order mirrors [`apply_paste_tsv`]: degraded → nothing-to-paste → overflow →
+    /// unresolved sheet. The slot is `take`n so its JSON is passed to the engine by reference
+    /// (no clone); a non-consuming early return / failed paste restores it, a successful copy
+    /// keeps it (repeatable), and a successful cut drops it (single-use).
+    fn apply_paste_internal(&mut self, dest: SheetId, target: CellRange) {
+        let anchor = target.start;
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(slot) = self.clipboard.take() else {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+        // A degenerate slot (an inverted range from an out-of-range copy, or no rows) has nothing
+        // to paste — reject at the worker rather than trusting the UI, and avoid the `as u32`
+        // wrap a `r1 < r0` range would produce below (Mild #3). It is junk, so it is not restored.
+        let (r0, c0, r1, c1) = slot.range;
+        if r1 < r0 || c1 < c0 || slot.data.as_object().is_none_or(|o| o.is_empty()) {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        }
+        // A single-cell / exact-divisor COPY into a larger selection fills the whole target (BUG 4);
+        // values + styles fill exactly, formula refs get one uniform (not per-cell) shift (accepted
+        // limitation U2 in `GAPS.md`). Cap the fill at the same size guard font edits use so a 1-cell
+        // paste into a full-column selection can't materialise a million cells — reject it as
+        // Overflow (nothing pasted). The fill target is itself a valid on-sheet selection, so no
+        // sheet-edge overflow is possible.
+        let fill = if slot.cut {
+            None
+        } else {
+            crate::document::fill_target_dims(slot.range, target)
+        };
+        if let Some((tw, th)) = fill {
+            if tw as u64 * th as u64 > MAX_REFRESH_CELLS {
+                self.clipboard = Some(slot); // still valid — the user can retry on a smaller target
+                self.emit(WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow,
+                });
+                return;
+            }
+        }
+        // Overflow pre-check against the slot's effective (dimension-clamped) source dims. When
+        // filling, the source is a divisor of the (valid) target, so its top-left tile fits too.
+        let (width, height) = ((c1 - c0 + 1) as u32, (r1 - r0 + 1) as u32);
+        if !paste_fits(anchor, width, height) {
+            self.clipboard = Some(slot); // still valid — the user can retry at a smaller anchor
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::Overflow,
+            });
+            return;
+        }
+        let (Some(dest_idx), Some(source_idx)) = (self.resolve(dest), self.resolve(slot.sheet))
+        else {
+            // The destination or copied-from sheet was deleted — keep the copy (a sheet can
+            // return via undo-of-delete); this paste just can't run now.
+            self.clipboard = Some(slot);
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+
+        let source_range = slot.range;
+        let cut = slot.cut;
+        // Borrow the slot's JSON into the guarded paste (no clone). The closure's borrow ends when
+        // `run_guarded_paste` returns, freeing `slot` for the restore/drop decision below.
+        let outcome = {
+            let data = &slot.data;
+            self.run_guarded_paste(move |doc| {
+                doc.paste_clipboard(dest_idx, source_idx, source_range, data, cut, target)
+            })
+        };
+        match outcome {
+            PasteOutcome::Applied(pasted) => {
+                // The pasted destination, plus (on cut) the cleared source, form ONE undo entry.
+                let mut touched = vec![(dest, pasted)];
+                if cut {
+                    touched.push((slot.sheet, tuple_to_range(source_range)));
+                }
+                self.commit_paste(dest, pasted, touched);
+                if !cut {
+                    self.clipboard = Some(slot); // a copy is repeatable; a cut is consumed
+                }
+            }
+            PasteOutcome::EngineError(msg) => {
+                self.clipboard = Some(slot); // the paste didn't apply — keep the copy
+                self.emit(WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(msg),
+                });
+            }
+            // A caught panic degrades the model; the (now-suspect) slot is dropped.
+            PasteOutcome::Panicked => self.handle_caught_panic(),
+        }
+    }
+
+    /// Paste external tab-separated `text` at `anchor` on `dest` (`paste_csv_string`): each token
+    /// as user input, one undo entry.
+    fn apply_paste_tsv(&mut self, dest: SheetId, anchor: CellRef, text: &str) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let (width, height) = tsv_dims(text);
+        if width == 0 || height == 0 {
+            return; // empty clipboard text → nothing to paste (no-op)
+        }
+        if !paste_fits(anchor, width, height) {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::Overflow,
+            });
+            return;
+        }
+        let Some(dest_idx) = self.resolve(dest) else {
+            return;
+        };
+        let text = text.to_string();
+        match self.run_guarded_paste(move |doc| doc.paste_tsv(dest_idx, anchor, &text)) {
+            PasteOutcome::Applied(pasted) => {
+                self.commit_paste(dest, pasted, vec![(dest, pasted)]);
+            }
+            PasteOutcome::EngineError(msg) => self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Engine(msg),
+            }),
+            PasteOutcome::Panicked => self.handle_caught_panic(),
+        }
+    }
+
+    /// Run a paste mutation under the same paused-recompute + `catch_unwind` guard the edit batch
+    /// uses (round-3 D belt-and-braces: a pasted formula reaches the recursive parser). On
+    /// success the engine has re-selected the pasted rectangle; read it back as the outcome.
+    fn run_guarded_paste(
+        &mut self,
+        f: impl FnOnce(&mut WorkbookDocument) -> Result<(), String>,
+    ) -> PasteOutcome {
+        self.emit(WorkerEvent::EvalStarted);
+        let outcome = {
+            let doc = &mut self.doc;
+            catch_unwind(AssertUnwindSafe(move || {
+                doc.pause_evaluation();
+                let result = f(doc);
+                doc.resume_evaluation();
+                if result.is_ok() {
+                    doc.evaluate(); // the ONE coalesced recompute for this paste
+                }
+                result.map(|()| doc.selected_range_0based())
+            }))
+        };
+        self.emit(WorkerEvent::EvalFinished);
+        match outcome {
+            Ok(Ok(range)) => PasteOutcome::Applied(range),
+            Ok(Err(msg)) => PasteOutcome::EngineError(msg),
+            Err(_) => {
+                // Recover the pause flag (guarded — a poisoned model could panic on it too).
+                {
+                    let doc = &mut self.doc;
+                    let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                }
+                tracing::debug!("worker: caught panic in paste; entering recovery");
+                PasteOutcome::Panicked
+            }
+        }
+    }
+
+    /// Shared post-paste bookkeeping: count the eval + committed op, publish, push the single
+    /// undo touch-entry (clearing redo), refresh the touched cache ranges, and reply `Pasted`.
+    fn commit_paste(
+        &mut self,
+        dest: SheetId,
+        pasted: CellRange,
+        touched: Vec<(SheetId, CellRange)>,
+    ) {
+        self.eval_count += 1;
+        self.ops_seen += 1;
+        self.shared
+            .committed_ops
+            .store(self.ops_seen, Ordering::Release);
+        self.publish();
+        self.emit(WorkerEvent::Published);
+
+        // One paste = one engine undo entry → one touch-entry (possibly multi-range), and a
+        // fresh edit invalidates the redo stack.
+        self.undo_touches.push(Touch::Ranges(touched.clone()));
+        self.redo_touches.clear();
+        for sheet in self.refresh_cache_cells(&touched) {
+            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+
+        self.emit(WorkerEvent::Pasted {
+            sheet: dest,
+            range: pasted,
+        });
+    }
+
+    /// Apply a `SetFont` (`architecture.md §3.3`, `components/style_render.md`): materialise the
+    /// font family/size over the (clamped) selection via `on_paste_styles`, auto-grow rows too
+    /// small for a larger size, then mirror the touched cells + heights into the cache. Style-only
+    /// — no evaluation. Emits a **variable** number of engine diff-lists (one style paste + one per
+    /// contiguous grown-row run); it pushes exactly that many touch-set entries so the undo stack
+    /// stays 1:1 aligned (so undoing a font change is up to K+1 steps — accepted, DECISIONS).
+    fn apply_set_font(
+        &mut self,
+        sheet: SheetId,
+        range: CellRange,
+        family: Option<String>,
+        size_pt: Option<f64>,
+    ) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(idx) = self.resolve(sheet) else {
+            return; // the sheet vanished — nothing to do
+        };
+        // Full row/col/select-all clamps to the used range (no font bands); a bounded selection
+        // applies as-is. An empty intersection (band beyond the used range) is a no-op.
+        let clamped = match self.doc.clamp_to_used(idx, range) {
+            Ok(Some(r)) => r,
+            Ok(None) => return,
+            Err(msg) => {
+                tracing::debug!(%msg, "worker: SetFont clamp failed (ignored)");
+                return;
+            }
+        };
+        // Cap: on_paste_styles materialises one style per cell, so a pathological used-range is
+        // refused with a dialog-worthy message rather than churning millions of cells.
+        if range_area(&clamped) > MAX_REFRESH_CELLS {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Engine(
+                    "Selection too large for font changes".to_string(),
+                ),
+            });
+            return;
+        }
+
+        let default_name = self.doc.default_font().1;
+        self.emit(WorkerEvent::EvalStarted);
+        // Guarded (round-3 D belt-and-braces): the style paste + height writes run under
+        // catch_unwind on the worker's big stack. Count the diff-lists actually committed (a failed
+        // height run commits nothing — `set_rows_height` pushes atomically) so the touch-set stays
+        // aligned even under a (near-impossible) partial failure.
+        let outcome = {
+            let doc = &mut self.doc;
+            catch_unwind(AssertUnwindSafe(move || {
+                doc.pause_evaluation();
+                let set_res = doc.set_font(idx, clamped, family.as_deref(), size_pt, &default_name);
+                let mut height_runs = 0u64;
+                if set_res.is_ok() {
+                    if let Some(pt) = size_pt {
+                        // Auto-grow only on a size change (a family swap keeps the size, so the
+                        // row already fits). Work in IronCalc px (get_row_height's 28px-default
+                        // space) so the same 96/72 factor drives text size + row height.
+                        let needed = (pt * 96.0 / 72.0 * 1.25).ceil() + 4.0;
+                        let mut grow_rows: Vec<u32> = Vec::new();
+                        for row in clamped.rows() {
+                            if let Ok(cur) = doc.row_height_px(idx, row) {
+                                if needed > cur {
+                                    grow_rows.push(row);
+                                }
+                            }
+                        }
+                        // Coalesce contiguous rows into runs; one set_rows_height per run.
+                        let mut i = 0;
+                        while i < grow_rows.len() {
+                            let start = grow_rows[i];
+                            let mut end = start;
+                            while i + 1 < grow_rows.len() && grow_rows[i + 1] == end + 1 {
+                                i += 1;
+                                end = grow_rows[i];
+                            }
+                            if doc.set_row_heights_run(idx, start, end, needed).is_ok() {
+                                height_runs += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+                doc.resume_evaluation();
+                (set_res, height_runs)
+            }))
+        };
+        self.emit(WorkerEvent::EvalFinished);
+
+        match outcome {
+            Ok((Ok(()), height_runs)) => {
+                let diff_lists = 1 + height_runs;
+                self.ops_seen += diff_lists;
+                self.shared
+                    .committed_ops
+                    .store(self.ops_seen, Ordering::Release);
+                self.publish();
+                self.emit(WorkerEvent::Published);
+                // One touch per committed diff-list (all covering the clamped range — re-reading it
+                // syncs both the styles and the row heights), and a fresh edit clears the redo side.
+                for _ in 0..diff_lists {
+                    self.undo_touches.push(Touch::Cells {
+                        sheet,
+                        range: clamped,
+                    });
+                }
+                self.redo_touches.clear();
+                for s in self.refresh_cache_cells(&[(sheet, clamped)]) {
+                    self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
+                }
+            }
+            // A clean engine error (near-unreachable for valid input): nothing committed → no touch.
+            Ok((Err(msg), _)) => self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Engine(msg),
+            }),
+            Err(_) => {
+                // Recover the pause flag (guarded — a poisoned model could panic on it too).
+                {
+                    let doc = &mut self.doc;
+                    let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                }
+                tracing::debug!("worker: caught panic in SetFont; entering recovery");
+                self.handle_caught_panic();
+            }
+        }
+    }
+
     /// Mirror a batch's applied ops into the resident cache (`components/style_cache.md
     /// §Lifecycle`): maintain the undo/redo touch-set stacks, reconcile the caches map when the
     /// sheet set changed, re-read the touched cells, and emit `StyleCacheUpdated` per changed
     /// sheet. Runs after the eval + publish (styles don't depend on the recompute).
     fn mirror_applied_ops(&mut self, applied_ops: Vec<AppliedOp>, sheets_before: &[SheetMeta]) {
         let mut refresh: Vec<(SheetId, CellRange)> = Vec::new();
+        // Sheets whose whole cache must be rebuilt (a resize / insert / delete, or the undo/redo
+        // of one — the region touched is unbounded so a per-cell mirror can't express it).
+        let mut rebuild: Vec<SheetId> = Vec::new();
         for op in applied_ops {
             match op {
                 AppliedOp::Cells { sheet, range } => {
@@ -418,19 +906,22 @@ impl Worker {
                     self.undo_touches.push(Touch::Sheets);
                     self.redo_touches.clear();
                 }
+                AppliedOp::Rebuild { sheet } => {
+                    self.undo_touches.push(Touch::Rebuild { sheet });
+                    self.redo_touches.clear();
+                    rebuild.push(sheet);
+                }
                 AppliedOp::Undo => {
                     if let Some(touch) = self.undo_touches.pop() {
-                        if let Touch::Cells { sheet, range } = touch {
-                            refresh.push((sheet, range));
-                        }
+                        refresh.extend(touch_refresh_ranges(&touch));
+                        rebuild.extend(touch_rebuild_sheets(&touch));
                         self.redo_touches.push(touch);
                     }
                 }
                 AppliedOp::Redo => {
                     if let Some(touch) = self.redo_touches.pop() {
-                        if let Touch::Cells { sheet, range } = touch {
-                            refresh.push((sheet, range));
-                        }
+                        refresh.extend(touch_refresh_ranges(&touch));
+                        rebuild.extend(touch_rebuild_sheets(&touch));
                         self.undo_touches.push(touch);
                     }
                 }
@@ -450,6 +941,17 @@ impl Worker {
 
         for sheet in self.refresh_cache_cells(&refresh) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+
+        // Full rebuilds for resize / insert / delete (and their undo/redo). Only resident sheets
+        // rebuild — an absent sheet rebuilds lazily on its next activation. Deduped so a batch that
+        // resizes the same sheet twice rebuilds once.
+        rebuild.sort_unstable();
+        rebuild.dedup();
+        for sheet in rebuild {
+            if self.shared.caches.read().contains(sheet) && self.build_and_store_cache(sheet) {
+                self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+            }
         }
     }
 
@@ -481,12 +983,20 @@ impl Worker {
                     continue;
                 }
             } else {
+                // Resolve the workbook default font once for the whole range (not per cell).
+                let (def_sz, def_name) = self.doc.default_font();
                 let mut guard = caches.write();
                 if let Some(cache) = guard.get_mut(*sheet) {
                     for row in range.rows() {
                         for col in range.cols() {
-                            let _ =
-                                cache::refresh_cell(cache, &self.doc, idx, CellRef::new(row, col));
+                            let _ = cache::refresh_cell(
+                                cache,
+                                &self.doc,
+                                idx,
+                                CellRef::new(row, col),
+                                def_sz,
+                                &def_name,
+                            );
                         }
                     }
                     // Mirror IronCalc's row-height auto-fit over the touched rows (one axis
@@ -595,6 +1105,34 @@ impl Worker {
                     .collect();
                 validate_sheet_name(name, &existing).map_err(EditRejectedReason::InvalidSheetName)
             }
+            // Merge guard (authoritative layer, `components/grid_structure.md §5.3`): block an
+            // insert/delete that would displace a file-loaded merge. A merge at/after the affected
+            // 0-based index blocks (the UI also disables the menu item; this covers staleness). If
+            // the sheet doesn't resolve, let the apply path surface the error.
+            Command::InsertRows { sheet, row, .. } | Command::DeleteRows { sheet, row, .. } => {
+                self.merge_guard(*sheet, |merges| blocks_row_op(merges, *row))
+            }
+            Command::InsertColumns { sheet, col, .. }
+            | Command::DeleteColumns { sheet, col, .. } => {
+                self.merge_guard(*sheet, |merges| blocks_col_op(merges, *col))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Runs the merge-guard predicate against `sheet`'s file-loaded merges, returning
+    /// `Err(MergedCells)` when `blocked` is true. A sheet that doesn't resolve (or whose merges
+    /// can't be read) passes the guard — the apply path then surfaces its own error.
+    fn merge_guard(
+        &self,
+        sheet: SheetId,
+        blocked: impl Fn(&[CellRange]) -> bool,
+    ) -> Result<(), EditRejectedReason> {
+        let Some(idx) = self.resolve(sheet) else {
+            return Ok(());
+        };
+        match self.doc.merge_ranges(idx) {
+            Ok(merges) if blocked(&merges) => Err(EditRejectedReason::MergedCells),
             _ => Ok(()),
         }
     }
@@ -629,17 +1167,23 @@ impl Worker {
                 let mut cells = Vec::new();
                 for row in vp.rows.clone() {
                     for col in vp.cols.clone() {
-                        if let Ok(text) = self.doc.formatted_value(idx, CellRef::new(row, col)) {
+                        let cell = CellRef::new(row, col);
+                        if let Ok(text) = self.doc.formatted_value(idx, cell) {
                             if !text.is_empty() {
+                                // Classify the cell + resolve its text colour ([Red]-style
+                                // number-format colour or explicit font colour, `§1.2`). A
+                                // rare read error defaults to plain text (never fails a
+                                // publish).
+                                let (kind, text_color) = self
+                                    .doc
+                                    .published_style(idx, cell)
+                                    .unwrap_or((CellKind::Text, None));
                                 cells.push(PublishedCell {
                                     row,
                                     col,
                                     display_text: text,
-                                    // Number-format colour ([Red]-style) is a palette index in
-                                    // the pinned engine, not an RGB; mapping it belongs with the
-                                    // Phase-5 style cache (which owns the colour table). P4
-                                    // publishes text only (DECISIONS_TO_REVIEW).
-                                    text_color: None,
+                                    kind,
+                                    text_color,
                                 });
                             }
                         }
@@ -702,6 +1246,67 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             apply_style(doc, idx, *range, *attr)?;
             // Styles don't affect values → no recompute needed (component-doc command table).
             Ok(AppliedKind::StyleOnly)
+        }
+        Command::SetStylePath {
+            sheet,
+            range,
+            path,
+            value,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.update_style_path(idx, *range, path.as_str(), value)?;
+            // Text color / alignment / number format never change values → no recompute.
+            Ok(AppliedKind::StyleOnly)
+        }
+        Command::SetBorders {
+            sheet,
+            range,
+            preset,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_borders(idx, *range, preset.border_type_tag())?;
+            // Borders never change values → no recompute.
+            Ok(AppliedKind::StyleOnly)
+        }
+        Command::SetColumnWidths {
+            sheet,
+            col_start,
+            col_end,
+            px,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_column_widths(idx, *col_start, *col_end, *px)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
+        Command::SetRowHeights {
+            sheet,
+            row_start,
+            row_end,
+            px,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_row_heights_px(idx, *row_start, *row_end, *px)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
+        Command::InsertRows { sheet, row, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.insert_rows(idx, *row, *count)?;
+            Ok(AppliedKind::Structure)
+        }
+        Command::InsertColumns { sheet, col, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.insert_columns(idx, *col, *count)?;
+            Ok(AppliedKind::Structure)
+        }
+        Command::DeleteRows { sheet, row, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.delete_rows(idx, *row, *count)?;
+            Ok(AppliedKind::Structure)
+        }
+        Command::DeleteColumns { sheet, col, count } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.delete_columns(idx, *col, *count)?;
+            Ok(AppliedKind::Structure)
         }
         Command::AddSheet => {
             doc.add_sheet()?;
@@ -783,10 +1388,28 @@ fn op_of(edit: &Command) -> AppliedOp {
             sheet: *sheet,
             range: *range,
         },
-        Command::SetStyleAttr { sheet, range, .. } => AppliedOp::Cells {
+        Command::SetStyleAttr { sheet, range, .. } | Command::SetStylePath { sheet, range, .. } => {
+            AppliedOp::Cells {
+                sheet: *sheet,
+                range: *range,
+            }
+        }
+        // `set_area_with_border` also fixes up the four cells adjacent to the range (heavier-wins
+        // sync of the shared edge), so the mirror must re-read a one-cell ring around the target.
+        // A full row/col stays band-creating after expansion → the refresh takes the full-rebuild
+        // path, which reads bands back correctly.
+        Command::SetBorders { sheet, range, .. } => AppliedOp::Cells {
             sheet: *sheet,
-            range: *range,
+            range: expand_by_one_cell(*range),
         },
+        // Resize / insert / delete: the touched region is unbounded (geometry + shifted content),
+        // so the whole sheet cache is rebuilt on apply and on undo/redo.
+        Command::SetColumnWidths { sheet, .. }
+        | Command::SetRowHeights { sheet, .. }
+        | Command::InsertRows { sheet, .. }
+        | Command::InsertColumns { sheet, .. }
+        | Command::DeleteRows { sheet, .. }
+        | Command::DeleteColumns { sheet, .. } => AppliedOp::Rebuild { sheet: *sheet },
         Command::AddSheet | Command::RenameSheet { .. } | Command::DeleteSheet { .. } => {
             AppliedOp::Sheets
         }
@@ -796,11 +1419,54 @@ fn op_of(edit: &Command) -> AppliedOp {
     }
 }
 
+/// The `(sheet, range)`s to re-read when a touch-entry is undone/redone (a paste's
+/// `Touch::Ranges` fans out to several; `Touch::Sheets` reconciles the map instead of cells).
+fn touch_refresh_ranges(touch: &Touch) -> Vec<(SheetId, CellRange)> {
+    match touch {
+        Touch::Cells { sheet, range } => vec![(*sheet, *range)],
+        Touch::Ranges(ranges) => ranges.clone(),
+        Touch::Sheets | Touch::Rebuild { .. } => Vec::new(),
+    }
+}
+
+/// The sheet(s) to fully rebuild when a touch-entry is undone/redone — only a
+/// [`Touch::Rebuild`] (a resize / insert / delete), whose region is unbounded.
+fn touch_rebuild_sheets(touch: &Touch) -> Vec<SheetId> {
+    match touch {
+        Touch::Rebuild { sheet } => vec![*sheet],
+        Touch::Cells { .. } | Touch::Ranges(_) | Touch::Sheets => Vec::new(),
+    }
+}
+
+/// Converts a 1-based inclusive engine rectangle `(row0, col0, row1, col1)` to a 0-based
+/// [`CellRange`] (the clipboard slot stores the engine's tuple; the cache mirror wants a range).
+fn tuple_to_range((r0, c0, r1, c1): (i32, i32, i32, i32)) -> CellRange {
+    let cell = |r: i32, c: i32| CellRef::new(r.max(1) as u32 - 1, c.max(1) as u32 - 1);
+    CellRange::new(cell(r0, c0), cell(r1, c1))
+}
+
 /// The number of cells a [`CellRange`] covers (for the mirror's pathological-range guard).
 fn range_area(range: &CellRange) -> u64 {
     let rows = (range.end.row - range.start.row) as u64 + 1;
     let cols = (range.end.col - range.start.col) as u64 + 1;
     rows * cols
+}
+
+/// Grows `range` by one cell in every direction, clamped to the sheet bounds — the refresh window
+/// for a border edit (the engine's `set_area_with_border` also touches the four adjacent strips).
+/// A full-row/col range is unchanged on its spanning axis (already at the bound), so it stays
+/// band-creating and the refresh full-rebuilds.
+fn expand_by_one_cell(range: CellRange) -> CellRange {
+    CellRange::new(
+        CellRef::new(
+            range.start.row.saturating_sub(1),
+            range.start.col.saturating_sub(1),
+        ),
+        CellRef::new(
+            (range.end.row + 1).min(limits::MAX_ROWS - 1),
+            (range.end.col + 1).min(limits::MAX_COLS - 1),
+        ),
+    )
 }
 
 /// Whether a style edit over `range` makes IronCalc create a **band** (a row spanning every
@@ -854,6 +1520,7 @@ fn clamp_span(range: std::ops::Range<u32>, sheet_max: u32, max_len: u32) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::protocol::StylePath;
     use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
     use freecell_core::Rgb;
 
@@ -875,6 +1542,7 @@ mod tests {
             panic_count: 0,
             undo_touches: Vec::new(),
             redo_touches: Vec::new(),
+            clipboard: None,
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;
@@ -1331,6 +1999,416 @@ mod tests {
     }
 
     #[test]
+    fn set_style_path_num_fmt_applies_and_cache_reflects() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "1234.5"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::SetStylePath {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            path: StylePath::NumFmt,
+            value: "$#,##0.00".to_string(),
+        }]);
+
+        // The cache's num-fmt side table now resolves the cell to the Currency code.
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let rs = cache
+                .render_style(1, 1)
+                .copied()
+                .expect("format-only cell stored");
+            assert_eq!(cache.num_fmt_code(rs.num_fmt), "$#,##0.00");
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        // Style-only: it ships a StyleCacheUpdated delta (the coalesced `evaluate()` is skipped
+        // for a format change, verified structurally by `AppliedKind::StyleOnly`; the spinner's
+        // EvalStarted still fires for the batch, as with any other style edit).
+        assert!(drain_events(&rx)
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+    }
+
+    #[test]
+    fn set_style_path_align_and_color_apply() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "hi"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![
+            Command::SetStylePath {
+                sheet,
+                range: CellRange::single(CellRef::new(1, 1)),
+                path: StylePath::AlignHorizontal,
+                value: "right".to_string(),
+            },
+            Command::SetStylePath {
+                sheet,
+                range: CellRange::single(CellRef::new(1, 1)),
+                path: StylePath::FontColor,
+                value: "#FF0000".to_string(),
+            },
+        ]);
+
+        let rs = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(1, 1)
+            .copied()
+            .unwrap();
+        assert_eq!(rs.h_align, Some(freecell_core::Align::Right));
+        assert_eq!(rs.font_color, Some(Rgb::from_hex(0xFF0000)));
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+
+        // Re-pressing the alignment clears horizontal only (value "general") → back to default.
+        worker.process_batch(vec![Command::SetStylePath {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            path: StylePath::AlignHorizontal,
+            value: "general".to_string(),
+        }]);
+        let rs = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(1, 1)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            rs.h_align, None,
+            "general clears the explicit horizontal alignment"
+        );
+        assert_eq!(
+            rs.font_color,
+            Some(Rgb::from_hex(0xFF0000)),
+            "color is untouched"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn set_borders_applies_and_undo() {
+        use crate::worker::protocol::BorderPreset;
+        use freecell_core::BorderSpec;
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 1, 1, "x"),
+        ]);
+        drain_events(&rx);
+
+        // Apply "All" over a bounded 2×2 block B2:C3 (one undoable diff-list).
+        worker.process_batch(vec![Command::SetBorders {
+            sheet,
+            range: CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)),
+            preset: BorderPreset::All,
+        }]);
+
+        // B2 now carries all four thin edges, and the cache agrees with a fresh engine re-read
+        // (which also validates the adjacent-strip fix-up refresh via the expanded range).
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let rs = cache
+                .render_style(1, 1)
+                .copied()
+                .expect("bordered cell stored");
+            let spec = cache.border_spec(rs.border);
+            assert!(spec.top.is_some() && spec.right.is_some() && spec.bottom.is_some());
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
+            "a border edit ships a StyleCacheUpdated delta"
+        );
+
+        // One undo step reverts the whole border edit → B2 has no border again.
+        worker.process_batch(vec![Command::Undo]);
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let border = cache
+                .render_style(1, 1)
+                .map(|rs| cache.border_spec(rs.border))
+                .unwrap_or(BorderSpec::NONE);
+            assert!(border.is_none(), "undo reverts the border to NONE");
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn set_borders_full_column_is_band() {
+        use crate::worker::protocol::BorderPreset;
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        // Full-column "All" over column D → `set_area_with_border` routes to a column band; the
+        // mirror must full-rebuild (band-creating, even after the +1 expansion) rather than
+        // materialize 1M cells.
+        worker.process_batch(vec![Command::SetBorders {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 3), CellRef::new(limits::MAX_ROWS - 1, 3)),
+            preset: BorderPreset::All,
+        }]);
+
+        let (rows, cols) = wide_probes();
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        // A far, empty cell on the banded column resolves to the border (the band), not default.
+        let spec = {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            cache
+                .render_style(5000, 3)
+                .map(|rs| cache.border_spec(rs.border))
+        };
+        assert!(
+            matches!(spec, Some(s) if !s.is_none()),
+            "a far cell on the banded column carries the border"
+        );
+    }
+
+    /// Send a `SetFont` and drain — the font op runs standalone after any edit batch.
+    fn set_font(
+        sheet: SheetId,
+        range: CellRange,
+        family: Option<&str>,
+        size_pt: Option<f64>,
+    ) -> Command {
+        Command::SetFont {
+            sheet,
+            range,
+            family: family.map(str::to_string),
+            size_pt,
+        }
+    }
+
+    #[test]
+    fn set_font_grows_rows_and_reflects_cache() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "Big"),
+        ]);
+        let before_h = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(1);
+        drain_events(&rx);
+
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::single(CellRef::new(1, 1)),
+            None,
+            Some(24.0),
+        )]);
+
+        // The cache reflects the 24pt size (96 quarter-points) and the row grew.
+        {
+            let guard = worker.shared.caches.read();
+            let cache = guard.get(sheet).unwrap();
+            let rs = cache.render_style(1, 1).copied().expect("font cell stored");
+            assert_eq!(rs.font_size_q, 96);
+            assert!(
+                cache.row_height(1) > before_h,
+                "row 1 auto-grew for the larger font ({} → {})",
+                before_h,
+                cache.row_height(1)
+            );
+        }
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        // Style-only: no evaluate; a StyleCacheUpdated delta ships.
+        assert!(drain_events(&rx)
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+    }
+
+    #[test]
+    fn set_font_undo_reverts_size_and_height() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "x"),
+        ]);
+        let base_h = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(1);
+        // `ops_seen` is a monotonic dirty counter (undo increments it too), so capture how many
+        // diff-lists the SetFont committed and undo exactly that many (K+1 = style + row runs).
+        let ops_before = worker.ops_seen; // = 1 (the input)
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::single(CellRef::new(1, 1)),
+            Some("Arial"),
+            Some(28.0),
+        )]);
+        drain_events(&rx);
+        let font_diff_lists = worker.ops_seen - ops_before;
+        assert!(
+            font_diff_lists >= 2,
+            "SetFont committed a style + a height diff-list, got {font_diff_lists}"
+        );
+
+        // Undo every committed diff-list; the cache re-reads and agrees with the engine each step.
+        for _ in 0..font_diff_lists {
+            worker.process_batch(vec![Command::Undo]);
+            worker_cache_agrees(&worker, sheet, &rows, &cols);
+        }
+        let guard = worker.shared.caches.read();
+        let cache = guard.get(sheet).unwrap();
+        assert_eq!(
+            cache.render_style(1, 1).map(|s| s.font_size_q).unwrap_or(0),
+            0,
+            "undo restored the default size"
+        );
+        assert!(
+            (cache.row_height(1) - base_h).abs() < 1e-3,
+            "undo restored the original row height"
+        );
+    }
+
+    #[test]
+    fn set_font_full_column_clamps_to_used() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "1"),
+            set_input(sheet, 2, 0, "2"),
+        ]);
+        // A full-column SetFont clamps to the used rows (does NOT materialise 1M cells).
+        let full_col = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+        );
+        worker.process_batch(vec![set_font(sheet, full_col, Some("Arial"), None)]);
+        let guard = worker.shared.caches.read();
+        let cache = guard.get(sheet).unwrap();
+        assert_eq!(
+            cache.font_family_name(cache.render_style(0, 0).unwrap().font_family),
+            "Arial"
+        );
+        assert_eq!(
+            cache.font_family_name(cache.render_style(2, 0).unwrap().font_family),
+            "Arial"
+        );
+        // A row past the used range was not materialised.
+        assert!(cache.render_style(100, 0).is_none());
+    }
+
+    #[test]
+    fn set_font_too_large_selection_rejects() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Populate a corner so the used range spans a huge rectangle (>100k cells).
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "a"),
+            set_input(sheet, 999, 199, "b"), // used range 1000 × 200 = 200k cells
+        ]);
+        drain_events(&rx);
+        // Select-all clamps to the used rectangle (1000 × 200 = 200k cells) → over the 100k cap.
+        let select_all = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(
+                freecell_core::limits::MAX_ROWS - 1,
+                freecell_core::limits::MAX_COLS - 1,
+            ),
+        );
+        worker.process_batch(vec![set_font(sheet, select_all, None, Some(20.0))]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(m)
+                } if m.contains("too large")
+            )),
+            "a >100k clamped font selection is rejected with a dialog-worthy message"
+        );
+    }
+
+    #[test]
+    fn set_font_degraded_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::TestPanic]);
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(worker.degraded);
+        drain_events(&rx);
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            Some("Arial"),
+            Some(20.0),
+        )]);
+        assert!(drain_events(&rx).iter().any(|e| matches!(
+            e,
+            WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded
+            }
+        )));
+    }
+
+    #[test]
     fn undo_redo_agreement_walk() {
         // A scripted edit/undo/redo walk: the cache must agree with the engine after EVERY step.
         let (mut worker, _rx) = test_worker();
@@ -1587,5 +2665,779 @@ mod tests {
         assert!(worker.shared.generation.load(Ordering::Acquire) >= 1);
         let cells = worker.shared.publication.load_full().cells.len();
         assert!(cells <= (MAX_PUBLISH_ROWS * MAX_PUBLISH_COLS) as usize);
+    }
+
+    // ---- Range clipboard (`components/clipboard.md`) --------------------------------------
+
+    /// The displayed value of a cell on sheet index 0 (the only sheet in these tests).
+    fn value_at(worker: &Worker, row: u32, col: u32) -> String {
+        worker
+            .doc
+            .formatted_value(0, CellRef::new(row, col))
+            .unwrap_or_default()
+    }
+
+    /// Copy `range` on `sheet` (drains the `CopyReady` reply) and return its TSV.
+    fn do_copy(
+        worker: &mut Worker,
+        rx: &async_channel::Receiver<WorkerEvent>,
+        sheet: SheetId,
+        range: CellRange,
+        cut: bool,
+    ) -> String {
+        worker.process_batch(vec![Command::CopySelection { sheet, range, cut }]);
+        drain_events(rx)
+            .into_iter()
+            .find_map(|e| match e {
+                WorkerEvent::CopyReady { tsv } => Some(tsv),
+                _ => None,
+            })
+            .expect("CopySelection must reply CopyReady")
+    }
+
+    #[test]
+    fn copy_reply_carries_tab_separated_text() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "1"),
+            set_input(sheet, 0, 1, "2"),
+        ]);
+        drain_events(&rx);
+        let tsv = do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(0, 1)),
+            false,
+        );
+        assert_eq!(
+            tsv, "1\t2",
+            "the copy reply is the row's tab-separated values"
+        );
+    }
+
+    #[test]
+    fn copy_then_paste_internal_writes_values_and_selects() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "10"),
+            set_input(sheet, 1, 0, "20"),
+        ]);
+        drain_events(&rx);
+
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            false,
+        );
+        // Paste the A1:A2 payload with its top-left at C1 (row 0, col 2).
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+
+        assert_eq!(value_at(&worker, 0, 2), "10");
+        assert_eq!(value_at(&worker, 1, 2), "20");
+        // The reply carries the pasted rectangle (C1:C2) + a repaint + a style-cache delta.
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range }
+                    if *s == sheet
+                        && *range == CellRange::new(CellRef::new(0, 2), CellRef::new(1, 2))
+            )),
+            "paste replies with the pasted rectangle; got {events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { .. })));
+    }
+
+    #[test]
+    fn cut_slot_is_single_use() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "7"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            true,
+        );
+
+        // First paste moves the cut value to C1 and clears the source.
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+        assert_eq!(value_at(&worker, 0, 2), "7");
+        assert_eq!(value_at(&worker, 0, 0), "", "the cut source is cleared");
+        drain_events(&rx);
+
+        // The slot is consumed → a second paste has nothing to paste.
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 4)),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::NothingToPaste
+                }
+            )),
+            "a cut is single-use; got {events:?}"
+        );
+        assert_eq!(
+            value_at(&worker, 0, 4),
+            "",
+            "the second paste wrote nothing"
+        );
+    }
+
+    #[test]
+    fn degenerate_slot_is_nothing_to_paste_not_overflow() {
+        // A slot with an inverted (clamped) range must reject as NothingToPaste — not wrap the
+        // `(r1 - r0 + 1) as u32` height into a spurious Overflow (Mild #3).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.clipboard = Some(ClipboardSlot {
+            sheet,
+            range: (5, 1, 2, 1), // r1 (2) < r0 (5): degenerate
+            data: serde_json::json!({ "5": { "1": { "text": "x", "style": {} } } }),
+            cut: false,
+        });
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 0)),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::NothingToPaste
+                }
+            )),
+            "an inverted slot range is NothingToPaste; got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "it must NOT surface as Overflow"
+        );
+    }
+
+    #[test]
+    fn paste_internal_overflow_is_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "a"),
+            set_input(sheet, 1, 0, "b"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            false,
+        );
+        let ops_before = worker.ops_seen;
+
+        // A 2-row payload pasted onto the very last row spills past the sheet edge.
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(limits::MAX_ROWS - 1, 0)),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an overflowing paste is rejected; got {events:?}"
+        );
+        assert_eq!(worker.ops_seen, ops_before, "nothing was applied");
+    }
+
+    #[test]
+    fn paste_tsv_writes_typed_cells() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::PasteTsv {
+            sheet,
+            anchor: CellRef::new(0, 0),
+            text: "1\t2\n=1+2\ttrue\n".to_string(),
+        }]);
+        assert_eq!(value_at(&worker, 0, 0), "1");
+        assert_eq!(value_at(&worker, 0, 1), "2");
+        assert_eq!(value_at(&worker, 1, 0), "3", "the =1+2 formula evaluated");
+        assert_eq!(value_at(&worker, 1, 1), "TRUE");
+        let events = drain_events(&rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Pasted { .. })),
+            "a TSV paste replies Pasted; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn paste_tsv_overflow_is_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::PasteTsv {
+            sheet,
+            anchor: CellRef::new(limits::MAX_ROWS - 1, 0),
+            text: "1\n2\n".to_string(), // two rows onto the last row → overflow
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an overflowing TSV paste is rejected; got {events:?}"
+        );
+        assert_eq!(worker.ops_seen, ops_before);
+    }
+
+    #[test]
+    fn paste_tsv_quoted_field_width_overflow_is_rejected() {
+        // CR Moderate (width): a quoted field with an embedded newline is a 3-wide record; pasted
+        // two columns from the right edge it spills — the guard must catch it, no partial write.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::PasteTsv {
+            sheet,
+            anchor: CellRef::new(0, limits::MAX_COLS - 2),
+            text: "a\t\"x\ny\"\tb".to_string(),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "a quoted 3-wide record near the right edge must overflow-reject; got {events:?}"
+        );
+        assert_eq!(worker.ops_seen, ops_before, "nothing written");
+    }
+
+    #[test]
+    fn copy_slot_survives_repeated_pastes() {
+        // A copy (not cut) is repeatable: the slot stays live across multiple pastes (Mild #4).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "42"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+        assert_eq!(value_at(&worker, 0, 2), "42");
+        assert!(
+            worker.clipboard.is_some(),
+            "a copy stays on the slot after the first paste"
+        );
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 4)),
+        }]);
+        assert_eq!(value_at(&worker, 0, 4), "42", "the second paste also lands");
+        assert!(
+            worker.clipboard.is_some(),
+            "and the slot is still present after the second paste"
+        );
+    }
+
+    #[test]
+    fn engine_error_on_paste_restores_the_slot() {
+        // If the paste fails mid-flight (here: a slot whose JSON isn't valid `ClipboardData`, so
+        // the engine adapter errors before mutating), the copy is kept for a retry (Mild #4).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.clipboard = Some(ClipboardSlot {
+            sheet,
+            range: (1, 1, 1, 1), // valid 1×1 — passes the degenerate + overflow guards
+            data: serde_json::json!({ "not-an-i32-row": 1 }), // non-empty, but not ClipboardData
+            cut: false,
+        });
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 0)),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(_)
+                }
+            )),
+            "a failed paste surfaces an engine rejection; got {events:?}"
+        );
+        assert!(
+            worker.clipboard.is_some(),
+            "the copy is kept after a failed paste (retryable)"
+        );
+    }
+
+    #[test]
+    fn paste_is_a_single_undo_step() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "5"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+        assert_eq!(value_at(&worker, 0, 2), "5");
+        drain_events(&rx);
+
+        // One undo removes the whole paste.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(value_at(&worker, 0, 2), "", "one undo reverts the paste");
+        assert_eq!(value_at(&worker, 0, 0), "5", "the copy source is untouched");
+    }
+
+    #[test]
+    fn single_cell_paste_fills_the_whole_target_selection_in_one_undo() {
+        // BUG 4: copy one cell, paste onto a 3×3 selection → all nine cells fill, one undo step.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "7"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        // Paste onto C1:E3 (rows 0..=2, cols 2..=4) — a 3×3 target, anchor at C1.
+        let target = CellRange::new(CellRef::new(0, 2), CellRef::new(2, 4));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(
+                    value_at(&worker, r, c),
+                    "7",
+                    "cell ({r},{c}) should be filled by the single-cell paste"
+                );
+            }
+        }
+        // The reply carries the FULL filled rectangle (C1:E3), and one undo clears all nine cells.
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == target
+            )),
+            "fill reply carries the whole target; got {events:?}"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(
+                    value_at(&worker, r, c),
+                    "",
+                    "one undo must clear the entire fill at ({r},{c})"
+                );
+            }
+        }
+        assert_eq!(value_at(&worker, 0, 0), "7", "the copy source is untouched");
+    }
+
+    #[test]
+    fn single_cell_paste_into_oversized_selection_is_rejected() {
+        // A 1-cell paste into a full-column selection would fill > 100k cells — reject as Overflow
+        // (the fill cap), nothing pasted, and the copy is preserved for a retry.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "9")]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        // A whole column A (Excel-max rows) as the target.
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(limits::MAX_ROWS - 1, 0));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an oversized fill is rejected; got {events:?}"
+        );
+        assert!(
+            worker.clipboard.is_some(),
+            "the copy is preserved after a rejected fill"
+        );
+    }
+
+    // ---- Phase 7: structure (resize, insert/delete, clamp, merge guard) --------------------
+
+    /// A resident cache's device-px column width for `col`.
+    fn col_w(worker: &Worker, sheet: SheetId, col: u32) -> f32 {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .col_width(col)
+    }
+    /// A resident cache's device-px row height for `row`.
+    fn row_h(worker: &Worker, sheet: SheetId, row: u32) -> f32 {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .row_height(row)
+    }
+
+    #[test]
+    fn set_columns_width_range_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetColumnWidths {
+            sheet,
+            col_start: 1,
+            col_end: 2,
+            px: 200.0,
+        }]);
+        // The resize round-trips device px through the engine (device → IronCalc → device) and the
+        // cache is rebuilt to reflect it; the untouched column stays at the default.
+        assert!(
+            (col_w(&worker, sheet, 1) - 200.0).abs() < 1.0,
+            "col 1 = {}",
+            col_w(&worker, sheet, 1)
+        );
+        assert!((col_w(&worker, sheet, 2) - 200.0).abs() < 1.0);
+        assert!(
+            (col_w(&worker, sheet, 0) - 100.0).abs() < 1.0,
+            "col 0 default"
+        );
+        // Undo is one step and restores the default width.
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            (col_w(&worker, sheet, 1) - 100.0).abs() < 1.0,
+            "after undo col 1 = {}",
+            col_w(&worker, sheet, 1)
+        );
+    }
+
+    #[test]
+    fn set_rows_height_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetRowHeights {
+            sheet,
+            row_start: 3,
+            row_end: 3,
+            px: 60.0,
+        }]);
+        assert!(
+            (row_h(&worker, sheet, 3) - 60.0).abs() < 1.0,
+            "row 3 = {}",
+            row_h(&worker, sheet, 3)
+        );
+        assert!(
+            (row_h(&worker, sheet, 0) - 24.0).abs() < 1.0,
+            "row 0 default"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            (row_h(&worker, sheet, 3) - 24.0).abs() < 1.0,
+            "after undo row 3 default"
+        );
+    }
+
+    #[test]
+    fn insert_rows_shifts_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..10,
+            cols: 0..3,
+        }]);
+        worker.process_batch(vec![set_input(sheet, 2, 0, "42")]); // A3 = 42
+                                                                  // Insert one row at the top → A3's content shifts down to A4.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+        assert_eq!(
+            value_at(&worker, 3, 0),
+            "42",
+            "content shifted down one row"
+        );
+        assert_eq!(value_at(&worker, 2, 0), "", "the vacated row is empty");
+        // Undo restores the original position.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            value_at(&worker, 2, 0),
+            "42",
+            "undo restores the pre-insert layout"
+        );
+    }
+
+    #[test]
+    fn delete_columns_shifts_and_undo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..3,
+            cols: 0..5,
+        }]);
+        worker.process_batch(vec![set_input(sheet, 0, 2, "z")]); // C1 = z
+                                                                 // Delete column A → C1's content shifts left to B1.
+        worker.process_batch(vec![Command::DeleteColumns {
+            sheet,
+            col: 0,
+            count: 1,
+        }]);
+        assert_eq!(
+            value_at(&worker, 0, 1),
+            "z",
+            "content shifted left one column"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            value_at(&worker, 0, 2),
+            "z",
+            "undo restores the deleted column"
+        );
+    }
+
+    #[test]
+    fn clear_contents_clamps_full_column() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 5, 1, "x")]); // B6
+                                                                 // Delete over the WHOLE column B (all 1,048,576 rows). The clamp keeps this from iterating
+                                                                 // the full band — it clears only the used cell and returns promptly.
+        let full_col_b = CellRange::new(CellRef::new(0, 1), CellRef::new(limits::MAX_ROWS - 1, 1));
+        worker.process_batch(vec![Command::ClearCells {
+            sheet,
+            range: full_col_b,
+        }]);
+        assert_eq!(
+            value_at(&worker, 5, 1),
+            "",
+            "the used cell in the column was cleared"
+        );
+    }
+
+    /// Builds a merged-cell fixture xlsx (`K7:L10`) by saving a fresh workbook and injecting a
+    /// `<mergeCells>` element into its sheet XML — IronCalc has no merge-creation API at 0.7.1, but
+    /// its importer reads `mergeCells` from the file (`import/worksheets.rs:load_merge_cells`).
+    fn merged_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::{Read, Write};
+        let base = dir.join("base.xlsx");
+        WorkbookDocument::new_empty().unwrap().save(&base).unwrap();
+        let bytes = std::fs::read(&base).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let out = dir.join("merged.xlsx");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&out).unwrap());
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut content = Vec::new();
+            f.read_to_end(&mut content).unwrap();
+            if name.contains("worksheets/sheet1.xml") {
+                let s = String::from_utf8(content).unwrap().replace(
+                    "</worksheet>",
+                    "<mergeCells count=\"1\"><mergeCell ref=\"K7:L10\"/></mergeCells></worksheet>",
+                );
+                content = s.into_bytes();
+            }
+            writer.start_file(name, opts).unwrap();
+            writer.write_all(&content).unwrap();
+        }
+        writer.finish().unwrap();
+        out
+    }
+
+    /// A worker over an already-opened document (the merged fixture), with its active-sheet cache
+    /// built — mirrors `test_worker` but takes the document.
+    fn worker_over(doc: WorkbookDocument) -> (Worker, async_channel::Receiver<WorkerEvent>) {
+        let (tx, rx) = async_channel::unbounded();
+        let shared = Arc::new(Shared::new(SheetId(0)));
+        let mut worker = Worker {
+            doc,
+            shared,
+            event_tx: tx,
+            active_sheet: SheetId(0),
+            viewport: None,
+            ops_seen: 0,
+            eval_count: 0,
+            degraded: false,
+            panic_count: 0,
+            undo_touches: Vec::new(),
+            redo_touches: Vec::new(),
+            clipboard: None,
+        };
+        if let Some(first) = worker.sheet_metas().first() {
+            worker.active_sheet = first.id;
+        }
+        worker.build_and_store_cache(worker.active_sheet);
+        (worker, rx)
+    }
+
+    #[test]
+    fn merge_guard_blocks_and_allows_on_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = merged_fixture(dir.path());
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        // The merge parses into a 0-based range (K7:L10 → rows 6..=9, cols 10..=11)…
+        let merge = CellRange::new(CellRef::new(6, 10), CellRef::new(9, 11));
+        assert_eq!(doc.merge_ranges(0).unwrap(), vec![merge]);
+        let (mut worker, rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+        // …and rides into the resident cache for the UI guard layer.
+        assert_eq!(
+            worker.shared.caches.read().get(sheet).unwrap().merges(),
+            &[merge]
+        );
+
+        // Inserting ABOVE the merge (0-based row 6 = 1-based 7) is blocked with the typed dialog
+        // reason, and nothing changes.
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 6,
+            count: 1,
+        }]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "insert above a merge must be refused with MergedCells"
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "a blocked insert commits nothing"
+        );
+
+        // Inserting BELOW every merge (0-based row 10 = 1-based 11) is allowed and commits.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 10,
+            count: 1,
+        }]);
+        assert!(
+            worker.ops_seen > ops_before,
+            "an insert below all merges must apply"
+        );
+        let deleting_col_left_of_merge = drain_events(&rx);
+        assert!(
+            !deleting_col_left_of_merge.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "an op below all merges must not be merge-blocked"
+        );
     }
 }

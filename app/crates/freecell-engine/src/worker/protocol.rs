@@ -28,6 +28,75 @@ pub enum StyleAttr {
     Fill(Option<Rgb>),
 }
 
+/// A direct-set style attribute addressed by IronCalc's `update_range_style` path
+/// (`architecture.md §3.1`, `components/action_bar.md`). Typed (instead of a raw path string) so
+/// the UI can only ever address the three formatting paths this project owns — the value carried by
+/// [`Command::SetStylePath`] is what varies. No IronCalc type crosses the seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StylePath {
+    /// `font.color` — `#RRGGBB` sets, `""` clears (→ Automatic).
+    FontColor,
+    /// `alignment.horizontal` — `left|center|right` sets, `general` clears horizontal only
+    /// (leaving any file-loaded vertical/wrap alignment intact).
+    AlignHorizontal,
+    /// `num_fmt` — the raw number-format code (one of the dropdown codes, or a decimals-adjusted
+    /// derivative).
+    NumFmt,
+}
+
+impl StylePath {
+    /// The IronCalc `update_range_style` path string for this attribute.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StylePath::FontColor => "font.color",
+            StylePath::AlignHorizontal => "alignment.horizontal",
+            StylePath::NumFmt => "num_fmt",
+        }
+    }
+}
+
+/// A fixed border preset the borders popover applies over the selection (`functional_spec.md §3.6`,
+/// `components/action_bar.md`). Each maps 1:1 to an IronCalc `BorderType` (thin black only — the
+/// worker builds the `BorderArea` from [`border_type_tag`](BorderPreset::border_type_tag)). Kept a
+/// plain enum (no IronCalc type crosses the seam), mirroring [`StylePath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderPreset {
+    /// Every edge of every selected cell.
+    All,
+    /// Interior edges only (between adjacent selected cells).
+    Inner,
+    /// The selection's outer perimeter.
+    Outer,
+    /// The top edge of the selection's top row.
+    Top,
+    /// The bottom edge of the selection's bottom row.
+    Bottom,
+    /// The left edge of the selection's left column.
+    Left,
+    /// The right edge of the selection's right column.
+    Right,
+    /// Clears all borders in the selection.
+    None,
+}
+
+impl BorderPreset {
+    /// The IronCalc `BorderType` serde tag for this preset (the `"type"` field of the JSON-built
+    /// `BorderArea`, `architecture.md §3.4`). Same pattern as [`StylePath::as_str`]: a plain string,
+    /// not an engine type.
+    pub fn border_type_tag(self) -> &'static str {
+        match self {
+            BorderPreset::All => "All",
+            BorderPreset::Inner => "Inner",
+            BorderPreset::Outer => "Outer",
+            BorderPreset::Top => "Top",
+            BorderPreset::Bottom => "Bottom",
+            BorderPreset::Left => "Left",
+            BorderPreset::Right => "Right",
+            BorderPreset::None => "None",
+        }
+    }
+}
+
 /// A command the UI hands the worker over the (unbounded, non-blocking) command channel.
 /// Undoable edits trigger a coalesced eval + publish; reads/control do not
 /// (`components/engine_worker.md §Public interface` — the authoritative semantics table).
@@ -52,6 +121,84 @@ pub enum Command {
         range: CellRange,
         attr: StyleAttr,
     },
+    /// Set a direct style attribute (text color, horizontal alignment, or number format) over a
+    /// range via IronCalc's `update_range_style` path (`architecture.md §3.1`). Style-only: no
+    /// evaluation, cache rebuild + publish only. Fire-and-forget (log-only on engine rejection —
+    /// the UI only ever sends valid paths/values).
+    SetStylePath {
+        sheet: SheetId,
+        range: CellRange,
+        path: StylePath,
+        value: String,
+    },
+    /// Set the font **family** and/or **size** over a range (`architecture.md §3.3`,
+    /// `components/action_bar.md`). IronCalc 0.7.1 has no font-name/absolute-size style path, so the
+    /// worker applies it via `on_paste_styles` (materialising per-cell styles → full row/col/
+    /// select-all clamps to the used range, a documented deviation) and **auto-grows** rows too
+    /// small for a larger size. Style-only: no evaluation. `family = Some("")` = System Default
+    /// (reset to the workbook default); `Some(name)` sets it; `None` leaves the family. `size_pt =
+    /// Some(pt)` sets the size; `None` leaves it. A too-large clamped selection replies
+    /// [`WorkerEvent::EditRejected`] with an `Engine` message the window dialogs.
+    SetFont {
+        sheet: SheetId,
+        range: CellRange,
+        family: Option<String>,
+        size_pt: Option<f64>,
+    },
+    /// Apply a border preset over a range (`architecture.md §3.4`, `components/action_bar.md`).
+    /// Style-only (no evaluation): applied via IronCalc `set_area_with_border` — one undoable
+    /// diff-list, band-aware for full rows/columns, with the engine's heavier-wins fix-up on the
+    /// four adjacent strips. Fire-and-forget (log-only on engine rejection). Thin black only.
+    SetBorders {
+        sheet: SheetId,
+        range: CellRange,
+        preset: BorderPreset,
+    },
+    /// Set the width of an inclusive column run `[col_start, col_end]` (0-based) to `px`
+    /// **device px** (`functional_spec.md §5.1`). Geometry-only (no evaluation): applied via
+    /// `set_columns_width` (one undoable diff-list), then the active sheet's cache is rebuilt.
+    /// Sent over a **bounded** run only (a resize target / selected header run).
+    SetColumnWidths {
+        sheet: SheetId,
+        col_start: u32,
+        col_end: u32,
+        px: f64,
+    },
+    /// Set the height of an inclusive row run `[row_start, row_end]` (0-based) to `px` **device
+    /// px** (`functional_spec.md §5.1`). Geometry-only (no evaluation); cf. [`Command::SetColumnWidths`].
+    SetRowHeights {
+        sheet: SheetId,
+        row_start: u32,
+        row_end: u32,
+        px: f64,
+    },
+    /// Insert `count` blank rows so new rows appear at 0-based `row` (`functional_spec.md §5.3`);
+    /// content at/after `row` shifts down and formulas adjust. Undoable; needs evaluation. The
+    /// worker **merge-guards** it first (a merge at/after `row` → [`EditRejectedReason::MergedCells`]
+    /// dialog); a shift past the sheet edge returns an engine error → dialog.
+    InsertRows {
+        sheet: SheetId,
+        row: u32,
+        count: u32,
+    },
+    /// Insert `count` blank columns at 0-based `col` (column analog of [`Command::InsertRows`]).
+    InsertColumns {
+        sheet: SheetId,
+        col: u32,
+        count: u32,
+    },
+    /// Delete `count` rows starting at 0-based `row` (row analog; merge-guarded + undoable).
+    DeleteRows {
+        sheet: SheetId,
+        row: u32,
+        count: u32,
+    },
+    /// Delete `count` columns starting at 0-based `col` (column analog).
+    DeleteColumns {
+        sheet: SheetId,
+        col: u32,
+        count: u32,
+    },
     /// Append a new sheet.
     AddSheet,
     /// Rename a sheet (re-validated against the other sheet names here).
@@ -62,6 +209,30 @@ pub enum Command {
     Undo,
     /// Redo the last undone edit.
     Redo,
+    /// Copy (or cut) the selection to the engine clipboard slot (`components/clipboard.md`).
+    /// Replies with [`WorkerEvent::CopyReady`] carrying the tab-separated text to place on the
+    /// system clipboard. `cut` is recorded for the later paste (nothing clears at cut time).
+    CopySelection {
+        sheet: SheetId,
+        range: CellRange,
+        cut: bool,
+    },
+    /// Paste the engine clipboard slot into `target` — the destination selection (full-fidelity:
+    /// values + adjusted formulas + styles). The paste anchors at `target.start`; when the copied
+    /// source is a single cell (or an exact divisor of the target) and `target` is larger, the
+    /// source is **tiled/filled** across the whole selection as one undo step (BUG 4). Values and
+    /// styles fill exactly; a **formula** gets the top-left cell's `anchor − source` reference shift
+    /// applied uniformly to every filled cell — NOT Excel's per-cell relative fill (accepted
+    /// limitation U2 in `GAPS.md`, to keep the fill one undo step). Replies with
+    /// [`WorkerEvent::Pasted`] (the pasted range) or [`WorkerEvent::PasteRejected`].
+    PasteInternal { sheet: SheetId, target: CellRange },
+    /// Paste external tab-separated `text` at `anchor` (each token as user input). Replies with
+    /// [`WorkerEvent::Pasted`] or [`WorkerEvent::PasteRejected`].
+    PasteTsv {
+        sheet: SheetId,
+        anchor: CellRef,
+        text: String,
+    },
     /// Set the active sheet + overscanned viewport (already overscanned UI-side); triggers an
     /// immediate republish from current model state (no eval).
     SetViewport {
@@ -95,11 +266,27 @@ pub enum EditRejectedReason {
     InvalidSheetName(SheetNameError),
     /// IronCalc returned a typed error for the edit (message preserved).
     Engine(String),
+    /// An insert/delete rows/columns was blocked because the sheet has merged cells the op would
+    /// displace (`functional_spec.md §5.3`). Merged cells aren't yet supported, so the op is
+    /// refused and the UI shows the merge-guard dialog. Carries no payload (fixed message).
+    MergedCells,
     /// The apply panicked and was caught (`catch_unwind`); the batch was dropped.
     EnginePanic,
     /// The worker is degraded (a prior unrecoverable panic) and is refusing edits; the UI
     /// offers Save As + reopen.
     Degraded,
+}
+
+/// Why a paste was refused (carried by [`WorkerEvent::PasteRejected`]). `Overflow` is
+/// user-visible (a dialog — the copied range would spill past the sheet edge, so nothing is
+/// pasted); `NothingToPaste` is log-only (an internal paste with no live slot, e.g. the second
+/// paste of a cut).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteError {
+    /// The paste would extend past the Excel-max sheet edge (`functional_spec.md §2.2`).
+    Overflow,
+    /// An internal paste ran with no clipboard slot (empty, or a cut already consumed).
+    NothingToPaste,
 }
 
 /// Sheet metadata the worker publishes for the tab bar (`architecture.md §3`). `id` is stable
@@ -142,6 +329,14 @@ pub enum WorkerEvent {
     StyleCacheUpdated { sheet: SheetId },
     /// The sheet list changed (add / rename / delete) — the UI re-syncs its tab bar.
     SheetsChanged { sheets: Vec<SheetMeta> },
+    /// Reply to [`Command::CopySelection`]: the tab-separated text the UI writes to the system
+    /// clipboard (and remembers as its last copy, to route a later paste internally).
+    CopyReady { tsv: String },
+    /// Reply to a paste: it applied and the pasted rectangle (0-based) is now selected — the UI
+    /// mirrors it into its `SelectionModel`.
+    Pasted { sheet: SheetId, range: CellRange },
+    /// Reply to a paste that could not apply (`Overflow` → dialog; `NothingToPaste` → log).
+    PasteRejected { reason: PasteError },
     /// The worker hit an unrecoverable panic and is degraded: it keeps serving the last good
     /// publication + reads/save, but refuses edits. The UI shows the error bar + Save As.
     WorkerDegraded { reason: String },

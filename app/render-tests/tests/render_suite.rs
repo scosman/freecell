@@ -181,7 +181,8 @@ render_cases! {
     // Formula errors
     cell_error_div0, cell_error_name, cell_error_circ,
     // Layout / alignment / geometry
-    cell_align_left_text, cell_align_right_number, cell_align_center_explicit,
+    cell_align_left_text, cell_align_right_number, cell_number_align_left,
+    cell_align_center_explicit,
     cell_align_explicit_overrides_default, cell_text_clipped, cell_text_exact_fit,
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
     // Whole-grid scenes
@@ -189,6 +190,18 @@ render_cases! {
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
     grid_selection_scrolled, grid_variable_geometry, grid_loading_overlay,
     grid_scrollbars_visible, grid_mixed_content,
+    // Editing feel (Phase 2): live mirror + in-cell editor overlay
+    cell_mirror_typing, incell_editor_open,
+    // Fonts (Phase 5): family + size + row auto-grow
+    font_family_serif, font_size_24_row_grown, font_missing_family_fallback,
+    // Borders (Phase 6): edge paint, presets, shared-edge precedence
+    border_all_thin, border_outer_medium, border_heavier_edge_wins, border_over_fill,
+    border_shared_edge_adjacent, border_none_clear,
+    // Structure (Phase 7): resized geometry + header selection
+    col_resized_narrow_clips_text, row_resized_tall,
+    header_full_column_selected, header_full_row_selected,
+    // Chrome / formatting (Phase 8): explicit text colour + the macOS titlebar row
+    text_color_red, titlebar_row,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

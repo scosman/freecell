@@ -32,6 +32,45 @@ pub enum InputRejection {
     TooDeeplyNested { depth: usize, max: usize },
 }
 
+impl InputRejection {
+    /// The user-facing cap-error message (`functional_spec.md §4.2`) shown in the popover
+    /// under the active editor. The cap value is grouped with thousands separators
+    /// (8192 → "8,192") to match Excel's phrasing.
+    pub fn message(&self) -> String {
+        match self {
+            InputRejection::TooLong { max, .. } => {
+                format!(
+                    "Formula too long (max {} characters)",
+                    group_thousands(*max)
+                )
+            }
+            InputRejection::TooDeeplyNested { max, .. } => {
+                format!(
+                    "Formula nested too deeply (max {} levels)",
+                    group_thousands(*max)
+                )
+            }
+        }
+    }
+}
+
+/// Formats `n` with `,` thousands separators (`8192` → `"8,192"`). Used only for the small
+/// cap values in [`InputRejection::message`].
+fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    // The first group has `len % 3` digits (or 3 when the length is a multiple of 3); a
+    // separator precedes every full group of three after it.
+    let first = digits.len() % 3;
+    for (i, ch) in digits.chars().enumerate() {
+        if i != 0 && i >= first && (i - first).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Validates a cell input before it reaches the engine. Non-formula inputs (not starting
 /// with `=`) always pass — they never touch the recursive parser. Formulas are rejected if
 /// they exceed the length or nesting-depth cap.
@@ -194,5 +233,36 @@ mod tests {
             ")".repeat(MAX_NESTING_DEPTH)
         );
         assert_eq!(validate_input(&at_depth), Ok(()));
+    }
+
+    #[test]
+    fn rejection_messages_match_spec() {
+        // `functional_spec.md §4.2` pins these exact strings.
+        assert_eq!(
+            InputRejection::TooLong {
+                len: 9000,
+                max: MAX_INPUT_LEN
+            }
+            .message(),
+            "Formula too long (max 8,192 characters)"
+        );
+        assert_eq!(
+            InputRejection::TooDeeplyNested {
+                depth: 70,
+                max: MAX_NESTING_DEPTH
+            }
+            .message(),
+            "Formula nested too deeply (max 64 levels)"
+        );
+    }
+
+    #[test]
+    fn group_thousands_inserts_separators() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(64), "64");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(8192), "8,192");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(1_000_000), "1,000,000");
     }
 }

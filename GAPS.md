@@ -29,23 +29,23 @@ these are presentation / entry-point behaviors consciously deferred. Each also a
 
 | # | Behavior | Spec | Severity | Current behavior | Root cause | Detailed home |
 |---|----------|------|----------|------------------|------------|---------------|
-| 1 | **Type-based default cell alignment** — numbers/dates right, booleans/errors center | §3.6 | Moderate | Grid defaults **every** cell to left; *explicit* alignment still renders correctly | `PublishedCell` carries only a display string, no value type | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
-| 2 | **`[Red]` number-format text color** | §3.6 | Mild | `PublishedCell.text_color` always published `None`; negatives render default color | Worker doesn't publish resolved per-cell color | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
-| 3 | **Input-cap rejection message text** — "Formula too long / too deeply nested" popover | §3.3 | Mild | Danger **border** only; the *safety* behavior (reject, keep focus, cell unmodified) is implemented and tested — just no human-readable reason shown | `DataRowEffect::ShowCapError` is a no-op in the chrome; message-popover not built | *inline below* |
+| 1 | **Type-based default cell alignment** — numbers/dates right, booleans/errors center | §3.6 | Moderate | ✅ **Resolved (mvp-gaps Phase 1)** — `PublishedCell.kind` is published and the grid aligns by type when no explicit alignment is set; explicit alignment still wins | `PublishedCell` carries only a display string, no value type | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
+| 2 | **`[Red]` number-format text color** | §3.6 | Mild | ✅ **Resolved (mvp-gaps Phase 1)** — the worker resolves per-cell `text_color` (explicit font colour → number-format colour); `[Red]` negatives render red | Worker doesn't publish resolved per-cell color | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
+| 3 | **Input-cap rejection message text** — "Formula too long / too deeply nested" popover | §3.3 | Mild | ✅ **Resolved (mvp-gaps Phase 1 + 2)** — a tooltip-style popover shows the length/depth reason under the **data row** (Phase 1) and the **in-cell editor** (Phase 2); dismisses on the next keystroke/focus change | `DataRowEffect::ShowCapError` was a no-op in the chrome; message-popover not built | *inline below* |
 | 4 | **macOS Finder open-file** — double-click / `open -a` / drag-onto-Dock | §2.1 | Moderate | Only the **CLI-argv** open path is wired; the primary-platform "double-click a file" flow does not open it | Pinned gpui rev's `on_open_urls` callback lacks a context (`cx`) arg | *inline below* |
 | 5 | **Bundled Inter font** — ship Inter via `add_fonts` at startup | §3.3/§3.6 | Nicety (not a functional gap) | App renders on the platform default font; render baselines pinned to the CI runner image | Fonts not vendored; `register_fonts` is a documented no-op | [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md) |
 
 ### Detail for the two without a dedicated note
 
-**#3 — Input-cap rejection message text (§3.3).**
-Today an over-cap edit (formula length > 8192 chars or paren-depth > 64) is rejected at
-both the `freecell-core::input_cap` validator and the worker-side re-check; the data row
-shows a red danger border and keeps the user in edit mode with the cell unmodified
-(tested: `chrome/view.rs::cap_reject_keeps_editing_and_flags_error`, plus
-`input_cap.rs` unit tests). What's missing is the specced inline message-popover text
-telling the user *why* the input bounced. Work when picked up: wire
-`DataRowEffect::ShowCapError` to render a tooltip-style popover below the content field
-with the reason string (length vs depth). Small, chrome-local change.
+**#3 — Input-cap rejection message text (§3.3). ✅ RESOLVED (mvp-gaps Phase 1 + 2).**
+An over-cap edit (formula length > 8192 chars or paren-depth > 64) is rejected at both the
+`freecell-core::input_cap` validator and the worker-side re-check; the data row shows a red
+danger border and keeps the user in edit mode with the cell unmodified. mvp-gaps wired the
+specced inline message-popover: `DataRowEffect::ShowCapError` now renders a tooltip-style
+popover below the active editor with the reason string (length vs depth), on the **data row**
+(Phase 1) and the **in-cell editor** (Phase 2), auto-dismissing on the next keystroke/focus
+change (`chrome/view.rs` `cap_error*` state + `cap_error_visible()`, tested via
+`edit_rejected_input_cap_flags_chrome_data_row` + the `input_cap.rs` unit tests).
 
 **#4 — macOS Finder open-file (§2.1).**
 `main.rs` wires only `xlsx_arg` (CLI argv). Opening a `.xlsx` from Finder
@@ -67,10 +67,10 @@ deferred dispatch; then map the incoming URLs through the existing `do_open_path
 
 ### When picking these up
 
-Items #1 and #2 share a root cause (the publication carries no per-cell type/color) and
-should be done together — see [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md)
-for the publication → grid threading plan. #3 is a small chrome-local change. #4 needs a
-gpui-capability spike before estimating. None are blocked by the others.
+Items **#1, #2, and #3 are RESOLVED** by the `specs/projects/mvp-gaps` build (Phases 1–2 —
+publication type/color + type-aware alignment + the cap-error popover). **Still open:** #4
+(macOS Finder open-file — needs a gpui-capability spike before estimating) and #5 (bundled
+Inter font — a nicety, not a functional gap). Neither is blocked by the other.
 
 ---
 
@@ -105,7 +105,7 @@ built-in number-format table, and accepts an `xfId`-less `cellXfs`, `open_fixups
 
 | Gap | Severity | Why it matters | Sketch |
 |-----|----------|----------------|--------|
-| **Save a `.back` backup before the first save** | High (we're alpha) | The save path can lose data (IronCalc's writer silently strips anything it doesn't model; we're early and bugs are likely). A one-time backup of the original bytes means an overwrite can never be the *only* copy. | Before the **first** save of a document opened from disk, copy the original file to `filename.xlsx.back` (write-once — do **not** re-back-up / overwrite the backup on subsequent saves, so the backup always holds the pristine original). Applies to files opened from disk; a never-saved new workbook has nothing to back up. **Picked up in `specs/projects/mvp-gaps`.** |
+| **Save a `.back` backup before the first save** ✅ **RESOLVED (mvp-gaps Phase 1)** | High (we're alpha) | The save path can lose data (IronCalc's writer silently strips anything it doesn't model; we're early and bugs are likely). A one-time backup of the original bytes means an overwrite can never be the *only* copy. | ✅ **Done.** Before the **first** save-in-place of a document opened from disk, the original bytes are copied to `<name>.xlsx.back` (write-once — never overwritten on later saves; not created by Save-As to a new path; a copy failure aborts the save with a "Couldn't create backup — file not saved." dialog). `shell/lifecycle.rs` `backup_path`/`backup_target` + the save flow, tested by `first_save_of_opened_file_writes_back_backup_once`, `backup_failure_aborts_the_save_with_a_dialog`, and the `backup_target_*` unit tests. |
 
 ---
 
@@ -144,3 +144,25 @@ lost if one bites in practice.
 | **External TSV paste skips empty tokens instead of clearing cells** | Excel blanks the target cell | Engine `paste_csv_string` behavior. Fix = FreeCell pre-clears the target area (one extra undoable step) if this bites. |
 | **`.back` backup failure blocks the save** | n/a (our feature) | Data-safety-wins call: "Couldn't create backup — file not saved." The annoying case (unwritable dir) mostly implies the atomic save would fail too. Could soften to warn-and-continue. |
 | **No action-bar overflow; window min-width rises to fit the control row** | Excel ribbon collapses | Could feel restrictive on small/split screens. Fix = overflow menu for trailing groups. |
+
+### Render fidelity — surfaced by the render-baseline eyeball (2026-07-06)
+
+Two rendering deviations caught when every render-test baseline was regenerated on the
+bundled Inter font and eyeballed. Both are **pre-existing** (unrelated to the font change);
+the baselines faithfully capture current behavior. Recorded here, **not fixed** (out of scope
+for the font work).
+
+| Deviation | Vs. Excel | Follow-up if needed |
+|---|---|---|
+| **A fill does not cover interior gridlines.** In a multi-cell fill block, each cell still paints its own right/bottom gridline over its fill, so faint gray gridlines cross the block interior (visible in `cell_fill_covers_gridlines`: the 2×2 yellow block shows a gray line down the B/C boundary and across the row-2/3 boundary). The case name/comment says the fill should "paint over the interior gridlines (Excel look)", but it does not. | Excel shows no interior gridlines inside a filled range — it reads as one solid block. | Skip a cell's right/bottom gridline when the neighbor across that edge shares the same fill (or draw gridlines beneath fills). Then regenerate + eyeball `cell_fill_covers_gridlines`. |
+| **Full-row selection does not highlight the row-number header.** A full-row selection tints the row and draws the accent border, but the left-hand row-number header cell is **not** darkened — whereas a full-**column** selection *does* darken the column-letter header (`header_full_column_selected` vs `header_full_row_selected`). Asymmetric. | Excel highlights both the row and column headers of a full-line selection. | Apply the selected-header background to the row-number header on a full-row selection the same way the column path already does. Then regenerate + eyeball `header_full_row_selected`. |
+
+### `mvp-gaps` UI review — accepted limitations (owner-approved 2026-07-06)
+
+Two judgment calls from the post-Phase-8 **UI-review bug-fix round**, reviewed and accepted by
+the owner as-is. Each ships as built; recorded here so neither is later mistaken for a defect.
+
+| # | Limitation | Vs. Excel | Root cause | Current behavior | Follow-up if needed |
+|---|---|---|---|---|---|
+| U1 | **Open dialog shows all files, not just `*.xlsx`** | Excel's file picker filters to workbook types | The pinned gpui rev's `PathPromptOptions` (`crates/gpui/src/platform.rs`) has **no** extension/content-type field, and neither the macOS impl (`NSOpenPanel`, never calls `setAllowedContentTypes:`) nor the Linux `prompt_for_paths` exposes a filter hook — so pre-filtering is impossible without bumping the pinned gpui dep (a separate, riskier change against a pinned dependency). | **Correct + graceful fallback:** a files-only picker, then a **post-selection** magic-byte check rejects a non-`.xlsx` → `LoadError::NotXlsx` → the "Couldn't open the workbook" dialog. No crash, no wrong-file load. | Revisit if gpui is bumped to a rev whose path prompt gains a filter field; then set the filter in `open_panel_options` (`shell/window.rs`). |
+| U2 | **Single-cell paste-fill uses block-uniform formula displacement, not per-cell relative fill** | Excel fills a 1×1 copy across a larger selection with **per-cell** relative-reference adjustment | The fill is one synthesized `paste_from_clipboard` call so it stays **one undo step** (IronCalc 0.7.1 has no fill-to-selection), which applies a single uniform `anchor − source` reference shift to every filled cell. Per-cell relative fill would need N×M separate engine pastes (= N×M undo entries, breaking the one-undo-step requirement) or an engine fill API that does not exist. | Pasting a 1×1 (or exact-divisor block) copy onto a larger selection fills the **whole** target in **one** undo step; **values and styles are exact** for every cell, but a **formula** gets the top-left cell's reference shift applied uniformly (not re-adjusted per cell). Over-large fills (> 100k cells) are rejected as Overflow. | Revisit if an IronCalc relative-fill API appears, or if the one-undo-step constraint is relaxed (then paste per cell). |

@@ -3,9 +3,24 @@
 //! rows here (stated as a review requirement in `README.md`). `name` is snake_case and IS the
 //! baseline filename, so a red CI line names the exact broken feature.
 
-use freecell_core::{Align, CellRef, SelectionModel};
+use freecell_core::{Align, BorderSpec, CellRef, Edge, Rgb, SelectionModel};
 
 use crate::scene::Scene;
+
+/// A solid black border edge of the given px `weight` (the render-case builder's shorthand).
+fn edge(weight: u8) -> Option<Edge> {
+    Some(Edge::new(weight, Rgb::new(0, 0, 0)))
+}
+
+/// A four-sided border, every edge `weight` px black.
+fn all_edges(weight: u8) -> BorderSpec {
+    BorderSpec {
+        top: edge(weight),
+        right: edge(weight),
+        bottom: edge(weight),
+        left: edge(weight),
+    }
+}
 
 /// A demonstrative multi-line-ish word with an ascender + descenders, so bold / italic /
 /// underline read clearly in a baseline.
@@ -29,6 +44,15 @@ pub struct RenderCase {
     pub force_scrollbars: bool,
     /// A `(row, col)` scrolled fully into view before capture (deep-header / scroll cases).
     pub reveal: Option<(u32, u32)>,
+    /// A live cell mirror `(row, col, raw text)` painted over the cell's published value while an
+    /// edit is pending (`functional_spec.md §1.2`).
+    pub mirror: Option<(u32, u32, &'static str)>,
+    /// An open in-cell editor overlay `(row, col, text)` (`functional_spec.md §1.3`).
+    pub in_cell: Option<(u32, u32, &'static str)>,
+    /// `Some(title)` prepends the macOS custom titlebar row over the grid (`architecture.md
+    /// §7.1, §9`). The row is just a div, so it renders in the Linux harness too — the *native*
+    /// macOS integration (transparent titlebar + traffic lights) is the on-device smoke.
+    pub titlebar: Option<&'static str>,
 }
 
 impl RenderCase {
@@ -41,11 +65,29 @@ impl RenderCase {
             loading: None,
             force_scrollbars: false,
             reveal: None,
+            mirror: None,
+            in_cell: None,
+            titlebar: None,
         }
     }
 
     fn selection(mut self, selection: SelectionModel) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    fn titlebar(mut self, title: &'static str) -> Self {
+        self.titlebar = Some(title);
+        self
+    }
+
+    fn mirror(mut self, row: u32, col: u32, text: &'static str) -> Self {
+        self.mirror = Some((row, col, text));
+        self
+    }
+
+    fn in_cell(mut self, row: u32, col: u32, text: &'static str) -> Self {
+        self.in_cell = Some((row, col, text));
         self
     }
 
@@ -150,8 +192,13 @@ pub fn all() -> Vec<RenderCase> {
         ),
         cell("cell_number_percent", Scene::new().input(1, 1, "50%")),
         cell(
-            // The [Red] number-format COLOUR is not yet published (Phase-4: text_color = None);
-            // this baseline shows the negative number correctly formatted in the default colour.
+            // NOTE (mvp-gaps Phase 1): despite the name, this renders in the DEFAULT colour,
+            // not red. IronCalc infers `#,##0.00` from `-1,234.50` — a single colourless
+            // section — so `resolve_text_color` short-circuits (`!num_fmt.contains('[')`) and
+            // publishes no `text_color`. Phase 1 changes only its ALIGNMENT (Number → right).
+            // The `[Red]` text-colour path (GAPS #2) has no render case — the Scene builder
+            // can't set a custom `num_fmt` — so it is guarded by the engine integration test
+            // `published_style_resolves_format_and_explicit_colors` (see DECISIONS §6).
             "cell_number_negative_red",
             Scene::new().input(1, 1, "-1,234.50"),
         ),
@@ -174,6 +221,12 @@ pub fn all() -> Vec<RenderCase> {
         cell(
             "cell_align_right_number",
             Scene::new().input(1, 1, "42").align(1, 1, Align::Right),
+        ),
+        cell(
+            // A number defaults right (Phase-1 §1.3); an explicit Left alignment overrides
+            // the type-default — the mirror of `cell_align_explicit_overrides_default`.
+            "cell_number_align_left",
+            Scene::new().input(1, 1, "42").align(1, 1, Align::Left),
         ),
         cell(
             "cell_align_center_explicit",
@@ -281,6 +334,188 @@ pub fn all() -> Vec<RenderCase> {
         .force_scrollbars(),
         RenderCase::new("grid_mixed_content", mixed_content_scene(), (720, 400))
             .selection(sel((2, 1), (4, 3))),
+        // ---- Editing feel (Phase 2): live mirror + in-cell editor overlay --------------
+        RenderCase::new(
+            // The active cell shows the raw text being typed (default style, left-aligned)
+            // instead of its committed value (`functional_spec.md §1.2`).
+            "cell_mirror_typing",
+            Scene::new().input(1, 1, "42"),
+            CELL_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .mirror(1, 1, "=1+2"),
+        RenderCase::new(
+            // The in-cell editor overlay open over B2 (2 px accent border, raw content;
+            // `functional_spec.md §1.3`).
+            "incell_editor_open",
+            Scene::new().input(1, 1, "42"),
+            CELL_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(1, 1, "=SUM(A1:A3)"),
+        // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
+        cell(
+            // A serif family (visibly distinct from the default sans) rendered per-cell. NOTE:
+            // this depends on a serif font being installed on the pinned runner — see DECISIONS.
+            "font_family_serif",
+            at(Scene::new()).font(1, 1, Some("DejaVu Serif"), None),
+        ),
+        cell(
+            // 24pt text in a row grown to fit it (the worker's auto-grow, simulated by the injected
+            // row height ≈ ceil(24*96/72*1.25)+4 IronCalc px → FreeCell px).
+            "font_size_24_row_grown",
+            at(Scene::new())
+                .font(1, 1, None, Some(24.0))
+                .row_height(1, 38.0),
+        ),
+        cell(
+            // A family the runner does not have → gpui falls back to the default font (display-only;
+            // the style is preserved). Guards that a missing family never blanks the cell.
+            "font_missing_family_fallback",
+            at(Scene::new()).font(1, 1, Some("NoSuchFontXYZ123"), None),
+        ),
+        // ---- Borders (Phase 6): edge paint, presets, shared-edge precedence -------------
+        cell(
+            // A single cell with all four thin (1px) black edges.
+            "border_all_thin",
+            at(Scene::new()).border(1, 1, all_edges(1)),
+        ),
+        cell(
+            // A 2×2 block with a medium (2px) OUTER border only — each corner cell carries just its
+            // two outward edges, so no interior edges draw.
+            "border_outer_medium",
+            at(Scene::new())
+                .input(1, 2, "b")
+                .input(2, 1, "c")
+                .input(2, 2, "d")
+                .border(
+                    1,
+                    1,
+                    BorderSpec {
+                        top: edge(2),
+                        left: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    1,
+                    2,
+                    BorderSpec {
+                        top: edge(2),
+                        right: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    2,
+                    1,
+                    BorderSpec {
+                        bottom: edge(2),
+                        left: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    2,
+                    2,
+                    BorderSpec {
+                        bottom: edge(2),
+                        right: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                ),
+        ),
+        cell(
+            // Adjacent cells DISAGREE on the shared edge: B2's right is thin (1px), C2's left is
+            // thick (3px). The heavier (thick) wins, and the edge is drawn once — by B2.
+            "border_heavier_edge_wins",
+            at(Scene::new())
+                .input(1, 2, "X")
+                .border(
+                    1,
+                    1,
+                    BorderSpec {
+                        right: edge(1),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .border(
+                    1,
+                    2,
+                    BorderSpec {
+                        left: edge(3),
+                        ..BorderSpec::NONE
+                    },
+                ),
+        ),
+        cell(
+            // A border painted over a fill: the edges draw ON TOP of the yellow fill (Excel look).
+            "border_over_fill",
+            at(Scene::new())
+                .fill(1, 1, 0xFFEB3B)
+                .border(1, 1, all_edges(1)),
+        ),
+        cell(
+            // Two adjacent all-thin cells: the shared vertical edge is drawn exactly ONCE (by the
+            // left cell), so it looks identical to a single continuous line — no double-thick seam.
+            "border_shared_edge_adjacent",
+            at(Scene::new())
+                .input(1, 2, "Y")
+                .border(1, 1, all_edges(1))
+                .border(1, 2, all_edges(1)),
+        ),
+        cell(
+            // A cell whose border was cleared (NONE) renders as a plain cell — guards the clear path.
+            "border_none_clear",
+            at(Scene::new()).border(1, 1, BorderSpec::NONE),
+        ),
+        // ---- Structure (Phase 7): resized geometry + header selection -------------------
+        cell(
+            // A number in a column narrowed to 20 px — the value clips (resize geometry honored
+            // end-to-end through the cache, `components/grid_structure.md §5.1`).
+            "col_resized_narrow_clips_text",
+            Scene::new().input(1, 1, "1234567").col_width(1, 20.0),
+        ),
+        cell(
+            // A row grown to 48 px — the tall row's geometry reflows the grid below it.
+            "row_resized_tall",
+            at(Scene::new()).row_height(1, 48.0),
+        ),
+        RenderCase::new(
+            // A full-column header selection (`functional_spec.md §5.2`): the whole column is tinted
+            // and its header selected. The overlay is viewport-clamped (the range spans all rows).
+            "header_full_column_selected",
+            Scene::new().input(0, 1, "B1").input(2, 1, "B3"),
+            GRID_VP,
+        )
+        .selection(sel((0, 1), (freecell_core::limits::MAX_ROWS - 1, 1))),
+        RenderCase::new(
+            // A full-row header selection: the whole row is tinted, its header selected.
+            "header_full_row_selected",
+            Scene::new().input(2, 0, "A3").input(2, 2, "C3"),
+            GRID_VP,
+        )
+        .selection(sel((2, 0), (2, freecell_core::limits::MAX_COLS - 1))),
+        // ---- Chrome / formatting (Phase 8) ---------------------------------------------
+        cell(
+            // An explicit RED font colour on a cell (`architecture.md §1.2` precedence: an
+            // explicit `font.color` wins). The §9 `format_red_negative` companion — a colour
+            // produced by a `[Red]` number format — has NO render case (the Scene builder can't
+            // set a custom `num_fmt`; it is guarded by the engine test
+            // `published_style_resolves_format_and_explicit_colors`, see DECISIONS §8).
+            "text_color_red",
+            at(Scene::new()).font_color(1, 1, 0xFF0000),
+        ),
+        RenderCase::new(
+            // The macOS custom titlebar row (§7.1) over a short grid. It is just a div, so it
+            // renders in the Linux harness (this case); the *native* macOS integration
+            // (transparent titlebar, repositioned traffic lights, drag/zoom/fullscreen) is the
+            // on-device smoke gate, not pixel-baselined here.
+            "titlebar_row",
+            Scene::new().input(0, 0, "A1"),
+            (480, 120),
+        )
+        .titlebar("Budget.xlsx — Edited"),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

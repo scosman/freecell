@@ -15,13 +15,21 @@ use std::fs::File;
 use std::io::{self, BufWriter, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use freecell_core::{CellRange, CellRef, Rgb};
+use freecell_core::format_color::{format_color_rgb, is_date_format};
+use freecell_core::{CellKind, CellRange, CellRef, Rgb};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
+use ironcalc_base::cell::CellValue;
 use ironcalc_base::expressions::types::Area;
-use ironcalc_base::types::{Style, Worksheet};
+use ironcalc_base::formatter::format::format_number;
+use ironcalc_base::locale::get_locale;
+use ironcalc_base::types::{CellType, Font, Style, Worksheet};
+use ironcalc_base::Model;
 
 use crate::UserModel; // the crate's single canonical path to the IronCalc workbook type
+use ironcalc_base::BorderArea;
+use ironcalc_base::ClipboardData;
+use serde::Deserialize;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -112,6 +120,18 @@ impl FontFlag {
             FontFlag::Underline => "font.u",
         }
     }
+}
+
+/// The result of copying a range to the engine clipboard (`components/clipboard.md §Copy /
+/// Cut`). Engine-free so it can cross back to the worker: `tsv` goes on the system clipboard,
+/// `data` is stashed (serialized — the concrete `ClipboardCell` type is private to
+/// ironcalc_base) for a later internal paste, and `range` is the engine's **effective**
+/// (dimension-clamped) source rectangle in 1-based inclusive `(row0, col0, row1, col1)` coords.
+#[derive(Debug, Clone)]
+pub(crate) struct CopiedRange {
+    pub tsv: String,
+    pub data: serde_json::Value,
+    pub range: (i32, i32, i32, i32),
 }
 
 /// The magic-byte family of a file, used to classify open failures into typed [`LoadError`]s
@@ -210,6 +230,16 @@ impl WorkbookDocument {
         }
     }
 
+    /// Wraps a pre-built IronCalc `Model` (test-only): lets a test author a workbook whose
+    /// **default** style differs from `new_empty`'s (e.g. an opened file with a non-Calibri default
+    /// font) by mutating the public `workbook.styles` before wrapping.
+    #[cfg(test)]
+    pub(crate) fn from_test_model(model: Model<'static>) -> Self {
+        Self {
+            model: UserModel::from_model(model),
+        }
+    }
+
     /// Builds a document from a [`DocumentSource`] (Phase-4 `spawn` entry point).
     pub fn from_source(source: &DocumentSource) -> Result<Self, LoadError> {
         match source {
@@ -282,6 +312,45 @@ impl WorkbookDocument {
         self.model
             .get_formatted_cell_value(sheet, row, col)
             .map_err(CellQueryError)
+    }
+
+    /// A published cell's evaluated [`CellKind`] and fully-resolved text colour
+    /// (`architecture.md §1.2`) — the two presentation attributes the worker adds to each
+    /// [`PublishedCell`](freecell_core::PublishedCell).
+    ///
+    /// - **kind**: the engine cell type (`get_cell_type`) mapped to `CellKind`, with a
+    ///   `Number` reclassified to `Date` when its number format is date/time-like (the
+    ///   engine stores dates as serial numbers, so it has no distinct date type).
+    /// - **text colour** (precedence per `§1.2`): the cell's explicit non-black font colour
+    ///   if set; else the number format's produced colour (e.g. `[Red]` negatives) when the
+    ///   format specifies one and the value is numeric; else `None` (the grid's default).
+    pub fn published_style(
+        &self,
+        sheet: u32,
+        cell: CellRef,
+    ) -> Result<(CellKind, Option<Rgb>), CellQueryError> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        let cell_type = self
+            .model
+            .get_cell_type(sheet, row, col)
+            .map_err(CellQueryError)?;
+        let model = self.model.get_model();
+        let style = model
+            .get_style_for_cell(sheet, row, col)
+            .map_err(CellQueryError)?;
+
+        let kind = match cell_type {
+            CellType::Number if is_date_format(&style.num_fmt) => CellKind::Date,
+            CellType::Number => CellKind::Number,
+            CellType::LogicalValue => CellKind::Bool,
+            CellType::ErrorValue => CellKind::Error,
+            // Text, and the rare Array / CompoundData results, default to text alignment.
+            _ => CellKind::Text,
+        };
+
+        let text_color = resolve_text_color(model, sheet, row, col, &style);
+        Ok((kind, text_color))
     }
 
     /// The raw content of a cell: the `=formula` text for formula cells, the literal for
@@ -442,13 +511,120 @@ impl WorkbookDocument {
 
     /// Clears a range's **contents only** (keeps styles) — `ClearCells`. One undoable engine
     /// op over the rectangle. Auto-evaluates unless paused.
+    ///
+    /// `range_clear_contents` has **no band fast path** — a full-column Area would iterate
+    /// 1,048,576 cells (`architecture.md §5.2` clamping rule). So a full-row/col/select-all range
+    /// (a header-selection Delete) is clamped to the used rectangle first; a bounded selection is
+    /// unchanged. An empty intersection (nothing used) is a no-op.
     pub(crate) fn clear_contents(
         &mut self,
         sheet_idx: u32,
         range: CellRange,
     ) -> Result<(), String> {
         crate::instrument::record_engine_call();
-        self.model.range_clear_contents(&area_of(sheet_idx, range))
+        let clamped = match self.clamp_to_used(sheet_idx, range)? {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        self.model
+            .range_clear_contents(&area_of(sheet_idx, clamped))
+    }
+
+    /// Sets the width (device px) of the inclusive column run `[col_start, col_end]` (0-based) —
+    /// `SetColumnWidths`. One undoable diff-list (`set_columns_width`, `common.rs:1055`). Device px
+    /// are converted to IronCalc px at this boundary (the grid speaks device px). Called only over
+    /// a bounded run (a resize target / selected header run), never an unbounded range.
+    pub(crate) fn set_column_widths(
+        &mut self,
+        sheet_idx: u32,
+        col_start: u32,
+        col_end: u32,
+        device_px: f64,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let px = crate::cache::col_ironcalc_px(device_px);
+        self.model
+            .set_columns_width(sheet_idx, col_start as i32 + 1, col_end as i32 + 1, px)
+    }
+
+    /// Sets the height (device px) of the inclusive row run `[row_start, row_end]` (0-based) —
+    /// `SetRowHeights`. One undoable diff-list (`set_rows_height`, `common.rs:1081`). Device px are
+    /// converted to IronCalc px here (cf. [`set_column_widths`](Self::set_column_widths)).
+    pub(crate) fn set_row_heights_px(
+        &mut self,
+        sheet_idx: u32,
+        row_start: u32,
+        row_end: u32,
+        device_px: f64,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let px = crate::cache::row_ironcalc_px(device_px);
+        self.model
+            .set_rows_height(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, px)
+    }
+
+    /// Inserts `count` blank rows so new rows appear at 0-based `row` (`InsertRows`); everything at/
+    /// after `row` shifts down and formulas adjust (`insert_rows`, `common.rs:882`; undoable). A
+    /// shift that would push used cells past the last row returns `Err(String)` (→ dialog).
+    pub(crate) fn insert_rows(
+        &mut self,
+        sheet_idx: u32,
+        row: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .insert_rows(sheet_idx, row as i32 + 1, count as i32)
+    }
+
+    /// Inserts `count` blank columns at 0-based `col` (`InsertColumns`, `common.rs:907`; undoable).
+    pub(crate) fn insert_columns(
+        &mut self,
+        sheet_idx: u32,
+        col: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .insert_columns(sheet_idx, col as i32 + 1, count as i32)
+    }
+
+    /// Deletes `count` rows starting at 0-based `row` (`DeleteRows`, `common.rs:932`; undoable —
+    /// the removed data + heights + band styles are snapshotted for undo; formulas adjust).
+    pub(crate) fn delete_rows(
+        &mut self,
+        sheet_idx: u32,
+        row: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .delete_rows(sheet_idx, row as i32 + 1, count as i32)
+    }
+
+    /// Deletes `count` columns starting at 0-based `col` (`DeleteColumns`, `common.rs:974`;
+    /// undoable).
+    pub(crate) fn delete_columns(
+        &mut self,
+        sheet_idx: u32,
+        col: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .delete_columns(sheet_idx, col as i32 + 1, count as i32)
+    }
+
+    /// The sheet's file-loaded merged ranges (0-based), parsed from `worksheet.merge_cells`
+    /// (`Vec<String>` A1 ranges). Unparseable entries are skipped (defensive). The worker's merge
+    /// guard reads this before an insert/delete (`components/grid_structure.md §5.3`).
+    pub(crate) fn merge_ranges(&self, sheet_idx: u32) -> Result<Vec<CellRange>, String> {
+        let ws = self.worksheet(sheet_idx)?;
+        Ok(ws
+            .merge_cells
+            .iter()
+            .filter_map(|m| CellRange::from_a1(m))
+            .collect())
     }
 
     /// Whether `cell` currently has the given character-format flag set (the per-cell read the
@@ -501,6 +677,166 @@ impl WorkbookDocument {
             .update_range_style(&area_of(sheet_idx, range), "fill.fg_color", &value)
     }
 
+    /// Sets a direct style attribute over a range via IronCalc's `update_range_style` path — the
+    /// generic pass-through behind `SetStylePath` (text color / horizontal alignment / number
+    /// format, `architecture.md §3.1`). One undoable range-style op; the band fast path engages
+    /// automatically when `range` is a full row/column (`common.rs:1274`). `path` is one of the
+    /// three typed [`StylePath`](crate::StylePath) strings, `value` its already-formatted payload.
+    pub(crate) fn update_style_path(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        path: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .update_range_style(&area_of(sheet_idx, range), path, value)
+    }
+
+    /// Applies a border `preset` (an IronCalc `BorderType` serde tag) over a range via
+    /// `set_area_with_border` (`architecture.md §3.4`, `border.rs:346`). One undoable diff-list;
+    /// band-aware for full rows/columns; the engine applies its heavier-wins fix-up to the four
+    /// adjacent strips. `BorderArea` has `pub(crate)` fields and no constructor at 0.7.1 but derives
+    /// `Deserialize`, so it is built from JSON — thin black only (the only style the borders popover
+    /// applies; `functional_spec.md §3.6`). For `type: "None"` the engine ignores `item` and clears
+    /// the edges.
+    pub(crate) fn set_borders(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        border_type: &str,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let border_area: BorderArea = serde_json::from_value(serde_json::json!({
+            "item": { "style": "thin", "color": "#000000" },
+            "type": border_type,
+        }))
+        .map_err(|e| format!("failed to build BorderArea for {border_type:?}: {e}"))?;
+        self.model
+            .set_area_with_border(&area_of(sheet_idx, range), &border_area)
+    }
+
+    /// The workbook's **default font** `(size_pt, family_name)` — the font a truly-unstyled cell
+    /// resolves to (style index 0). Read from the public workbook styles
+    /// (`cell_xfs[0].font_id` → `fonts[id]`); a hostile/empty styles table falls back to
+    /// IronCalc's `Font::default()` (13pt Calibri) rather than panicking. The cache resolves each
+    /// cell's `font_size_q`/`font_family` **relative to this** (so a default-font cell interns to
+    /// the default style, exactly as `font.color` is resolved relative to black — `architecture.md
+    /// §1.1`, `components/style_render.md`). Cheap (a couple of `Vec` index reads).
+    pub(crate) fn default_font(&self) -> (i32, String) {
+        crate::instrument::record_engine_call();
+        let styles = &self.model.get_model().workbook.styles;
+        let font = styles
+            .cell_xfs
+            .first()
+            .map(|xf| xf.font_id as usize)
+            .and_then(|id| styles.fonts.get(id));
+        match font {
+            Some(f) => (f.sz, f.name.clone()),
+            None => {
+                let d = Font::default();
+                (d.sz, d.name)
+            }
+        }
+    }
+
+    /// Sets the font **family** and/or **size** over a range (`SetFont`, `architecture.md §3.3`).
+    /// IronCalc 0.7.1 has no `font.name`/absolute-size `update_range_style` path, so this uses
+    /// `on_paste_styles`: it points the engine's view selection at `range`, builds a row-major
+    /// grid of each cell's **resolved** style (`get_style_for_cell`) with the font overridden, and
+    /// pastes it back — one undoable diff-list. `family = Some("")` is "System Default" (reset to
+    /// `default_name`); `Some(name)` sets it; `None` leaves the family. `size_pt = Some(pt)` sets
+    /// `font.sz` (rounded to whole points — IronCalc stores an `i32`); `None` leaves the size.
+    /// Because it materialises the resolved style per cell, a whole column/row is clamped to the
+    /// used range by the caller first (no font bands — documented deviation).
+    pub(crate) fn set_font(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+        family: Option<&str>,
+        size_pt: Option<f64>,
+        default_name: &str,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        // on_paste_styles pastes into the engine's view selection; the top-left anchor is on
+        // every range's edge, so this passes IronCalc's anchor-on-edge check.
+        self.set_view_selection(sheet_idx, range)?;
+        let model = self.model.get_model();
+        let mut styles: Vec<Vec<Style>> = Vec::with_capacity(range.rows().count());
+        for row in range.rows() {
+            let mut row_styles: Vec<Style> = Vec::with_capacity(range.cols().count());
+            for col in range.cols() {
+                let (r, c) = to_engine_coords(CellRef::new(row, col));
+                let mut style = model.get_style_for_cell(sheet_idx, r, c)?;
+                if let Some(pt) = size_pt {
+                    style.font.sz = pt.round() as i32;
+                }
+                if let Some(name) = family {
+                    style.font.name = if name.is_empty() {
+                        default_name.to_string()
+                    } else {
+                        name.to_string()
+                    };
+                }
+                row_styles.push(style);
+            }
+            styles.push(row_styles);
+        }
+        self.model.on_paste_styles(&styles)
+    }
+
+    /// Sets a contiguous run of rows `[row_start, row_end]` (0-based) to `px` **IronCalc pixels**
+    /// (one undoable diff-list) — the row auto-grow primitive behind `SetFont` (`architecture.md
+    /// §3.3`). Never called with unbounded ranges (the worker coalesces only rows that need
+    /// growing, within a clamped selection).
+    pub(crate) fn set_row_heights_run(
+        &mut self,
+        sheet_idx: u32,
+        row_start: u32,
+        row_end: u32,
+        px: f64,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .set_rows_height(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, px)
+    }
+
+    /// Clamps a **full-row / full-column / select-all** `range` to the sheet's used rectangle
+    /// (`worksheet.dimension()`), returning `None` when the intersection is empty (nothing to do).
+    /// A **bounded** selection is returned unchanged — it applies exactly as selected, even over
+    /// empty cells (`architecture.md §5.2`). Centralised here so `SetFont` (and Phase-7 clears)
+    /// never iterate a 1M-cell band.
+    pub(crate) fn clamp_to_used(
+        &self,
+        sheet_idx: u32,
+        range: CellRange,
+    ) -> Result<Option<CellRange>, String> {
+        use freecell_core::limits;
+        let spans_all_rows = range.start.row == 0 && range.end.row == limits::MAX_ROWS - 1;
+        let spans_all_cols = range.start.col == 0 && range.end.col == limits::MAX_COLS - 1;
+        if !(spans_all_rows || spans_all_cols) {
+            return Ok(Some(range));
+        }
+        let dim = self.worksheet(sheet_idx)?.dimension();
+        // dimension() is 1-based inclusive; convert to 0-based and intersect with the request.
+        let used_r0 = (dim.min_row.max(1) - 1) as u32;
+        let used_r1 = (dim.max_row.max(1) - 1) as u32;
+        let used_c0 = (dim.min_column.max(1) - 1) as u32;
+        let used_c1 = (dim.max_column.max(1) - 1) as u32;
+        let r0 = range.start.row.max(used_r0);
+        let r1 = range.end.row.min(used_r1);
+        let c0 = range.start.col.max(used_c0);
+        let c1 = range.end.col.min(used_c1);
+        if r1 < r0 || c1 < c0 {
+            return Ok(None); // the selected band lies entirely outside the used range
+        }
+        Ok(Some(CellRange::new(
+            CellRef::new(r0, c0),
+            CellRef::new(r1, c1),
+        )))
+    }
+
     /// Appends a new sheet (`AddSheet`); IronCalc names + numbers it. Undoable.
     pub(crate) fn add_sheet(&mut self) -> Result<(), String> {
         crate::instrument::record_engine_call();
@@ -533,6 +869,148 @@ impl WorkbookDocument {
         self.model.redo()
     }
 
+    // ---- Range clipboard (`components/clipboard.md`, `architecture.md §6`) -----------------
+    //
+    // These are the ONLY feature routing through IronCalc's hidden view-selection state:
+    // `copy_to_clipboard` / `paste_from_clipboard` / `paste_csv_string` all read the engine's
+    // *selected view* (not their arguments) for the sheet + anchor, so each op first sets the
+    // selection, then calls the engine API. The selection is view-only (not undoable, no eval).
+
+    /// Point the engine's view selection at `range` (top-left as the anchor — always on the
+    /// range edge, so IronCalc's edge check passes even for full row/column/select-all ranges).
+    fn set_view_selection(&mut self, sheet_idx: u32, range: CellRange) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model.set_selected_sheet(sheet_idx)?;
+        let (r0, c0) = to_engine_coords(range.start);
+        let (r1, c1) = to_engine_coords(range.end);
+        // The selected cell must be set before the range (IronCalc validates the range against
+        // it); the top-left corner is on every range's edge.
+        self.model.set_selected_cell(r0, c0)?;
+        self.model.set_selected_range(r0, c0, r1, c1)?;
+        Ok(())
+    }
+
+    /// Copy `range` on `sheet_idx` to the engine clipboard (`copy_to_clipboard`, `common.rs:1765`).
+    /// The engine clamps the copied rectangle to `worksheet.dimension()`, so a full-column /
+    /// select-all copy is cheap; the returned `range` is that clamped extent. The `Clipboard`
+    /// struct isn't nameable outside ironcalc_base (private fields, not re-exported), so its
+    /// `csv` / `data` / `range` are read out of its `Serialize` form.
+    pub(crate) fn copy_range(
+        &mut self,
+        sheet_idx: u32,
+        range: CellRange,
+    ) -> Result<CopiedRange, String> {
+        self.set_view_selection(sheet_idx, range)?;
+        crate::instrument::record_engine_call();
+        let clipboard = self.model.copy_to_clipboard()?;
+        let value = serde_json::to_value(&clipboard)
+            .map_err(|e| format!("failed to serialize clipboard: {e}"))?;
+        let tsv = value
+            .get("csv")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let data = value
+            .get("data")
+            .cloned()
+            .ok_or_else(|| "clipboard payload missing `data`".to_string())?;
+        let range = value
+            .get("range")
+            .cloned()
+            .ok_or_else(|| "clipboard payload missing `range`".to_string())
+            .and_then(|v| {
+                serde_json::from_value::<(i32, i32, i32, i32)>(v)
+                    .map_err(|e| format!("bad clipboard range: {e}"))
+            })?;
+        Ok(CopiedRange { tsv, data, range })
+    }
+
+    /// Paste a previously-copied engine payload at `anchor` on `dest_idx` (`paste_from_clipboard`,
+    /// `common.rs:1811`): Excel relative-reference adjustment on copy, move semantics + source
+    /// clear on cut, one undoable diff list, then the pasted area is re-selected. `source_idx` /
+    /// `source_range` are the copy-time sheet index + effective rectangle (the source cleared on
+    /// cut). The caller pauses evaluation around this (the batch's single recompute follows).
+    pub(crate) fn paste_clipboard(
+        &mut self,
+        dest_idx: u32,
+        source_idx: u32,
+        source_range: (i32, i32, i32, i32),
+        data_json: &serde_json::Value,
+        cut: bool,
+        target: CellRange,
+    ) -> Result<(), String> {
+        // The paste anchors at the target's top-left (the destination selection's anchor).
+        let anchor = target.start;
+        // A single-cell (or exact-divisor) COPY into a larger selection tiles/fills the source
+        // across the whole `target` as ONE diff-list — the engine only ever pastes the source
+        // rectangle once at the anchor, so we synthesize a target-sized payload here (BUG 4). Values
+        // and styles fill exactly; because the whole synthesized block is pasted in one call it
+        // takes a single uniform `anchor − source` reference shift, so a **formula** is filled with
+        // the top-left cell's shift on every cell, NOT Excel's per-cell relative fill (accepted
+        // limitation U2 in `GAPS.md`; per-cell fill would need N×M pastes = N×M undo entries). A cut
+        // is a move with a single destination, so it never fills.
+        let fill = (!cut)
+            .then(|| fill_target_dims(source_range, target))
+            .flatten();
+        // Set the destination selection to the single anchor cell (the paste anchors from it).
+        self.set_view_selection(dest_idx, CellRange::single(anchor))?;
+        crate::instrument::record_engine_call();
+        match fill {
+            Some((tw, th)) => {
+                let tiled_json = tile_clipboard_json(data_json, source_range, tw, th)?;
+                let data = ClipboardData::deserialize(&tiled_json)
+                    .map_err(|e| format!("failed to deserialize tiled clipboard data: {e}"))?;
+                let (sr0, sc0, _, _) = source_range;
+                let tiled_range = (sr0, sc0, sr0 + th as i32 - 1, sc0 + tw as i32 - 1);
+                self.model
+                    .paste_from_clipboard(source_idx, tiled_range, &data, cut)
+            }
+            None => {
+                // Deserialize directly from the borrowed `Value` (no clone — `&Value` is a
+                // Deserializer).
+                let data = ClipboardData::deserialize(data_json)
+                    .map_err(|e| format!("failed to deserialize clipboard data: {e}"))?;
+                self.model
+                    .paste_from_clipboard(source_idx, source_range, &data, cut)
+            }
+        }
+    }
+
+    /// Paste a tab-delimited TSV at `anchor` on `dest_idx` (`paste_csv_string`, `common.rs:1926`):
+    /// each field is applied as user input (numbers / booleans / `=formulas` / text), one
+    /// undoable diff list, then the pasted area is re-selected. Only `area.{sheet,row,column}`
+    /// are used by the engine (width/height are ignored — the reader derives them from the text).
+    pub(crate) fn paste_tsv(
+        &mut self,
+        dest_idx: u32,
+        anchor: CellRef,
+        text: &str,
+    ) -> Result<(), String> {
+        // Set the destination selection so the engine's end-of-paste re-select has a valid anchor.
+        self.set_view_selection(dest_idx, CellRange::single(anchor))?;
+        let (row, column) = to_engine_coords(anchor);
+        let area = Area {
+            sheet: dest_idx,
+            row,
+            column,
+            width: 1,
+            height: 1,
+        };
+        crate::instrument::record_engine_call();
+        self.model.paste_csv_string(&area, text)
+    }
+
+    /// The engine's current view selection as a 0-based [`CellRange`] — read back right after a
+    /// paste (both paste APIs re-select the pasted rectangle) to mirror it into FreeCell's
+    /// `SelectionModel`.
+    pub(crate) fn selected_range_0based(&self) -> CellRange {
+        crate::instrument::record_engine_call();
+        let [r0, c0, r1, c1] = self.model.get_selected_view().range;
+        // Engine coords are 1-based inclusive; clamp the `- 1` at 0 defensively.
+        let cell = |r: i32, c: i32| CellRef::new(r.max(1) as u32 - 1, c.max(1) as u32 - 1);
+        CellRange::new(cell(r0, c0), cell(r1, c1))
+    }
+
     /// Mutable reference to the owned model — the write seam used by the [`fixtures`] module
     /// to populate cells. In-crate only; the model is an `ironcalc` type and never leaves this
     /// crate. (The Phase-4 worker drives edits through the typed methods above, not this.)
@@ -558,10 +1036,112 @@ impl WorkbookDocument {
     }
 }
 
+/// The fully-resolved text colour for a cell (`architecture.md §1.2`, precedence: explicit
+/// non-black font colour → number-format `[Red]`-style colour → `None`). Shares the cache's
+/// [`parse_color`](crate::cache::parse_color) + black-filter so it agrees with the resident
+/// style cache the grid also reads.
+fn resolve_text_color(model: &Model, sheet: u32, row: i32, col: i32, style: &Style) -> Option<Rgb> {
+    // 1. An explicit non-black font colour always wins (a pure-black colour is
+    //    indistinguishable from IronCalc's default, so it falls through — matching the cache).
+    if let Some(rgb) = style
+        .font
+        .color
+        .as_deref()
+        .and_then(crate::cache::parse_color)
+        .filter(|c| *c != Rgb::new(0, 0, 0))
+    {
+        return Some(rgb);
+    }
+    // 2. A number-format-produced colour (e.g. `[Red]` negatives). Only formats carrying a
+    //    `[...]` section can produce one, and only numeric values are formatted — gate on
+    //    both to avoid formatting text/blank cells.
+    if !style.num_fmt.contains('[') {
+        return None;
+    }
+    let value = match model.get_cell_value_by_index(sheet, row, col) {
+        Ok(CellValue::Number(v)) => v,
+        _ => return None,
+    };
+    let locale = get_locale(&model.workbook.settings.locale).ok()?;
+    format_color_rgb(format_number(value, &style.num_fmt, locale).color?)
+}
+
 /// Converts a 0-based [`CellRef`] to IronCalc's 1-based `(row, column)` `i32` coordinates.
 /// The Excel-max bounds (`freecell_core::limits`) fit comfortably in `i32`.
 fn to_engine_coords(cell: CellRef) -> (i32, i32) {
     (cell.row as i32 + 1, cell.col as i32 + 1)
+}
+
+/// The tiled destination dims `(width, height)` in cells when a copied `source_range` fills a
+/// larger `target` selection by whole-multiple replication (single-cell / exact-divisor block
+/// fill): `Some((tw, th))` iff `target` is an exact multiple of the source in BOTH axes AND
+/// strictly larger; else `None` (paste the source once at the anchor). Shared by the worker (fill
+/// cap) and [`WorkbookDocument::paste_clipboard`] (the synthesis) so the two can never disagree.
+/// `source_range` is the engine's (1-based, inclusive) copied rectangle; only its dims are read,
+/// so the coordinate base is immaterial. (The fill copies values + styles exactly but shifts a
+/// formula's refs uniformly, not per-cell — accepted limitation U2 in `GAPS.md`.)
+pub(crate) fn fill_target_dims(
+    source_range: (i32, i32, i32, i32),
+    target: CellRange,
+) -> Option<(u32, u32)> {
+    let (sr0, sc0, sr1, sc1) = source_range;
+    if sr1 < sr0 || sc1 < sc0 {
+        return None; // degenerate source
+    }
+    let sw = (sc1 - sc0 + 1) as u32;
+    let sh = (sr1 - sr0 + 1) as u32;
+    let tw = target.width();
+    let th = target.height();
+    let exact = sw != 0 && sh != 0 && tw.is_multiple_of(sw) && th.is_multiple_of(sh);
+    (exact && (tw > sw || th > sh)).then_some((tw, th))
+}
+
+/// Replicates a clipboard payload's cells to fill a `tw`×`th` block by tiling the `source_range`
+/// rectangle across it (BUG 4 fill). `data_json` is the serialized [`ClipboardData`] —
+/// `{ "<row>": { "<col>": { text, style } } }` with engine 1-based integer-as-string keys — and
+/// the result has the same shape, every tile's cells cloned into place, ready to
+/// `ClipboardData::deserialize`. `tw`/`th` are assumed whole multiples of the source dims (the
+/// caller gates on [`fill_target_dims`]). Errors only on a malformed payload (non-object shape /
+/// non-integer keys) — a defensive guard, since the payload always comes from the engine's own
+/// `copy_to_clipboard`.
+fn tile_clipboard_json(
+    data_json: &serde_json::Value,
+    source_range: (i32, i32, i32, i32),
+    tw: u32,
+    th: u32,
+) -> Result<serde_json::Value, String> {
+    let (sr0, sc0, sr1, sc1) = source_range;
+    let sw = sc1 - sc0 + 1;
+    let sh = sr1 - sr0 + 1;
+    let src = data_json
+        .as_object()
+        .ok_or_else(|| "clipboard data is not an object".to_string())?;
+    let reps_r = th as i32 / sh;
+    let reps_c = tw as i32 / sw;
+    let mut out = serde_json::Map::new();
+    for a in 0..reps_r {
+        for b in 0..reps_c {
+            for (row_key, row_val) in src {
+                let src_row: i32 = row_key
+                    .parse()
+                    .map_err(|_| format!("bad clipboard row key: {row_key}"))?;
+                let row_obj = row_val
+                    .as_object()
+                    .ok_or_else(|| "clipboard row is not an object".to_string())?;
+                let out_row = out
+                    .entry((src_row + a * sh).to_string())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                let out_row_obj = out_row.as_object_mut().expect("just inserted an object");
+                for (col_key, cell_val) in row_obj {
+                    let src_col: i32 = col_key
+                        .parse()
+                        .map_err(|_| format!("bad clipboard col key: {col_key}"))?;
+                    out_row_obj.insert((src_col + b * sw).to_string(), cell_val.clone());
+                }
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(out))
 }
 
 /// Converts a 0-based [`CellRange`] on `sheet_idx` to IronCalc's 1-based inclusive
@@ -683,6 +1263,64 @@ mod tests {
     }
 
     #[test]
+    fn published_style_maps_cell_kinds() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "42").unwrap(); // number
+        doc.set_cell_input(0, CellRef::new(1, 0), "hello").unwrap(); // text
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap(); // bool
+        doc.set_cell_input(0, CellRef::new(3, 0), "=1/0").unwrap(); // error
+        doc.set_cell_input(0, CellRef::new(4, 0), "2021-01-01")
+            .unwrap(); // date (inferred fmt)
+        doc.evaluate();
+
+        let kind = |r| doc.published_style(0, CellRef::new(r, 0)).unwrap().0;
+        assert_eq!(kind(0), CellKind::Number);
+        assert_eq!(kind(1), CellKind::Text);
+        assert_eq!(kind(2), CellKind::Bool);
+        assert_eq!(kind(3), CellKind::Error);
+        assert_eq!(kind(4), CellKind::Date, "a date-formatted number is Date");
+    }
+
+    #[test]
+    fn published_style_resolves_format_and_explicit_colors() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        let range = CellRange::single(a1);
+        // A currency format whose negative section is `[Red]`.
+        doc.set_cell_input(0, a1, "-5").unwrap();
+        doc.user_model_mut()
+            .update_range_style(&area_of(0, range), "num_fmt", "$#,##0.00;[Red]$#,##0.00")
+            .unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, a1).unwrap().1,
+            Some(Rgb::new(0xFF, 0, 0)),
+            "a negative value under a [Red] format publishes red text"
+        );
+
+        // A positive value uses the (colourless) positive section → no override.
+        doc.set_cell_input(0, a1, "5").unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, a1).unwrap().1,
+            None,
+            "the positive section has no colour"
+        );
+
+        // An explicit non-black font colour wins over the format colour.
+        doc.set_cell_input(0, a1, "-5").unwrap();
+        doc.user_model_mut()
+            .update_range_style(&area_of(0, range), "font.color", "#00AA00")
+            .unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, a1).unwrap().1,
+            Some(Rgb::new(0x00, 0xAA, 0x00)),
+            "explicit font colour beats the number-format colour"
+        );
+    }
+
+    #[test]
     fn sheet_properties_report_has_content() {
         let mut doc = WorkbookDocument::new_empty().unwrap();
         // A fresh workbook's only sheet is empty → has_content = false (delete-confirm gate off).
@@ -745,5 +1383,347 @@ mod tests {
         assert_eq!(fill.fg_color.as_deref(), Some("#FF0000"));
         let font = reopened.cell_style(0, CellRef::new(1, 1)).unwrap().font;
         assert_eq!(font.color.as_deref(), Some("#0000FF"));
+    }
+
+    #[test]
+    fn default_font_reads_workbook_default() {
+        // A fresh workbook's default is IronCalc's `Font::default()` — 13pt Calibri (NOT the
+        // 11pt the specs state; the cache detects "default" relative to this value).
+        let doc = WorkbookDocument::new_empty().unwrap();
+        let (sz, name) = doc.default_font();
+        assert_eq!(sz, 13);
+        assert_eq!(name, "Calibri");
+    }
+
+    #[test]
+    fn set_borders_applies_all_and_none_clears() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        doc.set_cell_input(0, a1, "x").unwrap();
+
+        // "All" sets all four thin edges.
+        doc.set_borders(0, CellRange::single(a1), "All").unwrap();
+        let b = doc.cell_style(0, a1).unwrap().border;
+        assert!(
+            b.top.is_some() && b.right.is_some() && b.bottom.is_some() && b.left.is_some(),
+            "All applies every edge"
+        );
+        assert_eq!(
+            b.top.as_ref().unwrap().style,
+            ironcalc_base::types::BorderStyle::Thin
+        );
+
+        // "None" clears them again.
+        doc.set_borders(0, CellRange::single(a1), "None").unwrap();
+        let b = doc.cell_style(0, a1).unwrap().border;
+        assert!(
+            b.top.is_none() && b.right.is_none() && b.bottom.is_none() && b.left.is_none(),
+            "None clears every edge"
+        );
+
+        // A bogus tag is a clean error (never panics).
+        assert!(doc.set_borders(0, CellRange::single(a1), "Bogus").is_err());
+    }
+
+    #[test]
+    fn set_font_applies_family_and_size_and_system_default_clears() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        let b2 = CellRef::new(1, 1);
+        let range = CellRange::new(a1, b2);
+        doc.set_cell_input(0, a1, "x").unwrap();
+        doc.set_cell_input(0, b2, "y").unwrap();
+        let (_, default_name) = doc.default_font();
+
+        // Set Arial 20pt over A1:B2 (one on_paste_styles undo entry).
+        doc.set_font(0, range, Some("Arial"), Some(20.0), &default_name)
+            .unwrap();
+        for cell in [a1, b2] {
+            let style = doc.cell_style(0, cell).unwrap();
+            assert_eq!(style.font.name, "Arial");
+            assert_eq!(style.font.sz, 20);
+        }
+
+        // A size-only change leaves the family.
+        doc.set_font(0, CellRange::single(a1), None, Some(9.0), &default_name)
+            .unwrap();
+        let style = doc.cell_style(0, a1).unwrap();
+        assert_eq!(
+            style.font.name, "Arial",
+            "family untouched by a size-only set"
+        );
+        assert_eq!(style.font.sz, 9);
+
+        // System Default (family = Some("")) resets the family to the workbook default.
+        doc.set_font(0, CellRange::single(a1), Some(""), None, &default_name)
+            .unwrap();
+        assert_eq!(doc.cell_style(0, a1).unwrap().font.name, default_name);
+
+        // One undo reverts the last font op (on_paste_styles is a single diff-list).
+        doc.undo().unwrap();
+        assert_eq!(doc.cell_style(0, a1).unwrap().font.name, "Arial");
+    }
+
+    #[test]
+    fn clamp_to_used_clamps_bands_not_bounded() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "a").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 1), "b").unwrap(); // used range A1:B3
+                                                                 // A full column clamps to the used rows.
+        let full_col = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+        );
+        assert_eq!(
+            doc.clamp_to_used(0, full_col).unwrap(),
+            Some(CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)))
+        );
+        // A bounded selection is returned unchanged (applies even over empty cells).
+        let bounded = CellRange::new(CellRef::new(5, 5), CellRef::new(7, 7));
+        assert_eq!(doc.clamp_to_used(0, bounded).unwrap(), Some(bounded));
+        // A full column beyond the used columns → empty intersection.
+        let far_col = CellRange::new(
+            CellRef::new(0, 9),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 9),
+        );
+        assert_eq!(doc.clamp_to_used(0, far_col).unwrap(), None);
+    }
+
+    // ---- Range clipboard (`components/clipboard.md`) --------------------------------------
+
+    fn cell(row: u32, col: u32) -> CellRef {
+        CellRef::new(row, col)
+    }
+
+    /// Copy `range`, then paste its payload at `anchor` on `dest_idx` (copy semantics unless
+    /// `cut`). Returns the pasted 0-based range the engine re-selected.
+    fn copy_then_paste(
+        doc: &mut WorkbookDocument,
+        src_idx: u32,
+        range: CellRange,
+        dest_idx: u32,
+        anchor: CellRef,
+        cut: bool,
+    ) -> CellRange {
+        let copied = doc.copy_range(src_idx, range).unwrap();
+        // Paste once at the anchor (no fill): the target is the single anchor cell.
+        doc.paste_clipboard(
+            dest_idx,
+            src_idx,
+            copied.range,
+            &copied.data,
+            cut,
+            CellRange::single(anchor),
+        )
+        .unwrap();
+        doc.evaluate();
+        doc.selected_range_0based()
+    }
+
+    #[test]
+    fn copy_paste_roundtrips_values_and_styles() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "42").unwrap();
+        doc.set_font_flag(0, CellRange::single(a1), FontFlag::Bold, true)
+            .unwrap();
+        doc.set_fill(0, CellRange::single(a1), Some(Rgb::new(0xFF, 0, 0)))
+            .unwrap();
+        doc.evaluate();
+
+        let pasted = copy_then_paste(&mut doc, 0, CellRange::single(a1), 0, cell(0, 2), false);
+        assert_eq!(pasted, CellRange::single(cell(0, 2)));
+        // Value + both styles arrive at C1.
+        assert_eq!(doc.formatted_value(0, cell(0, 2)).unwrap(), "42");
+        let style = doc.cell_style(0, cell(0, 2)).unwrap();
+        assert!(style.font.b, "bold copied");
+        assert_eq!(
+            style.fill.fg_color.as_deref(),
+            Some("#FF0000"),
+            "fill copied"
+        );
+    }
+
+    #[test]
+    fn single_cell_copy_fills_a_larger_target_with_value_and_style() {
+        // BUG 4: a 1×1 copy pasted into a 3×3 target fills all nine cells (value + style).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "7").unwrap();
+        doc.set_font_flag(0, CellRange::single(a1), FontFlag::Bold, true)
+            .unwrap();
+        doc.set_fill(0, CellRange::single(a1), Some(Rgb::new(0xFF, 0, 0)))
+            .unwrap();
+        doc.evaluate();
+
+        let copied = doc.copy_range(0, CellRange::single(a1)).unwrap();
+        // Target C1:E3 (rows 0..=2, cols 2..=4) — a 3×3 block, anchor at C1.
+        let target = CellRange::new(cell(0, 2), cell(2, 4));
+        doc.paste_clipboard(0, 0, copied.range, &copied.data, false, target)
+            .unwrap();
+        doc.evaluate();
+
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(
+                    doc.formatted_value(0, cell(r, c)).unwrap(),
+                    "7",
+                    "cell ({r},{c}) should be filled with the copied value"
+                );
+                let style = doc.cell_style(0, cell(r, c)).unwrap();
+                assert!(style.font.b, "cell ({r},{c}) should be bold");
+                assert_eq!(
+                    style.fill.fg_color.as_deref(),
+                    Some("#FF0000"),
+                    "cell ({r},{c}) should carry the copied fill"
+                );
+            }
+        }
+        // The engine re-selected the whole filled block.
+        assert_eq!(doc.selected_range_0based(), target);
+    }
+
+    #[test]
+    fn copy_paste_adjusts_relative_but_not_absolute_refs() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "10").unwrap(); // A1
+        doc.set_cell_input(0, cell(1, 0), "=A1").unwrap(); // A2 (relative)
+        doc.set_cell_input(0, cell(1, 1), "=$A$1").unwrap(); // B2 (absolute)
+        doc.evaluate();
+
+        // Copy A2 one row down → A3 should reference A2 (relative shift).
+        copy_then_paste(
+            &mut doc,
+            0,
+            CellRange::single(cell(1, 0)),
+            0,
+            cell(2, 0),
+            false,
+        );
+        assert_eq!(doc.cell_content(0, cell(2, 0)).unwrap(), "=A2");
+        // Copy B2 one row down → B3 keeps the absolute reference.
+        copy_then_paste(
+            &mut doc,
+            0,
+            CellRange::single(cell(1, 1)),
+            0,
+            cell(2, 1),
+            false,
+        );
+        assert_eq!(doc.cell_content(0, cell(2, 1)).unwrap(), "=$A$1");
+    }
+
+    #[test]
+    fn cut_paste_moves_value_and_clears_source() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "5").unwrap(); // A1
+        doc.set_cell_input(0, cell(1, 0), "=A1+1").unwrap(); // A2, a formula that moves with A1
+        doc.evaluate();
+
+        // Cut A1:A2 to C1 (so the internal reference A2→A1 stays within the moved block).
+        copy_then_paste(
+            &mut doc,
+            0,
+            CellRange::new(cell(0, 0), cell(1, 0)),
+            0,
+            cell(0, 2),
+            true,
+        );
+        // The block moved: C1 = 5, C2 = "=C1+1" (the intra-block reference followed the move).
+        assert_eq!(doc.formatted_value(0, cell(0, 2)).unwrap(), "5");
+        assert_eq!(doc.cell_content(0, cell(1, 2)).unwrap(), "=C1+1");
+        assert_eq!(doc.formatted_value(0, cell(1, 2)).unwrap(), "6");
+        // The source cells are cleared.
+        assert_eq!(
+            doc.formatted_value(0, cell(0, 0)).unwrap(),
+            "",
+            "A1 cleared"
+        );
+        assert_eq!(
+            doc.formatted_value(0, cell(1, 0)).unwrap(),
+            "",
+            "A2 cleared"
+        );
+    }
+
+    #[test]
+    fn full_column_copy_clamps_to_used_range() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "1").unwrap();
+        doc.set_cell_input(0, cell(1, 0), "2").unwrap();
+        doc.evaluate();
+        // Copy the entire column A (Excel-max rows) — the engine clamps to `dimension()`.
+        let full_col = CellRange::new(cell(0, 0), cell(freecell_core::limits::MAX_ROWS - 1, 0));
+        let copied = doc.copy_range(0, full_col).unwrap();
+        // The effective source range is 1-based rows 1..=2, NOT the whole column.
+        assert_eq!(copied.range, (1, 1, 2, 1), "copy clamped to the used range");
+    }
+
+    #[test]
+    fn cross_sheet_internal_paste() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "9").unwrap();
+        doc.add_sheet().unwrap(); // sheet index 1
+        doc.evaluate();
+
+        let copied = doc.copy_range(0, CellRange::single(cell(0, 0))).unwrap();
+        doc.paste_clipboard(
+            1,
+            0,
+            copied.range,
+            &copied.data,
+            false,
+            CellRange::single(cell(3, 3)),
+        )
+        .unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(1, cell(3, 3)).unwrap(), "9");
+        // The source sheet is untouched (copy, not cut).
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "9");
+    }
+
+    #[test]
+    fn paste_tsv_writes_dims_and_types() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.paste_tsv(0, cell(0, 0), "1\t2\n=A1\ttrue\n").unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "1");
+        assert_eq!(doc.formatted_value(0, cell(0, 1)).unwrap(), "2");
+        // A2 got the literal "=A1" (paste is user-input; no ref adjustment) → evaluates to A1.
+        assert_eq!(doc.cell_content(0, cell(1, 0)).unwrap(), "=A1");
+        assert_eq!(doc.formatted_value(0, cell(1, 0)).unwrap(), "1");
+        assert_eq!(doc.formatted_value(0, cell(1, 1)).unwrap(), "TRUE");
+    }
+
+    #[test]
+    fn paste_tsv_tolerates_crlf_and_drops_ragged_rows() {
+        // CRLF-terminated, equal-width rows all land (each `\r\n` is one record terminator).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.paste_tsv(0, cell(0, 0), "1\t2\r\n3\t4\r\n").unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "1");
+        assert_eq!(doc.formatted_value(0, cell(0, 1)).unwrap(), "2");
+        assert_eq!(doc.formatted_value(0, cell(1, 0)).unwrap(), "3");
+        assert_eq!(doc.formatted_value(0, cell(1, 1)).unwrap(), "4");
+
+        // A ragged (narrower) middle row is DROPPED and later rows COMPACT up: with
+        // `flexible = false` the csv reader errors on the odd-width record and `paste_csv_string`
+        // skips it *without advancing the row*, so the wide row after it lands one row early.
+        // (DECISION #5 — accepted engine behaviour; NOT the "pad ⇒ skipped cells" of empty
+        // tokens within an equal-width row.)
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.paste_tsv(0, cell(0, 0), "a\tb\nc\nd\te\n").unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "a");
+        assert_eq!(doc.formatted_value(0, cell(0, 1)).unwrap(), "b");
+        // The ragged "c" row vanished — its cell is empty, not written…
+        assert_eq!(
+            doc.formatted_value(0, cell(1, 0)).unwrap(),
+            "d",
+            "the wide row compacts up into the dropped ragged row's slot"
+        );
+        assert_eq!(doc.formatted_value(0, cell(1, 1)).unwrap(), "e");
+        // …and nothing landed at what would have been row 3 (no `c` anywhere).
+        assert_eq!(doc.formatted_value(0, cell(2, 0)).unwrap(), "");
     }
 }

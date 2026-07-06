@@ -7,7 +7,8 @@
 //! box; `anchor` is the fixed corner a range extends from. Collapsing motions set both to
 //! the new cell; extending motions move only `active`.
 
-use crate::refs::{CellRange, CellRef};
+use crate::limits;
+use crate::refs::{column_label, CellRange, CellRef};
 
 /// A sheet's dimensions, used to clamp motions to valid cells. Motions never move past
 /// `[0, rows) × [0, cols)`.
@@ -95,6 +96,51 @@ impl Default for SelectionModel {
     /// A1 selected — the state a fresh sheet opens on (`components/grid.md`).
     fn default() -> Self {
         Self::single(CellRef::new(0, 0))
+    }
+}
+
+/// Whether `range` spans every row of the sheet (a full-column / whole-sheet selection).
+fn spans_all_rows(range: &CellRange) -> bool {
+    range.start.row == 0 && range.end.row == limits::MAX_ROWS - 1
+}
+
+/// Whether `range` spans every column of the sheet (a full-row / whole-sheet selection).
+fn spans_all_cols(range: &CellRange) -> bool {
+    range.start.col == 0 && range.end.col == limits::MAX_COLS - 1
+}
+
+/// Whether `sel` is a full-column header selection (spans every row of one or more columns).
+/// A whole-sheet selection also qualifies (it is rendered in the column form, `A:XFD`).
+pub fn is_full_column_selection(sel: &SelectionModel) -> bool {
+    spans_all_rows(&sel.range())
+}
+
+/// Whether `sel` is a full-row header selection (spans every column of one or more rows, and is
+/// **not** also a full-column/whole-sheet selection, which takes the column form).
+pub fn is_full_row_selection(sel: &SelectionModel) -> bool {
+    let range = sel.range();
+    spans_all_cols(&range) && !spans_all_rows(&range)
+}
+
+/// The reference-box text for a selection (`components/grid_structure.md §Public interface`):
+/// - a full-column selection → `C:C` / `C:E` (or the whole sheet → `A:XFD`),
+/// - a full-row selection → `3:3` / `3:7`,
+/// - otherwise ordinary A1 (`A1` / `B2:D9`).
+///
+/// Full extents render as their band form so a header selection reads like Excel's name box; a
+/// bounded selection falls through to [`CellRange::to_a1`].
+pub fn format_selection_ref(sel: &SelectionModel) -> String {
+    let range = sel.range();
+    if spans_all_rows(&range) {
+        // Column form (a full column, several full columns, or the whole sheet → A:XFD).
+        let c0 = column_label(range.start.col);
+        let c1 = column_label(range.end.col);
+        format!("{c0}:{c1}")
+    } else if spans_all_cols(&range) {
+        // Row form (full rows) — 1-based labels.
+        format!("{}:{}", range.start.row + 1, range.end.row + 1)
+    } else {
+        range.to_a1()
     }
 }
 
@@ -367,6 +413,45 @@ mod tests {
             active: cell(8, 3),
         };
         assert_eq!(range.to_a1(), "B2:D9");
+    }
+
+    #[test]
+    fn format_selection_ref_all_shapes() {
+        let full_col = |c0, c1| SelectionModel {
+            anchor: cell(0, c0),
+            active: cell(limits::MAX_ROWS - 1, c1),
+        };
+        let full_row = |r0, r1| SelectionModel {
+            anchor: cell(r0, 0),
+            active: cell(r1, limits::MAX_COLS - 1),
+        };
+        // Single cell + rectangle fall through to A1.
+        assert_eq!(
+            format_selection_ref(&SelectionModel::single(cell(0, 0))),
+            "A1"
+        );
+        assert_eq!(
+            format_selection_ref(&SelectionModel {
+                anchor: cell(1, 1),
+                active: cell(8, 3),
+            }),
+            "B2:D9"
+        );
+        // Full columns.
+        assert_eq!(format_selection_ref(&full_col(2, 2)), "C:C");
+        assert_eq!(format_selection_ref(&full_col(2, 4)), "C:E");
+        // Full rows (1-based labels).
+        assert_eq!(format_selection_ref(&full_row(2, 2)), "3:3");
+        assert_eq!(format_selection_ref(&full_row(2, 6)), "3:7");
+        // Select-all → the column form A:XFD (full rows takes precedence).
+        let all = SelectionModel {
+            anchor: cell(0, 0),
+            active: cell(limits::MAX_ROWS - 1, limits::MAX_COLS - 1),
+        };
+        assert_eq!(format_selection_ref(&all), "A:XFD");
+        assert!(is_full_column_selection(&all));
+        assert!(!is_full_row_selection(&all));
+        assert!(is_full_row_selection(&full_row(2, 2)));
     }
 
     #[test]

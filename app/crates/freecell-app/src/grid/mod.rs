@@ -21,7 +21,8 @@ use std::ops::Range;
 
 use gpui::{App, Window};
 
-use freecell_core::{CellRange, SelectionModel};
+use freecell_core::selection::Direction;
+use freecell_core::{CellRange, CellRef, SelectionModel};
 
 pub use view::{GridDataSources, GridView};
 
@@ -74,11 +75,19 @@ pub const EDGE_AUTOSCROLL_HOTZONE_PX: f64 = 24.0;
 /// edge with no mouse-move events" case; a live `window.mouse_position()` drives the extend).
 pub const AUTOSCROLL_INTERVAL_MS: u64 = 16;
 
-/// The grid/cell font family the design *intends* (`ui_design.md §3.3`: bundled Inter).
-/// **Reserved, not applied in MVP** — the grid renders on GPUI's default UI font (bundling
-/// Inter was deferred; see `shell/fonts.rs` + `projects/bundled-inter-font.md`). Kept in one
-/// place so a future font pass names the family here and at the `grid/view.rs` text sites.
+/// The grid/cell font family (`ui_design.md §3.3`: bundled Inter). The app registers the
+/// bundled Inter faces and sets this as the UI font at startup (`shell/fonts.rs`), and the grid
+/// also names it explicitly at its `grid/view.rs` text sites (cell + header) for robustness.
+/// Named in one place so the registration and the text sites stay in sync.
 pub const GRID_FONT_FAMILY: &str = "Inter";
+
+/// Which axis a structural interaction targets — a resize / insert / delete of rows or columns
+/// (`components/grid_structure.md §5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOrCol {
+    Row,
+    Col,
+}
 
 /// Events the grid raises to its owner (`WorkbookWindow`, Phase 11). Phase 8 drives
 /// [`GridEvent::SelectionChanged`] (mouse + keyboard), [`GridEvent::ViewportChanged`]
@@ -97,6 +106,42 @@ pub enum GridEvent {
     ClearCells(CellRange),
     /// A click-away happened while the data row was editing (commit the pending edit).
     EditCommitRequested,
+    /// A printable, modifier-free keystroke on the focused grid with a single (or collapsed-to-
+    /// active) selection — start a **type-to-replace** edit whose content is `text`
+    /// (`functional_spec.md §1.1`). The window routes this to `ChromeView::begin_typed`.
+    TypeToEdit(String),
+    /// Double-click on a cell, or F2 with a single selection — open the **in-cell editor** over
+    /// `cell` (`functional_spec.md §1.3`). Routed to `ChromeView::begin_in_cell`.
+    OpenInCellEditor(CellRef),
+    /// Tab / Shift+Tab captured in the in-cell overlay — commit + move (`functional_spec.md §1.4`).
+    InCellCommitMove(Direction),
+    /// Escape captured in the in-cell overlay — cancel the pending edit.
+    InCellCancel,
+    /// Cmd/Ctrl+C (`cut: false`) / Cmd/Ctrl+X (`cut: true`) on the focused grid — copy/cut the
+    /// selection to the range clipboard (`functional_spec.md §2.1`). The window routes this to
+    /// the `ClipboardCoordinator`.
+    Copy { cut: bool },
+    /// Cmd/Ctrl+V on the focused grid — paste at the selection anchor (`functional_spec.md §2.2`).
+    Paste,
+    /// A row/column resize was committed on release (`functional_spec.md §5.1`). `start..=end` is
+    /// the inclusive 0-based track run — the dragged index alone, or the whole selected header run
+    /// when the dragged header sits inside a header selection; `px` is the released device-px size.
+    /// The window forwards it as `SetColumnWidths` / `SetRowHeights`.
+    ResizeCommitted {
+        axis: RowOrCol,
+        start: u32,
+        end: u32,
+        px: f32,
+    },
+    /// Insert `count` rows so new rows appear at 0-based `at` (`functional_spec.md §5.3`, chosen
+    /// from the header context menu). The window forwards it as `Command::InsertRows`.
+    InsertRows { at: u32, count: u32 },
+    /// Insert `count` columns at 0-based `at`.
+    InsertColumns { at: u32, count: u32 },
+    /// Delete `count` rows starting at 0-based `at`.
+    DeleteRows { at: u32, count: u32 },
+    /// Delete `count` columns starting at 0-based `at`.
+    DeleteColumns { at: u32, count: u32 },
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

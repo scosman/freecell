@@ -2057,6 +2057,9 @@ dependencies = [
 [[package]]
 name = "freecell-core"
 version = "0.1.0"
+dependencies = [
+ "csv",
+]
 
 [[package]]
 name = "freecell-engine"
@@ -2069,6 +2072,8 @@ dependencies = [
  "ironcalc_base",
  "parking_lot",
  "roxmltree 0.19.0",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

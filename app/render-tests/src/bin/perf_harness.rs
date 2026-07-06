@@ -29,8 +29,9 @@ use freecell_core::perf::{
 };
 use freecell_engine::engine_call_count;
 use render_tests::perf::{
-    build_fixture, environment_json, negative_control_edit, CI_CELL_LOAD_P99_NS, CI_FRAME_MAX_NS,
-    CI_FRAME_P99_NS, FIXTURE_VALUE_ROWS,
+    build_bordered_fixture, build_fixture, environment_json, negative_control_edit,
+    BORDERED_VIEWPORT_MIN_CELLS, BORDER_FIXTURE_COLS, BORDER_FIXTURE_ROWS, CI_CELL_LOAD_P99_NS,
+    CI_FRAME_MAX_NS, CI_FRAME_P99_NS, FIXTURE_VALUE_ROWS,
 };
 
 fn main() {
@@ -63,6 +64,17 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // The §9 bordered-viewport gate fixture: a small region with a cache-resident border on
+    // EVERY cell + narrow geometry, so one measured frame paints ≥ 500 bordered cells.
+    eprintln!("building bordered-viewport fixture …");
+    let bordered_fixture = match build_bordered_fixture() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("perf_harness: bordered fixture build failed: {e}");
+            std::process::exit(2);
+        }
+    };
     // Engine work happened building the fixture — the counter is already nonzero here.
     let engine_calls_after_fixture = engine_call_count();
     assert!(
@@ -76,21 +88,109 @@ fn main() {
         let outcome = run_sweep(cx, &cfg, value_rows, &fixture, &commit, &date);
         // Report to stdout (p50/p99, environment-stamped).
         println!("{}", outcome.report_text);
-        // Write the recorded JSON.
-        match outcome.write_json() {
+
+        // The §9 bordered-viewport gate: measure one frame of the ≥500-bordered-cell fixture and
+        // assert its build stays under the buffered CI frame budget (borders are cache-resident).
+        let bordered = measure_bordered_frame(cx, &bordered_fixture);
+        println!("{}", bordered.report_text());
+
+        // Write the recorded JSON (incl. the bordered-frame result).
+        match outcome.write_json(&bordered) {
             Ok(path) => println!("results written to {}", path.display()),
             Err(e) => eprintln!("perf_harness: failed to write results JSON: {e}"),
         }
 
         let ok = outcome.zero_engine_calls
             && outcome.negative_control_climbed
-            && outcome.ci_report.passed();
+            && outcome.ci_report.passed()
+            && bordered.within_budget;
         if gate_mode && !ok {
             eprintln!("perf_harness: GATE FAILED (see report above)");
             std::process::exit(1);
         }
         std::process::exit(0);
     });
+}
+
+/// The bordered-viewport gate result (`architecture.md §9`).
+struct BorderedFrame {
+    /// Frame-build time (ns) of the heaviest of a few measured bordered frames.
+    frame_render_ns: u64,
+    /// The count of **distinct visible cells** in the measured frame — every one is bordered
+    /// (the fixture borders the whole region, which the frame is asserted to stay inside). This
+    /// is the §9 metric: `(rows.end-rows.start) * (cols.end-cols.start)` from the frame's ranges.
+    bordered_cells: u32,
+    /// The content-layer **element** count for that frame (`content_children.len()`: one cell div
+    /// per visible cell PLUS ~2 border-edge quads per bordered cell + any selection overlays — so
+    /// ≈ 3× `bordered_cells`). Reported separately so an element count is never called a cell count.
+    content_elements: u32,
+    /// Whether `frame_render_ns` is under the buffered CI frame budget.
+    within_budget: bool,
+}
+
+impl BorderedFrame {
+    fn report_text(&self) -> String {
+        format!(
+            "--- §9 bordered-viewport gate (borders cache-resident) ---\n\
+             bordered-cell frame: {} bordered cells ({} content elements), build {} (budget {}) → {}",
+            self.bordered_cells,
+            self.content_elements,
+            fmt_ns(self.frame_render_ns),
+            fmt_ns(CI_FRAME_MAX_NS),
+            if self.within_budget { "PASS" } else { "FAIL" },
+        )
+    }
+}
+
+/// Measure a few frames of the bordered fixture over a large viewport and reduce to the worst.
+/// FORCE + ASSERT (`CLAUDE.md`): the measured frame must paint ≥ 500 **actual bordered cells**
+/// (distinct visible cells, all bordered — not the inflated content-element count); a smaller
+/// frame would not exercise the border paint loop at scale.
+fn measure_bordered_frame(cx: &mut App, fixture: &render_tests::perf::Fixture) -> BorderedFrame {
+    let sources = fixture.sources();
+    let grid = cx.new(|cx| GridView::new(sources, GridEventSink::noop(), cx));
+
+    // A large viewport so the visible frame packs well over 500 of the narrow bordered cells.
+    let (vw, vh) = (1400.0_f64, 900.0_f64);
+    let mut worst_ns = 0u64;
+    let mut bordered_cells = 0u32;
+    let mut content_elements = 0u32;
+    let mut prev = None;
+    for _ in 0..8 {
+        let (sample, ranges) =
+            grid.update(cx, |g, _cx| g.measure_frame(0.0, 0.0, vw, vh, prev.clone()));
+        // Every visible cell is bordered ONLY while the frame stays inside the bordered region,
+        // so assert that — then `(rows × cols)` below is an EXACT distinct-bordered-cell count,
+        // not an estimate (and not the ~3×-inflated content-element count).
+        assert!(
+            ranges.0.end <= BORDER_FIXTURE_ROWS && ranges.1.end <= BORDER_FIXTURE_COLS,
+            "the measured frame ({:?} × {:?}) escaped the bordered region ({} × {}) — every \
+             visible cell must be bordered for the §9 metric to be exact (shrink the viewport or \
+             grow the fixture region)",
+            ranges.0,
+            ranges.1,
+            BORDER_FIXTURE_ROWS,
+            BORDER_FIXTURE_COLS,
+        );
+        worst_ns = worst_ns.max(sample.frame_render_ns);
+        bordered_cells = (ranges.0.end - ranges.0.start) * (ranges.1.end - ranges.1.start);
+        content_elements = sample.elements;
+        prev = Some(ranges);
+    }
+
+    assert!(
+        bordered_cells >= BORDERED_VIEWPORT_MIN_CELLS,
+        "bordered frame painted only {bordered_cells} bordered cells — need ≥ \
+         {BORDERED_VIEWPORT_MIN_CELLS} to exercise the border paint loop at scale (widen the \
+         viewport or the fixture region)"
+    );
+
+    BorderedFrame {
+        frame_render_ns: worst_ns,
+        bordered_cells,
+        content_elements,
+        within_budget: worst_ns <= CI_FRAME_MAX_NS,
+    }
 }
 
 /// The finalized outcome of a sweep — everything the driver prints, records, and gates on.
@@ -103,11 +203,28 @@ struct Outcome {
 }
 
 impl Outcome {
-    fn write_json(&self) -> std::io::Result<PathBuf> {
+    fn write_json(&self, bordered: &BorderedFrame) -> std::io::Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("results");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("perf-runtest.json");
-        std::fs::write(&path, serde_json::to_vec_pretty(&self.json)?)?;
+        // Fold the §9 bordered-viewport gate into the recorded report.
+        let mut json = self.json.clone();
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "bordered_viewport_gate".into(),
+                serde_json::json!({
+                    "min_bordered_cells": BORDERED_VIEWPORT_MIN_CELLS,
+                    "bordered_cells": bordered.bordered_cells,
+                    "content_elements": bordered.content_elements,
+                    "frame_render_ns": bordered.frame_render_ns,
+                    "frame_render": fmt_ns(bordered.frame_render_ns),
+                    "budget_ns": CI_FRAME_MAX_NS,
+                    "verdict": if bordered.within_budget { "PASS" } else { "FAIL" },
+                    "note": "borders are cache-resident; a ≥500-bordered-cell frame (distinct visible cells, ALL bordered) must build under the buffered CI frame budget (architecture.md §9). content_elements is the content-layer div/quad count for the SAME frame (≈3× bordered_cells) — NOT a cell count.",
+                }),
+            );
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&json)?)?;
         Ok(path)
     }
 }

@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::axis::Axis;
-use crate::refs::SheetId;
+use crate::border::BorderSpec;
+use crate::refs::{CellRange, SheetId};
 use crate::style::RenderStyle;
 
 /// Default column width in px when the file specifies no override (`ui_design.md §3.3`).
@@ -54,6 +55,130 @@ pub struct SheetCache {
     /// render form). Entries are never removed; the resolved table only grows, bounded by the
     /// (small) number of distinct styles a sheet uses.
     style_ids: HashMap<RenderStyle, StyleId>,
+    /// Number-format code strings, indexed by [`RenderStyle::num_fmt`]. `[0]` is always
+    /// `"general"`. Built worker-side alongside the resolved-style table and read by the action
+    /// bar for category display + decimals ± (`components/action_bar.md`). Tiny (a handful of
+    /// distinct formats per sheet), so interning is a linear scan; `Arc<str>` keeps `SheetCache`
+    /// `Send + Sync` without pulling gpui into this headless crate.
+    num_fmts: Vec<Arc<str>>,
+    /// Font-family names, indexed by [`RenderStyle::font_family`]. `[0]` is always `""` = the
+    /// workbook default (rendered in the grid's default family). Built worker-side alongside the
+    /// resolved-style table; the grid resolves a cell's family name from this for `.font_family`,
+    /// and the action bar reads it for the family dropdown's active label (`components/style_render.md`,
+    /// `components/action_bar.md`). Tiny (a handful of families per sheet) — same linear-scan
+    /// interning + `Arc<str>` rationale as `num_fmts`.
+    font_families: Vec<Arc<str>>,
+    /// Resolved cell borders, indexed by [`RenderStyle::border`]. `[0]` is always
+    /// [`BorderSpec::NONE`]. Built worker-side alongside the resolved-style table; the grid resolves
+    /// a cell's `BorderSpec` from this to paint its edges (`components/style_render.md §Border
+    /// painting`). Tiny (a handful of distinct border combinations per sheet), so interning is a
+    /// linear scan — same rationale as `num_fmts` / `font_families`, except `BorderSpec` is
+    /// `Copy + Eq + Hash` so it is a direct value (no `Arc<str>` needed to stay `Send + Sync`).
+    border_specs: Vec<BorderSpec>,
+    /// The **workbook's default font size** in quarter-points (e.g. `52` = 13pt) — the size a cell
+    /// with `RenderStyle::font_size_q == 0` actually is. The action bar shows this in the size box
+    /// for a default cell (so the label reflects the real default, not a hardcoded value —
+    /// `components/action_bar.md`); the grid does not read it (default cells render at the grid's
+    /// own `CELL_FONT_PX`). `0` when unknown (a bare fixture cache that never set it).
+    default_font_size_q: u16,
+    /// The sheet's file-loaded merged ranges (0-based), parsed once at cache build from
+    /// `worksheet().merge_cells` (`components/grid_structure.md §5.3`). Consumed by the insert/
+    /// delete **merge guard**: the UI disables a menu item whose op would displace a merge. Merged
+    /// cells are otherwise unsupported (a deferred project), so the grid does not render them.
+    merges: Vec<CellRange>,
+}
+
+/// The canonical default number-format code (IronCalc's `Style::default().num_fmt`, lowercase).
+const DEFAULT_NUM_FMT: &str = "general";
+
+/// The `num_fmts` table every fresh cache/builder starts with: `[0] = "general"`.
+fn seed_num_fmts() -> Vec<Arc<str>> {
+    vec![Arc::from(DEFAULT_NUM_FMT)]
+}
+
+/// The `font_families` table every fresh cache/builder starts with: `[0] = ""` (the workbook
+/// default font, rendered in the grid's default family).
+fn seed_font_families() -> Vec<Arc<str>> {
+    vec![Arc::from("")]
+}
+
+/// The `border_specs` table every fresh cache/builder starts with: `[0] = BorderSpec::NONE` (so a
+/// borderless cell interns to the default `RenderStyle`).
+fn seed_border_specs() -> Vec<BorderSpec> {
+    vec![BorderSpec::NONE]
+}
+
+/// Interns a [`BorderSpec`] into `table`, returning its [`RenderStyle::border`] id. The empty
+/// [`BorderSpec::NONE`] always maps to `0`. Shares the `num_fmts` overflow guard: at the
+/// (unreachable) `u16::MAX` cap a further distinct spec returns `u16::MAX`, which
+/// [`SheetCache::border_spec`] resolves to `NONE` rather than wrapping to `0`.
+fn intern_border_spec_into(table: &mut Vec<BorderSpec>, spec: BorderSpec) -> u16 {
+    if spec.is_none() {
+        return 0;
+    }
+    if let Some(idx) = table.iter().position(|s| *s == spec) {
+        return idx as u16;
+    }
+    debug_assert!(
+        table.len() < u16::MAX as usize,
+        "border_specs table overflow (>= u16::MAX distinct borders)"
+    );
+    if table.len() >= u16::MAX as usize {
+        return u16::MAX;
+    }
+    let id = table.len() as u16;
+    table.push(spec);
+    id
+}
+
+/// Interns a font-family `name` into `table`, returning its [`RenderStyle::font_family`] id. An
+/// empty name (the workbook default) always maps to `0`. Shares the `num_fmts` overflow guard:
+/// at the (unreachable) `u16::MAX` cap a further distinct name returns `u16::MAX`, which
+/// [`SheetCache::font_family_name`] resolves to the default `""` rather than wrapping to `0`.
+fn intern_font_family_into(table: &mut Vec<Arc<str>>, name: &str) -> u16 {
+    if name.is_empty() {
+        return 0;
+    }
+    if let Some(idx) = table.iter().position(|c| c.as_ref() == name) {
+        return idx as u16;
+    }
+    debug_assert!(
+        table.len() < u16::MAX as usize,
+        "font_families table overflow (>= u16::MAX distinct families)"
+    );
+    if table.len() >= u16::MAX as usize {
+        return u16::MAX;
+    }
+    let id = table.len() as u16;
+    table.push(Arc::from(name));
+    id
+}
+
+/// Interns a number-format `code` into `table`, returning its `u16` id. Case-insensitive
+/// `"general"` always maps to `0` (so a plain cell interns to the default `RenderStyle`).
+///
+/// Ids are `u16`, so the table holds at most `u16::MAX` (65535) distinct formats — orders of
+/// magnitude beyond the few dozen a real sheet uses. At that (unreachable) cap a further distinct
+/// code is **not** interned: it returns `u16::MAX`, which [`SheetCache::num_fmt_code`] resolves to
+/// the general fallback (out of range), rather than letting `len() as u16` wrap to `0` and collide
+/// with `"general"`.
+fn intern_num_fmt_into(table: &mut Vec<Arc<str>>, code: &str) -> u16 {
+    if code.eq_ignore_ascii_case(DEFAULT_NUM_FMT) {
+        return 0;
+    }
+    if let Some(idx) = table.iter().position(|c| c.as_ref() == code) {
+        return idx as u16;
+    }
+    debug_assert!(
+        table.len() < u16::MAX as usize,
+        "num_fmts table overflow (>= u16::MAX distinct formats)"
+    );
+    if table.len() >= u16::MAX as usize {
+        return u16::MAX;
+    }
+    let id = table.len() as u16;
+    table.push(Arc::from(code));
+    id
 }
 
 impl SheetCache {
@@ -137,6 +262,81 @@ impl SheetCache {
     /// the sheet data uses its own style, even the default, over any band).
     pub fn is_on_band(&self, row: u32, col: u32) -> bool {
         self.row_styles.contains_key(&row) || self.col_styles.contains_key(&col)
+    }
+
+    /// Interns a number-format `code` into the side table, returning its [`RenderStyle::num_fmt`]
+    /// id. Case-insensitive `"general"` → `0`. The worker's mirror path calls this before storing
+    /// a refreshed [`RenderStyle`] so the resident table carries every live format string.
+    pub fn intern_num_fmt(&mut self, code: &str) -> u16 {
+        intern_num_fmt_into(&mut self.num_fmts, code)
+    }
+
+    /// The number-format code string for [`RenderStyle::num_fmt`] id `id`. `0` (or an out-of-range
+    /// id, defensively) → the default `"general"`. The action bar reads this for the active cell's
+    /// format category + decimals ±.
+    pub fn num_fmt_code(&self, id: u16) -> &str {
+        self.num_fmts
+            .get(id as usize)
+            .map(|c| c.as_ref())
+            .unwrap_or(DEFAULT_NUM_FMT)
+    }
+
+    /// Interns a font-family `name` into the side table, returning its [`RenderStyle::font_family`]
+    /// id (empty `name` → `0` = the workbook default). The worker's mirror path calls this before
+    /// storing a refreshed [`RenderStyle`] so the resident table carries every live family name.
+    pub fn intern_font_family(&mut self, name: &str) -> u16 {
+        intern_font_family_into(&mut self.font_families, name)
+    }
+
+    /// The font-family name for [`RenderStyle::font_family`] id `id`. `0` (or an out-of-range id,
+    /// defensively) → `""` = the workbook default (the grid renders its default family). The grid
+    /// resolves a cell's `.font_family` from this; the action bar reads it for the active cell's
+    /// family label.
+    pub fn font_family_name(&self, id: u16) -> &str {
+        self.font_families
+            .get(id as usize)
+            .map(|c| c.as_ref())
+            .unwrap_or("")
+    }
+
+    /// The full font-family side table — the grid snapshots this (cheap `Arc` clones) alongside the
+    /// visible styles so it can resolve each cell's `.font_family` after releasing the cache lock.
+    pub fn font_families(&self) -> &[Arc<str>] {
+        &self.font_families
+    }
+
+    /// Interns a [`BorderSpec`] into the side table, returning its [`RenderStyle::border`] id
+    /// ([`BorderSpec::NONE`] → `0`). The worker's mirror path calls this before storing a refreshed
+    /// [`RenderStyle`] so the resident table carries every live border.
+    pub fn intern_border_spec(&mut self, spec: BorderSpec) -> u16 {
+        intern_border_spec_into(&mut self.border_specs, spec)
+    }
+
+    /// The [`BorderSpec`] for [`RenderStyle::border`] id `id`. `0` (or an out-of-range id,
+    /// defensively) → [`BorderSpec::NONE`]. The grid resolves a cell's edges from this.
+    pub fn border_spec(&self, id: u16) -> BorderSpec {
+        self.border_specs
+            .get(id as usize)
+            .copied()
+            .unwrap_or(BorderSpec::NONE)
+    }
+
+    /// The full border side table — the grid snapshots this (cheap `Copy`s) alongside the visible
+    /// styles so it can resolve each cell's `BorderSpec` after releasing the cache lock.
+    pub fn border_specs(&self) -> &[BorderSpec] {
+        &self.border_specs
+    }
+
+    /// The workbook's default font size in quarter-points (`0` = unknown). The action bar reads this
+    /// to label the size box for a default cell (`font_size_q == 0`) with the real workbook default.
+    pub fn default_font_size_q(&self) -> u16 {
+        self.default_font_size_q
+    }
+
+    /// The sheet's file-loaded merged ranges (0-based). The grid reads these to gate the insert/
+    /// delete context-menu items behind the merge guard (`components/grid_structure.md §5.3`).
+    pub fn merges(&self) -> &[CellRange] {
+        &self.merges
     }
 
     /// Interns `style` into the resolved table (equal styles share a [`StyleId`]).
@@ -261,6 +461,11 @@ pub struct SheetCacheBuilder {
     col_styles: BTreeMap<u32, StyleId>,
     resolved: Vec<RenderStyle>,
     style_ids: HashMap<RenderStyle, StyleId>,
+    num_fmts: Vec<Arc<str>>,
+    font_families: Vec<Arc<str>>,
+    border_specs: Vec<BorderSpec>,
+    default_font_size_q: u16,
+    merges: Vec<CellRange>,
 }
 
 impl SheetCacheBuilder {
@@ -278,7 +483,51 @@ impl SheetCacheBuilder {
             col_styles: BTreeMap::new(),
             resolved: Vec::new(),
             style_ids: HashMap::new(),
+            num_fmts: seed_num_fmts(),
+            font_families: seed_font_families(),
+            border_specs: seed_border_specs(),
+            default_font_size_q: 0,
+            merges: Vec::new(),
         }
+    }
+
+    /// Records the workbook's default font size (quarter-points) — the engine's build loop sets it
+    /// so the action bar can label a default cell with the real workbook default size.
+    pub fn set_default_font_size_q(&mut self, q: u16) {
+        self.default_font_size_q = q;
+    }
+
+    /// Records a file-loaded merged range (0-based) — the engine's build loop pushes one per parsed
+    /// `worksheet().merge_cells` entry, for the insert/delete merge guard.
+    pub fn push_merge(&mut self, range: CellRange) {
+        self.merges.push(range);
+    }
+
+    /// Records a merged range (consuming/fluent form for hand-built fixtures/tests).
+    pub fn merge(mut self, range: CellRange) -> Self {
+        self.push_merge(range);
+        self
+    }
+
+    /// Interns a number-format `code` into the side table, returning its [`RenderStyle::num_fmt`]
+    /// id (case-insensitive `"general"` → `0`). The engine's build loop calls this per cell/band
+    /// before pushing the resolved style.
+    pub fn intern_num_fmt(&mut self, code: &str) -> u16 {
+        intern_num_fmt_into(&mut self.num_fmts, code)
+    }
+
+    /// Interns a font-family `name` into the side table, returning its [`RenderStyle::font_family`]
+    /// id (empty `name` → `0` = the workbook default). The engine's build loop calls this per
+    /// cell/band before pushing the resolved style.
+    pub fn intern_font_family(&mut self, name: &str) -> u16 {
+        intern_font_family_into(&mut self.font_families, name)
+    }
+
+    /// Interns a [`BorderSpec`] into the side table, returning its [`RenderStyle::border`] id
+    /// ([`BorderSpec::NONE`] → `0`). The engine's build loop calls this per cell/band before pushing
+    /// the resolved style.
+    pub fn intern_border_spec(&mut self, spec: BorderSpec) -> u16 {
+        intern_border_spec_into(&mut self.border_specs, spec)
     }
 
     /// Overrides the default row height / column width (px).
@@ -389,6 +638,11 @@ impl SheetCacheBuilder {
             col_styles: self.col_styles,
             resolved: self.resolved,
             style_ids: self.style_ids,
+            num_fmts: self.num_fmts,
+            font_families: self.font_families,
+            border_specs: self.border_specs,
+            default_font_size_q: self.default_font_size_q,
+            merges: self.merges,
         }
     }
 }
@@ -536,6 +790,150 @@ mod tests {
             .cell_style(0, 1, RenderStyle::default())
             .build();
         assert_eq!(c2.resolved.len(), 2);
+    }
+
+    #[test]
+    fn num_fmt_interning_dedups_and_general_is_zero() {
+        let mut cache = SheetCacheBuilder::new(4, 4).build();
+        // A fresh cache resolves index 0 to "general".
+        assert_eq!(cache.num_fmt_code(0), "general");
+        // Case-insensitive "general" always maps to 0 (so plain cells stay the default style).
+        assert_eq!(cache.intern_num_fmt("general"), 0);
+        assert_eq!(cache.intern_num_fmt("General"), 0);
+        // Distinct codes get distinct, stable ids; equal codes dedup.
+        let cur = cache.intern_num_fmt("$#,##0.00");
+        let pct = cache.intern_num_fmt("0.00%");
+        assert_ne!(cur, 0);
+        assert_ne!(cur, pct);
+        assert_eq!(cache.intern_num_fmt("$#,##0.00"), cur, "equal codes dedup");
+        // Round-trips back to the string.
+        assert_eq!(cache.num_fmt_code(cur), "$#,##0.00");
+        assert_eq!(cache.num_fmt_code(pct), "0.00%");
+        // An out-of-range id falls back to "general" (defensive, never panics).
+        assert_eq!(cache.num_fmt_code(9999), "general");
+
+        // The builder interns identically, and the built cache carries the table.
+        let mut b = SheetCacheBuilder::new(2, 2);
+        let id = b.intern_num_fmt("m/d/yyyy");
+        let built = b
+            .cell_style(
+                0,
+                0,
+                RenderStyle {
+                    num_fmt: id,
+                    ..RenderStyle::default()
+                },
+            )
+            .build();
+        assert_eq!(built.num_fmt_code(id), "m/d/yyyy");
+        assert_eq!(built.render_style(0, 0).unwrap().num_fmt, id);
+    }
+
+    #[test]
+    fn font_family_interning_dedups_and_default_is_zero() {
+        let mut cache = SheetCacheBuilder::new(4, 4).build();
+        // A fresh cache resolves index 0 to "" (the workbook default family).
+        assert_eq!(cache.font_family_name(0), "");
+        // An empty name always maps to 0.
+        assert_eq!(cache.intern_font_family(""), 0);
+        // Distinct names get distinct, stable ids; equal names dedup.
+        let serif = cache.intern_font_family("Times New Roman");
+        let mono = cache.intern_font_family("Courier New");
+        assert_ne!(serif, 0);
+        assert_ne!(serif, mono);
+        assert_eq!(
+            cache.intern_font_family("Times New Roman"),
+            serif,
+            "equal names dedup"
+        );
+        // Round-trips back to the name.
+        assert_eq!(cache.font_family_name(serif), "Times New Roman");
+        assert_eq!(cache.font_family_name(mono), "Courier New");
+        // An out-of-range id falls back to "" (defensive, never panics).
+        assert_eq!(cache.font_family_name(9999), "");
+
+        // The builder interns identically, and the built cache carries the table.
+        let mut b = SheetCacheBuilder::new(2, 2);
+        let id = b.intern_font_family("Arial");
+        let built = b
+            .cell_style(
+                0,
+                0,
+                RenderStyle {
+                    font_family: id,
+                    ..RenderStyle::default()
+                },
+            )
+            .build();
+        assert_eq!(built.font_family_name(id), "Arial");
+        assert_eq!(built.render_style(0, 0).unwrap().font_family, id);
+        // The whole side table is exposed for the grid snapshot.
+        assert_eq!(built.font_families().len(), 2); // [""], ["Arial"]
+    }
+
+    #[test]
+    fn border_spec_interning_dedups_and_none_is_zero() {
+        use crate::border::{BorderSpec, Edge};
+        let thin = |w| Some(Edge::new(w, Rgb::new(0, 0, 0)));
+        let all_thin = BorderSpec {
+            top: thin(1),
+            right: thin(1),
+            bottom: thin(1),
+            left: thin(1),
+        };
+        let thick_bottom = BorderSpec {
+            bottom: thin(3),
+            ..BorderSpec::NONE
+        };
+
+        let mut cache = SheetCacheBuilder::new(4, 4).build();
+        // A fresh cache resolves index 0 to NONE.
+        assert_eq!(cache.border_spec(0), BorderSpec::NONE);
+        // NONE always maps to 0.
+        assert_eq!(cache.intern_border_spec(BorderSpec::NONE), 0);
+        // Distinct specs get distinct, stable ids; equal specs dedup.
+        let a = cache.intern_border_spec(all_thin);
+        let b = cache.intern_border_spec(thick_bottom);
+        assert_ne!(a, 0);
+        assert_ne!(a, b);
+        assert_eq!(cache.intern_border_spec(all_thin), a, "equal specs dedup");
+        // Round-trips back to the spec.
+        assert_eq!(cache.border_spec(a), all_thin);
+        assert_eq!(cache.border_spec(b), thick_bottom);
+        // An out-of-range id falls back to NONE (defensive, never panics).
+        assert_eq!(cache.border_spec(9999), BorderSpec::NONE);
+
+        // The builder interns identically, and the built cache carries the table; `border`
+        // participates in StyleId identity (two cells differing only by border → distinct ids).
+        let mut bld = SheetCacheBuilder::new(2, 2);
+        let id = bld.intern_border_spec(all_thin);
+        let built = bld
+            .cell_style(
+                0,
+                0,
+                RenderStyle {
+                    border: id,
+                    ..RenderStyle::default()
+                },
+            )
+            .cell_style(0, 1, RenderStyle::default())
+            .build();
+        assert_eq!(built.border_spec(id), all_thin);
+        assert_eq!(built.render_style(0, 0).unwrap().border, id);
+        assert_eq!(built.resolved.len(), 2, "border distinguishes StyleIds");
+        assert_eq!(built.border_specs().len(), 2); // [NONE, all_thin]
+    }
+
+    #[test]
+    fn merges_round_trip_through_builder() {
+        use crate::refs::{CellRange, CellRef};
+        // A fresh cache carries no merges.
+        assert!(SheetCacheBuilder::new(4, 4).build().merges().is_empty());
+        // Pushed merges survive the build in order.
+        let a = CellRange::new(CellRef::new(6, 10), CellRef::new(9, 11)); // K7:L10
+        let b = CellRange::single(CellRef::new(0, 0)); // A1
+        let cache = SheetCacheBuilder::new(20, 20).merge(a).merge(b).build();
+        assert_eq!(cache.merges(), &[a, b]);
     }
 
     #[test]

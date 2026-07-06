@@ -26,8 +26,10 @@
 //! it converts the 1-based `Row.r` / `Col.min..=max` itself.
 
 use freecell_core::cache::{DEFAULT_COL_WIDTH_PX, DEFAULT_ROW_HEIGHT_PX};
-use freecell_core::{limits, CellRef, RenderStyle, Rgb, SheetCache, SheetCacheBuilder};
-use ironcalc_base::types::{HorizontalAlignment, Style};
+use freecell_core::{
+    limits, BorderSpec, CellRef, Edge, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
+};
+use ironcalc_base::types::{Border, BorderItem, BorderStyle, HorizontalAlignment, Style};
 
 use crate::document::WorkbookDocument;
 
@@ -45,6 +47,17 @@ pub(crate) fn col_px(ironcalc_px: f64) -> f32 {
 /// Converts an IronCalc row-height pixel value to a FreeCell device-px height (see module docs).
 pub(crate) fn row_px(ironcalc_px: f64) -> f32 {
     (ironcalc_px * (DEFAULT_ROW_HEIGHT_PX as f64 / IRONCALC_DEFAULT_ROW_HEIGHT_PX)) as f32
+}
+
+/// Converts a FreeCell device-px column width back to IronCalc pixels — the inverse of [`col_px`],
+/// used to write a user resize (the grid speaks device px; the engine stores IronCalc px).
+pub(crate) fn col_ironcalc_px(device_px: f64) -> f64 {
+    device_px * (IRONCALC_DEFAULT_COL_WIDTH_PX / DEFAULT_COL_WIDTH_PX as f64)
+}
+
+/// Converts a FreeCell device-px row height back to IronCalc pixels — the inverse of [`row_px`].
+pub(crate) fn row_ironcalc_px(device_px: f64) -> f64 {
+    device_px * (IRONCALC_DEFAULT_ROW_HEIGHT_PX / DEFAULT_ROW_HEIGHT_PX as f64)
 }
 
 /// The FreeCell-px row-height **override** for `row` (0-based): `Some(px)` when the engine reports
@@ -84,10 +97,49 @@ pub(crate) fn parse_color(s: &str) -> Option<Rgb> {
     Some(Rgb::from_hex(value))
 }
 
-/// Derives the engine-free [`RenderStyle`] from an IronCalc `Style` — the MVP subset the grid
-/// draws (`functional_spec.md §3.6`). Everything IronCalc models but the grid ignores (borders,
-/// font family/size, strikethrough, wrap, vertical align) is intentionally dropped from the
-/// render form; it stays in the engine and round-trips on save.
+/// Maps an IronCalc [`BorderStyle`] to the grid's px weight class (`architecture.md §1.1`, corrected
+/// to the actual nine 0.7.1 variants — the spec's `Hair`/`Dashed` don't exist at this rev; see
+/// DECISIONS_TO_REVIEW): Thin/Dotted → `1`; the Medium family + SlantDashDot → `2`; Thick/Double →
+/// `3`. All are drawn solid (dotted/dashed fidelity collapses to its weight class — SP5-accepted).
+pub(crate) fn border_weight(style: &BorderStyle) -> u8 {
+    match style {
+        BorderStyle::Thin | BorderStyle::Dotted => 1,
+        BorderStyle::Medium
+        | BorderStyle::MediumDashed
+        | BorderStyle::MediumDashDot
+        | BorderStyle::MediumDashDotDot
+        | BorderStyle::SlantDashDot => 2,
+        BorderStyle::Thick | BorderStyle::Double => 3,
+    }
+}
+
+/// Resolves one IronCalc [`BorderItem`] to a render [`Edge`]: its weight class + colour (defaulting
+/// to black when the item carries none or an unparseable string — the render never panics).
+fn edge_from(item: &BorderItem) -> Edge {
+    let color = item
+        .color
+        .as_deref()
+        .and_then(parse_color)
+        .unwrap_or(Rgb::new(0, 0, 0));
+    Edge::new(border_weight(&item.style), color)
+}
+
+/// Resolves an IronCalc [`Border`] into the engine-free [`BorderSpec`] the grid paints. Only the
+/// four side edges are drawn (diagonals are out of scope — `functional_spec.md §3.6`).
+pub(crate) fn border_spec_from(border: &Border) -> BorderSpec {
+    BorderSpec {
+        top: border.top.as_ref().map(edge_from),
+        right: border.right.as_ref().map(edge_from),
+        bottom: border.bottom.as_ref().map(edge_from),
+        left: border.left.as_ref().map(edge_from),
+    }
+}
+
+/// Derives the engine-free [`RenderStyle`] from an IronCalc `Style` — the subset the grid draws
+/// (`functional_spec.md §3.6`). Font family/size, borders, and number format are **side-table
+/// indices** resolved by the caller (which holds the interning tables); everything IronCalc models
+/// but the grid ignores (strikethrough, wrap, vertical/diagonal) stays in the engine and
+/// round-trips on save.
 ///
 /// `render_style_from(&Style::default()) == RenderStyle::default()` (asserted in the tests) — so
 /// a plain cell interns to the default style and resolves to `None` (the grid's default paint).
@@ -108,9 +160,40 @@ pub(crate) fn render_style_from(style: &Style) -> RenderStyle {
             .and_then(parse_color)
             .filter(|rgb| *rgb != Rgb::new(0, 0, 0)),
         h_align: h_align_of(style),
-        // The grid only distinguishes "General" (its own type-based alignment / passthrough) from
-        // an explicit format; IronCalc's default is the lowercase "general".
-        num_format_is_default: style.num_fmt.eq_ignore_ascii_case("general"),
+        // `num_fmt` / `font_family` / `border` are side-table indices resolved by the caller
+        // (build/refresh), which holds the interning tables; a bare conversion carries `0`
+        // (= "general" / the workbook default family / BorderSpec::NONE). `font_size_q` is likewise
+        // resolved by the caller against the workbook default (`font_size_q_of`). The caller
+        // overrides all four before the default-check so a font/format/border-only cell is still stored.
+        num_fmt: 0,
+        font_size_q: 0,
+        font_family: 0,
+        border: 0,
+    }
+}
+
+/// Converts an IronCalc font size (whole points, `i32`) to [`RenderStyle::font_size_q`]
+/// quarter-points, mapping the **workbook default** size (`default_sz`) — and any non-positive
+/// garbage — to `0` ("the workbook default"). Resolving the default relative to `default_sz`
+/// (rather than a hardcoded 11/13) keeps every default-font cell interning to the default style,
+/// so opened files render unchanged (`architecture.md §1.1`; the spec's literal "11pt" is a
+/// documented misstatement — IronCalc's real default is 13pt). Saturates for hostile huge sizes.
+pub(crate) fn font_size_q_of(sz: i32, default_sz: i32) -> u16 {
+    if sz <= 0 || sz == default_sz {
+        0
+    } else {
+        (sz.clamp(0, u16::MAX as i32) as u16).saturating_mul(4)
+    }
+}
+
+/// Resolves a cell/band font `name` to a [`RenderStyle::font_family`] id against the workbook
+/// default: the default name (and `""`) → `0`; any other name interns into the builder's side
+/// table. Keeps a default-font cell mapping to the default style.
+fn resolve_family(builder: &mut SheetCacheBuilder, name: &str, default_name: &str) -> u16 {
+    if name == default_name {
+        0
+    } else {
+        builder.intern_font_family(name)
     }
 }
 
@@ -137,6 +220,12 @@ pub(crate) fn build_sheet_cache(
 ) -> Result<SheetCache, String> {
     let mut builder = SheetCacheBuilder::new(limits::MAX_ROWS, limits::MAX_COLS);
     let ws = doc.worksheet(sheet_idx)?;
+    // The workbook default font — each cell's font_size_q/font_family is resolved relative to it,
+    // so a default-font cell interns to the default style (`font_size_q_of` + the family check).
+    let (def_sz, def_name) = doc.default_font();
+    // Record the workbook default size (quarter-points) so the action bar can label a default cell
+    // with the real workbook default rather than a hardcoded value.
+    builder.set_default_font_size_q((def_sz.clamp(0, u16::MAX as i32) as u16).saturating_mul(4));
 
     // Track the rows/cols that carry a *non-default* band, so a populated cell reverting to the
     // default style still gets an explicit entry to shadow the band (IronCalc's rule that a cell
@@ -155,7 +244,11 @@ pub(crate) fn build_sheet_cache(
         }
         if col.style.is_some() {
             if let Some(style) = doc.col_band_style(sheet_idx, (col.min - 1) as u32)? {
-                let rs = render_style_from(&style);
+                let mut rs = render_style_from(&style);
+                rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
+                rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+                rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
                 if rs != RenderStyle::default() {
                     for c in col.min..=col.max {
                         let c0 = (c - 1) as u32;
@@ -177,12 +270,26 @@ pub(crate) fn build_sheet_cache(
         }
         if r.custom_format && r.s != 0 {
             if let Some(style) = doc.row_band_style(sheet_idx, r0)? {
-                let rs = render_style_from(&style);
+                let mut rs = render_style_from(&style);
+                rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
+                rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+                rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
                 if rs != RenderStyle::default() {
                     builder.push_row_style(r0, rs);
                     band_rows.insert(r0);
                 }
             }
+        }
+    }
+
+    // Merged ranges: parse the sheet's file-loaded A1 merge strings once (0-based) for the
+    // insert/delete merge guard (`components/grid_structure.md §5.3`). A hostile/unparseable
+    // entry is skipped + logged (never panics — defensive against malformed files).
+    for m in &ws.merge_cells {
+        match freecell_core::CellRange::from_a1(m) {
+            Some(range) => builder.push_merge(range),
+            None => tracing::debug!(merge = %m, "cache: skipping unparseable merge range"),
         }
     }
 
@@ -193,7 +300,11 @@ pub(crate) fn build_sheet_cache(
             let col0 = (*col_1 - 1) as u32;
             let cell = CellRef::new(row0, col0);
             if let Some(style) = doc.cell_own_style(sheet_idx, cell)? {
-                let rs = render_style_from(&style);
+                let mut rs = render_style_from(&style);
+                rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
+                rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+                rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
                 // `band_rows`/`band_cols` hold only *non-default* bands. A populated cell with a
                 // default own style on such a band gets an explicit default entry to shadow it.
                 // MICRO-EDGE (DECISIONS_TO_REVIEW, Phase 5): a `custom_format` row whose style
@@ -217,15 +328,28 @@ pub(crate) fn build_sheet_cache(
 /// present in the sheet data uses its own style (even the default, which shadows a band); an
 /// absent cell falls through to the band/default. Guarantees `cache.render_style(cell)` keeps
 /// matching `get_style_for_cell(cell)`.
+///
+/// `def_sz` / `def_name` are the workbook default font (`doc.default_font()`), passed in so a
+/// multi-cell refresh resolves it **once** rather than re-reading + re-cloning it per cell.
 pub(crate) fn refresh_cell(
     cache: &mut SheetCache,
     doc: &WorkbookDocument,
     sheet_idx: u32,
     cell: CellRef,
+    def_sz: i32,
+    def_name: &str,
 ) -> Result<(), String> {
     match doc.cell_own_style(sheet_idx, cell)? {
         Some(style) => {
-            let rs = render_style_from(&style);
+            let mut rs = render_style_from(&style);
+            rs.num_fmt = cache.intern_num_fmt(&style.num_fmt);
+            rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
+            rs.font_family = if style.font.name == def_name {
+                0
+            } else {
+                cache.intern_font_family(&style.font.name)
+            };
+            rs.border = cache.intern_border_spec(border_spec_from(&style.border));
             if rs != RenderStyle::default() {
                 cache.set_cell_style(cell.row, cell.col, rs);
             } else if cache.is_on_band(cell.row, cell.col) {
@@ -254,14 +378,67 @@ pub(crate) fn assert_cache_agrees(
     rows_probe: &[u32],
     cols_probe: &[u32],
 ) -> Result<(), String> {
+    let (def_sz, def_name) = doc.default_font();
     for &r in rows_probe {
         for &c in cols_probe {
             let cached = cache.render_style(r, c).copied().unwrap_or_default();
-            let engine =
-                render_style_from(&doc.resolved_cell_style(sheet_idx, CellRef::new(r, c))?);
-            if cached != engine {
+            let engine_style = doc.resolved_cell_style(sheet_idx, CellRef::new(r, c))?;
+            // Structural compare ignores the cache-local indices (`num_fmt`, `font_family`), but
+            // resolves the *value* fields the engine side also carries (`font_size_q` is an absolute
+            // quarter-point value, comparable directly once resolved against the workbook default).
+            let mut engine = render_style_from(&engine_style);
+            engine.font_size_q = font_size_q_of(engine_style.font.sz, def_sz);
+            let cached_structural = RenderStyle {
+                num_fmt: 0,
+                font_family: 0,
+                border: 0,
+                ..cached
+            };
+            let engine_structural = RenderStyle {
+                num_fmt: 0,
+                font_family: 0,
+                border: 0,
+                ..engine
+            };
+            if cached_structural != engine_structural {
                 return Err(format!(
                     "style mismatch at ({r},{c}): cache={cached:?} engine={engine:?}"
+                ));
+            }
+            // The border agreement is over the resolved *spec* (the `border` field is a cache-local
+            // index; the engine side resolves the spec directly).
+            let cached_spec = cache.border_spec(cached.border);
+            let engine_spec = border_spec_from(&engine_style.border);
+            if cached_spec != engine_spec {
+                return Err(format!(
+                    "border mismatch at ({r},{c}): cache={cached_spec:?} engine={engine_spec:?}"
+                ));
+            }
+            // The num-fmt agreement is over the resolved *string* (general normalized).
+            let cached_code = cache.num_fmt_code(cached.num_fmt);
+            let engine_general = engine_style.num_fmt.eq_ignore_ascii_case("general");
+            let cached_general = cached_code.eq_ignore_ascii_case("general");
+            let code_ok = if engine_general {
+                cached_general
+            } else {
+                cached_code == engine_style.num_fmt
+            };
+            if !code_ok {
+                return Err(format!(
+                    "num_fmt mismatch at ({r},{c}): cache={cached_code:?} engine={:?}",
+                    engine_style.num_fmt
+                ));
+            }
+            // The font-family agreement is over the resolved *name* (default → "").
+            let cached_family = cache.font_family_name(cached.font_family);
+            let engine_family = if engine_style.font.name == def_name {
+                ""
+            } else {
+                engine_style.font.name.as_str()
+            };
+            if cached_family != engine_family {
+                return Err(format!(
+                    "font_family mismatch at ({r},{c}): cache={cached_family:?} engine={engine_family:?}"
                 ));
             }
         }
@@ -353,9 +530,150 @@ mod tests {
             render_style_from(&style_with("alignment.horizontal", "center")).h_align,
             Some(Align::Center)
         );
-        // A custom number format flips num_format_is_default off.
-        assert!(!render_style_from(&style_with("num_fmt", "0.00%")).num_format_is_default);
-        assert!(render_style_from(&Style::default()).num_format_is_default);
+        // `render_style_from` never resolves the num-fmt index itself (the caller does, via the
+        // interning table); it always carries the default 0.
+        assert_eq!(
+            render_style_from(&style_with("num_fmt", "0.00%")).num_fmt,
+            0
+        );
+        assert_eq!(render_style_from(&Style::default()).num_fmt, 0);
+    }
+
+    #[test]
+    fn build_carries_num_fmt_from_file() {
+        // A cell whose ONLY styling is a custom number format is still stored (num_fmt != 0), and
+        // its resolved string round-trips through the side table; a plain cell stays default.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let area = ironcalc_base::expressions::types::Area {
+            sheet: 0,
+            row: 1,
+            column: 1,
+            width: 1,
+            height: 1,
+        };
+        doc.user_model_mut()
+            .update_range_style(&area, "num_fmt", "$#,##0.00")
+            .unwrap();
+
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let formatted = cache
+            .render_style(0, 0)
+            .expect("format-only cell is stored");
+        assert_ne!(formatted.num_fmt, 0);
+        assert_eq!(cache.num_fmt_code(formatted.num_fmt), "$#,##0.00");
+        // The plain number cell resolves to the default (general) — no stored style, index 0.
+        assert!(cache.render_style(1, 0).is_none());
+    }
+
+    #[test]
+    fn default_font_detects_workbook_default() {
+        // A fresh workbook's default font (13pt Calibri) resolves cells to font_size_q/font_family
+        // 0 — so a default-font cell interns to the default style and renders at the grid default.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "plain").unwrap();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        assert!(
+            cache.render_style(0, 0).is_none(),
+            "a default-font cell is not stored (interns to default)"
+        );
+    }
+
+    #[test]
+    fn opened_file_nondefault_default_font_interns_to_sentinel() {
+        // Simulate an OPENED file whose default (style 0) font is Arial 10 — NOT new_empty's
+        // Calibri 13. This substantiates "no opened-file regression": unstyled cells still intern
+        // to the sentinel (render unchanged) and the cache reports the file's default size.
+        let mut model = ironcalc_base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        model.workbook.styles.fonts[0].name = "Arial".to_string();
+        model.workbook.styles.fonts[0].sz = 10;
+        let mut doc = WorkbookDocument::from_test_model(model);
+        assert_eq!(doc.default_font(), (10, "Arial".to_string()));
+
+        doc.set_cell_input(0, CellRef::new(0, 0), "x").unwrap();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        assert!(
+            cache.render_style(0, 0).is_none(),
+            "a cell inheriting the file default font interns to the sentinel (renders unchanged)"
+        );
+        assert_eq!(
+            cache.default_font_size_q(),
+            40,
+            "10pt → 40 quarter-points (the action-bar default label)"
+        );
+
+        // A cell explicitly set to a DIFFERENT font (Calibri 13) is stored non-default.
+        let (_, def_name) = doc.default_font();
+        doc.set_cell_input(0, CellRef::new(1, 0), "y").unwrap();
+        doc.set_font(
+            0,
+            CellRange::single(CellRef::new(1, 0)),
+            Some("Calibri"),
+            Some(13.0),
+            &def_name,
+        )
+        .unwrap();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let rs = cache
+            .render_style(1, 0)
+            .expect("a font differing from the file default is stored");
+        assert_eq!(cache.font_family_name(rs.font_family), "Calibri");
+        assert_eq!(rs.font_size_q, 13 * 4);
+    }
+
+    #[test]
+    fn build_carries_font_from_file() {
+        // A cell with a non-default family + size resolves to a non-zero font_family/font_size_q
+        // whose name round-trips through the side table; a plain cell stays 0/0 (unstored).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = CellRef::new(0, 0);
+        doc.set_cell_input(0, a1, "styled").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "plain").unwrap();
+        let (_, def_name) = doc.default_font();
+        doc.set_font(
+            0,
+            CellRange::single(a1),
+            Some("Times New Roman"),
+            Some(24.0),
+            &def_name,
+        )
+        .unwrap();
+
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let rs = cache.render_style(0, 0).expect("font-only cell is stored");
+        assert_eq!(rs.font_size_q, 24 * 4, "24pt → 96 quarter-points");
+        assert_ne!(rs.font_family, 0);
+        assert_eq!(cache.font_family_name(rs.font_family), "Times New Roman");
+        // The plain cell resolves to the default (no stored style).
+        assert!(cache.render_style(1, 0).is_none());
+    }
+
+    #[test]
+    fn band_font_resolves_into_cells() {
+        // A whole-column band font-size (an in-engine col band via the full-height fast path)
+        // resolves into the RenderStyle of every cell in that column — the band path shares the
+        // build loop's `font_size_q_of` resolution.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // `font.size_delta` on a full column creates a col band whose font size is default + delta.
+        let col_area = ironcalc_base::expressions::types::Area {
+            sheet: 0,
+            row: 1,
+            column: 4, // 0-based column 3
+            width: 1,
+            height: limits::MAX_ROWS as i32,
+        };
+        doc.user_model_mut()
+            .update_range_style(&col_area, "font.size_delta", "10")
+            .unwrap();
+        let (def_sz, _) = doc.default_font();
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        // A cell in the band (no own style) resolves to the band's font size.
+        let rs = cache
+            .render_style(20, 3)
+            .expect("a col-band cell resolves to the band style");
+        assert_eq!(rs.font_size_q, font_size_q_of(def_sz + 10, def_sz));
+        assert_ne!(rs.font_size_q, 0, "the band's larger size is non-default");
     }
 
     #[test]
@@ -371,6 +689,87 @@ mod tests {
         assert_eq!(parse_color("#GGGGGG"), None);
         assert_eq!(parse_color("#12é45678"), None);
         assert_eq!(parse_color(""), None);
+    }
+
+    #[test]
+    fn border_weight_mapping_all_nine_styles() {
+        use ironcalc_base::types::BorderStyle::*;
+        // The actual nine 0.7.1 variants → px weight class (`architecture.md §1.1`, corrected).
+        assert_eq!(border_weight(&Thin), 1);
+        assert_eq!(border_weight(&Dotted), 1);
+        assert_eq!(border_weight(&Medium), 2);
+        assert_eq!(border_weight(&MediumDashed), 2);
+        assert_eq!(border_weight(&MediumDashDot), 2);
+        assert_eq!(border_weight(&MediumDashDotDot), 2);
+        assert_eq!(border_weight(&SlantDashDot), 2);
+        assert_eq!(border_weight(&Thick), 3);
+        assert_eq!(border_weight(&Double), 3);
+    }
+
+    #[test]
+    fn border_spec_from_reads_all_four_edges_and_colour() {
+        use freecell_core::Edge;
+        use ironcalc_base::types::{Border, BorderItem, BorderStyle};
+        let item = |style, color: &str| {
+            Some(BorderItem {
+                style,
+                color: Some(color.to_string()),
+            })
+        };
+        let border = Border {
+            top: item(BorderStyle::Thin, "#000000"),
+            right: item(BorderStyle::Thick, "#FF0000"),
+            bottom: item(BorderStyle::Medium, "#00FF00"),
+            left: None,
+            ..Border::default()
+        };
+        let spec = border_spec_from(&border);
+        assert_eq!(spec.top, Some(Edge::new(1, Rgb::new(0, 0, 0))));
+        assert_eq!(spec.right, Some(Edge::new(3, Rgb::new(0xFF, 0, 0))));
+        assert_eq!(spec.bottom, Some(Edge::new(2, Rgb::new(0, 0xFF, 0))));
+        assert_eq!(spec.left, None);
+        // A colourless item defaults to black (never panics).
+        let b2 = Border {
+            top: Some(BorderItem {
+                style: BorderStyle::Thin,
+                color: None,
+            }),
+            ..Border::default()
+        };
+        assert_eq!(
+            border_spec_from(&b2).top,
+            Some(Edge::new(1, Rgb::new(0, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn cache_carries_border_from_file() {
+        use freecell_core::{BorderSpec, Edge};
+        // A cell whose ONLY styling is an All-thin border is stored (border != 0), and its resolved
+        // BorderSpec round-trips through the side table; a plain neighbour stays default.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "x").unwrap();
+        doc.set_cell_input(0, CellRef::new(5, 5), "y").unwrap();
+        doc.set_borders(0, CellRange::single(CellRef::new(0, 0)), "All")
+            .unwrap();
+
+        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let rs = cache
+            .render_style(0, 0)
+            .expect("a border-only cell is stored");
+        assert_ne!(rs.border, 0);
+        let thin = Some(Edge::new(1, Rgb::new(0, 0, 0)));
+        assert_eq!(
+            cache.border_spec(rs.border),
+            BorderSpec {
+                top: thin,
+                right: thin,
+                bottom: thin,
+                left: thin,
+            }
+        );
+        // The plain far cell has no border (unstored).
+        assert!(cache.render_style(5, 5).is_none());
     }
 
     #[test]
@@ -525,11 +924,18 @@ mod tests {
     fn set_bold(doc: &mut WorkbookDocument, cache: &mut SheetCache, range: CellRange) {
         doc.set_font_flag(0, range, crate::document::FontFlag::Bold, true)
             .unwrap();
+        let (def_sz, def_name) = doc.default_font();
         for row in range.rows() {
             for col in range.cols() {
-                refresh_cell(cache, doc, 0, CellRef::new(row, col)).unwrap();
+                refresh_cell(cache, doc, 0, CellRef::new(row, col), def_sz, &def_name).unwrap();
             }
         }
+    }
+
+    /// Refresh a single cell's cache entry, resolving the workbook default font inline (test-only).
+    fn refresh_one(cache: &mut SheetCache, doc: &WorkbookDocument, cell: CellRef) {
+        let (def_sz, def_name) = doc.default_font();
+        refresh_cell(cache, doc, 0, cell, def_sz, &def_name).unwrap();
     }
 
     #[test]
@@ -556,11 +962,11 @@ mod tests {
             Some(Rgb::from_hex(0x00FF00)),
         )
         .unwrap();
-        refresh_cell(&mut cache, &doc, 0, CellRef::new(6, 6)).unwrap();
+        refresh_one(&mut cache, &doc, CellRef::new(6, 6));
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
         doc.set_fill(0, CellRange::single(CellRef::new(6, 6)), None)
             .unwrap();
-        refresh_cell(&mut cache, &doc, 0, CellRef::new(6, 6)).unwrap();
+        refresh_one(&mut cache, &doc, CellRef::new(6, 6));
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
     }
 

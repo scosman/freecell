@@ -850,8 +850,16 @@ impl GridView {
             self.set_selection_and_emit(selection, window, cx);
         }
         if is_double {
+            // Opening the in-cell editor focuses its input (synchronously, inside this emit). But
+            // gpui registers an automatic focus-transfer for every `track_focus` element on
+            // mouse-down, and the grid root's transfer runs *later* in this same bubble dispatch —
+            // it would steal focus straight back to the grid, leaving the just-opened editor with
+            // no caret ("can't type", BUG D). `prevent_default` makes that built-in transfer skip
+            // (`Interactivity::paint_mouse_listeners` gates it on `!window.default_prevented()`),
+            // so the editor keeps focus. The explicit grid focus above already ran and is harmless.
             self.events
                 .emit(&GridEvent::OpenInCellEditor(cell), window, cx);
+            window.prevent_default();
         }
         // Begin a drag from the (kept or new) anchor; subsequent moves extend to the hovered cell.
         self.drag = Some(DragState {
@@ -2508,11 +2516,18 @@ impl GridView {
             rgb(ACCENT)
         };
         let editor = div()
+            .debug_selector(|| "in-cell-editor".into())
             .absolute()
             .left(px(x))
             .top(px(y))
             .w(px(w))
             .h(px(h))
+            // Capture clicks inside the editor so a click within its bounds moves the caret instead
+            // of falling through to the grid's mouse-down — which would treat it as a click-away and
+            // commit + close the edit (BUG D). The hosted input paints above this hitbox, so it
+            // still receives its own clicks; a click OUTSIDE the editor still reaches the grid and
+            // commits (outside-commit preserved).
+            .occlude()
             .flex()
             .items_center()
             .bg(rgb(CELL_BG))
@@ -2521,7 +2536,19 @@ impl GridView {
             .px(px(1.0))
             .text_size(px(CELL_FONT_PX))
             .text_color(rgb(CELL_TEXT))
-            .child(Input::new(input).w_full());
+            // Strip the hosted input's own chrome (border / rounded / background / shadow) via
+            // `appearance(false)` so it reads as editing the cell in place, not a control-in-a-box
+            // (BUG D). The 2 px accent border on this wrapper is the intended in-place edit cue
+            // (`ui_design.md §3`). Pin the input's text to the cell font (its default is `text_sm`
+            // = 14 px, one off the 13 px cell) and drop its horizontal padding so glyphs line up
+            // with the cell's own text rather than sitting inset like a control.
+            .child(
+                Input::new(input)
+                    .appearance(false)
+                    .text_size(px(CELL_FONT_PX))
+                    .px_0()
+                    .w_full(),
+            );
 
         let mut elements = vec![deferred(editor).into_any_element()];
 
@@ -3127,5 +3154,120 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    // ---- BUG D: in-cell editor focus + click capture (`functional_spec.md §1.3`) ----------
+
+    /// A real `GridView` over the demo sources plus a real in-cell `InputState`, wired so the event
+    /// sink focuses that input on `OpenInCellEditor` — exactly what the window's `begin_in_cell`
+    /// does. Returns the grid, the input, and the window so a **real** mouse event can be dispatched
+    /// through gpui (driving the grid root's built-in focus-transfer, which a direct
+    /// `handle_mouse_down` call would bypass).
+    fn grid_with_incell_focus_sink(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<GridView>,
+        gpui::Entity<InputState>,
+        gpui::WindowHandle<Root>,
+    ) {
+        cx.update(gpui_component::init);
+        let mut g_out = None;
+        let mut in_out = None;
+        let g_slot = &mut g_out;
+        let in_slot = &mut in_out;
+        let window = cx.open_window(size(px(1200.0), px(800.0)), |window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            *in_slot = Some(input.clone());
+            let sink_input = input.clone();
+            let sink = GridEventSink::new(move |e, window, cx| {
+                if let GridEvent::OpenInCellEditor(_) = e {
+                    sink_input.update(cx, |i, cx| i.focus(window, cx));
+                }
+            });
+            let g = cx.new(|cx| GridView::new(demo_sources(), sink, cx));
+            *g_slot = Some(g.clone());
+            Root::new(g, window, cx)
+        });
+        (g_out.unwrap(), in_out.unwrap(), window)
+    }
+
+    #[gpui::test]
+    fn double_click_keeps_focus_on_in_cell_input(cx: &mut TestAppContext) {
+        // Reproduces the exact interactive bug a direct-call test cannot: opening the editor focuses
+        // its input, but the grid root's built-in mouse-down focus-transfer runs later in the same
+        // bubble dispatch and used to steal focus straight back, leaving no caret. The
+        // `prevent_default` in `mouse_down_cell` defeats that; here we drive a *real* double-click.
+        let (grid, input, window) = grid_with_incell_focus_sink(cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+
+        // Deep in the data area (past the header gutter). The first click selects the cell; the
+        // click_count==2 down opens + focuses the editor.
+        let pos = gpui::point(px(400.0), px(300.0));
+        let mods = Modifiers::default();
+        vcx.simulate_click(pos, mods);
+        vcx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: mods,
+            click_count: 2,
+            first_mouse: false,
+        });
+        vcx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: mods,
+            click_count: 2,
+        });
+
+        let (input_focused, grid_focused) = vcx.update(|window, cx| {
+            (
+                input.read(cx).focus_handle(cx).is_focused(window),
+                grid.read(cx).focus_handle(cx).is_focused(window),
+            )
+        });
+        assert!(
+            input_focused,
+            "after a double-click the in-cell input must hold focus (a blinking caret)"
+        );
+        assert!(
+            !grid_focused,
+            "the grid must not re-steal focus after opening the in-cell editor"
+        );
+    }
+
+    #[gpui::test]
+    fn click_inside_open_in_cell_editor_does_not_reach_grid(cx: &mut TestAppContext) {
+        // With the editor open, a click *inside* its bounds must be captured by the editor overlay
+        // (`.occlude()`), not fall through to the grid's mouse-down — which would treat it as a
+        // click-away and commit + close the edit (BUG D). We assert no click-away `SelectionChanged`
+        // reaches the grid's event sink.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                g.update(cx, |grid, cx| {
+                    grid.set_incell_input(input, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, cx);
+                });
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        let bounds = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+        events.borrow_mut().clear();
+
+        vcx.simulate_click(bounds.center(), Modifiers::default());
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+            "a click inside the in-cell editor must not reach the grid: {:?}",
+            events.borrow()
+        );
     }
 }

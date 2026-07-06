@@ -2048,6 +2048,7 @@ impl ChromeView {
                         .id(gpui::ElementId::Name(
                             format!("swatch-{}", swatch.name).into(),
                         ))
+                        .debug_selector(|| format!("fill-swatch-{}", swatch.name))
                         .w(px(20.0))
                         .h(px(20.0))
                         .rounded_sm()
@@ -2079,6 +2080,14 @@ impl ChromeView {
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::Fill.idx()]))
+                    // Occlude the card so a mouse-down on it can't reach the backdrop's dismiss
+                    // listener painted behind it (BUG A/B): the card's `BlockMouse` hitbox drops
+                    // the backdrop out of the hit-test under the pointer, so `is_hovered` is false
+                    // there and the backdrop's `on_mouse_down` never fires. Without this, clicking
+                    // an item dismissed the popover on mouse-DOWN, tearing it down before the item's
+                    // `on_click` (mouse-UP) could apply. Items inside paint above the card, so their
+                    // own clicks are unaffected; a click OUTSIDE the card still dismisses.
+                    .occlude()
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -2092,6 +2101,7 @@ impl ChromeView {
                     .child(
                         Button::new("no-fill")
                             .label("No fill")
+                            .debug_selector(|| "fill-no-fill".into())
                             .ghost()
                             .small()
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -2159,6 +2169,8 @@ impl ChromeView {
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::TextColor.idx()]))
+                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
+                    .occlude()
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -2172,6 +2184,7 @@ impl ChromeView {
                     .child(
                         Button::new("text-automatic")
                             .label("Automatic")
+                            .debug_selector(|| "text-automatic".into())
                             .ghost()
                             .small()
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -2207,6 +2220,7 @@ impl ChromeView {
                     format!("numfmt-{}", category.label()).into(),
                 ))
                 .label(category.label())
+                .debug_selector(move || format!("numfmt-{}", category.label()))
                 .ghost()
                 .small()
                 .selected(category == active)
@@ -2230,6 +2244,9 @@ impl ChromeView {
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::NumFmt.idx()]))
+                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
+                    .occlude()
+                    .debug_selector(|| "numfmt-card".into())
                     .flex()
                     .flex_col()
                     .p_1()
@@ -2257,6 +2274,7 @@ impl ChromeView {
                     i as u64,
                 ))
                 .label(name.clone())
+                .debug_selector(move || format!("font-family-{i}"))
                 .ghost()
                 .small()
                 .selected(name.as_ref() == active)
@@ -2281,6 +2299,8 @@ impl ChromeView {
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::FontFamily.idx()]))
+                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
+                    .occlude()
                     .flex()
                     .flex_col()
                     .p_1()
@@ -2306,6 +2326,7 @@ impl ChromeView {
             menu = menu.child(
                 Button::new(gpui::ElementId::NamedInteger("font-size".into(), pt as u64))
                     .label(label.clone())
+                    .debug_selector(move || format!("font-size-{pt}"))
                     .ghost()
                     .small()
                     .selected(label == active)
@@ -2330,6 +2351,8 @@ impl ChromeView {
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::FontSize.idx()]))
+                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
+                    .occlude()
                     .flex()
                     .flex_col()
                     .p_1()
@@ -2355,6 +2378,7 @@ impl ChromeView {
                           cx: &mut Context<Self>| {
             Button::new(id)
                 .label(label)
+                .debug_selector(move || id.to_string())
                 .ghost()
                 .small()
                 .w(px(64.0))
@@ -2396,6 +2420,8 @@ impl ChromeView {
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::Borders.idx()]))
+                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
+                    .occlude()
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -2424,6 +2450,10 @@ impl ChromeView {
                     .absolute()
                     .bottom(px(TAB_BAR_H))
                     .left(px(16.0))
+                    // Occlude the card so Rename/Delete clicks don't trip the backdrop dismiss on
+                    // mouse-down before their `on_click` (mouse-up) fires (BUG A/B, same root cause
+                    // as the action-bar popovers).
+                    .occlude()
                     .flex()
                     .flex_col()
                     .p_1()
@@ -2634,6 +2664,17 @@ mod tests {
     }
 
     fn build(cx: &mut TestAppContext, sheets: Vec<SheetTab>, active: SheetId) -> Harness {
+        build_win(cx, sheets, active, 200.0)
+    }
+
+    /// [`build`] with a caller-chosen window height — the popover-click tests want a tall enough
+    /// window that every dropdown item lays out on-screen and can be hit by a simulated click.
+    fn build_win(
+        cx: &mut TestAppContext,
+        sheets: Vec<SheetTab>,
+        active: SheetId,
+        height: f32,
+    ) -> Harness {
         let client = Rc::new(RecordingClient::new());
         let grid_requests: Rc<RefCell<Vec<ChromeGridRequest>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -2644,7 +2685,7 @@ mod tests {
         let mut chrome_out: Option<Entity<ChromeView>> = None;
         let chrome_slot = &mut chrome_out;
 
-        let window = cx.open_window(size(px(900.0), px(200.0)), |window, cx| {
+        let window = cx.open_window(size(px(900.0), px(height)), |window, cx| {
             let client_dyn: Rc<dyn ChromeClient> = client_for_window;
             let reqs = reqs_for_window;
             let sink = ChromeGridSink::new(move |req, _w, _cx| reqs.borrow_mut().push(req.clone()));
@@ -2663,6 +2704,34 @@ mod tests {
 
     fn one_sheet(cx: &mut TestAppContext) -> Harness {
         build(cx, vec![SheetTab::new(SheetId(0), "Sheet1")], SheetId(0))
+    }
+
+    /// A stand-in for the hosted grid: an empty full-size body. Its only job is to make the chrome
+    /// **fill the window** (`render` flexes only when a body is present), so a popover's full-window
+    /// backdrop really spans the window height — the condition under which BUG A/B bites. With a
+    /// bodyless chrome the backdrop is only ~3 rows tall and the dropdown items lay out *below* it,
+    /// never overlapping it, so the regression would hide.
+    struct BodyStub;
+    impl gpui::Render for BodyStub {
+        fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+        }
+    }
+
+    /// One sheet in a tall window with a (stub) grid body, for the popover-click tests: every item
+    /// lays out on-screen over a full-height backdrop.
+    fn tall_sheet(cx: &mut TestAppContext) -> Harness {
+        let h = build_win(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            600.0,
+        );
+        upd(&h, cx, |c, _w, cx| {
+            let body: gpui::AnyView = cx.new(|_| BodyStub).into();
+            c.set_grid_body(body, cx);
+        });
+        h
     }
 
     /// Runs `f` against the chrome with a live `Window`.
@@ -3207,6 +3276,38 @@ mod tests {
     }
 
     #[gpui::test]
+    fn decimals_gating_for_custom_formats_matches_spec(cx: &mut TestAppContext) {
+        // BUG C audit: for a cell with an explicit *custom* number format, ± must be enabled iff the
+        // format is safely adjustable — single-section, no exponent (`E`/`e`), no quoted/escaped
+        // literal (`functional_spec.md §3.4`, the deliberate Phase-4 gate). This locks the exact
+        // enable/disable set so it can be reconciled against what the owner observed.
+        let h = one_sheet(cx);
+        fn gate(h: &Harness, cx: &mut TestAppContext, code: &str) -> (bool, bool) {
+            h.client.set_num_fmt(SheetId(0), cell(1, 1), code);
+            select_single(h, cx, 1, 1);
+            (
+                upd(h, cx, |c, _w, _cx| c.increase_decimals_enabled()),
+                upd(h, cx, |c, _w, _cx| c.decrease_decimals_enabled()),
+            )
+        }
+        // Safe single-section customs ARE enabled: increase always, decrease when ≥1 decimal.
+        assert_eq!(gate(&h, cx, "0.00"), (true, true), "0.00");
+        assert_eq!(gate(&h, cx, "#,##0.00"), (true, true), "#,##0.00");
+        assert_eq!(gate(&h, cx, "0.00%"), (true, true), "0.00%");
+        // `#,##0` has zero decimals → increase enabled, decrease a correct no-op (Excel: can't go
+        // below 0). This is NOT a bug: the format IS adjustable, there is just nothing to remove.
+        assert_eq!(gate(&h, cx, "#,##0"), (true, false), "#,##0");
+        // Only exponent / quoted / multi-section customs are (correctly) disabled both ways.
+        assert_eq!(gate(&h, cx, "0.00E+00"), (false, false), "0.00E+00");
+        assert_eq!(gate(&h, cx, "0.0\"x\""), (false, false), "0.0\"x\"");
+        assert_eq!(
+            gate(&h, cx, "0.00;[Red]0.00"),
+            (false, false),
+            "0.00;[Red]0.00"
+        );
+    }
+
+    #[gpui::test]
     fn controls_disabled_in_degraded_mode(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
         h.client.set_num_fmt(SheetId(0), cell(1, 1), "#,##0.00");
@@ -3239,6 +3340,261 @@ mod tests {
         assert!(
             h.client.take_commands().is_empty(),
             "no SetStylePath dispatches while degraded"
+        );
+    }
+
+    // ---- BUG A/B: popover item clicks APPLY (real mouse dispatch, not direct `apply_*`) -----
+    //
+    // These drive real mouse events through the rendered popover with a `VisualTestContext` over a
+    // full-height backdrop (`tall_sheet` mounts a body stub) — the path the part-1 anchor test and
+    // the `apply_*` unit tests never exercised. Empirically (see `card_padding_click_keeps_popover_
+    // open`) the full-window backdrop *does* dismiss on a mouse-DOWN, and it fires for a press that
+    // lands anywhere on the card that is NOT itself an occluding hitbox — the p_1/p_2 padding and
+    // the 1–2 px gaps between the small ghost menu buttons a user easily hits when aiming for an
+    // item. Wrapping the card in `.occlude()` drops the backdrop from the hit-test under the whole
+    // card, so no in-popover press can dismiss it. (These per-item tests are positive coverage that
+    // each item's real click still applies + closes; the discriminating guard for the fix is the
+    // padding test below, which fails without the card `.occlude()`.)
+
+    /// Opens a popover via `open`, paints, presses mouse **down** on the item registered under
+    /// debug-selector `item`, asserts `open_flag` still holds (the down did not dismiss), then
+    /// releases and returns the dispatched commands.
+    fn press_popover_button(
+        h: &Harness,
+        cx: &mut TestAppContext,
+        open: impl FnOnce(&mut ChromeView, &mut Window, &mut Context<ChromeView>),
+        item: &'static str,
+        open_flag: impl Fn(&ChromeView) -> bool,
+    ) -> Vec<Command> {
+        upd(h, cx, |c, w, cx| open(c, w, cx));
+        h.client.take_commands(); // drop anything incidental to opening; isolate the click
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let center = vcx
+            .debug_bounds(item)
+            .unwrap_or_else(|| panic!("popover item {item:?} was not painted"))
+            .center();
+        let mods = gpui::Modifiers::default();
+        vcx.simulate_mouse_down(center, MouseButton::Left, mods);
+        let alive = vcx.update(|_w, cx| open_flag(h.chrome.read(cx)));
+        assert!(
+            alive,
+            "popover item {item:?}: a mouse-DOWN must not dismiss the popover"
+        );
+        vcx.simulate_mouse_up(center, MouseButton::Left, mods);
+        h.client.take_commands()
+    }
+
+    #[gpui::test]
+    fn card_padding_click_keeps_popover_open(cx: &mut TestAppContext) {
+        // The discriminating guard for the card `.occlude()` fix: a mouse-DOWN inside the popover
+        // but not on an (occluding) button — its padding/gap — must not reach the backdrop's dismiss
+        // listener. Without the card `.occlude()` this press dismisses the popover (verified: it
+        // fails). It is the same hit a user makes aiming slightly off a small ghost menu row.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        h.client.take_commands();
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let card = vcx
+            .debug_bounds("numfmt-card")
+            .expect("the number-format card was painted");
+        // The card's top-left padding corner (inside the p_1 border, above the first menu button).
+        let pad = gpui::point(card.origin.x + px(1.0), card.origin.y + px(1.0));
+        vcx.simulate_mouse_down(pad, MouseButton::Left, gpui::Modifiers::default());
+        assert!(
+            vcx.update(|_w, cx| h.chrome.read(cx).num_fmt_open),
+            "a press on the card's padding must not dismiss the popover"
+        );
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a press on the card padding dispatches no command"
+        );
+    }
+
+    #[gpui::test]
+    fn numfmt_currency_click_applies_and_closes(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_num_fmt_popover(cx),
+            "numfmt-Currency",
+            |c| c.num_fmt_open,
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "$#,##0.00"),
+            "clicking Currency must dispatch the Currency num-fmt, got {cmds:?}"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "the popover must close after applying"
+        );
+    }
+
+    #[gpui::test]
+    fn text_color_automatic_click_applies_and_closes(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_text_color_popover(cx),
+            "text-automatic",
+            |c| c.text_color_open,
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::FontColor, value, .. }] if value.is_empty()),
+            "Automatic must clear the font colour (empty value), got {cmds:?}"
+        );
+        assert!(!upd(&h, cx, |c, _w, _cx| c.text_color_open));
+    }
+
+    #[gpui::test]
+    fn fill_no_fill_click_applies_and_closes(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_fill_popover(cx),
+            "fill-no-fill",
+            |c| c.fill_open,
+        );
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStyleAttr {
+                    attr: StyleAttr::Fill(None),
+                    ..
+                }]
+            ),
+            "No fill must clear the fill, got {cmds:?}"
+        );
+        assert!(!upd(&h, cx, |c, _w, _cx| c.fill_open));
+    }
+
+    #[gpui::test]
+    fn fill_swatch_click_applies_and_closes(cx: &mut TestAppContext) {
+        // A swatch uses `on_mouse_down` — it applies (and closes) on the DOWN, so it was never
+        // broken by the backdrop-on-down bug. This is positive coverage that the card `.occlude()`
+        // doesn't break a swatch's own click. A single down suffices to dispatch its command.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_fill_popover(cx));
+        h.client.take_commands();
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let center = vcx
+            .debug_bounds("fill-swatch-Background 1")
+            .expect("the first fill swatch was painted")
+            .center();
+        vcx.simulate_mouse_down(center, MouseButton::Left, gpui::Modifiers::default());
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStyleAttr { attr: StyleAttr::Fill(Some(rgb)), .. }] if rgb.to_hex() == 0xFFFFFF
+            ),
+            "the first swatch must apply its colour, got {cmds:?}"
+        );
+        assert!(!upd(&h, cx, |c, _w, _cx| c.fill_open));
+    }
+
+    #[gpui::test]
+    fn font_family_click_applies_and_closes(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        // Item 0 is always "System Default" → clears the family override (sent as `Some("")`).
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_font_family_popover(cx),
+            "font-family-0",
+            |c| c.font_family_open,
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetFont { family: Some(f), size_pt: None, .. }] if f.is_empty()),
+            "System Default must clear the font family, got {cmds:?}"
+        );
+        assert!(!upd(&h, cx, |c, _w, _cx| c.font_family_open));
+    }
+
+    #[gpui::test]
+    fn font_size_click_applies_and_closes(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_font_size_popover(cx),
+            "font-size-14",
+            |c| c.font_size_open,
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetFont { family: None, size_pt: Some(pt), .. }] if (*pt - 14.0).abs() < 1e-6),
+            "clicking 14 must set the font size to 14 pt, got {cmds:?}"
+        );
+        assert!(!upd(&h, cx, |c, _w, _cx| c.font_size_open));
+    }
+
+    #[gpui::test]
+    fn borders_all_click_applies_and_closes(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_borders_popover(cx),
+            "border-all",
+            |c| c.borders_open,
+        );
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetBorders {
+                    preset: BorderPreset::All,
+                    ..
+                }]
+            ),
+            "clicking All must dispatch the All border preset, got {cmds:?}"
+        );
+        assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open));
+    }
+
+    #[gpui::test]
+    fn popover_backdrop_outside_click_dismisses_without_dispatch(cx: &mut TestAppContext) {
+        // The occluded card must still let a click OUTSIDE it hit the backdrop → dismiss (and never
+        // dispatch a command).
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        h.client.take_commands();
+
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let card = vcx
+            .debug_bounds("numfmt-card")
+            .expect("the number-format card was painted");
+        // A point on the backdrop but clear of the card: same top strip as the card (so it is within
+        // the backdrop, which only spans the chrome height when no grid body is hosted) but far to
+        // its left (the number-format trigger anchors the card on the right).
+        let outside = gpui::point(px(10.0), card.origin.y + px(4.0));
+        assert!(
+            !card.contains(&outside),
+            "test point must be outside the card, card = {card:?}"
+        );
+        vcx.simulate_click(outside, gpui::Modifiers::default());
+
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "a click outside the card dismisses the popover"
+        );
+        assert!(
+            h.client.take_commands().is_empty(),
+            "dismissing via the backdrop dispatches no command"
         );
     }
 
@@ -3757,6 +4113,24 @@ mod tests {
             last_edit_state(&h.grid_requests.borrow()).and_then(|(_, ic, _)| ic),
             Some(cell(0, 0))
         );
+    }
+
+    #[gpui::test]
+    fn begin_in_cell_focuses_the_in_cell_input(cx: &mut TestAppContext) {
+        // BUG D (seam-level): opening the in-cell editor must focus its input so it shows a caret
+        // and accepts typing. The grid-side focus-transfer *race* — where the grid re-steals focus
+        // after `begin_in_cell` focuses the input — needs a real grid and is covered by the grid
+        // harness test `double_click_keeps_focus_on_in_cell_input`.
+        let h = idle_on_a1(cx, "42");
+        let focused = upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.edit
+                .in_cell()
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(focused, "the in-cell input must be focused on open");
     }
 
     #[gpui::test]

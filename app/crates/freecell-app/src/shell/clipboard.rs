@@ -10,7 +10,7 @@
 
 use gpui::{App, ClipboardItem};
 
-use freecell_core::{CellRef, SelectionModel, SheetId};
+use freecell_core::{CellRange, SelectionModel, SheetId};
 use freecell_engine::{Command, DocumentClient};
 
 /// Owns the "is the system clipboard still ours?" decision. Held by the window (behind a
@@ -52,14 +52,15 @@ impl ClipboardCoordinator {
         self.last_copy_text = Some(tsv);
     }
 
-    /// Cmd/Ctrl+V: paste at `anchor` (the selection's top-left). Reads the system clipboard and
-    /// picks the internal (full-fidelity) or external (TSV) path. A no-op if the clipboard has
-    /// no text. The window commits any pending edit *before* calling this
-    /// (`functional_spec.md §2.2`).
+    /// Cmd/Ctrl+V: paste into `target` (the destination selection). Reads the system clipboard and
+    /// picks the internal (full-fidelity) or external (TSV) path. The internal paste carries the
+    /// whole `target` so a single-cell source fills the selection (BUG 4); the TSV paste anchors at
+    /// `target.start` (its extent comes from the text). A no-op if the clipboard has no text. The
+    /// window commits any pending edit *before* calling this (`functional_spec.md §2.2`).
     pub fn paste(
         &mut self,
         sheet: SheetId,
-        anchor: CellRef,
+        target: CellRange,
         client: &DocumentClient,
         cx: &mut App,
     ) {
@@ -71,14 +72,14 @@ impl ClipboardCoordinator {
         }
         if self.last_copy_text.as_deref() == Some(text.as_str()) {
             // Still the newest thing on the clipboard → paste the full-fidelity worker payload.
-            client.send(Command::PasteInternal { sheet, anchor });
+            client.send(Command::PasteInternal { sheet, target });
         } else {
             // A foreign clipboard change: our slot is no longer the newest, so forget it and
-            // paste the plain text as TSV.
+            // paste the plain text as TSV (at the selection's top-left).
             self.last_copy_text = None;
             client.send(Command::PasteTsv {
                 sheet,
-                anchor,
+                anchor: target.start,
                 text,
             });
         }

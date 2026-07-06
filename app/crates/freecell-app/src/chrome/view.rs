@@ -19,8 +19,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable, Hsla,
-    KeyDownEvent, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
+    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
@@ -31,13 +31,14 @@ use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
 use freecell_core::format_ui::{
-    adjust_decimals, font_size_display, num_fmt_category, Category, DROPDOWN_FORMATS,
+    adjust_decimals_cell, displayed_decimals, font_size_display, num_fmt_category, Category,
+    DROPDOWN_FORMATS,
 };
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{Align, CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
+use freecell_core::{Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
 
 use freecell_engine::{
     BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
@@ -65,6 +66,28 @@ const TOOLTIP_BG: u32 = 0x2B2B2B;
 const TOOLTIP_TEXT: u32 = 0xF5F5F5;
 
 const ACTION_ROW_H: f32 = 36.0;
+
+/// The action-row dropdown/popover triggers whose panel anchors under the button. The buttons are
+/// content-sized (their labels — font family, size, number-format category — change width), so a
+/// popover's x-offset can't be a fixed constant (BUG 2c); each trigger's real laid-out left edge is
+/// captured into [`ChromeView::anchor_x`] by a `canvas` probe and the panel renders at that x.
+/// Discriminants are the `anchor_x` indices.
+#[derive(Clone, Copy)]
+enum Anchor {
+    FontFamily = 0,
+    FontSize = 1,
+    TextColor = 2,
+    Fill = 3,
+    Borders = 4,
+    NumFmt = 5,
+}
+const ANCHOR_COUNT: usize = 6;
+
+impl Anchor {
+    fn idx(self) -> usize {
+        self as usize
+    }
+}
 /// The action row's natural (uncompressed) width for the current control set — font family +
 /// size (Phase 5), B/I/U, text color + fill, **borders** (Phase 6), alignment, number format +
 /// decimals — with its dividers. The row never wraps (`ui_design.md §2`: raise the window's min
@@ -104,6 +127,11 @@ pub struct ChromeView {
     /// The active cell's font-family name (`""` = the workbook default = "System Default"), cached
     /// alongside `active_style` for the family dropdown's label. `None` on a multi-cell selection.
     active_font_family: Option<String>,
+    /// The active cell's evaluated kind + displayed value from the latest publication, cached
+    /// alongside `active_num_fmt` — lets the decimals ± buttons enable on a *numeric* General cell
+    /// (`200000`) while staying disabled on a text/date General cell (BUG 3). `None` on a multi-cell
+    /// selection or an empty/off-viewport active cell.
+    active_published: Option<(CellKind, String)>,
     /// The workbook's default font size in points, cached from the resident cache — the size box
     /// labels a **default** cell (`font_size_q == 0`) with this instead of a hardcoded value, so the
     /// label reflects the real default (13pt for a new workbook, the file's default otherwise —
@@ -162,6 +190,10 @@ pub struct ChromeView {
     /// The borders-preset popover's open state (a 4×2 preset grid — presets are actions, not
     /// toggles, so it carries no active-state derivation; `components/action_bar.md`).
     borders_open: bool,
+    /// The captured chrome-local left-x (device px) of each action-row dropdown trigger, so its
+    /// popover anchors under the real (content-sized) button rather than a hardcoded offset (BUG
+    /// 2c). Written by a per-button `canvas` bounds probe during paint; indexed by [`Anchor`].
+    anchor_x: [f32; ANCHOR_COUNT],
 
     /// The sheet tabs (the chrome's mirror of the worker's sheet list).
     sheets: Vec<SheetTab>,
@@ -233,6 +265,7 @@ impl ChromeView {
             active_style: None,
             active_num_fmt: None,
             active_font_family: None,
+            active_published: None,
             default_font_size_pt: None,
             degraded: false,
             data_row: DataRow::default(),
@@ -247,6 +280,7 @@ impl ChromeView {
             text_color_open: false,
             text_color_picker,
             num_fmt_open: false,
+            anchor_x: [0.0; ANCHOR_COUNT],
             font_names,
             font_family_open: false,
             font_size_open: false,
@@ -278,10 +312,12 @@ impl ChromeView {
             self.active_style = self.client.render_style(self.active_sheet, cell);
             self.active_num_fmt = self.client.num_fmt_code(self.active_sheet, cell);
             self.active_font_family = self.client.font_family_name(self.active_sheet, cell);
+            self.active_published = self.client.published_cell(self.active_sheet, cell);
         } else {
             self.active_style = None;
             self.active_num_fmt = None;
             self.active_font_family = None;
+            self.active_published = None;
         }
         // The workbook default size is selection-independent (used to label a default cell).
         self.default_font_size_pt = self.client.default_font_size_pt(self.active_sheet);
@@ -316,10 +352,14 @@ impl ChromeView {
             self.active_font_family = self
                 .client
                 .font_family_name(self.active_sheet, selection.active);
+            self.active_published = self
+                .client
+                .published_cell(self.active_sheet, selection.active);
         } else {
             self.active_style = None;
             self.active_num_fmt = None;
             self.active_font_family = None;
+            self.active_published = None;
         }
         // The workbook default size is selection-independent (used to label a default cell).
         self.default_font_size_pt = self.client.default_font_size_pt(self.active_sheet);
@@ -930,11 +970,17 @@ impl ChromeView {
     }
 
     /// Adjusts the active cell's number of decimal places by `delta` (`+1` / `-1`). Computed
-    /// UI-side from the cached format string; a no-op format (`adjust_decimals` → `None`) does
-    /// nothing (the buttons also render disabled in that case).
+    /// UI-side from the cached format string and the active cell's kind/display: a real numeric
+    /// format is rewritten directly, and a *numeric* General cell (`200000`) is switched to a
+    /// `0.0…` format (BUG 3); a no-op (`adjust_decimals_cell` → `None`) does nothing (the buttons
+    /// also render disabled in that case).
     pub fn bump_decimals(&mut self, delta: i8, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.active_num_fmt.clone();
-        if let Some(new_code) = current.as_deref().and_then(|c| adjust_decimals(c, delta)) {
+        let (numeric, displayed) = self.active_numeric_decimals();
+        if let Some(new_code) = current
+            .as_deref()
+            .and_then(|c| adjust_decimals_cell(c, delta, numeric, displayed))
+        {
             self.apply_num_fmt(&new_code, window, cx);
         }
     }
@@ -1356,12 +1402,24 @@ impl ChromeView {
     }
 
     fn decimals_enabled(&self, delta: i8) -> bool {
-        !self.degraded
-            && self
-                .active_num_fmt
-                .as_deref()
-                .map(|c| adjust_decimals(c, delta).is_some())
-                .unwrap_or(false)
+        if self.degraded {
+            return false;
+        }
+        let (numeric, displayed) = self.active_numeric_decimals();
+        self.active_num_fmt
+            .as_deref()
+            .and_then(|c| adjust_decimals_cell(c, delta, numeric, displayed))
+            .is_some()
+    }
+
+    /// Whether the active cell is a *number* (not text/date/bool/error/empty) and, if so, how many
+    /// decimals its value currently displays — the inputs the decimals ± need to enable/adjust a
+    /// General-formatted number (BUG 3). Both come from the cached publication of the active cell.
+    fn active_numeric_decimals(&self) -> (bool, Option<u8>) {
+        match &self.active_published {
+            Some((CellKind::Number, display)) => (true, displayed_decimals(display)),
+            _ => (false, None),
+        }
     }
 
     /// Whether the worker is degraded (read-only) — all mutating action-bar controls disable.
@@ -1490,6 +1548,40 @@ impl Render for ChromeView {
 }
 
 impl ChromeView {
+    /// Wraps a dropdown/popover trigger `button` so its panel can anchor under the real, laid-out
+    /// button position instead of a guessed pixel offset (BUG 2c). A zero-size `canvas` probe
+    /// fills the wrapper and records the button's window-x into `anchor_x[which]` on each paint —
+    /// chrome-local x equals window x (the chrome fills the window width from x = 0), and only the
+    /// x is needed (the panel's y is the fixed action-row height). It notifies only on a real
+    /// change, so a stable layout captures once and never render-loops.
+    fn anchored_trigger(
+        &self,
+        which: Anchor,
+        button: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let probe = cx.entity().downgrade();
+        let idx = which.idx();
+        div().relative().child(button).child(
+            canvas(
+                move |bounds, _window, app| {
+                    probe
+                        .update(app, |this, cx| {
+                            let x = f32::from(bounds.origin.x);
+                            if (this.anchor_x[idx] - x).abs() > 0.5 {
+                                this.anchor_x[idx] = x;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+    }
+
     fn render_action_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Every mutating control disables in degraded/read-only mode (`functional_spec.md §6`).
         let disabled = self.degraded;
@@ -1544,30 +1636,38 @@ impl ChromeView {
             .border_color(rgb(HAIRLINE))
             // Font family · size (`ui_design.md §2`):
             .child(
-                Button::new("font-family")
-                    .label(format!("{} ▾", self.font_family_label()))
-                    .tooltip("Font")
-                    .ghost()
-                    .small()
-                    .w(px(140.0))
-                    .disabled(disabled)
-                    .selected(self.font_family_open)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_font_family_popover(cx);
-                    })),
+                self.anchored_trigger(
+                    Anchor::FontFamily,
+                    Button::new("font-family")
+                        .label(format!("{} ▾", self.font_family_label()))
+                        .tooltip("Font")
+                        .ghost()
+                        .small()
+                        .w(px(140.0))
+                        .disabled(disabled)
+                        .selected(self.font_family_open)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_font_family_popover(cx);
+                        })),
+                    cx,
+                ),
             )
             .child(
-                Button::new("font-size")
-                    .label(format!("{} ▾", self.font_size_label()))
-                    .tooltip("Font size")
-                    .ghost()
-                    .small()
-                    .w(px(56.0))
-                    .disabled(disabled)
-                    .selected(self.font_size_open)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_font_size_popover(cx);
-                    })),
+                self.anchored_trigger(
+                    Anchor::FontSize,
+                    Button::new("font-size")
+                        .label(format!("{} ▾", self.font_size_label()))
+                        .tooltip("Font size")
+                        .ghost()
+                        .small()
+                        .w(px(56.0))
+                        .disabled(disabled)
+                        .selected(self.font_size_open)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_font_size_popover(cx);
+                        })),
+                    cx,
+                ),
             )
             .child(action_divider())
             // B I U:
@@ -1598,42 +1698,54 @@ impl ChromeView {
             .child(action_divider())
             // Text color · Fill:
             .child(
-                Button::new("text-color")
-                    .label("A ▾")
-                    .tooltip("Text color")
-                    .ghost()
-                    .small()
-                    .disabled(disabled)
-                    .selected(self.text_color_open)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_text_color_popover(cx);
-                    })),
+                self.anchored_trigger(
+                    Anchor::TextColor,
+                    Button::new("text-color")
+                        .label("A ▾")
+                        .tooltip("Text color")
+                        .ghost()
+                        .small()
+                        .disabled(disabled)
+                        .selected(self.text_color_open)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_text_color_popover(cx);
+                        })),
+                    cx,
+                ),
             )
             .child(
-                Button::new("fill")
-                    .label("Fill ▾")
-                    .tooltip("Fill color")
-                    .ghost()
-                    .small()
-                    .disabled(disabled)
-                    .selected(self.fill_open)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_fill_popover(cx);
-                    })),
+                self.anchored_trigger(
+                    Anchor::Fill,
+                    Button::new("fill")
+                        .label("Fill ▾")
+                        .tooltip("Fill color")
+                        .ghost()
+                        .small()
+                        .disabled(disabled)
+                        .selected(self.fill_open)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_fill_popover(cx);
+                        })),
+                    cx,
+                ),
             )
             .child(action_divider())
             // Borders preset popover:
             .child(
-                Button::new("borders")
-                    .label("⊞ ▾")
-                    .tooltip("Borders")
-                    .ghost()
-                    .small()
-                    .disabled(disabled)
-                    .selected(self.borders_open)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_borders_popover(cx);
-                    })),
+                self.anchored_trigger(
+                    Anchor::Borders,
+                    Button::new("borders")
+                        .label("⊞ ▾")
+                        .tooltip("Borders")
+                        .ghost()
+                        .small()
+                        .disabled(disabled)
+                        .selected(self.borders_open)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_borders_popover(cx);
+                        })),
+                    cx,
+                ),
             )
             .child(action_divider())
             // Alignment L / C / R:
@@ -1655,16 +1767,20 @@ impl ChromeView {
             .child(action_divider())
             // Number format dropdown + decimals ±:
             .child(
-                Button::new("num-fmt")
-                    .label(format!("{} ▾", self.num_fmt_category_label()))
-                    .tooltip("Number format")
-                    .ghost()
-                    .small()
-                    .disabled(disabled)
-                    .selected(self.num_fmt_open)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.toggle_num_fmt_popover(cx);
-                    })),
+                self.anchored_trigger(
+                    Anchor::NumFmt,
+                    Button::new("num-fmt")
+                        .label(format!("{} ▾", self.num_fmt_category_label()))
+                        .tooltip("Number format")
+                        .ghost()
+                        .small()
+                        .disabled(disabled)
+                        .selected(self.num_fmt_open)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_num_fmt_popover(cx);
+                        })),
+                    cx,
+                ),
             )
             .child(
                 Button::new("decimals-inc")
@@ -1881,12 +1997,23 @@ impl ChromeView {
         on_dismiss: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        div().absolute().top_0().left_0().size_full().on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                on_dismiss(this, window, cx);
-            }),
-        )
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            // Occlude the grid behind the popover: `BlockMouse` makes every hitbox behind this one
+            // (the grid) un-hovered and un-scrollable, so a click on the overlay no longer also
+            // moves the grid selection (BUG 2a) and scrolling anywhere over it no longer scrolls the
+            // grid underneath (BUG 2b). The popover card, painted *after* this backdrop, still gets
+            // its own clicks/scroll (it is in front, not behind).
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    on_dismiss(this, window, cx);
+                }),
+            )
     }
 
     /// The cap-error popover (`functional_spec.md §4.2`, `ui_design.md §4`): a small dark
@@ -1951,7 +2078,7 @@ impl ChromeView {
                 div()
                     .absolute()
                     .top(px(ACTION_ROW_H))
-                    .left(px(120.0))
+                    .left(px(self.anchor_x[Anchor::Fill.idx()]))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -2031,7 +2158,7 @@ impl ChromeView {
                 div()
                     .absolute()
                     .top(px(ACTION_ROW_H))
-                    .left(px(180.0))
+                    .left(px(self.anchor_x[Anchor::TextColor.idx()]))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -2102,7 +2229,7 @@ impl ChromeView {
                 div()
                     .absolute()
                     .top(px(ACTION_ROW_H))
-                    .left(px(360.0))
+                    .left(px(self.anchor_x[Anchor::NumFmt.idx()]))
                     .flex()
                     .flex_col()
                     .p_1()
@@ -2153,7 +2280,7 @@ impl ChromeView {
                     .id("font-family-menu")
                     .absolute()
                     .top(px(ACTION_ROW_H))
-                    .left(px(8.0))
+                    .left(px(self.anchor_x[Anchor::FontFamily.idx()]))
                     .flex()
                     .flex_col()
                     .p_1()
@@ -2202,7 +2329,7 @@ impl ChromeView {
                     .id("font-size-menu")
                     .absolute()
                     .top(px(ACTION_ROW_H))
-                    .left(px(150.0))
+                    .left(px(self.anchor_x[Anchor::FontSize.idx()]))
                     .flex()
                     .flex_col()
                     .p_1()
@@ -2268,7 +2395,7 @@ impl ChromeView {
                 div()
                     .absolute()
                     .top(px(ACTION_ROW_H))
-                    .left(px(300.0))
+                    .left(px(self.anchor_x[Anchor::Borders.idx()]))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -2475,6 +2602,11 @@ impl ChromeView {
     /// Test seam: which editor currently drives the edit.
     fn edit_origin(&self) -> EditOrigin {
         self.edit.origin()
+    }
+
+    /// Test seam: the captured chrome-local left-x of a dropdown trigger (BUG 2c anchoring).
+    fn anchor_x_of(&self, which: Anchor) -> f32 {
+        self.anchor_x[which.idx()]
     }
 }
 
@@ -2995,6 +3127,82 @@ mod tests {
         assert!(
             h.client.take_commands().is_empty(),
             "a no-op decimals adjust sends nothing"
+        );
+    }
+
+    #[gpui::test]
+    fn dropdown_anchors_capture_button_positions_left_to_right(cx: &mut TestAppContext) {
+        // BUG 2c: each dropdown popover anchors under its real (content-sized) trigger button, not
+        // a hardcoded x. After a paint, the `canvas` probes capture each button's laid-out left
+        // edge; they must land in left-to-right action-row order and be strictly increasing.
+        let h = one_sheet(cx);
+        // Force the window to paint so the canvas probes capture each button's laid-out x.
+        {
+            let vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+        }
+
+        let xs = upd(&h, cx, |c, _w, _cx| {
+            [
+                c.anchor_x_of(Anchor::FontFamily),
+                c.anchor_x_of(Anchor::FontSize),
+                c.anchor_x_of(Anchor::TextColor),
+                c.anchor_x_of(Anchor::Fill),
+                c.anchor_x_of(Anchor::Borders),
+                c.anchor_x_of(Anchor::NumFmt),
+            ]
+        });
+        assert!(
+            xs[0] >= 0.0 && xs.windows(2).all(|w| w[1] > w[0]),
+            "trigger anchors must be captured in strictly increasing left-to-right order, got {xs:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn decimals_enabled_on_general_numeric_cell(cx: &mut TestAppContext) {
+        // BUG 3: a plain number like `200000` is stored with the General format. The ± must still
+        // be adjustable — increase applies `0.0`; decrease is a no-op at zero decimals (disabled).
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "general");
+        h.client
+            .set_published_cell(SheetId(0), cell(1, 1), CellKind::Number, "200000");
+        select_single(&h, cx, 1, 1);
+
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.increase_decimals_enabled()),
+            "increase must be enabled on a General-formatted number"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.decrease_decimals_enabled()),
+            "decrease is a no-op on a General integer (0 decimals)"
+        );
+
+        upd(&h, cx, |c, window, cx| c.bump_decimals(1, window, cx));
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "0.0"
+            ),
+            "increase on a General number applies a 0.0 format, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn decimals_disabled_on_general_text_cell(cx: &mut TestAppContext) {
+        // A text cell under General is not numeric → the ± stay disabled and no-op.
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "general");
+        h.client
+            .set_published_cell(SheetId(0), cell(1, 1), CellKind::Text, "hello");
+        select_single(&h, cx, 1, 1);
+
+        assert!(!upd(&h, cx, |c, _w, _cx| c.increase_decimals_enabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.decrease_decimals_enabled()));
+        upd(&h, cx, |c, window, cx| c.bump_decimals(1, window, cx));
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a text General cell must not emit a number-format change"
         );
     }
 

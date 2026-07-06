@@ -152,6 +152,90 @@ fn last_zero_group(code: &str) -> Option<(usize, usize, usize)> {
     best
 }
 
+/// Whether `code` is the engine's General format (or the empty/absent code) — the default
+/// numeric display that carries no `0` placeholder, so [`adjust_decimals`] treats it as a no-op.
+fn is_general(code: &str) -> bool {
+    let t = code.trim();
+    t.is_empty() || t.eq_ignore_ascii_case("general")
+}
+
+/// The number-format code for a plain number with `n` decimal places: `0` → `"0"`, `2` → `"0.00"`.
+fn decimals_code(n: u8) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut s = String::with_capacity(2 + n as usize);
+    s.push_str("0.");
+    for _ in 0..n {
+        s.push('0');
+    }
+    s
+}
+
+/// The count of fractional digits a **plain decimal** number displays, for the General-format
+/// decimals ± entry point: `"200000"` → `Some(0)`, `"200000.5"` → `Some(1)`, `"-1,234.50"` →
+/// `Some(2)`. Returns `None` for any text that isn't a plain decimal — scientific notation
+/// (`"1E+20"`), error strings, booleans — so the ± stays disabled on a General cell whose value
+/// can't be cleanly re-expressed as `0.0…` (`components/action_bar.md §Command emission`).
+///
+/// A leading sign is allowed and thousands separators (`,`) are tolerated (General never emits
+/// one, but a robust scan shouldn't reject one); anything else makes it not-a-plain-number.
+pub fn displayed_decimals(text: &str) -> Option<u8> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let mut seen_dot = false;
+    let mut frac: u8 = 0;
+    let mut any_digit = false;
+    for &b in body.as_bytes() {
+        match b {
+            b'0'..=b'9' => {
+                any_digit = true;
+                if seen_dot {
+                    frac = frac.checked_add(1)?;
+                }
+            }
+            b'.' if !seen_dot => seen_dot = true,
+            b',' if !seen_dot => {} // thousands separator — ignore
+            _ => return None,       // scientific `E`, currency symbol, letters → not a plain number
+        }
+    }
+    any_digit.then_some(frac)
+}
+
+/// The decimals ±1 result for a specific **cell**, layered on [`adjust_decimals`]: a format that
+/// already carries an editable decimal group (Number/Currency/Percent/thousands, or a bare `0`)
+/// is rewritten exactly as before, independent of the cell's kind. The **new** case this adds is
+/// a *numeric* cell shown under **General** — Excel enables ± on a plain number by switching it to
+/// a `0.0…` format (`200000` → increase → `"0.0"`; a General value already showing N decimals
+/// starts from `0.{N}`). `numeric` gates this to real number cells (text / date / bool / error /
+/// empty → `false` → stays disabled), and `displayed` (the cell's shown decimal count, `None` for
+/// a non-plain display like scientific) gates the entry point. The unsafe custom formats
+/// [`adjust_decimals`] already refuses (multi-section / exponent / quoted) are **not** General, so
+/// they stay gated off here too.
+pub fn adjust_decimals_cell(
+    code: &str,
+    delta: i8,
+    numeric: bool,
+    displayed: Option<u8>,
+) -> Option<String> {
+    if let Some(next) = adjust_decimals(code, delta) {
+        return Some(next);
+    }
+    if numeric && is_general(code) {
+        let displayed = displayed?;
+        let next = match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => displayed.checked_add(1)?,
+            std::cmp::Ordering::Less => displayed.checked_sub(1)?, // 0 decimals → None (disabled)
+            std::cmp::Ordering::Equal => return None,
+        };
+        return Some(decimals_code(next));
+    }
+    None
+}
+
 /// The size-dropdown display for a quarter-point font size (`components/action_bar.md`): `0` → the
 /// engine default `"11"`; otherwise `q/4` with a trailing `.0` trimmed (e.g. `48` → `"12"`,
 /// `46` → `"11.5"`).
@@ -237,6 +321,72 @@ mod tests {
         );
         assert_eq!(adjust_decimals("0.00%", 1).as_deref(), Some("0.000%"));
         assert_eq!(adjust_decimals("0.00%", -1).as_deref(), Some("0.0%"));
+    }
+
+    #[test]
+    fn displayed_decimals_counts_fraction_of_plain_numbers_only() {
+        assert_eq!(displayed_decimals("200000"), Some(0));
+        assert_eq!(displayed_decimals("200000.5"), Some(1));
+        assert_eq!(displayed_decimals("-1,234.50"), Some(2));
+        assert_eq!(displayed_decimals("0"), Some(0));
+        // Not plain decimals → the ± must stay disabled.
+        assert_eq!(displayed_decimals(""), None);
+        assert_eq!(displayed_decimals("1E+20"), None); // scientific
+        assert_eq!(displayed_decimals("#DIV/0!"), None); // error text
+        assert_eq!(displayed_decimals("hello"), None);
+        assert_eq!(displayed_decimals("TRUE"), None);
+    }
+
+    #[test]
+    fn adjust_decimals_cell_enables_general_numeric() {
+        // `200000` is a General-formatted number (GAPS bug): increase enables → `0.0`; decrease is
+        // a no-op at zero decimals (disabled).
+        assert_eq!(
+            adjust_decimals_cell("general", 1, true, Some(0)).as_deref(),
+            Some("0.0")
+        );
+        assert_eq!(adjust_decimals_cell("general", -1, true, Some(0)), None);
+        // A General number already showing decimals starts from its displayed count.
+        assert_eq!(
+            adjust_decimals_cell("general", 1, true, Some(2)).as_deref(),
+            Some("0.000")
+        );
+        assert_eq!(
+            adjust_decimals_cell("general", -1, true, Some(2)).as_deref(),
+            Some("0.0")
+        );
+        assert_eq!(
+            adjust_decimals_cell("general", -1, true, Some(1)).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn adjust_decimals_cell_disabled_for_nonnumeric_and_nonplain() {
+        // A text cell under General is never adjustable, either direction.
+        assert_eq!(adjust_decimals_cell("general", 1, false, Some(0)), None);
+        assert_eq!(adjust_decimals_cell("general", -1, false, Some(0)), None);
+        // A numeric General cell whose display isn't a plain decimal (scientific) → disabled.
+        assert_eq!(adjust_decimals_cell("general", 1, true, None), None);
+    }
+
+    #[test]
+    fn adjust_decimals_cell_preserves_existing_format_gating() {
+        // Real numeric formats behave exactly as `adjust_decimals`, kind-independent.
+        assert_eq!(
+            adjust_decimals_cell("#,##0.00", 1, true, None).as_deref(),
+            Some("#,##0.000")
+        );
+        assert_eq!(
+            adjust_decimals_cell("0.00%", -1, false, None).as_deref(),
+            Some("0.0%")
+        );
+        // The unsafe custom formats stay gated off even for a numeric cell (they aren't General).
+        assert_eq!(adjust_decimals_cell("0.00E+00", 1, true, Some(2)), None);
+        assert_eq!(
+            adjust_decimals_cell("#,##0.00;(#,##0.00)", 1, true, Some(2)),
+            None
+        );
     }
 
     #[test]

@@ -7,6 +7,11 @@
 # (= 2× the p99 calibrated on this runner image — render-tests/src/perf.rs `CI_*`) and on the
 # zero-engine-calls-on-scroll gate. Real-hardware budgets (8.33 ms / 2 ms) stay the product
 # truth, checked on macos-verify. Recalibrate only deliberately (a committed change).
+#
+# DISK: this job does a RELEASE build (optimized, no debug info) of a single bin
+# (perf_harness), so target/ stays small — ~1.9 GB cold, measured locally — and fits the
+# runner's ~16 GB free on / (observed in CI run #29, before any prune) with NO disk prune.
+# That is unlike render.yml, which does the disk-hungry DEBUG pixel build and KEEPS its prune.
 
 name: perf-gates
 
@@ -32,8 +37,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # No incremental artifacts in CI (large + useless; rust-cache discards them). The release
-  # profile already emits no debug info, so no debug trim is needed here — the disk win for
-  # this job comes from the free-disk step below.
+  # profile already emits no debug info, so target/ stays small and no debug trim (or disk
+  # prune) is needed here — see the DISK note in the header.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -41,19 +46,8 @@ jobs:
     name: perf harness (Linux, buffered thresholds)
     runs-on: ubuntu-24.04
     steps:
-      # Same disk reclaim as checks.yml: the release build of this GPUI/zed-scale tree is large,
-      # and this job also lacked any headroom step. See checks.yml for the full rationale.
-      - name: Free runner disk (drop preinstalled SDKs unused by this Rust build)
-        run: |
-          echo "== disk before =="; df -h /
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL || true
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          echo "== disk after =="; df -h /
-
+      # (No free-disk prune step — see the DISK note in the header: the release build's target/
+      # is ~1.9 GB, far under the runner's ~16 GB free. Dropping it saved ~1m13 per run.)
       - uses: actions/checkout@v4
 
       # Build deps for the GPUI (blade/Vulkan) release build + the perf harness's virtual

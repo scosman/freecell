@@ -8,6 +8,20 @@ round-3 C `ci_rendering`). A pixel test failing means the product is wrong, not 
 scenes run engine → `Publication` + `SheetCaches` → grid → pixels. Full design:
 `../../specs/projects/mvp/components/render_test_harness.md`.
 
+## Setup (Linux only)
+
+Rendering + capture is **Linux-only** (Xvfb + Mesa lavapipe). Install everything with the
+one canonical setup script — the single source of truth CI uses too, so environments can't
+drift:
+
+```sh
+app/render-tests/scripts/setup_render_env.sh   # capture stack + build deps + DejaVu Serif
+```
+
+> **The UI font (Inter) is bundled in the app binary** (`assets/fonts/inter/`, registered
+> at startup via `add_fonts` — see `crates/freecell-app/src/shell/fonts.rs`), so **no system
+> UI font is required** and bold/italic render correctly on every platform. See *Font* below.
+
 ## How it runs
 
 ```sh
@@ -34,11 +48,27 @@ render-tests/scripts/render_tests.sh generate [--only <prefix>]
   the GPUI-free perceptual-diff unit tests (`tests/perceptual_diff.rs`) still run; CI runs
   the real gate via `render_tests.sh` (a required step in `checks.yml`).
 
+## Font: bundled Inter (cross-platform)
+
+The grid + chrome render in **Inter**, vendored under
+`crates/freecell-app/assets/fonts/inter/` (4 static RIBBI faces, SIL OFL) and registered at
+startup by `shell/fonts.rs::register_fonts` via `cx.text_system().add_fonts(...)`. The
+render harness registers the same faces (`render-tests/src/render.rs`), so captures match
+the app.
+
+Bundling is **load-bearing, not cosmetic**. Before it, the app used GPUI's platform-default
+UI font: `.SystemUIFont` — the real system font on macOS, but on Linux gpui rewrites that to
+`"IBM Plex Sans"`, and when *that* is absent it collapses to a single regular face with **no
+bold/italic** (weight/style silently render as regular). That made every pre-Inter baseline
+untrustworthy (`cell_bold` was byte-identical to `cell_plain`). Bundling Inter — which ships
+real Bold/Italic/BoldItalic faces — fixes bold/italic **and** makes macOS, Linux, and CI
+render the *same* font, so a baseline represents what every platform shows.
+
 ## Pinned baseline environment (record on every re-baseline)
 
-Baselines are captured on and validated against **this exact image**; software
-rasterization + the (Phase-10) bundled Inter font make them bit-stable. Re-baseline only on
-this class of runner:
+Baselines are captured on and validated against **this exact image**. The bundled Inter font
+means the *text* is font-stable everywhere; lavapipe's software rasterization makes the
+*pixels* bit-stable on this runner class. Re-baseline only here:
 
 | | |
 |---|---|
@@ -46,21 +76,38 @@ this class of runner:
 | Rust toolchain | `1.95.0` (`app/rust-toolchain.toml`) |
 | Mesa (lavapipe) | `mesa-vulkan-drivers` 25.2.8-0ubuntu0.24.04.2 → device `llvmpipe (LLVM 20.1.2, 256 bits)` |
 | Vulkan loader | `libvulkan1` 1.3.275.0 |
+| UI font | **Inter (bundled in the binary)** — not a system package |
+| Serif case font | `fonts-dejavu-core` (DejaVu Serif) — the only system font the suite needs |
 
 Dev-machine renders (a real GPU) are for **eyeballing only** — never commit them as
 baselines; their anti-aliasing differs from lavapipe.
 
-## The human baseline process (a review requirement)
+## The baseline process — agent generates + eyeballs; human signs off pre-merge
 
-Baselines are **committed PNGs** and must be trustworthy:
+Baselines are **committed PNGs** and must be trustworthy. Generating + capturing them is
+**Linux-only**, so this is the **implementing agent's** job — never hand "please run
+generate" to a human on macOS (it cannot render the suite). The split is:
 
-1. Regenerate on the pinned runner image (CI artifact job, or a matching container):
+**Pre-commit — the agent that changes rendering owns the pixels:**
+
+1. On a Linux box (or `render_tests.sh`-capable container), run the setup script, then
    `render-tests/scripts/render_tests.sh generate [--only <prefix>]` — prints a
    **NEW / CHANGED / unchanged** summary.
-2. **Visually inspect every NEW/CHANGED PNG.** Open `render-tests/baselines/` and look.
-   Never regenerate baselines to "make CI green" without eyeballing what moved.
+2. **Eyeball every NEW/CHANGED PNG with vision** — open each `render-tests/baselines/*.png`
+   and confirm it actually renders its feature (e.g. `cell_bold` is *visibly bolder* than
+   `cell_plain`; `cell_fill_red` is red; alignment/geometry are right). An agent does this by
+   reading the PNGs directly (vision), comparing against the case's intent in `src/cases.rs`.
+   **Fix any defect before committing** — never regenerate to "make CI green" without looking.
 3. Commit the baselines **together with** the code change that moved the pixels, with a
-   message saying why they changed.
+   message saying why they changed. Open a PR.
+
+**Pre-merge — a human signs off on the visuals, on GitHub:**
+
+4. A human reviewer opens the PR's **Files changed** tab (GitHub renders image diffs for the
+   changed PNGs) and visually confirms the new baselines look right **before merging**. This
+   gate is *pre-merge, not pre-commit* — the human reviews rendered images on GitHub, not a
+   local checkout. It is enforced by `.github/CODEOWNERS` (baseline changes require a
+   code-owner review); keep branch protection's "require review from Code Owners" on.
 
 ## Adding a rendering feature / case
 
@@ -70,7 +117,8 @@ declarative case table — one axis or meaningful permutation per case, snake_ca
 1. Add the `RenderCase` to `src/cases.rs` (`cases::all()`).
 2. Add the case name to the `render_cases! { … }` list in `tests/render_suite.rs`
    (`case_names_match_table` fails the build if the two drift).
-3. Regenerate its baseline, **eyeball it**, and commit it in the same PR.
+3. Generate its baseline, **eyeball it with vision + fix any defect** (agent, pre-commit),
+   commit it in the same PR, and get the **human pre-merge sign-off** (above).
 
 Scenes drive the real worker: values/formulas/errors and number formats via `SetCellInput`
 (IronCalc **infers** currency/percent/thousands/date from the input string), and

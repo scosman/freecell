@@ -75,10 +75,10 @@ pub const EDGE_AUTOSCROLL_HOTZONE_PX: f64 = 24.0;
 /// edge with no mouse-move events" case; a live `window.mouse_position()` drives the extend).
 pub const AUTOSCROLL_INTERVAL_MS: u64 = 16;
 
-/// The grid/cell font family the design *intends* (`ui_design.md §3.3`: bundled Inter).
-/// **Reserved, not applied in MVP** — the grid renders on GPUI's default UI font (bundling
-/// Inter was deferred; see `shell/fonts.rs` + `projects/bundled-inter-font.md`). Kept in one
-/// place so a future font pass names the family here and at the `grid/view.rs` text sites.
+/// The grid/cell font family (`ui_design.md §3.3`: bundled Inter). The app registers the
+/// bundled Inter faces and sets this as the UI font at startup (`shell/fonts.rs`), and the grid
+/// also names it explicitly at its `grid/view.rs` text sites (cell + header) for robustness.
+/// Named in one place so the registration and the text sites stay in sync.
 pub const GRID_FONT_FAMILY: &str = "Inter";
 
 /// Which axis a structural interaction targets — a resize / insert / delete of rows or columns

@@ -57,8 +57,11 @@ suite is a separate step, below).
 
 The cell-render snapshot suite (`render-tests/`) renders the **real** `GridView` over
 scenes produced by the **real** engine, captures PNGs on Linux under **Xvfb + Mesa
-lavapipe** (software Vulkan), and perceptually diffs them against 48 committed baselines —
-one `#[test]` per feature/permutation, so a red line names the exact broken thing.
+lavapipe** (software Vulkan), and perceptually diffs them against the committed baselines —
+one `#[test]` per feature/permutation, so a red line names the exact broken thing. Text
+renders in the **bundled Inter** font (registered via `add_fonts`), so bold/italic and
+metrics are identical on macOS, Linux, and CI. Install the Linux capture stack with
+`render-tests/scripts/setup_render_env.sh`.
 
 ```sh
 render-tests/scripts/render_tests.sh test              # run the full pixel suite (asserts baselines)

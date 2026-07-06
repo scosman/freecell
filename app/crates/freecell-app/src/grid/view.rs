@@ -42,7 +42,7 @@ use super::layout::{
 use super::{
     GridEvent, GridEventSink, RowOrCol, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX,
     CELL_H_PAD, CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, GRIDLINE,
-    HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT,
+    GRID_FONT_FAMILY, HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT,
     SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
 };
 
@@ -2401,7 +2401,10 @@ fn cell_element(
         .whitespace_nowrap()
         .px(px(CELL_H_PAD))
         .text_size(px(CELL_FONT_PX))
-        .text_color(text_color);
+        .text_color(text_color)
+        // Render the grid in the bundled Inter family (an explicit per-cell family below still
+        // wins, e.g. the serif case).
+        .font_family(GRID_FONT_FAMILY);
 
     // Explicit alignment wins; otherwise fall back to the cell's type-aware default
     // (numbers/dates right, booleans/errors center, text left — `architecture.md §1.3`).
@@ -2465,6 +2468,7 @@ fn header_element(x: f32, y: f32, w: f32, h: f32, label: String, selected: bool)
         .border_color(rgb(HEADER_HAIRLINE))
         .text_size(px(HEADER_FONT_PX))
         .text_color(rgb(HEADER_TEXT))
+        .font_family(GRID_FONT_FAMILY)
         .child(label)
         .into_any_element()
 }

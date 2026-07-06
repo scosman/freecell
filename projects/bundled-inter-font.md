@@ -1,6 +1,22 @@
 # Bundled Inter Font
 
-**Status: Future (deferred from MVP Phase 13, 2026-07-04).**
+**Status: Implemented (2026-07-06).** Inter is vendored at
+`crates/freecell-app/assets/fonts/inter/` (4 static RIBBI faces + OFL) and registered at
+startup via `add_fonts` in `shell/fonts.rs::register_fonts` (called by both the app and the
+render harness `render-tests/src/render.rs`); the grid + chrome use `GRID_FONT_FAMILY`
+("Inter"). All render baselines were regenerated on Inter and eyeballed.
+
+> **Why this was actually done (not just a "portability upgrade"):** the deferral below
+> assumed baseline stability was "already delivered by pinning the runner image." That proved
+> **false** — on Linux the platform-default UI font (`.SystemUIFont` → "IBM Plex Sans" → a
+> single regular face when absent) rendered **bold/italic as regular**, so every pre-Inter
+> baseline was untrustworthy (`cell_bold` == `cell_plain`). Bundling Inter fixed bold/italic
+> and made macOS, Linux, and CI render the same font. The original deferral rationale is kept
+> below for history.
+
+---
+
+**Original status: Future (deferred from MVP Phase 13, 2026-07-04).**
 
 ## Goal
 

@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------------
+# chart-poc — a de-risking experiment group for FreeCell chart support (see
+# specs/projects/chart-proof-of-concept/). Independent of /app, matching the
+# experiments/ convention, but organised as a small workspace so `chart-model`
+# (the OOXML-shaped data model, functional_spec §2) can be a single shared crate
+# that both `chart-render` (render from it) and, later, `load-save` (parse into it)
+# path-depend on.
+#
+# The gpui / gpui-component pins below MIRROR app/Cargo.toml and are a KNOWN-GOOD
+# PAIR — bump both together, never one alone. First builds are SLOW (heavy git
+# deps); that is expected, do not fight it.
+# ---------------------------------------------------------------------------------
+[workspace]
+resolver = "2"
+members = ["chart-model", "chart-render"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# MSRV matches the pinned toolchain (rust-toolchain.toml): gpui needs
+# `std::hint::cold_path()`, stabilized in 1.95.0.
+rust-version = "1.95"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+chart-model = { path = "chart-model" }
+
+# GPUI (pinned zed rev, mirrors app/Cargo.toml). gpui_platform features mirror
+# gpui-component's own workspace (font-kit + the Linux backends x11/wayland +
+# runtime_shaders) so this build matches the known-good gpui-component config.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+
+# gpui-component pinned to the main SHA that pins the zed rev above.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
+
+# Capture + PNG handling (mirrors app/Cargo.toml).
+image = { version = "0.25", default-features = false, features = ["png"] }
+png = "0.17"
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# gpui is slow when built unoptimised (per gpui-component's own workspace); build it
+# and its platform layer with optimisation even in dev so builds/frames stay usable.
+[profile.dev.package.gpui]
+opt-level = 3
+
+[profile.dev.package.gpui_platform]
+opt-level = 3

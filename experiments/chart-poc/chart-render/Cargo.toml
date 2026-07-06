@@ -1,0 +1,38 @@
+[package]
+name = "chart-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Experiment 2/3 — FreeCell chart widgets built over gpui-component's plot primitives, example scenes, a headless capture binary (Xvfb + Mesa lavapipe + xrefresh, per app/render-tests), and the agent-review harness. Renders from chart-model."
+
+[lib]
+name = "chart_render"
+path = "src/lib.rs"
+
+# The gpui renderer: opens ONE window sized to a scene's viewport with the chart
+# widget, then self-quits. The capture harness forces presentation with xrefresh and
+# grabs the window (the app/render-tests mechanism).
+[[bin]]
+name = "render_scene"
+path = "src/bin/render_scene.rs"
+
+# The capture harness: for each scene, run render_scene under its own Xvfb display +
+# lavapipe, xrefresh to force presentation, capture the window to results/<name>.png,
+# and emit results/manifest.json.
+[[bin]]
+name = "capture"
+path = "src/bin/capture.rs"
+
+[dependencies]
+chart-model.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+image.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true

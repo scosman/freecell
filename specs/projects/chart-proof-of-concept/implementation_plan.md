@@ -87,7 +87,7 @@ Ordered so the worst dealbreaker is hit first (functional_spec §7). **Each phas
 STOP/REASSESS checkpoint; a failed core gate can end the PoC with a NO-GO / PARTIAL-GO — do
 not grind through later phases once a core capability is shown unachievable.**
 
-- [ ] **Phase 0 — Enablement (M0).** Scaffold `chart-poc/`; `chart-model` crate (the §2
+- [x] **Phase 0 — Enablement (M0).** Scaffold `chart-poc/`; `chart-model` crate (the §2
   data model); `chart-render` wired to the pinned gpui/gpui-component pair; a working
   headless **capture** bin; the **agent-review** step. Prove end-to-end on ONE trivial
   single-series bar → non-blank PNG, reviewer agent confirms "a bar chart." *Exit: the

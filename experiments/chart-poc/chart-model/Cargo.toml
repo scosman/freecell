@@ -1,0 +1,12 @@
+[package]
+name = "chart-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The OOXML-shaped chart data model (functional_spec §2): the seam between load/save (parse into it) and the renderer (render from it). gpui-free and ironcalc-free on purpose."
+
+[lib]
+name = "chart_model"
+path = "src/lib.rs"

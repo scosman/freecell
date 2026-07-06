@@ -1,0 +1,8 @@
+[
+  {
+    "name": "bar_single",
+    "png": "bar_single.png",
+    "description": "A single-series vertical bar (column) chart of quarterly revenue with four bars (Q1-Q4), a title, axis titles, a numeric value axis, and a legend.",
+    "expectation": "A vertical bar chart with four upright bars of differing heights, a readable numeric value axis on the left, category labels Q1-Q4 along the bottom, a chart title, and a legend. Non-blank."
+  }
+]

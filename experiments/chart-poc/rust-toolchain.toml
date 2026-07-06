@@ -1,0 +1,5 @@
+# The app workspace pins 1.95 for gpui's `std::hint::cold_path()` (stabilized 1.95.0);
+# that pin lives under `/app` and does not reach `experiments/`, so this group pins its
+# own toolchain. 1.94 cannot build gpui at the pinned zed rev.
+[toolchain]
+channel = "1.95.0"

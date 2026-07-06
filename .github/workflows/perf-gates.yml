@@ -1,4 +1,4 @@
-# Linux `perf-gates` — required-green performance gate (architecture.md §9 item 2).
+# Linux `perf-gates` — the MANUAL, required-before-merge performance gate (architecture.md §9).
 #
 # Runs the Phase-12 perf harness: the POC "Run Test" scenario against the REAL GridView over a
 # 1M×100 styled engine-backed fixture, under Xvfb + Mesa lavapipe. It measures the CPU
@@ -7,23 +7,25 @@
 # (= 2× the p99 calibrated on this runner image — render-tests/src/perf.rs `CI_*`) and on the
 # zero-engine-calls-on-scroll gate. Real-hardware budgets (8.33 ms / 2 ms) stay the product
 # truth, checked on macos-verify. Recalibrate only deliberately (a committed change).
+#
+# Like render.yml, this was SPLIT OFF the every-push critical path: a full RELEASE build of the
+# GPUI/zed-scale tree is slow, so it now runs only when MANUALLY DISPATCHED (Actions tab ->
+# "perf-gates" -> Run workflow) as a deliberate final check before merge, rather than on every
+# app PR.
+#
+# BRANCH PROTECTION: this is a required status check — add it under the EXACT context name
+# `perf harness (Linux, buffered thresholds)` (the job `name:` below). Keep that name stable —
+# renaming it silently drops the requirement.
+#
+# BOOTSTRAP NOTE: a `workflow_dispatch` workflow's "Run workflow" button (and the trigger
+# itself) only appear once this file exists on the DEFAULT branch (`main`). So the very PR that
+# demotes this gate to workflow_dispatch cannot dispatch it on itself — merge to `main` first
+# (or mark the check non-required temporarily), then it is dispatchable on later PRs.
 
 name: perf-gates
 
-# Scoped to `app/**` + this workflow file, same as `checks.yml` — a spec/docs/experiments
-# change can't move these perf numbers, so it shouldn't spend a release build's worth of
-# runner minutes here. See the note in checks.yml about trigger-level `paths` filters and
-# required status checks (a PR touching no `app/**` file skips this workflow entirely).
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'app/**'
-      - '.github/workflows/perf-gates.yml'
-  pull_request:
-    paths:
-      - 'app/**'
-      - '.github/workflows/perf-gates.yml'
+  workflow_dispatch:
 
 concurrency:
   group: perf-gates-${{ github.ref }}

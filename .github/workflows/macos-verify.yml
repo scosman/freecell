@@ -43,8 +43,9 @@ jobs:
         run: cargo test --workspace
 
       # The Linux Xvfb+lavapipe capture is the PRIMARY, proven pixel gate (Phase-1 spike
-      # PASSED; the required `checks` job runs the full render suite there). The macOS
-      # offscreen-Metal capture (round-3 C) remains the DOCUMENTED FALLBACK and is not
+      # PASSED; the full render pixel suite runs in the required `render` workflow —
+      # .github/workflows/render.yml). The macOS offscreen-Metal capture (round-3 C) remains
+      # the DOCUMENTED FALLBACK and is not
       # implemented — it is only needed if the Linux path ever regresses. `cargo test
       # --workspace` above already builds `render-tests` on macOS and runs its GPUI-free
       # perceptual-diff unit tests; the pixel cases self-skip here (no lavapipe/xvfb), so no

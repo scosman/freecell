@@ -325,23 +325,52 @@ variance).
 
 ### CI (GitHub Actions, repo root — **Linux runners are the gating target**)
 
-1. **checks** (Linux, every push/PR, required): `cargo fmt --check`; `cargo clippy
-   --workspace -- -D warnings`; **full workspace build** (freecell-app compiles on
-   Linux); `cargo test --workspace` (core + engine + app logic tests); render suite
-   under Xvfb + lavapipe; `cargo-deny check` (licenses/advisories — with a
-   documented temporary exception for the GPL `ztracing` transitive dep, tracked
-   against zed #55470; must be resolved before any binary distribution).
-2. **perf-gates** (Linux, every push/PR, required): the perf harness with **hard
-   but buffered thresholds** (product call): during the perf phase, calibrate on
-   the pinned runner image and commit absolute thresholds = **2× the calibrated
-   p99** (documented next to the numbers); real-hardware budgets (8.33 ms/2 ms)
-   remain the product truth, checked manually on macOS and recorded in the repo.
-   Recalibrate only deliberately (a committed change with rationale), never to
-   quiet a regression.
-3. **macos-verify** (manual dispatch / weekly cron, non-required): full build + test
-   + render-harness smoke on `macos-14` — keeps the primary design target honest
-   without putting slow/expensive runners in the merge path.
-4. Caching (`Swatinem/rust-cache`) to keep the gpui build tolerable.
+Four workflows. **checks** runs automatically on the app critical path; the two heavy
+gates (**render**, **perf-gates**) are **manual `workflow_dispatch`** — deliberate "final
+checks before merge" — because a software-render pass and a full release build are
+slow/flaky and not worth spending on every push. `checks`, `render`, and `perf-gates` are
+all **required** status checks.
+
+1. **checks** (`checks.yml`, Linux, **auto** on every push-to-`main` / PR that touches
+   `app/**` — paths-scoped, so spec/experiments/docs-only changes skip it; required, fast):
+   `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings`; **full
+   workspace build** (`cargo build --workspace` — freecell-app compiles **and links** on
+   Linux); `cargo test --workspace` (core + engine + app logic + render-tests' GPUI-free
+   unit tests — the pixel cases self-skip without `FREECELL_RENDER`, so the crate stays
+   compiled + covered); `cargo-deny check` (licenses/advisories — with a documented
+   temporary exception for the GPL `ztracing` transitive dep, tracked against zed #55470;
+   must be resolved before any binary distribution). Disk/speed: **no free-disk prune
+   needed here** — `CARGO_INCREMENTAL=0` + `CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only`
+   keep the build+test `target/` peak ~6.3 GB (well under the ~14 GB free on `ubuntu-24.04`),
+   and `Swatinem/rust-cache` (`cache-on-failure: true`) makes a warm run ~3 min.
+2. **render** (`render.yml`, **NEW**; Linux software Vulkan, **manual `workflow_dispatch`**,
+   required): the cell-render pixel suite under **Xvfb + Mesa lavapipe** (see "Cell-render
+   snapshot suite" above). **Split out of `checks`** because software rendering is slow and
+   occasionally flaky; it frees runner disk first (it is the disk-hungry job now) and installs
+   the full capture stack. Must be wired into branch protection under the exact context name
+   **`render (Xvfb + lavapipe)`**.
+3. **perf-gates** (`perf-gates.yml`, Linux buffered, **now manual `workflow_dispatch`**,
+   required): the perf harness with **hard but buffered thresholds** (product call): during
+   the perf phase, calibrate on the pinned runner image and commit absolute thresholds = **2×
+   the calibrated p99** (documented next to the numbers); real-hardware budgets (8.33 ms/2 ms)
+   remain the product truth, checked manually on macOS and recorded in the repo. Recalibrate
+   only deliberately (a committed change with rationale), never to quiet a regression.
+   **Demoted from every-app-PR to manual dispatch** (a full release build is slow); its
+   required-check context name is **`perf harness (Linux, buffered thresholds)`**.
+4. **macos-verify** (`macos-verify.yml`, **manual dispatch / weekly cron, non-required**):
+   full build + test + render-harness smoke on `macos-14` — keeps the primary design target
+   honest without putting slow/expensive runners in the merge path.
+
+Caching (`Swatinem/rust-cache`, `workspaces: app`, `cache-on-failure: true`) keeps the gpui
+build tolerable across runs. GitHub scopes caches by branch, so the win lands once `main`
+runs green + saves once; feature-branch runs then restore `main`'s cache as fallback.
+
+**`workflow_dispatch` bootstrap caveat:** a manual workflow's "Run workflow" button only
+appears once the file exists on the default branch (`main`), so the PR that first introduces
+`render.yml` / demotes `perf-gates.yml` cannot dispatch those checks on *itself* — merge to
+`main` first (or make them non-required temporarily). Dispatch **render** and **perf-gates**
+from the Actions tab against the PR's branch (or, if a merge queue is later enabled, wire them
+to a `merge_group` trigger so the queue runs them automatically).
 
 ## 10. Technical risks & mitigations (build-time)
 

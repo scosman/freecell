@@ -112,7 +112,7 @@ not grind through later phases once a core capability is shown unachievable.**
   round-trip. May run in parallel with Phases 1–3 (render leads). *Checkpoint: save FAIL →
   display-only recommendation; load FAIL is serious.*
 
-- [ ] **Phase 5 — Synthesis.** Aggregate PNGs + review tables + per-experiment `findings.md`
+- [x] **Phase 5 — Synthesis.** Aggregate PNGs + review tables + per-experiment `findings.md`
   into `experiments/chart-poc/SYNTHESIS.md`: **GO / NO-GO / PARTIAL-GO**, recommended scope
   (types in/out, scatter in/out, display-only vs save-preservation), known risks, and a
   rough shape for the follow-on ship-quality project.

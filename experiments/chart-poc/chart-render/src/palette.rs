@@ -23,6 +23,15 @@ pub const BASE: [Color; 5] = [
     Color::from_hex(0xB07AA1), // purple
 ];
 
+/// The color for pie/doughnut **slice** `index`. A pie is single-series, so its slices are
+/// the categories; there is no auto-palette in gpui-component (an unset slice color paints a
+/// monochrome disc), so we synthesize one from the same categorical cycle the multi-series
+/// charts use — and the legend keys off the same function, so slice↔swatch match by
+/// construction. Alias of [`series_color`] so the intent reads clearly at the call site.
+pub fn slice_color(index: usize) -> Color {
+    series_color(index)
+}
+
 /// The color for series `index`, cycling the five base colors and rotating hue for a
 /// second/third lap so >5 series stay distinct rather than repeating exactly.
 pub fn series_color(index: usize) -> Color {

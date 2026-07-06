@@ -1,21 +1,23 @@
 //! The chart **frame** FreeCell owns around a plot element: chart title, axis titles, and a
 //! legend. The stock gpui-component chart structs have none of these
 //! (`research/gpui-component-charts.md`), so we build them as a plain gpui `div` layout and
-//! drop any plot (bar, line, …) into the plot slot.
+//! drop any plot (bar, line, area, pie, …) into the plot slot.
 //!
-//! The legend is the load-bearing piece for multi-series: it lists **every** series with the
-//! exact color that series' marks use (`series[i].color` or the palette cycle), so the
-//! series→color mapping the §6 rubric checks is correct by construction — the plot and the
-//! legend read the same source.
+//! The legend is the load-bearing piece for a multi-series (or multi-slice) chart: it lists
+//! every series/slice with the exact color that mark uses, so the series→color mapping the §6
+//! rubric checks is correct by construction — the plot and the legend read the same palette.
+//! For a **pie/doughnut** the "series" are the *categories* of the single series, so the legend
+//! keys off the categories + [`slice_color`]; for everything else it keys off the series +
+//! [`series_color`].
 
 use gpui::{div, px, rgb, FontWeight, IntoElement, ParentElement, SharedString, Styled};
 
-use chart_model::Chart;
+use chart_model::{BarDir, Chart, ChartKind, SeriesData};
 
-use crate::palette::series_color;
+use crate::palette::{series_color, slice_color};
 use crate::style::{AXIS_TITLE_TEXT, BACKGROUND, TITLE_TEXT};
 
-/// One legend row: a color swatch + the series name.
+/// One legend row: a color swatch + the series/slice name.
 fn legend_row(color: u32, name: String) -> gpui::AnyElement {
     div()
         .flex()
@@ -32,10 +34,21 @@ fn legend_row(color: u32, name: String) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Build the legend: one row per series, each swatch colored exactly like that series' marks
-/// (explicit `series.color`, else the palette cycle at the series index).
-fn legend(chart: &Chart) -> gpui::AnyElement {
-    let rows: Vec<gpui::AnyElement> = chart
+/// The legend rows: one per slice (categories of the first series) for a pie/doughnut, else one
+/// per series. Each swatch is colored by the same palette function the marks use.
+fn legend_rows(chart: &Chart) -> Vec<gpui::AnyElement> {
+    if matches!(chart.kind, ChartKind::Pie { .. }) {
+        if let Some(SeriesData::CategoryValue { categories, .. }) =
+            chart.series.first().map(|s| &s.data)
+        {
+            return categories
+                .iter()
+                .enumerate()
+                .map(|(i, c)| legend_row(slice_color(i).to_hex(), c.label()))
+                .collect();
+        }
+    }
+    chart
         .series
         .iter()
         .enumerate()
@@ -47,38 +60,60 @@ fn legend(chart: &Chart) -> gpui::AnyElement {
                 .unwrap_or_else(|| format!("Series {}", i + 1));
             legend_row(color, name)
         })
-        .collect();
+        .collect()
+}
 
+/// Build the legend column.
+fn legend(chart: &Chart) -> gpui::AnyElement {
     div()
         .flex()
         .flex_col()
         .justify_center()
         .gap_1()
         .pl_2()
-        .children(rows)
+        .children(legend_rows(chart))
         .into_any_element()
 }
 
-/// Wrap a plot element in the full chart frame: chart title on top, the value-axis title as a
-/// compact caption above the plot, the plot beside its legend, and the category-axis title
-/// centered below. Shared by every chart kind so the chrome is identical across them.
+/// The two axis-title captions (above the plot, below the plot). For a **horizontal** bar chart
+/// the value axis is at the bottom and the category axis on the left, so the captions swap:
+/// value title goes below (under the bottom value axis), category title above. Every other kind
+/// keeps value-title-above / category-title-below.
+fn captions(chart: &Chart) -> (String, String) {
+    let value = chart.val_axis.title.clone().unwrap_or_default();
+    let category = chart.cat_axis.title.clone().unwrap_or_default();
+    if matches!(
+        chart.kind,
+        ChartKind::Bar {
+            dir: BarDir::Bar,
+            ..
+        }
+    ) {
+        (category, value)
+    } else {
+        (value, category)
+    }
+}
+
+/// Wrap a plot element in the full chart frame: chart title on top, one axis-title caption above
+/// the plot, the plot beside its legend, and the other axis-title caption centered below. Shared
+/// by every chart kind so the chrome is identical across them.
 pub fn chart_frame(chart: &Chart, plot: gpui::AnyElement) -> gpui::AnyElement {
     let title = chart.title.clone().unwrap_or_default();
-    let value_axis_title = chart.val_axis.title.clone().unwrap_or_default();
-    let category_axis_title = chart.cat_axis.title.clone().unwrap_or_default();
+    let (top_caption, bottom_caption) = captions(chart);
 
     let body = div()
         .flex_1()
         .min_h(px(0.))
         .flex()
         .flex_col()
-        // Value-axis title (compact caption above the axis gutter).
+        // Top axis-title caption (compact caption above the plot).
         .child(
             div().pl(px(6.)).child(
                 div()
                     .text_color(rgb(AXIS_TITLE_TEXT))
                     .text_size(px(11.))
-                    .child(SharedString::from(value_axis_title)),
+                    .child(SharedString::from(top_caption)),
             ),
         )
         .child(
@@ -109,13 +144,13 @@ pub fn chart_frame(chart: &Chart, plot: gpui::AnyElement) -> gpui::AnyElement {
             ),
         )
         .child(body)
-        // Category-axis title.
+        // Bottom axis-title caption.
         .child(
             div().w_full().flex().justify_center().child(
                 div()
                     .text_color(rgb(AXIS_TITLE_TEXT))
                     .text_size(px(11.))
-                    .child(SharedString::from(category_axis_title)),
+                    .child(SharedString::from(bottom_caption)),
             ),
         )
         .into_any_element()

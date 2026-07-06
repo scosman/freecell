@@ -97,7 +97,7 @@ not grind through later phases once a core capability is shown unachievable.**
   axis titles + numeric value-axis (nice ticks) + category axis + **legend**. Capture +
   **3-agent panel** review. **STOP: if panel FAIL → write NO-GO `SYNTHESIS.md` and end.**
 
-- [ ] **Phase 2 — Gate 2: harder layouts.** Single column + horizontal bar; **grouped
+- [x] **Phase 2 — Gate 2: harder layouts.** Single column + horizontal bar; **grouped
   (clustered)** column; **stacked** + **100%-stacked** column; **stacked area** (Area fork);
   **pie** + **doughnut** with synthesized palette. Capture + single-agent review each.
   *Checkpoint: wholesale grouped/stacked FAIL → lean PARTIAL-GO (e.g. "single-series only").*

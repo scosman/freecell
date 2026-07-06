@@ -7,12 +7,15 @@
 
 pub mod palette;
 pub mod scenes;
+pub mod stacking;
 pub mod ticks;
 
+pub mod area;
 pub mod bar;
 pub mod capture;
 pub mod chrome;
 pub mod line;
+pub mod pie;
 pub mod render;
 pub mod style;
 
@@ -24,6 +27,8 @@ pub fn chart_element(chart: &Chart) -> Option<gpui::AnyElement> {
     match chart.kind {
         ChartKind::Line { .. } => line::line_element(chart),
         ChartKind::Bar { .. } => bar::bar_element(chart),
+        ChartKind::Area { .. } => area::area_element(chart),
+        ChartKind::Pie { .. } => pie::pie_element(chart),
         _ => None,
     }
 }

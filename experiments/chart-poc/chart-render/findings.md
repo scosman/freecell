@@ -192,3 +192,104 @@ Gate 2 — it is not a NO-GO.**
 - `scenes::gate1_line_scene_is_multi_series_line` — `line_multi` is a Line, ≥2 series, shared
   category count. (21 unit tests total across the crate + `chart-model`, all passing.)
 - The **`line_multi.png` + 3-agent panel** in `results/` is the real Gate-1 evidence.
+
+---
+
+# Phase 2 (Gate 2 — harder layouts): bar family, stacked area, pie/doughnut
+
+Goal (functional_spec §3 table, §7): the layouts that carry the research-flagged traps —
+single-series **column** + **horizontal bar**, **grouped (clustered)** column, **stacked** +
+**100%-stacked** column, **stacked** + **100%-stacked area**, and **pie** + **doughnut** with a
+synthesized palette — all from `chart-model`, reusing the Phase 0/1 shared chrome / palette /
+ticks. Single-agent review each (Gate 2 is not the Gate-1 3-panel).
+
+## Result: GATE 2 PASS (9/9 scenes PASS)
+
+Every new scene rendered as a chart a user would accept; a fresh single-agent reviewer returned
+**PASS** on all nine (`results/review.md`): `bar_horizontal`, `bar_grouped`, `bar_stacked`,
+`bar_percent_stacked`, `area_stacked`, `area_percent_stacked`, `pie`, `doughnut`, plus a
+re-review of `bar_single` after `bar.rs` was generalized. **No wholesale grouped/stacked FAIL →
+this is a GO signal for the harder layouts, not a PARTIAL-GO.** The two research-named hard
+problems — stacked *area* (scalar-baseline `Area` primitive) and the pie *no-auto-palette* crux
+— both came out clean.
+
+## What worked
+
+- **One `BarPlot` covers the whole bar family.** `bar.rs` was generalized from Phase 0's
+  single-series-column-only widget into a `BarPlot { dir, grouping, series, scale, percent }`
+  that renders `Col`/`Bar` × `Clustered`/`Stacked`/`PercentStacked`. The raw `Bar` primitive
+  takes caller-supplied `cross` (category-axis pixel), `base`/`value` (value-axis pixels), and
+  `band_width`, and a `BarAlignment` selects orientation — so the SAME `cross`/`value` closures
+  serve both orientations (only the alignment differs), because the shared `Geometry` already
+  maps the value axis to Y (columns) or X (bars) and the category axis to the other.
+- **Grouped/stacked geometry is DIY and computed manually — NOT via `ScaleBand`.** `ScaleBand`
+  is a trap here: its `band_width()` is hard-capped at 30px (`plot/scale/band.rs:37`), far too
+  narrow for a multi-series cluster. So the slot math is our own: `slot = plot_span /
+  n_categories`, `center_i = span_start + slot*(i+0.5)`, cluster occupies `slot*GROUP_FILL`. For
+  **clustered**, that group is sub-divided across series (`sub_w = group_width/n_series`, each
+  bar `SUB_BAR_FILL` of its sub-slot) — a unit test asserts the sub-bars are disjoint and inside
+  the group. For **stacked**, one column of `group_width` holds the cumulative segments.
+- **Stacking math is one shared, gpui-free module (`stacking.rs`).** `stacked_segments` +
+  `percent_segments` + `category_totals` produce the per-(series, category) cumulative `(lo,hi)`
+  that both the stacked bars and the stacked area consume. (gpui-component's `Stack` primitive
+  computes the same numbers but paints nothing and has **no percent mode**, so inlining the ~10
+  lines is simpler than adapting it and lets bars + areas share one implementation + the percent
+  normalize pass.) The value axis reflects the grouping: `for_values` over single values
+  (clustered), over per-category **sums** (stacked, so the axis reaches the tallest stack), or a
+  fixed 0–100 (percent, with `%`-suffixed tick labels).
+- **Stacked area = hand-rolled filled polygons (the `Area`-fork the research called for).** The
+  `Area` primitive closes its fill with a **flat** bottom edge at a scalar `y0` (`area.rs`), so
+  it *cannot* draw a stacked band's wavy per-x baseline. `area.rs` instead builds each band as a
+  `gpui::PathBuilder::fill()` polygon: trace the upper boundary forward (`value_scale(seg.hi)`
+  at each category x), then the lower boundary **backward** (`value_scale(seg.lo)` reversed),
+  `close()`, `window.paint_path`; a solid `PathBuilder::stroke` traces the top edge. Painting
+  bottom→top means each higher band sits over the one below. This is the exact
+  research-recommended approach and it produced clean, correct stacks + 100%-stacks on the first
+  capture — the reviewer confirmed the bands stack cumulatively rather than all rising from zero.
+- **Pie/doughnut: the no-auto-palette crux is solved by synthesizing per-slice colors.** The
+  stock behavior (and an unset `.color()`) paints every slice `chart_2` → a useless monochrome
+  disc. A pie is single-series, so its *slices are the categories*; `pie.rs` colors slice `i`
+  with `slice_color(i)` (an alias of the categorical `series_color` cycle), and the legend in
+  `chrome.rs` keys off the same function over the same categories — so slice↔swatch match by
+  construction. Angles come from `Pie::arcs`, each slice painted with `Arc::paint` (centered on
+  the plot bounds); **doughnut = the same with `inner_radius = doughnut_hole × outer_radius`**.
+  On-slice percentage labels (via the public `plot::label::Text` + `PlotLabel`, placed at each
+  slice's mid-angle) give the part-to-whole read a pie has instead of a numeric value axis.
+
+## What was hard / notable
+
+- **Orientation-aware chrome caption.** The shared `chart_frame` puts the value-axis title above
+  the plot and the category-axis title below — correct for columns, but a **horizontal** bar has
+  its value axis at the *bottom* and categories on the *left*. So `chrome.rs` now swaps the two
+  captions for `Bar { dir: Bar }` (value title below, category caption above). Reviewers still
+  noted the value-axis title is a horizontal caption, not a rotated vertical title — the same
+  cosmetic non-defect flagged at Gate 1; legible and correctly associated, not docked.
+- **`Bar` primitive `cross` is the bar's *near edge*, not its center.** Centering a clustered
+  sub-bar in its sub-slot means computing the center, then subtracting `bar_w/2` for `cross`. Off
+  by that half-width and the bars drift within the group. A unit test pins the partition.
+- **Percent axis label formatting.** The percent variants reuse the same `NiceScale::new(0,100)`
+  ticks but the value labels get a `%` suffix (a `percent` flag on the widget), so `0/20/…/100`
+  reads as `0%/20%/…/100%`. Small, but needed for the axis to read as a share.
+- **`Arc::paint` centers on the passed `bounds`, and its angle 0 is 12 o'clock (clockwise).**
+  Convenient — the pie centers itself in the plot slot with no extra math — but on-slice label
+  placement must use the same `angle - π/2` convention to land labels on the right wedge.
+- **Regenerated `bar_single`.** Generalizing `bar.rs` changed the Phase-0 column render (bars are
+  now `slot*GROUP_FILL*SUB_BAR_FILL` wide instead of the 30px `ScaleBand` cap). It was
+  re-captured and re-reviewed → still PASS, no regression; the wider Excel-like columns read at
+  least as well.
+
+## Tests added (light, per relaxed rigor)
+
+- `stacking`: cumulative baselines chain (seg top == next seg bottom, top == category total);
+  percent segments sum to 100 per category; zero-total category collapses; negatives clamped.
+- `bar`: clustered sub-bar offsets partition the band (disjoint, inside the group); stacked
+  baselines cumulative + axis covers the stack total; percent sums to 100 and axis is 0–100;
+  clustered axis covers the max single value (not inflated to the stack); horizontal dir carried
+  through; rejects non-bar.
+- `area`: stacked baselines cumulative; percent sums to 100 and axis is 0–100; standard bands all
+  start at zero; rejects non-area.
+- `pie`: slice sweep angles sum to 2π; doughnut inner radius = hole × outer; slices distinct
+  colors; rejects non-pie.
+- `scenes`: the eight new scenes are name-lookupable with the expected `ChartKind`. (36 unit
+  tests total across the workspace, all passing.)
+- The **9 PNGs + single-agent review** in `results/` are the real Gate-2 evidence.

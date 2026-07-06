@@ -2108,9 +2108,16 @@ impl GridView {
         let any_blocked = items.iter().any(|(_, blocked, _)| *blocked);
 
         let mut card = div()
+            .debug_selector(|| "header-menu-card".into())
             .absolute()
             .left(px(menu.x))
             .top(px(menu.y))
+            // Occlude the card so a mouse-down anywhere on it — the p(4) padding ring or the
+            // "Sheet has merged cells…" footnote row, neither of which carries a listener — can't
+            // fall through to the deferred dismiss backdrop and close the menu without acting (same
+            // backdrop-on-down bug as the action-bar popovers, BUG A/B). The item rows already
+            // `stop_propagation`; this covers the dead zones around them.
+            .occlude()
             .flex()
             .flex_col()
             .p(px(4.0))
@@ -3267,6 +3274,50 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
             "a click inside the in-cell editor must not reach the grid: {:?}",
+            events.borrow()
+        );
+    }
+
+    #[gpui::test]
+    fn header_menu_padding_click_keeps_menu_open(cx: &mut TestAppContext) {
+        // BUG A/B (header insert/delete menu): a mouse-DOWN on the menu card's padding ring — not on
+        // an item row (those `stop_propagation`) — must not fall through to the dismiss backdrop and
+        // close the menu without acting. Verified to fail without the card `.occlude()`.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Open the column-header menu (col-header strip: y < 24, x past the gutter).
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 60.0, 10.0),
+                        window,
+                        cx,
+                    );
+                    assert!(grid.header_menu.is_some(), "the header menu opened");
+                });
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        let card = vcx
+            .debug_bounds("header-menu-card")
+            .expect("the header menu card was painted");
+        events.borrow_mut().clear();
+        // The card's top-left padding corner (inside the p(4) ring, above the first item row).
+        let pad = gpui::point(card.origin.x + px(1.0), card.origin.y + px(1.0));
+        vcx.simulate_mouse_down(pad, MouseButton::Left, Modifiers::default());
+
+        assert!(
+            vcx.update(|_w, cx| g.read(cx).header_menu.is_some()),
+            "a press on the menu's padding must not dismiss it"
+        );
+        assert!(
+            !events.borrow().iter().any(|e| matches!(
+                e,
+                GridEvent::InsertColumns { .. } | GridEvent::DeleteColumns { .. }
+            )),
+            "a press on the menu padding dispatches no structure command: {:?}",
             events.borrow()
         );
     }

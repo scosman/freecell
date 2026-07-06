@@ -2714,7 +2714,10 @@ mod tests {
     struct BodyStub;
     impl gpui::Render for BodyStub {
         fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full()
+            // A concrete-height body so the chrome content — and thus the popover backdrop, which is
+            // `size_full` of the chrome — spans well past the dropdown items. (`flex_1` alone won't
+            // stretch it: the test Root sizes the chrome to its content, not the window.)
+            div().h(px(500.0)).w_full()
         }
     }
 
@@ -3346,19 +3349,23 @@ mod tests {
     // ---- BUG A/B: popover item clicks APPLY (real mouse dispatch, not direct `apply_*`) -----
     //
     // These drive real mouse events through the rendered popover with a `VisualTestContext` over a
-    // full-height backdrop (`tall_sheet` mounts a body stub) — the path the part-1 anchor test and
-    // the `apply_*` unit tests never exercised. Empirically (see `card_padding_click_keeps_popover_
-    // open`) the full-window backdrop *does* dismiss on a mouse-DOWN, and it fires for a press that
-    // lands anywhere on the card that is NOT itself an occluding hitbox — the p_1/p_2 padding and
-    // the 1–2 px gaps between the small ghost menu buttons a user easily hits when aiming for an
-    // item. Wrapping the card in `.occlude()` drops the backdrop from the hit-test under the whole
-    // card, so no in-popover press can dismiss it. (These per-item tests are positive coverage that
-    // each item's real click still applies + closes; the discriminating guard for the fix is the
-    // padding test below, which fails without the card `.occlude()`.)
+    // full-height backdrop (`tall_sheet` mounts a tall body stub so the backdrop — `size_full` of
+    // the chrome — actually spans the dropdown items) — the path the part-1 anchor test and the
+    // `apply_*` unit tests never exercised. Pre-fix, EVERY mouse-down inside the card reached the
+    // backdrop: the menu `Button`s insert a plain (Normal) hitbox and only `prevent_default()` on
+    // down (never `.occlude()`/`stop_propagation`), and the backdrop's `on_mouse_down` is not gated
+    // on `default_prevented`, so a down directly on an item — as well as on the p_1/p_2 padding and
+    // the gaps between rows — fired the backdrop's dismiss, tearing the popover down before the
+    // item's `on_click` (mouse-UP) could dispatch. Wrapping the card in `.occlude()` inserts a
+    // BlockMouse hitbox that breaks the hit-test before the backdrop for ALL in-card presses, so no
+    // in-popover press can dismiss it. The mouse-DOWN is the discriminating signal (a full
+    // `simulate_click` would not catch the regression: it sends down+up with no intervening repaint,
+    // so the doomed button's `on_click` still fires); each per-item test below asserts the down
+    // keeps the popover open — and fails without the card `.occlude()`.
 
     /// Opens a popover via `open`, paints, presses mouse **down** on the item registered under
-    /// debug-selector `item`, asserts `open_flag` still holds (the down did not dismiss), then
-    /// releases and returns the dispatched commands.
+    /// debug-selector `item`, asserts `open_flag` still holds (the down did not reach the backdrop
+    /// dismiss — the BUG A/B guard), then releases and returns the dispatched commands.
     fn press_popover_button(
         h: &Harness,
         cx: &mut TestAppContext,
@@ -3387,10 +3394,10 @@ mod tests {
 
     #[gpui::test]
     fn card_padding_click_keeps_popover_open(cx: &mut TestAppContext) {
-        // The discriminating guard for the card `.occlude()` fix: a mouse-DOWN inside the popover
-        // but not on an (occluding) button — its padding/gap — must not reach the backdrop's dismiss
-        // listener. Without the card `.occlude()` this press dismisses the popover (verified: it
-        // fails). It is the same hit a user makes aiming slightly off a small ghost menu row.
+        // Covers the card region a press can land on that ISN'T an item — the p_1 padding ring and
+        // the gaps between rows. Like the buttons, pre-fix this reached the backdrop's dismiss
+        // listener and closed the popover; the card `.occlude()` shields it too. Verified to fail
+        // without the fix.
         let h = tall_sheet(cx);
         select_single(&h, cx, 1, 1);
         upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
@@ -3478,9 +3485,10 @@ mod tests {
 
     #[gpui::test]
     fn fill_swatch_click_applies_and_closes(cx: &mut TestAppContext) {
-        // A swatch uses `on_mouse_down` — it applies (and closes) on the DOWN, so it was never
-        // broken by the backdrop-on-down bug. This is positive coverage that the card `.occlude()`
-        // doesn't break a swatch's own click. A single down suffices to dispatch its command.
+        // A swatch applies on `on_mouse_down` (the backdrop also dismissed on that same down pre-fix,
+        // but the swatch's own listener still ran, so the command went out either way). This is
+        // positive coverage that the card `.occlude()` doesn't break a swatch's own down-to-apply. A
+        // single down suffices to dispatch its command.
         let h = tall_sheet(cx);
         select_single(&h, cx, 1, 1);
         upd(&h, cx, |c, _w, cx| c.toggle_fill_popover(cx));

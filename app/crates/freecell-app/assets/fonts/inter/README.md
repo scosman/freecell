@@ -13,10 +13,10 @@ isolated from our source so the license boundary is unambiguous.
 
 | File | Family | Style | Weight |
 |---|---|---|---|
-| `Inter-Regular.otf`    | Inter | Regular     | 400 |
-| `Inter-Bold.otf`       | Inter | Bold        | 700 |
-| `Inter-Italic.otf`     | Inter | Italic      | 400 |
-| `Inter-BoldItalic.otf` | Inter | Bold Italic | 700 |
+| `Inter-Regular.ttf`    | Inter | Regular     | 400 |
+| `Inter-Bold.ttf`       | Inter | Bold        | 700 |
+| `Inter-Italic.ttf`     | Inter | Italic      | 400 |
+| `Inter-BoldItalic.ttf` | Inter | Bold Italic | 700 |
 
 All four share the family name **"Inter"**, so GPUI's font matcher selects the correct
 face for a `font_weight(BOLD)` / `italic()` request. We vendor the **static** desktop
@@ -24,10 +24,17 @@ faces (not the variable font) so weight/italic resolve deterministically — imp
 bit-stable render-test baselines. The other Inter weights (Thin…Black) and the `Display`
 optical size are intentionally omitted; the app only uses Regular/Bold + their italics.
 
+**Why TrueType (`.ttf`), not OpenType/CFF (`.otf`):** GPUI registers embedded fonts on macOS
+via `CGFont::from_data_provider`, which cannot load CFF outlines — an `.otf` here loads fine
+on Linux but makes `add_fonts` fail on macOS, so the whole UI silently reverts to the system
+font. Inter's release ships both formats; we vendor the upstream **TrueType** (`glyf`) faces,
+which load on every platform.
+
 ## Provenance & license
 
 - **Upstream:** Inter — https://github.com/rsms/inter (© 2016 The Inter Project Authors).
-- **Version:** Inter 4.0, obtained from the Debian/Ubuntu `fonts-inter` package
-  (`4.0+ds-1`, `pool/universe/f/fonts-inter`), which repackages the upstream OFL release.
-- **License:** SIL Open Font License 1.1 — full text in [`OFL.txt`](./OFL.txt). The OFL
-  permits bundling/embedding in software; these faces are unmodified.
+- **Version:** Inter **4.1** (font `Version 4.001`), the four static RIBBI faces from the
+  `ttf/` folder of the official `Inter-4.1.zip` release. **Unmodified** upstream files (verified
+  byte-for-byte against the release).
+- **License:** SIL Open Font License 1.1 — full text in [`OFL.txt`](./OFL.txt) (the license as
+  shipped in the release). The OFL permits bundling and embedding in software.

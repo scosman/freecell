@@ -18,12 +18,15 @@ use gpui::App;
 use crate::grid::GRID_FONT_FAMILY;
 
 /// The bundled Inter faces (family name "Inter"), embedded in the binary so no external font
-/// package is required. Static RIBBI faces are used (not the variable font) for deterministic
-/// weight/italic resolution.
-const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Regular.otf");
-const INTER_BOLD: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Bold.otf");
-const INTER_ITALIC: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Italic.otf");
-const INTER_BOLD_ITALIC: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-BoldItalic.otf");
+/// package is required. Static RIBBI faces (not the variable font) for deterministic
+/// weight/italic resolution, and **TrueType (`glyf`) outlines, not OpenType/CFF (`.otf`)** —
+/// macOS registers embedded fonts via `CGFont::from_data_provider`, which fails on CFF, so an
+/// `.otf` here would make `add_fonts` error and the whole UI fall back to the system font
+/// (Linux's loader tolerates CFF, so it would look fine there and break only on macOS).
+const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Regular.ttf");
+const INTER_BOLD: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Bold.ttf");
+const INTER_ITALIC: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Italic.ttf");
+const INTER_BOLD_ITALIC: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-BoldItalic.ttf");
 
 /// Registers the bundled Inter faces with the text system and sets Inter as the app UI font
 /// (both the grid and the gpui-component chrome), so rendering is one predictable family across

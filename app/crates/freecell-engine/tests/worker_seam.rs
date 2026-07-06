@@ -406,20 +406,29 @@ fn invalid_sheet_rename_is_rejected() {
 
 #[test]
 fn style_edit_publishes_without_changing_values() {
-    let (client, rx, sheet) = spawn_new();
+    let (client, _rx, sheet) = spawn_new();
     client.send(full_viewport(sheet));
     client.send(set_input(sheet, 0, 0, "5"));
-    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    poll_until(
+        || published_text(&client, 0, 0) == "5",
+        "the seed value should publish",
+    );
 
     client.send(Command::SetStyleAttr {
         sheet,
         range: CellRange::single(CellRef::new(0, 0)),
         attr: StyleAttr::Bold,
     });
-    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
-    // The value is unchanged; the style edit still committed an op + published.
+    // The style edit commits a second op but leaves the value unchanged, so there is no new
+    // display text to poll on. Poll committed_ops instead (apply increments it before the
+    // publish), rather than racing a single wait_for(Published) that can catch the seed's
+    // publish and read committed_ops before the style edit's op lands.
+    poll_until(
+        || client.committed_ops() >= 2,
+        "the style edit should commit a second op",
+    );
+    // The value is unchanged by the style edit.
     assert_eq!(published_text(&client, 0, 0), "5");
-    assert!(client.committed_ops() >= 2);
 }
 
 #[test]

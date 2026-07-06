@@ -76,9 +76,14 @@ jobs:
         working-directory: app
         run: rustup toolchain install
 
+      # `cache-on-failure: true` — the perf gate hard-fails on a threshold breach, and without
+      # this rust-cache's default (`false`) would discard the whole release build on any red run,
+      # keeping the job permanently cold. See checks.yml for the full rationale + the branch-scope
+      # caveat (feature branches inherit only main's cache).
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
+          cache-on-failure: true
 
       # The harness builds itself in release (perf numbers must be optimized — CLAUDE.md) and
       # runs FOREGROUND under Xvfb + lavapipe, HARD-FAILING at the committed buffered thresholds

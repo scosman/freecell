@@ -92,9 +92,18 @@ jobs:
         working-directory: app
         run: rustup toolchain install
 
+      # `cache-on-failure: true` is ESSENTIAL for this job. Its later steps (the render suite)
+      # can fail, and rust-cache's DEFAULT (`false`) then SKIPS the post-job save — so a red
+      # pipeline discards the whole freshly-compiled gpui/zed/ironcalc tree and every subsequent
+      # run starts cold ("No cache found"). That is self-perpetuating with a build that was also
+      # dying on disk. Saving on failure too means the expensive dep build is reused across runs
+      # regardless of whether render/test passed. NOTE: GitHub scopes caches by branch — feature
+      # branches can only restore THIS branch's cache or the default branch's, so the big win
+      # lands once `main` runs green+saves once; after that PRs restore main's cache as fallback.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
+          cache-on-failure: true
 
       - name: Format
         working-directory: app

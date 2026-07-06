@@ -27,9 +27,12 @@ jobs:
         working-directory: app
         run: rustup toolchain install
 
+      # `cache-on-failure: true` so a failed weekly/manual run still saves the dep build instead
+      # of leaving the next run cold (see checks.yml for the full rationale).
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
+          cache-on-failure: true
 
       - name: Build workspace
         working-directory: app

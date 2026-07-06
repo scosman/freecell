@@ -8,10 +8,26 @@
 
 name: checks
 
+# Scope the heavy Rust CI to changes that can actually affect it: the `app/` workspace or
+# this workflow file. This repo's activity is mostly non-`app/` (specs / experiments / docs),
+# and those pushes/PRs have nothing to build here — running the full clippy+build+test+render
+# stack on them only burns runner minutes. NOTE: because this is a trigger-level `paths`
+# filter, a PR that touches no `app/**` file skips the whole workflow, so the `checks` context
+# is never reported. If `checks` is a *required* status check with strict branch protection,
+# such a PR will sit "Expected — waiting for status" and cannot merge. That is the intended
+# budget trade-off; if it becomes a problem, either mark the check non-required for docs-only
+# PRs or replace the trigger filter with an always-running job that gates the heavy STEPS via
+# a path-changes detector (e.g. dorny/paths-filter) so one context is always posted.
 on:
   push:
     branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/checks.yml'
   pull_request:
+    paths:
+      - 'app/**'
+      - '.github/workflows/checks.yml'
 
 concurrency:
   group: checks-${{ github.ref }}
@@ -19,12 +35,43 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI-only build trims (measured locally on a 4-core box comparable to the runner):
+  # the checks-job target/ peak drops from ~14 GB to ~6.3 GB (54%), which is what fixes the
+  # "No space left on device" during the render-tests link, and the cold build is a bit faster.
+  #  - CARGO_INCREMENTAL=0: incremental artifacts are large and useless in CI (~270 MB here,
+  #    and rust-cache discards them anyway), so don't generate them.
+  #  - *_DEBUG=line-tables-only: keep file:line in panic/test backtraces but drop the heavy
+  #    DWARF that dominated target/ and the failing link (render_scene test binary: 684 MB ->
+  #    282 MB). TEST inherits DEV, but both are set so the intent survives a profile refactor.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   checks:
     name: fmt / clippy / build / test / render / deny (Linux)
     runs-on: ubuntu-24.04
     steps:
+      # ubuntu-24.04 runners have ~14 GB free after their preinstalled toolchains, and a cold
+      # debug build of this GPUI/zed-scale workspace peaks target/ right at that ceiling — the
+      # render-tests link is where it tips into "No space left on device". Reclaim ~20 GB up
+      # front by deleting large preinstalled SDKs this Rust build never touches (Android / .NET
+      # / GHC / CodeQL) plus cached docker images. Inlined rather than a third-party action so
+      # the exact rm set is auditable and can't change under us (matches this repo's pinning
+      # posture, e.g. the exact cargo-deny pin below); the trade-off is we hand-maintain these
+      # paths if a future runner image relocates them. rm of a missing path is a harmless no-op,
+      # and swap + the apt/cargo/rust caches are left intact.
+      - name: Free runner disk (drop preinstalled SDKs unused by this Rust build)
+        run: |
+          echo "== disk before =="; df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "== disk after =="; df -h /
+
       - uses: actions/checkout@v4
 
       # System deps for the GPUI Linux (blade/Vulkan) build + the render suite, via

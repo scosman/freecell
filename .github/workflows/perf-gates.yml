@@ -10,10 +10,20 @@
 
 name: perf-gates
 
+# Scoped to `app/**` + this workflow file, same as `checks.yml` — a spec/docs/experiments
+# change can't move these perf numbers, so it shouldn't spend a release build's worth of
+# runner minutes here. See the note in checks.yml about trigger-level `paths` filters and
+# required status checks (a PR touching no `app/**` file skips this workflow entirely).
 on:
   push:
     branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/perf-gates.yml'
   pull_request:
+    paths:
+      - 'app/**'
+      - '.github/workflows/perf-gates.yml'
 
 concurrency:
   group: perf-gates-${{ github.ref }}
@@ -21,14 +31,37 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # No incremental artifacts in CI (large + useless; rust-cache discards them). The release
+  # profile already emits no debug info, so no debug trim is needed here — the disk win for
+  # this job comes from the free-disk step below.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   perf-gates:
     name: perf harness (Linux, buffered thresholds)
     runs-on: ubuntu-24.04
     steps:
+      # Same disk reclaim as checks.yml: the release build of this GPUI/zed-scale tree is large,
+      # and this job also lacked any headroom step. See checks.yml for the full rationale.
+      - name: Free runner disk (drop preinstalled SDKs unused by this Rust build)
+        run: |
+          echo "== disk before =="; df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "== disk after =="; df -h /
+
       - uses: actions/checkout@v4
 
+      # Build deps for the GPUI (blade/Vulkan) release build + the perf harness's virtual
+      # display. This is intentionally a lean SUBSET of app/render-tests/scripts/setup_render_env.sh
+      # (that script's canonical build-dep list is the source of truth): the perf harness needs
+      # only xvfb + the lavapipe ICD, not the full capture stack (ImageMagick / x11 tools / the
+      # explicit-serif font), so we skip those to keep this job fast. Keep the build-dep portion
+      # below in sync with setup_render_env.sh if the GPUI build deps ever change.
       - name: Install system dependencies
         run: |
           sudo apt-get update

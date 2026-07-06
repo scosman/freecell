@@ -731,3 +731,160 @@ tooltip** (needs an active mouse drag the static scene can't set up); and the **
 (opened by a right-click). These are exercised by the grid unit tests, not the pixel suite. The
 insert/delete **content shift** needs no new render case — a shifted cell renders through the existing
 publication path (ordinary cell rendering at new coordinates), no new rendered construct.
+
+## Phase 8 — Titlebar (macOS) + closeout
+
+### 1. §7.1 macOS on-device smoke is an OUTSTANDING GATE (implemented live, easily flippable)
+
+The gpui APIs §7.1 relies on were **verified present at the pinned gpui rev**
+(`1d217ee39d…`) before relying on them: `WindowOptions.titlebar` (`platform.rs:1486`),
+`TitlebarOptions { appears_transparent, traffic_light_position, title }`
+(`platform.rs:1647-1657`), the macOS transparent-titlebar + traffic-light impl
+(`gpui_macos/src/window.rs`), `WindowControlArea::Drag` (`window.rs:594`), and the
+`.window_control_area(..)` fluent method on `InteractiveElement` (`elements/div.rs:1136`,
+in the prelude; also used by zed's own `platform_title_bar`). So the §7.1 flag-off
+fallback is **NOT** triggered on API grounds.
+
+**What remains unverified here:** this is a headless **Linux** container — the actual
+macOS behaviors (transparent titlebar rendering, repositioned traffic lights, row
+drag / double-click-zoom / fullscreen at this rev) are the §7.1 **30-minute on-device
+smoke** and can only be checked on a Mac. **This is an outstanding gate requiring a human
+on a Mac before the macOS titlebar can be trusted.** Smoke item **MG-8** was added to
+`specs/projects/mvp/smoke_checklist.md`.
+
+**Implemented live but easily flippable.** The titlebar is guarded by a single master
+switch `shell::titlebar::MACOS_TITLEBAR = cfg!(target_os = "macos")` used at all three
+sites (both window options + both window renders). On Linux it is `false`, so the build
++ tests here are **completely unaffected** (server decorations as today; verified —
+`freecell-app` suite green, existing window render tests unchanged). The **pre-agreed
+§7.1 fallback** (if the on-device smoke finds traffic-light / fullscreen glitches at the
+pinned rev) is to set that one const to `false` — it removes both the transparent-titlebar
+`WindowOptions` and the drawn row everywhere, no gpui bump. Confirm the on-device smoke
+before shipping the macOS build.
+
+### 2. Custom titlebar text always carries the `— Edited` suffix (minor deviation)
+
+The native window title on macOS drops the `— Edited` suffix (the traffic-light edited dot
+carries dirtiness — `title_uses_suffix()` is `false` on macOS, unchanged). The **custom
+titlebar row** we draw, however, shows the edited state **textually** (`window_title(name,
+dirty, /*use_suffix=*/true)`) per `ui_design.md §1` ("shows `Name` or `Name — Edited`") and
+`functional_spec.md §4.1` ("name + edited state"). So on macOS a dirty document shows the
+edited state twice — the traffic-light dot **and** `— Edited` in our row. Both are specced;
+`set_window_edited` is still called (feeds the dot + Exposé). Flagged in case the owner
+prefers the row omit the suffix and rely on the dot alone (one-line change in
+`WorkbookWindow::titlebar_title`).
+
+### 3. Welcome render restructured (behavior-preserving on Linux)
+
+Adding the top titlebar row to the Welcome window required moving its centered content
+(`items_center/justify_center`) off the outer div into a `flex_1` inner container, with the
+titlebar as the first child of the outer `flex_col`. On Linux (`MACOS_TITLEBAR == false`)
+no titlebar child is emitted and the `flex_1` inner container is the sole flex child, so it
+fills the window exactly as before — **pixel-identical to today**. No Welcome behavior
+changed on Linux.
+
+### 4. Render-suite §9 reconciliation — two cases ADDED, one DEFERRED, three mapped
+
+Reconciling `architecture.md §9`'s render-case list against the harness (across Phases
+1–7 + this phase):
+
+**Already present** (verified registered + in `case_names_match_table`): `border_all_thin`,
+`border_outer_medium`, `border_heavier_edge_wins` (Phase 6); `font_family_serif`,
+`font_size_24_row_grown` (Phase 5); `incell_editor_open` (Phase 2).
+
+**ADDED this phase** (the harness can construct them now):
+- `text_color_red` — a cell with an **explicit** red font colour (constructible via the
+  existing `font_color` cache inject). This is the §1.2 "explicit `font.color` wins" path.
+- `titlebar_row` — the macOS custom titlebar row div over a short grid. The harness renders
+  only a `GridView`, so a `titlebar` field on `RenderCase` + a `TitlebarScene` wrapper view
+  in `render.rs` mount `flex_col[titlebar_row(title), grid]`. It is just a div, so it
+  renders on Linux; the NATIVE macOS integration stays the on-device smoke.
+
+**DEFERRED — cannot construct in the harness** (unchanged from Phase-1 §6a):
+- `format_red_negative` — a text colour produced by a `[Red]` **number format**. The Scene
+  builder drives cells only through `SetCellInput` (IronCalc **infers** the num_fmt) + the
+  cache mutators; it has **no way to set a custom `num_fmt`** on a cell, so no render case
+  can produce a number-format colour. The GAPS #2 `[Red]` visual output is guarded by the
+  engine integration test `published_style_resolves_format_and_explicit_colors`
+  (`freecell-engine/src/document.rs`). Landing the pixel case needs a small Scene-builder
+  `num_fmt` setter — deferred (additive; the engine test covers the behaviour).
+
+**Conceptual §9 names mapped to existing granular cases** (the type-aware alignment
+behaviour, Phase 1 §1.3 — already pixel-covered, no duplicate cases added):
+- `align_number_default_right` → `cell_number_plain` / `cell_number_thousands` /
+  `cell_number_currency` / `cell_number_percent` / `cell_date_default` (numbers & dates
+  default right when no explicit alignment).
+- `align_error_center` → `cell_error_div0` / `cell_error_name` / `cell_error_circ` (errors)
+  + `cell_boolean` (bool) — all default center.
+- `align_explicit_beats_default` → `cell_number_align_left` (number + explicit Left) and
+  `cell_align_explicit_overrides_default` (text + explicit Right).
+
+### 5. CONSOLIDATED render-baseline regen list (ALL phases) — pinned runner + human eyeball
+
+The baselines **cannot** be generated here (needs the pinned Xvfb + lavapipe runner +
+ImageMagick + a human eyeball, per `render-tests/README.md`; this container lacks the
+capture stack). **No baseline PNGs were committed in any mvp-gaps phase.** `cargo test`
+without `FREECELL_RENDER=1` is green (the pixel diff is gated; `case_names_match_table`
+passes — the macro list + table are in lockstep). The dedicated `render_tests.sh` pixel
+gate will be **red** until every baseline below is generated + eyeballed on the pinned
+runner. This is the single source of truth for the closeout render-regen work
+(30 baselines: 12 changed + 18 additive):
+
+**A. CHANGED — stale committed baselines that now render differently (Phase-1 §1.3
+alignment; must be REGENERATED and re-eyeballed):**
+- Numbers/dates now **right**-aligned: `cell_number_plain`, `cell_number_thousands`,
+  `cell_number_currency`, `cell_number_percent`, `cell_number_negative_red`,
+  `cell_date_default`, `cell_narrow_column_clipped_number`, and the numeric cells in
+  `grid_mixed_content`.
+- Booleans/errors now **center**-aligned: `cell_boolean`, `cell_error_div0`,
+  `cell_error_name`, `cell_error_circ`.
+
+**B. ADDITIVE — new cases with no committed baseline yet (GENERATE + eyeball):**
+- Phase 1: `cell_number_align_left`.
+- Phase 2: `cell_mirror_typing`, `incell_editor_open`.
+- Phase 5: `font_family_serif`, `font_size_24_row_grown`, `font_missing_family_fallback`
+  (⚠ `font_family_serif` needs **"DejaVu Serif"** installed on the runner — Phase-5 §5).
+- Phase 6: `border_all_thin`, `border_outer_medium`, `border_heavier_edge_wins`,
+  `border_over_fill`, `border_shared_edge_adjacent`, `border_none_clear`.
+- Phase 7: `col_resized_narrow_clips_text`, `row_resized_tall`,
+  `header_full_column_selected`, `header_full_row_selected`.
+- Phase 8: `text_color_red`, `titlebar_row`.
+
+**C. DEFERRED — no harness case (see §4):** `format_red_negative`.
+
+All other committed baselines (text attributes, fills, explicit-alignment/text cases, grid
+selection/geometry scenes) are **unchanged** and need no regeneration.
+
+### 6. §9 perf gate (500-bordered-cell viewport) — assertion added; RUN deferred to the runner
+
+Added the §9 perf assertion "a 500-bordered-cell viewport stays within budget (borders are
+cache-resident)": `render-tests/src/perf.rs::build_bordered_fixture` builds a 120×64 region
+with an all-thin border interned into the resident cache on **every** cell (borders + geometry
+only, no cell values) + narrow geometry; the `perf_harness` bin measures one frame over a large
+viewport, asserts the frame stays inside the bordered region, then **FORCE + ASSERTs** the
+**actual distinct visible bordered-cell count** — `(rows.end-rows.start)·(cols.end-cols.start)`
+from `measure_frame`'s returned ranges — is `≥ 500`, and gates its build time under the buffered
+CI frame budget (`CI_FRAME_MAX_NS`). Recorded in `results/perf-runtest.json` (as
+`bordered_cells`, with the content-layer element count reported **separately** as
+`content_elements` — never conflated: a content element is one cell div plus ~2 border-edge
+quads, so ≈3× the cell count) + contributing to the `--gate` verdict. **CR fix (metric
+honesty):** the first cut asserted/reported on `sample.elements` (the content-element count)
+mislabeled as "bordered cells", over-reporting ~3× and making `≥500` witness only ~167 real
+cells; the gate now measures the true bordered-cell count (the 1400×900 viewport over the
+120×64 region paints ~1,584 bordered cells, so the ≥500 intent holds with margin).
+
+The **fixture** is unit-tested headlessly here (`bordered_fixture_is_dense_bordered` — every
+region cell bordered, region > 500 cells, narrow geometry; passes in `cargo test`). The
+**frame measurement** needs the GPU/Xvfb + lavapipe stack, so it was **not run here** — it
+runs on the pinned runner via `render-tests/scripts/perf.sh [gate]`. Action required before
+merge: run `perf.sh gate` on the pinned runner and confirm the bordered-viewport gate PASSes
+alongside the existing frame/zero-engine-calls gates.
+
+### 7. Environment: §7.2 (cap popover) and §7.3 (.back backup) verified present (not re-built)
+
+Per the phase scope, §7.2 and §7.3 were delivered in Phase 1. Verified present, not
+re-implemented: the cap-error popover (chrome `cap_error*` state + `cap_error_visible()` +
+the worker-cap backstop test `edit_rejected_input_cap_flags_chrome_data_row`) and the `.back`
+backup (`lifecycle::backup_path`/`backup_target` + `fs::copy` in the save flow, with the three
+committed tests `first_save_of_opened_file_writes_back_backup_once`,
+`backup_failure_aborts_the_save_with_a_dialog`, and the `backup_target_*` unit tests).

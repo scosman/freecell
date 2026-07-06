@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    px, size, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Entity, Global,
-    WindowBounds, WindowHandle, WindowId, WindowOptions,
+    point, px, size, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Entity, Global,
+    TitlebarOptions, WindowBounds, WindowHandle, WindowId, WindowOptions,
 };
 use gpui_component::Root;
 
@@ -497,20 +497,40 @@ impl FreeCellApp {
     }
 }
 
-/// The document window options: ~1200×800, centered, resizable, standard traffic lights
-/// (`functional_spec.md §2.3`).
+/// The transparent macOS titlebar options (`architecture.md §7.1`, `ui_design.md §1`): a
+/// hidden system title + hidden native titlebar (so the window draws its own 36 px row —
+/// [`super::titlebar`]) with the traffic lights repositioned to vertically center in that row.
+/// `None` on Linux (server decorations, unchanged) and whenever the §7.1 fallback flips
+/// [`super::titlebar::MACOS_TITLEBAR`] off. Verified present at the pinned gpui rev; the native
+/// behavior itself is the on-device smoke gate.
+fn titlebar_options() -> Option<TitlebarOptions> {
+    if super::titlebar::MACOS_TITLEBAR {
+        Some(TitlebarOptions {
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(12.0), px(12.0))),
+            title: None,
+        })
+    } else {
+        None
+    }
+}
+
+/// The document window options: ~1200×800, centered, resizable, macOS custom titlebar (§7.1)
+/// or standard traffic lights on Linux (`functional_spec.md §2.3`).
 fn document_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.0), px(800.0)), cx)),
+        titlebar: titlebar_options(),
         ..Default::default()
     }
 }
 
-/// The welcome window options: small, fixed-size, non-resizable, centered
-/// (`functional_spec.md §2.2`).
+/// The welcome window options: small, fixed-size, non-resizable, centered, macOS custom
+/// titlebar (§7.1) or standard traffic lights on Linux (`functional_spec.md §2.2`).
 fn welcome_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(420.0), px(300.0)), cx)),
+        titlebar: titlebar_options(),
         is_resizable: false,
         is_minimizable: false,
         ..Default::default()

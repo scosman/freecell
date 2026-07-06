@@ -8,7 +8,7 @@
 use gpui::{div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, Window};
 use gpui_component::button::{Button, ButtonVariants as _};
 
-use super::{CloseWindow, FreeCellApp};
+use super::{titlebar, CloseWindow, FreeCellApp};
 
 const BG: u32 = 0xF7F7F7;
 const TEXT: u32 = 0x1F1F1F;
@@ -88,44 +88,54 @@ impl Render for WelcomeView {
             .size_full()
             .flex()
             .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_4()
             .bg(rgb(BG))
             // Cmd/Ctrl+W closes the welcome window (matches the platform convention). Closing
             // the last window quits the app via the registry (`app.rs on_window_closed`).
             .on_action(cx.listener(|_this, _: &CloseWindow, window, _cx| window.remove_window()))
+            // macOS custom titlebar (§7.1): "FreeCell", drawn only when the master switch is on.
+            // On Linux it is omitted and the centered content below fills the window exactly as
+            // before (the `flex_1` inner container is the sole flex child).
+            .children(titlebar::MACOS_TITLEBAR.then(|| titlebar::titlebar_row("FreeCell")))
             .child(
                 div()
-                    .text_size(px(28.0))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(TEXT))
-                    .child("FreeCell"),
-            )
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(rgb(MUTED_TEXT))
-                    .child("A fast, Excel-compatible spreadsheet."),
-            )
-            .child(
-                div()
+                    .flex_1()
                     .flex()
-                    .gap_3()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_4()
                     .child(
-                        Button::new("new-spreadsheet")
-                            .label("New Spreadsheet")
-                            .primary()
-                            .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
-                                FreeCellApp::new_workbook(cx);
-                            })),
+                        div()
+                            .text_size(px(28.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(TEXT))
+                            .child("FreeCell"),
                     )
                     .child(
-                        Button::new("open-file")
-                            .label("Open…")
-                            .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
-                                FreeCellApp::open_via_panel(cx);
-                            })),
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(MUTED_TEXT))
+                            .child("A fast, Excel-compatible spreadsheet."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                Button::new("new-spreadsheet")
+                                    .label("New Spreadsheet")
+                                    .primary()
+                                    .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
+                                        FreeCellApp::new_workbook(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("open-file")
+                                    .label("Open…")
+                                    .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
+                                        FreeCellApp::open_via_panel(cx);
+                                    })),
+                            ),
                     ),
             )
             .children(self.render_modal(cx))

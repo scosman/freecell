@@ -8,6 +8,8 @@
 # Run FOREGROUND (this script blocks) — never background it (`CLAUDE.md`). The harness
 # itself times the CPU render-build path + the engine-call counter (representative under
 # lavapipe); it does not gate on GPU present (not representative under software Vulkan).
+# It also runs the §9 bordered-viewport gate: one frame of a ≥500-bordered-cell fixture
+# (cache-resident borders) must build under the buffered CI frame budget.
 #
 # Requires: cargo + the pinned toolchain; xvfb (xvfb-run); mesa-vulkan-drivers (the
 # lavapipe ICD). See app/README.md for the apt list.

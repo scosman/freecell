@@ -31,21 +31,21 @@ these are presentation / entry-point behaviors consciously deferred. Each also a
 |---|----------|------|----------|------------------|------------|---------------|
 | 1 | **Type-based default cell alignment** — numbers/dates right, booleans/errors center | §3.6 | Moderate | ✅ **Resolved (mvp-gaps Phase 1)** — `PublishedCell.kind` is published and the grid aligns by type when no explicit alignment is set; explicit alignment still wins | `PublishedCell` carries only a display string, no value type | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
 | 2 | **`[Red]` number-format text color** | §3.6 | Mild | ✅ **Resolved (mvp-gaps Phase 1)** — the worker resolves per-cell `text_color` (explicit font colour → number-format colour); `[Red]` negatives render red | Worker doesn't publish resolved per-cell color | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
-| 3 | **Input-cap rejection message text** — "Formula too long / too deeply nested" popover | §3.3 | Mild | ✅ **Resolved for the data row (mvp-gaps Phase 1)** — a tooltip-style popover shows the length/depth reason under the data-row editor (the in-cell editor gets the same popover in mvp-gaps Phase 2) | `DataRowEffect::ShowCapError` is a no-op in the chrome; message-popover not built | *inline below* |
+| 3 | **Input-cap rejection message text** — "Formula too long / too deeply nested" popover | §3.3 | Mild | ✅ **Resolved (mvp-gaps Phase 1 + 2)** — a tooltip-style popover shows the length/depth reason under the **data row** (Phase 1) and the **in-cell editor** (Phase 2); dismisses on the next keystroke/focus change | `DataRowEffect::ShowCapError` was a no-op in the chrome; message-popover not built | *inline below* |
 | 4 | **macOS Finder open-file** — double-click / `open -a` / drag-onto-Dock | §2.1 | Moderate | Only the **CLI-argv** open path is wired; the primary-platform "double-click a file" flow does not open it | Pinned gpui rev's `on_open_urls` callback lacks a context (`cx`) arg | *inline below* |
 | 5 | **Bundled Inter font** — ship Inter via `add_fonts` at startup | §3.3/§3.6 | Nicety (not a functional gap) | App renders on the platform default font; render baselines pinned to the CI runner image | Fonts not vendored; `register_fonts` is a documented no-op | [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md) |
 
 ### Detail for the two without a dedicated note
 
-**#3 — Input-cap rejection message text (§3.3).**
-Today an over-cap edit (formula length > 8192 chars or paren-depth > 64) is rejected at
-both the `freecell-core::input_cap` validator and the worker-side re-check; the data row
-shows a red danger border and keeps the user in edit mode with the cell unmodified
-(tested: `chrome/view.rs::cap_reject_keeps_editing_and_flags_error`, plus
-`input_cap.rs` unit tests). What's missing is the specced inline message-popover text
-telling the user *why* the input bounced. Work when picked up: wire
-`DataRowEffect::ShowCapError` to render a tooltip-style popover below the content field
-with the reason string (length vs depth). Small, chrome-local change.
+**#3 — Input-cap rejection message text (§3.3). ✅ RESOLVED (mvp-gaps Phase 1 + 2).**
+An over-cap edit (formula length > 8192 chars or paren-depth > 64) is rejected at both the
+`freecell-core::input_cap` validator and the worker-side re-check; the data row shows a red
+danger border and keeps the user in edit mode with the cell unmodified. mvp-gaps wired the
+specced inline message-popover: `DataRowEffect::ShowCapError` now renders a tooltip-style
+popover below the active editor with the reason string (length vs depth), on the **data row**
+(Phase 1) and the **in-cell editor** (Phase 2), auto-dismissing on the next keystroke/focus
+change (`chrome/view.rs` `cap_error*` state + `cap_error_visible()`, tested via
+`edit_rejected_input_cap_flags_chrome_data_row` + the `input_cap.rs` unit tests).
 
 **#4 — macOS Finder open-file (§2.1).**
 `main.rs` wires only `xlsx_arg` (CLI argv). Opening a `.xlsx` from Finder
@@ -67,10 +67,10 @@ deferred dispatch; then map the incoming URLs through the existing `do_open_path
 
 ### When picking these up
 
-Items #1 and #2 share a root cause (the publication carries no per-cell type/color) and
-should be done together — see [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md)
-for the publication → grid threading plan. #3 is a small chrome-local change. #4 needs a
-gpui-capability spike before estimating. None are blocked by the others.
+Items **#1, #2, and #3 are RESOLVED** by the `specs/projects/mvp-gaps` build (Phases 1–2 —
+publication type/color + type-aware alignment + the cap-error popover). **Still open:** #4
+(macOS Finder open-file — needs a gpui-capability spike before estimating) and #5 (bundled
+Inter font — a nicety, not a functional gap). Neither is blocked by the other.
 
 ---
 
@@ -105,7 +105,7 @@ built-in number-format table, and accepts an `xfId`-less `cellXfs`, `open_fixups
 
 | Gap | Severity | Why it matters | Sketch |
 |-----|----------|----------------|--------|
-| **Save a `.back` backup before the first save** | High (we're alpha) | The save path can lose data (IronCalc's writer silently strips anything it doesn't model; we're early and bugs are likely). A one-time backup of the original bytes means an overwrite can never be the *only* copy. | Before the **first** save of a document opened from disk, copy the original file to `filename.xlsx.back` (write-once — do **not** re-back-up / overwrite the backup on subsequent saves, so the backup always holds the pristine original). Applies to files opened from disk; a never-saved new workbook has nothing to back up. **Picked up in `specs/projects/mvp-gaps`.** |
+| **Save a `.back` backup before the first save** ✅ **RESOLVED (mvp-gaps Phase 1)** | High (we're alpha) | The save path can lose data (IronCalc's writer silently strips anything it doesn't model; we're early and bugs are likely). A one-time backup of the original bytes means an overwrite can never be the *only* copy. | ✅ **Done.** Before the **first** save-in-place of a document opened from disk, the original bytes are copied to `<name>.xlsx.back` (write-once — never overwritten on later saves; not created by Save-As to a new path; a copy failure aborts the save with a "Couldn't create backup — file not saved." dialog). `shell/lifecycle.rs` `backup_path`/`backup_target` + the save flow, tested by `first_save_of_opened_file_writes_back_backup_once`, `backup_failure_aborts_the_save_with_a_dialog`, and the `backup_target_*` unit tests. |
 
 ---
 

@@ -35,6 +35,7 @@ use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView, RowOrCol}
 use super::clipboard::ClipboardCoordinator;
 use super::lifecycle::{self, SaveTarget};
 use super::registry::WindowKey;
+use super::titlebar;
 use super::{
     CloseWindow, FreeCellApp, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
 };
@@ -752,6 +753,15 @@ impl WorkbookWindow {
         )
     }
 
+    /// The text drawn in the macOS custom titlebar row (§7.1 / `ui_design.md §1`): the document
+    /// name, **always** with the `— Edited` suffix when dirty. Unlike the native window title
+    /// (which drops the suffix on macOS in favor of the traffic-light edited dot — see
+    /// [`title_uses_suffix`]), the custom row shows the edited state textually, so the user sees
+    /// it in the row we draw. `set_window_edited` still lights the dot too.
+    fn titlebar_title(&self) -> String {
+        titlebar_title_text(&lifecycle::document_name(self.path.as_deref()), self.dirty)
+    }
+
     /// Test seam: force the dirty flag (mirrors the registry) without a worker round-trip.
     #[cfg(test)]
     pub(crate) fn set_dirty_for_test(&mut self, dirty: bool, cx: &mut Context<Self>) {
@@ -908,6 +918,12 @@ impl Render for WorkbookWindow {
             .on_action(cx.listener(|this, _: &ToggleUnderline, window, cx| {
                 this.toggle_style(StyleAttr::Underline, window, cx)
             }))
+            // macOS custom titlebar (§7.1): the very top row, drawn only when the master switch
+            // is on (Linux omits it → server decorations, unaffected). Its native integration is
+            // the on-device smoke gate.
+            .children(
+                titlebar::MACOS_TITLEBAR.then(|| titlebar::titlebar_row(self.titlebar_title())),
+            )
             .children(
                 self.degraded
                     .clone()
@@ -1003,6 +1019,15 @@ impl WorkbookWindow {
 /// (`functional_spec.md §2.3`).
 fn title_uses_suffix() -> bool {
     !cfg!(target_os = "macos")
+}
+
+/// The macOS custom-titlebar text (§7.1 / `ui_design.md §1`): the document `name` with the
+/// `— Edited` suffix **always** applied when `dirty` — deliberately independent of
+/// [`title_uses_suffix`]. The native window title drops the suffix on macOS (the traffic-light
+/// dot carries dirtiness), but the row we draw shows the edited state textually. Pure so the
+/// "always suffix" contract is directly unit-tested.
+fn titlebar_title_text(name: &str, dirty: bool) -> String {
+    lifecycle::window_title(name, dirty, /* use_edited_suffix = */ true)
 }
 
 /// A small modal card: title, body text, and a right-aligned button row.
@@ -1342,5 +1367,37 @@ pub(super) fn open_panel_options() -> PathPromptOptions {
         directories: false,
         multiple: false,
         prompt: Some("Open".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The macOS custom titlebar (§7.1 / `ui_design.md §1`) shows the edited state **textually**
+    /// and **always** — its distinguishing contract vs the native window title, which drops the
+    /// `— Edited` suffix on macOS (`title_uses_suffix()` is `false` there, the traffic-light dot
+    /// carrying dirtiness). This locks that in: a regression making `titlebar_title_text` defer to
+    /// `title_uses_suffix()` would, on macOS, drop the suffix and fail the `assert_ne!` below.
+    #[test]
+    fn titlebar_title_always_suffixes_when_dirty() {
+        // Dirty → suffix; clean → bare name.
+        assert_eq!(
+            titlebar_title_text("Budget.xlsx", true),
+            "Budget.xlsx — Edited"
+        );
+        assert_eq!(titlebar_title_text("Budget.xlsx", false), "Budget.xlsx");
+
+        // It must equal the ALWAYS-suffix form (use_edited_suffix = true) and must NOT match the
+        // native-title rule where the suffix is suppressed (use_edited_suffix = false) — so a
+        // future change routing it through `title_uses_suffix()` (false on macOS) is caught.
+        assert_eq!(
+            titlebar_title_text("Budget.xlsx", true),
+            lifecycle::window_title("Budget.xlsx", true, true),
+        );
+        assert_ne!(
+            titlebar_title_text("Budget.xlsx", true),
+            lifecycle::window_title("Budget.xlsx", true, false),
+        );
     }
 }

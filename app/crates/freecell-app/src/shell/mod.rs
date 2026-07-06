@@ -16,6 +16,7 @@
 pub mod lifecycle;
 pub mod menus;
 pub mod registry;
+pub mod titlebar;
 
 mod app;
 mod clipboard;

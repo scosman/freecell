@@ -34,6 +34,6 @@ judgment calls in a `DECISIONS_TO_REVIEW.md` here).
 - [x] **Phase 7 — Structure**: resize hotspots/cursors/preview/commit (§5.1); header
       selection + select-all + clamping rule (§5.2); insert/delete menu + merge
       guard (§5.3).
-- [ ] **Phase 8 — Titlebar (macOS) + closeout**: on-device smoke first, then
+- [x] **Phase 8 — Titlebar (macOS) + closeout**: on-device smoke first, then
       implement or flag-off per §7.1; full render-baseline regen + smoke checklist
       pass; GAPS.md sweep.

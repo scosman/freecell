@@ -200,6 +200,8 @@ render_cases! {
     // Structure (Phase 7): resized geometry + header selection
     col_resized_narrow_clips_text, row_resized_tall,
     header_full_column_selected, header_full_row_selected,
+    // Chrome / formatting (Phase 8): explicit text colour + the macOS titlebar row
+    text_color_red, titlebar_row,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

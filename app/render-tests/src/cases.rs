@@ -49,6 +49,10 @@ pub struct RenderCase {
     pub mirror: Option<(u32, u32, &'static str)>,
     /// An open in-cell editor overlay `(row, col, text)` (`functional_spec.md §1.3`).
     pub in_cell: Option<(u32, u32, &'static str)>,
+    /// `Some(title)` prepends the macOS custom titlebar row over the grid (`architecture.md
+    /// §7.1, §9`). The row is just a div, so it renders in the Linux harness too — the *native*
+    /// macOS integration (transparent titlebar + traffic lights) is the on-device smoke.
+    pub titlebar: Option<&'static str>,
 }
 
 impl RenderCase {
@@ -63,11 +67,17 @@ impl RenderCase {
             reveal: None,
             mirror: None,
             in_cell: None,
+            titlebar: None,
         }
     }
 
     fn selection(mut self, selection: SelectionModel) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    fn titlebar(mut self, title: &'static str) -> Self {
+        self.titlebar = Some(title);
         self
     }
 
@@ -486,6 +496,26 @@ pub fn all() -> Vec<RenderCase> {
             GRID_VP,
         )
         .selection(sel((2, 0), (2, freecell_core::limits::MAX_COLS - 1))),
+        // ---- Chrome / formatting (Phase 8) ---------------------------------------------
+        cell(
+            // An explicit RED font colour on a cell (`architecture.md §1.2` precedence: an
+            // explicit `font.color` wins). The §9 `format_red_negative` companion — a colour
+            // produced by a `[Red]` number format — has NO render case (the Scene builder can't
+            // set a custom `num_fmt`; it is guarded by the engine test
+            // `published_style_resolves_format_and_explicit_colors`, see DECISIONS §8).
+            "text_color_red",
+            at(Scene::new()).font_color(1, 1, 0xFF0000),
+        ),
+        RenderCase::new(
+            // The macOS custom titlebar row (§7.1) over a short grid. It is just a div, so it
+            // renders in the Linux harness (this case); the *native* macOS integration
+            // (transparent titlebar, repositioned traffic lights, drag/zoom/fullscreen) is the
+            // on-device smoke gate, not pixel-baselined here.
+            "titlebar_row",
+            Scene::new().input(0, 0, "A1"),
+            (480, 120),
+        )
+        .titlebar("Budget.xlsx — Edited"),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

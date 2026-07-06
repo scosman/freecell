@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use freecell_app::grid::GridDataSources;
 use freecell_core::perf::PerfConfig;
-use freecell_core::{Align, CellRange, CellRef, RenderStyle, Rgb, SheetId};
+use freecell_core::{Align, BorderSpec, CellRange, CellRef, Edge, RenderStyle, Rgb, SheetId};
 use freecell_engine::{
     Command, DocumentClient, DocumentSource, StyleAttr, WorkerEvent, WorkerEventReceiver,
 };
@@ -172,6 +172,100 @@ pub fn build_fixture(cfg: &PerfConfig, value_rows: u32) -> Result<Fixture> {
         publication,
         sheet,
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// Bordered-viewport perf gate (`architecture.md §9`: "a 500-bordered-cell viewport stays
+// within the frame budget — borders are cache-resident").
+// ---------------------------------------------------------------------------------------
+
+/// The bordered fixture's region, sized so a large viewport shows **well over 500** bordered
+/// cells at once (narrow geometry packs many cells into the frame, and the region comfortably
+/// covers the visible frame + overscan at scroll `(0,0)`, so every visible cell is bordered).
+pub const BORDER_FIXTURE_ROWS: u32 = 120;
+/// The bordered fixture's column extent (see [`BORDER_FIXTURE_ROWS`]).
+pub const BORDER_FIXTURE_COLS: u32 = 64;
+/// Narrow row height (px) for the bordered fixture, so many bordered rows fit the viewport.
+const BORDER_ROW_PX: f32 = 18.0;
+/// Narrow column width (px) for the bordered fixture (see [`BORDER_ROW_PX`]).
+const BORDER_COL_PX: f32 = 40.0;
+
+/// The minimum bordered-cell count a measured bordered frame must reach for the §9 gate to be
+/// meaningful (FORCE + ASSERT — a smaller frame would not exercise the border paint loop at
+/// scale).
+pub const BORDERED_VIEWPORT_MIN_CELLS: u32 = 500;
+
+/// An all-thin (1 px) black four-edge border — the resolved [`BorderSpec`] every cell in the
+/// bordered fixture carries (interned once into the cache's side table).
+fn all_thin_border() -> BorderSpec {
+    let edge = Some(Edge::new(1, Rgb::new(0, 0, 0)));
+    BorderSpec {
+        top: edge,
+        right: edge,
+        bottom: edge,
+        left: edge,
+    }
+}
+
+/// Builds a small sheet where **every** cell in a [`BORDER_FIXTURE_ROWS`] × [`BORDER_FIXTURE_COLS`]
+/// region carries an all-thin black border in the **resident cache** (cache-resident — the scroll
+/// path reads it wait-free, never the engine), with narrow geometry so a large viewport shows
+/// ≥ [`BORDERED_VIEWPORT_MIN_CELLS`] bordered cells at once. The driver measures one such frame and
+/// gates its build time (`architecture.md §9`). The worker is left running (like [`build_fixture`]).
+pub fn build_bordered_fixture() -> Result<Fixture> {
+    let (client, events) = DocumentClient::spawn(DocumentSource::NewWorkbook);
+
+    let sheet = loop {
+        match events.recv_timeout(LOAD_TIMEOUT) {
+            Some(WorkerEvent::Loaded { sheets }) => {
+                break sheets.first().map(|m| m.id).unwrap_or(SheetId(0));
+            }
+            Some(WorkerEvent::LoadFailed { error }) => bail!("worker load failed: {error}"),
+            Some(_) => continue,
+            None => bail!("worker never emitted Loaded within {LOAD_TIMEOUT:?}"),
+        }
+    };
+
+    // Publish the region so the worker builds the active-sheet cache the grid renders from.
+    client.send(Command::SetViewport {
+        sheet,
+        rows: 0..BORDER_FIXTURE_ROWS,
+        cols: 0..BORDER_FIXTURE_COLS,
+    });
+    drain_to_idle(&events)?;
+
+    let publication = client.publication_swap();
+    let caches = client.caches();
+
+    apply_bordered_region(&caches, sheet);
+
+    Ok(Fixture {
+        client,
+        events,
+        caches,
+        publication,
+        sheet,
+    })
+}
+
+/// Intern the all-thin border once and set it (plus the narrow geometry) on every cell of the
+/// region — the same `RenderStyle.border` index a file's borders resolve to at cache build.
+fn apply_bordered_region(caches: &parking_lot::RwLock<freecell_core::SheetCaches>, sheet: SheetId) {
+    let mut guard = caches.write();
+    let Some(cache) = guard.get_mut(sheet) else {
+        return;
+    };
+    let border = cache.intern_border_spec(all_thin_border());
+    for row in 0..BORDER_FIXTURE_ROWS {
+        cache.set_row_height(row, BORDER_ROW_PX);
+    }
+    for col in 0..BORDER_FIXTURE_COLS {
+        cache.set_col_width(col, BORDER_COL_PX);
+        for row in 0..BORDER_FIXTURE_ROWS {
+            let base = cache.render_style(row, col).copied().unwrap_or_default();
+            cache.set_cell_style(row, col, RenderStyle { border, ..base });
+        }
+    }
 }
 
 /// The value for a fixture cell: mostly numbers, some short words, and a long string on a
@@ -358,5 +452,39 @@ mod tests {
             publication.cells.iter().all(|c| c.row < 6 && c.col < 8),
             "published cells are inside the valued band"
         );
+    }
+
+    /// The bordered fixture (§9 perf gate): every cell in the region is border-interned in the
+    /// resident cache, the region exceeds the 500-cell gate target, and the geometry is narrow so
+    /// a large viewport shows ≥ 500 of them at once. Headless (no GPU) — the *frame measurement*
+    /// runs in the perf_harness bin on the pinned runner (see DECISIONS Phase 8).
+    #[test]
+    fn bordered_fixture_is_dense_bordered() {
+        let fixture = build_bordered_fixture().expect("bordered fixture builds");
+        let sources = fixture.sources();
+        let caches = sources.caches.read();
+        let cache = caches
+            .get(fixture.sheet)
+            .expect("active-sheet cache resident");
+
+        let mut bordered = 0u32;
+        for row in 0..BORDER_FIXTURE_ROWS {
+            for col in 0..BORDER_FIXTURE_COLS {
+                if cache.render_style(row, col).map(|s| s.border).unwrap_or(0) != 0 {
+                    bordered += 1;
+                }
+            }
+        }
+        assert_eq!(
+            bordered,
+            BORDER_FIXTURE_ROWS * BORDER_FIXTURE_COLS,
+            "every cell in the region must be bordered (cache-resident)"
+        );
+        assert!(
+            bordered >= BORDERED_VIEWPORT_MIN_CELLS,
+            "the bordered region ({bordered}) must exceed the 500-cell gate target"
+        );
+        // Narrow geometry so the visible frame packs ≥ 500 bordered cells.
+        assert_eq!(cache.col_width(0), BORDER_COL_PX, "narrow columns");
     }
 }

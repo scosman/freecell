@@ -10,16 +10,40 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use gpui::{px, size, App, AppContext as _, AsyncApp, Bounds, Point, WindowBounds, WindowOptions};
+use gpui::{
+    div, prelude::*, px, size, App, AsyncApp, Bounds, Context, Entity, Point, SharedString, Window,
+    WindowBounds, WindowOptions,
+};
 use gpui_component::input::InputState;
 use gpui_component::Root;
 use gpui_platform::application;
 
 use freecell_app::grid::{GridEventSink, GridView};
+use freecell_app::shell::titlebar::titlebar_row;
 use freecell_core::CellRef;
 
 use crate::cases;
 use crate::scene::build_sources;
+
+/// The `titlebar_row` case's root: the macOS custom titlebar row (`architecture.md §7.1`) drawn
+/// over the real grid (a flex column), so the harness pixel-checks the row's own look on Linux.
+/// The row is built unconditionally (it is just a div — the master `MACOS_TITLEBAR` switch gates
+/// only the *real* windows, not this render fixture).
+struct TitlebarScene {
+    title: SharedString,
+    grid: Entity<GridView>,
+}
+
+impl Render for TitlebarScene {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(titlebar_row(self.title.clone()))
+            .child(self.grid.clone())
+    }
+}
 
 /// Runs the gpui app for a single named case: builds its engine-backed sources, opens a
 /// viewport-sized window with the real grid, and quits after `exit_after_ms`.
@@ -39,6 +63,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let reveal = case.reveal;
     let mirror = case.mirror;
     let in_cell = case.in_cell;
+    let titlebar = case.titlebar;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
@@ -96,8 +121,19 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     }
                     view
                 });
-                // gpui-component requires the top-level window element to be a `Root`.
-                cx.new(|cx| Root::new(grid, window, cx))
+                // gpui-component requires the top-level window element to be a `Root`. A
+                // `titlebar_row` case wraps the grid under the macOS custom titlebar row (§7.1);
+                // all other cases mount the bare grid (unchanged — no baseline perturbation).
+                let root_view: gpui::AnyView = match titlebar {
+                    Some(title) => cx
+                        .new(|_| TitlebarScene {
+                            title: title.into(),
+                            grid: grid.clone(),
+                        })
+                        .into(),
+                    None => grid.into(),
+                };
+                cx.new(|cx| Root::new(root_view, window, cx))
             },
         )
         .expect("failed to open render-test window");

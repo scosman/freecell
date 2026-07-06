@@ -1,28 +1,54 @@
 //! Font registration hook (`components/app_shell.md §Structure`, `ui_design.md §3.3`).
 //!
-//! The design *intends* to bundle **Inter** and register it via `cx.text_system().add_fonts(...)`
-//! before any window opens, so the grid + chrome render in one predictable family. **The MVP
-//! does not do this** — bundling Inter was a conscious Phase-13 deferral: the render-baseline
-//! stability the spec cites Inter for is already delivered by pinning the render-suite runner
-//! image, and changing the render font at the finish line would mean regenerating + re-eyeballing
-//! all 48 pixel baselines. The app runs on GPUI's **default UI font**.
+//! The app bundles **Inter** (SIL OFL, static RIBBI faces under `assets/fonts/inter/`) and
+//! registers it via `cx.text_system().add_fonts(...)` at startup, then sets it as the app UI
+//! font so the grid + gpui-component chrome render in one predictable family. This also fixes
+//! a real cross-platform bug: on Linux the GPUI default UI font resolves to a single regular
+//! face, so bold/italic silently render as regular — the vendored Inter has real Bold/Italic
+//! faces, so styled runs render correctly and identically on macOS and Linux.
 //!
-//! This function is therefore a **no-op** at present (it registers nothing). It is kept as the
-//! single seam a future font pass flips on — see `PROJECTS.md` → `projects/bundled-inter-font.md`
-//! and `DECISIONS_TO_REVIEW.md` (Phase 13). It intentionally makes no false "fonts registered"
-//! claim: nothing is added, so callers get the default font.
+//! Registration is **best-effort**: if `add_fonts` fails (unexpected on the bundled bytes) the
+//! function logs a warning and returns without setting the UI font, so the app falls back to
+//! GPUI's default font rather than panicking. See `projects/bundled-inter-font.md`.
+
+use std::borrow::Cow;
 
 use gpui::App;
 
-/// No-op today: the MVP ships on GPUI's default UI font (bundled Inter deferred — see the module
-/// doc and `projects/bundled-inter-font.md`). Kept as the startup seam a future font pass flips to
-/// `cx.text_system().add_fonts(...)`; call once before the first window opens.
-pub fn register_fonts(_cx: &mut App) {
-    // A future font pass vendors the Inter faces under `assets/fonts/` and replaces this body with
-    // `cx.text_system().add_fonts(...)`. Doing so requires regenerating + eyeballing all render
-    // baselines (they were captured on the default font), so it is deliberately NOT done in MVP.
-    tracing::debug!(
-        "register_fonts: no-op (MVP ships on the default UI font; bundled Inter deferred — \
-         see projects/bundled-inter-font.md)"
-    );
+use crate::grid::GRID_FONT_FAMILY;
+
+/// The bundled Inter faces (family name "Inter"), embedded in the binary so no external font
+/// package is required. Static RIBBI faces are used (not the variable font) for deterministic
+/// weight/italic resolution.
+const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Regular.otf");
+const INTER_BOLD: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Bold.otf");
+const INTER_ITALIC: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Italic.otf");
+const INTER_BOLD_ITALIC: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-BoldItalic.otf");
+
+/// Registers the bundled Inter faces with the text system and sets Inter as the app UI font
+/// (both the grid and the gpui-component chrome), so rendering is one predictable family across
+/// platforms. Call once before the first window opens, **after** `gpui_component::init(cx)`.
+///
+/// Best-effort: if registration fails, logs a warning and returns without changing the UI font,
+/// leaving the app on GPUI's default font (the documented "bundle absent → default font"
+/// fallback). Never panics.
+pub fn register_fonts(cx: &mut App) {
+    if let Err(err) = cx.text_system().add_fonts(vec![
+        Cow::Borrowed(INTER_REGULAR),
+        Cow::Borrowed(INTER_BOLD),
+        Cow::Borrowed(INTER_ITALIC),
+        Cow::Borrowed(INTER_BOLD_ITALIC),
+    ]) {
+        tracing::warn!(
+            error = %err,
+            "register_fonts: failed to register bundled Inter faces; falling back to the default UI font"
+        );
+        return;
+    }
+
+    // Point the gpui-component theme (which drives the chrome, and which the grid also names
+    // explicitly at its text sites) at Inter so everything renders in one family.
+    gpui_component::Theme::global_mut(cx).font_family = GRID_FONT_FAMILY.into();
+
+    tracing::debug!("register_fonts: registered bundled Inter faces; UI font set to Inter");
 }

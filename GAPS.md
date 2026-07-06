@@ -144,3 +144,15 @@ lost if one bites in practice.
 | **External TSV paste skips empty tokens instead of clearing cells** | Excel blanks the target cell | Engine `paste_csv_string` behavior. Fix = FreeCell pre-clears the target area (one extra undoable step) if this bites. |
 | **`.back` backup failure blocks the save** | n/a (our feature) | Data-safety-wins call: "Couldn't create backup — file not saved." The annoying case (unwritable dir) mostly implies the atomic save would fail too. Could soften to warn-and-continue. |
 | **No action-bar overflow; window min-width rises to fit the control row** | Excel ribbon collapses | Could feel restrictive on small/split screens. Fix = overflow menu for trailing groups. |
+
+### Render fidelity — surfaced by the render-baseline eyeball (2026-07-06)
+
+Two rendering deviations caught when every render-test baseline was regenerated on the
+bundled Inter font and eyeballed. Both are **pre-existing** (unrelated to the font change);
+the baselines faithfully capture current behavior. Recorded here, **not fixed** (out of scope
+for the font work).
+
+| Deviation | Vs. Excel | Follow-up if needed |
+|---|---|---|
+| **A fill does not cover interior gridlines.** In a multi-cell fill block, each cell still paints its own right/bottom gridline over its fill, so faint gray gridlines cross the block interior (visible in `cell_fill_covers_gridlines`: the 2×2 yellow block shows a gray line down the B/C boundary and across the row-2/3 boundary). The case name/comment says the fill should "paint over the interior gridlines (Excel look)", but it does not. | Excel shows no interior gridlines inside a filled range — it reads as one solid block. | Skip a cell's right/bottom gridline when the neighbor across that edge shares the same fill (or draw gridlines beneath fills). Then regenerate + eyeball `cell_fill_covers_gridlines`. |
+| **Full-row selection does not highlight the row-number header.** A full-row selection tints the row and draws the accent border, but the left-hand row-number header cell is **not** darkened — whereas a full-**column** selection *does* darken the column-letter header (`header_full_column_selected` vs `header_full_row_selected`). Asymmetric. | Excel highlights both the row and column headers of a full-line selection. | Apply the selected-header background to the row-number header on a full-row selection the same way the column path already does. Then regenerate + eyeball `header_full_row_selected`. |

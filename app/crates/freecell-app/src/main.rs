@@ -52,8 +52,9 @@ fn main() {
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
-        register_fonts(cx); // font-registration seam, called before any window opens; a no-op in
-                            // MVP — ships on the default font (bundled Inter deferred, see fonts.rs)
+        register_fonts(cx); // registers the bundled Inter faces + sets Inter as the UI font,
+                            // before any window opens (best-effort; falls back to the default
+                            // font on failure — see fonts.rs)
         cx.activate(true);
 
         FreeCellApp::init(cx);

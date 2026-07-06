@@ -68,6 +68,9 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        // Register the bundled Inter faces + set Inter as the UI font, so render-test captures
+        // use the same font the app does (matches main.rs).
+        freecell_app::shell::register_fonts(cx);
         cx.activate(true);
 
         // A window at the screen origin sized exactly to the case viewport, so `import -window

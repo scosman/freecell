@@ -1,8 +1,12 @@
-# Linux `checks` — the required-green gate (architecture.md §9).
+# Linux `checks` — the fast required-green gate (architecture.md §9).
 #
 # Runs on every push/PR: format, clippy (-D warnings), full workspace build (freecell-app
-# compiles on Linux), workspace tests, the render step under Xvfb + Mesa lavapipe, and
-# cargo-deny (licenses/advisories, incl. the documented GPL ztracing exception).
+# compiles + links on Linux), workspace tests, and cargo-deny (licenses/advisories, incl.
+# the documented GPL ztracing exception). This job builds AND tests the WHOLE workspace
+# (render-tests included); only the slow, flaky render PIXEL suite (Xvfb + Mesa lavapipe)
+# was split into its own manual gate — see .github/workflows/render.yml. `cargo test
+# --workspace` here still runs render-tests' GPUI-free unit tests (the pixel cases self-skip
+# without FREECELL_RENDER), so the crate stays compiled + covered on every push.
 #
 # The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
 
@@ -10,7 +14,7 @@ name: checks
 
 # Scope the heavy Rust CI to changes that can actually affect it: the `app/` workspace or
 # this workflow file. This repo's activity is mostly non-`app/` (specs / experiments / docs),
-# and those pushes/PRs have nothing to build here — running the full clippy+build+test+render
+# and those pushes/PRs have nothing to build here — running the full clippy+build+test+deny
 # stack on them only burns runner minutes. NOTE: because this is a trigger-level `paths`
 # filter, a PR that touches no `app/**` file skips the whole workflow, so the `checks` context
 # is never reported. If `checks` is a *required* status check with strict branch protection,
@@ -49,40 +53,24 @@ env:
 
 jobs:
   checks:
-    name: fmt / clippy / build / test / render / deny (Linux)
+    name: fmt / clippy / build / test / deny (Linux)
     runs-on: ubuntu-24.04
     steps:
-      # ubuntu-24.04 runners have ~14 GB free after their preinstalled toolchains, and a cold
-      # debug build of this GPUI/zed-scale workspace peaks target/ right at that ceiling — the
-      # render-tests link is where it tips into "No space left on device". Reclaim ~20 GB up
-      # front by deleting large preinstalled SDKs this Rust build never touches (Android / .NET
-      # / GHC / CodeQL) plus cached docker images. Inlined rather than a third-party action so
-      # the exact rm set is auditable and can't change under us (matches this repo's pinning
-      # posture, e.g. the exact cargo-deny pin below); the trade-off is we hand-maintain these
-      # paths if a future runner image relocates them. rm of a missing path is a harmless no-op,
-      # and swap + the apt/cargo/rust caches are left intact.
-      - name: Free runner disk (drop preinstalled SDKs unused by this Rust build)
-        run: |
-          echo "== disk before =="; df -h /
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL || true
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          echo "== disk after =="; df -h /
-
+      # No disk-prune step here: with the debug trims in this workflow's env
+      # (CARGO_PROFILE_DEV/TEST_DEBUG=line-tables-only + CARGO_INCREMENTAL=0), the whole-
+      # workspace `cargo build` + `cargo test --no-run` target/ peak measured ~6.7 GB locally
+      # — comfortably under the ~14 GB free on ubuntu-24.04. The disk-hungry render pixel suite
+      # (which needs the prune) now lives in render.yml.
       - uses: actions/checkout@v4
 
-      # System deps for the GPUI Linux (blade/Vulkan) build + the render suite, via
-      # the ONE canonical setup script (also run by devs/agents locally, so CI and
-      # local environments cannot drift): X11/Wayland/xkb, Vulkan loader + lavapipe
-      # (software Vulkan) ICD, fontconfig + freetype, gbm, ALSA, the capture tools
-      # (Xvfb, ImageMagick `import`, xrefresh, xwininfo), plus DejaVu Serif for the
-      # explicit-serif render case. The UI font (Inter) is bundled in the app binary
-      # (add_fonts), so no system UI font is needed. See the script header and
-      # render-tests/README.md.
-      - name: Install system dependencies (capture stack + fonts)
+      # System deps for the GPUI Linux (blade/Vulkan) build, via the ONE canonical setup
+      # script (also run by devs/agents locally + by render.yml, so environments cannot
+      # drift): X11/Wayland/xkb, Vulkan loader + lavapipe ICD, fontconfig + freetype, gbm,
+      # ALSA. render-tests must COMPILE here (it's a workspace member built + unit-tested by
+      # the steps below), which needs these -dev libs; the capture-only tools it also installs
+      # (Xvfb, ImageMagick, xrefresh/xwininfo, DejaVu Serif) are exercised by the pixel suite
+      # in render.yml, not here. See the script header and render-tests/README.md.
+      - name: Install system dependencies (GPUI build deps)
         run: app/render-tests/scripts/setup_render_env.sh
 
       # Installs the toolchain pinned by app/rust-toolchain.toml. `rustup toolchain
@@ -121,24 +109,10 @@ jobs:
         working-directory: app
         run: cargo test --workspace
 
-      # Phase 7: the REQUIRED render-test suite (Xvfb + Mesa lavapipe), replacing the
-      # Phase-1 informational spike. Renders the real grid over engine-produced scenes and
-      # perceptual-diffs each against a committed baseline. The harness sizes an Xvfb
-      # display per case (a small window on a large screen won't present under lavapipe),
-      # so this is not wrapped in a single xvfb-run; the script sets FREECELL_RENDER=1.
-      # (`cargo test --workspace` above already ran the GPUI-free diff unit tests; without
-      # FREECELL_RENDER the pixel cases there skip.)
-      - name: Render-test suite (Xvfb + lavapipe)
-        working-directory: app
-        run: render-tests/scripts/render_tests.sh test
-
-      - name: Upload render failures
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: render-failures
-          path: app/target/render-failures/
-          if-no-files-found: ignore
+      # The REQUIRED render pixel suite (Xvfb + Mesa lavapipe) is NOT here — it runs as a
+      # separate manual gate (.github/workflows/render.yml). `cargo test --workspace` above
+      # already compiled render-tests and ran its GPUI-free diff unit tests (the pixel cases
+      # self-skip without FREECELL_RENDER), so the crate stays built + covered on every push.
 
       # Pin the exact cargo-deny the gate was authored + verified against (0.19.9), so a
       # future action bump can't silently change gate behaviour. Installs a prebuilt

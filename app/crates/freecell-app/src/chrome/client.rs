@@ -32,7 +32,7 @@ pub trait ChromeClient {
 
     /// The resolved font-family name of a single cell (`components/action_bar.md`), for the font
     /// family dropdown's active label. `None` = no resident cache for the sheet; a cell with no
-    /// stored family resolves to `Some("")` (the workbook default = "System Default").
+    /// stored family resolves to `Some("")` (the workbook default = "Default (Inter)").
     fn font_family_name(&self, sheet: SheetId, cell: CellRef) -> Option<String>;
 
     /// The workbook's default font size in **points** (`components/action_bar.md`), so the size box

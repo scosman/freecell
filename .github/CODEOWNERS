@@ -1,0 +1,11 @@
+# Code owners — used to require human review on merge for specific paths.
+#
+# Render-test baselines are committed "pixel-truth" PNGs. They are generated + eyeballed
+# by the implementing agent pre-commit, but a HUMAN must sign off on the visuals
+# PRE-MERGE by reviewing the image diffs in the PR's "Files changed" tab. Making the
+# baselines a code-owned path turns that sign-off into a required review.
+#
+# Enforcement: enable branch protection on the default branch with
+# "Require review from Code Owners" so a baseline change cannot merge without this
+# approval. (CODEOWNERS alone requests the review; branch protection makes it blocking.)
+/app/render-tests/baselines/ @scosman

@@ -325,11 +325,11 @@ variance).
 
 ### CI (GitHub Actions, repo root — **Linux runners are the gating target**)
 
-Four workflows. **checks** runs automatically on the app critical path; the two heavy
-gates (**render**, **perf-gates**) are **manual `workflow_dispatch`** — deliberate "final
-checks before merge" — because a software-render pass and a full release build are
-slow/flaky and not worth spending on every push. `checks`, `render`, and `perf-gates` are
-all **required** status checks.
+Four workflows. **checks** and **perf-gates** run automatically on the app critical path
+(paths-scoped to `app/**`); **render** — the software-render pixel gate — is **manual
+`workflow_dispatch`** (a deliberate "final check before merge"), because a lavapipe pass is
+slow and occasionally flaky and not worth spending on every push. `checks`, `render`, and
+`perf-gates` are all **required** status checks.
 
 1. **checks** (`checks.yml`, Linux, **auto** on every push-to-`main` / PR that touches
    `app/**` — paths-scoped, so spec/experiments/docs-only changes skip it; required, fast):
@@ -349,14 +349,15 @@ all **required** status checks.
    occasionally flaky; it frees runner disk first (it is the disk-hungry job now) and installs
    the full capture stack. Must be wired into branch protection under the exact context name
    **`render (Xvfb + lavapipe)`**.
-3. **perf-gates** (`perf-gates.yml`, Linux buffered, **now manual `workflow_dispatch`**,
-   required): the perf harness with **hard but buffered thresholds** (product call): during
-   the perf phase, calibrate on the pinned runner image and commit absolute thresholds = **2×
-   the calibrated p99** (documented next to the numbers); real-hardware budgets (8.33 ms/2 ms)
-   remain the product truth, checked manually on macOS and recorded in the repo. Recalibrate
-   only deliberately (a committed change with rationale), never to quiet a regression.
-   **Demoted from every-app-PR to manual dispatch** (a full release build is slow); its
-   required-check context name is **`perf harness (Linux, buffered thresholds)`**.
+3. **perf-gates** (`perf-gates.yml`, Linux buffered, **auto** on every push-to-`main` / PR
+   that touches `app/**` — paths-scoped; required): the perf harness with **hard but buffered
+   thresholds** (product call): during the perf phase, calibrate on the pinned runner image
+   and commit absolute thresholds = **2× the calibrated p99** (documented next to the
+   numbers); real-hardware budgets (8.33 ms/2 ms) remain the product truth, checked manually
+   on macOS and recorded in the repo. Recalibrate only deliberately (a committed change with
+   rationale), never to quiet a regression. It runs the full release build, so it frees runner
+   disk first; its required-check context name is **`perf harness (Linux, buffered
+   thresholds)`**.
 4. **macos-verify** (`macos-verify.yml`, **manual dispatch / weekly cron, non-required**):
    full build + test + render-harness smoke on `macos-14` — keeps the primary design target
    honest without putting slow/expensive runners in the merge path.
@@ -365,12 +366,12 @@ Caching (`Swatinem/rust-cache`, `workspaces: app`, `cache-on-failure: true`) kee
 build tolerable across runs. GitHub scopes caches by branch, so the win lands once `main`
 runs green + saves once; feature-branch runs then restore `main`'s cache as fallback.
 
-**`workflow_dispatch` bootstrap caveat:** a manual workflow's "Run workflow" button only
-appears once the file exists on the default branch (`main`), so the PR that first introduces
-`render.yml` / demotes `perf-gates.yml` cannot dispatch those checks on *itself* — merge to
-`main` first (or make them non-required temporarily). Dispatch **render** and **perf-gates**
-from the Actions tab against the PR's branch (or, if a merge queue is later enabled, wire them
-to a `merge_group` trigger so the queue runs them automatically).
+**`workflow_dispatch` bootstrap caveat (render):** a manual workflow's "Run workflow" button
+only appears once the file exists on the default branch (`main`), so the PR that first
+introduces `render.yml` cannot dispatch that check on *itself* — merge to `main` first (or
+make it non-required temporarily). Dispatch **render** from the Actions tab against the PR's
+branch (or, if a merge queue is later enabled, wire it to a `merge_group` trigger so the queue
+runs it automatically).
 
 ## 10. Technical risks & mitigations (build-time)
 

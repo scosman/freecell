@@ -1,0 +1,85 @@
+{
+  "fill" : {
+    "automatic-gradient" : "display-p3:0.12451,0.45661,0.08145,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "grid6.svg",
+          "name" : "grid6",
+          "position" : {
+            "scale" : 1.89,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "hidden" : true,
+          "image-name" : "grid5.svg",
+          "name" : "grid5",
+          "position" : {
+            "scale" : 1.89,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "hidden" : true,
+          "image-name" : "grid4.svg",
+          "name" : "grid4",
+          "position" : {
+            "scale" : 1.89,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "hidden" : true,
+          "image-name" : "grid2.svg",
+          "name" : "grid2",
+          "position" : {
+            "scale" : 1.89,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "hidden" : true,
+          "image-name" : "grid.svg",
+          "name" : "grid",
+          "position" : {
+            "scale" : 1.87,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

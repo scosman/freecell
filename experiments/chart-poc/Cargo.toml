@@ -12,7 +12,7 @@
 # ---------------------------------------------------------------------------------
 [workspace]
 resolver = "2"
-members = ["chart-model", "chart-render"]
+members = ["chart-model", "chart-render", "load-save"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,6 +36,14 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee3
 # gpui-component pinned to the main SHA that pins the zed rev above.
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
+
+# load-save (Exp 1): the same libs open_fixups.rs already pulls in, plus IronCalc to
+# exercise the save path. `zip`/`roxmltree` versions mirror freecell-engine; the ironcalc
+# pins mirror app/Cargo.toml (=0.7.1 — never bump alone).
+zip = "0.6"
+roxmltree = "0.19"
+ironcalc = "=0.7.1"
+ironcalc_base = "=0.7.1"
 
 # Capture + PNG handling (mirrors app/Cargo.toml).
 image = { version = "0.25", default-features = false, features = ["png"] }

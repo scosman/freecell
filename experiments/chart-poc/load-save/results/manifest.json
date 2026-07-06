@@ -1,0 +1,20 @@
+[
+  {
+    "name": "loaded_column",
+    "png": "loaded_column.png",
+    "description": "Loaded from charts_basic.xlsx and rendered through chart-render: Quarterly Sales by Product (2 series).",
+    "expectation": "A clustered column chart titled 'Quarterly Sales by Product' with 2 series drawn side-by-side within each of four quarters (Q1-Q4), distinct colors matching a legend, a readable numeric value axis, and axis titles. Rendered FROM data parsed out of an .xlsx. Non-blank, no clipping."
+  },
+  {
+    "name": "loaded_line",
+    "png": "loaded_line.png",
+    "description": "Loaded from charts_basic.xlsx and rendered through chart-render: Sales Trend by Product (2 series).",
+    "expectation": "A multi-series line chart titled 'Sales Trend by Product' with 2 straight-segment lines over four quarters on one shared numeric value axis, dot markers, distinct colors matching a legend, and axis titles. Rendered FROM data parsed out of an .xlsx. Non-blank."
+  },
+  {
+    "name": "loaded_pie",
+    "png": "loaded_pie.png",
+    "description": "Loaded from charts_basic.xlsx and rendered through chart-render: Quarterly Totals (1 series).",
+    "expectation": "A pie chart titled 'Quarterly Totals' divided into four wedges in DISTINCT colors (one per quarter), on-slice percentage labels, and a legend mapping each quarter to its slice. Rendered FROM data parsed out of an .xlsx. Non-blank, no clipping."
+  }
+]

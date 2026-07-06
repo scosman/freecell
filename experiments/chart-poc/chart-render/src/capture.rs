@@ -88,18 +88,23 @@ pub fn lavapipe_icd() -> Option<PathBuf> {
     None
 }
 
-/// Locate the `render_scene` bin as a sibling of the current executable (they are built into
-/// the same `target/<profile>/` dir).
-pub fn sibling_render_scene_bin() -> Result<PathBuf> {
+/// Locate a bin as a sibling of the current executable (they are built into the same
+/// `target/<profile>/` dir). Reused by the `load-save` render proof to find `render_loaded`.
+pub fn sibling_bin(name: &str) -> Result<PathBuf> {
     let exe = std::env::current_exe().context("current_exe")?;
     let dir = exe
         .parent()
         .ok_or_else(|| anyhow!("current exe has no parent dir"))?;
-    let bin = dir.join("render_scene");
+    let bin = dir.join(name);
     if !bin.exists() {
-        bail!("render_scene bin not found next to {}", exe.display());
+        bail!("{name} bin not found next to {}", exe.display());
     }
     Ok(bin)
+}
+
+/// Locate the `render_scene` bin as a sibling of the current executable.
+pub fn sibling_render_scene_bin() -> Result<PathBuf> {
+    sibling_bin("render_scene")
 }
 
 /// Render every scene (or those whose name starts with `only`) into `out_dir` as
@@ -149,10 +154,36 @@ pub fn render_all(
 
 /// Render + capture a single scene into `out_dir/<name>.png` under its own Xvfb display.
 fn render_one(render_scene_bin: &Path, icd: &Path, scene: &Scene, out_dir: &Path) -> Result<()> {
-    let (w, h) = scene.viewport;
     let out = out_dir.join(format!("{}.png", scene.name));
+    let bin = shell_quote(path_str(render_scene_bin)?);
+    let exit_after_ms = default_exit_after_ms();
+    let launch = format!(
+        "{bin} --scene {} --exit-after-ms {exit_after_ms}",
+        scene.name
+    );
+    capture_window(&launch, scene.viewport, icd, &out)
+        .with_context(|| format!("capturing scene {}", scene.name))
+}
 
-    let script = capture_script(render_scene_bin, icd, scene, &out)?;
+/// The exit-after-ms a launched renderer should use so it outlives the settle + present +
+/// capture window.
+pub fn default_exit_after_ms() -> u64 {
+    ((settle_s() + present_s()) * 1000.0) as u64 + 8000
+}
+
+/// Launch `launch_cmd` (a shell command that starts a viewport-sized render window in the
+/// background and self-quits), force presentation with `xrefresh`, find the `WxH` window, and
+/// capture it to `out` — then assert the capture is non-blank. This is the reusable core of the
+/// proven `app/render-tests` path; both the scene harness and the `load-save` render proof call
+/// it. `launch_cmd` should NOT background itself (`&`) — this wrapper does.
+pub fn capture_window(
+    launch_cmd: &str,
+    viewport: (u32, u32),
+    icd: &Path,
+    out: &Path,
+) -> Result<()> {
+    let (w, h) = viewport;
+    let script = capture_script(launch_cmd, icd, viewport, out)?;
     let screen = format!("-screen 0 {}x{}x24", w + SCREEN_MARGIN, h + SCREEN_MARGIN);
 
     let output = Command::new("xvfb-run")
@@ -169,7 +200,7 @@ fn render_one(render_scene_bin: &Path, icd: &Path, scene: &Scene, out_dir: &Path
 
     // Guard against a silent blank (the window failed to present): a failed present yields a
     // single uniform colour, so a non-blank capture must have at least two distinct colours.
-    let colors = unique_colors(&out).with_context(|| {
+    let colors = unique_colors(out).with_context(|| {
         format!(
             "reading captured {} (xvfb stderr: {})",
             out.display(),
@@ -178,36 +209,34 @@ fn render_one(render_scene_bin: &Path, icd: &Path, scene: &Scene, out_dir: &Path
     })?;
     if colors <= 1 {
         bail!(
-            "capture for {} is blank ({colors} unique colour(s)); xvfb stderr:\n{}",
-            scene.name,
+            "capture {} is blank ({colors} unique colour(s)); xvfb stderr:\n{}",
+            out.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(())
 }
 
-/// The per-scene bash script run inside `xvfb-run`: launch the renderer, force presentation
-/// with `xrefresh`, find the chart window by its size, and capture it by id.
+/// The bash script run inside `xvfb-run`: launch the renderer, force presentation with
+/// `xrefresh`, find the window by its size, and capture it by id.
 fn capture_script(
-    render_scene_bin: &Path,
+    launch_cmd: &str,
     icd: &Path,
-    scene: &Scene,
+    viewport: (u32, u32),
     out: &Path,
 ) -> Result<String> {
-    let (w, h) = scene.viewport;
-    let bin = shell_quote(path_str(render_scene_bin)?);
+    let (w, h) = viewport;
     let icd = shell_quote(path_str(icd)?);
     let out = shell_quote(path_str(out)?);
     let settle = settle_s();
     let present = present_s();
-    let exit_after_ms = ((settle + present) * 1000.0) as u64 + 8000;
 
     Ok(format!(
         r#"set -u
 export VK_ICD_FILENAMES={icd}
 export LIBGL_ALWAYS_SOFTWARE=1
 export ZED_ALLOW_EMULATED_GPU=1
-{bin} --scene {scene} --exit-after-ms {exit_after_ms} >/dev/null 2>&1 &
+{launch_cmd} >/dev/null 2>&1 &
 APP=$!
 sleep {settle}
 xrefresh >/dev/null 2>&1 || true
@@ -223,7 +252,6 @@ fi
 kill -KILL $APP >/dev/null 2>&1 || true
 exit $rc
 "#,
-        scene = scene.name,
     ))
 }
 

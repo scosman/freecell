@@ -106,7 +106,7 @@ not grind through later phases once a core capability is shown unachievable.**
   + dots), reusing the Phase 1/2 title/axis/legend scaffolding. Capture + review.
   *Checkpoint: FAIL → scatter recorded out-of-scope for the follow-on (not a whole NO-GO).*
 
-- [ ] **Phase 4 — Gate 4: load/save stitching.** `load-save` crate: parse a real
+- [x] **Phase 4 — Gate 4: load/save stitching.** `load-save` crate: parse a real
   agent-authored `.xlsx` (a couple of in-scope chart types) into `chart-model` and render it
   via `chart-render`; **byte-preservation re-injection** on save + `open→save→reopen`
   round-trip. May run in parallel with Phases 1–3 (render leads). *Checkpoint: save FAIL →

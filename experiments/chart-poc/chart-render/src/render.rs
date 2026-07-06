@@ -34,8 +34,15 @@ impl Render for ChartView {
 /// widget and quits after `exit_after_ms`.
 pub fn run_render_scene(scene_name: &str, exit_after_ms: u64) -> Result<()> {
     let scene = scenes::get(scene_name).ok_or_else(|| anyhow!("unknown scene: {scene_name}"))?;
-    let (w, h) = scene.viewport;
-    let chart = scene.chart;
+    run_render_chart(scene.chart, scene.viewport, exit_after_ms)
+}
+
+/// Runs the gpui app for an arbitrary [`Chart`] (not tied to the scene registry): opens a
+/// `viewport`-sized window with the chart widget and quits after `exit_after_ms`. This is the
+/// seam the `load-save` render proof drives — a chart parsed out of an `.xlsx` is rendered
+/// through the exact same widgets as the built-in scenes.
+pub fn run_render_chart(chart: Chart, viewport: (u32, u32), exit_after_ms: u64) -> Result<()> {
+    let (w, h) = viewport;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {

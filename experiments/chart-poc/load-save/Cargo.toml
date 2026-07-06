@@ -1,0 +1,53 @@
+[package]
+name = "load-save"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Experiment 1 — load/save data stitching. Parses chart definitions out of an .xlsx zip (worksheet → drawing → chart relationship chain, cached numCache/strCache, no formula eval) INTO chart-model, and re-injects the original chart parts on save so charts survive IronCalc's chart-dropping writer. The parse/model layer is gpui-free and ironcalc-free (zip + roxmltree, mirroring app's open_fixups.rs); the save path drives IronCalc's real writer. A render feature adds a chart-render-backed PNG proof of the loaded charts."
+
+[lib]
+name = "load_save"
+path = "src/lib.rs"
+
+# Authors the .xlsx fixtures and runs the save round-trip (load → IronCalc save → re-inject →
+# reopen), writing artifacts under results/. gpui-free (default features only).
+[[bin]]
+name = "fixtures"
+path = "src/bin/fixtures.rs"
+
+# The gpui side of the render proof: loads one chart out of a fixture and opens ONE window
+# with it, mirroring chart-render's render_scene. Needs the render feature (pulls in gpui).
+[[bin]]
+name = "render_loaded"
+path = "src/bin/render_loaded.rs"
+required-features = ["render"]
+
+# Headless capture of each loaded chart to results/loaded_*.png, reusing chart-render's
+# xvfb/lavapipe/xrefresh capture path. Needs the render feature.
+[[bin]]
+name = "capture_loaded"
+path = "src/bin/capture_loaded.rs"
+required-features = ["render"]
+
+[features]
+# The render proof depends on chart-render (and thus gpui). Off by default so the
+# model/parse/save layer builds and tests gpui-free and fast.
+render = ["dep:chart-render", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+chart-model.workspace = true
+zip.workspace = true
+roxmltree.workspace = true
+ironcalc.workspace = true
+ironcalc_base.workspace = true
+anyhow.workspace = true
+
+# Render proof only (feature = "render").
+chart-render = { path = "../chart-render", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

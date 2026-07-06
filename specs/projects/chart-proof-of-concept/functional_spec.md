@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: Chart Proof of Concept
@@ -251,16 +251,13 @@ the recommended scope + known risks for the follow-on project.
 
 ---
 
-## 10. Open questions for review
+## 10. Resolved decisions (confirmed at review)
 
-1. **Gate ordering (§7):** run Experiment 1 (load/save) in parallel with the render
-   component, or strictly after Gate 1 passes? (Recommend: parallel-OK, render leads.)
-2. **Save PoC bar (§5):** is **byte-preservation re-injection** an acceptable proof, or do
-   you want synthesizing-chart-XML-from-our-model in the PoC? (Recommend: re-injection is
-   enough; synthesis is a stretch goal.)
-3. **Agentic review mechanics (§6):** one agent verdict per image, or a small panel
-   (e.g. 3) for the make-or-break Gate 1 image to reduce a single agent's misjudgment?
-   (Recommend: single verdict everywhere, panel of 3 for Gate 1 only.)
-4. **Real `.xlsx` fixtures:** OK for the agent to author example `.xlsx` files (via a
-   script / LibreOffice / a Rust xlsx writer) as load fixtures, or do you want to provide
-   real-world files? (Recommend: agent authors fixtures; you can drop in real files later.)
+1. **Gate ordering (§7):** Experiment 1 (load/save) **may run in parallel** with the render
+   component, but the **render component leads** — the go/no-go pivot is Gate 1.
+2. **Save PoC bar (§5):** **byte-preservation re-injection is the accepted proof.**
+   Synthesizing chart XML from our data model is a **stretch goal** only.
+3. **Agentic review (§6):** **single agent verdict per image**, except the make-or-break
+   **Gate 1 image gets a 3-agent panel** (majority) to reduce single-agent misjudgment.
+4. **Load fixtures (§5):** **the agent authors the example `.xlsx` fixtures** (script /
+   LibreOffice / a Rust xlsx writer); real-world files can be dropped in later.

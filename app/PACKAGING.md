@@ -32,9 +32,9 @@ config, so the same config serves all platforms.
 (`crates/freecell-app/`) before packaging, so the `icons` paths in the config are relative
 to *that* directory (`packaging/icons/...`), not the workspace root or your shell's CWD.
 
-Icons are placeholders — see
+Icons are final — see
 [`crates/freecell-app/packaging/icons/README.md`](crates/freecell-app/packaging/icons/README.md)
-for what real icons need and how to drop them in.
+for how they're generated from the two source PNGs.
 
 ## Build locally
 

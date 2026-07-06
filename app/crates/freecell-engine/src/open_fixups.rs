@@ -116,6 +116,12 @@ fn correct_theme_colors(model: &mut Model, path: &Path) {
             }
         }
     }
+
+    // Borders: each edge's `<color theme="…"/>` is rewritten the same way, via the shared walk.
+    // FONTS.xlsx's borders are *indexed*, not themed, but themed borders exist in other files —
+    // keeping the two passes symmetric (both fix fills, fonts, *and* borders) mirrors exactly how
+    // they already treat fills and fonts. `root` borrows the local `doc`, separate from `model`.
+    correct_border_colors(model, root, |n| themed_rgb(n, &palette));
 }
 
 /// Resolves a colour node against the file palette **iff** it used `theme=`; returns `None` for
@@ -240,6 +246,13 @@ fn correct_indexed_colors(model: &mut Model, path: &Path) {
             }
         }
     }
+
+    // Borders: each edge's `<color indexed="…"/>` is rewritten the same way, via the shared walk.
+    // This is the FONTS.xlsx bug — a border edge referencing `indexed="10"`/`"11"` was rendering
+    // as IronCalc's legacy default (red/green) instead of the file's grey override. `read_indexed_palette`
+    // already gated the whole pass on a `<colors><indexedColors>` override, so this only runs when
+    // the file supplies one. `root` borrows the local `doc`, separate from `model`.
+    correct_border_colors(model, root, |n| indexed_rgb(n, &palette));
 }
 
 /// Resolves a colour node against the file's indexed palette **iff** it used `indexed=` (and not an
@@ -297,6 +310,63 @@ fn parse_indexed_rgb(s: &str) -> Option<Rgb> {
         8 => parse_hex6(&s[2..8]), // AARRGGBB → keep RRGGBB
         6 => parse_hex6(s),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Border colour correction (shared by the theme + indexed passes)
+// ---------------------------------------------------------------------------------------------
+
+/// The five border edges, in the `<border>` child order the shared walk visits them.
+const BORDER_SIDES: [&str; 5] = ["left", "right", "top", "bottom", "diagonal"];
+
+/// Walks `<borders>` and rewrites each edge's stored colour via `resolve` — the same per-node
+/// resolver the fill/font passes use (`themed_rgb` / `indexed_rgb`), so a node the resolver
+/// declines (`rgb=`/`auto=`/out-of-range/wrong colour-kind) is left untouched. The i-th
+/// `<border>` child is `styles.borders[i]` (IronCalc pushes one entry per child in document
+/// order — identical to the fills/fonts alignment the other passes rely on). An edge whose model
+/// `BorderItem` is `None` (no border on that side) is skipped — we never fabricate an edge.
+///
+/// Kept generic over `resolve` so both passes reuse one walk: `resolve` closes over the pass's
+/// palette (separate from `model`), and `root` borrows the caller's local `doc` (also separate),
+/// so there is no aliasing with the `&mut model` the writes go through.
+fn correct_border_colors(
+    model: &mut Model,
+    root: roxmltree::Node,
+    resolve: impl Fn(&roxmltree::Node) -> Option<Rgb>,
+) {
+    let Some(borders) = root.children().find(|n| n.has_tag_name("borders")) else {
+        return;
+    };
+    for (i, border) in borders.children().enumerate() {
+        if i >= model.workbook.styles.borders.len() {
+            break;
+        }
+        for side in BORDER_SIDES {
+            // The side node (`<left>`/`<top>`/…) and its `<color>` child; a side with no element
+            // (an unset edge, e.g. `<diagonal/>`) or no `<color>` is left for IronCalc.
+            let Some(side_node) = border.children().find(|n| n.has_tag_name(side)) else {
+                continue;
+            };
+            let Some(color) = side_node.children().find(|n| n.has_tag_name("color")) else {
+                continue;
+            };
+            let Some(rgb) = resolve(&color) else {
+                continue;
+            };
+            // Only overwrite an edge IronCalc actually imported — a `None` edge (no border on that
+            // side) stays `None`, never fabricated from the XML.
+            let edge = match side {
+                "left" => &mut model.workbook.styles.borders[i].left,
+                "right" => &mut model.workbook.styles.borders[i].right,
+                "top" => &mut model.workbook.styles.borders[i].top,
+                "bottom" => &mut model.workbook.styles.borders[i].bottom,
+                _ => &mut model.workbook.styles.borders[i].diagonal,
+            };
+            if let Some(item) = edge {
+                item.color = Some(to_hex(rgb));
+            }
+        }
     }
 }
 
@@ -691,8 +761,10 @@ mod tests {
     );
 
     /// Minified styles.xml (no inter-element whitespace, as Excel writes it, so `<fills>` /
-    /// `<fonts>` child indices line up with the style tables). Fill 2 uses `theme=1`, fill 3
-    /// uses `theme=3` with a darkening tint, font 1 uses `theme=0`.
+    /// `<fonts>` / `<borders>` child indices line up with the style tables). Fill 2 uses `theme=1`,
+    /// fill 3 uses `theme=3` with a darkening tint, font 1 uses `theme=0`. Border 0 is the empty
+    /// default; border 1 exercises the edge branches: `left` themed (`theme=1`), `right` explicit
+    /// `rgb=`, `top` a non-theme `indexed=64`, `bottom` themed but with no matching model edge.
     const CRAFTED_STYLES: &str = concat!(
         r#"<?xml version="1.0"?><styleSheet xmlns="ns"><fills>"#,
         r#"<fill><patternFill patternType="none"/></fill>"#,
@@ -702,7 +774,13 @@ mod tests {
         r#"</fills><fonts>"#,
         r#"<font><sz val="10"/></font>"#,
         r#"<font><color theme="0"/><sz val="10"/></font>"#,
-        r#"</fonts></styleSheet>"#,
+        r#"</fonts><borders>"#,
+        r#"<border><left/><right/><top/><bottom/><diagonal/></border>"#,
+        r#"<border><left style="thin"><color theme="1"/></left>"#,
+        r#"<right style="thin"><color rgb="FFAABBCC"/></right>"#,
+        r#"<top style="thin"><color indexed="64"/></top>"#,
+        r#"<bottom style="thin"><color theme="1"/></bottom><diagonal/></border>"#,
+        r#"</borders></styleSheet>"#,
     );
 
     fn write_crafted_xlsx(dir: &std::path::Path) -> std::path::PathBuf {
@@ -796,6 +874,49 @@ mod tests {
     }
 
     #[test]
+    fn correct_theme_colors_rewrites_border_edges() {
+        use ironcalc_base::types::{Border, BorderItem, BorderStyle};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_crafted_xlsx(dir.path());
+
+        let thin = |c: &str| BorderItem {
+            style: BorderStyle::Thin,
+            color: Some(c.to_string()),
+        };
+
+        // Model borders mirror how IronCalc imports the crafted `<borders>` — each themed edge
+        // resolved WRONGLY against the default Office palette. Border 1 has NO `bottom` edge in the
+        // model, so even though the XML carries a `bottom` themed colour it must stay `None`.
+        let mut model = Model::new_empty("b", "en", "UTC", "en").unwrap();
+        model.workbook.styles.borders = vec![
+            Border::default(), // border 0: the empty default
+            Border {
+                left: Some(thin("#000000")),  // theme=1 wrongly resolved to black
+                right: Some(thin("#AABBCC")), // explicit rgb= (must be left alone)
+                top: Some(thin("#000000")),   // indexed=64 (not themed → left alone)
+                bottom: None,                 // no model edge → must NOT be fabricated
+                ..Border::default()
+            },
+        ];
+
+        correct_theme_colors(&mut model, &path);
+
+        let b = &model.workbook.styles.borders[1];
+        // left (theme=1) → this file's dk1 white.
+        assert_eq!(b.left.as_ref().unwrap().color.as_deref(), Some("#FFFFFF"));
+        // right (explicit rgb=) is left exactly as IronCalc parsed it.
+        assert_eq!(b.right.as_ref().unwrap().color.as_deref(), Some("#AABBCC"));
+        // top (indexed=64) is not a theme colour → untouched.
+        assert_eq!(b.top.as_ref().unwrap().color.as_deref(), Some("#000000"));
+        // bottom had no model edge → the themed XML colour must not fabricate one.
+        assert!(
+            b.bottom.is_none(),
+            "a missing model edge is never fabricated"
+        );
+    }
+
+    #[test]
     fn correct_theme_colors_is_noop_without_theme_file() {
         use ironcalc_base::types::Fill;
         // A zip with styles but no theme1.xml → theme correction bails, model untouched.
@@ -829,10 +950,11 @@ mod tests {
     // ----------------------------------------------------------------------------------------
 
     /// A minified styles.xml carrying a `<colors><indexedColors>` override (the first 8 standard
-    /// entries + this file's custom 9/12/13/14, mirroring the Numbers fixture) and fills/fonts
+    /// entries + this file's custom 9/12/13/14, mirroring the Numbers fixture) and fills/fonts/borders
     /// exercising every branch: an in-range `indexed=` fill (2), another in-range indexed fill
     /// (3), an out-of-range index (4), the system index 64 (5), and an explicit `rgb=` (6); font 1
-    /// uses an in-range `indexed=` colour.
+    /// uses an in-range `indexed=` colour; and a `<borders>` section (border 1's edges cover the
+    /// in-range / rgb= / system-64 / out-of-range / no-model-edge cases — see the const body).
     const CRAFTED_INDEXED_STYLES: &str = concat!(
         r#"<?xml version="1.0"?><styleSheet xmlns="ns"><fills>"#,
         r#"<fill><patternFill patternType="none"/></fill>"#,
@@ -846,6 +968,18 @@ mod tests {
         r#"<font><sz val="10"/></font>"#,
         r#"<font><color indexed="14"/><sz val="10"/></font>"#,
         r#"</fonts>"#,
+        // Border 0 is the empty default; border 1 exercises the edge branches: `left` an in-range
+        // `indexed=13` (→ the file's #FFD931), `right` an explicit `rgb=` (left alone), `top` the
+        // system `indexed=64` (left alone), `bottom` an out-of-range `indexed=99` (left alone),
+        // and `diagonal` an in-range `indexed=9` whose model edge is `None` (never fabricated).
+        r#"<borders>"#,
+        r#"<border><left/><right/><top/><bottom/><diagonal/></border>"#,
+        r#"<border><left style="thin"><color indexed="13"/></left>"#,
+        r#"<right style="thin"><color rgb="FFAABBCC"/></right>"#,
+        r#"<top style="thin"><color indexed="64"/></top>"#,
+        r#"<bottom style="thin"><color indexed="99"/></bottom>"#,
+        r#"<diagonal style="thin"><color indexed="9"/></diagonal></border>"#,
+        r#"</borders>"#,
         r#"<colors><indexedColors>"#,
         r#"<rgbColor rgb="ff000000"/><rgbColor rgb="ffffffff"/><rgbColor rgb="ffff0000"/>"#,
         r#"<rgbColor rgb="ff00ff00"/><rgbColor rgb="ff0000ff"/><rgbColor rgb="ffffff00"/>"#,
@@ -1020,6 +1154,52 @@ mod tests {
     }
 
     #[test]
+    fn correct_indexed_colors_rewrites_border_edges() {
+        use ironcalc_base::types::{Border, BorderItem, BorderStyle};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_styles_only_xlsx(dir.path(), CRAFTED_INDEXED_STYLES);
+
+        let thin = |c: &str| BorderItem {
+            style: BorderStyle::Thin,
+            color: Some(c.to_string()),
+        };
+
+        // Model borders mirror how IronCalc imports the crafted `<borders>` — each `indexed=` edge
+        // resolved WRONGLY against IronCalc's hardcoded legacy palette. Border 1's `diagonal` edge is
+        // absent from the model, so the in-range XML diagonal colour must NOT fabricate one.
+        let mut model = Model::new_empty("b", "en", "UTC", "en").unwrap();
+        model.workbook.styles.borders = vec![
+            Border::default(), // border 0: the empty default
+            Border {
+                left: Some(thin("#FFFF00")),   // index 13 → IronCalc default yellow
+                right: Some(thin("#AABBCC")),  // explicit rgb= (must be left alone)
+                top: Some(thin("#000000")),    // index 64 (system auto → left alone)
+                bottom: Some(thin("#000000")), // index 99 (out of range → left alone)
+                diagonal: None,                // no model edge → must NOT be fabricated
+                ..Border::default()
+            },
+        ];
+
+        correct_indexed_colors(&mut model, &path);
+
+        let b = &model.workbook.styles.borders[1];
+        // left (index 13) → the file's #FFD931 gold, not IronCalc's yellow.
+        assert_eq!(b.left.as_ref().unwrap().color.as_deref(), Some("#FFD931"));
+        // right (explicit rgb=) is left alone.
+        assert_eq!(b.right.as_ref().unwrap().color.as_deref(), Some("#AABBCC"));
+        // top (index 64, system auto) must not be remapped to an override slot.
+        assert_eq!(b.top.as_ref().unwrap().color.as_deref(), Some("#000000"));
+        // bottom (index 99, out of range) must not be remapped.
+        assert_eq!(b.bottom.as_ref().unwrap().color.as_deref(), Some("#000000"));
+        // diagonal had no model edge → the in-range XML colour must not fabricate one.
+        assert!(
+            b.diagonal.is_none(),
+            "a missing model edge is never fabricated"
+        );
+    }
+
+    #[test]
     fn correct_indexed_colors_is_noop_without_override() {
         use ironcalc_base::types::{Fill, Font};
         // A standard-palette file (indexed fills, but NO `<colors><indexedColors>` override): the
@@ -1111,6 +1291,59 @@ mod tests {
             fill(17, 2),
             Some(Rgb::from_hex(0xFE634D)),
             "C18 → file index 14 (#FE634D red-orange)"
+        );
+    }
+
+    /// End-to-end border-colour regression over the committed FONTS.xlsx fixture (a Numbers export
+    /// whose border edges reference `indexed="10"`/`indexed="11"`). Opening through the full public
+    /// path (`WorkbookDocument::open` → `apply_open_fixups`) and reading the resolved border must
+    /// yield the file's grey palette (10 → #A5A5A5, 11 → #3F3F3F), not IronCalc's legacy-palette
+    /// red (#FF0000) / green (#00FF00). Cell map verified against `xl/styles.xml` + `sheet1.xml`.
+    #[test]
+    fn fonts_fixture_indexed_borders_resolve_to_file_palette() {
+        use crate::document::WorkbookDocument;
+        use freecell_core::CellRef;
+
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/FONTS.xlsx");
+        let doc = WorkbookDocument::open(&path).expect("FONTS.xlsx opens (via repair)");
+
+        // C4 (0-based row 3, col 2): style 10 → borderId 7 → all four edges `indexed="10"` → the
+        // file's grey #A5A5A5 (IronCalc's legacy default 10 is red #FF0000).
+        let border = doc
+            .resolved_cell_style(0, CellRef::new(3, 2))
+            .expect("C4 style resolves")
+            .border;
+        for (name, edge) in [
+            ("top", &border.top),
+            ("right", &border.right),
+            ("bottom", &border.bottom),
+            ("left", &border.left),
+        ] {
+            let item = edge
+                .as_ref()
+                .unwrap_or_else(|| panic!("C4 {name} edge present"));
+            assert_eq!(
+                item.color.as_deref(),
+                Some("#A5A5A5"),
+                "C4 {name} border must be the file's index-10 grey #A5A5A5, not IronCalc's legacy red #FF0000",
+            );
+        }
+
+        // B3 (0-based row 2, col 1): style 5 → borderId 3 → left edge `indexed="11"` → the file's
+        // dark grey #3F3F3F (IronCalc's legacy default 11 is green #00FF00).
+        let b3 = doc
+            .resolved_cell_style(0, CellRef::new(2, 1))
+            .expect("B3 style resolves")
+            .border;
+        assert_eq!(
+            b3.left
+                .as_ref()
+                .expect("B3 left edge present")
+                .color
+                .as_deref(),
+            Some("#3F3F3F"),
+            "B3 left border must be the file's index-11 dark grey #3F3F3F, not IronCalc's legacy green #00FF00",
         );
     }
 }

@@ -1116,4 +1116,96 @@ mod tests {
         assert_eq!(cx.update(|cx| chrome.read(cx).ref_box_text()), "B7");
         assert_eq!(cx.update(|cx| chrome.read(cx).data_mode()), FieldMode::Idle);
     }
+
+    /// Opens the in-cell editor over `cell` in the Editing state with `text` pending: `begin_typed`
+    /// forces Editing on the active cell, then `begin_in_cell` promotes that pending text into the
+    /// focused overlay (keeping it) — the deterministic way to reach "focused in-cell editor mid-
+    /// edit" without relying on headless IME text insertion.
+    fn open_incell_editing(
+        window_entity: &Entity<WorkbookWindow>,
+        cx: &mut gpui::VisualTestContext,
+        text: &str,
+        cell: CellRef,
+    ) {
+        let chrome = cx.update(|_window, cx| window_entity.read(cx).chrome_for_test());
+        cx.update(|window, cx| {
+            chrome.update(cx, |c, ctx| {
+                // `begin_typed` forces Editing on the active cell; `begin_in_cell` promotes that
+                // pending text into the focused overlay — the deterministic way to reach "focused
+                // in-cell editor mid-edit" without relying on headless IME text insertion.
+                c.begin_typed(text, window, ctx);
+                c.begin_in_cell(cell, window, ctx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn in_cell_key_commands_do_not_reenter_grid_update(cx: &mut TestAppContext) {
+        use freecell_core::selection::Direction;
+        use gpui::Focusable as _;
+
+        // BUG #5 (re-entrant `GridView` update abort). An in-cell Tab/Escape is emitted by the grid
+        // root's `capture_key_down` listener — i.e. from *inside* the grid's own `update` lease
+        // (`cx.listener` == `grid.update`). It routes to the chrome, which commits/cancels and asks
+        // the grid to take focus back. If that `FocusGrid` re-focused the grid synchronously it would
+        // re-enter the in-flight grid update and abort ("cannot update GridView while it is already
+        // being updated"); the fix DEFERS it. Here we drive the real chrome↔grid sinks and reproduce
+        // the exact lease condition by emitting the same `GridEvent`s the capture handler emits, from
+        // within `grid.update`. (A real keystroke can't be used: the headless key-dispatch path does
+        // not route through the nested + `deferred()` overlay input to this grid ancestor — on macOS
+        // the key arrives via `do_command_by_selector`, which is the path the user's crash came from.)
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+        let mut vcx = gpui::VisualTestContext::from_window(handle, cx);
+        vcx.run_until_parked();
+
+        // --- Tab: commit + move, emitted while the grid is leased. ---
+        open_incell_editing(&entity, &mut vcx, "7", CellRef::new(0, 0));
+        assert_eq!(
+            vcx.update(|_w, cx| grid.read(cx).incell_open_for_test()),
+            Some(CellRef::new(0, 0)),
+            "the in-cell overlay is open before Tab"
+        );
+        vcx.update(|window, cx| {
+            grid.update(cx, |g, cx| {
+                g.emit_incell_commit_move_for_test(Direction::Right, window, cx)
+            });
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.update(|_w, cx| grid.read(cx).incell_open_for_test()),
+            None,
+            "Tab commits + closes the overlay; the commit's deferred FocusGrid did not re-enter the \
+             grid update"
+        );
+
+        // --- Escape: cancel, emitted while the grid is leased (active cell moved to B1 after Tab). ---
+        let active = vcx.update(|_w, cx| grid.read(cx).selection().active);
+        open_incell_editing(&entity, &mut vcx, "8", active);
+        assert_eq!(
+            vcx.update(|_w, cx| grid.read(cx).incell_open_for_test()),
+            Some(active),
+            "the in-cell overlay is open before Escape"
+        );
+        vcx.update(|window, cx| {
+            grid.update(cx, |g, cx| g.emit_incell_cancel_for_test(window, cx));
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.update(|_w, cx| grid.read(cx).incell_open_for_test()),
+            None,
+            "Escape cancels + closes the overlay; the cancel's deferred FocusGrid did not re-enter \
+             the grid update"
+        );
+
+        // The deferred FocusGrid landed focus back on the grid.
+        let grid_focused =
+            vcx.update(|window, cx| grid.read(cx).focus_handle(cx).is_focused(window));
+        assert!(
+            grid_focused,
+            "focus returns to the grid after an in-cell key command (deferred FocusGrid landed)"
+        );
+    }
 }

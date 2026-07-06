@@ -371,6 +371,14 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         self.mirror = mirror;
+        // Opening the in-cell editor ends any grid selection drag at its root (BUG #2): a drag armed
+        // before the editor opened must not survive into (or past) the editor's lifetime. The
+        // overlay `.occlude()`s the follow-up mouse-up, so the grid would never clear such a drag,
+        // and after the editor closes a later hover would extend a phantom selection. The
+        // `handle_mouse_move` gate remains as belt-and-braces while the editor is open.
+        if incell_open.is_some() {
+            self.drag = None;
+        }
         self.incell_open = incell_open;
         self.incell_cap = incell_cap;
         cx.notify();
@@ -861,11 +869,19 @@ impl GridView {
                 .emit(&GridEvent::OpenInCellEditor(cell), window, cx);
             window.prevent_default();
         }
-        // Begin a drag from the (kept or new) anchor; subsequent moves extend to the hovered cell.
-        self.drag = Some(DragState {
-            anchor: selection.anchor,
-            mode: DragMode::Cell,
-        });
+        // Begin a cell drag from the (kept or new) anchor so subsequent moves extend the range —
+        // but NEVER on the double-click that opens the in-cell editor (BUG #2). That press belongs
+        // to the editor (text selection); the editor overlay `.occlude()`s the follow-up mouse-up,
+        // so a drag armed here would never be cleared and the editor's own press+drag would then
+        // extend a phantom grid selection (which also emits `SelectionChanged` → the chrome closes
+        // the editor, stealing focus). `handle_mouse_move` additionally refuses to extend any drag
+        // while the editor is open, belt-and-braces.
+        if !is_double {
+            self.drag = Some(DragState {
+                anchor: selection.anchor,
+                mode: DragMode::Cell,
+            });
+        }
         cx.notify();
     }
 
@@ -935,6 +951,13 @@ impl GridView {
         let (local_x, local_y) = self.event_local(event.position);
         if self.resize_drag.is_some() {
             self.update_resize(local_x, local_y, cx);
+            return;
+        }
+        // While the in-cell editor owns the pointer, the grid must not extend a selection drag: a
+        // press+drag inside the editor is text selection, not a cell-range drag (BUG #2). This
+        // guards any drag still live from before the editor opened; `mouse_down_cell` also refuses
+        // to arm a drag on the editor-opening double-click.
+        if self.incell_open.is_some() {
             return;
         }
         let Some(drag) = self.drag else {
@@ -2503,6 +2526,43 @@ const IN_CELL_DANGER: u32 = 0xDC2626;
 const IN_CELL_TOOLTIP_BG: u32 = 0x2B2B2B;
 const IN_CELL_TOOLTIP_TEXT: u32 = 0xF5F5F5;
 
+/// The in-cell editor's resolved text attributes for a cell — the WYSIWYG font the overlay renders
+/// (BUG #4). Mirrors [`cell_element`]'s resolution so editing looks like the committed cell.
+struct IncellFont {
+    /// Text size in px (the cell's `q/4` pt → px, or [`CELL_FONT_PX`] for a default-font cell).
+    size_px: f32,
+    /// The cell's explicit font family, or `None` for the workbook default.
+    family: Option<SharedString>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+/// Resolves the edited cell's [`IncellFont`] from its [`RenderStyle`] (if any) and the sheet's
+/// `font_families` side table — pure so the resolution is unit-testable. A `None` style (default
+/// cell, or an anchor scrolled out of the visible-styles snapshot) falls back to the default font
+/// with no character styling. Mirrors [`cell_element`]: size from `font_size_q` (`0` = default),
+/// family from the side table (index `0`/empty = default), and bold/italic/underline as-is.
+fn resolve_incell_font(style: Option<RenderStyle>, families: &[SharedString]) -> IncellFont {
+    let size_px = style
+        .filter(|s| s.font_size_q != 0)
+        .map(|s| s.font_size_q as f32 / 4.0 * 96.0 / 72.0)
+        .unwrap_or(CELL_FONT_PX);
+    let family = style.and_then(|s| {
+        families
+            .get(s.font_family as usize)
+            .filter(|name| !name.is_empty())
+            .cloned()
+    });
+    IncellFont {
+        size_px,
+        family,
+        bold: style.map(|s| s.bold).unwrap_or(false),
+        italic: style.map(|s| s.italic).unwrap_or(false),
+        underline: style.map(|s| s.underline).unwrap_or(false),
+    }
+}
+
 impl GridView {
     /// The in-cell editor overlay elements at `cell`: the bordered white editor box holding the
     /// reused `Input`, plus the cap-error popover below it when a cap rejection is active
@@ -2522,6 +2582,37 @@ impl GridView {
         } else {
             rgb(ACCENT)
         };
+        // Resolve the edited cell's own font so the overlay is WYSIWYG (BUG #4): a large-font title
+        // cell must edit in place at that size + style, not the grid's default 13 px. The snapshot
+        // only holds visible cells, so a scrolled-out anchor (the overlay renders even off-viewport)
+        // simply falls back to the default font. Mirrors `cell_element`'s resolution.
+        let IncellFont {
+            size_px: font_px,
+            family,
+            bold,
+            italic,
+            underline,
+        } = resolve_incell_font(
+            self.visible_styles.get(&(cell.row, cell.col)).copied(),
+            &self.visible_font_families,
+        );
+        let mut input_el = Input::new(input)
+            .appearance(false)
+            .text_size(px(font_px))
+            .px_0()
+            .w_full();
+        if let Some(name) = family {
+            input_el = input_el.font_family(name);
+        }
+        if bold {
+            input_el = input_el.font_weight(FontWeight::BOLD);
+        }
+        if italic {
+            input_el = input_el.italic();
+        }
+        if underline {
+            input_el = input_el.underline();
+        }
         let editor = div()
             .debug_selector(|| "in-cell-editor".into())
             .absolute()
@@ -2541,21 +2632,16 @@ impl GridView {
             .border_2()
             .border_color(border)
             .px(px(1.0))
-            .text_size(px(CELL_FONT_PX))
+            .text_size(px(font_px))
             .text_color(rgb(CELL_TEXT))
             // Strip the hosted input's own chrome (border / rounded / background / shadow) via
             // `appearance(false)` so it reads as editing the cell in place, not a control-in-a-box
             // (BUG D). The 2 px accent border on this wrapper is the intended in-place edit cue
-            // (`ui_design.md §3`). Pin the input's text to the cell font (its default is `text_sm`
-            // = 14 px, one off the 13 px cell) and drop its horizontal padding so glyphs line up
-            // with the cell's own text rather than sitting inset like a control.
-            .child(
-                Input::new(input)
-                    .appearance(false)
-                    .text_size(px(CELL_FONT_PX))
-                    .px_0()
-                    .w_full(),
-            );
+            // (`ui_design.md §3`). The input's text is pinned to the EDITED CELL's resolved font —
+            // size + family + bold/italic (BUG #4) — so a big-font title edits WYSIWYG; a default
+            // cell falls back to the 13 px cell font (the input's own default is `text_sm` = 14 px,
+            // one off). Its horizontal padding is dropped so glyphs line up with the cell's text.
+            .child(input_el);
 
         let mut elements = vec![deferred(editor).into_any_element()];
 
@@ -2755,6 +2841,43 @@ impl GridView {
     /// The active sheet (for tests / Phase-11 wiring).
     pub fn active_sheet(&self) -> SheetId {
         self.active_sheet
+    }
+
+    /// Whether a selection drag is currently armed (test introspection for BUG #2 — opening the
+    /// in-cell editor must not leave a live grid drag).
+    #[cfg(test)]
+    pub(crate) fn has_active_drag(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// The cell the in-cell overlay currently covers, if open (test introspection for BUG #5 — the
+    /// commit/cancel handlers close it, which proves an in-cell key command routed through the grid).
+    #[cfg(test)]
+    pub(crate) fn incell_open_for_test(&self) -> Option<CellRef> {
+        self.incell_open
+    }
+
+    /// Emits [`GridEvent::InCellCommitMove`] exactly as the `capture_key_down` Tab handler does — for
+    /// a BUG #5 test that must reproduce the emit happening **while the grid entity is leased**
+    /// (`cx.listener` == `grid.update`). The headless key-dispatch path cannot route a keystroke
+    /// through the nested + `deferred()` overlay input to this grid ancestor (on macOS the key
+    /// arrives via `do_command_by_selector`), so the test calls this from inside `grid.update`.
+    #[cfg(test)]
+    pub(crate) fn emit_incell_commit_move_for_test(
+        &self,
+        dir: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.events
+            .emit(&GridEvent::InCellCommitMove(dir), window, cx);
+    }
+
+    /// Emits [`GridEvent::InCellCancel`] exactly as the `capture_key_down` Escape handler does — the
+    /// Escape twin of [`emit_incell_commit_move_for_test`](Self::emit_incell_commit_move_for_test).
+    #[cfg(test)]
+    pub(crate) fn emit_incell_cancel_for_test(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.events.emit(&GridEvent::InCellCancel, window, cx);
     }
 }
 
@@ -3199,6 +3322,40 @@ mod tests {
     }
 
     #[gpui::test]
+    fn escape_in_focused_in_cell_editor_routes_through_capture_key_down(cx: &mut TestAppContext) {
+        // Locks the routing BUG #5 depends on: with the in-cell overlay open and its input focused,
+        // an Escape keystroke is intercepted by the grid root's `capture_key_down` and emitted as
+        // `InCellCancel` (Tab/Shift+Tab are, in the headless harness, swallowed by gpui's focus
+        // traversal before reaching the capture handler — on macOS they arrive via
+        // `do_command_by_selector`; see the window-level re-entrancy test's note).
+        let (g, window, events) = grid_recording(cx);
+        let input = window
+            .update(cx, |_root, window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                g.update(cx, |grid, cx| {
+                    grid.set_incell_input(input.clone(), cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, cx);
+                });
+                input
+            })
+            .unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| input.update(cx, |i, cx| i.focus(window, cx)));
+        vcx.run_until_parked();
+        events.borrow_mut().clear();
+        vcx.simulate_keystrokes("escape");
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::InCellCancel)),
+            "Escape in the focused in-cell editor must route through capture_key_down: {:?}",
+            events.borrow()
+        );
+    }
+
+    #[gpui::test]
     fn double_click_keeps_focus_on_in_cell_input(cx: &mut TestAppContext) {
         // Reproduces the exact interactive bug a direct-call test cannot: opening the editor focuses
         // its input, but the grid root's built-in mouse-down focus-transfer runs later in the same
@@ -3276,6 +3433,166 @@ mod tests {
             "a click inside the in-cell editor must not reach the grid: {:?}",
             events.borrow()
         );
+    }
+
+    fn mouse_down_at(pos: gpui::Point<gpui::Pixels>, click_count: usize) -> MouseDownEvent {
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: Modifiers::default(),
+            click_count,
+            first_mouse: false,
+        }
+    }
+
+    fn mouse_move_at(pos: gpui::Point<gpui::Pixels>) -> MouseMoveEvent {
+        MouseMoveEvent {
+            position: pos,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    #[gpui::test]
+    fn double_click_to_open_editor_arms_no_grid_drag(cx: &mut TestAppContext) {
+        // BUG #2 root cause: the double-click that opens the in-cell editor used to arm a cell
+        // selection drag. The editor overlay then `.occlude()`s the follow-up mouse-up, so that drag
+        // is never cleared — and a press+drag *inside* the editor (text selection) extends the stale
+        // grid drag, selecting cells and closing the editor. Opening the editor must arm no drag.
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // A1 is the default active single selection, so this is a double-click on the
+                    // already-active cell — the exact open-in-place gesture.
+                    grid.mouse_down_cell(0, 0, &mouse_down_at(gpui::point(px(1.0), px(1.0)), 2), window, cx);
+                    assert!(
+                        !grid.has_active_drag(),
+                        "opening the in-cell editor via double-click must not arm a grid selection drag"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn move_is_ignored_while_in_cell_editor_open(cx: &mut TestAppContext) {
+        // BUG #2 belt-and-braces: even if a drag becomes live while the in-cell editor is open, a
+        // pointer move must not extend the grid's selection — the press+drag belongs to the editor's
+        // text selection. Without the `incell_open` gate in `handle_mouse_move` the move would emit a
+        // `SelectionChanged` and close the editor. (The editor is opened FIRST here, then a drag is
+        // armed directly — `set_edit_state` now clears a pre-open drag, so arming after open is what
+        // isolates the gate; in the real app such a press is occluded.)
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, cx);
+                    grid.mouse_down_cell(
+                        2,
+                        2,
+                        &mouse_down_at(gpui::point(px(120.0), px(80.0)), 1),
+                        window,
+                        cx,
+                    );
+                    assert!(grid.has_active_drag(), "a single click arms a cell drag");
+                    events.borrow_mut().clear();
+                    // A drag move to a far cell would normally extend the selection.
+                    grid.handle_mouse_move(
+                        &mouse_move_at(gpui::point(px(700.0), px(500.0))),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+            "with the in-cell editor open, a pointer move must not extend a grid selection: {:?}",
+            events.borrow()
+        );
+    }
+
+    #[gpui::test]
+    fn drag_armed_before_editor_open_leaves_no_phantom_after_close(cx: &mut TestAppContext) {
+        // BUG #2 root fix (NIT): a drag armed *before* the editor opened must be cleared when the
+        // editor opens — its mouse-up is occluded by the overlay, so the grid never clears it, and
+        // after the editor closes a later hover would extend a phantom selection. `set_edit_state`
+        // clears `self.drag` at the point `incell_open` becomes `Some`.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Arm a real cell drag (single click on C3).
+                    grid.mouse_down_cell(
+                        2,
+                        2,
+                        &mouse_down_at(gpui::point(px(120.0), px(80.0)), 1),
+                        window,
+                        cx,
+                    );
+                    assert!(grid.has_active_drag(), "a single click arms a cell drag");
+                    // Open the editor → the drag must be cleared at the root.
+                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, cx);
+                    assert!(
+                        !grid.has_active_drag(),
+                        "opening the in-cell editor clears the pre-armed drag"
+                    );
+                    // Close the editor; the drag must stay cleared (no move-gate applies now).
+                    grid.set_edit_state(None, None, None, cx);
+                    assert!(
+                        !grid.has_active_drag(),
+                        "the drag stays cleared after the editor closes"
+                    );
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_move(
+                        &mouse_move_at(gpui::point(px(700.0), px(500.0))),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+            "a drag armed before the editor opened must not extend a selection after it closes: {:?}",
+            events.borrow()
+        );
+    }
+
+    #[test]
+    fn incell_font_resolves_cell_style_including_underline() {
+        // BUG #4 (NIT): the overlay's hosted Input renders at the edited cell's resolved font —
+        // size + family + bold/italic/underline — mirroring `cell_element` so editing is WYSIWYG.
+        let families = [SharedString::from(""), SharedString::from("Georgia")];
+
+        // A default cell (no style) → default size, no family, no character styling.
+        let d = resolve_incell_font(None, &families);
+        assert_eq!(d.size_px, CELL_FONT_PX);
+        assert!(d.family.is_none());
+        assert!(!d.bold && !d.italic && !d.underline);
+
+        // A styled cell: 24pt, Georgia (index 1), bold + italic + underline.
+        let style = RenderStyle {
+            bold: true,
+            italic: true,
+            underline: true,
+            font_size_q: 24 * 4,
+            font_family: 1,
+            ..RenderStyle::default()
+        };
+        let r = resolve_incell_font(Some(style), &families);
+        assert_eq!(r.size_px, 24.0 * 96.0 / 72.0);
+        assert_eq!(r.family.as_deref(), Some("Georgia"));
+        assert!(r.bold, "bold resolved");
+        assert!(r.italic, "italic resolved");
+        assert!(r.underline, "underline resolved (was previously dropped)");
     }
 
     #[gpui::test]

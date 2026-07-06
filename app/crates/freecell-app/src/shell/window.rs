@@ -1260,9 +1260,13 @@ fn make_grid_sink(
     })
 }
 
-/// Builds the chrome→grid [`ChromeGridSink`]. `FocusGrid` is direct (the grid is a sibling, not
-/// leased); `MoveActive` / `SetActiveSheet` are deferred because applying them makes the grid
-/// re-emit into the chrome, which is mid-`update` as the emitter.
+/// Builds the chrome→grid [`ChromeGridSink`]. Every request that touches the grid is deferred:
+/// applying it re-emits into or re-focuses the grid, which may be mid-`update` as the emitter.
+/// `FocusGrid` in particular is reachable from a focused-in-cell key command (Tab/Escape), which
+/// commits/cancels from *inside* the grid's own `capture_key_down` listener — i.e. while the grid
+/// entity is already leased — so focusing it synchronously would re-enter that update and abort
+/// (`entity_map` re-entrant-update panic, BUG #5). `MoveActive` / `SetActiveSheet` are deferred for
+/// the same reason (they re-emit into the chrome, mid-`update` as the emitter).
 fn make_chrome_grid_sink(
     grid_slot: Rc<OnceCell<WeakEntity<GridView>>>,
     chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>>,
@@ -1275,9 +1279,16 @@ fn make_chrome_grid_sink(
         };
         match request {
             ChromeGridRequest::FocusGrid => {
-                if let Some(grid) = grid.upgrade() {
-                    grid.update(cx, |g, cx| g.focus_self(window, cx));
-                }
+                // Deferred (BUG #5): a focused in-cell key command (Tab/Escape) reaches this from
+                // inside the grid's `capture_key_down` listener — the grid entity is already leased
+                // (`cx.listener` runs the callback inside `grid.update`). Focusing it synchronously
+                // here would re-enter that update and hit the `entity_map` re-entrant-update abort.
+                // One deferred cycle lands the focus after the grid's update completes.
+                window.defer(cx, move |window, cx| {
+                    if let Some(grid) = grid.upgrade() {
+                        grid.update(cx, |g, cx| g.focus_self(window, cx));
+                    }
+                });
             }
             ChromeGridRequest::MoveActive(motion) => {
                 let motion = *motion;

@@ -39,9 +39,12 @@ Ranked by how badly a "no" hurts (this ranking drives the ordering in §6):
    (Research flagged specific traps: `ScaleLinear` has no "nice" tick generation; the
    `Area` primitive has a scalar baseline so true stacked area needs an `Area` fork; pie
    has no auto-palette.)
-3. **Scatter feasibility.** Is a scatter plot (two numeric axes + dots), reusing the
-   title/axis/legend scaffolding, actually "just draw some dots," or a swamp? Scatter is
-   the highest-value type gpui-component can't do (`research/scope-and-gaps.md`).
+3. **Scatter feasibility (and bubble as a cheap generalization).** Is a scatter plot (two
+   numeric axes + dots), reusing the title/axis/legend scaffolding, actually "just draw
+   some dots," or a swamp? Scatter is the highest-value type gpui-component can't do
+   (`research/scope-and-gaps.md`). And once scatter works, is **bubble** (the same, with
+   marker radius driven by a third value) essentially free, or does sizing/overlap make it
+   more than a trivial add?
 4. **Load/save stitching.** Can we (a) parse chart definitions out of a real `.xlsx`
    alongside IronCalc's load, and (b) write a valid `.xlsx` that still contains a chart
    after IronCalc's chart-dropping save path runs? (Lower risk — the zip second-pass
@@ -69,11 +72,13 @@ Functional shape (names indicative, not binding):
   - `Area { grouping: Standard | Stacked | PercentStacked }`
   - `Pie { doughnut_hole: Option<f32> }`
   - `Scatter { }` (uses `xy` series, below)
+  - `Bubble { }` (uses `xy` series with `size`, below — scatter + a third value)
 - `Series`:
   - category/value series (bar/line/area/pie): `{ name: Option<String>, categories:
     Vec<Category>, values: Vec<f64>, color: Option<Color> }` — mirrors `c:cat` / `c:val`.
-  - xy series (scatter): `{ name, x: Vec<f64>, y: Vec<f64>, color }` — mirrors
-    `c:xVal` / `c:yVal`.
+  - xy series (scatter / bubble): `{ name, x: Vec<f64>, y: Vec<f64>, size:
+    Option<Vec<f64>>, color }` — mirrors `c:xVal` / `c:yVal` (+ `c:bubbleSize` for bubble;
+    `size` is `None` for plain scatter).
 - `Axis { title: Option<String> }` (numeric formatting/scale details are the renderer's
   business for the PoC).
 - `Legend { position }` (position may be ignored for the PoC; presence is what matters).
@@ -116,7 +121,7 @@ Excel pixel matching.
 
 ---
 
-## 4. Experiment 3 — scatter
+## 4. Experiment 3 — scatter (and bubble)
 
 Add a scatter plot to the same component, **reusing** the title / axis-title / legend /
 numeric-axis scaffolding from Experiment 2. The genuinely new part is a **second numeric
@@ -130,7 +135,24 @@ legend) with both numeric axes labeled and a title.
 exists, or does the category-vs-value orientation baked into the primitives make it
 painful? The answer directly sets whether scatter is in-scope for the follow-on project.
 
-**Out:** bubble (third dimension / sized markers), trendlines, log axes.
+### 4a. Bubble (small generalization of scatter)
+
+A **bubble** chart is scatter with a **third value per point** (`c:bubbleSize`) that drives
+the **marker radius**. It reuses the entire scatter render path (two numeric axes, legend,
+title); the only new work is varying dot radius by a size series (with a size→radius scale
+and a sensible max-radius clamp). It is validated **only if scatter passes** — if scatter is
+a swamp, bubble is moot.
+
+**Must render:** a single-series bubble chart (points sized by `size`) with both numeric
+axes labeled, a title, and legibly differentiated bubble sizes.
+
+**Question it answers:** is bubble genuinely "scatter + a radius" (near-free once scatter
+works), or does marker sizing / overlap / occlusion make it more than a trivial add? Sets
+whether bubble rides along with scatter in the follow-on scope.
+
+**Out (scatter & bubble):** trendlines, log axes, `c:bubble3D`, area-vs-width size
+semantics (`c:sizeRepresents`), negative-size handling — a fixed size→radius mapping is fine
+for the PoC.
 
 ---
 
@@ -206,6 +228,9 @@ examples once a core capability is shown unachievable.**
   grouped/stacked → likely PARTIAL-GO** (e.g. "single-series only" recommendation).
 - **Gate 3 — Scatter (§4).** Multi-series scatter, agent-judged. **FAIL → scatter recorded
   as out-of-scope for the follow-on**, PoC continues (not a whole-project NO-GO).
+- **Gate 3b — Bubble (§4a).** Only if Gate 3 passes: single-series bubble, agent-judged.
+  **FAIL → bubble recorded out-of-scope**, scatter unaffected. Skipped entirely if Gate 3
+  fails. (Deliberately tiny — it reuses the scatter path.)
 - **Gate 4 — Load/save (§5).** Load a real `.xlsx` and render it; re-inject on save and
   reopen. Load FAIL is serious (there's no chart data without it); **save FAIL →
   display-only recommendation**, not a whole-project NO-GO.
@@ -218,7 +243,7 @@ recommendation — confirm or reorder in review.
 
 ## 8. Out of scope (whole PoC)
 
-- Chart types: **stock/candlestick, combo/multi-plot, bubble, radar, surface, all 3D,
+- Chart types: **stock/candlestick, combo/multi-plot, radar, surface, all 3D,
   pie-of-pie, multi-ring doughnut**, and the entire extended `cx:` family (sunburst,
   treemap, waterfall, histogram, box-&-whisker, funnel, region map).
 - Any `/app` integration, interactive UI, hover/tooltips, selection, live re-render on data
@@ -236,8 +261,8 @@ The PoC is **successful as an experiment** if it produces a confident, evidence-
 decision — a clear NO-GO is a successful outcome. The recommendation is one of:
 
 - **GO** — Gate 1 passes and grouped/stacked/area/pie mostly PASS: a follow-on ship-quality
-  project is justified with the full in-scope type set. Scatter and save-preservation are
-  in or out per Gates 3–4.
+  project is justified with the full in-scope type set. Scatter, bubble, and
+  save-preservation are in or out per Gates 3–4.
 - **PARTIAL-GO** — the core renders but with a bounded limitation (e.g. single-series only;
   or display-only because save re-injection is intractable; or scatter out). Recommend the
   follow-on with that scope.

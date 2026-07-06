@@ -56,7 +56,9 @@ mapping), and **multi-series color cycle** over `chart_1..chart_5` (extend past 
 Known traps to hit head-on (all from `research/`): multi-line needs one **shared**
 `ScaleLinear` across series; **stacked area** needs an `Area` fork (scalar baseline) or
 hand-rolled polygons + a normalize pass for percent; **pie** has no auto-palette so we
-synthesize per-slice colors.
+synthesize per-slice colors. **Scatter** = two `ScaleLinear` axes + point marks; **bubble**
+= the same, with marker radius from a third `bubbleSize` series (a size→radius scale + a
+max-radius clamp) — a small generalization of the scatter mark, not a new render path.
 
 ### Headless capture (Exp 2/3 validation)
 Reuse the repo's proven Linux path rather than invent one: `app/render-tests/src/capture.rs`
@@ -105,6 +107,13 @@ not grind through later phases once a core capability is shown unachievable.**
 - [x] **Phase 3 — Gate 3: scatter.** Single- and multi-series **scatter** (two numeric axes
   + dots), reusing the Phase 1/2 title/axis/legend scaffolding. Capture + review.
   *Checkpoint: FAIL → scatter recorded out-of-scope for the follow-on (not a whole NO-GO).*
+
+- [ ] **Phase 3b — Gate 3b: bubble (small add-on, added after the initial GO synthesis).**
+  Only meaningful because Phase 3 (scatter) passed. Generalize the scatter mark: drive
+  per-point marker radius from a third `bubbleSize` series (size→radius scale + max-radius
+  clamp). Render a single-series bubble example (legibly varied sizes) + capture + review,
+  then fold the result into `SYNTHESIS.md`. *FAIL → bubble out-of-scope, scatter/GO
+  unaffected. Deliberately tiny — reuses the scatter render path.*
 
 - [x] **Phase 4 — Gate 4: load/save stitching.** `load-save` crate: parse a real
   agent-authored `.xlsx` (a couple of in-scope chart types) into `chart-model` and render it

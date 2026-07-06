@@ -12,12 +12,23 @@ Builder** (Icon Composer) app. Icon Builder exports two finished 1024×1024@2x
 
 | Source | Shape | Feeds |
 |---|---|---|
-| `sourceMacOS-1024x1024@2x.png` | macOS squircle — rounded corners + padding baked in, transparent corners | `icon.icns` |
-| `sourceWinLinux-1024x1024@2x.png` | square, full-bleed | `icon.ico` + every sized PNG + `icon.png` |
+| `sourceMacOS-1024x1024@2x.png` | macOS squircle — rounded corners baked in, transparent corners | `icon.icns` |
+| `sourceWinLinux-1024x1024@2x.png` | square variant | `icon.ico` + every sized PNG + `icon.png` |
 
-`generate_icons.py` only **resamples** these finished sources (LANCZOS downscale to each
-target size) — it does no drawing, rounding, or clipping. The shape and padding are
-already baked into the sources.
+`generate_icons.py` **resamples** these finished sources (LANCZOS downscale to each target
+size) and **insets each to the 824/1024 (~10%) icon grid** before deriving outputs — it
+does no drawing, rounding, or clipping (the shape is already baked into the sources).
+
+### Padding to the 824/1024 grid
+
+Both sources are exported full-bleed (artwork fills the whole 2048×2048 frame). Full-bleed
+art renders oversized next to native apps, so the script scales each source's artwork to
+**824×824 within the 1024×1024 canvas** (`CONTENT_FRAC = 824/1024`, ≈10% transparent
+padding per side) and centers it on a fully transparent canvas before deriving outputs.
+This applies to **every** icon — the macOS `.icns` and the Windows `.ico` + Linux PNGs +
+`icon.png` + `128x128@2x.png` alike — so nothing is full-bleed and the artwork matches
+native Dock/taskbar sizing. One padded master per source is downscaled (LANCZOS) to every
+target size, so the ratio holds at all resolutions.
 
 ## Files here
 

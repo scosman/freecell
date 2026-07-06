@@ -1,17 +1,37 @@
-# Linux `checks` — the required-green gate (architecture.md §9).
+# Linux `checks` — the fast required-green gate (architecture.md §9).
 #
 # Runs on every push/PR: format, clippy (-D warnings), full workspace build (freecell-app
-# compiles on Linux), workspace tests, the render step under Xvfb + Mesa lavapipe, and
-# cargo-deny (licenses/advisories, incl. the documented GPL ztracing exception).
+# compiles + links on Linux), workspace tests, and cargo-deny (licenses/advisories, incl.
+# the documented GPL ztracing exception). This job builds AND tests the WHOLE workspace
+# (render-tests included); only the slow, flaky render PIXEL suite (Xvfb + Mesa lavapipe)
+# was split into its own manual gate — see .github/workflows/render.yml. `cargo test
+# --workspace` here still runs render-tests' GPUI-free unit tests (the pixel cases self-skip
+# without FREECELL_RENDER), so the crate stays compiled + covered on every push.
 #
 # The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
 
 name: checks
 
+# Scope the heavy Rust CI to changes that can actually affect it: the `app/` workspace or
+# this workflow file. This repo's activity is mostly non-`app/` (specs / experiments / docs),
+# and those pushes/PRs have nothing to build here — running the full clippy+build+test+deny
+# stack on them only burns runner minutes. NOTE: because this is a trigger-level `paths`
+# filter, a PR that touches no `app/**` file skips the whole workflow, so the `checks` context
+# is never reported. If `checks` is a *required* status check with strict branch protection,
+# such a PR will sit "Expected — waiting for status" and cannot merge. That is the intended
+# budget trade-off; if it becomes a problem, either mark the check non-required for docs-only
+# PRs or replace the trigger filter with an always-running job that gates the heavy STEPS via
+# a path-changes detector (e.g. dorny/paths-filter) so one context is always posted.
 on:
   push:
     branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/checks.yml'
   pull_request:
+    paths:
+      - 'app/**'
+      - '.github/workflows/checks.yml'
 
 concurrency:
   group: checks-${{ github.ref }}
@@ -19,23 +39,38 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI-only build trims (measured locally on a 4-core box comparable to the runner):
+  # the checks-job target/ peak drops from ~14 GB to ~6.3 GB (54%), which is what fixes the
+  # "No space left on device" during the render-tests link, and the cold build is a bit faster.
+  #  - CARGO_INCREMENTAL=0: incremental artifacts are large and useless in CI (~270 MB here,
+  #    and rust-cache discards them anyway), so don't generate them.
+  #  - *_DEBUG=line-tables-only: keep file:line in panic/test backtraces but drop the heavy
+  #    DWARF that dominated target/ and the failing link (render_scene test binary: 684 MB ->
+  #    282 MB). TEST inherits DEV, but both are set so the intent survives a profile refactor.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   checks:
-    name: fmt / clippy / build / test / render / deny (Linux)
+    name: fmt / clippy / build / test / deny (Linux)
     runs-on: ubuntu-24.04
     steps:
+      # No disk-prune step here: with the debug trims in this workflow's env
+      # (CARGO_PROFILE_DEV/TEST_DEBUG=line-tables-only + CARGO_INCREMENTAL=0), the whole-
+      # workspace `cargo build` + `cargo test --no-run` target/ peak measured ~6.7 GB locally
+      # — comfortably under the ~14 GB free on ubuntu-24.04. The disk-hungry render pixel suite
+      # (which needs the prune) now lives in render.yml.
       - uses: actions/checkout@v4
 
-      # System deps for the GPUI Linux (blade/Vulkan) build + the render suite, via
-      # the ONE canonical setup script (also run by devs/agents locally, so CI and
-      # local environments cannot drift): X11/Wayland/xkb, Vulkan loader + lavapipe
-      # (software Vulkan) ICD, fontconfig + freetype, gbm, ALSA, the capture tools
-      # (Xvfb, ImageMagick `import`, xrefresh, xwininfo), plus DejaVu Serif for the
-      # explicit-serif render case. The UI font (Inter) is bundled in the app binary
-      # (add_fonts), so no system UI font is needed. See the script header and
-      # render-tests/README.md.
-      - name: Install system dependencies (capture stack + fonts)
+      # System deps for the GPUI Linux (blade/Vulkan) build, via the ONE canonical setup
+      # script (also run by devs/agents locally + by render.yml, so environments cannot
+      # drift): X11/Wayland/xkb, Vulkan loader + lavapipe ICD, fontconfig + freetype, gbm,
+      # ALSA. render-tests must COMPILE here (it's a workspace member built + unit-tested by
+      # the steps below), which needs these -dev libs; the capture-only tools it also installs
+      # (Xvfb, ImageMagick, xrefresh/xwininfo, DejaVu Serif) are exercised by the pixel suite
+      # in render.yml, not here. See the script header and render-tests/README.md.
+      - name: Install system dependencies (GPUI build deps)
         run: app/render-tests/scripts/setup_render_env.sh
 
       # Installs the toolchain pinned by app/rust-toolchain.toml. `rustup toolchain
@@ -45,9 +80,18 @@ jobs:
         working-directory: app
         run: rustup toolchain install
 
+      # `cache-on-failure: true` is ESSENTIAL for this job. Its later steps (the render suite)
+      # can fail, and rust-cache's DEFAULT (`false`) then SKIPS the post-job save — so a red
+      # pipeline discards the whole freshly-compiled gpui/zed/ironcalc tree and every subsequent
+      # run starts cold ("No cache found"). That is self-perpetuating with a build that was also
+      # dying on disk. Saving on failure too means the expensive dep build is reused across runs
+      # regardless of whether render/test passed. NOTE: GitHub scopes caches by branch — feature
+      # branches can only restore THIS branch's cache or the default branch's, so the big win
+      # lands once `main` runs green+saves once; after that PRs restore main's cache as fallback.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
+          cache-on-failure: true
 
       - name: Format
         working-directory: app
@@ -65,24 +109,10 @@ jobs:
         working-directory: app
         run: cargo test --workspace
 
-      # Phase 7: the REQUIRED render-test suite (Xvfb + Mesa lavapipe), replacing the
-      # Phase-1 informational spike. Renders the real grid over engine-produced scenes and
-      # perceptual-diffs each against a committed baseline. The harness sizes an Xvfb
-      # display per case (a small window on a large screen won't present under lavapipe),
-      # so this is not wrapped in a single xvfb-run; the script sets FREECELL_RENDER=1.
-      # (`cargo test --workspace` above already ran the GPUI-free diff unit tests; without
-      # FREECELL_RENDER the pixel cases there skip.)
-      - name: Render-test suite (Xvfb + lavapipe)
-        working-directory: app
-        run: render-tests/scripts/render_tests.sh test
-
-      - name: Upload render failures
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: render-failures
-          path: app/target/render-failures/
-          if-no-files-found: ignore
+      # The REQUIRED render pixel suite (Xvfb + Mesa lavapipe) is NOT here — it runs as a
+      # separate manual gate (.github/workflows/render.yml). `cargo test --workspace` above
+      # already compiled render-tests and ran its GPUI-free diff unit tests (the pixel cases
+      # self-skip without FREECELL_RENDER), so the crate stays built + covered on every push.
 
       # Pin the exact cargo-deny the gate was authored + verified against (0.19.9), so a
       # future action bump can't silently change gate behaviour. Installs a prebuilt

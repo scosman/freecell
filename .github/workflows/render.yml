@@ -1,0 +1,106 @@
+# Linux `render` — the MANUAL, required-before-merge pixel gate (architecture.md §9).
+#
+# Renders the real grid over engine-produced scenes under Xvfb + Mesa lavapipe (software
+# Vulkan) and perceptual-diffs each case against a committed baseline. This was SPLIT OUT
+# of the fast `checks` job because software rendering is slow and occasionally flaky, and we
+# don't want it on the every-push critical path. Instead it is a deliberate "final check
+# before merge": trigger it by hand (Actions tab -> "render" -> Run workflow) on the PR's
+# branch once you're ready to merge.
+#
+# BRANCH PROTECTION: because this is the pixel gate, it MUST be a required status check.
+# Add it to branch protection under the EXACT context name `render (Xvfb + lavapipe)` (the
+# job `name:` below). Keep that name stable — renaming it silently drops the requirement.
+# It is `workflow_dispatch`-only, so GitHub will not auto-run it; the merge is gated on a
+# green *manual* run of the current head commit.
+#
+# BOOTSTRAP NOTE: a `workflow_dispatch` workflow's "Run workflow" button (and the trigger
+# itself) only appear once this file exists on the DEFAULT branch (`main`). So the very PR
+# that introduces render.yml cannot dispatch this check on itself — merge it to `main` first
+# (or mark the check non-required temporarily), then it is dispatchable on later PRs.
+#
+# The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
+
+name: render
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same CI-only build trims as checks.yml so render's own build stays disk-lean:
+  # no incremental artifacts, and line-tables-only debug info (keeps file:line in
+  # backtraces but drops the heavy DWARF that dominated target/ + the link step).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  render:
+    name: render (Xvfb + lavapipe)
+    runs-on: ubuntu-24.04
+    steps:
+      # ubuntu-24.04 runners have ~14 GB free after their preinstalled toolchains, and this
+      # job cold-builds the GPUI/zed-scale tree AND links the debug-heavy render binaries — the
+      # step that historically tipped into "No space left on device". Reclaim ~20 GB up front by
+      # deleting large preinstalled SDKs this Rust build never touches (Android / .NET / GHC /
+      # CodeQL) plus cached docker images. Inlined rather than a third-party action so the exact
+      # rm set is auditable and can't change under us (matches this repo's pinning posture); the
+      # trade-off is we hand-maintain these paths if a future runner image relocates them. rm of
+      # a missing path is a harmless no-op, and swap + the apt/cargo/rust caches are left intact.
+      - name: Free runner disk (drop preinstalled SDKs unused by this Rust build)
+        run: |
+          echo "== disk before =="; df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "== disk after =="; df -h /
+
+      - uses: actions/checkout@v4
+
+      # The FULL capture stack via the ONE canonical setup script (also run by devs/agents
+      # locally + by checks.yml, so environments cannot drift): X11/Wayland/xkb, Vulkan loader
+      # + lavapipe (software Vulkan) ICD, fontconfig + freetype, gbm, ALSA, the capture tools
+      # (Xvfb, ImageMagick `import`, xrefresh, xwininfo), plus DejaVu Serif for the explicit-
+      # serif render case. The UI font (Inter) is bundled in the app binary (add_fonts), so no
+      # system UI font is needed. See the script header and render-tests/README.md.
+      - name: Install system dependencies (capture stack + fonts)
+        run: app/render-tests/scripts/setup_render_env.sh
+
+      # Installs the toolchain pinned by app/rust-toolchain.toml. `rustup toolchain install`
+      # (no arg) reads the override file; `rustup show` no longer installs on rustup >= 1.28.
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      # `cache-on-failure: true`: a red render run must still SAVE the freshly-compiled
+      # gpui/zed/ironcalc tree, or every manual run starts cold. Shares the `app` cache with
+      # checks.yml (same key inputs), so a green checks run on this branch/main warms this job.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+          cache-on-failure: true
+
+      # Phase 7 REQUIRED render-test suite. Renders the real grid over engine-produced scenes
+      # and perceptual-diffs each against a committed baseline. The harness sizes an Xvfb display
+      # per case (a small window on a large screen won't present under lavapipe), so this is NOT
+      # wrapped in a single xvfb-run; the script sets FREECELL_RENDER=1 to turn the pixel suite
+      # on (without it the pixel cases self-skip). It also hard-fails if the capture tooling is
+      # missing, refusing to run a zero-pixel gate.
+      - name: Render-test suite (Xvfb + lavapipe)
+        working-directory: app
+        run: render-tests/scripts/render_tests.sh test
+
+      - name: Upload render failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-failures
+          path: app/target/render-failures/
+          if-no-files-found: ignore

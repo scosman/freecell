@@ -7,13 +7,28 @@
 # (= 2× the p99 calibrated on this runner image — render-tests/src/perf.rs `CI_*`) and on the
 # zero-engine-calls-on-scroll gate. Real-hardware budgets (8.33 ms / 2 ms) stay the product
 # truth, checked on macos-verify. Recalibrate only deliberately (a committed change).
+#
+# DISK: this job does a RELEASE build (optimized, no debug info) of a single bin
+# (perf_harness), so target/ stays small — ~1.9 GB cold, measured locally — and fits the
+# runner's ~16 GB free on / (observed in CI run #29, before any prune) with NO disk prune.
+# That is unlike render.yml, which does the disk-hungry DEBUG pixel build and KEEPS its prune.
 
 name: perf-gates
 
+# Scoped to `app/**` + this workflow file, same as `checks.yml` — a spec/docs/experiments
+# change can't move these perf numbers, so it shouldn't spend a release build's worth of
+# runner minutes here. See the note in checks.yml about trigger-level `paths` filters and
+# required status checks (a PR touching no `app/**` file skips this workflow entirely).
 on:
   push:
     branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/perf-gates.yml'
   pull_request:
+    paths:
+      - 'app/**'
+      - '.github/workflows/perf-gates.yml'
 
 concurrency:
   group: perf-gates-${{ github.ref }}
@@ -21,14 +36,26 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # No incremental artifacts in CI (large + useless; rust-cache discards them). The release
+  # profile already emits no debug info, so target/ stays small and no debug trim (or disk
+  # prune) is needed here — see the DISK note in the header.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   perf-gates:
     name: perf harness (Linux, buffered thresholds)
     runs-on: ubuntu-24.04
     steps:
+      # (No free-disk prune step — see the DISK note in the header: the release build's target/
+      # is ~1.9 GB, far under the runner's ~16 GB free. Dropping it saved ~1m13 per run.)
       - uses: actions/checkout@v4
 
+      # Build deps for the GPUI (blade/Vulkan) release build + the perf harness's virtual
+      # display. This is intentionally a lean SUBSET of app/render-tests/scripts/setup_render_env.sh
+      # (that script's canonical build-dep list is the source of truth): the perf harness needs
+      # only xvfb + the lavapipe ICD, not the full capture stack (ImageMagick / x11 tools / the
+      # explicit-serif font), so we skip those to keep this job fast. Keep the build-dep portion
+      # below in sync with setup_render_env.sh if the GPUI build deps ever change.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -43,9 +70,14 @@ jobs:
         working-directory: app
         run: rustup toolchain install
 
+      # `cache-on-failure: true` — the perf gate hard-fails on a threshold breach, and without
+      # this rust-cache's default (`false`) would discard the whole release build on any red run,
+      # keeping the job permanently cold. See checks.yml for the full rationale + the branch-scope
+      # caveat (feature branches inherit only main's cache).
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
+          cache-on-failure: true
 
       # The harness builds itself in release (perf numbers must be optimized — CLAUDE.md) and
       # runs FOREGROUND under Xvfb + lavapipe, HARD-FAILING at the committed buffered thresholds

@@ -39,3 +39,37 @@ distinct from `specs/projects/`, which holds *active* spec-driven build planning
   **force + assert** the measured op so it can't measure a no-op; report **p50/p99**,
   environment-stamped; **adversarially review** surprising numbers before trusting them.
 - **Commit + push regularly** — the working container is ephemeral.
+
+## Render tests — agent-driven (no automatic every-push gate)
+
+The pixel render suite (Xvfb + Mesa **lavapipe**) is a **manual** gate: it runs only when
+the `render` workflow (`.github/workflows/render.yml`, required-check context
+`render (Xvfb + lavapipe)`) is dispatched — **not** on every push. The fast `checks` job
+compiles render-tests and runs its GPUI-free unit tests, but the actual **pixel diffs are
+not covered automatically**. So the **agent must decide when render coverage is needed and
+drive it** — there is no safety net.
+
+**1. Run it locally, in-container, whenever a change could move pixels** — grid/chrome/GPUI
+view code, fonts, layout, borders, styles, the render harness, or baselines:
+- first time: `app/render-tests/scripts/setup_render_env.sh` (installs the capture stack)
+- then: `app/render-tests/scripts/render_tests.sh test` (asserts every case == baseline)
+
+If the change **intentionally** alters rendering, regenerate + **eyeball** baselines
+(`app/render-tests/scripts/render_tests.sh generate`) and commit them *with* the change.
+Never land a rendering change without either a green local run or refreshed, eyeballed
+baselines.
+
+**2. Validate in CI before merge.** The required truth is the CI `render` gate. For any
+change that could regress or alter rendering, get a green CI render run on the branch before
+merge:
+- **Preferred — the agent triggers it:** dispatch the `render` workflow on the branch
+  (GitHub Actions MCP, or `gh workflow run render.yml --ref <branch>`), poll to completion,
+  confirm it passed. (Dispatchable once `render.yml` is on `main`.)
+- **Fallback:** if the agent can't dispatch, ask the user to kick off `render` and report
+  the result back.
+
+**3. Bake it into plans.** When an implementation plan makes UI/rendering changes that could
+regress or change pixels, the plan **must** include explicit steps: refresh + eyeball
+baselines if the change is intentional, and a **"dispatch the CI `render` gate and confirm it
+passes"** step before the phase is done. Decide this at planning time — don't leave render
+validation implicit.

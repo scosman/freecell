@@ -108,12 +108,15 @@ not grind through later phases once a core capability is shown unachievable.**
   + dots), reusing the Phase 1/2 title/axis/legend scaffolding. Capture + review.
   *Checkpoint: FAIL → scatter recorded out-of-scope for the follow-on (not a whole NO-GO).*
 
-- [ ] **Phase 3b — Gate 3b: bubble (small add-on, added after the initial GO synthesis).**
-  Only meaningful because Phase 3 (scatter) passed. Generalize the scatter mark: drive
-  per-point marker radius from a third `bubbleSize` series (size→radius scale + max-radius
-  clamp). Render a single-series bubble example (legibly varied sizes) + capture + review,
-  then fold the result into `SYNTHESIS.md`. *FAIL → bubble out-of-scope, scatter/GO
-  unaffected. Deliberately tiny — reuses the scatter render path.*
+- [x] **Phase 3b — Gate 3b: bubble — RESOLVED BY ANALYSIS (no render).** Added after the
+  initial GO synthesis. Because Phase 3 (scatter) passed and bubble is a strict, tiny
+  generalization of that exact render path (scatter + a per-point marker radius from a third
+  `c:bubbleSize` value: only new code is a √-scaled size→radius mapping + a max clamp),
+  bubble was judged **IN by code inspection rather than a rendered gate** — the residual
+  unknowns are cosmetic tuning, not feasibility. Reasoning + exact delta + residual risk:
+  [`experiments/chart-poc/bubble-analysis.md`](../../../experiments/chart-poc/bubble-analysis.md);
+  folded into `SYNTHESIS.md`. *(A ~30-min render confirmation remains available on the
+  existing harness if ever wanted.)*
 
 - [x] **Phase 4 — Gate 4: load/save stitching.** `load-save` crate: parse a real
   agent-authored `.xlsx` (a couple of in-scope chart types) into `chart-model` and render it

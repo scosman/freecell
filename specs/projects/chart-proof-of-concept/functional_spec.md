@@ -228,9 +228,12 @@ examples once a core capability is shown unachievable.**
   grouped/stacked → likely PARTIAL-GO** (e.g. "single-series only" recommendation).
 - **Gate 3 — Scatter (§4).** Multi-series scatter, agent-judged. **FAIL → scatter recorded
   as out-of-scope for the follow-on**, PoC continues (not a whole-project NO-GO).
-- **Gate 3b — Bubble (§4a).** Only if Gate 3 passes: single-series bubble, agent-judged.
-  **FAIL → bubble recorded out-of-scope**, scatter unaffected. Skipped entirely if Gate 3
-  fails. (Deliberately tiny — it reuses the scatter path.)
+- **Gate 3b — Bubble (§4a).** Resolved **by code analysis** rather than a rendered example:
+  because Gate 3 (scatter) passed and bubble is a strict, tiny generalization of that render
+  path (a per-point marker radius from `c:bubbleSize`), bubble is recorded **IN**. Reasoning
+  in [`experiments/chart-poc/bubble-analysis.md`](../../../experiments/chart-poc/bubble-analysis.md).
+  (Originally planned as a small render gate; downgraded to analysis once the scatter code
+  made the outcome unambiguous.)
 - **Gate 4 — Load/save (§5).** Load a real `.xlsx` and render it; re-inject on save and
   reopen. Load FAIL is serious (there's no chart data without it); **save FAIL →
   display-only recommendation**, not a whole-project NO-GO.

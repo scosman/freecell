@@ -27,7 +27,10 @@ badly a "no" would have hurt:
   regenerated single column) returned single-agent **PASS**. No wholesale grouped/stacked FAIL —
   a GO signal, not the PARTIAL-GO fallback.
 - **Gate 3 — scatter (§7).** Both single- and multi-series scatter (two numeric axes + dots)
-  returned **PASS** → scatter is IN-scope for the follow-on.
+  returned **PASS** → scatter is IN-scope for the follow-on. **Bubble** rides on this same
+  path and is IN too — **by code analysis, not a rendered gate** (it is scatter with a
+  per-point marker radius from a third `c:bubbleSize` value); see
+  [`bubble-analysis.md`](bubble-analysis.md).
 - **Gate 4 — load/save (§7).** Parsing charts out of a real `.xlsx` into the shared model and
   rendering them back returned **PASS** on all three loaded charts (**LOAD PASS**); and
   byte-preservation re-injection survives IronCalc's chart-dropping writer, verified three ways
@@ -106,9 +109,13 @@ this decision (§6), not an automated gate. **G1 = 3-agent panel; all others sin
 - **Scatter** (Gate 3 PASS): **IN** — it was the cheapest new type of the whole PoC, almost
   entirely reuse (the "second numeric axis" is just the value axis applied twice; dots are the
   `Line` primitive's dot mark drawn without the path).
+- **Bubble** (**IN by analysis**, not a rendered gate): scatter with a per-point marker radius
+  from a third `c:bubbleSize` value — a tiny generalization of the passed scatter path (only
+  new code: a √-scaled size→radius mapping + a max clamp). Full reasoning + residual risk in
+  [`bubble-analysis.md`](bubble-analysis.md).
 
 ### Chart types — **OUT** (permanent, functional_spec §8)
-Stock/candlestick, combo/multi-plot, **bubble** (sized third dimension), radar, surface, all
+Stock/candlestick, combo/multi-plot, radar, surface, all
 3D, pie-of-pie, multi-ring doughnut, and the entire extended `cx:` family (sunburst, treemap,
 waterfall, histogram, box-&-whisker, funnel, region map). Also out per §4/§8: trendlines and log
 axes on scatter.

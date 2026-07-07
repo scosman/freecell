@@ -23,12 +23,17 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
   `get_color_indexed` (fills/fonts/borders/dxfs); tab/CF colours keep the default resolver
   (documented follow-up). 4 tests (end-to-end load_styles ±override + guards), fmt + clippy clean.
   Merged → `freecell-fixes` (`48b0b23`, both fixes; combined suite green). Pushed.
-- [ ] **Phase 3 — FreeCell upgrade (the migration).** Add `[patch.crates-io]` → `freecell-fixes`.
-  Delete `open_fixups.rs` + `open_repair.rs` (+ their `document.rs::open` call sites) and drop
-  `roxmltree`/`zip`. Migrate the color-read path (`cache.rs`, `document.rs`) to resolve `Color` via
-  `UserModel::resolve_color` (`Color::None` ⇒ no fill); fix any incidental `main` API drift the
-  build surfaces. Update tests/fixtures reading `fill.fg_color`. Workspace `cargo test` + checks
-  green.
+- [~] **Phase 3 — FreeCell upgrade (the migration). PARTIAL — blocked on engine-default drift.**
+  Done: `[patch.crates-io]` → `freecell-fixes`; deleted `open_fixups.rs` + `open_repair.rs` (+ the
+  `document.rs::open` call sites), dropped `roxmltree`, moved `zip` to dev-deps; migrated the
+  colour-read path (`cache.rs` `resolve_rgb`/`render_style_from`/`border_spec_from`, `document.rs`
+  `resolve_text_color` + a `workbook_theme()` accessor) to the new `Color` enum. **`freecell-engine`
+  compiles clean against the fork; the `Color` migration is small (4 prod + 6 test sites).**
+  **BLOCKER (see finding below):** building against upstream `main` is a full 0.7.1→`main` engine
+  upgrade — `main` changed `new_empty`'s **default geometry** (row height, col width) and **default
+  font** (12pt Inter vs 13pt Calibri). FreeCell's cache-agreement invariant is pinned to the 0.7.1
+  values, so **21/91 engine tests fail — all geometry/default mismatches, zero colour-correctness
+  failures.** Decision needed (decouple vs. push through the full upgrade).
 - [ ] **Phase 4 — Validation (the redundancy proof).** Port `open_fixups`' theme + indexed goldens
   into an equivalence test (engine `resolve_color` == the RGBs the hack produced). Owner visual
   pass: open the mortgage (purple theme), Numbers (indexed palette + `xfId`-less), and a
@@ -37,6 +42,38 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
 - [ ] **Phase 5 — Sign-off gate → upstream PRs.** On owner approval: rebase `fix/*` on fresh
   `upstream/main`; open one PR per fix (E2, E5) against `ironcalc/IronCalc:main`, PR-first, minimal
   repro + tests in each body. Record in the status table.
+
+## Phase 3 finding — "upgrade to main" is a full engine upgrade (2026-07-07)
+
+Building FreeCell against the fork's `freecell-fixes` (= upstream `main` + E2/E5) surfaced that
+`main` has drifted from the pinned `0.7.1` in ways **unrelated to the E1–E5 workarounds**:
+
+- **Default geometry changed.** Fork `constants.rs`: `DEFAULT_ROW_HEIGHT = 25`, `DEFAULT_COLUMN_WIDTH
+  = 90`; a `new_empty` sheet's rows report **21.43 px** via `get_row_height`. FreeCell hardcodes
+  `DEFAULT_ROW_HEIGHT_PX = 24`, `DEFAULT_COL_WIDTH_PX = 100` (tuned to `0.7.1`).
+- **Default font changed.** Fork `Font::default()` = **12 pt "Inter"**; FreeCell expects **13 pt
+  "Calibri"**.
+- **Consequence:** the resident-cache↔engine **agreement invariant** (FreeCell's core correctness
+  contract) is pinned to the old defaults → **21/91 `freecell-engine` tests fail, all
+  geometry/default mismatches; zero colour/number-format correctness failures.**
+
+**Interpretation:** the workaround *removal itself is correct* — the colour/format hacks the engine
+now subsumes (E1/E2/E5) and the `xfId` accept (E4) are gone cleanly, and nothing colour/format
+regressed. The failures are the cost of moving from the `0.7.1` release to unreleased git-`main`,
+which also carries a font/geometry refresh. The E1/E4/tint fixes are **entangled** with that larger
+`main` evolution (the `Color`-enum refactor shipped *with* the theme fix), so there is no clean
+"`0.7.1` + only our 5 fixes" base.
+
+**Decision needed (recorded, pending owner):**
+- **(A) Decouple (recommended):** ship E2+E5 upstream (done, PR-ready); make the FreeCell
+  hack-removal its own **engine-upgrade project** against a *released* IronCalc that bundles all
+  five fixes (`projects/ironcalc-upgrade.md`), where reconciling row/col/font defaults + updating the
+  geometry tests and render baselines is in scope. Revert this branch's Phase-3 changes (restore the
+  `0.7.1` pin + hacks) so FreeCell stays green. The Phase-3 migration is preserved (committed WIP) for
+  that project to build on.
+- **(B) Push through now:** reconcile all of `main`'s drift (bump the geometry/font defaults, fix the
+  21 tests + render baselines, chase any further drift) and pin FreeCell to git-`main`. Larger than
+  scoped, and a git-`main` pin is not shippable.
 
 ## Follow-up (NOT this project)
 - Move FreeCell from the git-`main` patch to a **released** IronCalc pin once the fixes ship →

@@ -29,7 +29,9 @@ use freecell_core::cache::{DEFAULT_COL_WIDTH_PX, DEFAULT_ROW_HEIGHT_PX};
 use freecell_core::{
     limits, BorderSpec, CellRef, Edge, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
 };
-use ironcalc_base::types::{Border, BorderItem, BorderStyle, HorizontalAlignment, Style};
+use ironcalc_base::types::{
+    Border, BorderItem, BorderStyle, Color, HorizontalAlignment, Style, Theme,
+};
 
 use crate::document::WorkbookDocument;
 
@@ -113,25 +115,28 @@ pub(crate) fn border_weight(style: &BorderStyle) -> u8 {
     }
 }
 
+/// Resolves an IronCalc [`Color`] to an `#RRGGBB` [`Rgb`], consulting the workbook `theme` for
+/// theme-indexed colours (`Color::to_rgb`). `Color::None` — and any unparseable resolved string —
+/// yields `None`, so an unexpected colour never panics; the cell falls back to the render default.
+pub(crate) fn resolve_rgb(color: &Color, theme: &Theme) -> Option<Rgb> {
+    parse_color(&color.to_rgb(theme))
+}
+
 /// Resolves one IronCalc [`BorderItem`] to a render [`Edge`]: its weight class + colour (defaulting
-/// to black when the item carries none or an unparseable string — the render never panics).
-fn edge_from(item: &BorderItem) -> Edge {
-    let color = item
-        .color
-        .as_deref()
-        .and_then(parse_color)
-        .unwrap_or(Rgb::new(0, 0, 0));
+/// to black when the item carries none or an unparseable colour — the render never panics).
+fn edge_from(item: &BorderItem, theme: &Theme) -> Edge {
+    let color = resolve_rgb(&item.color, theme).unwrap_or(Rgb::new(0, 0, 0));
     Edge::new(border_weight(&item.style), color)
 }
 
 /// Resolves an IronCalc [`Border`] into the engine-free [`BorderSpec`] the grid paints. Only the
 /// four side edges are drawn (diagonals are out of scope — `functional_spec.md §3.6`).
-pub(crate) fn border_spec_from(border: &Border) -> BorderSpec {
+pub(crate) fn border_spec_from(border: &Border, theme: &Theme) -> BorderSpec {
     BorderSpec {
-        top: border.top.as_ref().map(edge_from),
-        right: border.right.as_ref().map(edge_from),
-        bottom: border.bottom.as_ref().map(edge_from),
-        left: border.left.as_ref().map(edge_from),
+        top: border.top.as_ref().map(|e| edge_from(e, theme)),
+        right: border.right.as_ref().map(|e| edge_from(e, theme)),
+        bottom: border.bottom.as_ref().map(|e| edge_from(e, theme)),
+        left: border.left.as_ref().map(|e| edge_from(e, theme)),
     }
 }
 
@@ -141,24 +146,20 @@ pub(crate) fn border_spec_from(border: &Border) -> BorderSpec {
 /// but the grid ignores (strikethrough, wrap, vertical/diagonal) stays in the engine and
 /// round-trips on save.
 ///
-/// `render_style_from(&Style::default()) == RenderStyle::default()` (asserted in the tests) — so
+/// `rsf(&Style::default()) == RenderStyle::default()` (asserted in the tests) — so
 /// a plain cell interns to the default style and resolves to `None` (the grid's default paint).
-pub(crate) fn render_style_from(style: &Style) -> RenderStyle {
+pub(crate) fn render_style_from(style: &Style, theme: &Theme) -> RenderStyle {
     RenderStyle {
         bold: style.font.b,
         italic: style.font.i,
         underline: style.font.u,
-        // A solid fill's colour lives in `fill.fg_color`; absent (or cleared) → no fill.
-        fill: style.fill.fg_color.as_deref().and_then(parse_color),
+        // A solid fill's colour is `fill.color` (resolved against the theme); `Color::None` (or an
+        // unparseable colour) → no fill.
+        fill: resolve_rgb(&style.fill.color, theme),
         // `None` on RenderStyle means "grid default (near-black)"; IronCalc's default font colour
-        // is pure black, so map black (and absent/unparseable) to `None` to keep default cells
+        // is pure black, so map black (and none/unparseable) to `None` to keep default cells
         // interning to the default style.
-        font_color: style
-            .font
-            .color
-            .as_deref()
-            .and_then(parse_color)
-            .filter(|rgb| *rgb != Rgb::new(0, 0, 0)),
+        font_color: resolve_rgb(&style.font.color, theme).filter(|rgb| *rgb != Rgb::new(0, 0, 0)),
         h_align: h_align_of(style),
         // `num_fmt` / `font_family` / `border` are side-table indices resolved by the caller
         // (build/refresh), which holds the interning tables; a bare conversion carries `0`
@@ -244,11 +245,11 @@ pub(crate) fn build_sheet_cache(
         }
         if col.style.is_some() {
             if let Some(style) = doc.col_band_style(sheet_idx, (col.min - 1) as u32)? {
-                let mut rs = render_style_from(&style);
+                let mut rs = render_style_from(&style, doc.workbook_theme());
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
-                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
                 if rs != RenderStyle::default() {
                     for c in col.min..=col.max {
                         let c0 = (c - 1) as u32;
@@ -270,11 +271,11 @@ pub(crate) fn build_sheet_cache(
         }
         if r.custom_format && r.s != 0 {
             if let Some(style) = doc.row_band_style(sheet_idx, r0)? {
-                let mut rs = render_style_from(&style);
+                let mut rs = render_style_from(&style, doc.workbook_theme());
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
-                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
                 if rs != RenderStyle::default() {
                     builder.push_row_style(r0, rs);
                     band_rows.insert(r0);
@@ -300,11 +301,11 @@ pub(crate) fn build_sheet_cache(
             let col0 = (*col_1 - 1) as u32;
             let cell = CellRef::new(row0, col0);
             if let Some(style) = doc.cell_own_style(sheet_idx, cell)? {
-                let mut rs = render_style_from(&style);
+                let mut rs = render_style_from(&style, doc.workbook_theme());
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
-                rs.border = builder.intern_border_spec(border_spec_from(&style.border));
+                rs.border = builder.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
                 // `band_rows`/`band_cols` hold only *non-default* bands. A populated cell with a
                 // default own style on such a band gets an explicit default entry to shadow it.
                 // MICRO-EDGE (DECISIONS_TO_REVIEW, Phase 5): a `custom_format` row whose style
@@ -341,7 +342,7 @@ pub(crate) fn refresh_cell(
 ) -> Result<(), String> {
     match doc.cell_own_style(sheet_idx, cell)? {
         Some(style) => {
-            let mut rs = render_style_from(&style);
+            let mut rs = render_style_from(&style, doc.workbook_theme());
             rs.num_fmt = cache.intern_num_fmt(&style.num_fmt);
             rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
             rs.font_family = if style.font.name == def_name {
@@ -349,7 +350,7 @@ pub(crate) fn refresh_cell(
             } else {
                 cache.intern_font_family(&style.font.name)
             };
-            rs.border = cache.intern_border_spec(border_spec_from(&style.border));
+            rs.border = cache.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
             if rs != RenderStyle::default() {
                 cache.set_cell_style(cell.row, cell.col, rs);
             } else if cache.is_on_band(cell.row, cell.col) {
@@ -386,7 +387,7 @@ pub(crate) fn assert_cache_agrees(
             // Structural compare ignores the cache-local indices (`num_fmt`, `font_family`), but
             // resolves the *value* fields the engine side also carries (`font_size_q` is an absolute
             // quarter-point value, comparable directly once resolved against the workbook default).
-            let mut engine = render_style_from(&engine_style);
+            let mut engine = render_style_from(&engine_style, doc.workbook_theme());
             engine.font_size_q = font_size_q_of(engine_style.font.sz, def_sz);
             let cached_structural = RenderStyle {
                 num_fmt: 0,
@@ -408,7 +409,7 @@ pub(crate) fn assert_cache_agrees(
             // The border agreement is over the resolved *spec* (the `border` field is a cache-local
             // index; the engine side resolves the spec directly).
             let cached_spec = cache.border_spec(cached.border);
-            let engine_spec = border_spec_from(&engine_style.border);
+            let engine_spec = border_spec_from(&engine_style.border, doc.workbook_theme());
             if cached_spec != engine_spec {
                 return Err(format!(
                     "border mismatch at ({r},{c}): cache={cached_spec:?} engine={engine_spec:?}"
@@ -469,6 +470,15 @@ mod tests {
     use super::*;
     use freecell_core::{Align, CellRange};
 
+    // Colour resolution needs a workbook theme; these tests exercise explicit `#rgb` colours
+    // (theme-independent), so the default theme suffices.
+    fn rsf(style: &Style) -> RenderStyle {
+        render_style_from(style, &Theme::default())
+    }
+    fn bsf(border: &Border) -> BorderSpec {
+        border_spec_from(border, &Theme::default())
+    }
+
     /// A tiny seeded LCG so the "random probe" set is deterministic without a `rand` dep.
     struct Lcg(u64);
     impl Lcg {
@@ -501,42 +511,42 @@ mod tests {
 
     #[test]
     fn render_style_from_default_is_plain() {
-        assert_eq!(render_style_from(&Style::default()), RenderStyle::default());
+        assert_eq!(rsf(&Style::default()), RenderStyle::default());
     }
 
     #[test]
     fn render_style_from_maps_each_attribute() {
-        assert!(render_style_from(&style_with("font.b", "true")).bold);
-        assert!(render_style_from(&style_with("font.i", "true")).italic);
-        assert!(render_style_from(&style_with("font.u", "true")).underline);
+        assert!(rsf(&style_with("font.b", "true")).bold);
+        assert!(rsf(&style_with("font.i", "true")).italic);
+        assert!(rsf(&style_with("font.u", "true")).underline);
         assert_eq!(
-            render_style_from(&style_with("fill.fg_color", "#FF0000")).fill,
+            rsf(&style_with("fill.fg_color", "#FF0000")).fill,
             Some(Rgb::from_hex(0xFF0000))
         );
         assert_eq!(
-            render_style_from(&style_with("font.color", "#0000FF")).font_color,
+            rsf(&style_with("font.color", "#0000FF")).font_color,
             Some(Rgb::from_hex(0x0000FF))
         );
         // Explicit black font colour maps to None (the grid's default near-black).
         assert_eq!(
-            render_style_from(&style_with("font.color", "#000000")).font_color,
+            rsf(&style_with("font.color", "#000000")).font_color,
             None
         );
         assert_eq!(
-            render_style_from(&style_with("alignment.horizontal", "right")).h_align,
+            rsf(&style_with("alignment.horizontal", "right")).h_align,
             Some(Align::Right)
         );
         assert_eq!(
-            render_style_from(&style_with("alignment.horizontal", "center")).h_align,
+            rsf(&style_with("alignment.horizontal", "center")).h_align,
             Some(Align::Center)
         );
         // `render_style_from` never resolves the num-fmt index itself (the caller does, via the
         // interning table); it always carries the default 0.
         assert_eq!(
-            render_style_from(&style_with("num_fmt", "0.00%")).num_fmt,
+            rsf(&style_with("num_fmt", "0.00%")).num_fmt,
             0
         );
-        assert_eq!(render_style_from(&Style::default()).num_fmt, 0);
+        assert_eq!(rsf(&Style::default()).num_fmt, 0);
     }
 
     #[test]
@@ -713,7 +723,7 @@ mod tests {
         let item = |style, color: &str| {
             Some(BorderItem {
                 style,
-                color: Some(color.to_string()),
+                color: Color::Rgb(color.to_string()),
             })
         };
         let border = Border {
@@ -723,7 +733,7 @@ mod tests {
             left: None,
             ..Border::default()
         };
-        let spec = border_spec_from(&border);
+        let spec = bsf(&border);
         assert_eq!(spec.top, Some(Edge::new(1, Rgb::new(0, 0, 0))));
         assert_eq!(spec.right, Some(Edge::new(3, Rgb::new(0xFF, 0, 0))));
         assert_eq!(spec.bottom, Some(Edge::new(2, Rgb::new(0, 0xFF, 0))));
@@ -732,12 +742,12 @@ mod tests {
         let b2 = Border {
             top: Some(BorderItem {
                 style: BorderStyle::Thin,
-                color: None,
+                color: Color::None,
             }),
             ..Border::default()
         };
         assert_eq!(
-            border_spec_from(&b2).top,
+            bsf(&b2).top,
             Some(Edge::new(1, Rgb::new(0, 0, 0)))
         );
     }

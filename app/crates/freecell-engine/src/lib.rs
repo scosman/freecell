@@ -26,8 +26,6 @@ pub(crate) mod cache;
 pub mod document;
 pub mod fixtures;
 pub mod instrument;
-pub(crate) mod open_fixups;
-pub(crate) mod open_repair;
 pub mod worker;
 
 pub use document::{

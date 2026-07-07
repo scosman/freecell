@@ -83,3 +83,14 @@ opt-level = 3
 
 [profile.dev.package.gpui_platform]
 opt-level = 3
+
+# ---------------------------------------------------------------------------------
+# IronCalc upstreaming (specs/projects/ironcalc-upstreaming): build against our fork's
+# `freecell-fixes` branch — upstream `main` (which already fixes E1 theme / E4 xfId / the
+# tint bug) plus our E2 (num-fmt table) and E5 (<indexedColors> override) fixes. This is
+# what lets the local import workarounds (open_fixups/open_repair) be removed. TEMPORARY:
+# revert to a released crates.io pin once the fixes ship (projects/ironcalc-upgrade.md).
+# ---------------------------------------------------------------------------------
+[patch.crates-io]
+ironcalc = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
+ironcalc_base = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }

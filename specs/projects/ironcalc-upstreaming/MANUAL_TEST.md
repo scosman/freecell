@@ -105,13 +105,19 @@ Run `cargo run -p freecell-app -- <path>` from `app/`.
   `#VALUE!`.
 - **Old bug:** every such cell showed `#VALUE!` even though the value was fine.
 
-### E3 — date/time built-ins render  *(was: residual mis-map)*
-- **File:** a workbook with **date/time** cells using built-in date formats (ids 14–22) — e.g. cells
-  formatted `Short Date`, `Long Date`, `Time` in Excel.
-- **PASS:** they render as dates/times (`1/1/2021`, `13:45`), not raw serials (`44197`) or garbage.
-- *Note:* E2's fix rebuilt the **whole** built-in table, so the old E3 date/time residual is covered
-  too. (One known engine gap: format id 47 `mmss.0` still won't render — separate upstream formatter
-  issue, out of scope.)
+### E3 — date/time built-ins render  *(was: residual mis-map)* — **covered by an automated test**
+- **No manual step needed** — a date format is a deterministic string, so it's asserted, not eyeballed:
+  ```sh
+  cd app && cargo test -p freecell-engine --test dates_fixture   # opens tests/fixtures/dates.xlsx
+  ```
+  It opens a crafted workbook referencing the built-in date/time ids **14–22 undefined** (the exact
+  E3 case) and asserts each renders as a date/time, not a raw serial. Verified rendering:
+  `id14 → 01-01-21`, `id15 → 1-Jan-21`, `id16 → 1-Jan`, `id17 → Jan-21`, `id22 → 1/1/22 12:00`,
+  `id20 → 12:00`, `id21 → 12:00:00`, `id18 → 12:00 PM`.
+- *Optional* visual spot-check: open `crates/freecell-engine/tests/fixtures/dates.xlsx` in the app.
+- *Note:* E2's fix rebuilt the **whole** built-in table, so the old E3 residual is covered too. (One
+  known engine gap: id 47 `mmss.0` still won't render — separate upstream formatter issue, out of
+  scope.)
 
 ---
 

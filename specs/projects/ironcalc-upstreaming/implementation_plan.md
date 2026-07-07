@@ -127,10 +127,10 @@ drift is reconciled here, not decoupled. Remaining work under Phase 6:
   change.
 - Then the FreeCell workspace is fully green on the fork.
 
-The manual verification (`MANUAL_TEST.md`) already confirms the **fix-relevant** behaviour with the
-hacks removed: **E1, E2, E4, E5 verified in-app by the owner (2026-07-07); E3 (date/time) pending.**
-The 21 failures are geometry-only and don't touch fix correctness — they're the reconciliation task
-above, not a blocker to the fixes.
+Verification with the hacks removed is **complete**: **E1, E2, E4, E5 confirmed in-app by the owner
+(2026-07-07); E3 covered by the `dates_fixture` integration test** (built-in date/time ids 14–22
+render as dates, not serials — `tests/fixtures/dates.xlsx`). All five fixes confirmed. The 21
+geometry failures don't touch fix correctness — they're the reconciliation task above, not a blocker.
 
 ## Optional optimisation (not required)
 - When upstream releases a version containing our merged fixes, optionally bump FreeCell's
@@ -144,7 +144,7 @@ above, not a blocker to the fixes.
 | E2 num-fmt | `fix/e2-numfmt` (`953af32`) | ✅ base 2107 + xlsx 213 green, fmt+clippy clean | ✅ merged | ✅ E2 (mortgage) | ⏳ awaiting sign-off | fix pushed; backup `patches/0001-e2-numfmt.patch` |
 | E5 indexed | `fix/e5-indexed` (`1c2c477`) | ✅ 4 new + xlsx 213 green, fmt+clippy clean | ✅ merged (`48b0b23`) | ✅ E5 fills (numbers_table) + borders (FONTS.xlsx) | ⏳ awaiting sign-off | fix pushed; backup `patches/0002-e5-indexed.patch` |
 | E1/E4/tint | (already on upstream `main`) | n/a | inherited | ✅ E1 (mortgage) + E4 (numbers_table opens) | n/a | consumed via the fork; no PR needed |
-| FreeCell migration | (this branch, WIP `3fc7b1d`) | engine compiles; ~21 geometry tests pending reconcile | — | ✅ E1/E2/E4/E5; ⬜ E3 (date/time) | n/a | Color migration + hacks removed; **remaining: geometry/font reconcile (Phase 6)** |
+| FreeCell migration | (this branch, WIP) | engine compiles; +`dates_fixture` E3 test green; ~21 geometry tests pending reconcile | — | ✅ E1/E2/E4/E5 (in-app) + E3 (test) | n/a | Color migration + hacks removed; **all 5 fixes verified**; remaining: geometry/font reconcile (Phase 6) |
 
 > **Push access resolved (2026-07-07):** owner granted write to `scosman/ironcalc`; commits are
 > authored `Steve Cosman <848343+scosman@users.noreply.github.com>` (noreply, to satisfy email

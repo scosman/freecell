@@ -35,7 +35,7 @@ upstream PRs.
 | D4 | Upstream flow | **PR-first, one PR per fix** (E2, E5), against `ironcalc/IronCalc:main`, on sign-off only. |
 | D5 | No submission without sign-off | Nothing to `ironcalc/IronCalc` until the owner approves. Fork + FreeCell-branch work is unrestricted. |
 | D6 | Validation is central | Prove redundancy: (a) FreeCell tests green post-migration/removal; (b) `resolve_color` reproduces the **exact RGBs** `open_fixups` computed for the fixtures (assertable — our old tests carry the goldens); (c) visual pass on the real files; (d) open→save→reopen of an affected file. |
-| D7 | git-`main` pin is temporary | Building on unreleased git-`main` is the validation vehicle. Moving to a **released** pin once IronCalc publishes the fixes is a slim follow-up (`projects/ironcalc-upgrade.md`). |
+| D7 | The fork is FreeCell's **permanent** engine (updated 2026-07-07) | FreeCell rides the fork's `freecell-fixes` as its normal dependency ongoing — we fix IronCalc, not hack FreeCell (see implementation_plan §Operating model). Building on git-`main` is not a temporary vehicle; moving to a released pin is only an optional leaner alternative when upstream ships our fixes. |
 
 ## 3. The fork fixes
 

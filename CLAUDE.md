@@ -33,6 +33,24 @@ it:
 This keeps good ideas tracked without dragging them onto the critical path. It is
 distinct from `specs/projects/`, which holds *active* spec-driven build planning.
 
+## Engine: we ride our IronCalc fork (fix upstream, don't hack FreeCell)
+
+FreeCell depends on **our fork** `scosman/ironcalc`, not crates.io directly. When you hit an
+IronCalc bug or missing capability, **fix it in the fork and contribute it back upstream**
+(`ironcalc/IronCalc`) as a clean single-fix PR — do **not** add a compensating workaround in
+FreeCell. This is the standing way of working, not a one-off.
+
+- FreeCell's `app/Cargo.toml` pins `ironcalc`/`ironcalc_base` via `[patch.crates-io]` → the fork's
+  **`freecell-fixes`** branch (the sum of our not-yet-upstreamed fixes).
+- Fork branches: `main` = clean mirror of upstream; `fix/<slug>` = one branch per fix (off `main`,
+  with upstream-style tests) = one clean PR; `freecell-fixes` = integration branch FreeCell builds
+  against. Sync `main` from upstream periodically (rebase `fix/*` + `freecell-fixes`); expect
+  incidental drift to reconcile on the FreeCell side.
+- An agent can work both repos in one container (FreeCell here; fork at `/workspace/ironcalc` via
+  `add_repo scosman/ironcalc`). **Full process + the per-issue loop:**
+  [`specs/projects/ironcalc-upstreaming/implementation_plan.md`](specs/projects/ironcalc-upstreaming/implementation_plan.md)
+  §Operating model.
+
 ## Conventions
 
 - **Benchmarks:** run FOREGROUND with `timeout` (never `nohup`/`&`/background monitors);

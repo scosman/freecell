@@ -54,13 +54,11 @@ registry: each entry is a short description plus a pointer to a design note unde
   insert/delete rows/cols that would displace merges.
   → [`projects/merged-cells.md`](projects/merged-cells.md)
 
-- **IronCalc Upgrade (adopt fixed engine, delete import hacks)** — *Future (gated on an
-  IronCalc release carrying all five import fixes).* Upstream `main` already fixed 3 of our 5
-  import workarounds (E4 `xfId`, E1 theme, E1′ tint) and the `ironcalc-upstreaming` project
-  upstreams the other 2 (E2 num-fmt, E5 indexed). Once a release ships them, bump the dep,
-  migrate FreeCell to `main`'s new `Color`-enum style API, delete `open_fixups.rs` +
-  `open_repair.rs` (+ `roxmltree`/`zip`), and do the in-app visual validation. Do **not** pin to
-  git-`main`. → [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md)
+- **IronCalc — move to a released pin** — *Future (follow-up tail of `ironcalc-upstreaming`).*
+  That project upgrades FreeCell onto the fork's git-`main` + our E2/E5 fixes (migrating to the
+  new `Color`-enum API and deleting `open_fixups`/`open_repair` + `roxmltree`/`zip`). This tail
+  swaps the temporary `[patch.crates-io]` git pin for a **released** IronCalc version once one
+  ships with all five fixes, and re-validates. → [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md)
 
 - **Viewport Value Cache** — *Future, optional scroll-perf push.*
   Delta-load only newly-exposed cells' *values* on scroll (styles/geometry come from the

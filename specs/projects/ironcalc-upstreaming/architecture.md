@@ -4,9 +4,9 @@ status: draft
 
 # Architecture: IronCalc Upstreaming
 
-> Scope = Option 1 (E2 + E5 upstreamed to the fork; FreeCell migration deferred). See
-> `functional_spec.md` + `fork_audit.md`. All paths below are in `scosman/ironcalc`
-> (`/workspace/ironcalc` in this container) unless prefixed `freecell:`.
+> Scope = Option 2 (E2 + E5 upstreamed to the fork **and** FreeCell upgraded onto the fork with
+> the workarounds removed + validated). See `functional_spec.md` + `fork_audit.md`. Fork paths
+> are in `scosman/ironcalc` (`/workspace/ironcalc`); FreeCell paths are prefixed `freecell:`.
 
 ## 1. Repos, crates, branches
 
@@ -103,8 +103,67 @@ status: draft
 - Push order: fork branches first (any time); PRs only after the owner signs off.
 - Track fix ↔ branch ↔ PR status in `implementation_plan.md` / a status table.
 
-## 6. Deferred (separate project)
+## 6. FreeCell upgrade onto the fork
 
-FreeCell's `Color`-enum migration, in-app visual validation, and deletion of
-`open_fixups.rs`/`open_repair.rs` (+ `roxmltree`/`zip`) live in `freecell:projects/ironcalc-upgrade.md`
-(status Future), gated on an IronCalc release carrying all five fixes.
+### 6.1 Wire the dep (`freecell:app/Cargo.toml`)
+Keep `ironcalc = "=0.7.1"` / `ironcalc_base = "=0.7.1"`, add:
+
+```toml
+[patch.crates-io]
+ironcalc      = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
+ironcalc_base = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
+```
+
+The fork crates are versioned `0.7.1`, so the patch satisfies the `=0.7.1` requirement. For fast
+in-container iteration a `path` patch to `/workspace/ironcalc/{xlsx,base}` is equivalent; the
+committed form uses the git branch (reproducible off-container). The 4.1 build break is expected
+and is the discovery pass for any API drift beyond colors.
+
+### 6.2 The `Color` model (what changed)
+`main`: `Style { fill: Fill { color: Color }, font: Font { color: Color, .. }, border: … }` where
+
+```rust
+pub enum Color { Rgb(String), Theme(i32, f64), None }   // base/src/types.rs:17
+```
+
+Colors are **unresolved** in `Style` (`Color::Theme` carries the slot+tint). Resolution helpers:
+- `Color::to_rgb(&Theme) -> String` (`base/src/types.rs:54`) — `Rgb→hex`, `Theme→theme.resolve(idx,tint)`.
+- `UserModel::resolve_color(&Color) -> String` (`base/src/user_model/common.rs:1800`) — the same,
+  against the workbook’s **file-parsed** `workbook.theme` (`types.rs:134`). **This is the E1 fix**:
+  resolving through it reproduces/supersedes `open_fixups::correct_theme_colors`.
+
+### 6.3 FreeCell migration surface (concentrated)
+- **`freecell:app/crates/freecell-engine/src/cache.rs`** — the render-style resolution:
+  `cache.rs:152` `style.fill.fg_color.as_deref().and_then(parse_color)` →
+  resolve `style.fill.color`: `Color::None ⇒ no fill`, else `parse_color(&resolve_color(&color))`.
+  `edge_from` (`:118`) reads `BorderItem.color` (now `Color`) the same way. `parse_color` stays
+  (it validates an `#RRGGBB` string) — feed it the resolved hex.
+- **`freecell:…/document.rs`** — `resolve_text_color` (font colour → `Color`), `default_font`
+  (`:734`, `Font.color` now `Color`), and the font-override render path (`:771`). Resolve via the
+  worker’s `UserModel::resolve_color`.
+- **Setting fills — no change:** `update_range_style(area, "fill.fg_color", hex)` still maps to
+  `fill.color` upstream (`common.rs:137`). `document.rs:677` and all `"fill.fg_color"` set-sites
+  are untouched.
+- **Delete:** `open_fixups.rs`, `open_repair.rs`, their call sites in `document.rs::open`, and the
+  `roxmltree` + `zip` deps in `freecell-engine/Cargo.toml`.
+- **Tests/fixtures:** update reads of `fill.fg_color` (`document.rs:1383/1541/1576`,
+  `cache.rs:513`, `fixtures.rs:76`) to the resolved-`Color` form; `"fill.fg_color"` *set* paths in
+  tests stay valid.
+
+### 6.4 Where the resolver lives
+`resolve_color` is on `UserModel`, which the worker owns. The published render style is built in
+the worker/`cache` path, so resolution happens there (it has the model). Confirm no color-resolution
+is needed on the GPUI side — the grid consumes already-resolved `#RRGGBB` from the publication, as
+today.
+
+### 6.5 Validation (D6)
+- `cargo test` (workspace) + the FreeCell checks green with the hacks gone.
+- A test asserting `resolve_color` reproduces `open_fixups`' expected RGBs for the theme + indexed
+  fixtures (the goldens live in the old `open_fixups` tests before deletion — port them as the
+  regression that proves equivalence).
+- Owner visual pass on the mortgage / Numbers / currency files + one open→save→reopen.
+
+## 7. Follow-up (slim)
+
+Move FreeCell from the git-`main` patch to a **released** IronCalc pin once the fixes ship →
+`freecell:projects/ironcalc-upgrade.md`.

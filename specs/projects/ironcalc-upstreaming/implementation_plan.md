@@ -9,15 +9,20 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
 
 ## Phases
 
-- [ ] **Phase 0 — Fork setup & baseline.** Add `upstream` remote (`ironcalc/IronCalc`); sync fork
-  `main` to `upstream/main`; record base SHA; create `freecell-fixes` off `main`. Baseline green:
-  `cargo test` + `make lint`.
-- [ ] **Phase 1 — E2: num-fmt table (fork).** `fix/e2-numfmt` off `main`. Correct
-  `base/src/number_format.rs` `DEFAULT_NUM_FMTS` (ids 5–8, 37–49) per architecture; formatter
-  tests. Green. Merge → `freecell-fixes`. Push.
-- [ ] **Phase 2 — E5: `<indexedColors>` override (fork).** `fix/e5-indexed` off `main`. Parse
-  `<indexedColors>` in `xlsx/src/import/styles.rs`; thread to `get_color`; resolve when present.
-  Crafted-styles tests + guards. Green. Merge → `freecell-fixes`. Push.
+- [x] **Phase 0 — Fork setup & baseline.** Recorded base SHA `29daa42`; created `freecell-fixes`
+  off `main`; `ironcalc_base` baseline green. *(Deferred: adding the `upstream` remote + syncing
+  `main` to `upstream/main` — `ironcalc/IronCalc` isn't in this session's scope; done at Phase 5
+  pre-PR when upstream is added. Fork `main` is already a clean upstream mirror, authored by the
+  IronCalc maintainer.)*
+- [x] **Phase 1 — E2: num-fmt table (fork).** `fix/e2-numfmt` (`953af32`). **Discovery:** the
+  table was structurally misaligned (index ≠ id from id ~18), so the fix is a full ECMA-376
+  realignment, not a few-cell edit. `base` 2107 + `xlsx` 213 green, fmt + strict clippy clean.
+  Merged → `freecell-fixes`. Pushed. (id 47 `mmss.0` = separate formatter gap, documented.)
+- [x] **Phase 2 — E5: `<indexedColors>` override (fork).** `fix/e5-indexed` (`1c2c477`). Parse
+  `<indexedColors>` in `styles.rs`, thread through the styles-path colour resolution via
+  `get_color_indexed` (fills/fonts/borders/dxfs); tab/CF colours keep the default resolver
+  (documented follow-up). 4 tests (end-to-end load_styles ±override + guards), fmt + clippy clean.
+  Merged → `freecell-fixes` (`48b0b23`, both fixes; combined suite green). Pushed.
 - [ ] **Phase 3 — FreeCell upgrade (the migration).** Add `[patch.crates-io]` → `freecell-fixes`.
   Delete `open_fixups.rs` + `open_repair.rs` (+ their `document.rs::open` call sites) and drop
   `roxmltree`/`zip`. Migrate the color-read path (`cache.rs`, `document.rs`) to resolve `Color` via
@@ -42,8 +47,8 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
 | Item | Branch | Tests | `freecell-fixes` | FreeCell migrated | Upstream PR | State |
 |------|--------|-------|------------------|-------------------|-------------|-------|
 | E2 num-fmt | `fix/e2-numfmt` (`953af32`) | ✅ base 2107 + xlsx 213 green, fmt+clippy clean | ✅ merged | — | ⏳ awaiting sign-off | **fix complete + pushed to fork**; patch backup `patches/0001-e2-numfmt.patch` |
-| E5 indexed | `fix/e5-indexed` | — | — | — | — | not started (next) |
-| FreeCell upgrade | (this branch) | — | — | — | n/a | not started |
+| E5 indexed | `fix/e5-indexed` (`1c2c477`) | ✅ 4 new + xlsx 213 green, fmt+clippy clean | ✅ merged (`48b0b23`) | — | ⏳ awaiting sign-off | **fix complete + pushed to fork**; patch backup `patches/0002-e5-indexed.patch` |
+| FreeCell upgrade | (this branch) | — | — | — | n/a | not started (Phase 3 — awaiting go-ahead) |
 
 > **Push access resolved (2026-07-07):** owner granted write to `scosman/ironcalc`; commits are
 > authored `Steve Cosman <848343+scosman@users.noreply.github.com>` (noreply, to satisfy email

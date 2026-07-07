@@ -41,13 +41,10 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
 
 | Item | Branch | Tests | `freecell-fixes` | FreeCell migrated | Upstream PR | State |
 |------|--------|-------|------------------|-------------------|-------------|-------|
-| E2 num-fmt | `fix/e2-numfmt` (local) | ✅ base 2107 + xlsx 213 green, fmt+clippy clean | ✅ merged (local) | — | ⛔ blocked | **fix complete locally**; patch saved (`patches/0001-e2-numfmt.patch`); **fork push blocked — no write access to `scosman/ironcalc`** |
-| E5 indexed | `fix/e5-indexed` | — | — | — | — | not started (blocked on push access to iterate/save cleanly) |
+| E2 num-fmt | `fix/e2-numfmt` (`953af32`) | ✅ base 2107 + xlsx 213 green, fmt+clippy clean | ✅ merged | — | ⏳ awaiting sign-off | **fix complete + pushed to fork**; patch backup `patches/0001-e2-numfmt.patch` |
+| E5 indexed | `fix/e5-indexed` | — | — | — | — | not started (next) |
 | FreeCell upgrade | (this branch) | — | — | — | n/a | not started |
 
-> **⛔ Blocker (Phase 1→push):** `git push` to `scosman/ironcalc` returns GitHub 403
-> "Permission denied to scosman". `add_repo` granted **read** (clone/context works) but the
-> session's git credential has **no write access** to the fork. Needs the Claude GitHub App
-> granted write on `scosman/ironcalc` (owner action), or an alternate push path. E2 is done and
-> backed up as a patch in `patches/`; local fork branches `fix/e2-numfmt` + `freecell-fixes` hold
-> the commit (`18ed888`).
+> **Push access resolved (2026-07-07):** owner granted write to `scosman/ironcalc`; commits are
+> authored `Steve Cosman <848343+scosman@users.noreply.github.com>` (noreply, to satisfy email
+> privacy). `fix/e2-numfmt` + `freecell-fixes` pushed at `953af32`; `main` clean at `29daa42`.

@@ -1,6 +1,6 @@
-From 18ed888a50a489182ad299c5e445934fe5206dd3 Mon Sep 17 00:00:00 2001
-From: scosman <scosman@gmail.com>
-Date: Tue, 7 Jul 2026 18:18:57 +0000
+From 953af32adad32f3b9c59c22833a867774fb0e662 Mon Sep 17 00:00:00 2001
+From: scosman <848343+scosman@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 19:22:25 +0000
 Subject: [PATCH] fix(base): correct the built-in numFmtId table (ECMA-376)
 
 DEFAULT_NUM_FMTS is indexed by numFmtId, but from id ~18 onward the entries were

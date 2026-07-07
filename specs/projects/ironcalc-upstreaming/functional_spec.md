@@ -4,167 +4,111 @@ status: draft
 
 # Functional Spec: IronCalc Upstreaming
 
+> **Direction (Option 1, adopted 2026-07-07):** Upstream the two bugs still broken on
+> upstream `main` — **E2** (built-in num-fmt table) and **E5** (indexed `<indexedColors>`
+> override) — as tested, PR-ready patches in our fork. The other three workarounds (E4 `xfId`,
+> E1 theme, E1′ tint) are **already fixed upstream** (see `fork_audit.md`); FreeCell gets them
+> by upgrading. The FreeCell-side upgrade — migrating to `main`'s new `Color` API, validating
+> visually, and deleting `open_fixups`/`open_repair` — is a **separate future project**
+> (`projects/ironcalc-upgrade.md`), gated on an IronCalc release that carries all five fixes.
+
 ## 1. Goal & shape
 
-Fix, in our fork `scosman/ironcalc`, the IronCalc defects and API gaps that FreeCell
-currently compensates for; validate each fix in the real FreeCell app built against the
-fork; then, on owner sign-off, submit each upstream. Success = FreeCell carries the
-**minimum** engine-compensation code (ideally `open_fixups.rs` + `open_repair.rs` deleted),
-and every submitted fix is an isolated, tested, independently-mergeable patch.
-
-This is a **workflow project**, not a feature. Its deliverables are: (a) a set of patch
-branches in the fork with tests, (b) an integration branch FreeCell builds against, (c) a
-FreeCell change that swaps the dep and removes the now-dead hacks, and (d) upstream PRs.
+Contribute the two genuinely-still-broken IronCalc import bugs upstream, as isolated, tested
+patches in `scosman/ironcalc`, PR-ready against `ironcalc/IronCalc:main` on owner sign-off.
+This is a **workflow/contribution project**. Deliverables: two fix branches with upstream-style
+tests, merged into an integration branch, and — on sign-off — two upstream PRs. FreeCell's own
+code is **untouched** by this project.
 
 ## 2. Decisions of record
 
-Locked for this project (defaults adopted where not explicitly chosen; override on review):
-
 | # | Decision | Choice |
 |---|---|---|
-| D1 | Fork branch model | Fork `main` stays a **clean mirror of upstream `main`**. Each fix is a topic branch off `main`. A dedicated integration branch **`freecell-fixes`** merges all topic branches; FreeCell builds against `freecell-fixes`. |
-| D2 | Project scope | **Import correctness bugs only** — A1–A4 (E4 `xfId`, E2+E3 num-fmt table, E1 theme + tint, E5 indexed). This is exactly the set that lets us delete `open_fixups.rs` + `open_repair.rs` + `roxmltree`/`zip`. The API-visibility cluster and the parser depth-cap are **out of scope** — a fast-follow (§4). |
-| D3 | Visibility packaging (deferred) | Recorded for the fast-follow: the four API-visibility fixes ship as **one PR per type** (four small independent PRs), not in this project's scope. |
-| D4 | Upstream flow | **PR-first**: each PR description carries the minimal repro and doubles as the report; file a standalone issue only if a maintainer asks. |
-| D5 | No submission without sign-off | Nothing is pushed to `ironcalc/IronCalc` (upstream) until the owner approves the human validation pass. Work on the fork (`scosman/ironcalc`) is unrestricted. |
-| D6 | Fork base | Sync fork `main` to **upstream `main`** first, branch fixes off that (not off the older crates.io `0.7.1` cut). FreeCell validates against post-0.7.1 upstream + our fixes. |
+| D1 | Fork branch model | Fork `main` = clean mirror of upstream `main`. Each fix = a topic branch off `main` (`fix/e2-numfmt`, `fix/e5-indexed`). A `freecell-fixes` branch merges both (staging for the future upgrade project). |
+| D2 | Scope | **E2 + E5 only.** The already-upstream fixes (E1/E4/E1′) are not re-done. The FreeCell upgrade/migration + hack deletion is **out of scope** (separate project — §4). |
+| D3 | Base | Branch off upstream `main` (D6 in the audit): E2/E5 are still broken there, and upstream wants PRs against `main`. |
+| D4 | Upstream flow | **PR-first**, **one PR per fix** (two independent PRs — they touch different crates and review cleanly apart). PR description carries the minimal repro. |
+| D5 | No submission without sign-off | Nothing goes to `ironcalc/IronCalc` until the owner approves. Fork work is unrestricted. |
+| D6 | Validation | Fork-side: each fix passes the fork's own `cargo test` + `make lint`. FreeCell-in-app visual validation of these two is **deferred to the upgrade project** (it needs the `Color`-migration to build against the fork). E2/E5 correctness is additionally corroborated by FreeCell's existing `0.7.1`-side evidence (`open_fixups` already produces the correct output on the real Numbers/mortgage files). |
 
-## 3. Fixes in scope
+## 3. The fixes
 
-Each fix below is one implementation phase (§ maps to implementation_plan.md). Each has:
-**Defect** (what IronCalc does wrong / lacks), **Fix** (what changes in the fork), **Upstream
-test** (added in the fork, synthetic — no copyrighted fixtures), and **Retires** (the FreeCell
-compensation it makes dead). File citations are FreeCell-side unless prefixed `fork:`.
+### E2 — Correct the built-in `numFmtId` table
 
-### Group A — `.xlsx` import correctness bugs (these delete our fix-up modules)
+- **Defect (fork `main`):** `base/src/number_format.rs` `DEFAULT_NUM_FMTS` maps standard
+  built-in ids to garbage codes — id 39 → `"t0.00"` (line 47), id with `%` → `"t0.00 %"` (51),
+  etc. `get_formatted_cell_value` then returns **`#VALUE!`** for a valid number whose cell uses
+  one of those ids. (Confirmed still present on `main`.)
+- **Fix:** replace the garbage entries with the correct ECMA-376 built-in codes. Scope the PR to
+  the **locale-independent** numeric / currency / accounting / misc block (ids 5–8, 37–49) —
+  the set FreeCell already proved correct end-to-end. The **date/time ids (14–22) are locale-
+  substituted** and must be handled carefully or left out of this PR (see §5 risk) to keep it
+  unambiguously correct.
+- **Upstream test:** for each corrected id, assert `get_num_fmt(id, &[])` returns the ECMA-376
+  code and/or that a representative value formats to the Excel string (e.g. `175000` under id 39
+  → `"175,000.00 "`, not `#VALUE!`). Port the assertions from FreeCell's
+  `inject_builtin_num_fmts` tests.
+- **PR shape:** small, `base`-only, self-contained. Highest value (fixes a wrong-output bug).
 
-**A1 — Missing-`xfId` hard open failure (E4).**
-- *Defect:* `fork: xlsx/src/import/styles.rs` reads `xfId` on `<cellXfs>/<xf>` as mandatory
-  (`get_attribute(&xfs, "xfId")?`); OOXML §18.8.10 makes it optional. Files from Numbers /
-  LibreOffice fail to open entirely (`XML Error: Missing "xfId" XML attribute`).
-- *Fix:* treat `xfId` on a `cellXfs/xf` as optional (default to none / 0), matching how the
-  parser already treats `cellStyleXfs`.
-- *Upstream test:* a crafted styles.xml whose `cellXfs/xf` omit `xfId` loads; `cellStyleXfs`
-  unaffected. (Port the crafted-zip cases from `open_repair.rs` tests.)
-- *Retires:* `open_repair.rs` entirely (~370 lines).
+### E5 — Honour the workbook's `<indexedColors>` override
 
-**A2 — Wrong built-in `numFmtId` table (E2 + E3).**
-- *Defect:* `fork: base/src/number_format` `DEFAULT_NUM_FMTS` maps standard built-in ids to
-  garbage codes (id 39 → `"t0.00"`), so `get_formatted_cell_value` returns **`#VALUE!`** for
-  valid numbers. Wrong across the numeric/currency/accounting block (5–8, 37–49) **and** the
-  date/time + spacing ids (11–13, 14–22, 23–36) — the E3 residual our FreeCell fix skips.
-- *Fix:* correct the whole `DEFAULT_NUM_FMTS` table to the ECMA-376 built-in codes (fix E2
-  *and* E3 in one PR — one table, fixed once).
-- *Upstream test:* per corrected id, assert `get_num_fmt` / a formatted value matches the
-  ECMA-376 code / Excel output. (Extend from `inject_builtin_num_fmts` tests.)
-- *Retires:* `open_fixups::inject_builtin_num_fmts` + `STANDARD_BUILTIN_NUM_FMTS`.
-
-**A3 — Theme palette ignored + `hue_to_rgb` tint bug (E1 + E1′).**
-- *Defect:* `fork: xlsx/src/import/colors.rs` `get_themed_color` resolves theme-indexed
-  colours against a **hardcoded default Office palette**, never parsing the file's
-  `xl/theme/theme1.xml`, and discards the theme index + tint. Separately, the tint math's
-  `hue_to_rgb` keeps an un-normalised hue offset that **overflows for light tints on
-  saturated hues**.
-- *Fix:* parse the workbook's `theme1.xml` `clrScheme` and resolve theme colours against it
-  (with the dark/light swap + §18.8.3 tint); fix `hue_to_rgb` to normalise `t` into `[0,1)`.
-- *Upstream test:* a crafted workbook with a swapped/custom theme resolves fills/fonts/borders
-  to the file's colours; the existing Excel-verified tint goldens still pass. (Port
-  `open_fixups` theme tests + `tint_matches_excel_goldens`.)
-- *Retires:* `open_fixups::correct_theme_colors` + the ported HSL/tint math.
-
-**A4 — Indexed-palette override ignored (E5).**
-- *Defect:* `fork: xlsx/src/import/colors.rs` `get_indexed_color` uses a hardcoded legacy
-  indexed palette and never reads the workbook's `<colors><indexedColors>` override (OOXML
-  §18.8.27), so `indexed="n"` fills/fonts/**borders** render the default colour n, not the
-  file's redefined colour n.
-- *Fix:* when the workbook supplies an `<indexedColors>` override, resolve `indexed=` colours
-  against it (fills, fonts, **and borders** — closes our border residual).
-- *Upstream test:* a crafted workbook with an `<indexedColors>` override resolves indexed
-  colours to the file's palette; a standard-palette file (no override) is unchanged. (Port
-  `open_fixups` indexed tests.)
-- *Retires:* `open_fixups::correct_indexed_colors`; with A1–A4 landed, delete `open_fixups.rs`
-  entirely and drop the `roxmltree` + `zip` deps from `freecell-engine`.
+- **Defect (fork `main`):** `xlsx/src/import/util.rs::get_color` resolves an `indexed="n"`
+  colour via the hardcoded `ironcalc_base::colors::get_indexed_color` (the legacy 56-colour
+  palette) and **never reads the workbook's `<colors><indexedColors>` override** (OOXML
+  §18.8.27) — grep of `base/src` + `xlsx/src` finds no reader. So a file that redefines palette
+  entries (as Numbers exports do) renders `indexed=` fills/fonts/borders with Excel's default
+  colour n, not the file's colour n.
+- **Fix (design in architecture):** parse `<colors><indexedColors>` in the styles importer into
+  a positional palette and, **when present**, resolve `indexed=` colours against it instead of
+  the hardcoded table; absent an override, behaviour is unchanged. Preferred approach:
+  read-at-import (thread the override palette into `get_color`), matching how `main` already
+  resolves `indexed=`/`rgb=` to `Color::Rgb` immediately — no new `Color` variant. (Alternative:
+  a deferred `Color::Indexed(i32)` variant resolved like `Theme`; rejected as over-invasive —
+  see architecture.)
+- **Upstream test:** a crafted `styles.xml` with an `<indexedColors>` override resolves indexed
+  fills/fonts/borders to the file's palette; a file with no override is byte-for-byte unchanged.
+  Port the crafted cases from FreeCell's `correct_indexed_colors` tests.
+- **PR shape:** touches `xlsx` import (+ possibly a `get_color` signature change); larger than
+  E2 and must be designed against `main`'s `Color` model.
 
 ## 4. Out of scope (explicit)
 
-- **API-visibility cluster — deferred to a fast-follow** (recorded here so it isn't lost;
-  packaging preference: one PR per type — D3): `Clipboard` not nameable, `BorderArea` has no
-  constructor, `Function` enum module is private, no workbook-default-font accessor. These
-  retire our `serde_json`-for-private-types shims and the `default_font` reach-in, but delete no
-  import code — lower urgency than A1–A4.
-- **Parser recursion depth-cap — deferred to a fast-follow** (issue-worthy): IronCalc's parser
-  has no depth limit → uncatchable SIGABRT on deep formulas. Weakest ROI (deletes nothing;
-  FreeCell's `input_cap.rs` stays as defense-in-depth regardless).
-- **Kept FreeCell-side by design** (legitimately consumer concerns, not IronCalc bugs): the
-  date-format heuristic (`is_date_format`) and format-color-index→RGB mapping
-  (`format_color_rgb`); zoom and hidden-column view state; the `catch_unwind` worker guard and
-  band-driven cache rebuild.
-- **Enhancement APIs** (fast-follow project if we want them): band fast-paths for range-clear /
-  full-row-col style ops, `paste_csv_string` dry-run dimensions, format-code classification /
-  decimal-increment API, sheet reorder, hidden-row setter, font-band style path,
-  fill-to-selection, comments export (lossy-save fix), data validation, hyperlinks.
-- **Large features / product decisions** (own designs, not this project): merged-cell write
-  API, conditional formatting, dynamic arrays / spill.
+- **Already fixed upstream — nothing to do** (arrive via a future FreeCell upgrade): E4 `xfId`
+  optionality, E1 file-theme resolution, E1′ `hue_to_rgb` tint normalisation. (`fork_audit.md`.)
+- **FreeCell upgrade / `Color`-enum migration / hack deletion — separate future project**
+  (`projects/ironcalc-upgrade.md`): migrate FreeCell off the `0.7.1` `Option<String>` style API
+  to `main`'s `Color` enum, delete `open_fixups.rs` + `open_repair.rs`, drop `roxmltree`/`zip`,
+  and do the in-app visual validation. Gated on an IronCalc **release** containing all five
+  fixes (so we pin a stable version, not git-`main`).
+- **API-visibility cluster** (Clipboard/BorderArea/Function/default-font) and the **parser
+  depth-cap** — deferred fast-follows (recorded in the earlier scope notes); not this project.
+- **Kept FreeCell-side by design / large features** — unchanged from the original inventory.
 
-## 5. Process contract (the workflow behaviors)
+## 5. Edge cases & risks
 
-**5.1 Fork setup.** Sync fork `main` to upstream `main` (D6). Create `freecell-fixes` off
-`main`. Verify the fork workspace builds + tests green *before* any fix (baseline).
+- **E2 date/time ids are locale-sensitive.** IronCalc may substitute locale-specific date codes
+  elsewhere; blindly overwriting ids 14–22 in the default table could regress localized output.
+  Mitigation: the PR fixes only the locale-independent block (5–8, 37–49); dates are a separate,
+  carefully-scoped follow-up if wanted. Verify against IronCalc's existing formatter tests.
+- **E5 must fit `main`'s `Color` model.** The fix is designed against the current enum, not
+  `0.7.1`. Risk: a `get_color` signature change ripples to its callers (fills/fonts/borders in
+  `styles.rs`). Keep the change local; the styles importer already has the styleSheet root to
+  parse `<indexedColors>` once and pass down.
+- **No in-app visual validation this project.** Because FreeCell can't build against `main`
+  (Color API), E2/E5 are validated by fork tests + FreeCell's existing `0.7.1` evidence, not a
+  live render. The live-render confirmation happens in the upgrade project. Acceptable: both
+  fixes have deterministic, unit-testable outputs.
+- **Fork `main` drift from upstream.** Re-sync `main` and rebase the fix branches before opening
+  PRs so each applies cleanly.
+- **Fork clippy is strict** (`make lint`: `-D warnings` with `unwrap_used`/`expect_used`/`panic`
+  as warns). Match the fork's own conventions — test modules use `#![allow(clippy::unwrap_used)]`
+  (e.g. `xlsx/src/import/util.rs:1`); non-test code must avoid `unwrap`/`expect`/`panic`.
 
-**5.2 Per-fix loop (each Group-A/B/C phase).**
-1. Branch `fix/<slug>` off `main`.
-2. Implement the fix in the fork; add upstream-style synthetic tests.
-3. Fork's own checks pass (`cargo test` for the touched crate + workspace clippy/fmt per the
-   fork's `CONTRIBUTING.md`/`Makefile`).
-4. Merge `fix/<slug>` into `freecell-fixes`.
-5. Commit + push the fork branch(es).
-
-**5.3 FreeCell integration (one phase, after the fixes exist).**
-1. Point FreeCell at the fork via `[patch.crates-io]` → `freecell-fixes`
-   (`ironcalc`/`ironcalc_base` names match, no rename needed). Path-patch to the local
-   `/workspace/ironcalc` checkout is acceptable for in-container validation; the committed
-   form uses the git branch so it's reproducible off this container.
-2. Remove the now-dead compensations, gated per fix: `open_repair.rs` (A1), the num-fmt
-   injector (A2), theme + indexed correctors → delete `open_fixups.rs` and drop
-   `roxmltree`/`zip` (A3+A4).
-3. FreeCell builds, all tests pass, render/behavior unchanged (the fixes reproduce what the
-   hacks did).
-
-**5.4 Human validation pass (single, owner-run).** With FreeCell on the fork and hacks
-removed, the owner confirms: the previously-broken files open and render correctly (theme
-colours, indexed colours, number formats, the Numbers `xfId` file), and nothing regressed with
-the compensation code gone. This is the **gate** before any upstream submission.
-
-**5.5 Upstream submission (on sign-off only).** For each fix (bundled per D3), open a PR from
-the topic branch against `ironcalc/IronCalc:main`, PR-first (D4), each with its minimal repro +
-tests. Track fix ↔ branch ↔ PR ↔ FreeCell-code-deleted in a status table.
-
-## 6. Edge cases, risks, failure modes
-
-- **A fix is rejected or stalls upstream.** The fork is a bridge: FreeCell keeps building
-  against `freecell-fixes`; if upstream declines a fix, we either keep carrying it in the fork
-  or restore the corresponding FreeCell hack. Because each patch is isolated (one branch, one
-  commit range), any single one can be dropped without disturbing the others.
-- **Fork `main` drifts from upstream.** Re-sync `main` and rebase the topic branches +
-  `freecell-fixes` before submitting, so each PR applies cleanly.
-- **Post-0.7.1 upstream changes break FreeCell.** Building against upstream `main` (D6) may
-  pull unrelated engine changes. If that surfaces breakage unrelated to our fixes, fall back to
-  branching the fixes off the `0.7.1` tag instead (documented fallback, not the default).
-- **`[patch.crates-io]` + exact-version pin.** FreeCell pins `=0.7.1`; a patch source whose
-  crate version differs can fail to satisfy `=0.7.1`. Keep the fork crate versions compatible
-  with the pin (or relax the FreeCell pin to match) — resolve during 5.3.
-- **Test fixtures.** All upstream tests use **synthetic crafted zips / inline XML** (as our
-  existing `open_fixups`/`open_repair` tests already do) — no copyrighted `.xlsx` files travel
-  into the fork or upstream.
-- **Removing a hack changes save output.** Some fix-ups only affected in-memory display; a few
-  (e.g. indexed borders) also affect the save round-trip. Validation (5.4) must eyeball an
-  open→save→reopen of an affected file, not just the on-screen render.
-
-## 7. Constraints
+## 6. Constraints
 
 - No upstream PR without explicit owner sign-off (D5).
-- FreeCell stays green throughout; the dep-swap + hack-removal lands only after it builds,
-  tests, and validates clean.
-- The fork carries the minimum diff; each patch is independently submittable and droppable.
-- License is MIT/Apache-2.0 both sides — no license friction; keep our commits under the
-  fork's existing license headers/conventions.
+- FreeCell code is untouched by this project (the migration is a separate project).
+- The fork carries the minimum diff; each fix is an independent, droppable branch/PR.
+- Fixes must pass the fork's `cargo test` + `make lint`, and follow its commit/style conventions
+  (MIT/Apache headers, existing test idioms). Tests use synthetic inline XML — no copyrighted
+  `.xlsx` files.

@@ -1,15 +1,22 @@
 # Project: Window UI Scaling / Zoom
 
-**Status:** Explored + declined (2026-07-08, task `gpui-scale-factor-explore`).
+**Status:** Explored; deferred (2026-07-08, task `gpui-scale-factor-explore`). The **preferred
+solve is known** — a rem-based layout rewrite — and is simply held off as a bigger project.
 
-**Verdict:** We explored a per-window UI zoom and **decided not to build it.** Shipping true
-window UI scaling at our pinned gpui rev would require either **forking and maintaining a zed
-fork** (to add a settable, viewport-consistent per-window scale override) or a **large
-rem-based rewrite of the app's layout including the perf-sensitive grid**. Both are too much
-long-term scope/maintenance for the value, and gpui here is deliberately **pinned, not
-forked**. So the approach is out — even if a throwaway spike could be made to render it, we
-are not pursuing it. Recorded here so we (and future readers) don't re-explore this; the task
-itself lived under git-ignored `.specs_skill_state/`.
+**Verdict:** We explored a per-window UI zoom and **decided not to build it now** — but the
+destination is clear. The **right long-term solve is a rem-based rewrite** of the app's layout
+(chrome *and* the grid's px geometry) so the whole app scales cleanly via `set_rem_size`. That
+is the principled, sustainable direction precisely because it **avoids maintaining a zed fork**
+and leaves the app scale-clean for good. We are **holding it off only because it's a bigger
+project**, not because it's wrong.
+
+The expedient alternative — **forking and maintaining a zed fork** to add a settable,
+viewport-consistent per-window `scale_factor` override — is the one we **reject**: gpui here is
+deliberately **pinned, not forked**, and a fork means an ongoing rebase/maintenance burden
+against zed for one nicety. So the feature is out for now, with a known right destination; even
+a throwaway spike could be made to render it, but we are not pursuing it. Recorded here so we
+(and future readers) don't re-walk the API dead-ends; the task itself lived under git-ignored
+`.specs_skill_state/`.
 
 ## What was proposed
 
@@ -67,23 +74,29 @@ scale the viewport / layout root so the surface and the scene stay consistent �
 the viewport-consistent per-window override that only a gpui fork can add cleanly. This is
 further evidence for declining: there isn't even a cheap, correct spike here.
 
-## Why we declined
+## The decision: rem-rewrite is the right solve (deferred); fork is rejected
 
-Both routes that could actually ship this were rejected:
+Two routes could actually ship true window zoom. They are **not** symmetric — one is the right
+long-term architecture we're merely deferring, the other is the wrong answer we reject:
 
-1. **Fork + maintain a zed fork — rejected.** A real build needs a per-window `scale_factor`
-   override that (a) survives `bounds_changed`, (b) is app-settable (thread through `WindowOptions`
-   and/or a `Window::set_scale_factor`), and (c) keeps the viewport/surface consistent with the
-   scaled scene (see the caveat above). This is upstream-surgery in gpui, and gpui here is
-   **pinned, not forked** — unlike the IronCalc fork policy, we deliberately do **not** maintain a
-   zed fork. Taking this on means an ongoing rebase/maintenance burden against zed for one nicety.
-2. **Rem-based end-to-end layout rewrite — rejected.** Convert the whole app — chrome *and* the
-   grid's geometry/text — to express sizes in rem, then drive zoom with `set_rem_size`. This avoids
-   the fork but is a **large change to the most performance-sensitive code** (the grid render path),
-   and forfeits the "pure scale to everything" simplicity that motivated the feature.
+1. **Rem-based end-to-end layout rewrite — the right solve, deferred (bigger project).** Convert
+   the whole app — chrome *and* the grid's geometry/text — to express sizes in rem, then drive
+   zoom with `set_rem_size`. This is the **principled, sustainable** direction: it needs **no gpui
+   fork**, keeps us on our pinned-not-forked posture, and makes the whole app scale-clean for
+   good. We are **not** rejecting it — we're **holding off** because it's a **large change to the
+   most performance-sensitive code** (the grid render path) and a bigger project than the value
+   justifies right now. This is the route to pick up when there's appetite for the larger effort.
+2. **Fork + maintain a zed fork — rejected.** A `scale_factor`-based override needs to (a) survive
+   `bounds_changed`, (b) be app-settable (thread through `WindowOptions` and/or a
+   `Window::set_scale_factor`), and (c) keep the viewport/surface consistent with the scaled scene
+   (see the caveat above). That is upstream-surgery in gpui, and gpui here is **pinned, not
+   forked** — unlike the IronCalc fork policy, we deliberately do **not** maintain a zed fork. It
+   would scale *everything* (px included) with zero app-layout changes, but at the cost of an
+   ongoing rebase/maintenance burden against zed for one nicety. **This is the wrong long-term
+   answer** — the thing we want to avoid — so we reject it.
 
-**Net:** the long-term scope and maintenance cost of either route is out of proportion to the
-value of window UI zoom right now, so it is not worth building. If we ever revisit, the
-fork route is the only one that scales *everything* (px included) with zero app-layout changes,
-and it must be weighed against our pinned-not-forked gpui posture; a real feature would also scope
-to spreadsheet windows only, exclude the OS title bar, and add persistence + keyboard shortcuts.
+**Net:** window UI zoom isn't worth building right now, but the destination is clear. When we do
+it, the **rem-based rewrite is the identified right direction** — it drops the fork-maintenance
+burden and leaves the app scale-clean. We are deferring it purely on size, **not** falling back
+to the fork. A real feature would also scope to spreadsheet windows only, exclude the OS title
+bar, and add persistence + keyboard shortcuts.

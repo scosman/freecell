@@ -88,16 +88,17 @@ registry: each entry is a short description plus a pointer to a design note unde
   ironcalc revs today; FreeCell ships no binaries yet, so the documented posture is
   acceptable for now. → [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)
 
-- **Window UI Scaling / Zoom** — *Explored + declined (2026-07-08).*
+- **Window UI Scaling / Zoom** — *Explored; deferred (2026-07-08).*
   A per-window zoom for spreadsheet windows (a Window menu of 70–150% multipliers of the
-  OS-DPI default), scaling the whole content area. Declined because shipping it needs a
-  maintained zed fork: at the pinned gpui rev `Window::scale_factor` is a read-only,
-  OS-derived getter re-read on every `bounds_changed` (no app-facing `set_scale_factor`,
-  `WindowOptions` has no scale field), there's no element-subtree scale transform, and
-  `set_rem_size` only scales rem units while the grid is all px. The only ship routes are a
-  gpui fork (a settable, viewport-consistent per-window scale override) or a rem-based layout
-  rewrite incl. the grid's px geometry — too much long-term scope/maintenance for the value,
-  and gpui here is pinned-not-forked. → [`projects/window-scaling.md`](projects/window-scaling.md)
+  OS-DPI default), scaling the whole content area. The **right long-term solve is a rem-based
+  layout rewrite** (chrome + the grid's px geometry, driven by `set_rem_size`) — it avoids a
+  zed fork and makes the whole app scale-clean; we're **deferring it only because it's a bigger
+  project**. At the pinned gpui rev the expedient alternative — a gpui fork adding a settable,
+  viewport-consistent per-window `scale_factor` override (the getter is read-only, OS-derived,
+  re-read on every `bounds_changed`; no app-facing `set_scale_factor`; `WindowOptions` has no
+  scale field; no element-subtree scale transform) — is **rejected** for the ongoing zed-fork
+  maintenance burden (gpui here is pinned-not-forked).
+  → [`projects/window-scaling.md`](projects/window-scaling.md)
 
 - **Windows Port** — *Future (packaging wired 2026-07-05; app build not a real target).*
   Make FreeCell compile + run on Windows (GPUI DirectX backend, `cfg(windows)` dep split,

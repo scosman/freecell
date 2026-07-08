@@ -145,3 +145,37 @@ File
 - Missing files never appear (silent prune), so a click always targets an existing file —
   no "dead" rows to confuse the user.
 - Copy is fixed strings; the only dynamic text is names/sizes/folders/timestamps.
+
+## 6. About window
+
+Standalone window (Phase 4), replacing the About modal. **Directional mockup — build on our
+design system** (§ "Design fidelity"). Reuse the palette tokens (§0) plus one link token.
+
+- **Window:** ~460×340, fixed, non-resizable, non-minimizable, centered; same titlebar
+  treatment as the welcome window (macOS custom titlebar / Linux decorations). Background
+  `CHROME_BG` (`0xF3F3F3`), matching the mockup's light card.
+- **Layout:** a single vertical flex, ~28–32 px padding.
+
+```
+┌────────────────────────────────┐
+│            FreeCell            │  ← wordmark, bold ~28 px, TEXT
+│      The open spreadsheet      │  ← tagline, ~13 px, MUTED_TEXT
+│           Version 0.1.0        │  ← ~12 px, lighter MUTED_TEXT, centered
+│  ───────────────────────────   │  ← 1 px HAIRLINE, horizontal margin
+│  Homepage   github.com/scos…   │  ← label (MUTED_TEXT) · value (LINK)
+│  Built with     IronCalc · GPUI│  ← label (MUTED_TEXT) · two LINKs + "·" (MUTED_TEXT)
+└────────────────────────────────┘
+```
+
+- **Top block** (centered): wordmark → tagline → version, tight vertical rhythm.
+- **Hairline:** `HAIRLINE` (`0xD9D9D9`), full content width (minus padding), generous space
+  above/below.
+- **Rows:** each a horizontal flex — label on the left (`MUTED_TEXT`), value right-aligned.
+  The "Built with" value is `IronCalc` · `GPUI`, each a link with a `MUTED_TEXT` "·"
+  separator between.
+- **Link token:** our design system has no link color, so introduce **one** `LINK` constant
+  (a blue in the app's spirit, e.g. `0x2563EB`) — do not copy the mockup's exact hex, and do
+  not sprinkle per-link colors. (If gpui-component's theme exposes an accent/link color at
+  the pinned rev, prefer that over a constant.) Links get a pointer cursor on hover; an
+  underline-on-hover is optional and fine to add.
+- Clicking a link opens its URL in the default browser.

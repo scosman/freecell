@@ -90,8 +90,8 @@ Times in the future (clock skew) clamp to `Just now`. All buckets are pure funct
 
 Redesigned per the mockups (`ui_design.md`), keeping the existing lifecycle
 (`functional_spec` of the MVP): opens at launch, closes when any document window loads,
-closing the last window quits the app, and it can still host the About / app-level error
-dialog when no document window exists.
+closing the last window quits the app, and it can still host the app-level error dialog when
+no document window exists (the About screen is its own window now — §4).
 
 ### 2.1 Layout (two panes)
 
@@ -138,15 +138,45 @@ the new ordering.
 - **Linux:** unchanged — there is no menu bar in the MVP (`menus.rs`), so Open Recent is
   macOS-only. The welcome pane is the cross-platform recents surface.
 
-## 4. Out of scope
+## 4. About window
+
+The About screen becomes a **standalone window**, not a modal — replacing the previous About
+overlay hosted on the welcome/document windows.
+
+- **Trigger:** the `About` action (macOS **About FreeCell** menu item), from any context.
+- **Single instance:** opening About when it is already open just activates the existing
+  window (same pattern as the welcome window).
+- **Cross-platform:** a real window on both macOS and Linux; the old About modal is removed
+  from both the welcome window and document windows (their error dialogs stay).
+- **Non-document:** no dirty/save, no document menu actions; small, fixed-size,
+  non-resizable, non-minimizable, centered, with the same titlebar treatment as the welcome
+  window (macOS custom titlebar / Linux server decorations).
+- **Lifecycle:** it counts as an open window for the "quit when the last window closes" rule
+  — the app stays alive while only the About window is open and quits when it, as the last
+  window, closes. It never participates in dirty/quit prompting.
+
+### 4.1 Content (per the mockup, directional)
+
+- **FreeCell** wordmark + the tagline "The open spreadsheet".
+- A **version** line: `Version {v}` where `v` is the package version
+  (`env!("CARGO_PKG_VERSION")` — currently `0.1.0`; the mockup's "1.0" is illustrative, show
+  the real build version).
+- A hairline, then two label → value rows:
+  - **Homepage** → `github.com/scosman/freecell` (opens <https://github.com/scosman/freecell>).
+  - **Built with** → **IronCalc** (<https://www.ironcalc.com>) · **GPUI** (<https://gpui.rs>).
+- Link text uses the app's link/accent color (`ui_design.md §6`); clicking opens the URL in
+  the user's default browser; hover shows a pointer.
+
+## 5. Out of scope
 
 - Pinning/favoriting, drag-reorder, right-click context menus on rows, or "reveal in Finder".
+- About-window credits/licenses list, update checks, or copy version/build info.
 - Thumbnails/previews.
 - Syncing recents across machines.
 - Tracking recents for documents that are never saved to disk.
 - Recent-files support in any non-`.xlsx` flow (there is only `.xlsx`).
 
-## 5. Constraints
+## 6. Constraints
 
 - Reuse the **existing app palette** (`ui_design.md §0`) — the mockups' ad-hoc colors are
   not the design system.

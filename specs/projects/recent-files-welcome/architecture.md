@@ -18,6 +18,7 @@ plumbing (store ownership, record sites, welcome view, menu).
 | App wiring | `freecell-app/src/shell/app.rs` | own `RecentList`, record on open + path-adoption, push updates to welcome + menu |
 | Welcome UI | `freecell-app/src/shell/welcome.rs` | two-pane render, recent rows, empty state, click→open |
 | Menu | `freecell-app/src/shell/menus.rs` | Open Recent submenu build; `OpenRecent`/`ClearRecent` actions |
+| About window (Phase 4) | `freecell-app/src/shell/about.rs` (new) | standalone About window + links (replaces the About modal) |
 
 ## 2. Data model & persistence (`freecell-core::recent`)
 
@@ -281,3 +282,71 @@ scope; noted here as a conscious decision per `CLAUDE.md`.
 - `freecell-core`: `serde` (derive) + `serde_json` — both workspace deps, add to manifest.
 - `freecell-app`: `dirs = "6"` (path resolution) + `serde_json` if it constructs JSON
   directly (it does not — core owns (de)serialization; app only needs `dirs`).
+
+## 9. About window (Phase 4)
+
+Turns the About screen from a modal overlay into a standalone, single-instance window,
+mirroring the welcome-window plumbing already in `app.rs`.
+
+### 9.1 New view — `freecell-app/src/shell/about.rs`
+
+`AboutView` — a `Render` + `Focusable` entity like `WelcomeView`, with no state (pure static
+content). Renders `ui_design.md §6`: wordmark, tagline (the same "The open spreadsheet"
+string as the welcome), version `concat!("Version ", env!("CARGO_PKG_VERSION"))`, a
+`HAIRLINE` rule, and the two label→value link rows. URLs are module constants:
+
+```rust
+const HOMEPAGE_URL: &str = "https://github.com/scosman/freecell";
+const IRONCALC_URL: &str = "https://www.ironcalc.com";
+const GPUI_URL:     &str = "https://gpui.rs";
+const LINK: u32 = 0x2563EB; // the one link/accent token (ui_design §6)
+```
+
+Each link is a `div().id(..).cursor_pointer().hover(..).on_mouse_down`/`on_click` handler that
+calls `cx.open_url(URL)` (gpui `App::open_url`). **Risk / fallback:** if `open_url` is
+unavailable at the pinned gpui rev, shell out via the `open` crate or a platform command
+(`open`/`xdg-open`); bounded and decided in Phase 4 (the one place this phase could hit the
+"new technical constraint" rule).
+
+### 9.2 App wiring (`FreeCellApp`)
+
+Mirror the welcome fields/flow:
+
+- Fields `about: Option<Entity<AboutView>>`, `about_id: Option<WindowId>`.
+- `about_window_options(cx)` — small fixed (~460×340), non-resizable, non-minimizable,
+  centered, `titlebar_options()` (same as welcome).
+- `show_about` (already the `About` action handler) now **opens or activates** the About
+  window instead of routing a modal: if `about_id` is set, activate it; else open a window
+  hosting `AboutView` (same `open_window` + `Root::new` pattern as `do_show_welcome`). Remove
+  the old `do_show_about` modal routing (active-window lookup + `ww.show_about` /
+  `welcome.show_about`).
+- `on_window_closed` clears `about`/`about_id` when the About window closes (like the welcome
+  branch) and falls through to the quit-when-empty check.
+
+### 9.3 Registry accounting (`registry.rs`)
+
+Add an `about_open: bool` parallel to `welcome_open`: `set_about_open`, `about_open`, and
+include it in `open_count` (`windows.len() + welcome + about`). This keeps "app quits when the
+last window closes" correct when only the About window remains. Add a unit test mirroring
+`welcome_counts_toward_open_count`.
+
+### 9.4 Remove the old About modal
+
+- `welcome.rs`: drop `WelcomeModal::About`, `WelcomeView::show_about`, and the About arm of
+  `render_modal` (keep the `Error` modal). `FreeCellApp` no longer calls `welcome.show_about`.
+- `window.rs` (`WorkbookWindow`): drop `show_about` and any About modal arm (keep error /
+  unsaved modals).
+- Update/remove any tests that asserted the About modal on those views.
+
+### 9.5 Tests (`freecell-app`, worker-less `TestAppContext`)
+
+- The `About` action opens an About window: `about_open` true + `cx.windows().len()`
+  reflects it; a second `About` activates rather than duplicating (single instance).
+- Closing the About window when it is the only window triggers `cx.quit()` (quit-accounting).
+- `AboutView` exposes its link URLs / version string via `#[cfg(test)]` accessors for a
+  content assertion (homepage/ironcalc/gpui URLs present, version = `CARGO_PKG_VERSION`).
+- `registry`: `about_counts_toward_open_count`.
+
+The About window is not part of the pixel render suite (same rationale as the welcome window,
+§7); it is covered by the gpui tests above + the Xvfb smoke launch (About FreeCell opens the
+window).

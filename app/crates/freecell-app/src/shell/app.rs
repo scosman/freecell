@@ -16,7 +16,7 @@ use gpui::{
 };
 use gpui_component::Root;
 
-use freecell_core::recent::RecentList;
+use freecell_core::recent::{RecentList, WELCOME_LIMIT};
 use freecell_engine::DocumentSource;
 
 use super::lifecycle::{QuitPlan, QuitStep};
@@ -241,6 +241,9 @@ impl FreeCellApp {
         self.welcome = entity_slot;
         self.welcome_id = Some(any.window_id());
         self.registry.set_welcome_open(true);
+        // Seed the freshly-opened welcome with the current recent rows (and rebuild the menu);
+        // `refresh_recents_ui` then keeps it live while it stays open (`functional_spec.md §2.4`).
+        self.refresh_recents_ui(cx);
     }
 
     fn close_welcome(&mut self, cx: &mut App) {
@@ -522,10 +525,16 @@ impl FreeCellApp {
         }
     }
 
-    /// Pushes the current recent-files list to the UI surfaces that reflect it. In Phase 2 that
-    /// is the macOS **Open Recent** menu only; Phase 3 extends this seam to also hand fresh
-    /// display rows to the welcome view (`self.welcome` → `set_recents`).
+    /// Pushes the current recent-files list to the UI surfaces that reflect it: the welcome
+    /// window (if open) gets fresh display rows (`functional_spec.md §2.4` live updates), and the
+    /// macOS **Open Recent** menu is rebuilt (`architecture.md §3.2`).
     fn refresh_recents_ui(&mut self, cx: &mut App) {
+        if let Some(welcome) = self.welcome.clone() {
+            let rows = self
+                .recents
+                .display_entries(recents::now_unix_secs(), WELCOME_LIMIT);
+            welcome.update(cx, |w, cx| w.set_recents(rows, cx));
+        }
         menus::install_menus_with(&self.recents, cx);
     }
 
@@ -570,6 +579,12 @@ impl FreeCellApp {
     #[cfg(test)]
     pub(crate) fn welcome_open(cx: &App) -> bool {
         cx.global::<FreeCellApp>().registry.welcome_open()
+    }
+
+    /// The live welcome view entity, if the welcome window is open (tests).
+    #[cfg(test)]
+    pub(crate) fn welcome_view(cx: &App) -> Option<Entity<WelcomeView>> {
+        cx.global::<FreeCellApp>().welcome.clone()
     }
 
     /// The document window entity at `index` (tests).
@@ -642,11 +657,12 @@ fn document_window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// The welcome window options: small, fixed-size, non-resizable, centered, macOS custom
-/// titlebar (§7.1) or standard traffic lights on Linux (`functional_spec.md §2.2`).
+/// The welcome window options: fixed **720×480** two-pane launch surface (`ui_design.md §1`),
+/// non-resizable, non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic
+/// lights on Linux (`functional_spec.md §2.2`).
 fn welcome_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(420.0), px(300.0)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(720.0), px(480.0)), cx)),
         titlebar: titlebar_options(),
         is_resizable: false,
         is_minimizable: false,
@@ -671,6 +687,7 @@ mod tests {
     //! synthesized [`WorkerEvent`]s straight into `on_worker_event` (no emission, no parking).
 
     use super::*;
+    use freecell_core::recent::DisplayEntry;
     use freecell_engine::{LoadError, SaveError, WorkerEvent};
     use gpui::TestAppContext;
     use tempfile::tempdir;
@@ -863,6 +880,85 @@ mod tests {
             cx.update(|cx| FreeCellApp::recents_paths(cx)),
             vec![path.canonicalize().unwrap()],
             "load_recents reads the persisted store into the app"
+        );
+    }
+
+    #[gpui::test]
+    fn showing_welcome_seeds_current_recents(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Seed.xlsx");
+        write_xlsx(&path);
+        // Record a recent *before* the welcome opens, then open it: `do_show_welcome` must seed
+        // the fresh view with the current rows (`architecture.md §3.2`).
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        cx.update(FreeCellApp::show_welcome);
+        let welcome = cx.update(|cx| FreeCellApp::welcome_view(cx).expect("welcome open"));
+        assert_eq!(
+            cx.update(|cx| welcome.read(cx).recent_row_count()),
+            1,
+            "the freshly-opened welcome is seeded with the current recent rows"
+        );
+    }
+
+    #[gpui::test]
+    fn recording_updates_the_open_welcome(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_welcome);
+        let welcome = cx.update(|cx| FreeCellApp::welcome_view(cx).expect("welcome open"));
+        assert!(
+            cx.update(|cx| welcome.read(cx).is_empty_state()),
+            "the welcome starts on the empty state with no recents"
+        );
+        // Recording a recent while the welcome is open pushes the new row into it live
+        // (`functional_spec.md §2.4`, the `refresh_recents_ui` welcome branch).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Live.xlsx");
+        write_xlsx(&path);
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        assert_eq!(
+            cx.update(|cx| welcome.read(cx).recent_row_count()),
+            1,
+            "recording a recent live-updates the open welcome"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_recent_row_routes_to_open_path(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Clicked.xlsx");
+        write_xlsx(&path);
+        let canonical = path.canonicalize().unwrap();
+
+        cx.update(FreeCellApp::show_welcome);
+        let welcome = cx.update(|cx| FreeCellApp::welcome_view(cx).expect("welcome open"));
+        // Seed a row for the real file (the view renders from its own display rows).
+        cx.update(|cx| {
+            welcome.update(cx, |w, cx| {
+                w.set_recents(
+                    vec![DisplayEntry {
+                        path: canonical.clone(),
+                        name: "Clicked.xlsx".to_string(),
+                        subtitle: "0 B · tmp".to_string(),
+                        relative_time: "Just now".to_string(),
+                    }],
+                    cx,
+                )
+            })
+        });
+        assert_eq!(cx.update(|cx| welcome.read(cx).recent_row_count()), 1);
+
+        // The file vanishes between render and click; clicking the row must route to `open_path`,
+        // whose canonicalize-failure surfaces the "Couldn't open the file" dialog on the welcome
+        // (`functional_spec.md §2.2`). That modal is the observable proof the click reached
+        // `open_path` — with no real worker window spawned.
+        std::fs::remove_file(&canonical).unwrap();
+        cx.update(|cx| welcome.update(cx, |w, cx| w.open_recent(0, cx)));
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx| welcome.read(cx).has_modal()),
+            "clicking a recent row routes to open_path (its vanished-file error lands on the welcome)"
         );
     }
 

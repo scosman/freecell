@@ -26,7 +26,7 @@ coherent CR unit. Details live in `functional_spec.md`, `ui_design.md`, `archite
   (`architecture.md §7`). *No welcome-view changes yet* (the welcome still renders its current
   body; it just gets seeded/updated harmlessly or is left untouched until Phase 3).
 
-- [ ] **Phase 3 — Welcome screen redesign (`freecell-app::shell::welcome`).** Two-pane layout
+- [x] **Phase 3 — Welcome screen redesign (`freecell-app::shell::welcome`).** Two-pane layout
   (720×480 window), new tagline "The open spreadsheet", RECENT list of up to 5 rows
   (glyph/name/subtitle/relative-time, hover, click→`open_path`), empty state, and the
   `set_recents` update seam wired from `FreeCellApp::refresh_recents_ui` +

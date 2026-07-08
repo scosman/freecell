@@ -202,6 +202,8 @@ render_cases! {
     border_shared_edge_adjacent, border_none_clear,
     // Border line patterns (Phase 2): dashed + double
     border_dashed_all, border_double_all, border_pattern_mixed,
+    // Border pen (Phase 3): a pen-applied dashed + non-default-colour outer border
+    border_pen_outer_dashed_red,
     // Structure (Phase 7): resized geometry + header selection
     col_resized_narrow_clips_text, row_resized_tall,
     header_full_column_selected, header_full_row_selected,

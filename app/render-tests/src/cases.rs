@@ -548,6 +548,63 @@ pub fn all() -> Vec<RenderCase> {
             at(Scene::new()).border(1, 1, all_edges_pat(3, LinePattern::Double)),
         ),
         cell(
+            // Pen model (Phase 3): "select Outer with a dashed + red pen" — a 2×2 block whose four
+            // corner cells carry only their two OUTER edges as dashed red (2px); the interior edges
+            // stay bare. This is the resolved `BorderSpec` a `SetBorders { preset: Outer, line:
+            // Dashed, color: red }` produces, so it covers a pen-applied border (dashed + a
+            // non-default color, on the perimeter only) end-to-end at the render layer — chrome
+            // (the popover itself) has no pixel coverage in this harness.
+            "border_pen_outer_dashed_red",
+            {
+                // A dashed red (2px) edge — the pen the worked example paints (`functional_spec.md
+                // §2.1`). Each corner cell of the 2×2 block gets only its two perimeter edges.
+                let dr = || {
+                    Some(Edge::with_pattern(
+                        2,
+                        Rgb::new(0xFF, 0, 0),
+                        LinePattern::Dashed,
+                    ))
+                };
+                at(Scene::new())
+                    .border(
+                        1,
+                        1,
+                        BorderSpec {
+                            top: dr(),
+                            left: dr(),
+                            ..BorderSpec::NONE
+                        },
+                    )
+                    .border(
+                        1,
+                        2,
+                        BorderSpec {
+                            top: dr(),
+                            right: dr(),
+                            ..BorderSpec::NONE
+                        },
+                    )
+                    .border(
+                        2,
+                        1,
+                        BorderSpec {
+                            bottom: dr(),
+                            left: dr(),
+                            ..BorderSpec::NONE
+                        },
+                    )
+                    .border(
+                        2,
+                        2,
+                        BorderSpec {
+                            bottom: dr(),
+                            right: dr(),
+                            ..BorderSpec::NONE
+                        },
+                    )
+            },
+        ),
+        cell(
             // One cell mixing all three patterns + weights so solid, dashed, and double read
             // side by side (and confirm the solid path is unchanged next to the new patterns):
             // solid-thin top, dashed-medium right, double bottom, solid-thick left.

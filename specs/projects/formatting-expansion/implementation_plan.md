@@ -29,7 +29,7 @@ with committed code + refreshed/eyeballed render baselines. See `functional_spec
   Outer preserves interior), worker, cache; render cases for dashed/double + eyeballed
   baselines.
 
-- [ ] **Phase 3 — Part 2: Border UI (pen popover).**
+- [x] **Phase 3 — Part 2: Border UI (pen popover).**
   Borders popover redesign: transient `border_target` + pen (`border_line`,
   `border_color`) view state reset on open; the parameterized 2×2 `border_target_icon`
   component; the line-style gallery previews; reused color picker (`border_color_picker`

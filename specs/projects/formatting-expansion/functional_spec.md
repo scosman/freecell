@@ -197,15 +197,15 @@ The target set keeps today's semantics:
 A second row under the target icons:
 
 - **Line style — a gallery/dropdown (option 1A).** Each entry is a small preview of the
-  actual line, combining weight and pattern into one choice. Proposed set (bounded by
-  the engine's representable styles):
+  actual line, combining weight and pattern into one choice. **MVP set** (kept lean —
+  solid weights render for free; only dashed + double are new paint work):
   - Thin solid (1px)
   - Medium solid (2px)
   - Thick solid (3px)
   - Dashed (2px)
-  - Dotted (1px)
   - Double (3px)
-  - *(optional)* Dash-dot (2px)
+  - **Deferred → `GAPS.md`:** Dotted (round-trips lossily at 0.7.1) and Dash-dot
+    (niche). Adding them later is a gallery entry + one more render pattern each.
 - **Color — reuse the existing color picker** (the same `ColorPicker` + 10-swatch
   `FILL_PALETTE` + "Custom…" affordance used for text color and fill). Default black.
 - The controls always display the **current pen**. Changing a control updates the pen
@@ -242,14 +242,14 @@ P2 is not built in the initial phases.
 
 - **Single-cell selection:** Outer = that cell's four edges; Inner = no-op; Top/Bottom/
   Left/Right = the corresponding single edge.
-- **Undo/redo:** each paint is one undoable step. Rapid pen tweaks on the same target
-  **should coalesce** into a single undo entry while the popover stays on that target
-  (mirrors the worker's edit coalescing); at minimum every paint is individually
-  undoable. Final coalescing policy decided in architecture.
-- **`.xlsx` round-trip fidelity — dotted:** at IronCalc 0.7.1, `Dotted` degraded to
-  `Thin` on import. Architecture must verify whether our fork fixes this; if not, either
-  fix it in the fork (per the fix-upstream policy) or drop Dotted from the gallery to
-  avoid silent data loss. Dashed/double are represented.
+- **Undo/redo (simplified):** each paint is one undoable step; **no special
+  coalescing** in MVP. Nudging a target's style/color several times therefore produces
+  several undo entries — accepted as a pragmatic trade. Coalescing is a possible later
+  nicety, not built now.
+- **`.xlsx` round-trip fidelity:** the MVP gallery (thin/medium/thick solid, dashed,
+  double) is fully representable and round-trips. **Dotted is dropped** precisely
+  because it degraded to `Thin` on import at 0.7.1 — deferred to `GAPS.md` rather than
+  shipping silent data loss.
 - **Degraded / read-only worker:** the borders control is disabled and any open popover
   force-closes, exactly as today.
 - **Diagonal borders:** out of scope.
@@ -259,8 +259,9 @@ P2 is not built in the initial phases.
 
 # Out of scope (whole project)
 
-- Auto-grow row height for wrap (→ `GAPS.md`).
-- P2 restyle-all-with-no-target (designed-for, deferred).
+- Auto-grow row height for wrap (→ `GAPS.md` F1).
+- P2 restyle-all-with-no-target (designed-for, deferred → `GAPS.md` F2).
+- Dotted + dash-dot line styles (→ `GAPS.md` F3).
 - Diagonal borders; inner-horizontal / inner-vertical border targets.
 - Justify / Distributed vertical alignment.
 - Merged cells, overflow-into-neighbors changes, and any non-formatting behavior.
@@ -277,5 +278,6 @@ P2 is not built in the initial phases.
   `render` gate dispatched and green before merge. Baked into the implementation plan.
 - **Engine-boundary discipline.** No IronCalc type crosses the `freecell-engine`
   boundary; new formatting flows through the existing command/protocol/cache seam.
-- **`.xlsx` fidelity.** Prefer only representable styles; resolve any round-trip loss
-  (dotted) in the fork rather than silently degrading.
+- **`.xlsx` fidelity.** Ship only fully-representable styles (the MVP gallery
+  round-trips cleanly); the one lossy style (dotted) is deferred rather than shipped
+  with silent degradation.

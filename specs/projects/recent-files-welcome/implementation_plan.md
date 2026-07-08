@@ -9,7 +9,7 @@ coherent CR unit. Details live in `functional_spec.md`, `ui_design.md`, `archite
 
 ## Phases
 
-- [ ] **Phase 1 — Recent-files core (`freecell-core::recent`).** Data model
+- [x] **Phase 1 — Recent-files core (`freecell-core::recent`).** Data model
   (`RecentEntry`/`RecentList`), JSON (de)serialize, `record` (front-insert + dedupe-by-path +
   cap + prune-missing), `clear`, `display_entries` (stat for size, drop missing, build
   `DisplayEntry`), and pure formatters (`format_size`, `parent_folder_label`,

@@ -12,6 +12,18 @@ description = "GPUI-free, IronCalc-free foundation for FreeCell: pure logic type
 # `paste_csv_string` uses, so `tsv_dims` is a quote-/terminator-aware upper bound that can't
 # diverge from the engine's own record/field parse (`components/clipboard.md §Paste-TSV`).
 csv.workspace = true
+# Recent-files store (`recent` module, recent-files-welcome/architecture.md §2): the
+# `RecentList` persists as a small JSON cache (`{ "entries": [...] }`). `serde` (derive)
+# drives the model (de)serialize; `serde_json` is the concrete codec. Both are workspace
+# deps already in-tree (the engine's clipboard uses them); neither is gpui/ironcalc, so the
+# headless dependency rule (`tests/dependency_rule.rs`) is untouched.
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# The `recent` module's `record`/`display_entries`/`save` tests exercise real filesystem
+# stat/prune/round-trip behaviour, so they create throwaway files in a `TempDir`.
+tempfile.workspace = true
 
 [lints]
 workspace = true

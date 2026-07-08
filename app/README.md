@@ -112,5 +112,5 @@ scripts\package.ps1         # Windows (PowerShell)
 
 Builds are **unsigned dev builds** (not for distribution yet). Config, formats, prerequisites,
 the Windows-port requirements, and the signing deferral are documented in
-[`PACKAGING.md`](PACKAGING.md); the placeholder icons in
+[`PACKAGING.md`](PACKAGING.md); the app icons in
 [`crates/freecell-app/packaging/icons/`](crates/freecell-app/packaging/icons/README.md).

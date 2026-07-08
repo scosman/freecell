@@ -31,8 +31,8 @@ use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
     apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
-    is_full_row_selection, Align, Axis, BorderSpec, CellRange, CellRef, Edge, RenderStyle,
-    SelectionModel, SheetDims,
+    is_full_row_selection, Align, Axis, BorderSpec, CellRange, CellRef, Edge, LinePattern,
+    RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
 use super::input::{command_for_key, GridKeyCommand};
@@ -1742,11 +1742,11 @@ impl GridView {
                 let (x, y, w, h) = cell_rect(r, c, frame);
                 // Right edge (shared with the cell at c+1) — always drawn by this (left) cell.
                 if let Some(edge) = effective_edge(spec.right, self.border_spec_at(r, c + 1).left) {
-                    content_children.push(vertical_edge_quad(x + w, y, h, edge));
+                    push_vertical_edge(&mut content_children, x + w, y, h, edge);
                 }
                 // Bottom edge (shared with r+1) — always drawn by this (upper) cell.
                 if let Some(edge) = effective_edge(spec.bottom, self.border_spec_at(r + 1, c).top) {
-                    content_children.push(horizontal_edge_quad(x, y + h, w, edge));
+                    push_horizontal_edge(&mut content_children, x, y + h, w, edge);
                 }
                 // Left edge: only when the left neighbour won't draw it as its right edge.
                 if self.no_left_owner(r, c, frame) {
@@ -1756,7 +1756,7 @@ impl GridView {
                         self.border_spec_at(r, c - 1)
                     };
                     if let Some(edge) = effective_edge(spec.left, left_nbr.right) {
-                        content_children.push(vertical_edge_quad(x, y, h, edge));
+                        push_vertical_edge(&mut content_children, x, y, h, edge);
                     }
                 }
                 // Top edge: only when the top neighbour won't draw it as its bottom edge.
@@ -1767,7 +1767,7 @@ impl GridView {
                         self.border_spec_at(r - 1, c)
                     };
                     if let Some(edge) = effective_edge(spec.top, top_nbr.bottom) {
-                        content_children.push(horizontal_edge_quad(x, y, w, edge));
+                        push_horizontal_edge(&mut content_children, x, y, w, edge);
                     }
                 }
             }
@@ -2375,22 +2375,70 @@ fn span_rect(rows: Range<u32>, cols: Range<u32>, frame: &Frame) -> (f32, f32, f3
     (x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
 }
 
-/// A vertical border edge: a solid `edge.weight`-px strip centred on `boundary_x` (the shared
-/// column boundary), spanning the cell's row height. Painted over the gridline/fills.
-fn vertical_edge_quad(boundary_x: f32, y: f32, h: f32, edge: Edge) -> AnyElement {
-    let w = edge.weight as f32;
-    rect_div(boundary_x - w / 2.0, y, w, h)
-        .bg(to_rgba(edge.color))
-        .into_any_element()
+/// One dash's length (px) and the gap after it, for [`LinePattern::Dashed`] edges. Chosen so a
+/// dash reads clearly at typical column widths/row heights without looking dotted.
+const DASH_LEN: f32 = 4.0;
+const DASH_GAP: f32 = 3.0;
+
+/// Invokes `emit(offset, length)` once per dash of a dashed line spanning `[start, start + span)`:
+/// dashes of [`DASH_LEN`] separated by [`DASH_GAP`], the final dash clamped so it never overruns the
+/// span. The phase restarts at each edge's `start` — i.e. dashes are per-cell-edge, not continuous
+/// across cell boundaries; this is intentional for MVP (consistent with how solid edges are drawn
+/// per-cell, `architecture.md §7`).
+fn for_each_dash(start: f32, span: f32, mut emit: impl FnMut(f32, f32)) {
+    let mut pos = 0.0;
+    while pos < span {
+        emit(start + pos, DASH_LEN.min(span - pos));
+        pos += DASH_LEN + DASH_GAP;
+    }
 }
 
-/// A horizontal border edge: a solid `edge.weight`-px strip centred on `boundary_y` (the shared
-/// row boundary), spanning the cell's column width.
-fn horizontal_edge_quad(x: f32, boundary_y: f32, w: f32, edge: Edge) -> AnyElement {
+/// Pushes the quad(s) for a vertical border edge centred on `boundary_x` (the shared column
+/// boundary), spanning the cell's row height `h`, into `out`. Painted over the gridline/fills. The
+/// quad(s) depend on `edge.pattern` (`architecture.md §7`): `Solid` → one `edge.weight`-px strip
+/// (zero extra allocation — the common case); `Dashed` → a run of short strips; `Double` → two 1px
+/// strips separated by a gap, spanning the weight.
+fn push_vertical_edge(out: &mut Vec<AnyElement>, boundary_x: f32, y: f32, h: f32, edge: Edge) {
+    let w = edge.weight as f32;
+    let color = to_rgba(edge.color);
+    let left = boundary_x - w / 2.0;
+    match edge.pattern {
+        LinePattern::Solid => out.push(rect_div(left, y, w, h).bg(color).into_any_element()),
+        LinePattern::Dashed => for_each_dash(y, h, |oy, len| {
+            out.push(rect_div(left, oy, w, len).bg(color).into_any_element());
+        }),
+        LinePattern::Double => {
+            out.push(rect_div(left, y, 1.0, h).bg(color).into_any_element());
+            out.push(
+                rect_div(left + w - 1.0, y, 1.0, h)
+                    .bg(color)
+                    .into_any_element(),
+            );
+        }
+    }
+}
+
+/// Pushes the quad(s) for a horizontal border edge centred on `boundary_y` (the shared row
+/// boundary), spanning the cell's column width `w`, into `out`. Pattern handling mirrors
+/// [`push_vertical_edge`].
+fn push_horizontal_edge(out: &mut Vec<AnyElement>, x: f32, boundary_y: f32, w: f32, edge: Edge) {
     let h = edge.weight as f32;
-    rect_div(x, boundary_y - h / 2.0, w, h)
-        .bg(to_rgba(edge.color))
-        .into_any_element()
+    let color = to_rgba(edge.color);
+    let top = boundary_y - h / 2.0;
+    match edge.pattern {
+        LinePattern::Solid => out.push(rect_div(x, top, w, h).bg(color).into_any_element()),
+        LinePattern::Dashed => for_each_dash(x, w, |ox, len| {
+            out.push(rect_div(ox, top, len, h).bg(color).into_any_element());
+        }),
+        LinePattern::Double => {
+            out.push(rect_div(x, top, w, 1.0).bg(color).into_any_element());
+            out.push(
+                rect_div(x, top + h - 1.0, w, 1.0)
+                    .bg(color)
+                    .into_any_element(),
+            );
+        }
+    }
 }
 
 /// Builds one data cell element (fill, gridlines, text with resolved style attributes).
@@ -2419,7 +2467,10 @@ fn cell_element(
         .border_b_1()
         .border_color(rgb(GRIDLINE))
         .flex()
-        .items_center()
+        // Default vertical placement is BOTTOM — Excel-faithful (decision C): every cell
+        // bottom-aligns its text unless it carries an explicit `v_align` (handled below). This is
+        // also what mirror/pending cells (`style: None`) get, so the default is uniform.
+        .items_end()
         .overflow_hidden()
         .whitespace_nowrap()
         .px(px(CELL_H_PAD))
@@ -2449,6 +2500,20 @@ fn cell_element(
         if s.underline {
             el = el.underline();
         }
+        // Strikethrough: a line through the text (mirrors the underline seam; combines with it —
+        // `functional_spec.md §1.1`).
+        if s.strikethrough {
+            el = el.line_through();
+        }
+        // Explicit vertical alignment positions the text block within the row height. `None` keeps
+        // the base default — BOTTOM, Excel-faithful (decision C) — so unset and explicit-`Bottom`
+        // render identically (`functional_spec.md §1.3`, `architecture.md §7`).
+        el = match s.v_align {
+            Some(VAlign::Top) => el.items_start(),
+            Some(VAlign::Center) => el.items_center(),
+            Some(VAlign::Bottom) => el.items_end(),
+            None => el,
+        };
         // A non-default font size renders at `q/4` pt → px (`components/style_render.md`); the
         // default (`0`) keeps the grid's `CELL_FONT_PX`. Mirror/pending cells pass `style: None`,
         // so they always render in the default font (`functional_spec.md §1.2`).
@@ -2463,6 +2528,24 @@ fn cell_element(
 
     if text.is_empty() {
         el.into_any_element()
+    } else if style.map(|s| s.wrap).unwrap_or(false) {
+        // Wrapped text needs a width-bounded box to flow into: a flex row's direct text child is
+        // sized to its (unwrapped) content, so `whitespace_normal` only breaks lines once the text
+        // has a definite width. Wrap it in a full-width content box (which sets `whitespace_normal`,
+        // overriding the cell's base `whitespace_nowrap`) so gpui wraps at the column width.
+        // Horizontal placement moves from the flex's justify-content to the box's text-align; the
+        // outer flex's `items_*` still positions the whole block vertically, and `overflow_hidden`
+        // clips the lines that don't fit the row height (no auto-grow — GAPS F1).
+        let h_align = style
+            .and_then(|s| s.h_align)
+            .unwrap_or_else(|| kind.default_align());
+        let content = div().w_full().whitespace_normal();
+        let content = match h_align {
+            Align::Left => content.text_left(),
+            Align::Center => content.text_center(),
+            Align::Right => content.text_right(),
+        };
+        el.child(content.child(text)).into_any_element()
     } else {
         el.child(text).into_any_element()
     }

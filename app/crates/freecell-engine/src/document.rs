@@ -102,13 +102,14 @@ pub enum SaveError {
 pub struct CellQueryError(String);
 
 /// A character-format boolean the worker toggles (the engine style paths `font.b` / `font.i`
-/// / `font.u`). In-crate: the toggle *policy* (any-lacking → set-all) lives in the worker;
-/// this is only the read/write *mechanism* over the pinned IronCalc range-style API.
+/// / `font.u` / `font.strike`). In-crate: the toggle *policy* (any-lacking → set-all) lives in the
+/// worker; this is only the read/write *mechanism* over the pinned IronCalc range-style API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FontFlag {
     Bold,
     Italic,
     Underline,
+    Strike,
 }
 
 impl FontFlag {
@@ -118,6 +119,7 @@ impl FontFlag {
             FontFlag::Bold => "font.b",
             FontFlag::Italic => "font.i",
             FontFlag::Underline => "font.u",
+            FontFlag::Strike => "font.strike",
         }
     }
 }
@@ -625,7 +627,18 @@ impl WorkbookDocument {
             FontFlag::Bold => style.font.b,
             FontFlag::Italic => style.font.i,
             FontFlag::Underline => style.font.u,
+            FontFlag::Strike => style.font.strike,
         })
+    }
+
+    /// Whether `cell` currently has wrap-text set (`alignment.wrap_text`) — the per-cell read the
+    /// worker samples for the wrap toggle's decision. A cell with no alignment record reads
+    /// `false` (mirrors the [`font_flag`](Self::font_flag) per-cell reader).
+    pub(crate) fn wrap_flag(&self, sheet_idx: u32, cell: CellRef) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        let style = self.model.get_cell_style(sheet_idx, row, col)?;
+        Ok(style.alignment.map(|a| a.wrap_text).unwrap_or(false))
     }
 
     /// Sets a character-format flag across a range to `value` (one undoable range-style op).
@@ -677,22 +690,26 @@ impl WorkbookDocument {
             .update_range_style(&area_of(sheet_idx, range), path, value)
     }
 
-    /// Applies a border `preset` (an IronCalc `BorderType` serde tag) over a range via
-    /// `set_area_with_border` (`architecture.md §3.4`, `border.rs:346`). One undoable diff-list;
+    /// Applies a border over a range: the `border_type` (an IronCalc `BorderType` serde tag) selects
+    /// which edges are written; `style_tag` (a `BorderStyle` serde tag, e.g. `"thin"`/`"mediumdashed"`
+    /// /`"double"`) and `color_hex` (`#RRGGBB`) are the written border item. Applied via
+    /// `set_area_with_border` (`architecture.md §3.4/§4`, `border.rs:346`). One undoable diff-list;
     /// band-aware for full rows/columns; the engine applies its heavier-wins fix-up to the four
-    /// adjacent strips. `BorderArea` has `pub(crate)` fields and no constructor at 0.7.1 but derives
-    /// `Deserialize`, so it is built from JSON — thin black only (the only style the borders popover
-    /// applies; `functional_spec.md §3.6`). For `type: "None"` the engine ignores `item` and clears
-    /// the edges.
+    /// adjacent strips and overwrites **only** the edges `border_type` implies (non-targeted edges,
+    /// incl. interior borders, are preserved). `BorderArea` has `pub(crate)` fields and no constructor
+    /// at 0.7.1 but derives `Deserialize`, so it is built from JSON. For `type: "None"` the engine
+    /// ignores `item` and clears the edges.
     pub(crate) fn set_borders(
         &mut self,
         sheet_idx: u32,
         range: CellRange,
         border_type: &str,
+        style_tag: &str,
+        color_hex: &str,
     ) -> Result<(), String> {
         crate::instrument::record_engine_call();
         let border_area: BorderArea = serde_json::from_value(serde_json::json!({
-            "item": { "style": "thin", "color": "#000000" },
+            "item": { "style": style_tag, "color": color_hex },
             "type": border_type,
         }))
         .map_err(|e| format!("failed to build BorderArea for {border_type:?}: {e}"))?;
@@ -1348,10 +1365,12 @@ mod tests {
         assert_eq!(classify_magic(&empty).unwrap(), FileKind::Other);
     }
 
-    /// Bold / italic / underline / fill / font-color survive a save→reopen round-trip.
-    /// In-crate (not an integration test) because it reads back the raw `ironcalc` `Style`.
+    /// Bold / italic / underline / strikethrough / fill / font-color / wrap / vertical-align
+    /// survive a save→reopen round-trip. In-crate (not an integration test) because it reads back
+    /// the raw `ironcalc` `Style`.
     #[test]
     fn roundtrip_styles_preserved() {
+        use ironcalc_base::types::VerticalAlignment;
         let dir = tempdir().unwrap();
         let path = dir.path().join("styles.xlsx");
 
@@ -1363,6 +1382,14 @@ mod tests {
         assert!(reopened.cell_style(0, CellRef::new(0, 0)).unwrap().font.b);
         assert!(reopened.cell_style(0, CellRef::new(0, 1)).unwrap().font.i);
         assert!(reopened.cell_style(0, CellRef::new(0, 2)).unwrap().font.u);
+        // D1 strikethrough.
+        assert!(
+            reopened
+                .cell_style(0, CellRef::new(0, 3))
+                .unwrap()
+                .font
+                .strike
+        );
 
         // A2 red fill, B2 blue font color.
         let fill = reopened.cell_style(0, CellRef::new(1, 0)).unwrap().fill;
@@ -1374,6 +1401,19 @@ mod tests {
         assert_eq!(
             font.color,
             ironcalc_base::types::Color::Rgb("#0000FF".to_string())
+        );
+
+        // D2 wrap-text, D3 vertical alignment = top.
+        let d2 = reopened.cell_style(0, CellRef::new(1, 3)).unwrap();
+        assert!(
+            d2.alignment.map(|a| a.wrap_text).unwrap_or(false),
+            "wrap_text survives the round-trip"
+        );
+        let d3 = reopened.cell_style(0, CellRef::new(2, 3)).unwrap();
+        assert_eq!(
+            d3.alignment.map(|a| a.vertical),
+            Some(VerticalAlignment::Top),
+            "vertical alignment survives the round-trip"
         );
     }
 
@@ -1390,24 +1430,30 @@ mod tests {
 
     #[test]
     fn set_borders_applies_all_and_none_clears() {
+        use ironcalc_base::types::BorderStyle;
         let mut doc = WorkbookDocument::new_empty().unwrap();
         let a1 = CellRef::new(0, 0);
         doc.set_cell_input(0, a1, "x").unwrap();
 
-        // "All" sets all four thin edges.
-        doc.set_borders(0, CellRange::single(a1), "All").unwrap();
+        // "All" with a dashed-red pen sets all four edges with the requested style + colour.
+        doc.set_borders(0, CellRange::single(a1), "All", "mediumdashed", "#FF0000")
+            .unwrap();
         let b = doc.cell_style(0, a1).unwrap().border;
         assert!(
             b.top.is_some() && b.right.is_some() && b.bottom.is_some() && b.left.is_some(),
             "All applies every edge"
         );
+        let top = b.top.as_ref().unwrap();
+        assert_eq!(top.style, BorderStyle::MediumDashed, "pen style is written");
         assert_eq!(
-            b.top.as_ref().unwrap().style,
-            ironcalc_base::types::BorderStyle::Thin
+            top.color.to_rgb(doc.workbook_theme()),
+            "#FF0000",
+            "pen colour is written"
         );
 
         // "None" clears them again.
-        doc.set_borders(0, CellRange::single(a1), "None").unwrap();
+        doc.set_borders(0, CellRange::single(a1), "None", "thin", "#000000")
+            .unwrap();
         let b = doc.cell_style(0, a1).unwrap().border;
         assert!(
             b.top.is_none() && b.right.is_none() && b.bottom.is_none() && b.left.is_none(),
@@ -1415,7 +1461,44 @@ mod tests {
         );
 
         // A bogus tag is a clean error (never panics).
-        assert!(doc.set_borders(0, CellRange::single(a1), "Bogus").is_err());
+        assert!(doc
+            .set_borders(0, CellRange::single(a1), "Bogus", "thin", "#000000")
+            .is_err());
+    }
+
+    #[test]
+    fn set_borders_outer_preserves_existing_interior_edges() {
+        use ironcalc_base::types::BorderStyle;
+        // Non-destructive per-type application (`architecture.md §0`): painting "Outer" over a cell
+        // that already carries an inner edge must leave that inner edge intact.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A 2×2 block B2:C3 so "Inner" writes real interior edges.
+        let block = CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2));
+        doc.set_borders(0, block, "Inner", "thick", "#0000FF")
+            .unwrap();
+        // B2's right edge is an interior edge of the block.
+        let b2 = CellRef::new(1, 1);
+        let inner_right = doc.cell_style(0, b2).unwrap().border.right;
+        assert!(
+            inner_right.is_some(),
+            "Inner wrote B2's interior right edge"
+        );
+
+        // Now paint the block's Outer perimeter with a different (thin) pen.
+        doc.set_borders(0, block, "Outer", "thin", "#000000")
+            .unwrap();
+        let b = doc.cell_style(0, b2).unwrap().border;
+        // The interior right edge is untouched (still thick blue) …
+        let right = b.right.as_ref().expect("interior edge preserved");
+        assert_eq!(
+            right.style,
+            BorderStyle::Thick,
+            "interior edge survives Outer"
+        );
+        assert_eq!(right.color.to_rgb(doc.workbook_theme()), "#0000FF");
+        // … while B2's top+left (its share of the perimeter) are the new thin pen.
+        assert_eq!(b.top.as_ref().unwrap().style, BorderStyle::Thin);
+        assert_eq!(b.left.as_ref().unwrap().style, BorderStyle::Thin);
     }
 
     #[test]

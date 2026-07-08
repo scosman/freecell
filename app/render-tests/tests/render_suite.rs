@@ -172,6 +172,7 @@ render_cases! {
     // Text attributes
     cell_plain, cell_bold, cell_italic, cell_underline,
     cell_bold_italic, cell_bold_underline, cell_italic_underline, cell_bold_italic_underline,
+    cell_strikethrough, cell_strikethrough_underline,
     // Fill
     cell_fill_red, cell_fill_yellow, cell_fill_dark_text_contrast, cell_fill_none_explicit,
     cell_bold_fill_yellow, cell_bold_italic_underline_fill_blue, cell_fill_covers_gridlines,
@@ -185,6 +186,8 @@ render_cases! {
     cell_align_center_explicit,
     cell_align_explicit_overrides_default, cell_text_clipped, cell_text_exact_fit,
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
+    cell_wrap_multiline_clipped,
+    cell_valign_top, cell_valign_middle, cell_valign_bottom, cell_wrap_valign_bottom,
     // Whole-grid scenes
     grid_empty_origin, grid_headers_scrolled_deep, grid_selection_single, grid_selection_range,
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
@@ -197,6 +200,10 @@ render_cases! {
     // Borders (Phase 6): edge paint, presets, shared-edge precedence
     border_all_thin, border_outer_medium, border_heavier_edge_wins, border_over_fill,
     border_shared_edge_adjacent, border_none_clear,
+    // Border line patterns (Phase 2): dashed + double
+    border_dashed_all, border_double_all, border_pattern_mixed,
+    // Border pen (Phase 3): a pen-applied dashed + non-default-colour outer border
+    border_pen_outer_dashed_red,
     // Structure (Phase 7): resized geometry + header selection
     col_resized_narrow_clips_text, row_resized_tall,
     header_full_column_selected, header_full_row_selected,

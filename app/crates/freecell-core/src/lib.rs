@@ -34,7 +34,7 @@ pub mod tsv;
 // The load-bearing types re-exported at the crate root for ergonomic downstream use
 // (the grid, engine, and shell all reach for these constantly).
 pub use axis::Axis;
-pub use border::{effective_edge, BorderSpec, Edge};
+pub use border::{effective_edge, BorderSpec, Edge, LinePattern};
 pub use cache::{SheetCache, SheetCacheBuilder, SheetCaches, StyleId};
 pub use color::Rgb;
 pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};
@@ -46,7 +46,7 @@ pub use selection::{
     apply_motion, format_selection_ref, is_full_column_selection, is_full_row_selection, Direction,
     Motion, SelectionModel, SheetDims,
 };
-pub use style::{Align, RenderStyle};
+pub use style::{Align, RenderStyle, VAlign};
 
 /// The Excel-max grid dimensions FreeCell targets (`CLAUDE.md`): the engine, geometry
 /// cache, and validators are all sized against these hard maxima.

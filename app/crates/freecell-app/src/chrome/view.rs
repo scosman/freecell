@@ -38,10 +38,10 @@ use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
+use freecell_core::{Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign};
 
 use freecell_engine::{
-    BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
+    BorderLine, BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
 };
 
 use super::{
@@ -64,6 +64,14 @@ const DANGER: u32 = 0xDC2626;
 /// Dark tooltip fill + text for the cap-error popover (`ui_design.md §4`).
 const TOOLTIP_BG: u32 = 0x2B2B2B;
 const TOOLTIP_TEXT: u32 = 0xF5F5F5;
+/// Accent ring around the borders popover's selected color swatch (Office Accent 1 — reads over a
+/// black or white swatch, unlike a grey/dark ring; `ui_design.md §2.1`).
+const SWATCH_SELECTED_RING: u32 = 0x4472C4;
+/// The borders target-icon 2×2 diagram: light-grey context gridlines vs. the solid-dark affected
+/// edges (`ui_design.md §2.2`). Drawn from `div` rectangles, the same primitive as the grid's edges.
+const TARGET_ICON_PX: f32 = 22.0;
+const TARGET_ICON_GREY: u32 = 0xC8C8C8;
+const TARGET_ICON_DARK: u32 = 0x1F1F1F;
 
 const ACTION_ROW_H: f32 = 36.0;
 
@@ -89,12 +97,14 @@ impl Anchor {
     }
 }
 /// The action row's natural (uncompressed) width for the current control set — font family +
-/// size (Phase 5), B/I/U, text color + fill, **borders** (Phase 6), alignment, number format +
-/// decimals — with its dividers. The row never wraps (`ui_design.md §2`: raise the window's min
-/// width instead), so it holds this min width; the document window (1200 px) is far wider. Phase 6
-/// adds the borders button (~64 px) + a divider, so this grows 816 → 896. Recorded in
+/// size (Phase 5), B/I/U + strikethrough/wrap, text color + fill, **borders** (Phase 6),
+/// horizontal + vertical alignment, number format + decimals — with its dividers. The row never
+/// wraps (`ui_design.md §2`: raise the window's min width instead), so it holds this min width; the
+/// document window (1200 px) is far wider. Phase 6 added the borders button (~64 px) + a divider
+/// (816 → 896); the formatting-expansion project adds strikethrough + wrap toggles and the
+/// three-button vertical-align group + a divider (~180 px → 896 → 1080). Recorded in
 /// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips.
-const ACTION_ROW_MIN_W: f32 = 896.0;
+const ACTION_ROW_MIN_W: f32 = 1080.0;
 
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
@@ -192,9 +202,20 @@ pub struct ChromeView {
     font_family_open: bool,
     /// The font-size dropdown's open state.
     font_size_open: bool,
-    /// The borders-preset popover's open state (a 4×2 preset grid — presets are actions, not
-    /// toggles, so it carries no active-state derivation; `components/action_bar.md`).
+    /// The borders popover's open state (the pen-model card — target icons + line gallery +
+    /// color; `ui_design.md §2`). Only click-away / Esc closes it; a target click paints and
+    /// keeps it open.
     borders_open: bool,
+    /// The pen's **selected target** — which set of edges the line/color controls paint right now
+    /// (`functional_spec.md §2.1`). `None` on open (and after `None`/click-away); reset every open.
+    border_target: Option<BorderPreset>,
+    /// The pen's **line style**, default thin solid, reset every open (`ui_design.md §2.4`).
+    border_line: BorderLine,
+    /// The pen's **color**, default black, reset every open.
+    border_color: Rgb,
+    /// The stock color picker for the borders popover's "Custom…" entry (reused pattern, like the
+    /// fill/text-color pickers).
+    border_color_picker: Entity<ColorPickerState>,
     /// The captured chrome-local left-x (device px) of each action-row dropdown trigger, so its
     /// popover anchors under the real (content-sized) button rather than a hardcoded offset (BUG
     /// 2c). Written by a per-button `canvas` bounds probe during paint; indexed by [`Anchor`].
@@ -238,6 +259,7 @@ impl ChromeView {
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
         let text_color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
+        let border_color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
 
         // Installed font families for the dropdown, fetched once (`all_font_names` is verified
         // available). "Default (Inter)" is prepended as the clear-the-override entry.
@@ -259,6 +281,11 @@ impl ChromeView {
             cx.subscribe_in(&rename_input, window, Self::on_rename_event),
             cx.subscribe_in(&color_picker, window, Self::on_color_picker_event),
             cx.subscribe_in(&text_color_picker, window, Self::on_text_color_picker_event),
+            cx.subscribe_in(
+                &border_color_picker,
+                window,
+                Self::on_border_color_picker_event,
+            ),
         ];
 
         Self {
@@ -290,6 +317,10 @@ impl ChromeView {
             font_family_open: false,
             font_size_open: false,
             borders_open: false,
+            border_target: None,
+            border_line: BorderLine::ThinSolid,
+            border_color: Rgb::new(0, 0, 0),
+            border_color_picker,
             sheets,
             rename_target: None,
             rename_input,
@@ -968,6 +999,21 @@ impl ChromeView {
         self.apply_style_path(StylePath::AlignHorizontal, value, window, cx);
     }
 
+    /// Applies a vertical alignment (top/center/bottom) over the selection — a plain radio-style
+    /// set (`functional_spec.md §1.3`, `architecture.md §2`). Unlike horizontal align there is no
+    /// re-press-to-clear: IronCalc's vertical default is `bottom` and the grid's default placement
+    /// is also bottom (decision C — Excel-faithful), so there is no independent "unset" value to
+    /// clear back to; the group is purely one-of-N (top / center / bottom).
+    pub fn apply_valign(&mut self, valign: VAlign, window: &mut Window, cx: &mut Context<Self>) {
+        let value = match valign {
+            VAlign::Top => "top",
+            VAlign::Center => "center",
+            VAlign::Bottom => "bottom",
+        }
+        .to_string();
+        self.apply_style_path(StylePath::AlignVertical, value, window, cx);
+    }
+
     /// Applies a number-format code over the selection, closing the number-format dropdown.
     pub fn apply_num_fmt(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.num_fmt_open = false;
@@ -1054,40 +1100,119 @@ impl ChromeView {
         cx.notify();
     }
 
-    // ---- Action row: SetBorders (preset popover) ------------------------------------------
+    // ---- Action row: SetBorders (pen popover) ---------------------------------------------
 
-    /// Applies a border `preset` over the selection, closing the borders popover. Commits any
-    /// pending edit first and degraded-guards, the same rule as the other action-row controls
-    /// (`components/action_bar.md`). Fire-and-forget: the worker logs any engine rejection.
-    pub fn apply_borders(
+    /// Paints the current pen (`border_line` + `border_color`) onto `preset`'s edges over the
+    /// selection. Degraded-guards + commits any pending edit first, the same rule as the other
+    /// action-row controls (`components/action_bar.md`); returns whether it dispatched. Shared by
+    /// [`select_border_target`](Self::select_border_target) and the pen-tweak repaints. For
+    /// [`BorderPreset::None`] the engine clears the selection's borders (line/color unused).
+    /// Fire-and-forget: the worker logs any engine rejection.
+    fn send_border_paint(
         &mut self,
         preset: BorderPreset,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.borders_open = false;
+    ) -> bool {
         if self.degraded {
-            return;
+            return false;
         }
         if !self.commit_pending_edit(window, cx) {
-            return;
+            return false;
         }
         self.client.send(Command::SetBorders {
             sheet: self.active_sheet,
             range: self.selection.range(),
             preset,
+            line: self.border_line,
+            color: Some(self.border_color),
         });
+        true
+    }
+
+    /// Selects a border **target** and paints the current pen onto just its edges — the pen model
+    /// (`functional_spec.md §2.1`, `ui_design.md §2.4`). The popover **stays open** (unlike the old
+    /// apply-and-close preset path): only click-away / Esc closes it. `None` clears all borders in
+    /// the selection and leaves **no** target selected (there is nothing left to keep styling).
+    pub fn select_border_target(
+        &mut self,
+        preset: BorderPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.send_border_paint(preset, window, cx) {
+            return;
+        }
+        // `None` is an action, not a paintable target — it deselects; every other preset becomes
+        // the selected target so subsequent pen tweaks repaint it.
+        self.border_target = (preset != BorderPreset::None).then_some(preset);
         cx.notify();
     }
 
+    /// Sets the pen's **line style**. If a target is selected, repaints that target with the new
+    /// pen; with no target, updates the pen only (MVP — no sheet change until a target is picked;
+    /// P2 restyle-all is deferred, GAPS F2). The pen carries across target switches.
+    pub fn set_border_line(
+        &mut self,
+        line: BorderLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.border_line = line;
+        if let Some(preset) = self.border_target {
+            self.send_border_paint(preset, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Sets the pen's **color** (symmetric to [`set_border_line`](Self::set_border_line)):
+    /// repaints the selected target, or updates the pen only when no target is selected.
+    pub fn set_border_color(&mut self, color: Rgb, window: &mut Window, cx: &mut Context<Self>) {
+        self.border_color = color;
+        if let Some(preset) = self.border_target {
+            self.send_border_paint(preset, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Toggles the borders popover. **Opening resets the transient pen state** — no target
+    /// selected, pen back to thin solid black — even if the selection already has borders (border
+    /// state is never derived from existing cell borders; `functional_spec.md §2.1`).
     fn toggle_borders_popover(&mut self, cx: &mut Context<Self>) {
         self.borders_open = !self.borders_open;
+        if self.borders_open {
+            self.border_target = None;
+            self.border_line = BorderLine::ThinSolid;
+            // The pen color is our source of truth; resetting it re-rings the black swatch. We
+            // deliberately do NOT reach into the stock `border_color_picker`'s internal display
+            // state, so its "Custom…" preview can still show the previous custom color until the
+            // user picks again — cosmetic, and identical to the fill/text-color pickers by precedent.
+            self.border_color = Rgb::new(0, 0, 0);
+        }
         cx.notify();
     }
 
     /// Whether the borders popover is open (test/render introspection).
     pub fn borders_open(&self) -> bool {
         self.borders_open
+    }
+
+    /// The pen's selected target, if any (test introspection).
+    #[cfg(test)]
+    pub fn border_target(&self) -> Option<BorderPreset> {
+        self.border_target
+    }
+
+    /// The pen's current line style (test introspection).
+    #[cfg(test)]
+    pub fn border_line(&self) -> BorderLine {
+        self.border_line
+    }
+
+    /// The pen's current color (test introspection).
+    #[cfg(test)]
+    pub fn border_color(&self) -> Rgb {
+        self.border_color
     }
 
     /// The font-family dropdown's active label: the active cell's family, or "Default (Inter)" for a
@@ -1124,6 +1249,21 @@ impl ChromeView {
         let ColorPickerEvent::Change(color) = event;
         if let Some(hsla) = color {
             self.apply_text_color(Some(hsla_to_rgb(*hsla)), window, cx);
+        }
+    }
+
+    /// The borders "Custom…" picker changed → set the pen color (repaints the selected target, if
+    /// any). Mirrors [`on_color_picker_event`](Self::on_color_picker_event).
+    fn on_border_color_picker_event(
+        &mut self,
+        _picker: &Entity<ColorPickerState>,
+        event: &ColorPickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ColorPickerEvent::Change(color) = event;
+        if let Some(hsla) = color {
+            self.set_border_color(hsla_to_rgb(*hsla), window, cx);
         }
     }
 
@@ -1379,10 +1519,29 @@ impl ChromeView {
         self.active_style.map(|s| s.underline).unwrap_or(false)
     }
 
+    /// Whether the strikethrough toggle is pressed.
+    pub fn strikethrough_active(&self) -> bool {
+        self.active_style.map(|s| s.strikethrough).unwrap_or(false)
+    }
+
+    /// Whether the wrap-text toggle is pressed.
+    pub fn wrap_active(&self) -> bool {
+        self.active_style.map(|s| s.wrap).unwrap_or(false)
+    }
+
     /// Whether an alignment button is pressed — the **explicit** alignment only (a number aligned
     /// right by type default shows no pressed button, matching Excel; `components/action_bar.md`).
     pub fn align_active(&self, align: Align) -> bool {
         self.active_style.and_then(|s| s.h_align) == Some(align)
+    }
+
+    /// Whether a vertical-alignment button is pressed — the active cell's resolved vertical
+    /// alignment (`functional_spec.md §1.3`). Under decision C the resolver reports a defaulted
+    /// bottom as `Some(Bottom)`, so a cell whose vertical is merely defaulted (e.g. only horizontal
+    /// set, or loaded from `.xlsx`) lights **Align bottom**; a truly-clean cell (no alignment
+    /// record at all) lights nothing but still renders bottom. Accepted Excel-ish behavior.
+    pub fn valign_active(&self, valign: VAlign) -> bool {
+        self.active_style.and_then(|s| s.v_align) == Some(valign)
     }
 
     /// The active cell's number-format [`Category`] (General on a multi-cell selection / no cache).
@@ -1512,6 +1671,137 @@ fn hsla_to_rgb(hsla: Hsla) -> Rgb {
     )
 }
 
+/// Which of the target icon's six segments `(top, bottom, left, right, inner_h, inner_v)` a
+/// `preset` paints **dark** (affected), the rest staying light-grey context (`ui_design.md §2.2`).
+/// The mask mirrors IronCalc's per-`BorderType` edges: All = all six, Inner = the inner cross,
+/// Outer = the perimeter, None = nothing, and each of Top/Bottom/Left/Right = its one outer edge.
+/// Split out from [`border_target_icon`] so this affordance-defining table is unit-testable (the
+/// render harness doesn't cover the chrome popover).
+fn border_target_icon_mask(preset: BorderPreset) -> (bool, bool, bool, bool, bool, bool) {
+    match preset {
+        BorderPreset::All => (true, true, true, true, true, true),
+        BorderPreset::Inner => (false, false, false, false, true, true),
+        BorderPreset::Outer => (true, true, true, true, false, false),
+        BorderPreset::None => (false, false, false, false, false, false),
+        BorderPreset::Top => (true, false, false, false, false, false),
+        BorderPreset::Bottom => (false, true, false, false, false, false),
+        BorderPreset::Left => (false, false, true, false, false, false),
+        BorderPreset::Right => (false, false, false, true, false, false),
+    }
+}
+
+/// A borders **target icon** (`ui_design.md §2.2`): a ~22px 2×2 mini-grid drawn from `div`
+/// rectangles. Every gridline is context light-grey (1px); the segments the `preset` affects are
+/// solid dark (2px, heavier). The six segments are the four outer edges + the inner cross (mid-H,
+/// mid-V); the per-preset dark mask ([`border_target_icon_mask`]) mirrors IronCalc's per-`BorderType`
+/// edges. Grey segments paint first so a dark segment always wins at a crossing.
+fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
+    let (top, bottom, left, right, inner_h, inner_v) = border_target_icon_mask(preset);
+    let near = 1.0;
+    let far = TARGET_ICON_PX - 1.0;
+    let mid = TARGET_ICON_PX / 2.0;
+    // A horizontal / vertical segment centered on `nominal`, spanning the inset box `[near, far]`
+    // extended by its own thickness `t` at each end so it reaches the OUTER edge of the
+    // perpendicular lines: corners meet flush (dark t=2 → full extent) with no gap or overhang.
+    let hline = |nominal: f32, dark: bool| {
+        let t = if dark { 2.0 } else { 1.0 };
+        div()
+            .absolute()
+            .left(px(near - t / 2.0))
+            .top(px(nominal - t / 2.0))
+            .w(px(far - near + t))
+            .h(px(t))
+            .bg(rgb(if dark {
+                TARGET_ICON_DARK
+            } else {
+                TARGET_ICON_GREY
+            }))
+    };
+    let vline = |nominal: f32, dark: bool| {
+        let t = if dark { 2.0 } else { 1.0 };
+        div()
+            .absolute()
+            .top(px(near - t / 2.0))
+            .left(px(nominal - t / 2.0))
+            .h(px(far - near + t))
+            .w(px(t))
+            .bg(rgb(if dark {
+                TARGET_ICON_DARK
+            } else {
+                TARGET_ICON_GREY
+            }))
+    };
+    // Each segment as (is_horizontal, nominal, dark).
+    let segments = [
+        (true, near, top),
+        (true, far, bottom),
+        (true, mid, inner_h),
+        (false, near, left),
+        (false, far, right),
+        (false, mid, inner_v),
+    ];
+    let mut icon = div()
+        .relative()
+        .flex_none()
+        .w(px(TARGET_ICON_PX))
+        .h(px(TARGET_ICON_PX));
+    // Grey first, then dark on top (so a dark segment wins where it crosses a grey one).
+    for &(is_h, nominal, _) in segments.iter().filter(|s| !s.2) {
+        icon = icon.child(if is_h {
+            hline(nominal, false)
+        } else {
+            vline(nominal, false)
+        });
+    }
+    for &(is_h, nominal, _) in segments.iter().filter(|s| s.2) {
+        icon = icon.child(if is_h {
+            hline(nominal, true)
+        } else {
+            vline(nominal, true)
+        });
+    }
+    icon.into_any_element()
+}
+
+/// A borders **line-style preview** (`ui_design.md §2.3`): a short horizontal sample of the real
+/// line, vertically centered in a ~34px box. Solid weights are one dark bar (1/2/3px); dashed is a
+/// row of short dark dashes; double is two 1px dark bars with a gap.
+fn border_line_preview(line: BorderLine) -> gpui::AnyElement {
+    const SAMPLE_W: f32 = 34.0;
+    let box_ = || {
+        div()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .w(px(SAMPLE_W))
+            .h(px(12.0))
+    };
+    let bar = |weight: f32| {
+        div()
+            .w(px(SAMPLE_W))
+            .h(px(weight))
+            .bg(rgb(TARGET_ICON_DARK))
+    };
+    match line {
+        BorderLine::ThinSolid => box_().child(bar(1.0)).into_any_element(),
+        BorderLine::MediumSolid => box_().child(bar(2.0)).into_any_element(),
+        BorderLine::ThickSolid => box_().child(bar(3.0)).into_any_element(),
+        BorderLine::Dashed => {
+            // A run of short dark dashes with gaps (5 dashes across the sample).
+            let mut dashes = div().flex().items_center().gap(px(2.0)).h(px(2.0));
+            for _ in 0..5 {
+                dashes = dashes.child(div().w(px(4.0)).h(px(2.0)).bg(rgb(TARGET_ICON_DARK)));
+            }
+            box_().child(dashes).into_any_element()
+        }
+        BorderLine::Double => box_()
+            .gap(px(1.0))
+            .child(bar(1.0))
+            .child(bar(1.0))
+            .into_any_element(),
+    }
+}
+
 /// Formats a font size in points for the size box, trimming a trailing `.0` (`13.0` → `"13"`,
 /// `10.5` → `"10.5"`) — the same look as [`font_size_display`] for explicit sizes.
 fn format_size_pt(pt: f64) -> String {
@@ -1627,6 +1917,25 @@ impl ChromeView {
                 }))
         };
 
+        // A vertical-alignment button (pressed = the cell's explicit vertical alignment). Mirrors
+        // `align_btn` but drives the vertical group (`ui_design.md §1.1`).
+        let valign_btn = |id: &'static str,
+                          tooltip: &'static str,
+                          valign: VAlign,
+                          glyph: &'static str,
+                          cx: &mut Context<Self>| {
+            Button::new(id)
+                .label(glyph)
+                .tooltip(tooltip)
+                .ghost()
+                .small()
+                .disabled(disabled)
+                .selected(self.valign_active(valign))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_valign(valign, window, cx);
+                }))
+        };
+
         div()
             .flex()
             .items_center()
@@ -1700,6 +2009,24 @@ impl ChromeView {
                 StyleAttr::Underline,
                 cx,
             ))
+            // Strikethrough (S with a combining long-stroke overlay) + Wrap text (⤶),
+            // appended to the B/I/U toggle group (`ui_design.md §1.1`, `functional_spec.md §1`).
+            .child(toggle(
+                "strikethrough",
+                "S\u{0336}",
+                "Strikethrough",
+                self.strikethrough_active(),
+                StyleAttr::Strikethrough,
+                cx,
+            ))
+            .child(toggle(
+                "wrap",
+                "\u{2936}",
+                "Wrap text",
+                self.wrap_active(),
+                StyleAttr::WrapText,
+                cx,
+            ))
             .child(action_divider())
             // Text color · Fill:
             .child(
@@ -1767,6 +2094,29 @@ impl ChromeView {
                 "Align right",
                 Align::Right,
                 "⇥",
+                cx,
+            ))
+            .child(action_divider())
+            // Vertical alignment — its own group after horizontal align (`ui_design.md §1.1`):
+            .child(valign_btn(
+                "valign-top",
+                "Align top",
+                VAlign::Top,
+                "\u{2912}",
+                cx,
+            ))
+            .child(valign_btn(
+                "valign-middle",
+                "Align middle",
+                VAlign::Center,
+                "\u{2015}",
+                cx,
+            ))
+            .child(valign_btn(
+                "valign-bottom",
+                "Align bottom",
+                VAlign::Bottom,
+                "\u{2913}",
                 cx,
             ))
             .child(action_divider())
@@ -2415,43 +2765,195 @@ impl ChromeView {
             .into_any_element()
     }
 
-    /// The borders popover: a 4×2 grid of preset actions (All/Inner/Outer/None over
-    /// Top/Bottom/Left/Right — `ui_design.md §2`). Presets are actions, not toggles, so no button
-    /// carries pressed state.
+    /// The borders **pen** popover (`ui_design.md §2`): three stacked regions — "Borders"
+    /// target icons, a "Line" style gallery, and a "Color" swatch grid + custom picker. A target
+    /// click paints the pen onto just those edges and keeps the popover open; only click-away / Esc
+    /// closes it. The current target/pen is shown `.selected`.
     fn render_borders_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let preset_btn = |id: &'static str,
-                          label: &'static str,
+        // Region A — the eight "Borders" target icons (icon-only, so each carries a tooltip).
+        let target_btn = |id: &'static str,
+                          name: &'static str,
                           preset: BorderPreset,
+                          this: &Self,
                           cx: &mut Context<Self>| {
             Button::new(id)
-                .label(label)
                 .debug_selector(move || id.to_string())
                 .ghost()
                 .small()
-                .w(px(64.0))
+                .w(px(40.0))
+                .h(px(34.0))
+                .tooltip(name)
+                .selected(this.border_target == Some(preset))
+                .child(border_target_icon(preset))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.apply_borders(preset, window, cx);
+                    this.select_border_target(preset, window, cx);
                 }))
         };
         let row1 = div()
             .flex()
             .gap_1()
-            .child(preset_btn("border-all", "All", BorderPreset::All, cx))
-            .child(preset_btn("border-inner", "Inner", BorderPreset::Inner, cx))
-            .child(preset_btn("border-outer", "Outer", BorderPreset::Outer, cx))
-            .child(preset_btn("border-none", "None", BorderPreset::None, cx));
+            .child(target_btn("border-all", "All", BorderPreset::All, self, cx))
+            .child(target_btn(
+                "border-inner",
+                "Inner",
+                BorderPreset::Inner,
+                self,
+                cx,
+            ))
+            .child(target_btn(
+                "border-outer",
+                "Outer",
+                BorderPreset::Outer,
+                self,
+                cx,
+            ))
+            .child(target_btn(
+                "border-none",
+                "None",
+                BorderPreset::None,
+                self,
+                cx,
+            ));
         let row2 = div()
             .flex()
             .gap_1()
-            .child(preset_btn("border-top", "Top", BorderPreset::Top, cx))
-            .child(preset_btn(
+            .child(target_btn("border-top", "Top", BorderPreset::Top, self, cx))
+            .child(target_btn(
                 "border-bottom",
                 "Bottom",
                 BorderPreset::Bottom,
+                self,
                 cx,
             ))
-            .child(preset_btn("border-left", "Left", BorderPreset::Left, cx))
-            .child(preset_btn("border-right", "Right", BorderPreset::Right, cx));
+            .child(target_btn(
+                "border-left",
+                "Left",
+                BorderPreset::Left,
+                self,
+                cx,
+            ))
+            .child(target_btn(
+                "border-right",
+                "Right",
+                BorderPreset::Right,
+                self,
+                cx,
+            ));
+
+        // Region B — the line-style gallery (each button previews the real line).
+        let line_btn = |id: &'static str,
+                        name: &'static str,
+                        line: BorderLine,
+                        this: &Self,
+                        cx: &mut Context<Self>| {
+            Button::new(id)
+                .debug_selector(move || id.to_string())
+                .ghost()
+                .small()
+                .h(px(28.0))
+                .tooltip(name)
+                .selected(this.border_line == line)
+                .child(border_line_preview(line))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.set_border_line(line, window, cx);
+                }))
+        };
+        let gallery = div()
+            .flex()
+            .gap_1()
+            .child(line_btn(
+                "border-line-thin",
+                "Thin",
+                BorderLine::ThinSolid,
+                self,
+                cx,
+            ))
+            .child(line_btn(
+                "border-line-medium",
+                "Medium",
+                BorderLine::MediumSolid,
+                self,
+                cx,
+            ))
+            .child(line_btn(
+                "border-line-thick",
+                "Thick",
+                BorderLine::ThickSolid,
+                self,
+                cx,
+            ))
+            .child(line_btn(
+                "border-line-dashed",
+                "Dashed",
+                BorderLine::Dashed,
+                self,
+                cx,
+            ))
+            .child(line_btn(
+                "border-line-double",
+                "Double",
+                BorderLine::Double,
+                self,
+                cx,
+            ));
+
+        // Region C — the color swatches (verbatim reuse of the fill popover's `FILL_PALETTE` grid;
+        // the current pen color's swatch is ringed) + the inline "Custom…" picker.
+        let mut swatches = div().flex().flex_col().gap_1();
+        for chunk in FILL_PALETTE.chunks(5) {
+            let mut r = div().flex().gap_1();
+            for swatch in chunk {
+                let color = swatch.rgb;
+                let selected = color == self.border_color;
+                r = r.child(
+                    div()
+                        .id(gpui::ElementId::Name(
+                            format!("border-swatch-{}", swatch.name).into(),
+                        ))
+                        .debug_selector(|| format!("border-swatch-{}", swatch.name))
+                        .w(px(20.0))
+                        .h(px(20.0))
+                        .rounded_sm()
+                        .bg(rgb(color.to_hex()))
+                        // Ring the pen's current swatch (a 2px accent border) so the selected color
+                        // reads over any swatch fill; others keep the hairline outline.
+                        .border_2()
+                        .border_color(rgb(if selected {
+                            SWATCH_SELECTED_RING
+                        } else {
+                            HAIRLINE
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                this.set_border_color(color, window, cx);
+                            }),
+                        ),
+                );
+            }
+            swatches = swatches.child(r);
+        }
+        let color_region = div().flex().flex_col().gap_1().child(swatches).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(MUTED_TEXT))
+                        .child("Custom…"),
+                )
+                .child(ColorPicker::new(&self.border_color_picker).small()),
+        );
+
+        let section_label = |text: &'static str| {
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(MUTED_TEXT))
+                .child(text)
+        };
+        let divider = || div().h(px(1.0)).bg(rgb(HAIRLINE));
 
         div()
             .absolute()
@@ -2484,8 +2986,14 @@ impl ChromeView {
                     .border_color(rgb(HAIRLINE))
                     .rounded_md()
                     .shadow_md()
+                    .child(section_label("Borders"))
                     .child(row1)
-                    .child(row2),
+                    .child(row2)
+                    .child(divider())
+                    .child(section_label("Line"))
+                    .child(gallery)
+                    .child(section_label("Color"))
+                    .child(color_region),
             )
             .into_any_element()
     }
@@ -2738,7 +3246,10 @@ mod tests {
         let mut chrome_out: Option<Entity<ChromeView>> = None;
         let chrome_slot = &mut chrome_out;
 
-        let window = cx.open_window(size(px(900.0), px(height)), |window, cx| {
+        // The test window matches the real document window width (1200 px) so the full action row
+        // — including the number-format popover trigger past the vertical-align group — is on-screen
+        // for the popover-hit tests (the row's natural width is ~1080 px, `ACTION_ROW_MIN_W`).
+        let window = cx.open_window(size(px(1200.0), px(height)), |window, cx| {
             let client_dyn: Rc<dyn ChromeClient> = client_for_window;
             let reqs = reqs_for_window;
             let sink = ChromeGridSink::new(move |req, _w, _cx| reqs.borrow_mut().push(req.clone()));
@@ -3099,6 +3610,54 @@ mod tests {
     }
 
     #[gpui::test]
+    fn strikethrough_and_wrap_toggles_send_setstyleattr(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_style(StyleAttr::Strikethrough, window, cx)
+        });
+        assert!(matches!(
+            h.client.take_commands().as_slice(),
+            [Command::SetStyleAttr {
+                attr: StyleAttr::Strikethrough,
+                ..
+            }]
+        ));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_style(StyleAttr::WrapText, window, cx)
+        });
+        assert!(matches!(
+            h.client.take_commands().as_slice(),
+            [Command::SetStyleAttr {
+                attr: StyleAttr::WrapText,
+                ..
+            }]
+        ));
+    }
+
+    #[gpui::test]
+    fn strikethrough_and_wrap_reflect_active_style(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                strikethrough: true,
+                wrap: false,
+                ..Default::default()
+            },
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        assert!(upd(&h, cx, |c, _w, _cx| c.strikethrough_active()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.wrap_active()));
+    }
+
+    #[gpui::test]
     fn fill_swatch_and_no_fill(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
         upd(&h, cx, |c, window, cx| {
@@ -3197,6 +3756,52 @@ mod tests {
         assert!(matches!(
             cmds.as_slice(),
             [Command::SetStylePath { path: StylePath::AlignHorizontal, value, .. }] if value == "left"
+        ));
+    }
+
+    #[gpui::test]
+    fn vertical_alignment_sets_and_reflects(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // The active cell is explicitly top-aligned → the Top button reads pressed, others not.
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                v_align: Some(VAlign::Top),
+                ..Default::default()
+            },
+        );
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.valign_active(VAlign::Top)));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.valign_active(VAlign::Bottom)));
+
+        // Pressing a vertical-align button is a plain set (no re-press-to-clear).
+        upd(&h, cx, |c, window, cx| {
+            c.apply_valign(VAlign::Bottom, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetStylePath { path: StylePath::AlignVertical, value, .. }] if value == "bottom"
+        ));
+
+        // Re-pressing the already-active alignment re-applies it (no clear value).
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                v_align: Some(VAlign::Center),
+                ..Default::default()
+            },
+        );
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, window, cx| {
+            c.apply_valign(VAlign::Center, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetStylePath { path: StylePath::AlignVertical, value, .. }] if value == "center"
         ));
     }
 
@@ -3629,7 +4234,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn borders_all_click_applies_and_closes(cx: &mut TestAppContext) {
+    fn border_target_icon_click_paints_and_stays_open(cx: &mut TestAppContext) {
+        // Pen model (`functional_spec.md §2.1`): a real click on the "All" target icon paints the
+        // pen onto those edges AND — unlike the old apply-and-close preset path — leaves the
+        // popover open with the target selected. `press_popover_button` already asserts the
+        // mouse-DOWN doesn't dismiss; here we additionally assert it is still open after mouse-UP.
         let h = tall_sheet(cx);
         select_single(&h, cx, 1, 1);
         let cmds = press_popover_button(
@@ -3644,12 +4253,22 @@ mod tests {
                 cmds.as_slice(),
                 [Command::SetBorders {
                     preset: BorderPreset::All,
+                    line: BorderLine::ThinSolid,
+                    color: Some(rgb),
                     ..
-                }]
+                }] if rgb.to_hex() == 0x000000
             ),
-            "clicking All must dispatch the All border preset, got {cmds:?}"
+            "clicking All must paint the default thin-solid-black pen onto All, got {cmds:?}"
         );
-        assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.borders_open),
+            "the popover must STAY OPEN after a target click (pen model)"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_target()),
+            Some(BorderPreset::All),
+            "the clicked target must become selected"
+        );
     }
 
     #[gpui::test]
@@ -3736,7 +4355,29 @@ mod tests {
         );
     }
 
-    // ---- Action row: SetBorders (preset popover) ------------------------------------------
+    // ---- Action row: SetBorders (pen popover) ---------------------------------------------
+
+    /// The pen dispatched by one `SetBorders`, asserting it is the single command and returning its
+    /// `(preset, line, color)` for the test to check. Also asserts the range is the whole selection.
+    fn one_border_cmd(cmds: &[Command]) -> (BorderPreset, BorderLine, Option<Rgb>) {
+        match cmds {
+            [Command::SetBorders {
+                preset,
+                line,
+                color,
+                range,
+                ..
+            }] => {
+                assert_eq!(
+                    *range,
+                    freecell_core::CellRange::single(cell(1, 1)),
+                    "the paint must cover the selection"
+                );
+                (*preset, *line, *color)
+            }
+            other => panic!("expected exactly one SetBorders, got {other:?}"),
+        }
+    }
 
     #[gpui::test]
     fn borders_popover_toggles(cx: &mut TestAppContext) {
@@ -3749,24 +4390,240 @@ mod tests {
     }
 
     #[gpui::test]
-    fn apply_borders_sends_command_over_selection(cx: &mut TestAppContext) {
+    fn select_border_target_paints_and_stays_open(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
-        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
         select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        h.client.take_commands();
         upd(&h, cx, |c, window, cx| {
-            c.apply_borders(BorderPreset::All, window, cx)
+            c.select_border_target(BorderPreset::Outer, window, cx)
         });
-        let cmds = h.client.take_commands();
-        assert!(
-            matches!(
-                cmds.as_slice(),
-                [Command::SetBorders { preset: BorderPreset::All, range, .. }]
-                    if *range == freecell_core::CellRange::single(cell(1, 1))
-            ),
-            "picking a preset dispatches one SetBorders over the selection, got {cmds:?}"
+        let (preset, line, color) = one_border_cmd(&h.client.take_commands());
+        assert_eq!(preset, BorderPreset::Outer);
+        assert_eq!(line, BorderLine::ThinSolid, "the default pen line");
+        assert_eq!(
+            color.map(|c| c.to_hex()),
+            Some(0x000000),
+            "the default pen color (explicit black)"
         );
-        // Picking closes the popover.
-        assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open()));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.borders_open()),
+            "a target click keeps the popover open (pen model)"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_target()),
+            Some(BorderPreset::Outer)
+        );
+    }
+
+    #[gpui::test]
+    fn set_border_line_with_target_repaints(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        upd(&h, cx, |c, window, cx| {
+            c.select_border_target(BorderPreset::Outer, window, cx)
+        });
+        h.client.take_commands();
+        // Changing the line with a target selected repaints that target with the new pen.
+        upd(&h, cx, |c, window, cx| {
+            c.set_border_line(BorderLine::Dashed, window, cx)
+        });
+        let (preset, line, _) = one_border_cmd(&h.client.take_commands());
+        assert_eq!((preset, line), (BorderPreset::Outer, BorderLine::Dashed));
+    }
+
+    #[gpui::test]
+    fn set_border_color_with_target_repaints(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        upd(&h, cx, |c, window, cx| {
+            c.select_border_target(BorderPreset::Outer, window, cx)
+        });
+        h.client.take_commands();
+        let red = Rgb::from_hex(0xFF0000);
+        upd(&h, cx, |c, window, cx| c.set_border_color(red, window, cx));
+        let (preset, _, color) = one_border_cmd(&h.client.take_commands());
+        assert_eq!(preset, BorderPreset::Outer);
+        assert_eq!(color, Some(red), "the target repaints in the new pen color");
+    }
+
+    #[gpui::test]
+    fn pen_carries_across_target_switch(cx: &mut TestAppContext) {
+        // Set a non-default pen on Outer, then switch to Top — the carried-over pen paints Top.
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        upd(&h, cx, |c, window, cx| {
+            c.select_border_target(BorderPreset::Outer, window, cx)
+        });
+        let red = Rgb::from_hex(0xFF0000);
+        upd(&h, cx, |c, window, cx| {
+            c.set_border_line(BorderLine::Dashed, window, cx);
+            c.set_border_color(red, window, cx);
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.select_border_target(BorderPreset::Top, window, cx)
+        });
+        let (preset, line, color) = one_border_cmd(&h.client.take_commands());
+        assert_eq!(preset, BorderPreset::Top);
+        assert_eq!(
+            line,
+            BorderLine::Dashed,
+            "pen line carries across the switch"
+        );
+        assert_eq!(color, Some(red), "pen color carries across the switch");
+    }
+
+    #[gpui::test]
+    fn set_border_line_without_target_updates_pen_only(cx: &mut TestAppContext) {
+        // No target selected: changing the line updates the pen but changes nothing on the sheet
+        // (MVP; P2 restyle-all is deferred — GAPS F2).
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.set_border_line(BorderLine::ThickSolid, window, cx)
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "changing the line with no target selected must not touch the sheet"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_line()),
+            BorderLine::ThickSolid,
+            "the pen still updates (the next target click paints with it)"
+        );
+    }
+
+    #[gpui::test]
+    fn set_border_color_without_target_updates_pen_only(cx: &mut TestAppContext) {
+        // Symmetric to the line path: with no target selected, changing the color updates the pen
+        // only — no sheet change (MVP; P2 restyle-all is deferred — GAPS F2).
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        h.client.take_commands();
+        let red = Rgb::from_hex(0xFF0000);
+        upd(&h, cx, |c, window, cx| c.set_border_color(red, window, cx));
+        assert!(
+            h.client.take_commands().is_empty(),
+            "changing the color with no target selected must not touch the sheet"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_color()),
+            red,
+            "the pen still updates (the next target click paints with it)"
+        );
+    }
+
+    #[gpui::test]
+    fn border_none_clears_and_deselects(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        // Select a real target first so we can see None clear it.
+        upd(&h, cx, |c, window, cx| {
+            c.select_border_target(BorderPreset::Outer, window, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.select_border_target(BorderPreset::None, window, cx)
+        });
+        let (preset, _, _) = one_border_cmd(&h.client.take_commands());
+        assert_eq!(preset, BorderPreset::None, "None dispatches a clear");
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_target()),
+            None,
+            "None leaves no target selected"
+        );
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.borders_open()),
+            "None clears but does not close the popover (only click-away/Esc closes)"
+        );
+    }
+
+    #[test]
+    fn border_target_icon_mask_matches_border_type_edges() {
+        // The 2×2 icon's per-preset dark-edge table is the one piece of new UI logic with no render
+        // coverage (the harness doesn't render the chrome popover), so pin it here: a future
+        // Top/Bottom (or inner/outer) swap fails loudly. Tuple = (top, bottom, left, right,
+        // inner_h, inner_v). Mirrors `functional_spec.md §2.2` / IronCalc's per-`BorderType` edges.
+        use BorderPreset::*;
+        assert_eq!(
+            border_target_icon_mask(All),
+            (true, true, true, true, true, true),
+            "All darkens every outer edge + the inner cross"
+        );
+        assert_eq!(
+            border_target_icon_mask(Inner),
+            (false, false, false, false, true, true),
+            "Inner darkens only the inner cross"
+        );
+        assert_eq!(
+            border_target_icon_mask(Outer),
+            (true, true, true, true, false, false),
+            "Outer darkens only the perimeter"
+        );
+        assert_eq!(
+            border_target_icon_mask(BorderPreset::None),
+            (false, false, false, false, false, false),
+            "None darkens nothing (all grey)"
+        );
+        assert_eq!(
+            border_target_icon_mask(Top),
+            (true, false, false, false, false, false),
+            "Top darkens only the top outer edge"
+        );
+        assert_eq!(
+            border_target_icon_mask(Bottom),
+            (false, true, false, false, false, false),
+            "Bottom darkens only the bottom outer edge"
+        );
+        assert_eq!(
+            border_target_icon_mask(Left),
+            (false, false, true, false, false, false),
+            "Left darkens only the left outer edge"
+        );
+        assert_eq!(
+            border_target_icon_mask(Right),
+            (false, false, false, true, false, false),
+            "Right darkens only the right outer edge"
+        );
+    }
+
+    #[gpui::test]
+    fn borders_reopen_resets_target_and_pen(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        // Dirty the transient state: a target + a non-default pen.
+        upd(&h, cx, |c, window, cx| {
+            c.select_border_target(BorderPreset::Outer, window, cx);
+            c.set_border_line(BorderLine::Double, window, cx);
+            c.set_border_color(Rgb::from_hex(0xFF0000), window, cx);
+        });
+        // Close, then reopen.
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_target()),
+            None,
+            "reopen resets the target"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_line()),
+            BorderLine::ThinSolid,
+            "reopen resets the pen line to the default"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_color().to_hex()),
+            0x000000,
+            "reopen resets the pen color to black"
+        );
     }
 
     #[gpui::test]
@@ -3775,14 +4632,19 @@ mod tests {
         select_single(&h, cx, 1, 1);
         upd(&h, cx, |c, _w, cx| c.toggle_borders_popover(cx));
         upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
-        // The popover is force-closed and a preset click can no longer dispatch.
+        // The popover is force-closed and a target click can no longer dispatch.
         assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open()));
         upd(&h, cx, |c, window, cx| {
-            c.apply_borders(BorderPreset::Outer, window, cx)
+            c.select_border_target(BorderPreset::Outer, window, cx)
         });
         assert!(
             h.client.take_commands().is_empty(),
             "no SetBorders dispatches while degraded"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.border_target()),
+            None,
+            "a degraded target click leaves no target selected"
         );
     }
 

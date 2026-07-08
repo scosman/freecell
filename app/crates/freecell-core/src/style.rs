@@ -16,10 +16,21 @@ pub enum Align {
     Right,
 }
 
-/// A resolved, ready-to-draw cell style. All fields describe *only* what the MVP grid
-/// paints; anything the engine models but the grid ignores (borders, strikethrough, wrap,
-/// vertical align, …) is intentionally absent — it is preserved in the engine and on save,
-/// never in this render form (`functional_spec.md §3.6`).
+/// Vertical text alignment (parallel to the horizontal [`Align`]). `None` on a [`RenderStyle`]
+/// means "no explicit vertical alignment" — the grid keeps its default vertical placement, so a
+/// cell only moves when it opts in (`functional_spec.md §1.3`). Excel's `Justify`/`Distributed`
+/// are out of scope and resolve to `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VAlign {
+    Top,
+    Center,
+    Bottom,
+}
+
+/// A resolved, ready-to-draw cell style. All fields describe *only* what the grid paints;
+/// anything the engine models but the grid ignores (diagonal borders, justify/distributed
+/// alignment, …) is intentionally absent — it is preserved in the engine and on save, never in
+/// this render form (`functional_spec.md §3.6`).
 ///
 /// `Default` (all fields zero/`None`/`false`) is the plain cell whose `num_fmt` index `0` resolves
 /// to `"general"` and whose `font_size_q`/`font_family` `0` mean "the workbook default font" — so a
@@ -29,6 +40,13 @@ pub struct RenderStyle {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// Strikethrough: a horizontal line through the vertical middle of the cell text (IronCalc
+    /// `font.strike`). Toggled like [`bold`](Self::bold); combines with `underline`.
+    pub strikethrough: bool,
+    /// Wrap text: when set, the cell's text wraps to the column width and renders as multiple
+    /// lines clipped to the row height (IronCalc `alignment.wrap_text`); when unset, the current
+    /// single-line behavior is unchanged (`functional_spec.md §1.2`).
+    pub wrap: bool,
     /// Background fill, if any (`None` = the default white cell).
     pub fill: Option<Rgb>,
     /// Explicit font colour, e.g. a number-format `[Red]` override (`None` = near-black
@@ -36,6 +54,9 @@ pub struct RenderStyle {
     pub font_color: Option<Rgb>,
     /// Explicit horizontal alignment (`None` = engine default by cell type).
     pub h_align: Option<Align>,
+    /// Explicit vertical alignment (`None` = the grid's default vertical placement — unset cells
+    /// don't move, `functional_spec.md §1.3`).
+    pub v_align: Option<VAlign>,
     /// Index into the owning [`SheetCache`](crate::SheetCache)'s `num_fmts` side table for
     /// this cell's number-format code string; `0` = the default `"general"`. The grid does
     /// not render from this (display text is engine-formatted in the publication) — it is the
@@ -72,9 +93,11 @@ mod tests {
     fn render_style_default_is_plain() {
         let s = RenderStyle::default();
         assert!(!s.bold && !s.italic && !s.underline);
+        assert!(!s.strikethrough && !s.wrap);
         assert_eq!(s.fill, None);
         assert_eq!(s.font_color, None);
         assert_eq!(s.h_align, None);
+        assert_eq!(s.v_align, None);
         assert_eq!(
             s.num_fmt, 0,
             "a default cell uses the General format (index 0)"

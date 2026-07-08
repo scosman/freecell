@@ -16,15 +16,21 @@ use freecell_core::{CellRange, CellRef, Rgb, SheetId};
 
 use crate::document::{LoadError, SaveError};
 
-/// A character/fill style change (`SetStyleAttr`). Bold / italic / underline are **toggles**
-/// resolved worker-side — "any cell in the range lacks it → set the whole range, else clear
-/// the whole range" (`components/engine_worker.md §SetStyleAttr`). `Fill` is a direct set
-/// (`Some(color)`) or clear (`None`), matching the fill popover's swatches + "No Fill".
+/// A character/fill style change (`SetStyleAttr`). Bold / italic / underline / strikethrough /
+/// wrap-text are **toggles** resolved worker-side — "any cell in the range lacks it → set the
+/// whole range, else clear the whole range" (`components/engine_worker.md §SetStyleAttr`). `Fill`
+/// is a direct set (`Some(color)`) or clear (`None`), matching the fill popover's swatches + "No
+/// Fill".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StyleAttr {
     Bold,
     Italic,
     Underline,
+    /// Strikethrough (`font.strike`) — toggles like [`Bold`](StyleAttr::Bold).
+    Strikethrough,
+    /// Wrap text (`alignment.wrap_text`) — toggles like [`Bold`](StyleAttr::Bold): any cell in the
+    /// range lacking wrap → set the whole range, else clear it.
+    WrapText,
     Fill(Option<Rgb>),
 }
 
@@ -39,6 +45,10 @@ pub enum StylePath {
     /// `alignment.horizontal` — `left|center|right` sets, `general` clears horizontal only
     /// (leaving any file-loaded vertical/wrap alignment intact).
     AlignHorizontal,
+    /// `alignment.vertical` — `top|center|bottom` sets the cell's vertical alignment (a plain set,
+    /// exactly like [`AlignHorizontal`](StylePath::AlignHorizontal); no toggle). Justify/Distributed
+    /// are out of scope.
+    AlignVertical,
     /// `num_fmt` — the raw number-format code (one of the dropdown codes, or a decimals-adjusted
     /// derivative).
     NumFmt,
@@ -50,15 +60,18 @@ impl StylePath {
         match self {
             StylePath::FontColor => "font.color",
             StylePath::AlignHorizontal => "alignment.horizontal",
+            StylePath::AlignVertical => "alignment.vertical",
             StylePath::NumFmt => "num_fmt",
         }
     }
 }
 
 /// A fixed border preset the borders popover applies over the selection (`functional_spec.md §3.6`,
-/// `components/action_bar.md`). Each maps 1:1 to an IronCalc `BorderType` (thin black only — the
-/// worker builds the `BorderArea` from [`border_type_tag`](BorderPreset::border_type_tag)). Kept a
-/// plain enum (no IronCalc type crosses the seam), mirroring [`StylePath`].
+/// `components/action_bar.md`). Each maps 1:1 to an IronCalc `BorderType` and selects **which edges**
+/// are written (the worker builds the `BorderArea` `"type"` from
+/// [`border_type_tag`](BorderPreset::border_type_tag)); it is orthogonal to the line style + color,
+/// which the pen ([`BorderLine`] + `color`) carries. Kept a plain enum (no IronCalc type crosses the
+/// seam), mirroring [`StylePath`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorderPreset {
     /// Every edge of every selected cell.
@@ -77,6 +90,40 @@ pub enum BorderPreset {
     Right,
     /// Clears all borders in the selection.
     None,
+}
+
+/// The line style the borders control paints — the pen's `style`, mirroring the line-style
+/// gallery (`architecture.md §2`, `functional_spec.md §2.3`). Engine-free: it maps to an IronCalc
+/// `BorderStyle` serde tag via [`style_tag`](BorderLine::style_tag). The MVP set (thin/medium/thick
+/// solid, dashed, double) is fully `.xlsx`-representable; Dotted / dash-dot are deferred (GAPS F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderLine {
+    /// Thin (1px) solid — the default pen (`"thin"`).
+    #[default]
+    ThinSolid,
+    /// Medium (2px) solid (`"medium"`).
+    MediumSolid,
+    /// Thick (3px) solid (`"thick"`).
+    ThickSolid,
+    /// Dashed (2px, IronCalc `MediumDashed` — `"mediumdashed"`).
+    Dashed,
+    /// Double (3px, two thin parallel lines — `"double"`).
+    Double,
+}
+
+impl BorderLine {
+    /// The IronCalc `BorderStyle` serde tag for this line (the `"style"` field of the JSON-built
+    /// `BorderArea` item, `architecture.md §4`). All five round-trip through `.xlsx`. Same plain
+    /// pattern as [`BorderPreset::border_type_tag`] — no engine type crosses the seam.
+    pub fn style_tag(self) -> &'static str {
+        match self {
+            BorderLine::ThinSolid => "thin",
+            BorderLine::MediumSolid => "medium",
+            BorderLine::ThickSolid => "thick",
+            BorderLine::Dashed => "mediumdashed",
+            BorderLine::Double => "double",
+        }
+    }
 }
 
 impl BorderPreset {
@@ -145,14 +192,19 @@ pub enum Command {
         family: Option<String>,
         size_pt: Option<f64>,
     },
-    /// Apply a border preset over a range (`architecture.md §3.4`, `components/action_bar.md`).
-    /// Style-only (no evaluation): applied via IronCalc `set_area_with_border` — one undoable
-    /// diff-list, band-aware for full rows/columns, with the engine's heavier-wins fix-up on the
-    /// four adjacent strips. Fire-and-forget (log-only on engine rejection). Thin black only.
+    /// Apply a border preset over a range with a given line style + color
+    /// (`architecture.md §2/§4`, `components/action_bar.md`). Style-only (no evaluation): applied
+    /// via IronCalc `set_area_with_border` — one undoable diff-list, band-aware for full rows/
+    /// columns, with the engine's heavier-wins fix-up on the four adjacent strips. Fire-and-forget
+    /// (log-only on engine rejection). The written border item carries `line`'s
+    /// [`style_tag`](BorderLine::style_tag) and `color` (`None` ⇒ default black); non-targeted edges
+    /// are preserved (the `preset`'s `BorderType` implies which edges are written).
     SetBorders {
         sheet: SheetId,
         range: CellRange,
         preset: BorderPreset,
+        line: BorderLine,
+        color: Option<Rgb>,
     },
     /// Set the width of an inclusive column run `[col_start, col_end]` (0-based) to `px`
     /// **device px** (`functional_spec.md §5.1`). Geometry-only (no evaluation): applied via
@@ -340,4 +392,22 @@ pub enum WorkerEvent {
     /// The worker hit an unrecoverable panic and is degraded: it keeps serving the last good
     /// publication + reads/save, but refuses edits. The UI shows the error bar + Save As.
     WorkerDegraded { reason: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn border_line_style_tags_are_stable_ironcalc_serde_tags() {
+        // All five map to a lowercase IronCalc `BorderStyle` serde tag; Phase 3's gallery depends on
+        // these exact strings (`architecture.md §4`).
+        assert_eq!(BorderLine::ThinSolid.style_tag(), "thin");
+        assert_eq!(BorderLine::MediumSolid.style_tag(), "medium");
+        assert_eq!(BorderLine::ThickSolid.style_tag(), "thick");
+        assert_eq!(BorderLine::Dashed.style_tag(), "mediumdashed");
+        assert_eq!(BorderLine::Double.style_tag(), "double");
+        // The pen defaults to thin solid black.
+        assert_eq!(BorderLine::default(), BorderLine::ThinSolid);
+    }
 }

@@ -62,8 +62,9 @@ pub fn formulas() -> WorkbookDocument {
     doc
 }
 
-/// Character-format styles: bold, italic, underline, a solid red fill, and a blue font
-/// colour (one attribute per cell for interpretable round-trip assertions).
+/// Character-format styles: bold, italic, underline, strikethrough, a solid red fill, a blue
+/// font colour, wrap-text, and a vertical alignment (one attribute per cell for interpretable
+/// round-trip assertions).
 pub fn styles() -> WorkbookDocument {
     let mut doc = WorkbookDocument::new_empty().expect("new empty workbook");
     set(&mut doc, 0, CellRef::new(0, 0), "1"); // A1
@@ -76,6 +77,18 @@ pub fn styles() -> WorkbookDocument {
     style(&mut doc, 0, CellRef::new(1, 0), "fill.fg_color", "#FF0000");
     set(&mut doc, 0, CellRef::new(1, 1), "5"); // B2
     style(&mut doc, 0, CellRef::new(1, 1), "font.color", "#0000FF");
+    set(&mut doc, 0, CellRef::new(0, 3), "6"); // D1
+    style(&mut doc, 0, CellRef::new(0, 3), "font.strike", "true");
+    set(&mut doc, 0, CellRef::new(1, 3), "7"); // D2
+    style(
+        &mut doc,
+        0,
+        CellRef::new(1, 3),
+        "alignment.wrap_text",
+        "true",
+    );
+    set(&mut doc, 0, CellRef::new(2, 3), "8"); // D3
+    style(&mut doc, 0, CellRef::new(2, 3), "alignment.vertical", "top");
     doc
 }
 

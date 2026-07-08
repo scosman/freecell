@@ -8,22 +8,52 @@
 
 use crate::color::Rgb;
 
-/// One drawn cell edge: a solid line `weight` px wide in `color`. `weight` is `1|2|3` px — the
-/// three visual classes IronCalc's nine `BorderStyle`s collapse to (`architecture.md §1.1`; the
-/// worker owns that mapping, since it names the engine enum). Dotted/dashed families are drawn
-/// solid (SP5-accepted fidelity).
+/// The line pattern an [`Edge`] draws (`architecture.md §1`). The worker resolves it from the
+/// IronCalc `BorderStyle`: `MediumDashed → Dashed`, `Double → Double`, everything else (thin/
+/// medium/thick solid, and the deferred Dotted / dash-dot / SlantDashDot families) → `Solid`.
+/// Dotted is deferred (GAPS F3) — it renders `Solid` for now, unchanged from before this landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LinePattern {
+    /// A single filled strip (the default; how every non-dashed, non-double edge draws).
+    #[default]
+    Solid,
+    /// Evenly spaced dashes along the edge (IronCalc `MediumDashed`).
+    Dashed,
+    /// Two thin parallel strips separated by a gap, spanning the edge weight (IronCalc `Double`).
+    Double,
+}
+
+/// One drawn cell edge: a line `weight` px wide in `color`, drawn with `pattern`. `weight` is
+/// `1|2|3` px — the three visual classes IronCalc's nine `BorderStyle`s collapse to
+/// (`architecture.md §1.1`; the worker owns that mapping, since it names the engine enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Edge {
     /// Line thickness in device px: `1` (thin/dotted), `2` (medium family), `3` (thick/double).
     pub weight: u8,
     /// Line colour (default `#000` when the engine border item carries none).
     pub color: Rgb,
+    /// Line pattern (Solid / Dashed / Double — `architecture.md §7`).
+    pub pattern: LinePattern,
 }
 
 impl Edge {
-    /// A solid edge of the given px `weight` and `color`.
+    /// A **solid** edge of the given px `weight` and `color` (the common case — every edge that
+    /// isn't dashed or double). Kept as the primary constructor so existing callers are unchanged.
     pub const fn new(weight: u8, color: Rgb) -> Self {
-        Self { weight, color }
+        Self {
+            weight,
+            color,
+            pattern: LinePattern::Solid,
+        }
+    }
+
+    /// An edge with an explicit `pattern` (used by the cache resolver for dashed / double).
+    pub const fn with_pattern(weight: u8, color: Rgb, pattern: LinePattern) -> Self {
+        Self {
+            weight,
+            color,
+            pattern,
+        }
     }
 }
 
@@ -110,5 +140,30 @@ mod tests {
         let own = Edge::new(2, Rgb::new(0xAA, 0, 0));
         let nbr = Edge::new(2, Rgb::new(0, 0, 0xBB));
         assert_eq!(effective_edge(Some(own), Some(nbr)), Some(own));
+    }
+
+    #[test]
+    fn edge_new_is_solid_with_pattern_carries_pattern() {
+        assert_eq!(Edge::new(1, Rgb::new(0, 0, 0)).pattern, LinePattern::Solid);
+        assert_eq!(LinePattern::default(), LinePattern::Solid);
+        let dashed = Edge::with_pattern(2, Rgb::new(0, 0, 0), LinePattern::Dashed);
+        assert_eq!(dashed.pattern, LinePattern::Dashed);
+        assert_eq!(dashed.weight, 2);
+    }
+
+    #[test]
+    fn effective_edge_winner_carries_its_own_pattern() {
+        // Weight still decides the winner; the winning edge brings its pattern along.
+        let thin_dashed = Edge::with_pattern(1, Rgb::new(0, 0, 0), LinePattern::Dashed);
+        let thick_double = Edge::with_pattern(3, Rgb::new(0, 0, 0), LinePattern::Double);
+        assert_eq!(
+            effective_edge(Some(thin_dashed), Some(thick_double)),
+            Some(thick_double),
+            "heavier double edge wins and keeps its Double pattern"
+        );
+        assert_eq!(
+            effective_edge(Some(thick_double), Some(thin_dashed)),
+            Some(thick_double),
+        );
     }
 }

@@ -8,6 +8,21 @@ Redesign of the welcome window (`crates/freecell-app/src/shell/welcome.rs`) and 
 File menu (`menus.rs`). The mockups define **layout and hierarchy**; **colors come from the
 existing app palette**, not the mockups (§0).
 
+## Design fidelity (read first)
+
+The mockups are **directional, not pixel-perfect specs**. They are decent layouts drawn
+without our design system — do **not** reproduce them exactly. Instead:
+
+- Use our **standard palette tokens** (§0), never the mockups' ad-hoc hexes.
+- Prefer **gpui-component controls** and the app's existing GPUI idioms (`Button`, the same
+  `div()` styling patterns used in `welcome.rs` / `chrome/view.rs`) over bespoke widgets.
+- All px sizes/paddings/gaps below are **approximate guidance** — round to what reads clean
+  and matches neighboring chrome (the action row / titlebar spacing), not to the PNG.
+- Keep the code clean and idiomatic. Favor native-feel and consistency with the rest of the
+  app over faithfully matching the mockup's spacing, card radius, or shadows.
+
+When in doubt, match the existing app, not the mockup.
+
 ## 0. Palette (reuse the app's chrome tokens)
 
 The mockups were drawn without our design system. Map their neutrals onto the constants the

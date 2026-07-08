@@ -54,6 +54,12 @@ registry: each entry is a short description plus a pointer to a design note unde
   insert/delete rows/cols that would displace merges.
   → [`projects/merged-cells.md`](projects/merged-cells.md)
 
+- **IronCalc — move to a released pin** — *Future (follow-up tail of `ironcalc-upstreaming`).*
+  That project upgrades FreeCell onto the fork's git-`main` + our E2/E5 fixes (migrating to the
+  new `Color`-enum API and deleting `open_fixups`/`open_repair` + `roxmltree`/`zip`). This tail
+  swaps the temporary `[patch.crates-io]` git pin for a **released** IronCalc version once one
+  ships with all five fixes, and re-validates. → [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md)
+
 - **Viewport Value Cache** — *Future, optional scroll-perf push.*
   Delta-load only newly-exposed cells' *values* on scroll (styles/geometry come from the
   resident style cache above); invalidate on recompute. Optional — SP4 showed uncached

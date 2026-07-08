@@ -196,37 +196,20 @@ impl WorkbookDocument {
             .to_str()
             .ok_or_else(|| LoadError::Io(format!("path is not valid UTF-8: {}", path.display())))?;
 
+        // Theme/indexed-colour/number-format import fidelity and the optional-`xfId` accept are
+        // now handled by the IronCalc build we pin (the fork's `freecell-fixes`), so the former
+        // `open_fixups`/`open_repair` post/pre-parse workarounds are gone — the engine loads and
+        // resolves these itself. See specs/projects/ironcalc-upstreaming.
         match load_from_xlsx(path_str, DEFAULT_LOCALE, DEFAULT_TIMEZONE, DEFAULT_LANGUAGE) {
-            Ok(mut model) => {
-                // Correct IronCalc's theme-colour, indexed-colour, and built-in number-format
-                // import before the model is wrapped and read by the caches (`open_fixups`
-                // module docs).
-                crate::open_fixups::apply_open_fixups(&mut model, path);
-                Ok(Self {
-                    model: UserModel::from_model(model),
-                })
-            }
+            Ok(model) => Ok(Self {
+                model: UserModel::from_model(model),
+            }),
             // A real read error after the magic check (e.g. the file vanished mid-open).
             Err(ironcalc::error::XlsxError::IO(msg)) => Err(LoadError::Io(msg)),
-            // It IS a Zip, so any structural/parse/workbook/feature failure means the
-            // workbook itself is damaged or unsupported. Before giving up, try one
-            // best-effort **reactive repair** for IronCalc's over-strict styles parser
-            // (which rejects a `<cellXfs>` `<xf>` that omits the *optional* `xfId` — as
-            // Numbers/LibreOffice-exported files do). `try_repair_and_reload` returns `Some`
-            // only for that specific error class and only if the read→patch→reload all
-            // succeed; on any failure we fall through to the ORIGINAL typed error so the
-            // file's real problem is what surfaces (`open_repair` module docs).
-            Err(other) => match crate::open_repair::try_repair_and_reload(path, &other) {
-                Some(mut model) => {
-                    crate::open_fixups::apply_open_fixups(&mut model, path);
-                    Ok(Self {
-                        model: UserModel::from_model(model),
-                    })
-                }
-                // The message is preserved for the dialog details line (a `NotImplemented`
-                // message names the unsupported feature).
-                None => Err(LoadError::Corrupt(other.to_string())),
-            },
+            // It IS a Zip, so any structural/parse/workbook/feature failure means the workbook
+            // itself is damaged or unsupported. The message is preserved for the dialog details
+            // line (a `NotImplemented` message names the unsupported feature).
+            Err(other) => Err(LoadError::Corrupt(other.to_string())),
         }
     }
 
@@ -741,6 +724,13 @@ impl WorkbookDocument {
         }
     }
 
+    /// The workbook's colour theme, used to resolve theme-indexed cell colours
+    /// (`Color::Theme`) to concrete `#RRGGBB` — see [`crate::cache::resolve_rgb`]. Read-only;
+    /// the theme is a workbook-global property loaded on open (or the default for a new book).
+    pub(crate) fn workbook_theme(&self) -> &ironcalc_base::types::Theme {
+        &self.model.get_model().workbook.theme
+    }
+
     /// Sets the font **family** and/or **size** over a range (`SetFont`, `architecture.md §3.3`).
     /// IronCalc 0.7.1 has no `font.name`/absolute-size `update_range_style` path, so this uses
     /// `on_paste_styles`: it points the engine's view selection at `range`, builds a row-major
@@ -1043,11 +1033,7 @@ impl WorkbookDocument {
 fn resolve_text_color(model: &Model, sheet: u32, row: i32, col: i32, style: &Style) -> Option<Rgb> {
     // 1. An explicit non-black font colour always wins (a pure-black colour is
     //    indistinguishable from IronCalc's default, so it falls through — matching the cache).
-    if let Some(rgb) = style
-        .font
-        .color
-        .as_deref()
-        .and_then(crate::cache::parse_color)
+    if let Some(rgb) = crate::cache::resolve_rgb(&style.font.color, &model.workbook.theme)
         .filter(|c| *c != Rgb::new(0, 0, 0))
     {
         return Some(rgb);
@@ -1380,19 +1366,26 @@ mod tests {
 
         // A2 red fill, B2 blue font color.
         let fill = reopened.cell_style(0, CellRef::new(1, 0)).unwrap().fill;
-        assert_eq!(fill.fg_color.as_deref(), Some("#FF0000"));
+        assert_eq!(
+            fill.color,
+            ironcalc_base::types::Color::Rgb("#FF0000".to_string())
+        );
         let font = reopened.cell_style(0, CellRef::new(1, 1)).unwrap().font;
-        assert_eq!(font.color.as_deref(), Some("#0000FF"));
+        assert_eq!(
+            font.color,
+            ironcalc_base::types::Color::Rgb("#0000FF".to_string())
+        );
     }
 
     #[test]
     fn default_font_reads_workbook_default() {
-        // A fresh workbook's default is IronCalc's `Font::default()` — 13pt Calibri (NOT the
-        // 11pt the specs state; the cache detects "default" relative to this value).
+        // A fresh workbook's default is IronCalc's `Font::default()` — now 12pt Inter (our fork
+        // updated it from 13pt Calibri). This value only feeds the cache's "is this the default?"
+        // detection; default cells render in bundled Inter (`GRID_FONT_FAMILY`) regardless.
         let doc = WorkbookDocument::new_empty().unwrap();
         let (sz, name) = doc.default_font();
-        assert_eq!(sz, 13);
-        assert_eq!(name, "Calibri");
+        assert_eq!(sz, 12);
+        assert_eq!(name, "Inter");
     }
 
     #[test]
@@ -1538,8 +1531,8 @@ mod tests {
         let style = doc.cell_style(0, cell(0, 2)).unwrap();
         assert!(style.font.b, "bold copied");
         assert_eq!(
-            style.fill.fg_color.as_deref(),
-            Some("#FF0000"),
+            style.fill.color,
+            ironcalc_base::types::Color::Rgb("#FF0000".to_string()),
             "fill copied"
         );
     }
@@ -1573,8 +1566,8 @@ mod tests {
                 let style = doc.cell_style(0, cell(r, c)).unwrap();
                 assert!(style.font.b, "cell ({r},{c}) should be bold");
                 assert_eq!(
-                    style.fill.fg_color.as_deref(),
-                    Some("#FF0000"),
+                    style.fill.color,
+                    ironcalc_base::types::Color::Rgb("#FF0000".to_string()),
                     "cell ({r},{c}) should carry the copied fill"
                 );
             }

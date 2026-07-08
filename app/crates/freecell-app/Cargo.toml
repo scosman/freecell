@@ -90,6 +90,12 @@ gpui = { workspace = true, features = ["test-support"] }
 freecell-engine = { workspace = true, features = ["test-support"] }
 # save-flow / round-trip test fixtures write to a temp dir.
 tempfile.workspace = true
+# `fonts.rs` verifies the bundled non-RIBBI Inter faces resolve on the Linux text backend.
+# gpui's `#[gpui::test]` installs a `NoopTextSystem` (add_fonts is a no-op, every font resolves
+# to one stub id), so it can't verify registration — instead we exercise `fontdb` directly, the
+# exact crate gpui's cosmic-text (Linux) text system uses. Pinned to the version already in the
+# lockfile via gpui, so this adds no new crate and matches the shipped backend's behavior.
+fontdb = "=0.23.0"
 
 [lints]
 workspace = true

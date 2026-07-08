@@ -6,13 +6,12 @@
 //! static content: the FreeCell wordmark, the "The open spreadsheet" tagline, the build version
 //! (`env!("CARGO_PKG_VERSION")`), a hairline, then two label→value link rows (Homepage / Built
 //! with). Links open in the user's default browser via gpui's [`App::open_url`], with a pointer
-//! cursor + hover underline. It registers **no document actions**, so Save / Undo / etc. are
+//! cursor (no hover underline). It registers **no document actions**, so Save / Undo / etc. are
 //! disabled while it is frontmost; the app opens/activates/tracks/closes it (`super::app`).
 
-use gpui::{
-    div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, Window,
-};
+use gpui::{div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, Window};
 
+use super::fonts::{medium_font, semibold_font, wordmark_font};
 use super::{titlebar, CloseWindow};
 
 // Shared chrome/titlebar palette tokens (`ui_design.md §0`) — mirrored here as the established
@@ -22,6 +21,8 @@ const CHROME_BG: u32 = 0xF3F3F3; // window background (matches the mockup's ligh
 const HAIRLINE: u32 = 0xD9D9D9;
 const TEXT: u32 = 0x1F1F1F;
 const MUTED_TEXT: u32 = 0x555555;
+/// Tertiary text (the faint version line) — a step lighter than [`MUTED_TEXT`] (`ui_design.md §6`).
+const FAINT_TEXT: u32 = 0x9A9A9A;
 /// The one link/accent token (`ui_design.md §6`): our design system has no link color and
 /// gpui-component's theme exposes none at the pinned rev, so a single blue constant serves every
 /// link (not the mockup's exact hex, and not per-link colors).
@@ -108,28 +109,40 @@ impl Render for AboutView {
 /// The window body: a centered identity block (wordmark / tagline / version), a hairline, then the
 /// two label→value link rows (`ui_design.md §6`).
 fn render_body() -> impl IntoElement {
+    let (wordmark_family, wordmark_weight) = wordmark_font();
+    let (tagline_family, tagline_weight) = medium_font();
     div()
         .flex_1()
         .flex()
         .flex_col()
-        .p(px(30.0))
-        .gap(px(22.0))
+        // Vertically center the identity/hairline/rows stack so the top and bottom breathing room
+        // stay balanced (the old top-aligned layout left a large empty band at the bottom).
+        .justify_center()
+        .p(px(28.0))
+        .gap(px(18.0))
         .child(
             div()
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(4.0))
+                .gap(px(6.0))
                 .child(
+                    // The wordmark rides the Inter **Display ExtraBold** cut — a genuinely heavier
+                    // & tighter face than the RIBBI Bold. gpui at the pinned rev exposes no
+                    // letter-spacing API, so the Display cut's built-in tight tracking stands in
+                    // for the mockup's -0.03em (the exact tracking isn't settable in code).
                     div()
-                        .text_size(px(28.0))
-                        .font_weight(FontWeight::BOLD)
+                        .font_family(wordmark_family)
+                        .font_weight(wordmark_weight)
+                        .text_size(px(30.0))
                         .text_color(rgb(TEXT))
                         .child("FreeCell"),
                 )
                 .child(
                     div()
-                        .text_size(px(13.0))
+                        .font_family(tagline_family)
+                        .font_weight(tagline_weight)
+                        .text_size(px(14.0))
                         .text_color(rgb(MUTED_TEXT))
                         .child("The open spreadsheet"),
                 )
@@ -137,7 +150,7 @@ fn render_body() -> impl IntoElement {
                     div()
                         .pt(px(4.0))
                         .text_size(px(12.0))
-                        .text_color(rgb(MUTED_TEXT))
+                        .text_color(rgb(FAINT_TEXT))
                         .child(VERSION_LINE),
                 ),
         )
@@ -189,15 +202,18 @@ fn built_with() -> impl IntoElement {
         .child(link("about-gpui", "GPUI", GPUI_URL))
 }
 
-/// A clickable text link: `LINK`-colored, pointer cursor + hover underline, opening `url` in the
-/// default browser on click via gpui's [`App::open_url`] (`architecture.md §9.1`).
+/// A clickable text link: the Inter **SemiBold** cut, `LINK`-colored, pointer cursor (no hover
+/// underline), opening `url` in the default browser on click via gpui's [`App::open_url`]
+/// (`architecture.md §9.1`).
 fn link(id: &'static str, label: &'static str, url: &'static str) -> impl IntoElement {
+    let (family, weight) = semibold_font();
     div()
         .id(id)
+        .font_family(family)
+        .font_weight(weight)
         .text_size(px(13.0))
         .text_color(rgb(LINK))
         .cursor_pointer()
-        .hover(|s| s.underline())
         .on_click(move |_: &ClickEvent, _window, cx| cx.open_url(url))
         .child(label)
 }

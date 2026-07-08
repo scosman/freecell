@@ -698,12 +698,13 @@ fn welcome_window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// The About window options: small fixed **460×340** surface (`ui_design.md §6`), non-resizable,
+/// The About window options: small fixed **400×300** surface (`ui_design.md §6`), non-resizable,
 /// non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic lights on Linux
-/// (`functional_spec.md §4`).
+/// (`functional_spec.md §4`). Sized so the vertically-centered identity/links body (`about.rs`)
+/// keeps balanced top/bottom breathing room with no empty bottom band.
 fn about_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(460.0), px(340.0)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(400.0), px(300.0)), cx)),
         titlebar: titlebar_options(),
         is_resizable: false,
         is_minimizable: false,

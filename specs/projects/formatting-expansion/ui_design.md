@@ -78,7 +78,7 @@ dismiss).
 
 ```
 ┌──────────────────────────────────────────────┐
-│  Which lines                                   │   ← muted section label
+│  Borders                                       │   ← muted section label
 │   ┌───┐ ┌───┐ ┌───┐ ┌───┐                      │
 │   │▦  │ │ ┼ │ │ ▢ │ │   │      All Inner Outer None
 │   └───┘ └───┘ └───┘ └───┘                      │
@@ -95,7 +95,7 @@ dismiss).
 └──────────────────────────────────────────────┘
 ```
 
-- **Region A — "Which lines":** the 8 target icons in the same 4×2 arrangement as today
+- **Region A — "Borders":** the 8 target icons in the same 4×2 arrangement as today
   (row 1: All / Inner / Outer / None; row 2: Top / Bottom / Left / Right). Icon-only, so
   **each carries a tooltip** with its name for discoverability.
 - **Region B — "Line":** the line-style **gallery** — 5 small buttons, each a live preview

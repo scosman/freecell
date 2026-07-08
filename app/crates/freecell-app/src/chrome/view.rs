@@ -1697,14 +1697,18 @@ fn border_target_icon_mask(preset: BorderPreset) -> (bool, bool, bool, bool, boo
 /// edges. Grey segments paint first so a dark segment always wins at a crossing.
 fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
     let (top, bottom, left, right, inner_h, inner_v) = border_target_icon_mask(preset);
-    // A horizontal / vertical segment centered on `nominal` (px from the icon's top/left).
+    let near = 1.0;
+    let far = TARGET_ICON_PX - 1.0;
+    let mid = TARGET_ICON_PX / 2.0;
+    // A horizontal / vertical segment centered on `nominal`, clamped to the inset box `[near, far]`
+    // so perpendicular lines meet cleanly at the corners with no overhang past the 2×2 grid.
     let hline = |nominal: f32, dark: bool| {
         let t = if dark { 2.0 } else { 1.0 };
         div()
             .absolute()
-            .left(px(0.0))
+            .left(px(near))
             .top(px(nominal - t / 2.0))
-            .w(px(TARGET_ICON_PX))
+            .w(px(far - near))
             .h(px(t))
             .bg(rgb(if dark {
                 TARGET_ICON_DARK
@@ -1716,9 +1720,9 @@ fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
         let t = if dark { 2.0 } else { 1.0 };
         div()
             .absolute()
-            .top(px(0.0))
+            .top(px(near))
             .left(px(nominal - t / 2.0))
-            .h(px(TARGET_ICON_PX))
+            .h(px(far - near))
             .w(px(t))
             .bg(rgb(if dark {
                 TARGET_ICON_DARK
@@ -1726,9 +1730,6 @@ fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
                 TARGET_ICON_GREY
             }))
     };
-    let near = 1.0;
-    let far = TARGET_ICON_PX - 1.0;
-    let mid = TARGET_ICON_PX / 2.0;
     // Each segment as (is_horizontal, nominal, dark).
     let segments = [
         (true, near, top),
@@ -2763,12 +2764,12 @@ impl ChromeView {
             .into_any_element()
     }
 
-    /// The borders **pen** popover (`ui_design.md §2`): three stacked regions — "Which lines"
+    /// The borders **pen** popover (`ui_design.md §2`): three stacked regions — "Borders"
     /// target icons, a "Line" style gallery, and a "Color" swatch grid + custom picker. A target
     /// click paints the pen onto just those edges and keeps the popover open; only click-away / Esc
     /// closes it. The current target/pen is shown `.selected`.
     fn render_borders_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        // Region A — the eight "which lines" target icons (icon-only, so each carries a tooltip).
+        // Region A — the eight "Borders" target icons (icon-only, so each carries a tooltip).
         let target_btn = |id: &'static str,
                           name: &'static str,
                           preset: BorderPreset,
@@ -2984,7 +2985,7 @@ impl ChromeView {
                     .border_color(rgb(HAIRLINE))
                     .rounded_md()
                     .shadow_md()
-                    .child(section_label("Which lines"))
+                    .child(section_label("Borders"))
                     .child(row1)
                     .child(row2)
                     .child(divider())

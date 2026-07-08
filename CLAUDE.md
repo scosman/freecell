@@ -67,8 +67,21 @@ compiles render-tests and runs its GPUI-free unit tests, but the actual **pixel 
 not covered automatically**. So the **agent must decide when render coverage is needed and
 drive it** — there is no safety net.
 
-**1. Run it locally, in-container, whenever a change could move pixels** — grid/chrome/GPUI
-view code, fonts, layout, borders, styles, the render harness, or baselines:
+**Scope — what the suite actually covers.** Every render case is the real `GridView` rendered
+over an engine-driven scene: **cell / row / column / sheet rendering** (text, numbers, fonts,
+alignment, borders, fills, colors, selection overlay, in-cell editor, loading overlay,
+scrollbars, variable geometry) **plus the standalone macOS titlebar row**. That is the whole
+baseline inventory. It does **NOT** cover the **welcome window**, the **About window**, or the
+rest of the chrome (**action row, data/formula row, sheet tabs**) — none of those have
+baselines. A change **confined to those surfaces cannot move any baseline**, so **do not run
+the pixel suite for it**; validate it instead with the crate's gpui view tests + the Xvfb
+smoke launch (`xvfb-run -a cargo run -p freecell-app` opens the welcome window). If one of
+those surfaces ever gains its own baseline, update this scope note.
+
+**1. Run it locally, in-container, whenever a change could move *grid/cell/sheet or titlebar*
+pixels** — grid-render code / the `GridView`, fonts, layout, borders, fills, styles, the
+titlebar row, the render harness, or baselines (per the Scope above — not welcome/About/other
+chrome):
 - first time: `app/render-tests/scripts/setup_render_env.sh` (installs the capture stack)
 - then: `app/render-tests/scripts/render_tests.sh test` (asserts every case == baseline)
 
@@ -78,16 +91,18 @@ Never land a rendering change without either a green local run or refreshed, eye
 baselines.
 
 **2. Validate in CI before merge.** The required truth is the CI `render` gate. For any
-change that could regress or alter rendering, get a green CI render run on the branch before
-merge:
+**in-scope** change (grid/cell/sheet or titlebar — see Scope) that could regress or alter
+rendering, get a green CI render run on the branch before merge:
 - **Preferred — the agent triggers it:** dispatch the `render` workflow on the branch
   (GitHub Actions MCP, or `gh workflow run render.yml --ref <branch>`), poll to completion,
   confirm it passed. (Dispatchable once `render.yml` is on `main`.)
 - **Fallback:** if the agent can't dispatch, ask the user to kick off `render` and report
   the result back.
 
-**3. Bake it into plans.** When an implementation plan makes UI/rendering changes that could
-regress or change pixels, the plan **must** include explicit steps: refresh + eyeball
-baselines if the change is intentional, and a **"dispatch the CI `render` gate and confirm it
-passes"** step before the phase is done. Decide this at planning time — don't leave render
-validation implicit.
+**3. Bake it into plans.** When an implementation plan makes **in-scope** (grid/cell/sheet or
+titlebar) rendering changes that could regress or change pixels, the plan **must** include
+explicit steps: refresh + eyeball baselines if the change is intentional, and a **"dispatch
+the CI `render` gate and confirm it passes"** step before the phase is done. Decide this at
+planning time — don't leave render validation implicit. (Welcome/About/other-chrome changes
+are out of scope for the pixel suite — plan gpui view tests + a smoke launch for those
+instead.)

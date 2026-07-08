@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: Formatting Expansion
@@ -50,7 +50,7 @@ style+color and (b) hold the transient target/pen state in the view.
   ```
 - Add the vertical-alignment enum (parallel to the existing horizontal `Align`):
   ```rust
-  pub enum VAlign { Top, Center, Bottom, Justify }
+  pub enum VAlign { Top, Center, Bottom }
   ```
 - Update the module doc (currently lists strikethrough/wrap/vertical-align as
   "intentionally absent") — they are now present.
@@ -75,8 +75,8 @@ style+color and (b) hold the transient target/pen state in the view.
 - **Wrap (toggle):** extend `StyleAttr` with `WrapText`. Same toggle semantics; writes
   the `alignment.wrap_text` path (§4).
 - **Vertical align (radio/set):** extend `StylePath` with `AlignVertical`; `as_str()` →
-  `"alignment.vertical"`. Value strings `"top"|"center"|"bottom"|"justify"`. No toggle —
-  a plain set, exactly like `AlignHorizontal`.
+  `"alignment.vertical"`. Value strings `"top"|"center"|"bottom"`. No toggle — a plain
+  set, exactly like `AlignHorizontal`.
 - **Border pen:** extend `SetBorders` payload:
   ```rust
   SetBorders { sheet, range, preset: BorderPreset,
@@ -137,7 +137,7 @@ style+color and (b) hold the transient target/pen state in the view.
 - `strikethrough = style.font.strike`
 - `wrap = style.alignment.map(|a| a.wrap_text).unwrap_or(false)`
 - `v_align = style.alignment.and_then(|a| map a.vertical)` via a `v_align_of` helper
-  mirroring the existing `h_align_of` (Top/Center/Bottom/Justify → `Some`; Distributed →
+  mirroring the existing `h_align_of` (Top/Center/Bottom → `Some`; Justify/Distributed →
   `None`, i.e. treated as unset for the toolbar — out of scope).
 
 Border pattern mapping — extend the existing `border_weight` region into an

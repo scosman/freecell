@@ -74,14 +74,10 @@ through `.xlsx` (verified: `font.strike`, `alignment.vertical`, `alignment.wrap_
 
 ## 1.3 Vertical alignment
 
-- **Control:** four icon buttons — **Top / Center / Bottom / Justify** — in a **new
-  section** (its own divider group) placed **after** the horizontal align L / C / R group.
+- **Control:** three icon buttons — **Top / Center / Bottom** — in a **new section**
+  (its own divider group) placed **after** the horizontal align L / C / R group.
 - **Behavior:** radio-style, mirroring horizontal alignment. Clicking a button sets
-  that vertical alignment on the selection (`alignment.vertical` =
-  `top`/`center`/`bottom`/`justify`).
-- **Justify:** distributes wrapped lines to fill the cell height. Its visible effect
-  applies to **wrapped, multi-line** cells where the row is taller than the content;
-  a single line renders like Top. (Vertical `Distributed` remains out of scope.)
+  that vertical alignment on the selection (`alignment.vertical` = `top`/`center`/`bottom`).
 - **Active state:** a button is pressed only when the active cell has that vertical
   alignment set **explicitly** (mirrors horizontal align, where a value present only
   when explicit lights the button). A cell with no explicit vertical alignment shows
@@ -93,11 +89,11 @@ through `.xlsx` (verified: `font.strike`, `alignment.vertical`, `alignment.wrap_
     (unchanged from today — see edge cases). This avoids moving every existing render
     baseline; only cells that opt in change position.
   - Interacts with wrap: a wrapped multi-line block is positioned as a unit.
-- **Persistence:** stored as IronCalc `alignment.vertical` (Top/Center/Bottom/Justify;
-  Distributed out of scope); round-trips.
-- **New model type:** a `VAlign { Top, Center, Bottom, Justify }` enum in
-  `freecell-core::style` (parallel to the existing horizontal `Align`), surfaced on
-  `RenderStyle` as `v_align: Option<VAlign>`.
+- **Persistence:** stored as IronCalc `alignment.vertical` (Top/Center/Bottom;
+  Justify/Distributed out of scope); round-trips.
+- **New model type:** a `VAlign { Top, Center, Bottom }` enum in `freecell-core::style`
+  (parallel to the existing horizontal `Align`), surfaced on `RenderStyle` as
+  `v_align: Option<VAlign>`.
 
 ## Part 1 edge cases
 
@@ -267,7 +263,7 @@ P2 is not built in the initial phases.
 - P2 restyle-all-with-no-target (designed-for, deferred → `GAPS.md` F2).
 - Dotted + dash-dot line styles (→ `GAPS.md` F3).
 - Diagonal borders; inner-horizontal / inner-vertical border targets.
-- Distributed vertical alignment (Justify **is** in scope).
+- Justify / Distributed vertical alignment.
 - Merged cells, overflow-into-neighbors changes, and any non-formatting behavior.
 - New keyboard shortcuts (formatting is mouse/menu-driven for this project).
 

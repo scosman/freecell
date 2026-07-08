@@ -41,7 +41,7 @@ use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign};
 
 use freecell_engine::{
-    BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
+    BorderLine, BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
 };
 
 use super::{
@@ -1089,10 +1089,14 @@ impl ChromeView {
         if !self.commit_pending_edit(window, cx) {
             return;
         }
+        // Phase 2: the preset buttons keep applying the default pen (thin solid black); the pen
+        // popover redesign (line/color selection) is Phase 3.
         self.client.send(Command::SetBorders {
             sheet: self.active_sheet,
             range: self.selection.range(),
             preset,
+            line: BorderLine::ThinSolid,
+            color: None,
         });
         cx.notify();
     }
@@ -3953,10 +3957,17 @@ mod tests {
         assert!(
             matches!(
                 cmds.as_slice(),
-                [Command::SetBorders { preset: BorderPreset::All, range, .. }]
+                [Command::SetBorders {
+                    preset: BorderPreset::All,
+                    range,
+                    line: BorderLine::ThinSolid,
+                    color: None,
+                    ..
+                }]
                     if *range == freecell_core::CellRange::single(cell(1, 1))
             ),
-            "picking a preset dispatches one SetBorders over the selection, got {cmds:?}"
+            "picking a preset dispatches one SetBorders over the selection with the default \
+             thin-solid-black pen, got {cmds:?}"
         );
         // Picking closes the popover.
         assert!(!upd(&h, cx, |c, _w, _cx| c.borders_open()));

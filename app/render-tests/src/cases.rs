@@ -3,13 +3,18 @@
 //! rows here (stated as a review requirement in `README.md`). `name` is snake_case and IS the
 //! baseline filename, so a red CI line names the exact broken feature.
 
-use freecell_core::{Align, BorderSpec, CellRef, Edge, Rgb, SelectionModel, VAlign};
+use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
 
 use crate::scene::Scene;
 
 /// A solid black border edge of the given px `weight` (the render-case builder's shorthand).
 fn edge(weight: u8) -> Option<Edge> {
     Some(Edge::new(weight, Rgb::new(0, 0, 0)))
+}
+
+/// A black border edge of the given px `weight` and line `pattern` (dashed / double render cases).
+fn edge_pat(weight: u8, pattern: LinePattern) -> Option<Edge> {
+    Some(Edge::with_pattern(weight, Rgb::new(0, 0, 0), pattern))
 }
 
 /// A four-sided border, every edge `weight` px black.
@@ -19,6 +24,16 @@ fn all_edges(weight: u8) -> BorderSpec {
         right: edge(weight),
         bottom: edge(weight),
         left: edge(weight),
+    }
+}
+
+/// A four-sided border, every edge `weight` px black drawn with `pattern`.
+fn all_edges_pat(weight: u8, pattern: LinePattern) -> BorderSpec {
+    BorderSpec {
+        top: edge_pat(weight, pattern),
+        right: edge_pat(weight, pattern),
+        bottom: edge_pat(weight, pattern),
+        left: edge_pat(weight, pattern),
     }
 }
 
@@ -519,6 +534,34 @@ pub fn all() -> Vec<RenderCase> {
             // A cell whose border was cleared (NONE) renders as a plain cell — guards the clear path.
             "border_none_clear",
             at(Scene::new()).border(1, 1, BorderSpec::NONE),
+        ),
+        // ---- Border line patterns (Phase 2): dashed + double edge paint -------------------
+        cell(
+            // All four edges dashed (medium, 2px) — exercises the dashed run on both a vertical
+            // (left/right) and a horizontal (top/bottom) edge.
+            "border_dashed_all",
+            at(Scene::new()).border(1, 1, all_edges_pat(2, LinePattern::Dashed)),
+        ),
+        cell(
+            // All four edges double (3px, two thin parallel strips) on both axes.
+            "border_double_all",
+            at(Scene::new()).border(1, 1, all_edges_pat(3, LinePattern::Double)),
+        ),
+        cell(
+            // One cell mixing all three patterns + weights so solid, dashed, and double read
+            // side by side (and confirm the solid path is unchanged next to the new patterns):
+            // solid-thin top, dashed-medium right, double bottom, solid-thick left.
+            "border_pattern_mixed",
+            at(Scene::new()).border(
+                1,
+                1,
+                BorderSpec {
+                    top: edge(1),
+                    right: edge_pat(2, LinePattern::Dashed),
+                    bottom: edge_pat(3, LinePattern::Double),
+                    left: edge(3),
+                },
+            ),
         ),
         // ---- Structure (Phase 7): resized geometry + header selection -------------------
         cell(

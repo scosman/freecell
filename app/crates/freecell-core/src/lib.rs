@@ -32,7 +32,7 @@ pub mod tsv;
 // The load-bearing types re-exported at the crate root for ergonomic downstream use
 // (the grid, engine, and shell all reach for these constantly).
 pub use axis::Axis;
-pub use border::{effective_edge, BorderSpec, Edge};
+pub use border::{effective_edge, BorderSpec, Edge, LinePattern};
 pub use cache::{SheetCache, SheetCacheBuilder, SheetCaches, StyleId};
 pub use color::Rgb;
 pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};

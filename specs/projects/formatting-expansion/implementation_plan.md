@@ -20,7 +20,7 @@ with committed code + refreshed/eyeballed render baselines. See `functional_spec
   vertical text placement). Tests: engine round-trip, worker, cache, chrome; render cases
   + eyeballed baselines.
 
-- [ ] **Phase 2 — Part 2: Border engine + rendering foundation.**
+- [x] **Phase 2 — Part 2: Border engine + rendering foundation.**
   `Edge.pattern` + `LinePattern` enum; protocol (`SetBorders` gains `line: BorderLine` +
   `color`; `BorderLine` enum + `style_tag()`); document (`set_borders` parameterized —
   drop the hardcoded thin-black item); worker `SetBorders` dispatch; cache

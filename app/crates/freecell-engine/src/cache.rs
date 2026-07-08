@@ -28,7 +28,7 @@
 
 use freecell_core::cache::{DEFAULT_COL_WIDTH_PX, DEFAULT_ROW_HEIGHT_PX};
 use freecell_core::{
-    limits, BorderSpec, CellRef, Edge, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
+    limits, BorderSpec, CellRef, Edge, LinePattern, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
 };
 use ironcalc_base::types::{
     Border, BorderItem, BorderStyle, Color, HorizontalAlignment, Style, Theme, VerticalAlignment,
@@ -107,7 +107,7 @@ pub(crate) fn parse_color(s: &str) -> Option<Rgb> {
 /// Maps an IronCalc [`BorderStyle`] to the grid's px weight class (`architecture.md §1.1`, corrected
 /// to the actual nine 0.7.1 variants — the spec's `Hair`/`Dashed` don't exist at this rev; see
 /// DECISIONS_TO_REVIEW): Thin/Dotted → `1`; the Medium family + SlantDashDot → `2`; Thick/Double →
-/// `3`. All are drawn solid (dotted/dashed fidelity collapses to its weight class — SP5-accepted).
+/// `3`. The *pattern* (solid/dashed/double) is a separate axis — see [`border_pattern`].
 pub(crate) fn border_weight(style: &BorderStyle) -> u8 {
     match style {
         BorderStyle::Thin | BorderStyle::Dotted => 1,
@@ -117,6 +117,25 @@ pub(crate) fn border_weight(style: &BorderStyle) -> u8 {
         | BorderStyle::MediumDashDotDot
         | BorderStyle::SlantDashDot => 2,
         BorderStyle::Thick | BorderStyle::Double => 3,
+    }
+}
+
+/// Maps an IronCalc [`BorderStyle`] to the grid's line [`LinePattern`] (`architecture.md §5`):
+/// `MediumDashed → Dashed`, `Double → Double`; every other variant — the thin/medium/thick solids
+/// and the **deferred** Dotted / dash-dot / SlantDashDot families — falls back to `Solid`. The
+/// fallback keeps files that already carry a deferred style rendering exactly as they did before
+/// (GAPS F3).
+pub(crate) fn border_pattern(style: &BorderStyle) -> LinePattern {
+    match style {
+        BorderStyle::MediumDashed => LinePattern::Dashed,
+        BorderStyle::Double => LinePattern::Double,
+        BorderStyle::Thin
+        | BorderStyle::Medium
+        | BorderStyle::Thick
+        | BorderStyle::Dotted
+        | BorderStyle::MediumDashDot
+        | BorderStyle::MediumDashDotDot
+        | BorderStyle::SlantDashDot => LinePattern::Solid,
     }
 }
 
@@ -131,7 +150,11 @@ pub(crate) fn resolve_rgb(color: &Color, theme: &Theme) -> Option<Rgb> {
 /// to black when the item carries none or an unparseable colour — the render never panics).
 fn edge_from(item: &BorderItem, theme: &Theme) -> Edge {
     let color = resolve_rgb(&item.color, theme).unwrap_or(Rgb::new(0, 0, 0));
-    Edge::new(border_weight(&item.style), color)
+    Edge::with_pattern(
+        border_weight(&item.style),
+        color,
+        border_pattern(&item.style),
+    )
 }
 
 /// Resolves an IronCalc [`Border`] into the engine-free [`BorderSpec`] the grid paints. Only the
@@ -782,6 +805,22 @@ mod tests {
     }
 
     #[test]
+    fn border_pattern_mapping_all_nine_styles() {
+        use ironcalc_base::types::BorderStyle::*;
+        // Only MediumDashed → Dashed and Double → Double; every other style (incl. the deferred
+        // Dotted / dash-dot / SlantDashDot families) falls back to Solid — unchanged from before.
+        assert_eq!(border_pattern(&MediumDashed), LinePattern::Dashed);
+        assert_eq!(border_pattern(&Double), LinePattern::Double);
+        assert_eq!(border_pattern(&Thin), LinePattern::Solid);
+        assert_eq!(border_pattern(&Medium), LinePattern::Solid);
+        assert_eq!(border_pattern(&Thick), LinePattern::Solid);
+        assert_eq!(border_pattern(&Dotted), LinePattern::Solid);
+        assert_eq!(border_pattern(&MediumDashDot), LinePattern::Solid);
+        assert_eq!(border_pattern(&MediumDashDotDot), LinePattern::Solid);
+        assert_eq!(border_pattern(&SlantDashDot), LinePattern::Solid);
+    }
+
+    #[test]
     fn border_spec_from_reads_all_four_edges_and_colour() {
         use freecell_core::Edge;
         use ironcalc_base::types::{Border, BorderItem, BorderStyle};
@@ -794,15 +833,31 @@ mod tests {
         let border = Border {
             top: item(BorderStyle::Thin, "#000000"),
             right: item(BorderStyle::Thick, "#FF0000"),
-            bottom: item(BorderStyle::Medium, "#00FF00"),
-            left: None,
+            bottom: item(BorderStyle::MediumDashed, "#00FF00"),
+            left: item(BorderStyle::Double, "#0000FF"),
             ..Border::default()
         };
         let spec = bsf(&border);
+        // Solid edges (thin/thick) keep the default Solid pattern …
         assert_eq!(spec.top, Some(Edge::new(1, Rgb::new(0, 0, 0))));
         assert_eq!(spec.right, Some(Edge::new(3, Rgb::new(0xFF, 0, 0))));
-        assert_eq!(spec.bottom, Some(Edge::new(2, Rgb::new(0, 0xFF, 0))));
-        assert_eq!(spec.left, None);
+        // … while MediumDashed → Dashed (weight 2) and Double → Double (weight 3) carry their pattern.
+        assert_eq!(
+            spec.bottom,
+            Some(Edge::with_pattern(
+                2,
+                Rgb::new(0, 0xFF, 0),
+                LinePattern::Dashed
+            ))
+        );
+        assert_eq!(
+            spec.left,
+            Some(Edge::with_pattern(
+                3,
+                Rgb::new(0, 0, 0xFF),
+                LinePattern::Double
+            ))
+        );
         // A colourless item defaults to black (never panics).
         let b2 = Border {
             top: Some(BorderItem {
@@ -822,8 +877,14 @@ mod tests {
         let mut doc = WorkbookDocument::new_empty().unwrap();
         doc.set_cell_input(0, CellRef::new(0, 0), "x").unwrap();
         doc.set_cell_input(0, CellRef::new(5, 5), "y").unwrap();
-        doc.set_borders(0, CellRange::single(CellRef::new(0, 0)), "All")
-            .unwrap();
+        doc.set_borders(
+            0,
+            CellRange::single(CellRef::new(0, 0)),
+            "All",
+            "thin",
+            "#000000",
+        )
+        .unwrap();
 
         let cache = build_sheet_cache(&doc, 0).unwrap();
         let rs = cache

@@ -20,6 +20,6 @@ mod run;
 
 pub use client::{DocumentClient, WorkerEventReceiver, WORKER_STACK_SIZE};
 pub use protocol::{
-    BorderPreset, Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr, StylePath,
-    WorkerEvent,
+    BorderLine, BorderPreset, Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
+    StylePath, WorkerEvent,
 };

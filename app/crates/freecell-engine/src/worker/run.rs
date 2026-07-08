@@ -1262,9 +1262,21 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             sheet,
             range,
             preset,
+            line,
+            color,
         } => {
             let idx = resolve_idx(doc, *sheet)?;
-            doc.set_borders(idx, *range, preset.border_type_tag())?;
+            // `None` ⇒ default black; otherwise the pen's `#RRGGBB` (same form as `font.color`).
+            let color_hex = color
+                .map(|c| format!("#{:06X}", c.to_hex()))
+                .unwrap_or_else(|| "#000000".to_string());
+            doc.set_borders(
+                idx,
+                *range,
+                preset.border_type_tag(),
+                line.style_tag(),
+                &color_hex,
+            )?;
             // Borders never change values → no recompute.
             Ok(AppliedKind::StyleOnly)
         }
@@ -2258,7 +2270,7 @@ mod tests {
 
     #[test]
     fn set_borders_applies_and_undo() {
-        use crate::worker::protocol::BorderPreset;
+        use crate::worker::protocol::{BorderLine, BorderPreset};
         use freecell_core::BorderSpec;
         let (mut worker, rx) = test_worker();
         let sheet = sheet0(&worker);
@@ -2278,6 +2290,8 @@ mod tests {
             sheet,
             range: CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)),
             preset: BorderPreset::All,
+            line: BorderLine::ThinSolid,
+            color: None,
         }]);
 
         // B2 now carries all four thin edges, and the cache agrees with a fresh engine re-read
@@ -2315,8 +2329,69 @@ mod tests {
     }
 
     #[test]
+    fn set_borders_carries_line_style_and_color_into_cache() {
+        use crate::worker::protocol::{BorderLine, BorderPreset};
+        use freecell_core::{LinePattern, Rgb};
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+
+        // Paint an "All" dashed red border over B2 — the pen's line + color must survive into the
+        // resolved render `Edge` (dashed pattern, medium weight, red).
+        worker.process_batch(vec![Command::SetBorders {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            preset: BorderPreset::All,
+            line: BorderLine::Dashed,
+            color: Some(Rgb::new(0xFF, 0, 0)),
+        }]);
+
+        let guard = worker.shared.caches.read();
+        let cache = guard.get(sheet).unwrap();
+        let rs = cache.render_style(1, 1).copied().expect("bordered cell");
+        let top = cache.border_spec(rs.border).top.expect("top edge");
+        assert_eq!(top.pattern, LinePattern::Dashed, "dashed line resolves");
+        assert_eq!(top.weight, 2, "mediumdashed is weight-2");
+        assert_eq!(top.color, Rgb::new(0xFF, 0, 0), "pen colour resolves");
+    }
+
+    #[test]
+    fn set_borders_double_line_round_trips_into_cache() {
+        use crate::worker::protocol::{BorderLine, BorderPreset};
+        use freecell_core::LinePattern;
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+
+        // Paint an "All" double border over B2 — "double" must round-trip through IronCalc into a
+        // resolved `Edge` with pattern Double and weight 3.
+        worker.process_batch(vec![Command::SetBorders {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            preset: BorderPreset::All,
+            line: BorderLine::Double,
+            color: None,
+        }]);
+
+        let guard = worker.shared.caches.read();
+        let cache = guard.get(sheet).unwrap();
+        let rs = cache.render_style(1, 1).copied().expect("bordered cell");
+        let top = cache.border_spec(rs.border).top.expect("top edge");
+        assert_eq!(top.pattern, LinePattern::Double, "double line resolves");
+        assert_eq!(top.weight, 3, "double is weight-3");
+    }
+
+    #[test]
     fn set_borders_full_column_is_band() {
-        use crate::worker::protocol::BorderPreset;
+        use crate::worker::protocol::{BorderLine, BorderPreset};
         let (mut worker, _rx) = test_worker();
         let sheet = sheet0(&worker);
         worker.process_batch(vec![Command::SetViewport {
@@ -2331,6 +2406,8 @@ mod tests {
             sheet,
             range: CellRange::new(CellRef::new(0, 3), CellRef::new(limits::MAX_ROWS - 1, 3)),
             preset: BorderPreset::All,
+            line: BorderLine::ThinSolid,
+            color: None,
         }]);
 
         let (rows, cols) = wide_probes();

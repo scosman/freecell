@@ -16,6 +16,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_core::recent::DisplayEntry;
 
+use super::fonts::WORDMARK_FAMILY;
 use super::{titlebar, CloseWindow, FreeCellApp};
 
 // Shared chrome/titlebar palette tokens (`ui_design.md §0`) — mirrored here as the established
@@ -174,9 +175,11 @@ impl WelcomeView {
                     .flex_col()
                     .gap(px(4.0))
                     .child(
+                        // Same Inter Display ExtraBold single-face family as the About wordmark —
+                        // one family name resolves it on every platform (brand consistency).
                         div()
+                            .font_family(WORDMARK_FAMILY)
                             .text_size(px(28.0))
-                            .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(TEXT))
                             .child("FreeCell"),
                     )

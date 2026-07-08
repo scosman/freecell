@@ -8,12 +8,18 @@
 //! render correctly and identically on macOS and Linux.
 //!
 //! Beyond the four RIBBI faces (Regular / Bold / Italic / Bold Italic) the bundle now also carries
-//! three **non-RIBBI** static faces used by the About window's identity block: **Inter Medium**
-//! (tagline) and **Inter SemiBold** (links) from the "Inter" typographic family, plus **Inter
-//! Display ExtraBold** from the tighter, higher-contrast **"Inter Display"** family (the wordmark).
-//! These non-RIBBI faces register under platform-specific family names — see
-//! [`wordmark_font`]/[`medium_font`]/[`semibold_font`] for the resolution trap and how it is
-//! handled.
+//! three **non-RIBBI** static faces used by the About/Welcome identity block: **Inter Medium**
+//! (tagline), **Inter SemiBold** (links), and the tighter, higher-contrast **Inter Display
+//! ExtraBold** (wordmark).
+//!
+//! These three files were **rewritten at asset-prep time** (a one-off fontTools pass, not part of
+//! the build) so each is a clean **single-face family**: its legacy family (name ID 1) and
+//! typographic family (name ID 16) are the SAME string — [`WORDMARK_FAMILY`] /
+//! [`TAGLINE_FAMILY`] / [`LINK_FAMILY`] — with subfamily "Regular". That makes each face resolve
+//! by one unambiguous `.font_family(...)` name on BOTH gpui backends (font-kit/CoreText on macOS
+//! reads name ID 1; cosmic-text/fontdb on Linux prefers name ID 16), so there is no per-platform
+//! `cfg!` and no fragile weight-matching. `OS/2.usWeightClass` is left authentic (Medium 500,
+//! SemiBold 600, ExtraBold 800). See [`WORDMARK_FAMILY`] and the fontdb test below.
 //!
 //! Registration is **best-effort**: if `add_fonts` fails (unexpected on the bundled bytes) the
 //! function logs a warning and returns without setting the UI font, so the app falls back to
@@ -21,7 +27,7 @@
 
 use std::borrow::Cow;
 
-use gpui::{App, FontWeight};
+use gpui::App;
 
 use crate::grid::GRID_FONT_FAMILY;
 
@@ -74,59 +80,25 @@ pub fn register_fonts(cx: &mut App) {
     tracing::debug!("register_fonts: registered bundled Inter faces; UI font set to Inter");
 }
 
-// ---- About-window face resolution (the static-font naming trap) ---------------------------------
+// ---- About/Welcome identity-block face families -------------------------------------------------
 //
-// Inter's static, non-RIBBI faces carry TWO family names in their `name` table: the **typographic
-// family** (name ID 16 — "Inter" / "Inter Display", shared with the RIBBI faces, with the real
-// weight in ID 17) *and* a **legacy per-weight family** (name ID 1 — e.g. "Inter Medium", "Inter
-// SemiBold", "Inter Display ExtraBold", each carrying subfamily "Regular"). Which name a face is
-// reachable under depends on how the platform's font backend reads that table, so there is NO
-// single `.font_family(...)` string that resolves the target face on both platforms:
-//
-//   * **macOS** (Core Text / font-kit): `CTFontCopyFamilyName` on a `CGFont` built from our bytes
-//     returns name **ID 1**, so each non-RIBBI face lands in its own legacy family as a lone
-//     "Regular" — you reach it by that legacy family name (weight is then almost moot, the family
-//     has one face). `.font_family("Inter").font_weight(EXTRA_BOLD)` would silently fall back to
-//     the RIBBI Bold, so we must name the legacy family explicitly.
-//   * **Linux** (cosmic-text / fontdb): fontdb prefers name **ID 16**, so these faces join the
-//     "Inter" / "Inter Display" typographic families as genuine extra weights — you reach them by
-//     family + weight (`"Inter"` @ 500/600, `"Inter Display"` @ 800).
-//
-// So each helper picks the family string per platform via `cfg!` (both arms are compiled and
-// type-checked on every target — no `#[cfg]` dead-code trap for the macOS strings we can't build
-// here). The **non-macOS** (fontdb) branch is verified empirically by the test below
-// (`fontdb_backend_resolves_each_about_face_by_family_and_weight`), which loads the bundled bytes
-// into a `fontdb::Database` and asserts each family + weight resolves to the exact face by
-// PostScript name (not a Regular/Bold fallback). The macOS mapping is fixed by the ID-1 legacy
-// names dumped from the same `name` tables at bundling time.
+// The three non-RIBBI faces were rewritten (asset-prep) into clean single-face families whose
+// legacy (name ID 1) and typographic (name ID 16) family names are IDENTICAL to the strings below.
+// Because both gpui backends read one of those two IDs — CoreText/font-kit reads ID 1 on macOS,
+// fontdb prefers ID 16 on Linux — and here they are the same string, a single `.font_family(...)`
+// name resolves the exact face on every platform. No `cfg!`, no weight-matching: the family has one
+// face, so it resolves regardless of the requested weight. The fontdb (Linux) backend is verified
+// empirically by the test below; the macOS backend matches the same string because ID 1 == ID 16.
 
-/// The `(family, weight)` that resolves to the bundled **Inter Display ExtraBold** face — the
-/// About wordmark. This is a genuinely heavier & tighter cut than the RIBBI Bold.
-pub(crate) fn wordmark_font() -> (&'static str, FontWeight) {
-    if cfg!(target_os = "macos") {
-        ("Inter Display ExtraBold", FontWeight::EXTRA_BOLD)
-    } else {
-        ("Inter Display", FontWeight::EXTRA_BOLD)
-    }
-}
+/// Family name of the bundled **Inter Display ExtraBold** face — the About/Welcome wordmark. A
+/// genuinely heavier & tighter cut than the RIBBI Bold.
+pub(crate) const WORDMARK_FAMILY: &str = "Inter Display ExtraBold";
 
-/// The `(family, weight)` that resolves to the bundled **Inter Medium** face — the About tagline.
-pub(crate) fn medium_font() -> (&'static str, FontWeight) {
-    if cfg!(target_os = "macos") {
-        ("Inter Medium", FontWeight::MEDIUM)
-    } else {
-        ("Inter", FontWeight::MEDIUM)
-    }
-}
+/// Family name of the bundled **Inter Medium** face — the About tagline.
+pub(crate) const TAGLINE_FAMILY: &str = "Inter Medium";
 
-/// The `(family, weight)` that resolves to the bundled **Inter SemiBold** face — the About links.
-pub(crate) fn semibold_font() -> (&'static str, FontWeight) {
-    if cfg!(target_os = "macos") {
-        ("Inter SemiBold", FontWeight::SEMIBOLD)
-    } else {
-        ("Inter", FontWeight::SEMIBOLD)
-    }
-}
+/// Family name of the bundled **Inter SemiBold** face — the About links.
+pub(crate) const LINK_FAMILY: &str = "Inter SemiBold";
 
 #[cfg(test)]
 mod tests {
@@ -136,15 +108,15 @@ mod tests {
     //! `all_font_names` is empty, and every `resolve_font` returns the same stub `FontId` — so a
     //! gpui test cannot observe real registration. Instead we drive **fontdb** directly, the exact
     //! crate gpui's Linux (cosmic-text) text system loads fonts into and queries, with the bundled
-    //! bytes. This proves each target face resolves under the family + weight the **non-macOS**
-    //! branch of [`wordmark_font`]/[`medium_font`]/[`semibold_font`] uses. The macOS branch is
-    //! fixed by the ID-1 legacy family names carried in the same `name` tables.
+    //! bytes. This proves each identity-block face resolves by its single-face family name
+    //! ([`WORDMARK_FAMILY`] / [`TAGLINE_FAMILY`] / [`LINK_FAMILY`]) on the Linux backend. The macOS
+    //! backend matches the SAME string because each face's name ID 1 == name ID 16 (asset-prep).
     use super::*;
     use fontdb::{Database, Family, Query, Weight};
 
-    /// A fontdb database loaded with the RIBBI faces *and* the three non-RIBBI faces, so "Inter"
-    /// models the real registered family (a weight query must genuinely discriminate Medium /
-    /// SemiBold from Regular / Bold, not just find the only face).
+    /// A fontdb database loaded with the RIBBI faces *and* the three rewritten single-face faces, so
+    /// a family query must genuinely discriminate them from the RIBBI "Inter" family, not just find
+    /// the only face present.
     fn database() -> Database {
         let mut db = Database::new();
         for bytes in [
@@ -172,42 +144,42 @@ mod tests {
     }
 
     #[test]
-    fn fontdb_backend_resolves_each_about_face_by_family_and_weight() {
+    fn fontdb_backend_resolves_each_about_face_by_family() {
         let db = database();
 
-        // fontdb prefers the typographic family (name ID 16), so the non-RIBBI faces join the
-        // "Inter" / "Inter Display" families rather than legacy per-weight families.
+        // Each rewritten face is now its own single-face family registered under its target name.
         let families: Vec<&str> = db
             .faces()
             .flat_map(|f| f.families.iter().map(|(name, _)| name.as_str()))
             .collect();
-        assert!(
-            families.contains(&"Inter"),
-            "Inter typographic family present: {families:?}"
+        for fam in [WORDMARK_FAMILY, TAGLINE_FAMILY, LINK_FAMILY] {
+            assert!(
+                families.contains(&fam),
+                "single-face family `{fam}` present: {families:?}"
+            );
+        }
+
+        // The exact face each identity element renders — resolved by family name alone. Querying at
+        // the default NORMAL weight proves resolution no longer depends on weight-matching (the
+        // family has one face); this is the same string CoreText reads from name ID 1 on macOS.
+        assert_eq!(
+            resolved_postscript(&db, WORDMARK_FAMILY, Weight::NORMAL),
+            "InterDisplayExtraBold",
+            "wordmark resolves to the Display ExtraBold cut by family name alone"
         );
-        assert!(
-            families.contains(&"Inter Display"),
-            "Inter Display family present: {families:?}"
+        assert_eq!(
+            resolved_postscript(&db, TAGLINE_FAMILY, Weight::NORMAL),
+            "InterMedium",
+            "tagline resolves to Inter Medium by family name alone"
+        );
+        assert_eq!(
+            resolved_postscript(&db, LINK_FAMILY, Weight::NORMAL),
+            "InterSemiBold",
+            "links resolve to Inter SemiBold by family name alone"
         );
 
-        // The exact face each About element renders on the Linux backend.
-        assert_eq!(
-            resolved_postscript(&db, "Inter Display", Weight::EXTRA_BOLD),
-            "InterDisplay-ExtraBold",
-            "wordmark resolves to the Display ExtraBold cut"
-        );
-        assert_eq!(
-            resolved_postscript(&db, "Inter", Weight::MEDIUM),
-            "Inter-Medium",
-            "tagline resolves to Inter Medium"
-        );
-        assert_eq!(
-            resolved_postscript(&db, "Inter", Weight::SEMIBOLD),
-            "Inter-SemiBold",
-            "links resolve to Inter SemiBold"
-        );
-        // Guard against a silent weight fallback: the base weights still map to the RIBBI faces,
-        // proving Medium/SemiBold above are genuine distinct faces, not the nearest RIBBI weight.
+        // The RIBBI "Inter" family is untouched: the three non-RIBBI faces are their own families
+        // now, so "Inter" still resolves the genuine Regular/Bold RIBBI faces.
         assert_eq!(
             resolved_postscript(&db, "Inter", Weight::NORMAL),
             "Inter-Regular"

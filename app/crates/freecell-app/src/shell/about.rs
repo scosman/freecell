@@ -9,9 +9,11 @@
 //! cursor (no hover underline). It registers **no document actions**, so Save / Undo / etc. are
 //! disabled while it is frontmost; the app opens/activates/tracks/closes it (`super::app`).
 
-use gpui::{div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, Window};
+use gpui::{
+    div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, Window,
+};
 
-use super::fonts::{medium_font, semibold_font, wordmark_font};
+use super::fonts::{LINK_FAMILY, TAGLINE_FAMILY, WORDMARK_FAMILY};
 use super::{titlebar, CloseWindow};
 
 // Shared chrome/titlebar palette tokens (`ui_design.md §0`) — mirrored here as the established
@@ -106,42 +108,42 @@ impl Render for AboutView {
     }
 }
 
-/// The window body: a centered identity block (wordmark / tagline / version), a hairline, then the
-/// two label→value link rows (`ui_design.md §6`).
+/// The window body: a top-packed identity block (wordmark / tagline / version), a hairline, then
+/// the two label→value link rows (`ui_design.md §6`). Top-packed with a deliberate rhythm (not
+/// vertically centered) — the window height (`app.rs about_window_options`) is tuned so the bottom
+/// whitespace balances the top padding.
 fn render_body() -> impl IntoElement {
-    let (wordmark_family, wordmark_weight) = wordmark_font();
-    let (tagline_family, tagline_weight) = medium_font();
     div()
         .flex_1()
         .flex()
         .flex_col()
-        // Vertically center the identity/hairline/rows stack so the top and bottom breathing room
-        // stay balanced (the old top-aligned layout left a large empty band at the bottom).
-        .justify_center()
-        .p(px(28.0))
-        .gap(px(18.0))
+        .pt(px(28.0))
+        .px(px(30.0))
+        .pb(px(24.0))
+        .gap(px(20.0))
         .child(
             div()
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(5.0))
                 .child(
-                    // The wordmark rides the Inter **Display ExtraBold** cut — a genuinely heavier
-                    // & tighter face than the RIBBI Bold. gpui at the pinned rev exposes no
-                    // letter-spacing API, so the Display cut's built-in tight tracking stands in
-                    // for the mockup's -0.03em (the exact tracking isn't settable in code).
+                    // The wordmark rides the Inter **Display ExtraBold** single-face family — a
+                    // genuinely heavier & tighter cut than the RIBBI Bold, resolved by one family
+                    // name on every platform. gpui at the pinned rev exposes no letter-spacing API,
+                    // so the Display cut's built-in tight tracking stands in for the mockup's
+                    // -0.03em (the exact tracking isn't settable in code). The weight is stated for
+                    // intent; the lone face resolves regardless.
                     div()
-                        .font_family(wordmark_family)
-                        .font_weight(wordmark_weight)
+                        .font_family(WORDMARK_FAMILY)
+                        .font_weight(FontWeight::EXTRA_BOLD)
                         .text_size(px(30.0))
                         .text_color(rgb(TEXT))
                         .child("FreeCell"),
                 )
                 .child(
                     div()
-                        .font_family(tagline_family)
-                        .font_weight(tagline_weight)
+                        .font_family(TAGLINE_FAMILY)
                         .text_size(px(14.0))
                         .text_color(rgb(MUTED_TEXT))
                         .child("The open spreadsheet"),
@@ -159,7 +161,7 @@ fn render_body() -> impl IntoElement {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(12.0))
+                .gap(px(11.0))
                 .child(info_row(
                     "Homepage",
                     link("about-homepage", HOMEPAGE_LABEL, HOMEPAGE_URL).into_any_element(),
@@ -202,15 +204,13 @@ fn built_with() -> impl IntoElement {
         .child(link("about-gpui", "GPUI", GPUI_URL))
 }
 
-/// A clickable text link: the Inter **SemiBold** cut, `LINK`-colored, pointer cursor (no hover
-/// underline), opening `url` in the default browser on click via gpui's [`App::open_url`]
+/// A clickable text link: the Inter **SemiBold** single-face family, `LINK`-colored, pointer cursor
+/// (no hover underline), opening `url` in the default browser on click via gpui's [`App::open_url`]
 /// (`architecture.md §9.1`).
 fn link(id: &'static str, label: &'static str, url: &'static str) -> impl IntoElement {
-    let (family, weight) = semibold_font();
     div()
         .id(id)
-        .font_family(family)
-        .font_weight(weight)
+        .font_family(LINK_FAMILY)
         .text_size(px(13.0))
         .text_color(rgb(LINK))
         .cursor_pointer()

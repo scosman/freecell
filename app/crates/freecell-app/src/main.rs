@@ -17,7 +17,7 @@ use std::time::Duration;
 use gpui::{App, AsyncApp};
 use gpui_platform::application;
 
-use freecell_app::shell::{register_fonts, FreeCellApp};
+use freecell_app::shell::{register_fonts, AppAssets, FreeCellApp};
 
 /// Parses an optional `--exit-after-ms <n>` argument (the render-spike safety valve).
 fn exit_after_ms() -> Option<u64> {
@@ -49,7 +49,10 @@ fn main() {
     let exit_after = exit_after_ms();
     let open_path = xlsx_arg();
 
-    let app = application().with_assets(gpui_component_assets::Assets);
+    // The combined asset source: FreeCell's vendored action-bar icons composed over the
+    // gpui-component bundle (`shell::assets`). The bundle still resolves `IconName::Loader`,
+    // `ChevronDown`, etc. — see `AppAssets`.
+    let app = application().with_assets(AppAssets);
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
         register_fonts(cx); // registers the bundled Inter faces + sets Inter as the UI font,

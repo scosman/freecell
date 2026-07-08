@@ -13,6 +13,7 @@
 //! ([`app`], `welcome`, `window`, [`menus`]) are the thin plumbing that performs those
 //! decisions against real windows, menus, panels, and dialogs.
 
+pub mod assets;
 pub mod lifecycle;
 pub mod menus;
 pub mod recents;
@@ -31,6 +32,7 @@ use std::path::PathBuf;
 use gpui::actions;
 
 pub use app::FreeCellApp;
+pub use assets::AppAssets;
 pub use fonts::register_fonts;
 pub use welcome::WelcomeView;
 pub use window::WorkbookWindow;

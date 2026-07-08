@@ -13,11 +13,15 @@ use gpui_component::Root;
 use gpui_platform::application;
 
 use freecell_app::chrome::{ChromeClient, ChromeGridSink, ChromeView, RecordingClient, SheetTab};
+use freecell_app::shell::AppAssets;
 use freecell_core::{CellRef, RenderStyle, SelectionModel, SheetId};
 use freecell_engine::WorkerEvent;
 
 fn main() {
-    let app = application().with_assets(gpui_component_assets::Assets);
+    // The combined asset source (matching `main.rs`) so the action row's vendored Lucide icons
+    // resolve here too — with the plain bundle they render blank (gpui swallows the SVG asset
+    // miss via `.log_err()`).
+    let app = application().with_assets(AppAssets);
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
         cx.activate(true);

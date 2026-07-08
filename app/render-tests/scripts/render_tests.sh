@@ -15,8 +15,12 @@
 #           (lavapipe ICD). See app/README.md for the full apt list.
 #
 # Usage:
-#   render_tests.sh            # run the suite (assert every case matches its baseline)
-#   render_tests.sh test       # same
+#   render_tests.sh                 # run the whole suite (assert every case matches its baseline)
+#   render_tests.sh test            # same
+#   render_tests.sh test <filter>   # run ONLY cases whose #[test] name matches <filter> — a fast
+#                                   #   subset for iterating on a specific rendering change (e.g.
+#                                   #   `test cell_` or `test border_`). The full suite is slow;
+#                                   #   see CLAUDE.md "Render tests" for when to run which.
 #   render_tests.sh generate [--only <prefix>]   # (re)write baselines/, print a summary
 # ---------------------------------------------------------------------------------
 set -euo pipefail
@@ -53,7 +57,8 @@ require_tools() {
 case "$mode" in
     test)
         require_tools
-        exec cargo test --manifest-path "$here/Cargo.toml" -p render-tests
+        shift || true   # drop the "test" arg; forward any remaining as a cargo test name filter
+        exec cargo test --manifest-path "$here/Cargo.toml" -p render-tests "$@"
         ;;
     generate)
         require_tools
@@ -66,7 +71,7 @@ case "$mode" in
             --bin generate_baselines -- "$@"
         ;;
     *)
-        echo "usage: $0 [test | generate [--only <prefix>]]" >&2
+        echo "usage: $0 [test [filter] | generate [--only <prefix>]]" >&2
         exit 2
         ;;
 esac

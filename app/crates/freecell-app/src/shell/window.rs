@@ -77,8 +77,6 @@ enum ActiveModal {
         detail: String,
         close_window_on_dismiss: bool,
     },
-    /// The About dialog.
-    About,
 }
 
 /// A document window's shell state + lifecycle.
@@ -586,12 +584,6 @@ impl WorkbookWindow {
         cx.notify();
     }
 
-    /// Shows the About dialog on this window.
-    pub fn show_about(&mut self, cx: &mut Context<Self>) {
-        self.modal = Some(ActiveModal::About);
-        cx.notify();
-    }
-
     /// Shows an app-level error dialog on this window (e.g. an `Open…` that failed to resolve
     /// its path, reported on the frontmost document window). Dismiss keeps the window — this is
     /// not *this* document's load failure, so `close_window_on_dismiss` is false.
@@ -622,7 +614,7 @@ impl WorkbookWindow {
         window.remove_window();
     }
 
-    /// Unsaved-changes → **Cancel** (or Error/About dismiss): keep the window; abort a quit if
+    /// Unsaved-changes → **Cancel** (or Error dismiss): keep the window; abort a quit if
     /// one is in progress.
     fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let modal = self.modal.take();
@@ -986,13 +978,6 @@ impl WorkbookWindow {
             ActiveModal::Error { title, detail, .. } => dialog_card(
                 title,
                 detail,
-                vec![Button::new("ok").label("OK").primary().on_click(
-                    cx.listener(|this, _: &ClickEvent, window, cx| this.dismiss_modal(window, cx)),
-                )],
-            ),
-            ActiveModal::About => dialog_card(
-                "FreeCell",
-                "A GPU-rendered, Excel-compatible spreadsheet.\nMVP proof of concept.",
                 vec![Button::new("ok").label("OK").primary().on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.dismiss_modal(window, cx)),
                 )],

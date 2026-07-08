@@ -2042,6 +2042,8 @@ name = "freecell-app"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "dirs",
+ "fontdb",
  "freecell-core",
  "freecell-engine",
  "gpui",
@@ -2059,6 +2061,9 @@ name = "freecell-core"
 version = "0.1.0"
 dependencies = [
  "csv",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

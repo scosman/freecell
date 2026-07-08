@@ -4,7 +4,8 @@
 //! virtualization, [`CellRef`](refs::CellRef)/[`CellRange`](refs::CellRange)/A1 conversion,
 //! the [`SelectionModel`](selection::SelectionModel) and keyboard-motion rules, the formula
 //! [input-cap](input_cap) and [sheet-name](sheet_name) validators, the fill
-//! [palette](palette), the engine-free [`RenderStyle`](style::RenderStyle), and the read
+//! [palette](palette), the engine-free [`RenderStyle`](style::RenderStyle), the
+//! [recent-files](recent) store + formatters, and the read
 //! models the grid consumes ([`Publication`](publication::Publication)/[`PublishedCell`](publication::PublishedCell),
 //! the [`SheetCaches`](cache::SheetCaches) read model). It imports neither GPUI nor
 //! IronCalc, so it builds and tests on any machine with no GPU or display
@@ -23,6 +24,7 @@ pub mod merge_guard;
 pub mod palette;
 pub mod perf;
 pub mod publication;
+pub mod recent;
 pub mod refs;
 pub mod selection;
 pub mod sheet_name;
@@ -38,6 +40,7 @@ pub use color::Rgb;
 pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};
 pub use merge_guard::{blocks_col_op, blocks_row_op};
 pub use publication::{CellKind, Publication, PublishedCell};
+pub use recent::{DisplayEntry, RecentEntry, RecentList};
 pub use refs::{CellRange, CellRef, SheetId};
 pub use selection::{
     apply_motion, format_selection_ref, is_full_column_selection, is_full_row_selection, Direction,

@@ -16,13 +16,15 @@ use gpui::{
 };
 use gpui_component::Root;
 
+use freecell_core::recent::{RecentList, WELCOME_LIMIT};
 use freecell_engine::DocumentSource;
 
+use super::about::AboutView;
 use super::lifecycle::{QuitPlan, QuitStep};
 use super::registry::{OpenOutcome, WindowKey, WindowRegistry};
 use super::welcome::WelcomeView;
 use super::window::{open_panel_options, WorkbookWindow};
-use super::{menus, About, NewWorkbook, OpenFile, Quit};
+use super::{menus, recents, About, ClearRecent, NewWorkbook, OpenFile, OpenRecent, Quit};
 
 /// A document window as the app tracks it: its registry key, gpui identity, and the root
 /// entity (so the app can drive its modals during the quit flow).
@@ -38,11 +40,23 @@ pub struct FreeCellApp {
     registry: WindowRegistry,
     welcome: Option<Entity<WelcomeView>>,
     welcome_id: Option<WindowId>,
+    /// The standalone About window (`functional_spec.md §4`), when open. Single-instance: a second
+    /// `About` just activates it. Cleared with `about_id` when the window closes.
+    about: Option<Entity<AboutView>>,
+    about_id: Option<WindowId>,
     windows: Vec<AppWindow>,
     /// An in-progress app quit (front-to-back dirty-window prompting).
     quit_plan: Option<QuitPlan>,
     /// Set once the app has decided to quit, so a cascade of window closes doesn't re-quit.
     quitting: bool,
+    /// The live most-recent-first recent-files list, loaded in [`init`](Self::init) and updated
+    /// at every record site (`record_recent`) + `clear_recents`. All the list logic is the pure
+    /// [`RecentList`] (`freecell_core::recent`); this owns the app's working copy.
+    recents: RecentList,
+    /// Where the recent-files list persists (`<data_dir>/FreeCell/recents.json`), or `None` when
+    /// no per-user data directory resolves — then the list is in-memory only. Tests point this at
+    /// a temp file (or `None`) so they never touch the real user store.
+    recents_store: Option<PathBuf>,
 }
 
 impl Global for FreeCellApp {}
@@ -50,20 +64,34 @@ impl Global for FreeCellApp {}
 impl FreeCellApp {
     /// Installs the global, registers the global actions + menu bar + key bindings + the
     /// window-closed / open-file hooks. Call once at startup, before `show_welcome`.
+    ///
+    /// The recent-files list starts **empty**; the resolved store path is recorded but the disk
+    /// read is deferred to [`load_recents`](Self::load_recents) (a startup call from `main.rs`).
+    /// Keeping the load out of `init` means gpui tests — which call `init` then reset the store —
+    /// never touch the real per-user data dir (`architecture.md §3`).
     pub fn init(cx: &mut App) {
         cx.set_global(FreeCellApp {
             registry: WindowRegistry::new(),
             welcome: None,
             welcome_id: None,
+            about: None,
+            about_id: None,
             windows: Vec::new(),
             quit_plan: None,
             quitting: false,
+            recents: RecentList::default(),
+            recents_store: recents::recents_store_path(),
         });
 
         cx.on_action(|_: &NewWorkbook, cx| FreeCellApp::new_workbook(cx));
         cx.on_action(|_: &OpenFile, cx| FreeCellApp::open_via_panel(cx));
         cx.on_action(|_: &About, cx| FreeCellApp::show_about(cx));
         cx.on_action(|_: &Quit, cx| FreeCellApp::request_quit(cx));
+        // Open Recent carries the exact file path (not an install-time snapshot index), so it
+        // dispatches straight to `open_path` — which opens that file or shows the vanished-file
+        // dialog if it moved (`architecture.md §3.2, §5`).
+        cx.on_action(|a: &OpenRecent, cx| FreeCellApp::open_path(&a.path, cx));
+        cx.on_action(|_: &ClearRecent, cx| FreeCellApp::clear_recents(cx));
 
         cx.on_window_closed(|cx, window_id| {
             // Deferred so the handler never runs nested inside another `update_global` lease
@@ -76,7 +104,22 @@ impl FreeCellApp {
         .detach();
 
         menus::bind_keys(cx);
-        menus::install_menus(cx);
+        // Install the base menu bar (empty **Open Recent** until `load_recents` fills it; macOS
+        // only, a no-op on Linux).
+        menus::install_menus_with(&cx.global::<FreeCellApp>().recents, cx);
+    }
+
+    /// Loads the persisted recent-files list from disk into the app, once, at **startup**
+    /// (invoked from `main.rs` right after [`init`](Self::init)), and refreshes the UI. Kept out
+    /// of `init` so gpui tests never read the real per-user data dir (`architecture.md §3`);
+    /// production behavior is unchanged (load once at launch, missing/corrupt ⇒ empty).
+    pub fn load_recents(cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| {
+            if let Some(path) = app.recents_store.clone() {
+                app.recents = RecentList::load(&path);
+                app.refresh_recents_ui(cx);
+            }
+        });
     }
 
     /// Opens the welcome window (`functional_spec.md §2.1`).
@@ -132,10 +175,20 @@ impl FreeCellApp {
         cx.update_global::<FreeCellApp, _>(|app, cx| app.do_request_quit(cx));
     }
 
-    /// Shows the About dialog on the frontmost window.
+    /// Opens the standalone About window, or activates it if it is already open (single-instance,
+    /// `functional_spec.md §4`).
     pub fn show_about(cx: &mut App) {
-        let active = cx.active_window().map(|w| w.window_id());
-        cx.update_global::<FreeCellApp, _>(|app, cx| app.do_show_about(active, cx));
+        cx.update_global::<FreeCellApp, _>(|app, cx| app.do_show_about(cx));
+    }
+
+    /// Clears the recent-files list (**Clear Recent Files**, `functional_spec.md §3`), persists
+    /// the now-empty store, and refreshes the UI (menu → empty state).
+    fn clear_recents(cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| {
+            app.recents.clear();
+            app.persist_recents();
+            app.refresh_recents_ui(cx);
+        });
     }
 
     // ---- WorkbookWindow → app notifications (called from the document window) --------------
@@ -146,9 +199,14 @@ impl FreeCellApp {
         cx.update_global::<FreeCellApp, _>(|app, cx| app.close_welcome(cx));
     }
 
-    /// A window adopted a canonical path (after a `Save As`), so a later open dedupes to it.
+    /// A window adopted a canonical path (after a `Save As`), so a later open dedupes to it —
+    /// and it becomes a recent file (`functional_spec.md §1.1`: adopting a path via Save/Save As
+    /// records it).
     pub fn note_window_path(key: WindowKey, path: PathBuf, cx: &mut App) {
-        cx.update_global::<FreeCellApp, _>(|app, _| app.registry.set_path(key, Some(path)));
+        cx.update_global::<FreeCellApp, _>(|app, cx| {
+            app.registry.set_path(key, Some(path.clone()));
+            app.record_recent(path, cx);
+        });
     }
 
     /// A window's dirty flag changed.
@@ -190,6 +248,9 @@ impl FreeCellApp {
         self.welcome = entity_slot;
         self.welcome_id = Some(any.window_id());
         self.registry.set_welcome_open(true);
+        // Seed the freshly-opened welcome with the current recent rows (and rebuild the menu);
+        // `refresh_recents_ui` then keeps it live while it stays open (`functional_spec.md §2.4`).
+        self.refresh_recents_ui(cx);
     }
 
     fn close_welcome(&mut self, cx: &mut App) {
@@ -215,6 +276,11 @@ impl FreeCellApp {
                 return;
             }
         };
+        // A successful canonicalize means the file exists → record it as a recent file for BOTH
+        // outcomes (activate an already-open window, or open a new one). One record here covers
+        // the Open… panel, CLI argv, a welcome-row click, and the Open Recent menu
+        // (`functional_spec.md §1.1`, `architecture.md §3.1`).
+        self.record_recent(canonical.clone(), cx);
         match self.registry.resolve_open(&canonical) {
             OpenOutcome::Activate(key) => {
                 if let Some(w) = self.windows.iter().find(|w| w.key == key) {
@@ -238,6 +304,10 @@ impl FreeCellApp {
     #[cfg(test)]
     fn do_open_path_detached(&mut self, path: &Path, cx: &mut App) {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // Mirror the production record site (`do_open_path`) so the recents wiring is exercised
+        // under the deterministic test harness. `record` prunes a non-existent path, so a bogus
+        // detached open never leaves a phantom entry.
+        self.record_recent(canonical.clone(), cx);
         match self.registry.resolve_open(&canonical) {
             OpenOutcome::Activate(key) => {
                 if let Some(w) = self.windows.iter().find(|w| w.key == key) {
@@ -363,6 +433,10 @@ impl FreeCellApp {
             self.welcome = None;
             self.welcome_id = None;
             self.registry.set_welcome_open(false);
+        } else if self.about_id == Some(window_id) {
+            self.about = None;
+            self.about_id = None;
+            self.registry.set_about_open(false);
         } else if let Some(pos) = self.windows.iter().position(|w| w.window_id == window_id) {
             let key = self.windows[pos].key;
             self.windows.remove(pos);
@@ -391,24 +465,29 @@ impl FreeCellApp {
         }
     }
 
-    fn do_show_about(&mut self, active: Option<WindowId>, cx: &mut App) {
-        if let Some(id) = active {
-            if let Some(w) = self.windows.iter().find(|w| w.window_id == id) {
-                let entity = w.entity.clone();
-                entity.update(cx, |ww, cx| ww.show_about(cx));
-                return;
+    /// Opens or activates the standalone About window (`architecture.md §9.2`). Mirrors
+    /// [`do_show_welcome`](Self::do_show_welcome): `about` and `about_id` are set/cleared together.
+    fn do_show_about(&mut self, cx: &mut App) {
+        if let Some(id) = self.about_id {
+            // Already open — just activate it (single-instance, `functional_spec.md §4`).
+            if let Some(w) = cx.windows().into_iter().find(|w| w.window_id() == id) {
+                w.update(cx, |_, window, _| window.activate_window()).ok();
             }
-            if self.welcome_id == Some(id) {
-                if let Some(welcome) = self.welcome.clone() {
-                    welcome.update(cx, |w, cx| w.show_about(cx));
-                    return;
-                }
-            }
+            return;
         }
-        // Fall back to the welcome window if it's around.
-        if let Some(welcome) = self.welcome.clone() {
-            welcome.update(cx, |w, cx| w.show_about(cx));
-        }
+        let mut entity_slot: Option<Entity<AboutView>> = None;
+        let slot = &mut entity_slot;
+        let handle: WindowHandle<Root> = cx
+            .open_window(about_window_options(cx), |window, cx| {
+                let about = cx.new(|cx| AboutView::new(window, cx));
+                *slot = Some(about.clone());
+                cx.new(|cx| Root::new(about, window, cx))
+            })
+            .expect("open about window");
+        let any: AnyWindowHandle = handle.into();
+        self.about = entity_slot;
+        self.about_id = Some(any.window_id());
+        self.registry.set_about_open(true);
     }
 
     /// Reports an app-level error (e.g. an `Open…`/CLI path that failed to resolve): on the
@@ -433,6 +512,46 @@ impl FreeCellApp {
         if let Some(welcome) = self.welcome.clone() {
             welcome.update(cx, |w, cx| w.show_error(title, detail, cx));
         }
+    }
+
+    // ---- Recent files (`functional_spec.md §1`, `architecture.md §3`) ----------------------
+
+    /// The single record choke point (`architecture.md §3.1`): records `canonical` (already a
+    /// canonical, existing path) at the current instant, persists best-effort, and refreshes the
+    /// UI. Called from every place a window successfully associates with a file on disk — an open
+    /// (`do_open_path`) and a Save/Save-As path adoption (`note_window_path`).
+    fn record_recent(&mut self, canonical: PathBuf, cx: &mut App) {
+        self.recents.record(canonical, recents::now_unix_secs());
+        self.persist_recents();
+        self.refresh_recents_ui(cx);
+    }
+
+    /// Writes the recent-files store to disk when a store path is configured. Best-effort: a
+    /// write failure (e.g. a read-only disk) is logged and swallowed so it can never block an
+    /// open/save or raise a dialog (`functional_spec.md §1.5`, `architecture.md §6`).
+    fn persist_recents(&self) {
+        if let Some(path) = &self.recents_store {
+            if let Err(err) = self.recents.save(path) {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to persist recent files"
+                );
+            }
+        }
+    }
+
+    /// Pushes the current recent-files list to the UI surfaces that reflect it: the welcome
+    /// window (if open) gets fresh display rows (`functional_spec.md §2.4` live updates), and the
+    /// macOS **Open Recent** menu is rebuilt (`architecture.md §3.2`).
+    fn refresh_recents_ui(&mut self, cx: &mut App) {
+        if let Some(welcome) = self.welcome.clone() {
+            let rows = self
+                .recents
+                .display_entries(recents::now_unix_secs(), WELCOME_LIMIT);
+            welcome.update(cx, |w, cx| w.set_recents(rows, cx));
+        }
+        menus::install_menus_with(&self.recents, cx);
     }
 
     /// The registered window keys, front-to-back (the quit-prompt order). Uses the platform
@@ -478,6 +597,24 @@ impl FreeCellApp {
         cx.global::<FreeCellApp>().registry.welcome_open()
     }
 
+    /// The live welcome view entity, if the welcome window is open (tests).
+    #[cfg(test)]
+    pub(crate) fn welcome_view(cx: &App) -> Option<Entity<WelcomeView>> {
+        cx.global::<FreeCellApp>().welcome.clone()
+    }
+
+    /// Whether the About window is registered as open (tests).
+    #[cfg(test)]
+    pub(crate) fn about_open(cx: &App) -> bool {
+        cx.global::<FreeCellApp>().registry.about_open()
+    }
+
+    /// The live About view entity, if the About window is open (tests).
+    #[cfg(test)]
+    pub(crate) fn about_view(cx: &App) -> Option<Entity<AboutView>> {
+        cx.global::<FreeCellApp>().about.clone()
+    }
+
     /// The document window entity at `index` (tests).
     #[cfg(test)]
     pub(crate) fn nth_window(cx: &App, index: usize) -> Option<Entity<WorkbookWindow>> {
@@ -494,6 +631,29 @@ impl FreeCellApp {
             .windows
             .get(index)
             .map(|w| w.handle)
+    }
+
+    /// The stored recent-files paths, most-recent-first (tests).
+    #[cfg(test)]
+    pub(crate) fn recents_paths(cx: &App) -> Vec<PathBuf> {
+        cx.global::<FreeCellApp>()
+            .recents
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    /// Resets the recent-files state for a test: empties the in-memory list and points
+    /// persistence at `store` (`None` disables disk writes). `boot()` calls this with `None` so
+    /// no gpui test ever reads from / writes to the real per-user store; a test exercising the
+    /// persistence wiring passes a temp path.
+    #[cfg(test)]
+    pub(crate) fn reset_recents_for_test(store: Option<PathBuf>, cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, _| {
+            app.recents = RecentList::default();
+            app.recents_store = store;
+        });
     }
 }
 
@@ -525,11 +685,28 @@ fn document_window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// The welcome window options: small, fixed-size, non-resizable, centered, macOS custom
-/// titlebar (§7.1) or standard traffic lights on Linux (`functional_spec.md §2.2`).
+/// The welcome window options: fixed **720×480** two-pane launch surface (`ui_design.md §1`),
+/// non-resizable, non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic
+/// lights on Linux (`functional_spec.md §2.2`).
 fn welcome_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(420.0), px(300.0)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(720.0), px(480.0)), cx)),
+        titlebar: titlebar_options(),
+        is_resizable: false,
+        is_minimizable: false,
+        ..Default::default()
+    }
+}
+
+/// The About window options: small fixed **400×296** surface (`ui_design.md §6`), non-resizable,
+/// non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic lights on Linux
+/// (`functional_spec.md §4`). The height fits the top-packed identity/links body (`about.rs`)
+/// **plus the 36 px macOS titlebar row** — the earlier 262 was tuned against a titlebar-less Linux
+/// capture and clipped the last row on macOS; 296 clears the row with a balanced bottom margin.
+/// gpui has no fit-to-content window sizing, so this is a fixed height.
+fn about_window_options(cx: &App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(400.0), px(296.0)), cx)),
         titlebar: titlebar_options(),
         is_resizable: false,
         is_minimizable: false,
@@ -554,6 +731,7 @@ mod tests {
     //! synthesized [`WorkerEvent`]s straight into `on_worker_event` (no emission, no parking).
 
     use super::*;
+    use freecell_core::recent::DisplayEntry;
     use freecell_engine::{LoadError, SaveError, WorkerEvent};
     use gpui::TestAppContext;
     use tempfile::tempdir;
@@ -563,6 +741,9 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             FreeCellApp::init(cx);
+            // Isolate recents from the real per-user data dir: start empty and disable disk
+            // persistence unless a test opts into a temp store. Keeps every gpui test hermetic.
+            FreeCellApp::reset_recents_for_test(None, cx);
         });
     }
 
@@ -611,6 +792,266 @@ mod tests {
         // A second open of the same canonical path focuses the existing window — no duplicate.
         cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
         assert_eq!(window_count(cx), 1, "same path deduped to one window");
+    }
+
+    // ---- Recent files (`architecture.md §3`, §7) -------------------------------------------
+
+    #[gpui::test]
+    fn open_records_the_canonical_path_in_recents(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Recorded.xlsx");
+        write_xlsx(&path);
+
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)),
+            vec![path.canonicalize().unwrap()],
+            "opening a file records its canonical path"
+        );
+    }
+
+    #[gpui::test]
+    fn save_as_path_adoption_records_in_recents(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Adopted.xlsx");
+        write_xlsx(&path); // the file must exist for the Saved handler's canonicalize() to resolve
+
+        // Drive the same Saved → note_window_path seam as
+        // `saved_adopts_canonical_path_and_closes_after_save`.
+        let (handle, entity) = new_injectable_window(cx);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.set_dirty_for_test(true, ctx);
+                    w.arm_pending_save_for_test(path.clone(), 7, true);
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::Saved {
+                            req_id: 7,
+                            ops_seen: 0,
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)),
+            vec![path.canonicalize().unwrap()],
+            "adopting a path via Save records it as recent"
+        );
+    }
+
+    #[gpui::test]
+    fn reopening_a_file_dedupes_to_one_recent_entry(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Twice.xlsx");
+        write_xlsx(&path);
+
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)),
+            vec![path.canonicalize().unwrap()],
+            "re-opening the same path keeps a single deduped entry"
+        );
+    }
+
+    #[gpui::test]
+    fn clear_recents_empties_the_store(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ToClear.xlsx");
+        write_xlsx(&path);
+
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        assert_eq!(cx.update(|cx| FreeCellApp::recents_paths(cx)).len(), 1);
+        cx.update(FreeCellApp::clear_recents);
+        assert!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)).is_empty(),
+            "Clear Recent Files empties the list"
+        );
+    }
+
+    #[gpui::test]
+    fn recording_persists_to_the_configured_store_file(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        // A nested store path exercises `save`'s parent-dir creation.
+        let store = dir.path().join("state").join("recents.json");
+        cx.update(|cx| FreeCellApp::reset_recents_for_test(Some(store.clone()), cx));
+
+        let path = dir.path().join("Persisted.xlsx");
+        write_xlsx(&path);
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+
+        assert!(store.exists(), "recording persisted the store to disk");
+        let reloaded = RecentList::load(&store);
+        assert_eq!(
+            reloaded
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            vec![path.canonicalize().unwrap()],
+            "the persisted store round-trips the canonical path"
+        );
+    }
+
+    #[gpui::test]
+    fn load_recents_reads_the_configured_store(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Seeded.xlsx");
+        write_xlsx(&path);
+        // Pre-seed a store file on disk, then point the app at it via the test seam and load.
+        let store = dir.path().join("recents.json");
+        let mut seeded = RecentList::default();
+        seeded.record(path.canonicalize().unwrap(), 1_000);
+        seeded.save(&store).unwrap();
+
+        cx.update(|cx| FreeCellApp::reset_recents_for_test(Some(store.clone()), cx));
+        assert!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)).is_empty(),
+            "the app starts empty before the startup load"
+        );
+        cx.update(FreeCellApp::load_recents);
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)),
+            vec![path.canonicalize().unwrap()],
+            "load_recents reads the persisted store into the app"
+        );
+    }
+
+    #[gpui::test]
+    fn showing_welcome_seeds_current_recents(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Seed.xlsx");
+        write_xlsx(&path);
+        // Record a recent *before* the welcome opens, then open it: `do_show_welcome` must seed
+        // the fresh view with the current rows (`architecture.md §3.2`).
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        cx.update(FreeCellApp::show_welcome);
+        let welcome = cx.update(|cx| FreeCellApp::welcome_view(cx).expect("welcome open"));
+        assert_eq!(
+            cx.update(|cx| welcome.read(cx).recent_row_count()),
+            1,
+            "the freshly-opened welcome is seeded with the current recent rows"
+        );
+    }
+
+    #[gpui::test]
+    fn recording_updates_the_open_welcome(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_welcome);
+        let welcome = cx.update(|cx| FreeCellApp::welcome_view(cx).expect("welcome open"));
+        assert!(
+            cx.update(|cx| welcome.read(cx).is_empty_state()),
+            "the welcome starts on the empty state with no recents"
+        );
+        // Recording a recent while the welcome is open pushes the new row into it live
+        // (`functional_spec.md §2.4`, the `refresh_recents_ui` welcome branch).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Live.xlsx");
+        write_xlsx(&path);
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        assert_eq!(
+            cx.update(|cx| welcome.read(cx).recent_row_count()),
+            1,
+            "recording a recent live-updates the open welcome"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_recent_row_routes_to_open_path(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Clicked.xlsx");
+        write_xlsx(&path);
+        let canonical = path.canonicalize().unwrap();
+
+        cx.update(FreeCellApp::show_welcome);
+        let welcome = cx.update(|cx| FreeCellApp::welcome_view(cx).expect("welcome open"));
+        // Seed a row for the real file (the view renders from its own display rows).
+        cx.update(|cx| {
+            welcome.update(cx, |w, cx| {
+                w.set_recents(
+                    vec![DisplayEntry {
+                        path: canonical.clone(),
+                        name: "Clicked.xlsx".to_string(),
+                        subtitle: "0 B · tmp".to_string(),
+                        relative_time: "Just now".to_string(),
+                    }],
+                    cx,
+                )
+            })
+        });
+        assert_eq!(cx.update(|cx| welcome.read(cx).recent_row_count()), 1);
+
+        // The file vanishes between render and click; clicking the row must route to `open_path`,
+        // whose canonicalize-failure surfaces the "Couldn't open the file" dialog on the welcome
+        // (`functional_spec.md §2.2`). That modal is the observable proof the click reached
+        // `open_path` — with no real worker window spawned.
+        std::fs::remove_file(&canonical).unwrap();
+        cx.update(|cx| welcome.update(cx, |w, cx| w.open_recent(0, cx)));
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx| welcome.read(cx).has_modal()),
+            "clicking a recent row routes to open_path (its vanished-file error lands on the welcome)"
+        );
+    }
+
+    // ---- About window (`functional_spec.md §4`, `architecture.md §9`) ----------------------
+
+    #[gpui::test]
+    fn about_action_opens_a_single_about_window(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_about);
+        assert!(
+            cx.update(|cx| FreeCellApp::about_open(cx)),
+            "the About action opens (and registers) the About window"
+        );
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        assert!(cx.update(|cx| FreeCellApp::about_view(cx).is_some()));
+
+        // A second About activates the existing window rather than opening a duplicate
+        // (single-instance, `functional_spec.md §4`).
+        cx.update(FreeCellApp::show_about);
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "About is single-instance — a second trigger activates, not duplicates"
+        );
+    }
+
+    #[gpui::test]
+    fn closing_the_last_about_window_quits(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_about);
+        assert!(cx.update(|cx| FreeCellApp::about_open(cx)));
+
+        // Closing the About window when it is the only window clears its accounting and empties the
+        // registry → the app quits (`functional_spec.md §4`; the `about_id` branch of
+        // `on_window_closed` falls through to the quit-when-empty check).
+        let handle = cx.update(|cx| cx.windows().into_iter().next().expect("about window open"));
+        handle
+            .update(cx, |_root, window, _appcx| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|cx| FreeCellApp::about_open(cx)),
+            "closing the About window clears its open accounting"
+        );
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            0,
+            "no windows remain after the last (About) window closes"
+        );
     }
 
     #[gpui::test]

@@ -94,6 +94,21 @@ pub fn titlebar_row(title: impl Into<SharedString>) -> impl IntoElement {
         )
 }
 
+/// A **blank** titlebar drag row (`ui_design.md §6`, the About window): the same 36 px
+/// `CHROME_BG` drag region as [`titlebar_row`] but with **no centered title and no bottom
+/// hairline**, so the bar is seamless with the window body below it and only the OS traffic
+/// lights show. Same `start_window_move` drag behavior — see [`titlebar_row`] for the full
+/// rationale. Gated on [`MACOS_TITLEBAR`] at the call site like [`titlebar_row`].
+pub fn titlebar_row_plain() -> impl IntoElement {
+    div()
+        .h(px(TITLEBAR_HEIGHT))
+        .w_full()
+        .flex_shrink_0()
+        .bg(rgb(CHROME_BG))
+        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

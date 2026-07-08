@@ -15,14 +15,18 @@
 
 pub mod lifecycle;
 pub mod menus;
+pub mod recents;
 pub mod registry;
 pub mod titlebar;
 
+mod about;
 mod app;
 mod clipboard;
 mod fonts;
 mod welcome;
 mod window;
+
+use std::path::PathBuf;
 
 use gpui::actions;
 
@@ -62,7 +66,24 @@ actions!(
         ToggleUnderline,
         /// Quit the application (prompts each dirty window).
         Quit,
-        /// Show the About dialog.
+        /// Show the About window.
         About,
+        /// Clear the recent-files list (Open Recent → Clear Recent Files).
+        ClearRecent,
     ]
 );
+
+/// Open a specific recent file (`architecture.md §5`). Carries the file's **`PathBuf`** — the
+/// exact file to open — not an index into the self-pruning `display_entries` snapshot: its
+/// handler dispatches the path straight to [`FreeCellApp::open_path`], which dedupes/opens it or
+/// shows the vanished-file dialog (`§6`) if it moved. An index would open the *wrong* file if an
+/// earlier recent file were deleted between menu install and click. Carrying a `PathBuf` keeps it
+/// `Clone + PartialEq`, so it uses gpui's data-carrying `#[derive(Action)]` with
+/// `#[action(no_json)]` (dispatched only programmatically from the menu bar, never built from
+/// keymap JSON — so it needs neither `serde::Deserialize` nor `schemars::JsonSchema`).
+#[derive(Clone, PartialEq, Debug, gpui::Action)]
+#[action(namespace = freecell, no_json)]
+pub struct OpenRecent {
+    /// The exact file to open.
+    pub path: PathBuf,
+}

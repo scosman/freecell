@@ -63,9 +63,12 @@ through `.xlsx` (verified: `font.strike`, `alignment.vertical`, `alignment.wrap_
 - **Active state:** pressed when the active cell has wrap set (`RenderStyle.wrap`).
 - **Rendering:**
   - Text wraps to the cell's column width and renders as multiple lines.
-  - Only the lines that fit within the row's **current** height are shown; content
-    beyond the bottom of the cell is clipped. The user grows the row manually to
-    reveal more (row-resize already exists).
+  - Only the lines that fit within the row's **current** height are shown; the rest are
+    clipped. The wrapped block is positioned as a unit per the cell's **vertical
+    alignment** (§1.3): under the bottom default the block **bottom-anchors**, so the
+    **top** lines clip and the tail is shown; with `Top` the block top-anchors and the
+    **bottom** lines clip. The user grows the row manually to reveal the clipped lines
+    (row-resize already exists).
   - With wrap **on**, text no longer clips-at-boundary / overflows into neighbors the
     way unwrapped text does — it wraps inside its own cell.
 - **Deferred:** auto-growing the row height to fit all wrapped lines (true Excel wrap)
@@ -78,16 +81,22 @@ through `.xlsx` (verified: `font.strike`, `alignment.vertical`, `alignment.wrap_
   (its own divider group) placed **after** the horizontal align L / C / R group.
 - **Behavior:** radio-style, mirroring horizontal alignment. Clicking a button sets
   that vertical alignment on the selection (`alignment.vertical` = `top`/`center`/`bottom`).
-- **Active state:** a button is pressed only when the active cell has that vertical
-  alignment set **explicitly** (mirrors horizontal align, where a value present only
-  when explicit lights the button). A cell with no explicit vertical alignment shows
-  **no** button pressed.
-- **Rendering:**
+- **Active state:** a button is pressed when the active cell's **resolved** vertical
+  alignment equals it (`RenderStyle.v_align == Some(x)`). Under **decision C** (below),
+  IronCalc reports a defaulted vertical as `Bottom`, so a cell whose vertical is merely
+  defaulted (e.g. only horizontal alignment set, or one loaded from `.xlsx`) lights the
+  **Align bottom** button; a truly-clean cell (no alignment record at all) lights **no**
+  button but still renders bottom. This is the accepted, Excel-ish behavior — a minor
+  deviation from "only explicit lights the button," documented here.
+- **Rendering (decision C — match Excel):**
+  - FreeCell's default vertical placement is now **bottom** (Excel-faithful): every cell
+    bottom-aligns its text unless it carries an explicit `Top`/`Center` (or `Bottom`,
+    which renders identically to the default).
   - When set explicitly, the cell's text block is positioned at the top / vertical
-    center / bottom of the row.
-  - When **unset**, the cell keeps FreeCell's **current** default vertical rendering
-    (unchanged from today — see edge cases). This avoids moving every existing render
-    baseline; only cells that opt in change position.
+    center / bottom of the row; **unset** renders **bottom** (same as `Some(Bottom)`), so
+    unset and defaulted-bottom are coherent.
+  - Adopting bottom as the default moves text center → bottom for essentially every cell,
+    so **all** render baselines were regenerated and eyeballed with this change.
   - Interacts with wrap: a wrapped multi-line block is positioned as a unit.
 - **Persistence:** stored as IronCalc `alignment.vertical` (Top/Center/Bottom;
   Justify/Distributed out of scope); round-trips.
@@ -100,10 +109,11 @@ through `.xlsx` (verified: `font.strike`, `alignment.vertical`, `alignment.wrap_
 - **Mixed selection (some cells have the attribute, some don't):** toggles follow the
   bold rule (any cell lacking it → set all; else clear). Vertical align is a set (not
   toggle): applying sets all selected cells to the chosen value.
-- **Current default vertical position:** implementation must confirm FreeCell's present
-  vertical text placement and make "unset" render identically to today (likely center).
-  If explicit `Bottom` happens to match Excel's default, that's fine, but unset must not
-  shift baselines.
+- **Default vertical position (decision C):** FreeCell adopts **bottom** as the default
+  vertical placement (Excel-faithful). The prior default was center; under C the "unset"
+  path (`v_align == None`) renders bottom, identical to `Some(Bottom)`. This intentionally
+  moves text center → bottom across essentially every cell, so all render baselines were
+  regenerated and eyeballed — the shift is uniform and expected, not a regression.
 - **Wrap + very narrow column:** wrapping still applies at the column width; extremely
   narrow columns may show one character per line (acceptable, matches Excel).
 - **Undo/redo:** each of these is one IronCalc-native undoable step, like existing

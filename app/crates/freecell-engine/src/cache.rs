@@ -31,7 +31,7 @@ use freecell_core::{
     limits, BorderSpec, CellRef, Edge, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
 };
 use ironcalc_base::types::{
-    Border, BorderItem, BorderStyle, Color, HorizontalAlignment, Style, Theme,
+    Border, BorderItem, BorderStyle, Color, HorizontalAlignment, Style, Theme, VerticalAlignment,
 };
 
 use crate::document::WorkbookDocument;
@@ -158,6 +158,13 @@ pub(crate) fn render_style_from(style: &Style, theme: &Theme) -> RenderStyle {
         bold: style.font.b,
         italic: style.font.i,
         underline: style.font.u,
+        strikethrough: style.font.strike,
+        // Wrap is `alignment.wrap_text` (a cell with no alignment record reads `false`).
+        wrap: style
+            .alignment
+            .as_ref()
+            .map(|a| a.wrap_text)
+            .unwrap_or(false),
         // A solid fill's colour is `fill.color` (resolved against the theme); `Color::None` (or an
         // unparseable colour) → no fill.
         fill: resolve_rgb(&style.fill.color, theme),
@@ -166,6 +173,7 @@ pub(crate) fn render_style_from(style: &Style, theme: &Theme) -> RenderStyle {
         // interning to the default style.
         font_color: resolve_rgb(&style.font.color, theme).filter(|rgb| *rgb != Rgb::new(0, 0, 0)),
         h_align: h_align_of(style),
+        v_align: v_align_of(style),
         // `num_fmt` / `font_family` / `border` are side-table indices resolved by the caller
         // (build/refresh), which holds the interning tables; a bare conversion carries `0`
         // (= "general" / the workbook default family / BorderSpec::NONE). `font_size_q` is likewise
@@ -212,6 +220,29 @@ fn h_align_of(style: &Style) -> Option<freecell_core::Align> {
         Some(HorizontalAlignment::Left) => Some(Align::Left),
         Some(HorizontalAlignment::Center) => Some(Align::Center),
         Some(HorizontalAlignment::Right) => Some(Align::Right),
+        _ => None,
+    }
+}
+
+/// Maps IronCalc's vertical alignment to the grid's [`VAlign`](freecell_core::VAlign) (parallel to
+/// [`h_align_of`]). Only Top/Center/Bottom are drawn; Justify/Distributed — and a cell with no
+/// alignment record — resolve to `None`, which the grid renders as its default placement:
+/// **bottom**, Excel-faithful (decision C — `functional_spec.md §1.3`, `architecture.md §5`).
+///
+/// IronCalc's `VerticalAlignment` default is `Bottom`, so a cell with *any* alignment record (e.g.
+/// only `horizontal` set, or one loaded from `.xlsx`) carries `vertical = Bottom` and resolves to
+/// `Some(Bottom)`. Under decision C this is coherent: `None` (no alignment record) and
+/// `Some(Bottom)` (a record whose vertical is explicit-or-defaulted bottom) both render bottom, so
+/// there is no visible split between "unset" and "defaulted-bottom". The accepted consequence is
+/// that such a cell lights the **Align bottom** toolbar button — matching Excel's model where every
+/// cell is bottom-aligned by default. The engine cannot distinguish an explicit `bottom` from a
+/// defaulted one, and under C it does not need to.
+fn v_align_of(style: &Style) -> Option<freecell_core::VAlign> {
+    use freecell_core::VAlign;
+    match style.alignment.as_ref().map(|a| &a.vertical) {
+        Some(VerticalAlignment::Top) => Some(VAlign::Top),
+        Some(VerticalAlignment::Center) => Some(VAlign::Center),
+        Some(VerticalAlignment::Bottom) => Some(VAlign::Bottom),
         _ => None,
     }
 }
@@ -477,7 +508,7 @@ pub(crate) fn assert_cache_agrees(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freecell_core::{Align, CellRange};
+    use freecell_core::{Align, CellRange, VAlign};
 
     // Colour resolution needs a workbook theme; these tests exercise explicit `#rgb` colours
     // (theme-independent), so the default theme suffices.
@@ -528,6 +559,37 @@ mod tests {
         assert!(rsf(&style_with("font.b", "true")).bold);
         assert!(rsf(&style_with("font.i", "true")).italic);
         assert!(rsf(&style_with("font.u", "true")).underline);
+        assert!(rsf(&style_with("font.strike", "true")).strikethrough);
+        assert!(rsf(&style_with("alignment.wrap_text", "true")).wrap);
+        assert_eq!(
+            rsf(&style_with("alignment.vertical", "top")).v_align,
+            Some(VAlign::Top)
+        );
+        assert_eq!(
+            rsf(&style_with("alignment.vertical", "center")).v_align,
+            Some(VAlign::Center)
+        );
+        assert_eq!(
+            rsf(&style_with("alignment.vertical", "bottom")).v_align,
+            Some(VAlign::Bottom)
+        );
+        // Justify is out of scope → treated as unset.
+        assert_eq!(
+            rsf(&style_with("alignment.vertical", "justify")).v_align,
+            None
+        );
+        // Decision C: a cell that has an alignment record but only a *defaulted* vertical (here,
+        // only `horizontal` was set → IronCalc fills `vertical = Bottom` by default) resolves to
+        // `Some(Bottom)`. This guards the real engine mapping — the grid renders it bottom, exactly
+        // like the `None` (no-record) default, so the two are coherent.
+        assert_eq!(
+            rsf(&style_with("alignment.horizontal", "center")).v_align,
+            Some(VAlign::Bottom)
+        );
+        // A cell with no alignment record has no vertical alignment and no wrap.
+        assert_eq!(rsf(&Style::default()).v_align, None);
+        assert!(!rsf(&Style::default()).wrap);
+        assert!(!rsf(&Style::default()).strikethrough);
         assert_eq!(
             rsf(&style_with("fill.fg_color", "#FF0000")).fill,
             Some(Rgb::from_hex(0xFF0000))

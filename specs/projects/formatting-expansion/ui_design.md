@@ -56,9 +56,13 @@ ambiguous glyph.
 
 - All five text-style toggles (`B I U S ⤶`) show the pressed look when the active cell
   has that attribute (`RenderStyle.bold/italic/underline/strikethrough/wrap`).
-- V-align buttons: pressed only when the active cell has that vertical alignment set
-  **explicitly** (`RenderStyle.v_align == Some(x)`); none pressed when unset — exactly
-  like horizontal align.
+- V-align buttons: pressed when the active cell's **resolved** vertical alignment equals
+  the button (`RenderStyle.v_align == Some(x)`). Under **decision C** (bottom is the
+  default placement) this is **not** exactly like horizontal align: IronCalc reports a
+  defaulted vertical as `Bottom`, so a cell whose vertical is merely defaulted (e.g. only
+  horizontal set, or one loaded from `.xlsx`) lights **Align bottom**; a truly-clean cell
+  (no alignment record) lights nothing but still renders bottom. Accepted minor deviation
+  (see `functional_spec.md §1.3`).
 - All disabled (greyed) when the worker is degraded/read-only, like the existing group.
 
 ---

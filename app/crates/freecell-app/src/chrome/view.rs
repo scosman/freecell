@@ -38,7 +38,7 @@ use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId};
+use freecell_core::{Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign};
 
 use freecell_engine::{
     BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
@@ -89,12 +89,14 @@ impl Anchor {
     }
 }
 /// The action row's natural (uncompressed) width for the current control set — font family +
-/// size (Phase 5), B/I/U, text color + fill, **borders** (Phase 6), alignment, number format +
-/// decimals — with its dividers. The row never wraps (`ui_design.md §2`: raise the window's min
-/// width instead), so it holds this min width; the document window (1200 px) is far wider. Phase 6
-/// adds the borders button (~64 px) + a divider, so this grows 816 → 896. Recorded in
+/// size (Phase 5), B/I/U + strikethrough/wrap, text color + fill, **borders** (Phase 6),
+/// horizontal + vertical alignment, number format + decimals — with its dividers. The row never
+/// wraps (`ui_design.md §2`: raise the window's min width instead), so it holds this min width; the
+/// document window (1200 px) is far wider. Phase 6 added the borders button (~64 px) + a divider
+/// (816 → 896); the formatting-expansion project adds strikethrough + wrap toggles and the
+/// three-button vertical-align group + a divider (~180 px → 896 → 1080). Recorded in
 /// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips.
-const ACTION_ROW_MIN_W: f32 = 896.0;
+const ACTION_ROW_MIN_W: f32 = 1080.0;
 
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
@@ -968,6 +970,21 @@ impl ChromeView {
         self.apply_style_path(StylePath::AlignHorizontal, value, window, cx);
     }
 
+    /// Applies a vertical alignment (top/center/bottom) over the selection — a plain radio-style
+    /// set (`functional_spec.md §1.3`, `architecture.md §2`). Unlike horizontal align there is no
+    /// re-press-to-clear: IronCalc's vertical default is `bottom` and the grid's default placement
+    /// is also bottom (decision C — Excel-faithful), so there is no independent "unset" value to
+    /// clear back to; the group is purely one-of-N (top / center / bottom).
+    pub fn apply_valign(&mut self, valign: VAlign, window: &mut Window, cx: &mut Context<Self>) {
+        let value = match valign {
+            VAlign::Top => "top",
+            VAlign::Center => "center",
+            VAlign::Bottom => "bottom",
+        }
+        .to_string();
+        self.apply_style_path(StylePath::AlignVertical, value, window, cx);
+    }
+
     /// Applies a number-format code over the selection, closing the number-format dropdown.
     pub fn apply_num_fmt(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.num_fmt_open = false;
@@ -1379,10 +1396,29 @@ impl ChromeView {
         self.active_style.map(|s| s.underline).unwrap_or(false)
     }
 
+    /// Whether the strikethrough toggle is pressed.
+    pub fn strikethrough_active(&self) -> bool {
+        self.active_style.map(|s| s.strikethrough).unwrap_or(false)
+    }
+
+    /// Whether the wrap-text toggle is pressed.
+    pub fn wrap_active(&self) -> bool {
+        self.active_style.map(|s| s.wrap).unwrap_or(false)
+    }
+
     /// Whether an alignment button is pressed — the **explicit** alignment only (a number aligned
     /// right by type default shows no pressed button, matching Excel; `components/action_bar.md`).
     pub fn align_active(&self, align: Align) -> bool {
         self.active_style.and_then(|s| s.h_align) == Some(align)
+    }
+
+    /// Whether a vertical-alignment button is pressed — the active cell's resolved vertical
+    /// alignment (`functional_spec.md §1.3`). Under decision C the resolver reports a defaulted
+    /// bottom as `Some(Bottom)`, so a cell whose vertical is merely defaulted (e.g. only horizontal
+    /// set, or loaded from `.xlsx`) lights **Align bottom**; a truly-clean cell (no alignment
+    /// record at all) lights nothing but still renders bottom. Accepted Excel-ish behavior.
+    pub fn valign_active(&self, valign: VAlign) -> bool {
+        self.active_style.and_then(|s| s.v_align) == Some(valign)
     }
 
     /// The active cell's number-format [`Category`] (General on a multi-cell selection / no cache).
@@ -1627,6 +1663,25 @@ impl ChromeView {
                 }))
         };
 
+        // A vertical-alignment button (pressed = the cell's explicit vertical alignment). Mirrors
+        // `align_btn` but drives the vertical group (`ui_design.md §1.1`).
+        let valign_btn = |id: &'static str,
+                          tooltip: &'static str,
+                          valign: VAlign,
+                          glyph: &'static str,
+                          cx: &mut Context<Self>| {
+            Button::new(id)
+                .label(glyph)
+                .tooltip(tooltip)
+                .ghost()
+                .small()
+                .disabled(disabled)
+                .selected(self.valign_active(valign))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_valign(valign, window, cx);
+                }))
+        };
+
         div()
             .flex()
             .items_center()
@@ -1700,6 +1755,24 @@ impl ChromeView {
                 StyleAttr::Underline,
                 cx,
             ))
+            // Strikethrough (S with a combining long-stroke overlay) + Wrap text (⤶),
+            // appended to the B/I/U toggle group (`ui_design.md §1.1`, `functional_spec.md §1`).
+            .child(toggle(
+                "strikethrough",
+                "S\u{0336}",
+                "Strikethrough",
+                self.strikethrough_active(),
+                StyleAttr::Strikethrough,
+                cx,
+            ))
+            .child(toggle(
+                "wrap",
+                "\u{2936}",
+                "Wrap text",
+                self.wrap_active(),
+                StyleAttr::WrapText,
+                cx,
+            ))
             .child(action_divider())
             // Text color · Fill:
             .child(
@@ -1767,6 +1840,29 @@ impl ChromeView {
                 "Align right",
                 Align::Right,
                 "⇥",
+                cx,
+            ))
+            .child(action_divider())
+            // Vertical alignment — its own group after horizontal align (`ui_design.md §1.1`):
+            .child(valign_btn(
+                "valign-top",
+                "Align top",
+                VAlign::Top,
+                "\u{2912}",
+                cx,
+            ))
+            .child(valign_btn(
+                "valign-middle",
+                "Align middle",
+                VAlign::Center,
+                "\u{2015}",
+                cx,
+            ))
+            .child(valign_btn(
+                "valign-bottom",
+                "Align bottom",
+                VAlign::Bottom,
+                "\u{2913}",
                 cx,
             ))
             .child(action_divider())
@@ -2738,7 +2834,10 @@ mod tests {
         let mut chrome_out: Option<Entity<ChromeView>> = None;
         let chrome_slot = &mut chrome_out;
 
-        let window = cx.open_window(size(px(900.0), px(height)), |window, cx| {
+        // The test window matches the real document window width (1200 px) so the full action row
+        // — including the number-format popover trigger past the vertical-align group — is on-screen
+        // for the popover-hit tests (the row's natural width is ~1080 px, `ACTION_ROW_MIN_W`).
+        let window = cx.open_window(size(px(1200.0), px(height)), |window, cx| {
             let client_dyn: Rc<dyn ChromeClient> = client_for_window;
             let reqs = reqs_for_window;
             let sink = ChromeGridSink::new(move |req, _w, _cx| reqs.borrow_mut().push(req.clone()));
@@ -3099,6 +3198,54 @@ mod tests {
     }
 
     #[gpui::test]
+    fn strikethrough_and_wrap_toggles_send_setstyleattr(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_style(StyleAttr::Strikethrough, window, cx)
+        });
+        assert!(matches!(
+            h.client.take_commands().as_slice(),
+            [Command::SetStyleAttr {
+                attr: StyleAttr::Strikethrough,
+                ..
+            }]
+        ));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_style(StyleAttr::WrapText, window, cx)
+        });
+        assert!(matches!(
+            h.client.take_commands().as_slice(),
+            [Command::SetStyleAttr {
+                attr: StyleAttr::WrapText,
+                ..
+            }]
+        ));
+    }
+
+    #[gpui::test]
+    fn strikethrough_and_wrap_reflect_active_style(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                strikethrough: true,
+                wrap: false,
+                ..Default::default()
+            },
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        assert!(upd(&h, cx, |c, _w, _cx| c.strikethrough_active()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.wrap_active()));
+    }
+
+    #[gpui::test]
     fn fill_swatch_and_no_fill(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
         upd(&h, cx, |c, window, cx| {
@@ -3197,6 +3344,52 @@ mod tests {
         assert!(matches!(
             cmds.as_slice(),
             [Command::SetStylePath { path: StylePath::AlignHorizontal, value, .. }] if value == "left"
+        ));
+    }
+
+    #[gpui::test]
+    fn vertical_alignment_sets_and_reflects(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // The active cell is explicitly top-aligned → the Top button reads pressed, others not.
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                v_align: Some(VAlign::Top),
+                ..Default::default()
+            },
+        );
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.valign_active(VAlign::Top)));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.valign_active(VAlign::Bottom)));
+
+        // Pressing a vertical-align button is a plain set (no re-press-to-clear).
+        upd(&h, cx, |c, window, cx| {
+            c.apply_valign(VAlign::Bottom, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetStylePath { path: StylePath::AlignVertical, value, .. }] if value == "bottom"
+        ));
+
+        // Re-pressing the already-active alignment re-applies it (no clear value).
+        h.client.set_style(
+            SheetId(0),
+            cell(1, 1),
+            RenderStyle {
+                v_align: Some(VAlign::Center),
+                ..Default::default()
+            },
+        );
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, window, cx| {
+            c.apply_valign(VAlign::Center, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::SetStylePath { path: StylePath::AlignVertical, value, .. }] if value == "center"
         ));
     }
 

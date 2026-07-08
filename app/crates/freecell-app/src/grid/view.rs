@@ -32,7 +32,7 @@ use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
     apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
     is_full_row_selection, Align, Axis, BorderSpec, CellRange, CellRef, Edge, RenderStyle,
-    SelectionModel, SheetDims,
+    SelectionModel, SheetDims, VAlign,
 };
 
 use super::input::{command_for_key, GridKeyCommand};
@@ -2419,7 +2419,10 @@ fn cell_element(
         .border_b_1()
         .border_color(rgb(GRIDLINE))
         .flex()
-        .items_center()
+        // Default vertical placement is BOTTOM — Excel-faithful (decision C): every cell
+        // bottom-aligns its text unless it carries an explicit `v_align` (handled below). This is
+        // also what mirror/pending cells (`style: None`) get, so the default is uniform.
+        .items_end()
         .overflow_hidden()
         .whitespace_nowrap()
         .px(px(CELL_H_PAD))
@@ -2449,6 +2452,20 @@ fn cell_element(
         if s.underline {
             el = el.underline();
         }
+        // Strikethrough: a line through the text (mirrors the underline seam; combines with it —
+        // `functional_spec.md §1.1`).
+        if s.strikethrough {
+            el = el.line_through();
+        }
+        // Explicit vertical alignment positions the text block within the row height. `None` keeps
+        // the base default — BOTTOM, Excel-faithful (decision C) — so unset and explicit-`Bottom`
+        // render identically (`functional_spec.md §1.3`, `architecture.md §7`).
+        el = match s.v_align {
+            Some(VAlign::Top) => el.items_start(),
+            Some(VAlign::Center) => el.items_center(),
+            Some(VAlign::Bottom) => el.items_end(),
+            None => el,
+        };
         // A non-default font size renders at `q/4` pt → px (`components/style_render.md`); the
         // default (`0`) keeps the grid's `CELL_FONT_PX`. Mirror/pending cells pass `style: None`,
         // so they always render in the default font (`functional_spec.md §1.2`).
@@ -2463,6 +2480,24 @@ fn cell_element(
 
     if text.is_empty() {
         el.into_any_element()
+    } else if style.map(|s| s.wrap).unwrap_or(false) {
+        // Wrapped text needs a width-bounded box to flow into: a flex row's direct text child is
+        // sized to its (unwrapped) content, so `whitespace_normal` only breaks lines once the text
+        // has a definite width. Wrap it in a full-width content box (which sets `whitespace_normal`,
+        // overriding the cell's base `whitespace_nowrap`) so gpui wraps at the column width.
+        // Horizontal placement moves from the flex's justify-content to the box's text-align; the
+        // outer flex's `items_*` still positions the whole block vertically, and `overflow_hidden`
+        // clips the lines that don't fit the row height (no auto-grow — GAPS F1).
+        let h_align = style
+            .and_then(|s| s.h_align)
+            .unwrap_or_else(|| kind.default_align());
+        let content = div().w_full().whitespace_normal();
+        let content = match h_align {
+            Align::Left => content.text_left(),
+            Align::Center => content.text_center(),
+            Align::Right => content.text_right(),
+        };
+        el.child(content.child(text)).into_any_element()
     } else {
         el.child(text).into_any_element()
     }

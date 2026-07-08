@@ -102,13 +102,14 @@ pub enum SaveError {
 pub struct CellQueryError(String);
 
 /// A character-format boolean the worker toggles (the engine style paths `font.b` / `font.i`
-/// / `font.u`). In-crate: the toggle *policy* (any-lacking → set-all) lives in the worker;
-/// this is only the read/write *mechanism* over the pinned IronCalc range-style API.
+/// / `font.u` / `font.strike`). In-crate: the toggle *policy* (any-lacking → set-all) lives in the
+/// worker; this is only the read/write *mechanism* over the pinned IronCalc range-style API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FontFlag {
     Bold,
     Italic,
     Underline,
+    Strike,
 }
 
 impl FontFlag {
@@ -118,6 +119,7 @@ impl FontFlag {
             FontFlag::Bold => "font.b",
             FontFlag::Italic => "font.i",
             FontFlag::Underline => "font.u",
+            FontFlag::Strike => "font.strike",
         }
     }
 }
@@ -625,7 +627,18 @@ impl WorkbookDocument {
             FontFlag::Bold => style.font.b,
             FontFlag::Italic => style.font.i,
             FontFlag::Underline => style.font.u,
+            FontFlag::Strike => style.font.strike,
         })
+    }
+
+    /// Whether `cell` currently has wrap-text set (`alignment.wrap_text`) — the per-cell read the
+    /// worker samples for the wrap toggle's decision. A cell with no alignment record reads
+    /// `false` (mirrors the [`font_flag`](Self::font_flag) per-cell reader).
+    pub(crate) fn wrap_flag(&self, sheet_idx: u32, cell: CellRef) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        let style = self.model.get_cell_style(sheet_idx, row, col)?;
+        Ok(style.alignment.map(|a| a.wrap_text).unwrap_or(false))
     }
 
     /// Sets a character-format flag across a range to `value` (one undoable range-style op).
@@ -1348,10 +1361,12 @@ mod tests {
         assert_eq!(classify_magic(&empty).unwrap(), FileKind::Other);
     }
 
-    /// Bold / italic / underline / fill / font-color survive a save→reopen round-trip.
-    /// In-crate (not an integration test) because it reads back the raw `ironcalc` `Style`.
+    /// Bold / italic / underline / strikethrough / fill / font-color / wrap / vertical-align
+    /// survive a save→reopen round-trip. In-crate (not an integration test) because it reads back
+    /// the raw `ironcalc` `Style`.
     #[test]
     fn roundtrip_styles_preserved() {
+        use ironcalc_base::types::VerticalAlignment;
         let dir = tempdir().unwrap();
         let path = dir.path().join("styles.xlsx");
 
@@ -1363,6 +1378,14 @@ mod tests {
         assert!(reopened.cell_style(0, CellRef::new(0, 0)).unwrap().font.b);
         assert!(reopened.cell_style(0, CellRef::new(0, 1)).unwrap().font.i);
         assert!(reopened.cell_style(0, CellRef::new(0, 2)).unwrap().font.u);
+        // D1 strikethrough.
+        assert!(
+            reopened
+                .cell_style(0, CellRef::new(0, 3))
+                .unwrap()
+                .font
+                .strike
+        );
 
         // A2 red fill, B2 blue font color.
         let fill = reopened.cell_style(0, CellRef::new(1, 0)).unwrap().fill;
@@ -1374,6 +1397,19 @@ mod tests {
         assert_eq!(
             font.color,
             ironcalc_base::types::Color::Rgb("#0000FF".to_string())
+        );
+
+        // D2 wrap-text, D3 vertical alignment = top.
+        let d2 = reopened.cell_style(0, CellRef::new(1, 3)).unwrap();
+        assert!(
+            d2.alignment.map(|a| a.wrap_text).unwrap_or(false),
+            "wrap_text survives the round-trip"
+        );
+        let d3 = reopened.cell_style(0, CellRef::new(2, 3)).unwrap();
+        assert_eq!(
+            d3.alignment.map(|a| a.vertical),
+            Some(VerticalAlignment::Top),
+            "vertical alignment survives the round-trip"
         );
     }
 

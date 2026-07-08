@@ -3,7 +3,7 @@
 //! rows here (stated as a review requirement in `README.md`). `name` is snake_case and IS the
 //! baseline filename, so a red CI line names the exact broken feature.
 
-use freecell_core::{Align, BorderSpec, CellRef, Edge, Rgb, SelectionModel};
+use freecell_core::{Align, BorderSpec, CellRef, Edge, Rgb, SelectionModel, VAlign};
 
 use crate::scene::Scene;
 
@@ -145,6 +145,12 @@ pub fn all() -> Vec<RenderCase> {
             "cell_bold_italic_underline",
             at(Scene::new()).bold(1, 1).italic(1, 1).underline(1, 1),
         ),
+        cell("cell_strikethrough", at(Scene::new()).strikethrough(1, 1)),
+        cell(
+            // Strikethrough combines with underline (a cell can carry both — `functional_spec.md §1.1`).
+            "cell_strikethrough_underline",
+            at(Scene::new()).strikethrough(1, 1).underline(1, 1),
+        ),
         // ---- Fill ----------------------------------------------------------------------
         cell("cell_fill_red", at(Scene::new()).fill(1, 1, 0xFF0000)),
         cell("cell_fill_yellow", at(Scene::new()).fill(1, 1, 0xFFEB3B)),
@@ -250,6 +256,51 @@ pub fn all() -> Vec<RenderCase> {
         cell(
             "cell_tall_row",
             Scene::new().input(1, 1, "Tall").row_height(1, 60.0),
+        ),
+        cell(
+            // Wrap on: the text flows onto multiple lines constrained to the (narrow) column and
+            // clips to the row height — no overflow into neighbours, no auto-grow (GAPS F1).
+            "cell_wrap_multiline_clipped",
+            Scene::new()
+                .input(1, 1, "wrap this long text onto several lines")
+                .col_width(1, 72.0)
+                .row_height(1, 48.0)
+                .wrap(1, 1),
+        ),
+        // Vertical alignment: a tall row so top / middle / bottom placement is visible. Unset
+        // renders bottom (the grid default under decision C), covered by every other tall-row
+        // case above.
+        cell(
+            "cell_valign_top",
+            Scene::new()
+                .input(1, 1, "Top")
+                .row_height(1, 60.0)
+                .v_align(1, 1, VAlign::Top),
+        ),
+        cell(
+            "cell_valign_middle",
+            Scene::new()
+                .input(1, 1, "Mid")
+                .row_height(1, 60.0)
+                .v_align(1, 1, VAlign::Center),
+        ),
+        cell(
+            "cell_valign_bottom",
+            Scene::new()
+                .input(1, 1, "Bot")
+                .row_height(1, 60.0)
+                .v_align(1, 1, VAlign::Bottom),
+        ),
+        cell(
+            // Wrap + vertical alignment: the wrapped multi-line block is positioned as a unit at
+            // the bottom of the row (`functional_spec.md §1.3` — "positioned as a unit").
+            "cell_wrap_valign_bottom",
+            Scene::new()
+                .input(1, 1, "wrapped block aligned bottom")
+                .col_width(1, 80.0)
+                .row_height(1, 64.0)
+                .wrap(1, 1)
+                .v_align(1, 1, VAlign::Bottom),
         ),
         cell(
             "cell_wide_column",

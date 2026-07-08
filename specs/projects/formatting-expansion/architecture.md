@@ -138,7 +138,11 @@ style+color and (b) hold the transient target/pen state in the view.
 - `wrap = style.alignment.map(|a| a.wrap_text).unwrap_or(false)`
 - `v_align = style.alignment.and_then(|a| map a.vertical)` via a `v_align_of` helper
   mirroring the existing `h_align_of` (Top/Center/Bottom → `Some`; Justify/Distributed →
-  `None`, i.e. treated as unset for the toolbar — out of scope).
+  `None`, i.e. treated as unset for the toolbar — out of scope). **Decision C:** IronCalc's
+  `VerticalAlignment` default is `Bottom`, so a cell with any alignment record (e.g. only
+  horizontal set, or `.xlsx`-loaded) resolves to `Some(Bottom)`; `None` (no alignment
+  record) and `Some(Bottom)` both render bottom (§7), so the mapping is coherent — no
+  visible split between "unset" and "defaulted-bottom".
 
 Border pattern mapping — extend the existing `border_weight` region into an
 `edge_from`/`border_spec_from` that also sets `Edge.pattern`:
@@ -205,10 +209,12 @@ This keeps files that already contain deferred styles rendering exactly as they 
 - **Wrap (2A):** when `RenderStyle.wrap`, the cell text element wraps to the cell content
   width and renders multiple lines, **clipped** to the row height (no overflow into
   neighbors, no auto-grow — GAPS F1). When unset, current single-line behavior unchanged.
-- **Vertical align:** position the cell's text block at top / middle / bottom of the row
-  when `v_align` is `Some`; when `None`, keep the **current** default placement (locate
-  the existing text-y computation and branch — do not change the unset path, to avoid
-  moving every baseline).
+- **Vertical align (decision C):** position the cell's text block at top / middle / bottom
+  of the row for `Some(Top)` / `Some(Center)` / `Some(Bottom)`. The grid's **default**
+  placement (the flex container's `items_*`) is **bottom** — Excel-faithful — so `None`
+  (and `style: None` mirror cells) render bottom too. This intentionally moves the unset
+  baseline center → bottom for essentially every cell, so **all** render baselines are
+  regenerated + eyeballed with this change (not just the vertical-align cases).
 - **Border patterns:** `vertical_edge_quad` / `horizontal_edge_quad` branch on
   `Edge.pattern`:
   - `Solid` → today's single filled strip (unchanged).

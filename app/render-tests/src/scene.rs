@@ -27,12 +27,15 @@ use arc_swap::ArcSwap;
 
 use freecell_app::grid::GridDataSources;
 use freecell_core::cache::SheetCaches;
-use freecell_core::{Align, BorderSpec, CellRange, CellRef, RenderStyle, Rgb, SheetId};
+use freecell_core::{Align, BorderSpec, CellRange, CellRef, RenderStyle, Rgb, SheetId, VAlign};
 use freecell_engine::{Command, DocumentClient, DocumentSource, StyleAttr, WorkerEvent};
 
 /// One command-less style injection applied to the real `SheetCache` after the worker builds it.
 enum Inject {
     Align(u32, u32, Align),
+    /// Explicit vertical alignment (injected — the real `SetStylePath` path is exercised by the
+    /// engine integration tests; the grid renders identically from either source).
+    VAlign(u32, u32, VAlign),
     FontColor(u32, u32, Rgb),
     ColWidth(u32, f32),
     RowHeight(u32, f32),
@@ -102,6 +105,16 @@ impl Scene {
         self.style(CellRef::new(row, col), StyleAttr::Underline)
     }
 
+    /// Toggles strikethrough on a cell — a real `SetStyleAttr` worker edit.
+    pub fn strikethrough(self, row: u32, col: u32) -> Self {
+        self.style(CellRef::new(row, col), StyleAttr::Strikethrough)
+    }
+
+    /// Toggles wrap-text on a cell — a real `SetStyleAttr` worker edit.
+    pub fn wrap(self, row: u32, col: u32) -> Self {
+        self.style(CellRef::new(row, col), StyleAttr::WrapText)
+    }
+
     /// Sets a solid fill on a cell — a real `SetStyleAttr` worker edit.
     pub fn fill(self, row: u32, col: u32, rgb: u32) -> Self {
         self.style(
@@ -126,6 +139,12 @@ impl Scene {
     /// Sets explicit horizontal alignment (injected into the real cache — no worker command).
     pub fn align(mut self, row: u32, col: u32, align: Align) -> Self {
         self.injects.push(Inject::Align(row, col, align));
+        self
+    }
+
+    /// Sets explicit vertical alignment (injected into the real cache — no worker command).
+    pub fn v_align(mut self, row: u32, col: u32, valign: VAlign) -> Self {
+        self.injects.push(Inject::VAlign(row, col, valign));
         self
     }
 
@@ -282,6 +301,17 @@ fn apply_injections(caches: &parking_lot::RwLock<SheetCaches>, sheet: SheetId, i
                     *col,
                     RenderStyle {
                         h_align: Some(*align),
+                        ..base
+                    },
+                );
+            }
+            Inject::VAlign(row, col, valign) => {
+                let base = cache.render_style(*row, *col).copied().unwrap_or_default();
+                cache.set_cell_style(
+                    *row,
+                    *col,
+                    RenderStyle {
+                        v_align: Some(*valign),
                         ..base
                     },
                 );

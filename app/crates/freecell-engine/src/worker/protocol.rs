@@ -16,15 +16,21 @@ use freecell_core::{CellRange, CellRef, Rgb, SheetId};
 
 use crate::document::{LoadError, SaveError};
 
-/// A character/fill style change (`SetStyleAttr`). Bold / italic / underline are **toggles**
-/// resolved worker-side — "any cell in the range lacks it → set the whole range, else clear
-/// the whole range" (`components/engine_worker.md §SetStyleAttr`). `Fill` is a direct set
-/// (`Some(color)`) or clear (`None`), matching the fill popover's swatches + "No Fill".
+/// A character/fill style change (`SetStyleAttr`). Bold / italic / underline / strikethrough /
+/// wrap-text are **toggles** resolved worker-side — "any cell in the range lacks it → set the
+/// whole range, else clear the whole range" (`components/engine_worker.md §SetStyleAttr`). `Fill`
+/// is a direct set (`Some(color)`) or clear (`None`), matching the fill popover's swatches + "No
+/// Fill".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StyleAttr {
     Bold,
     Italic,
     Underline,
+    /// Strikethrough (`font.strike`) — toggles like [`Bold`](StyleAttr::Bold).
+    Strikethrough,
+    /// Wrap text (`alignment.wrap_text`) — toggles like [`Bold`](StyleAttr::Bold): any cell in the
+    /// range lacking wrap → set the whole range, else clear it.
+    WrapText,
     Fill(Option<Rgb>),
 }
 
@@ -39,6 +45,10 @@ pub enum StylePath {
     /// `alignment.horizontal` — `left|center|right` sets, `general` clears horizontal only
     /// (leaving any file-loaded vertical/wrap alignment intact).
     AlignHorizontal,
+    /// `alignment.vertical` — `top|center|bottom` sets the cell's vertical alignment (a plain set,
+    /// exactly like [`AlignHorizontal`](StylePath::AlignHorizontal); no toggle). Justify/Distributed
+    /// are out of scope.
+    AlignVertical,
     /// `num_fmt` — the raw number-format code (one of the dropdown codes, or a decimals-adjusted
     /// derivative).
     NumFmt,
@@ -50,6 +60,7 @@ impl StylePath {
         match self {
             StylePath::FontColor => "font.color",
             StylePath::AlignHorizontal => "alignment.horizontal",
+            StylePath::AlignVertical => "alignment.vertical",
             StylePath::NumFmt => "num_fmt",
         }
     }

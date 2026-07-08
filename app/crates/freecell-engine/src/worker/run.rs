@@ -1337,9 +1337,9 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
     }
 }
 
-/// Apply a style attribute across a range. Bold/italic/underline are toggles resolved from the
-/// current state ("any cell lacks it → set the whole range, else clear it"); `Fill` is a
-/// direct set/clear.
+/// Apply a style attribute across a range. Bold/italic/underline/strikethrough and wrap-text are
+/// toggles resolved from the current state ("any cell lacks it → set the whole range, else clear
+/// it"); `Fill` is a direct set/clear.
 fn apply_style(
     doc: &mut WorkbookDocument,
     idx: u32,
@@ -1348,22 +1348,39 @@ fn apply_style(
 ) -> Result<(), String> {
     let flag = match attr {
         StyleAttr::Fill(fill) => return doc.set_fill(idx, range, fill),
+        // Wrap toggles the same "any-lacking → set all, else clear" way, but writes the
+        // `alignment.wrap_text` path (it isn't a `font.*` flag).
+        StyleAttr::WrapText => {
+            let any_lacking = any_cell_lacks(range, |cell| doc.wrap_flag(idx, cell))?;
+            let value = if any_lacking { "true" } else { "false" };
+            return doc.update_style_path(idx, range, "alignment.wrap_text", value);
+        }
         StyleAttr::Bold => FontFlag::Bold,
         StyleAttr::Italic => FontFlag::Italic,
         StyleAttr::Underline => FontFlag::Underline,
+        StyleAttr::Strikethrough => FontFlag::Strike,
     };
     // Toggle resolution. P4 reads current state per cell from the engine; P5's resident cache
     // makes this an O(1)-ish map lookup. Ranges are user selections (bounded), not full sheets.
-    let mut any_lacking = false;
-    'scan: for row in range.rows() {
+    let any_lacking = any_cell_lacks(range, |cell| doc.font_flag(idx, cell, flag))?;
+    doc.set_font_flag(idx, range, flag, any_lacking)
+}
+
+/// Whether any cell in `range` fails `is_set` — the toggle scan shared by the font-flag and
+/// wrap-text toggles ("any cell lacks the attribute → set the whole range, else clear it").
+/// Short-circuits on the first lacking cell. Ranges are bounded user selections.
+fn any_cell_lacks(
+    range: CellRange,
+    mut is_set: impl FnMut(CellRef) -> Result<bool, String>,
+) -> Result<bool, String> {
+    for row in range.rows() {
         for col in range.cols() {
-            if !doc.font_flag(idx, CellRef::new(row, col), flag)? {
-                any_lacking = true;
-                break 'scan;
+            if !is_set(CellRef::new(row, col))? {
+                return Ok(true);
             }
         }
     }
-    doc.set_font_flag(idx, range, flag, any_lacking)
+    Ok(false)
 }
 
 /// Resolve a stable [`SheetId`] to a worksheet index, or an engine-style error message.
@@ -1843,6 +1860,135 @@ mod tests {
             .doc
             .font_flag(0, CellRef::new(1, 0), FontFlag::Bold)
             .unwrap());
+    }
+
+    #[test]
+    fn strikethrough_toggle_sets_all_then_clears() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "x"),
+            set_input(sheet, 1, 0, "y"),
+        ]);
+        // A1 strike, A2 plain → range lacks strike somewhere → toggle sets all.
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+            attr: StyleAttr::Strikethrough,
+        }]);
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            attr: StyleAttr::Strikethrough,
+        }]);
+        assert!(worker
+            .doc
+            .font_flag(0, CellRef::new(0, 0), FontFlag::Strike)
+            .unwrap());
+        assert!(worker
+            .doc
+            .font_flag(0, CellRef::new(1, 0), FontFlag::Strike)
+            .unwrap());
+        // Toggle again: all set → clear all.
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            attr: StyleAttr::Strikethrough,
+        }]);
+        assert!(!worker
+            .doc
+            .font_flag(0, CellRef::new(0, 0), FontFlag::Strike)
+            .unwrap());
+        assert!(!worker
+            .doc
+            .font_flag(0, CellRef::new(1, 0), FontFlag::Strike)
+            .unwrap());
+    }
+
+    #[test]
+    fn wrap_toggle_sets_all_then_clears() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "x"),
+            set_input(sheet, 1, 0, "y"),
+        ]);
+        // A1 wrapped, A2 plain → range lacks wrap somewhere → toggle sets all.
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+            attr: StyleAttr::WrapText,
+        }]);
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            attr: StyleAttr::WrapText,
+        }]);
+        assert!(worker.doc.wrap_flag(0, CellRef::new(0, 0)).unwrap());
+        assert!(worker.doc.wrap_flag(0, CellRef::new(1, 0)).unwrap());
+        // Toggle again: all wrapped → clear all.
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            attr: StyleAttr::WrapText,
+        }]);
+        assert!(!worker.doc.wrap_flag(0, CellRef::new(0, 0)).unwrap());
+        assert!(!worker.doc.wrap_flag(0, CellRef::new(1, 0)).unwrap());
+    }
+
+    #[test]
+    fn set_style_path_vertical_align_applies() {
+        use freecell_core::VAlign;
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "hi"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::SetStylePath {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            path: StylePath::AlignVertical,
+            value: "top".to_string(),
+        }]);
+
+        let rs = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(1, 1)
+            .copied()
+            .unwrap();
+        assert_eq!(rs.v_align, Some(VAlign::Top));
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+
+        // A second set to a different value replaces it (a plain set, like horizontal align).
+        worker.process_batch(vec![Command::SetStylePath {
+            sheet,
+            range: CellRange::single(CellRef::new(1, 1)),
+            path: StylePath::AlignVertical,
+            value: "center".to_string(),
+        }]);
+        let rs = worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .render_style(1, 1)
+            .copied()
+            .unwrap();
+        assert_eq!(rs.v_align, Some(VAlign::Center));
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
     }
 
     #[test]

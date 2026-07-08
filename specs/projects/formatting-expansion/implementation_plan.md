@@ -10,7 +10,7 @@ with committed code + refreshed/eyeballed render baselines. See `functional_spec
 
 ## Phases
 
-- [ ] **Phase 1 — Part 1: Text formatting (strikethrough, wrap, vertical align).**
+- [x] **Phase 1 — Part 1: Text formatting (strikethrough, wrap, vertical align).**
   `RenderStyle` fields (`strikethrough`, `wrap`, `v_align`) + `VAlign` enum; protocol
   (`StyleAttr::Strikethrough`, `StyleAttr::WrapText`, `StylePath::AlignVertical`,
   `FontFlag::Strike`); document (`Strike` flag, `wrap_flag` reader); worker `apply_style`

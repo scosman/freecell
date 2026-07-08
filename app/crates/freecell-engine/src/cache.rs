@@ -16,7 +16,8 @@
 //! ## Unit conversion (one place, `architecture.md §10`)
 //!
 //! IronCalc's geometry getters already return **pixels** (`ironcalc_base/src/constants.rs`:
-//! "COLUMN_WIDTH and ROW_HEIGHT are pixel values"; defaults 125 px / 28 px). FreeCell's chosen
+//! "COLUMN_WIDTH and ROW_HEIGHT are pixel values"; defaults 90 px / 25 px on our fork, 125/28 on
+//! 0.7.1 — see `IRONCALC_DEFAULT_*_PX`). FreeCell's chosen
 //! grid defaults are 100 px / 24 px (`ui_design.md §3.3`). We convert an override by the ratio
 //! `freecell_default / ironcalc_default`, so a track at IronCalc's default maps exactly to the
 //! FreeCell default and any deviation scales proportionally (a 2× column stays 2× of 100 px).
@@ -35,11 +36,15 @@ use ironcalc_base::types::{
 
 use crate::document::WorkbookDocument;
 
+// These mirror the pinned engine's default row/col size (`ironcalc_base/src/constants.rs`) — the
+// reference our px conversion maps onto FreeCell's own defaults, and the sentinel that marks a
+// non-custom row/col. They MUST track the pinned engine; update them when the engine's defaults
+// change (our fork set `DEFAULT_ROW_HEIGHT = 25`, `DEFAULT_COLUMN_WIDTH = 90`, vs 0.7.1's 28/125).
 /// IronCalc's default column width in px (`ironcalc_base/src/constants.rs`
 /// `DEFAULT_COLUMN_WIDTH`). A non-custom column reads back exactly this.
-pub(crate) const IRONCALC_DEFAULT_COL_WIDTH_PX: f64 = 125.0;
+pub(crate) const IRONCALC_DEFAULT_COL_WIDTH_PX: f64 = 90.0;
 /// IronCalc's default row height in px (`ironcalc_base/src/constants.rs` `DEFAULT_ROW_HEIGHT`).
-pub(crate) const IRONCALC_DEFAULT_ROW_HEIGHT_PX: f64 = 28.0;
+pub(crate) const IRONCALC_DEFAULT_ROW_HEIGHT_PX: f64 = 25.0;
 
 /// Converts an IronCalc column-width pixel value to a FreeCell device-px width (see module docs).
 pub(crate) fn col_px(ironcalc_px: f64) -> f32 {
@@ -249,7 +254,8 @@ pub(crate) fn build_sheet_cache(
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
-                rs.border = builder.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
+                rs.border = builder
+                    .intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
                 if rs != RenderStyle::default() {
                     for c in col.min..=col.max {
                         let c0 = (c - 1) as u32;
@@ -275,7 +281,8 @@ pub(crate) fn build_sheet_cache(
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
-                rs.border = builder.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
+                rs.border = builder
+                    .intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
                 if rs != RenderStyle::default() {
                     builder.push_row_style(r0, rs);
                     band_rows.insert(r0);
@@ -305,7 +312,8 @@ pub(crate) fn build_sheet_cache(
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
-                rs.border = builder.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
+                rs.border = builder
+                    .intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
                 // `band_rows`/`band_cols` hold only *non-default* bands. A populated cell with a
                 // default own style on such a band gets an explicit default entry to shadow it.
                 // MICRO-EDGE (DECISIONS_TO_REVIEW, Phase 5): a `custom_format` row whose style
@@ -350,7 +358,8 @@ pub(crate) fn refresh_cell(
             } else {
                 cache.intern_font_family(&style.font.name)
             };
-            rs.border = cache.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
+            rs.border =
+                cache.intern_border_spec(border_spec_from(&style.border, doc.workbook_theme()));
             if rs != RenderStyle::default() {
                 cache.set_cell_style(cell.row, cell.col, rs);
             } else if cache.is_on_band(cell.row, cell.col) {
@@ -528,10 +537,7 @@ mod tests {
             Some(Rgb::from_hex(0x0000FF))
         );
         // Explicit black font colour maps to None (the grid's default near-black).
-        assert_eq!(
-            rsf(&style_with("font.color", "#000000")).font_color,
-            None
-        );
+        assert_eq!(rsf(&style_with("font.color", "#000000")).font_color, None);
         assert_eq!(
             rsf(&style_with("alignment.horizontal", "right")).h_align,
             Some(Align::Right)
@@ -542,10 +548,7 @@ mod tests {
         );
         // `render_style_from` never resolves the num-fmt index itself (the caller does, via the
         // interning table); it always carries the default 0.
-        assert_eq!(
-            rsf(&style_with("num_fmt", "0.00%")).num_fmt,
-            0
-        );
+        assert_eq!(rsf(&style_with("num_fmt", "0.00%")).num_fmt, 0);
         assert_eq!(rsf(&Style::default()).num_fmt, 0);
     }
 
@@ -746,10 +749,7 @@ mod tests {
             }),
             ..Border::default()
         };
-        assert_eq!(
-            bsf(&b2).top,
-            Some(Edge::new(1, Rgb::new(0, 0, 0)))
-        );
+        assert_eq!(bsf(&b2).top, Some(Edge::new(1, Rgb::new(0, 0, 0))));
     }
 
     #[test]
@@ -787,9 +787,15 @@ mod tests {
         // IronCalc default px → FreeCell default px (exactly, within f32 tolerance).
         assert!((col_px(IRONCALC_DEFAULT_COL_WIDTH_PX) - DEFAULT_COL_WIDTH_PX).abs() < 1e-3);
         assert!((row_px(IRONCALC_DEFAULT_ROW_HEIGHT_PX) - DEFAULT_ROW_HEIGHT_PX).abs() < 1e-3);
-        // 2× the IronCalc default → 2× the FreeCell default.
-        assert!((col_px(250.0) - 200.0).abs() < 1e-3);
-        assert!((row_px(56.0) - 48.0).abs() < 1e-3);
+        // 2× the IronCalc default → 2× the FreeCell default (expressed via the constants so this
+        // stays correct if the pinned engine's defaults change again).
+        assert!(
+            (col_px(2.0 * IRONCALC_DEFAULT_COL_WIDTH_PX) - 2.0 * DEFAULT_COL_WIDTH_PX).abs() < 1e-3
+        );
+        assert!(
+            (row_px(2.0 * IRONCALC_DEFAULT_ROW_HEIGHT_PX) - 2.0 * DEFAULT_ROW_HEIGHT_PX).abs()
+                < 1e-3
+        );
     }
 
     /// A styled reference workbook (mirrors round-3 A's harness sheet): per-cell attributes, a

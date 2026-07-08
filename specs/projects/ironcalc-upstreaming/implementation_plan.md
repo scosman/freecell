@@ -23,17 +23,16 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
   `get_color_indexed` (fills/fonts/borders/dxfs); tab/CF colours keep the default resolver
   (documented follow-up). 4 tests (end-to-end load_styles ±override + guards), fmt + clippy clean.
   Merged → `freecell-fixes` (`48b0b23`, both fixes; combined suite green). Pushed.
-- [~] **Phase 3 — FreeCell upgrade (the migration). PARTIAL — blocked on engine-default drift.**
+- [x] **Phase 3 — FreeCell upgrade (the migration). DONE.**
   Done: `[patch.crates-io]` → `freecell-fixes`; deleted `open_fixups.rs` + `open_repair.rs` (+ the
   `document.rs::open` call sites), dropped `roxmltree`, moved `zip` to dev-deps; migrated the
   colour-read path (`cache.rs` `resolve_rgb`/`render_style_from`/`border_spec_from`, `document.rs`
-  `resolve_text_color` + a `workbook_theme()` accessor) to the new `Color` enum. **`freecell-engine`
-  compiles clean against the fork; the `Color` migration is small (4 prod + 6 test sites).**
-  **BLOCKER (see finding below):** building against upstream `main` is a full 0.7.1→`main` engine
-  upgrade — `main` changed `new_empty`'s **default geometry** (row height, col width) and **default
-  font** (12pt Inter vs 13pt Calibri). FreeCell's cache-agreement invariant is pinned to the 0.7.1
-  values, so **21/91 engine tests fail — all geometry/default mismatches, zero colour-correctness
-  failures.** Decision needed (decouple vs. push through the full upgrade).
+  `resolve_text_color` + a `workbook_theme()` accessor) to the new `Color` enum. The `Color`
+  migration is small (4 prod + 6 test sites). **Geometry/font drift reconciled** (see Phase-3
+  finding + Phase 6): recalibrated the two unit-conversion reference constants
+  (`IRONCALC_DEFAULT_ROW_HEIGHT_PX` 28→25, `IRONCALC_DEFAULT_COL_WIDTH_PX` 125→90) to the fork's
+  actual defaults and updated the `default_font` expectation (12pt Inter). **All 91 `freecell-engine`
+  lib tests + every integration suite green; fmt + strict clippy clean.**
 - [ ] **Phase 4 — Validation (the redundancy proof).** Port `open_fixups`' theme + indexed goldens
   into an equivalence test (engine `resolve_color` == the RGBs the hack produced). Owner visual
   pass: open the mortgage (purple theme), Numbers (indexed palette + `xfId`-less), and a
@@ -42,12 +41,19 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
 - [ ] **Phase 5 — Sign-off gate → upstream PRs.** On owner approval: rebase `fix/*` on fresh
   `upstream/main`; open one PR per fix (E2, E5) against `ironcalc/IronCalc:main`, PR-first, minimal
   repro + tests in each body. Record in the status table.
-- [ ] **Phase 6 — Adopt the fork as FreeCell's permanent engine + establish the ongoing loop.**
+- [x] **Phase 6 — Adopt the fork as FreeCell's permanent engine + establish the ongoing loop.**
   Not a one-shot: this makes "FreeCell rides our fork; fix IronCalc, don't hack FreeCell" the
   standing way of working. See **§Operating model** below for the durable process. Concretely for
-  this project: keep FreeCell's `[patch.crates-io]` → the fork's `freecell-fixes` as the **normal**
-  dependency (not temporary); land the git-`main` geometry/font reconciliation (Phase-3 finding) so
-  the workspace is fully green on the fork; and record the loop so future IronCalc issues follow it.
+  this project: FreeCell's `[patch.crates-io]` → the fork's `freecell-fixes` is now the **normal**
+  dependency (not temporary); the git-`main` geometry/font reconciliation landed (constant
+  recalibration + `default_font` test); the workspace is fully green on the fork; and the loop is
+  recorded in **§Operating model** + `CLAUDE.md` for future IronCalc issues. **Render baselines do
+  NOT move** (verified by code analysis, not just left unrun): every `render-tests` scene spawns a
+  `NewWorkbook` and injects custom col/row geometry **directly as device px** into the cache
+  (`cache.set_col_width`), bypassing the `col_px`/`row_px` conversion the constants feed; default
+  cells render at the fixed `CELL_FONT_PX = 13.0` app constant (independent of the engine's default
+  font, so the 13→12 change is inert); and the only explicit case font size is 24 pt (≠ 12/13, so
+  its default-vs-explicit quantization is unchanged). So no baseline regeneration is required.
 
 ## Operating model — FreeCell rides our IronCalc fork (standing process)
 
@@ -119,18 +125,29 @@ which also carries a font/geometry refresh. The E1/E4/tint fixes are **entangled
 
 **Decision (resolved 2026-07-07 — owner): push through; the fork is FreeCell's permanent engine.**
 FreeCell rides `freecell-fixes` as its normal dependency (see §Operating model), so the git-`main`
-drift is reconciled here, not decoupled. Remaining work under Phase 6:
-- **Reconcile the geometry/font defaults** on the FreeCell side: update `DEFAULT_ROW_HEIGHT_PX` /
-  `DEFAULT_COL_WIDTH_PX` (and any derived metrics) and the `default_font` expectation (12 pt Inter)
-  to match the fork, so the resident-cache↔engine agreement holds again.
-- **Fix the ~21 geometry/`default_font` tests** and **refresh the render baselines** the new metrics
-  change.
-- Then the FreeCell workspace is fully green on the fork.
+drift is reconciled here, not decoupled.
+
+**Resolved (2026-07-08).** The reconciliation was a small, self-contained recalibration, not a
+metrics overhaul. FreeCell keeps its **own** render defaults (`DEFAULT_ROW_HEIGHT_PX = 24`,
+`DEFAULT_COL_WIDTH_PX = 100`, `CELL_FONT_PX = 13`) — those are FreeCell's, not IronCalc's to dictate
+(owner: "FreeCell owns the defaults… their values are just values, not the 'right value'"). What had
+to track the engine is the **unit-conversion reference** — the IronCalc default the px conversion
+maps *onto* FreeCell's default, and the sentinel that marks a non-custom track. So the fix was:
+- `IRONCALC_DEFAULT_ROW_HEIGHT_PX` 28 → **25**, `IRONCALC_DEFAULT_COL_WIDTH_PX` 125 → **90** (the
+  fork's real defaults, probe-verified), with a comment that they must track the pinned engine.
+- `default_font` test expectation → **12 pt Inter** (the value only feeds the cache's "is this the
+  default?" detection; default cells still render bundled Inter at `CELL_FONT_PX`).
+- `unit_conversion_goldens` re-expressed via the constants so it stays correct on future drift.
+All 91 lib tests + integration suites pass; fmt + strict clippy clean. **Render baselines don't move**
+(see Phase 6). Inter stays FreeCell's default font (`GRID_FONT_FAMILY` untouched). Two follow-on
+ideas — persisting FreeCell's defaults into saved files for cross-app fidelity, and render-time
+fallback for unavailable explicit fonts — are tracked in `GAPS.md`, deliberately **out of scope** here.
 
 Verification with the hacks removed is **complete**: **E1, E2, E4, E5 confirmed in-app by the owner
 (2026-07-07); E3 covered by the `dates_fixture` integration test** (built-in date/time ids 14–22
-render as dates, not serials — `tests/fixtures/dates.xlsx`). All five fixes confirmed. The 21
-geometry failures don't touch fix correctness — they're the reconciliation task above, not a blocker.
+render as dates, not serials — `tests/fixtures/dates.xlsx`). All five fixes confirmed. The former 21
+geometry failures were the reconciliation task above, now **resolved (2026-07-08)** — the workspace
+is green on the fork.
 
 ## Optional optimisation (not required)
 - When upstream releases a version containing our merged fixes, optionally bump FreeCell's
@@ -144,7 +161,7 @@ geometry failures don't touch fix correctness — they're the reconciliation tas
 | E2 num-fmt | `fix/e2-numfmt` (`953af32`) | ✅ base 2107 + xlsx 213 green, fmt+clippy clean | ✅ merged | ✅ E2 (mortgage) | ⏳ awaiting sign-off | fix pushed; backup `patches/0001-e2-numfmt.patch` |
 | E5 indexed | `fix/e5-indexed` (`1c2c477`) | ✅ 4 new + xlsx 213 green, fmt+clippy clean | ✅ merged (`48b0b23`) | ✅ E5 fills (numbers_table) + borders (FONTS.xlsx) | ⏳ awaiting sign-off | fix pushed; backup `patches/0002-e5-indexed.patch` |
 | E1/E4/tint | (already on upstream `main`) | n/a | inherited | ✅ E1 (mortgage) + E4 (numbers_table opens) | n/a | consumed via the fork; no PR needed |
-| FreeCell migration | (this branch, WIP) | engine compiles; +`dates_fixture` E3 test green; ~21 geometry tests pending reconcile | — | ✅ E1/E2/E4/E5 (in-app) + E3 (test) | n/a | Color migration + hacks removed; **all 5 fixes verified**; remaining: geometry/font reconcile (Phase 6) |
+| FreeCell migration | (this branch) | ✅ 91 lib + all integration suites green (incl. `dates_fixture` E3); fmt + strict clippy clean | — | ✅ E1/E2/E4/E5 (in-app) + E3 (test) | n/a | Color migration + hacks removed; **all 5 fixes verified**; geometry/font reconciled (constants 25/90 + `default_font` 12/Inter); render baselines unaffected |
 
 > **Push access resolved (2026-07-07):** owner granted write to `scosman/ironcalc`; commits are
 > authored `Steve Cosman <848343+scosman@users.noreply.github.com>` (noreply, to satisfy email

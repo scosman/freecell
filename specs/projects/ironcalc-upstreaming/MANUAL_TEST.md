@@ -12,14 +12,19 @@ already wired in `app/Cargo.toml`, and it has `open_fixups.rs` / `open_repair.rs
 ## 0. Read this first — the one expected difference (NOT a regression)
 
 Building against unreleased upstream `main` also pulls an **unrelated font/geometry refresh**:
-default font is now **12 pt Inter** (was 13 pt Calibri) and default **row height / column width**
-changed. So:
+IronCalc's default font is now **12 pt Inter** (was 13 pt Calibri) and its default **row height /
+column width** changed. FreeCell keeps its **own** render defaults (24 px rows, 100 px cols, 13 px
+cell font) — those are FreeCell's, not IronCalc's to dictate — so the only reconciliation was
+recalibrating the two unit-conversion **reference** constants (`IRONCALC_DEFAULT_ROW_HEIGHT_PX` 28→25,
+`IRONCALC_DEFAULT_COL_WIDTH_PX` 125→90) and the `default_font` expectation. That is **done** on this
+branch. So:
 
-- **The app will look a little different** (Inter font, slightly tighter rows). That is expected.
-- **`cargo test --workspace` shows ~21 failures**, all in `freecell-engine`'s cache↔engine
-  **geometry-agreement** + `default_font` unit tests (see §5). They assert *row-height / font-size
-  defaults*, **not** colours or values. They are the known cost of the git-`main` upgrade, tracked
-  separately (`implementation_plan.md` Phase-3 finding). **Do not treat them as fix regressions.**
+- **The engine test suite is fully green** — `cargo test --workspace` passes (no more geometry/
+  `default_font` failures). *(This was ~21 failures before the reconciliation; if you're on an older
+  checkout you may still see them — pull the latest branch.)*
+- **The app looks the same** as before the upgrade: default cells still render bundled **Inter** at
+  FreeCell's own metrics; the engine-default-font change only feeds the cache's "is this the default?"
+  detection, not what's painted.
 
 A **real** regression = a wrong colour, a `#VALUE!`, a file that won't open, or a wrong cell value.
 
@@ -59,9 +64,8 @@ cargo test -p ironcalc_base    # 2107 pass (incl. the E2 num-fmt table tests)
 cargo test -p ironcalc         # 213+ pass (incl. the E5 <indexedColors> tests)
 ```
 
-**c) Full workspace** — `cargo test --workspace` — expect ONLY the ~21 geometry/default failures in
-§5. **Any colour / value / open / format test failure outside that list is a real regression → stop
-and report it.**
+**c) Full workspace** — `cargo test --workspace` — expect **all green** (the geometry/`default_font`
+reconciliation landed on this branch). **Any failure is a real regression → stop and report it.**
 
 ---
 
@@ -139,25 +143,18 @@ If all of these look right, the colour/format/value surface is **not** regressed
 
 ---
 
-## 5. Known-failing tests (expected — the git-`main` geometry/font drift, not the fixes)
+## 5. Geometry/font reconciliation — DONE (historical note)
 
-`cargo test --workspace` will fail these ~21, **all** in `freecell-engine`. They assert the
-cache↔engine **geometry agreement** or the **default font**, which changed in `main` (row/col
-defaults; 12 pt Inter vs 13 pt Calibri). Spot-check a couple of messages — they say things like
-`row 0 height mismatch: cache=24 engine=21.43` or `left: 12 right: 13`, i.e. **geometry/font, never a
-wrong colour or value**:
-
-- `cache::tests::` — `build_matches_engine_empty`, `build_matches_engine_band_only`,
-  `build_matches_engine_styled_fixture`, `mirror_set_style_each_attr_agrees`,
-  `negative_control_skipping_a_mirror_diverges`
-- `document::tests::default_font_reads_workbook_default`
-- `worker::run::tests::` — the `*_agrees` / `*_band*` / `set_font_*` / `set_rows_height*` /
-  `set_borders_*` / `set_style_path_*` / `sheet_switch_builds_cache_on_activation` /
-  `load_builds_active_sheet_cache` / `style_edit_mirrors_cache_*` / `undo_redo_agreement_walk` /
-  `multiline_input_mirrors_row_height_and_agrees` group
-
-These get fixed in the separate engine-upgrade work (reconcile the geometry/font defaults + refresh
-render baselines). They are **out of scope** for verifying E1–E5.
+Earlier in this branch, before the reconciliation, `cargo test --workspace` failed ~21
+`freecell-engine` tests — **all** cache↔engine **geometry agreement** / **default_font** assertions
+(messages like `row 0 height mismatch: cache=24 engine=21.43` or `left: 12 right: 13`), never a wrong
+colour or value. That drift is now reconciled: the two unit-conversion reference constants track the
+fork's defaults (25/90) and `default_font` expects 12 pt Inter. **All those tests now pass** — there
+is no expected-failing list anymore. **Render baselines were verified (by code analysis) NOT to move**:
+every `render-tests` scene spawns a `NewWorkbook` and injects custom col/row geometry directly as
+device px (`cache.set_col_width`), bypassing the `col_px`/`row_px` conversion; default cells render at
+the fixed `CELL_FONT_PX = 13` app constant; and the only explicit case font is 24 pt (≠ 12/13). So no
+baseline regeneration was needed.
 
 ---
 
@@ -169,7 +166,7 @@ render baselines). They are **out of scope** for verifying E1–E5.
 - [ ] E2 — built-in currency/accounting cells show numbers, not `#VALUE!`
 - [ ] E3 — built-in date/time cells render as dates
 - [ ] Regression §4 — explicit-rgb, standard-palette, values/formulas, round-trip, new-book all OK
-- [ ] Only the §5 geometry/default tests fail; nothing colour/value/open/format outside that list
+- [ ] `cargo test --workspace` is fully green (the §5 geometry/default reconciliation landed)
 
 If every box holds, removing the workarounds is confirmed correct, and E2/E5 are safe to PR upstream.
 ```

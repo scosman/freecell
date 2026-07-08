@@ -31,6 +31,14 @@ fn builtin_date_formats_render_as_dates_not_serials() {
         assert!(!s.trim().is_empty(), "row {r} rendered empty: {s:?}");
     }
     // Concrete spot-checks: a month name for a date id, a clock time for a time id.
-    assert!(f(1).contains("Jan"), "id 15 (d-mmm-yy) should name the month: {:?}", f(1));
-    assert!(f(5).contains("12:00"), "id 20 (h:mm) should show a time: {:?}", f(5));
+    assert!(
+        f(1).contains("Jan"),
+        "id 15 (d-mmm-yy) should name the month: {:?}",
+        f(1)
+    );
+    assert!(
+        f(5).contains("12:00"),
+        "id 20 (h:mm) should show a time: {:?}",
+        f(5)
+    );
 }

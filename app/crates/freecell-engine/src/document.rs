@@ -1379,12 +1379,13 @@ mod tests {
 
     #[test]
     fn default_font_reads_workbook_default() {
-        // A fresh workbook's default is IronCalc's `Font::default()` — 13pt Calibri (NOT the
-        // 11pt the specs state; the cache detects "default" relative to this value).
+        // A fresh workbook's default is IronCalc's `Font::default()` — now 12pt Inter (our fork
+        // updated it from 13pt Calibri). This value only feeds the cache's "is this the default?"
+        // detection; default cells render in bundled Inter (`GRID_FONT_FAMILY`) regardless.
         let doc = WorkbookDocument::new_empty().unwrap();
         let (sz, name) = doc.default_font();
-        assert_eq!(sz, 13);
-        assert_eq!(name, "Calibri");
+        assert_eq!(sz, 12);
+        assert_eq!(name, "Inter");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # UI Design: Formatting Expansion
@@ -22,8 +22,8 @@ are composed from `div` rectangles (the same primitive the grid uses to paint bo
 ### 1.1 New group order
 
 ```
-[ Font family ▾ ][ Size ▾ ] │ B  I  U  S  ⤶ │ A▾  Fill▾ │ ⊞▾(Borders) │ ⇤ ≡ ⇥ │ ⤒ ⯀ ⤓ │ Number… │ ……spinner
-                              └── text style ──┘                         └ H-align ┘ └ V-align ┘
+[ Font family ▾ ][ Size ▾ ] │ B  I  U  S  ⤶ │ A▾  Fill▾ │ ⊞▾(Borders) │ ⇤ ≡ ⇥ │ ⤒ ⯀ ⤓ ⇳ │ Number… │ ……spinner
+                              └── text style ──┘                         └ H-align ┘ └─ V-align ─┘
 ```
 
 Two insertions, both following existing patterns:
@@ -32,9 +32,10 @@ Two insertions, both following existing patterns:
   (no new divider — they sit right after Underline, per "after underline / after
   strikethrough"). Built with the same `toggle(...)` closure as B/I/U → they get the
   identical ghost/small/selected pressed-state look.
-- **Vertical align `⤒ ⯀ ⤓`** as a **new divider-bracketed group immediately after the
-  horizontal align group** (`⇤ ≡ ⇥`). Built with the same `align_btn(...)` closure shape
-  as horizontal align (radio-style, `.selected(...)` reflects the explicit value).
+- **Vertical align `⤒ ⯀ ⤓ ⇳`** (Top / Center / Bottom / Justify) as a **new
+  divider-bracketed group immediately after the horizontal align group** (`⇤ ≡ ⇥`). Built
+  with the same `align_btn(...)` closure shape as horizontal align (radio-style,
+  `.selected(...)` reflects the explicit value).
 
 ### 1.2 Glyphs (Unicode, to eyeball during build)
 
@@ -45,6 +46,7 @@ Two insertions, both following existing patterns:
 | V-align top | `⤒` (U+2912) | "Align top" | Mirrors the H-align arrow language (`⇤ ≡ ⇥`). |
 | V-align center | `⯀` / `≡`-style center mark | "Align middle" | A centered bar; pick whichever reads as "middle" next to top/bottom. |
 | V-align bottom | `⤓` (U+2913) | "Align bottom" | |
+| V-align justify | `⇳` (U+21F3) or a stacked-lines mark | "Justify" | Reads as "fill the height"; div-icon fallback = a box with evenly-spaced horizontal lines. |
 
 **Fallback if a glyph is illegible at 12px:** compose a tiny icon from `div`s (a cell
 box with a short bar at top / middle / bottom) using the same technique as the border

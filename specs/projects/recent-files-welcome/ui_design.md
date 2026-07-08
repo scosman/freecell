@@ -73,39 +73,33 @@ values above (`BG` → `CHROME_BG` `0xF3F3F3`).
 ### 3.1 Recent list
 
 Up to 5 rows in a single card (1 px `HAIRLINE` border, rounded ~8 px), rows separated by 1 px
-`HAIRLINE` hairlines (no separator under the last row). Each row is a clickable horizontal
-flex, ~64 px tall, ~14 px inner padding:
+`HAIRLINE` hairlines (no separator under the last row). **Pure text — no icons/glyphs.** Each
+row is a clickable horizontal flex, ~56 px tall, ~14 px inner padding:
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│ [glyph]  Q3 Revenue Forecast.xlsx                 2h ago   │
-│          1.2 MB · Downloads                                │
+│ Q3 Revenue Forecast.xlsx                          2h ago   │
+│ 1.2 MB · Downloads                                         │
 └───────────────────────────────────────────────────────────┘
 ```
 
-- **Glyph** (left): a small (~34 px) rounded-square spreadsheet mark drawn with `div`
-  borders — a `HAIRLINE`-bordered rounded square with a faint 2×2 interior grid (two thin
-  `HAIRLINE` lines). No external asset (keeps it deterministic + theme-consistent). If
-  gpui-component ships a suitable grid/table `Icon`, that may be used instead at `MUTED_TEXT`.
-- **Middle** (`flex_1`, min-width 0 so it truncates): name on top (~14–15 px, `TEXT`,
+- **Left / middle** (`flex_1`, min-width 0 so it truncates): name on top (~14–15 px, `TEXT`,
   semibold, single-line truncate), subtitle below (~12–13 px, `MUTED_TEXT`, single-line
-  truncate) = `"{size} · {folder}"`.
+  truncate) = `"{size} · {folder}"`. No leading icon.
 - **Right:** relative timestamp (~12–13 px, `MUTED_TEXT`), right-aligned, does not shrink.
 - **Hover:** row background → `CHROME_BG`; cursor pointer. Whole row is the click target.
 - **Click:** `FreeCellApp::open_path(path)`.
 
 ### 3.2 Empty state
 
-Centered in the body under the `RECENT` header:
+Centered in the body under the `RECENT` header — **pure text, no glyph/icon**:
 
 ```
-        [ spreadsheet glyph — large, faint ]
       No recent spreadsheets
   Create a new spreadsheet or open
         a file to get started.
 ```
 
-- Large (~48 px) faint spreadsheet glyph (same drawn mark, `HAIRLINE`-ish stroke).
 - **"No recent spreadsheets"** — ~15 px, semibold, `TEXT`.
 - **"Create a new spreadsheet or open a file to get started."** — ~13 px, `MUTED_TEXT`,
   centered, wrapped.

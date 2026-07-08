@@ -102,7 +102,8 @@ dialog when no document window exists.
 
 ### 2.2 Recent rows (welcome)
 
-- Each row shows the icon + name + subtitle + relative-time (§1.6) and is clickable.
+- Each row shows name + subtitle + relative-time (§1.6) and is clickable. **No icon/glyph —
+  pure text.**
 - **Click** opens that file via `FreeCellApp::open_path` (which dedupes against already-open
   windows and, on success, moves the entry to the front + closes the welcome window when the
   document loads — same as any open).
@@ -114,9 +115,9 @@ dialog when no document window exists.
 
 ### 2.3 Empty state
 
-When there are no existing recent files, the right pane shows a centered placeholder: the
-spreadsheet glyph, **"No recent spreadsheets"**, and **"Create a new spreadsheet or open a
-file to get started."** The `RECENT` header remains visible above it.
+When there are no existing recent files, the right pane shows a centered **text-only**
+placeholder (no glyph/icon): **"No recent spreadsheets"** and **"Create a new spreadsheet or
+open a file to get started."** The `RECENT` header remains visible above it.
 
 ### 2.4 Live updates
 

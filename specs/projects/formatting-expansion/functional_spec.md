@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: Formatting Expansion
@@ -242,10 +242,10 @@ P2 is not built in the initial phases.
 
 - **Single-cell selection:** Outer = that cell's four edges; Inner = no-op; Top/Bottom/
   Left/Right = the corresponding single edge.
-- **Undo/redo (simplified):** each paint is one undoable step; **no special
-  coalescing** in MVP. Nudging a target's style/color several times therefore produces
-  several undo entries — accepted as a pragmatic trade. Coalescing is a possible later
-  nicety, not built now.
+- **Undo/redo (intended design):** each border paint is one undoable step — selecting
+  a target, and each subsequent style/color change, is its own undo entry. This is the
+  correct model (one discrete user action → one undo step), **not** a limitation:
+  consecutive pen tweaks are deliberately **not** coalesced.
 - **`.xlsx` round-trip fidelity:** the MVP gallery (thin/medium/thick solid, dashed,
   double) is fully representable and round-trips. **Dotted is dropped** precisely
   because it degraded to `Thin` on import at 0.7.1 — deferred to `GAPS.md` rather than

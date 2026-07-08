@@ -19,6 +19,7 @@ use gpui_component::Root;
 use freecell_core::recent::{RecentList, WELCOME_LIMIT};
 use freecell_engine::DocumentSource;
 
+use super::about::AboutView;
 use super::lifecycle::{QuitPlan, QuitStep};
 use super::registry::{OpenOutcome, WindowKey, WindowRegistry};
 use super::welcome::WelcomeView;
@@ -39,6 +40,10 @@ pub struct FreeCellApp {
     registry: WindowRegistry,
     welcome: Option<Entity<WelcomeView>>,
     welcome_id: Option<WindowId>,
+    /// The standalone About window (`functional_spec.md §4`), when open. Single-instance: a second
+    /// `About` just activates it. Cleared with `about_id` when the window closes.
+    about: Option<Entity<AboutView>>,
+    about_id: Option<WindowId>,
     windows: Vec<AppWindow>,
     /// An in-progress app quit (front-to-back dirty-window prompting).
     quit_plan: Option<QuitPlan>,
@@ -69,6 +74,8 @@ impl FreeCellApp {
             registry: WindowRegistry::new(),
             welcome: None,
             welcome_id: None,
+            about: None,
+            about_id: None,
             windows: Vec::new(),
             quit_plan: None,
             quitting: false,
@@ -168,10 +175,10 @@ impl FreeCellApp {
         cx.update_global::<FreeCellApp, _>(|app, cx| app.do_request_quit(cx));
     }
 
-    /// Shows the About dialog on the frontmost window.
+    /// Opens the standalone About window, or activates it if it is already open (single-instance,
+    /// `functional_spec.md §4`).
     pub fn show_about(cx: &mut App) {
-        let active = cx.active_window().map(|w| w.window_id());
-        cx.update_global::<FreeCellApp, _>(|app, cx| app.do_show_about(active, cx));
+        cx.update_global::<FreeCellApp, _>(|app, cx| app.do_show_about(cx));
     }
 
     /// Clears the recent-files list (**Clear Recent Files**, `functional_spec.md §3`), persists
@@ -426,6 +433,10 @@ impl FreeCellApp {
             self.welcome = None;
             self.welcome_id = None;
             self.registry.set_welcome_open(false);
+        } else if self.about_id == Some(window_id) {
+            self.about = None;
+            self.about_id = None;
+            self.registry.set_about_open(false);
         } else if let Some(pos) = self.windows.iter().position(|w| w.window_id == window_id) {
             let key = self.windows[pos].key;
             self.windows.remove(pos);
@@ -454,24 +465,29 @@ impl FreeCellApp {
         }
     }
 
-    fn do_show_about(&mut self, active: Option<WindowId>, cx: &mut App) {
-        if let Some(id) = active {
-            if let Some(w) = self.windows.iter().find(|w| w.window_id == id) {
-                let entity = w.entity.clone();
-                entity.update(cx, |ww, cx| ww.show_about(cx));
-                return;
+    /// Opens or activates the standalone About window (`architecture.md §9.2`). Mirrors
+    /// [`do_show_welcome`](Self::do_show_welcome): `about` and `about_id` are set/cleared together.
+    fn do_show_about(&mut self, cx: &mut App) {
+        if let Some(id) = self.about_id {
+            // Already open — just activate it (single-instance, `functional_spec.md §4`).
+            if let Some(w) = cx.windows().into_iter().find(|w| w.window_id() == id) {
+                w.update(cx, |_, window, _| window.activate_window()).ok();
             }
-            if self.welcome_id == Some(id) {
-                if let Some(welcome) = self.welcome.clone() {
-                    welcome.update(cx, |w, cx| w.show_about(cx));
-                    return;
-                }
-            }
+            return;
         }
-        // Fall back to the welcome window if it's around.
-        if let Some(welcome) = self.welcome.clone() {
-            welcome.update(cx, |w, cx| w.show_about(cx));
-        }
+        let mut entity_slot: Option<Entity<AboutView>> = None;
+        let slot = &mut entity_slot;
+        let handle: WindowHandle<Root> = cx
+            .open_window(about_window_options(cx), |window, cx| {
+                let about = cx.new(|cx| AboutView::new(window, cx));
+                *slot = Some(about.clone());
+                cx.new(|cx| Root::new(about, window, cx))
+            })
+            .expect("open about window");
+        let any: AnyWindowHandle = handle.into();
+        self.about = entity_slot;
+        self.about_id = Some(any.window_id());
+        self.registry.set_about_open(true);
     }
 
     /// Reports an app-level error (e.g. an `Open…`/CLI path that failed to resolve): on the
@@ -587,6 +603,18 @@ impl FreeCellApp {
         cx.global::<FreeCellApp>().welcome.clone()
     }
 
+    /// Whether the About window is registered as open (tests).
+    #[cfg(test)]
+    pub(crate) fn about_open(cx: &App) -> bool {
+        cx.global::<FreeCellApp>().registry.about_open()
+    }
+
+    /// The live About view entity, if the About window is open (tests).
+    #[cfg(test)]
+    pub(crate) fn about_view(cx: &App) -> Option<Entity<AboutView>> {
+        cx.global::<FreeCellApp>().about.clone()
+    }
+
     /// The document window entity at `index` (tests).
     #[cfg(test)]
     pub(crate) fn nth_window(cx: &App, index: usize) -> Option<Entity<WorkbookWindow>> {
@@ -663,6 +691,19 @@ fn document_window_options(cx: &App) -> WindowOptions {
 fn welcome_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(720.0), px(480.0)), cx)),
+        titlebar: titlebar_options(),
+        is_resizable: false,
+        is_minimizable: false,
+        ..Default::default()
+    }
+}
+
+/// The About window options: small fixed **460×340** surface (`ui_design.md §6`), non-resizable,
+/// non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic lights on Linux
+/// (`functional_spec.md §4`).
+fn about_window_options(cx: &App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(460.0), px(340.0)), cx)),
         titlebar: titlebar_options(),
         is_resizable: false,
         is_minimizable: false,
@@ -959,6 +1000,54 @@ mod tests {
         assert!(
             cx.update(|cx| welcome.read(cx).has_modal()),
             "clicking a recent row routes to open_path (its vanished-file error lands on the welcome)"
+        );
+    }
+
+    // ---- About window (`functional_spec.md §4`, `architecture.md §9`) ----------------------
+
+    #[gpui::test]
+    fn about_action_opens_a_single_about_window(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_about);
+        assert!(
+            cx.update(|cx| FreeCellApp::about_open(cx)),
+            "the About action opens (and registers) the About window"
+        );
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        assert!(cx.update(|cx| FreeCellApp::about_view(cx).is_some()));
+
+        // A second About activates the existing window rather than opening a duplicate
+        // (single-instance, `functional_spec.md §4`).
+        cx.update(FreeCellApp::show_about);
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "About is single-instance — a second trigger activates, not duplicates"
+        );
+    }
+
+    #[gpui::test]
+    fn closing_the_last_about_window_quits(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_about);
+        assert!(cx.update(|cx| FreeCellApp::about_open(cx)));
+
+        // Closing the About window when it is the only window clears its accounting and empties the
+        // registry → the app quits (`functional_spec.md §4`; the `about_id` branch of
+        // `on_window_closed` falls through to the quit-when-empty check).
+        let handle = cx.update(|cx| cx.windows().into_iter().next().expect("about window open"));
+        handle
+            .update(cx, |_root, window, _appcx| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|cx| FreeCellApp::about_open(cx)),
+            "closing the About window clears its open accounting"
+        );
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            0,
+            "no windows remain after the last (About) window closes"
         );
     }
 

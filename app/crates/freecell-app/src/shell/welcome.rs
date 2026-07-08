@@ -4,7 +4,8 @@
 //! Spreadsheet** / **Open…** buttons; a RIGHT pane listing up to [`WELCOME_LIMIT`] recent files
 //! (or a text-only empty state). It registers **no document actions**, so Save / Undo / etc. are
 //! disabled while it is frontmost (`components/app_shell.md §Menus & actions`). It can also host
-//! an app-level error / About dialog when no document window is around to own it (`render_modal`).
+//! an app-level error dialog when no document window is around to own it (`render_modal`); the
+//! About screen is its own window now (`shell::about`), not a modal.
 //!
 //! The recent rows are driven entirely by [`set_recents`](WelcomeView::set_recents): the app hands
 //! this view ready-to-render [`DisplayEntry`]s (built by the pure `freecell_core::recent`), so the
@@ -28,11 +29,11 @@ const MUTED_TEXT: u32 = 0x555555;
 /// The left pane's fixed width (`ui_design.md §1`).
 const LEFT_PANE_WIDTH: f32 = 264.0;
 
-/// A dialog the welcome window can host when there's no document window to own it.
+/// A dialog the welcome window can host when there's no document window to own it. Only the
+/// app-level error dialog remains — the About screen is a standalone window now (`shell::about`).
 #[derive(Debug, Clone)]
 enum WelcomeModal {
     Error { title: String, detail: String },
-    About,
 }
 
 /// The launch window.
@@ -77,12 +78,6 @@ impl WelcomeView {
             title: title.into(),
             detail: detail.into(),
         });
-        cx.notify();
-    }
-
-    /// Shows the About dialog on the welcome window.
-    pub fn show_about(&mut self, cx: &mut Context<Self>) {
-        self.modal = Some(WelcomeModal::About);
         cx.notify();
     }
 
@@ -343,14 +338,8 @@ impl WelcomeView {
     }
 
     fn render_modal(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let modal = self.modal.as_ref()?;
-        let (title, body) = match modal {
-            WelcomeModal::Error { title, detail } => (title.clone(), detail.clone()),
-            WelcomeModal::About => (
-                "FreeCell".to_string(),
-                "A GPU-rendered, Excel-compatible spreadsheet.\nMVP proof of concept.".to_string(),
-            ),
-        };
+        let WelcomeModal::Error { title, detail } = self.modal.as_ref()?;
+        let (title, body) = (title.clone(), detail.clone());
         Some(
             div()
                 .absolute()

@@ -19,6 +19,7 @@ pub mod recents;
 pub mod registry;
 pub mod titlebar;
 
+mod about;
 mod app;
 mod clipboard;
 mod fonts;
@@ -65,7 +66,7 @@ actions!(
         ToggleUnderline,
         /// Quit the application (prompts each dirty window).
         Quit,
-        /// Show the About dialog.
+        /// Show the About window.
         About,
         /// Clear the recent-files list (Open Recent → Clear Recent Files).
         ClearRecent,

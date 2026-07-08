@@ -35,7 +35,7 @@ coherent CR unit. Details live in `functional_spec.md`, `ui_design.md`, `archite
   test accessors. Confirm the existing render suite still passes and the Xvfb smoke launch
   opens the redesigned welcome window.
 
-- [ ] **Phase 4 — About window (`freecell-app` shell).** Replace the About modal with a
+- [x] **Phase 4 — About window (`freecell-app` shell).** Replace the About modal with a
   standalone, single-instance About **window** (`functional_spec.md §4`, `ui_design.md §6`,
   `architecture.md §9`): new `shell/about.rs` (`AboutView` — wordmark, tagline, version from
   `CARGO_PKG_VERSION`, hairline, Homepage / Built-with link rows opening

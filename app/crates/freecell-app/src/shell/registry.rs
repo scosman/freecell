@@ -47,6 +47,7 @@ pub enum OpenOutcome {
 pub struct WindowRegistry {
     windows: Vec<WindowRecord>,
     welcome_open: bool,
+    about_open: bool,
     next_key: u64,
 }
 
@@ -137,15 +138,29 @@ impl WindowRegistry {
         self.welcome_open
     }
 
+    /// Marks the standalone About window as open/closed. Like the welcome window it counts toward
+    /// [`open_count`] so that closing it as the last window quits the app (`functional_spec.md
+    /// §4`).
+    ///
+    /// [`open_count`]: Self::open_count
+    pub fn set_about_open(&mut self, open: bool) {
+        self.about_open = open;
+    }
+
+    /// Whether the About window is currently open.
+    pub fn about_open(&self) -> bool {
+        self.about_open
+    }
+
     /// The number of workbook windows currently registered.
     pub fn window_count(&self) -> usize {
         self.windows.len()
     }
 
-    /// The total open-window count = workbook windows + the welcome window (if up). The app
-    /// quits when this reaches zero.
+    /// The total open-window count = workbook windows + the welcome window (if up) + the About
+    /// window (if up). The app quits when this reaches zero.
     pub fn open_count(&self) -> usize {
-        self.windows.len() + usize::from(self.welcome_open)
+        self.windows.len() + usize::from(self.welcome_open) + usize::from(self.about_open)
     }
 
     /// Whether no windows remain open at all — the app should quit
@@ -233,6 +248,17 @@ mod tests {
         assert_eq!(reg.open_count(), 1);
         assert!(!reg.is_empty());
         reg.set_welcome_open(false);
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn about_counts_toward_open_count() {
+        let mut reg = WindowRegistry::new();
+        assert!(reg.is_empty());
+        reg.set_about_open(true);
+        assert_eq!(reg.open_count(), 1);
+        assert!(!reg.is_empty());
+        reg.set_about_open(false);
         assert!(reg.is_empty());
     }
 

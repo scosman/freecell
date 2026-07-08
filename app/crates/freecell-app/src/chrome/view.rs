@@ -1700,15 +1700,16 @@ fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
     let near = 1.0;
     let far = TARGET_ICON_PX - 1.0;
     let mid = TARGET_ICON_PX / 2.0;
-    // A horizontal / vertical segment centered on `nominal`, clamped to the inset box `[near, far]`
-    // so perpendicular lines meet cleanly at the corners with no overhang past the 2×2 grid.
+    // A horizontal / vertical segment centered on `nominal`, spanning the inset box `[near, far]`
+    // extended by its own thickness `t` at each end so it reaches the OUTER edge of the
+    // perpendicular lines: corners meet flush (dark t=2 → full extent) with no gap or overhang.
     let hline = |nominal: f32, dark: bool| {
         let t = if dark { 2.0 } else { 1.0 };
         div()
             .absolute()
-            .left(px(near))
+            .left(px(near - t / 2.0))
             .top(px(nominal - t / 2.0))
-            .w(px(far - near))
+            .w(px(far - near + t))
             .h(px(t))
             .bg(rgb(if dark {
                 TARGET_ICON_DARK
@@ -1720,9 +1721,9 @@ fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
         let t = if dark { 2.0 } else { 1.0 };
         div()
             .absolute()
-            .top(px(near))
+            .top(px(near - t / 2.0))
             .left(px(nominal - t / 2.0))
-            .h(px(far - near))
+            .h(px(far - near + t))
             .w(px(t))
             .bg(rgb(if dark {
                 TARGET_ICON_DARK

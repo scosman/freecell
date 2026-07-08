@@ -142,7 +142,7 @@ impl Render for WelcomeView {
             .on_action(cx.listener(|_this, _: &CloseWindow, window, _cx| window.remove_window()))
             // macOS custom titlebar (§7.1): "FreeCell", drawn only when the master switch is on.
             // On Linux it is omitted and the two panes below fill the window.
-            .children(titlebar::MACOS_TITLEBAR.then(|| titlebar::titlebar_row("FreeCell")))
+            .children(titlebar::MACOS_TITLEBAR.then(|| titlebar::titlebar_row("")))
             .child(
                 div()
                     .flex_1()
@@ -173,7 +173,7 @@ impl WelcomeView {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.0))
+                    .gap(px(0.0))
                     .child(
                         // Same Inter Display ExtraBold single-face family as the About wordmark —
                         // one family name resolves it on every platform (brand consistency).
@@ -185,7 +185,7 @@ impl WelcomeView {
                     )
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(16.0))
                             .text_color(rgb(MUTED_TEXT))
                             .child("The open spreadsheet"),
                     ),

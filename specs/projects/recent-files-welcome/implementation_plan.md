@@ -17,7 +17,7 @@ coherent CR unit. Details live in `functional_spec.md`, `ui_design.md`, `archite
   to the core manifest. Full unit-test coverage (`architecture.md §7`). No GPUI, no
   wall-clock reads.
 
-- [ ] **Phase 2 — App integration + Open Recent menu (`freecell-app` shell).**
+- [x] **Phase 2 — App integration + Open Recent menu (`freecell-app` shell).**
   `shell/recents.rs` (`recents_store_path` via `dirs`); `FreeCellApp` owns `RecentList`,
   loads it in `init`, records on `do_open_path` (post-canonicalize) and `note_window_path`,
   and refreshes UI; `OpenRecent { index }` + `ClearRecent` actions + handlers; macOS

@@ -2042,6 +2042,7 @@ name = "freecell-app"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "dirs",
  "freecell-core",
  "freecell-engine",
  "gpui",

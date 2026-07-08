@@ -72,6 +72,11 @@ parking_lot.workspace = true
 # logging). `anyhow` is not yet used directly (gpui returns its own `Result` from
 # `open_window`), so it stays out of the manifest until first exercised.
 tracing.workspace = true
+# Recent-files store path (`shell::recents`, recent-files-welcome/architecture.md §2.3):
+# `dirs::data_dir()` resolves the per-user app-data directory that holds
+# `<data_dir>/FreeCell/recents.json`. Already resolved at 6.0.0 in the lockfile (a transitive
+# dep), so pinning it as a direct dep adds no new crate to `Cargo.lock`.
+dirs = "6"
 
 [dev-dependencies]
 # Phase 9 chrome interaction tests drive `ChromeView` through gpui's headless

@@ -58,6 +58,9 @@ fn main() {
         cx.activate(true);
 
         FreeCellApp::init(cx);
+        // Load the persisted recent-files list once, at startup (kept out of `init` so gpui
+        // tests never read the real per-user data dir — architecture.md §3).
+        FreeCellApp::load_recents(cx);
         match open_path {
             Some(path) => FreeCellApp::open_path(&path, cx),
             None => FreeCellApp::show_welcome(cx),

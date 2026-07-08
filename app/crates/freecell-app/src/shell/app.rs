@@ -698,14 +698,15 @@ fn welcome_window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// The About window options: small fixed **400×262** surface (`ui_design.md §6`), non-resizable,
+/// The About window options: small fixed **400×296** surface (`ui_design.md §6`), non-resizable,
 /// non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic lights on Linux
-/// (`functional_spec.md §4`). The height is tuned to the top-packed identity/links body
-/// (`about.rs`) so the bottom whitespace matches the top margin (no large empty band); verified by
-/// a headless capture during development.
+/// (`functional_spec.md §4`). The height fits the top-packed identity/links body (`about.rs`)
+/// **plus the 36 px macOS titlebar row** — the earlier 262 was tuned against a titlebar-less Linux
+/// capture and clipped the last row on macOS; 296 clears the row with a balanced bottom margin.
+/// gpui has no fit-to-content window sizing, so this is a fixed height.
 fn about_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(400.0), px(262.0)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(400.0), px(296.0)), cx)),
         titlebar: titlebar_options(),
         is_resizable: false,
         is_minimizable: false,

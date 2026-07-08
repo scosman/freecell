@@ -102,8 +102,12 @@ impl Render for AboutView {
             // Cmd/Ctrl+W closes the About window; closing the last window quits the app via the
             // registry (`app.rs on_window_closed`).
             .on_action(cx.listener(|_this, _: &CloseWindow, window, _cx| window.remove_window()))
-            // macOS custom titlebar (§7.1); omitted on Linux (server decorations).
-            .children(titlebar::MACOS_TITLEBAR.then(|| titlebar::titlebar_row("About FreeCell")))
+            // macOS custom titlebar (§7.1); omitted on Linux (server decorations). The About
+            // window uses the BLANK row — no centered title, no bottom hairline — so the top bar
+            // is a clean, seamless CHROME_BG band with only the traffic lights (`ui_design.md §6`).
+            // The OS-level window name is still set via `set_window_title` (accessibility / Window
+            // menu), just not drawn.
+            .children(titlebar::MACOS_TITLEBAR.then(titlebar::titlebar_row_plain))
             .child(render_body())
     }
 }

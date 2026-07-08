@@ -26,7 +26,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::spinner::Spinner;
-use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
@@ -1881,14 +1881,17 @@ impl ChromeView {
         // Every mutating control disables in degraded/read-only mode (`functional_spec.md §6`).
         let disabled = self.degraded;
 
+        // Each button renders a FreeCell-vendored Lucide icon (`shell::assets`) via
+        // gpui-component's `Icon` (`icons/<name>.svg`); `Icon` tints it to the button's
+        // foreground so the pressed/disabled states read the same as the former text glyphs.
         let toggle = |id: &'static str,
-                      label: &'static str,
+                      icon_path: &'static str,
                       tooltip: &'static str,
                       pressed: bool,
                       attr: StyleAttr,
                       cx: &mut Context<Self>| {
             Button::new(id)
-                .label(label)
+                .icon(Icon::empty().path(icon_path))
                 .tooltip(tooltip)
                 .ghost()
                 .small()
@@ -1903,10 +1906,10 @@ impl ChromeView {
         let align_btn = |id: &'static str,
                          tooltip: &'static str,
                          align: Align,
-                         glyph: &'static str,
+                         icon_path: &'static str,
                          cx: &mut Context<Self>| {
             Button::new(id)
-                .label(glyph)
+                .icon(Icon::empty().path(icon_path))
                 .tooltip(tooltip)
                 .ghost()
                 .small()
@@ -1922,10 +1925,10 @@ impl ChromeView {
         let valign_btn = |id: &'static str,
                           tooltip: &'static str,
                           valign: VAlign,
-                          glyph: &'static str,
+                          icon_path: &'static str,
                           cx: &mut Context<Self>| {
             Button::new(id)
-                .label(glyph)
+                .icon(Icon::empty().path(icon_path))
                 .tooltip(tooltip)
                 .ghost()
                 .small()
@@ -1987,7 +1990,7 @@ impl ChromeView {
             // B I U:
             .child(toggle(
                 "bold",
-                "B",
+                "icons/bold.svg",
                 "Bold ⌘B",
                 self.bold_active(),
                 StyleAttr::Bold,
@@ -1995,7 +1998,7 @@ impl ChromeView {
             ))
             .child(toggle(
                 "italic",
-                "I",
+                "icons/italic.svg",
                 "Italic ⌘I",
                 self.italic_active(),
                 StyleAttr::Italic,
@@ -2003,17 +2006,17 @@ impl ChromeView {
             ))
             .child(toggle(
                 "underline",
-                "U",
+                "icons/underline.svg",
                 "Underline ⌘U",
                 self.underline_active(),
                 StyleAttr::Underline,
                 cx,
             ))
-            // Strikethrough (S with a combining long-stroke overlay) + Wrap text (⤶),
-            // appended to the B/I/U toggle group (`ui_design.md §1.1`, `functional_spec.md §1`).
+            // Strikethrough + Wrap text, appended to the B/I/U toggle group
+            // (`ui_design.md §1.1`, `functional_spec.md §1`).
             .child(toggle(
                 "strikethrough",
-                "S\u{0336}",
+                "icons/strikethrough.svg",
                 "Strikethrough",
                 self.strikethrough_active(),
                 StyleAttr::Strikethrough,
@@ -2021,7 +2024,7 @@ impl ChromeView {
             ))
             .child(toggle(
                 "wrap",
-                "\u{2936}",
+                "icons/text-wrap.svg",
                 "Wrap text",
                 self.wrap_active(),
                 StyleAttr::WrapText,
@@ -2033,7 +2036,8 @@ impl ChromeView {
                 self.anchored_trigger(
                     Anchor::TextColor,
                     Button::new("text-color")
-                        .label("A ▾")
+                        .icon(Icon::empty().path("icons/baseline.svg"))
+                        .label("▾")
                         .tooltip("Text color")
                         .ghost()
                         .small()
@@ -2049,7 +2053,8 @@ impl ChromeView {
                 self.anchored_trigger(
                     Anchor::Fill,
                     Button::new("fill")
-                        .label("Fill ▾")
+                        .icon(Icon::empty().path("icons/paint-bucket.svg"))
+                        .label("▾")
                         .tooltip("Fill color")
                         .ghost()
                         .small()
@@ -2067,7 +2072,8 @@ impl ChromeView {
                 self.anchored_trigger(
                     Anchor::Borders,
                     Button::new("borders")
-                        .label("⊞ ▾")
+                        .icon(Icon::empty().path("icons/grid-2x2.svg"))
+                        .label("▾")
                         .tooltip("Borders")
                         .ghost()
                         .small()
@@ -2081,19 +2087,25 @@ impl ChromeView {
             )
             .child(action_divider())
             // Alignment L / C / R:
-            .child(align_btn("align-left", "Align left", Align::Left, "⇤", cx))
+            .child(align_btn(
+                "align-left",
+                "Align left",
+                Align::Left,
+                "icons/text-align-start.svg",
+                cx,
+            ))
             .child(align_btn(
                 "align-center",
                 "Align center",
                 Align::Center,
-                "≡",
+                "icons/text-align-center.svg",
                 cx,
             ))
             .child(align_btn(
                 "align-right",
                 "Align right",
                 Align::Right,
-                "⇥",
+                "icons/text-align-end.svg",
                 cx,
             ))
             .child(action_divider())
@@ -2102,21 +2114,21 @@ impl ChromeView {
                 "valign-top",
                 "Align top",
                 VAlign::Top,
-                "\u{2912}",
+                "icons/arrow-up-to-line.svg",
                 cx,
             ))
             .child(valign_btn(
                 "valign-middle",
                 "Align middle",
                 VAlign::Center,
-                "\u{2015}",
+                "icons/separator-horizontal.svg",
                 cx,
             ))
             .child(valign_btn(
                 "valign-bottom",
                 "Align bottom",
                 VAlign::Bottom,
-                "\u{2913}",
+                "icons/arrow-down-from-line.svg",
                 cx,
             ))
             .child(action_divider())
@@ -2139,7 +2151,7 @@ impl ChromeView {
             )
             .child(
                 Button::new("decimals-inc")
-                    .label(".00→")
+                    .icon(Icon::empty().path("icons/decimals-arrow-right.svg"))
                     .tooltip("Increase decimals")
                     .ghost()
                     .small()
@@ -2150,7 +2162,7 @@ impl ChromeView {
             )
             .child(
                 Button::new("decimals-dec")
-                    .label("→.00")
+                    .icon(Icon::empty().path("icons/decimals-arrow-left.svg"))
                     .tooltip("Decrease decimals")
                     .ghost()
                     .small()

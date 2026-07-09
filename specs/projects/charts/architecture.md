@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: Charts (production)
@@ -11,7 +11,7 @@ architecture + `engine_worker` component doc; this references them.
 
 **Organization decision (1-phase vs 2-phase):** a **single `architecture.md`** now. The
 v1-core design fits here; the deepest deferred piece — the **write-from-model serializer** and
-the **edit-panel** — gets its own component design **when Phase 6 (authoring) is planned**
+the **edit-panel** — gets its own component design **when the authoring phase is planned**
 (you asked to defer that detail). Flag if you'd rather split now.
 
 ## 1. Pinned dependencies
@@ -81,7 +81,7 @@ bookkeeping. This is the clean version of §5's three buckets — derived, self-
 
 ```
 OPEN ─ IronCalc load ─┬─ chart discovery (sheet→drawing→chart, PoC load.rs)
-                      └─ parse chartN.xml → ChartSpec{Chart, ranges, anchor, provenance, outcome}
+                      └─ parse chartN.xml → ChartSpec{Chart, source, ranges, anchor, origin}
                           (lazy: on first paint of the owning sheet region, off open's crit path)
 
 EDIT ─ IronCalc recompute ─ worker publish ─ dirty charts = (ranges ∩ changed cells)  [engine]
@@ -96,7 +96,7 @@ SAVE ─ IronCalc write (chart-less) ─ splice: unedited     → byte-preserve 
                                              authored      → synthesize source from a template
                                      + patch worksheet <drawing>/_rels + [Content_Types] + multi-sheet map
 
-AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert Authored ChartSpec (no source) →
+AUTHOR (authoring phase) ─ action-bar chart icon → type menu → insert Authored ChartSpec (no source) →
                     edit panel mutates Chart/ranges → live-binds → synthesize source on save
 ```
 
@@ -109,8 +109,8 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert Authored Cha
 - Save: `save_with_charts` extends PoC `save.rs` — **byte-preserve** unedited; **patch the
   retained source** for edited-loaded charts (reflow `numCache` + write back edited fields,
   keeping `c:f` and unmodeled styling); **synthesize from a template** for authored charts
-  (Phase 6); multi-sheet part map via `workbook.xml.rels`, **failing loudly** on a missing
-  target part.
+  (authoring phase); multi-sheet part map via `workbook.xml.rels`, **failing loudly** on a
+  missing target part.
 
 ### 4.2 App — render + interaction
 - **`ChartLayer`** painted after cells, before chrome overlays; anchor→pixel via the grid's
@@ -118,7 +118,7 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert Authored Cha
   free; culls off-screen; resident `Vec<RenderedChart>` repainted on the dirty set.
 - **Dispatch** = PoC `chart_element(&Chart)` over `ChartKind`, extended with P1/P2 fidelity;
   `Degraded` adds the corner badge; `Unsupported` → placeholder.
-- **Authoring (Phase 6):** action-bar chart-icon menu → insert; selection outline + handles on
+- **Authoring (authoring phase):** action-bar chart-icon menu → insert; selection outline + handles on
   the layer; the right-docked **edit panel** (a chrome overlay, form-factor fixed, detail
   deferred) mutates the `Chart`/ranges; on save the source is patched (edited-loaded) or
   synthesized from a template (authored).
@@ -136,7 +136,7 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert Authored Cha
    lossy regenerate; same targeted-XML pattern as `open_fixups.rs`). Authored = **synthesize
    source from a template** (no original) + drawing/anchor/rels/content-types. The
    template-synthesizer + edit-patcher are the hardest new pieces → their own component design
-   in Phase 6.
+   in the authoring phase.
 4. **Compatibility classification** (§3.3) — the parser is the sole classifier; deterministic
    feature→bucket mapping; 3D→2D reduction table.
 5. **Performance** — lazy parse, off-screen cull, dirty-set recompute, large-series down-sample
@@ -153,7 +153,7 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert Authored Cha
 ## 7. Testing strategy
 - **Engine (headless, no GPU):** unit tests for parse, `ParseOutcome` classification (incl.
   3D→2D + placeholder types), `c:f` resolution, dirty-set intersection, save reflow, and
-  write-from-model round-trip (Phase 6).
+  write-from-model round-trip (authoring phase).
 - **Render (`render-tests`):** lift the PoC capture harness (`xvfb`+lavapipe+`xrefresh`+`import`;
   provision `SYNTHESIS §4.4` container prereqs in CI); **perceptual-diff-vs-baseline** (reuse
   `round-3/C-ci-rendering` metric) with committed baseline PNGs per type/variation, incl. the

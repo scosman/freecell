@@ -102,10 +102,10 @@ Two **separate, sequenced** stages. These require a **write-from-model** path (s
 chart XML from `chart-model`); the writer is built in Stage A.
 
 ### 6.A — Minimal authoring (first extension stage)
-- **Insert a chart:** select a data range → *Insert chart* → choose an in-scope type →
-  FreeCell creates a chart with **sensible defaults** (series/categories inferred from the
-  range shape, default palette, auto axes, legend when multi-series), anchored near the
-  selection.
+- **Insert a chart:** a **chart icon on the action bar** opens a menu of chart-type glyphs;
+  choosing one inserts a **near-empty** chart of that type and opens its **edit panel**, which
+  the user shapes into form (range, title, …). See `ui_design.md §3–§4`. No pre-selected range
+  required. (Panel detail deferred to the phase.)
 - **Manipulate:** **select / move / resize / delete** a chart object in the grid.
 - **Change type** (among in-scope types) and **re-range** (re-pick the source range).
 - **Authored-chart styling is FreeCell-native** (our palette/defaults) — a valid `.xlsx` that

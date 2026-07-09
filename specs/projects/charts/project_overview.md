@@ -41,20 +41,20 @@ None of this was touched by the PoC (it was static-PNG-only, nothing in `/app`):
    colors, data labels, number formats, axis scaling), per
    `chart-proof-of-concept/ooxml-coverage-matrix.md`.
 
-## Scope decisions (baked into this plan — **confirm or redirect**)
+## Scope decisions (confirmed at Step 1 review)
 
-These frame everything downstream; I've taken the reading the PoC + your guidance most
-support. Correct any that are wrong before we build:
-
-- **DISPLAY + PRESERVE, not authoring.** v1 renders charts from opened `.xlsx` and keeps
-  them correct through edit+save. **No chart creation / editing UI** (insert a chart, change
-  type, re-pick data range) — that is a *separate future project*. The PoC and "get from
-  experiment to production quality" both point here.
-- **Live binding is the target.** Charts reflect *current* cell values and re-render on
-  edit (cache is the initial paint / fallback). This subsumes the stale-cache problem.
-- **Read-only, in-place for v1.** Charts render at their anchor and scroll with the sheet,
-  but **select / move / resize / delete** is a *later phase*, not the first cut. The
-  line-chart checkpoint validates rendering, perf, and save/restore — not manipulation.
+- **v1 core = DISPLAY + PRESERVE. Authoring + editing are in this project, as END phases.**
+  The shippable v1 renders charts from opened `.xlsx` and keeps them correct through
+  edit+save. **Authoring** (insert a chart, pick data range/type) **and editing** (change
+  type, re-range, restyle an existing chart) are **later phases in this same project** —
+  *extensions, not required to ship*: we may ship v1 (display + preserve) before they are
+  complete, but they are planned here, not spun off.
+- **Live binding.** Charts reflect *current* cell values and re-render on edit (cache is the
+  initial paint / fallback). This subsumes the stale-cache problem.
+- **Read-only, in-place for the v1 core.** Charts render at their anchor and scroll with the
+  sheet; **select / move / resize / delete** and the authoring/editing UI arrive in the
+  end-phase extensions above — *not* in the first cut. The line-chart checkpoint validates
+  rendering, perf, and save/restore, not manipulation.
 - **Type scope = the PoC's GO set:** line (first), then column/bar, area, pie/doughnut,
   scatter, bubble. **Out:** stock, combo, radar, surface, all 3D, ofPie, multi-ring
   doughnut, and the `cx:` extended family (per the coverage matrix).
@@ -69,6 +69,10 @@ support. Correct any that are wrong before we build:
   review + tuning pass validating the *whole vertical slice* before grinding out the
   remaining types. That checkpoint is the project's central de-risking gate.
 - **Then the rest of the types** ride the proven pipeline, followed by fidelity + robustness
-  hardening.
+  hardening — this completes the **shippable v1** (display + preserve).
+- **Finally, end-phase extensions: authoring + editing** (create/insert charts, edit an
+  existing chart's type/range/style, plus the select/move/resize interaction they require).
+  Planned here, but v1 can ship before they land.
 
-Details: `functional_spec.md`, `architecture.md`, and the phased `implementation_plan.md`.
+Details: `functional_spec.md`, `architecture.md`, and the phased `implementation_plan.md`
+(all three are being (re)written under the step-gated review — currently strawman).

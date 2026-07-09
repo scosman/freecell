@@ -116,10 +116,12 @@ chart XML from `chart-model`); the writer is built in Stage A.
   **data-label** toggles (show value / percent / name).
 
 ### Edit contract (editing a chart that was *loaded from a file*)
-- Editing a loaded chart switches it from byte-preservation to **written-from-our-model** on
-  save. Styling our model does not capture (gradients, theme effects, unmodeled fields) **may
-  be lost** on that first edit — accepted, documented behavior (the `.back` backup gives a
-  recovery path). Untouched loaded charts remain byte-preserved.
+- Editing a loaded chart **patches its retained source XML** — only the fields you change are
+  rewritten, so **unmodeled styling (gradients, theme effects, etc.) is preserved** (the
+  architecture's source-first save, `architecture.md §3/§5`). A *structural* change (e.g.
+  changing chart type) may reset more of the chart. Untouched loaded charts stay
+  byte-preserved; the `.back` backup remains a safety net. Detail finalized in the authoring
+  phase.
 
 ## 7. Edge cases & error handling
 

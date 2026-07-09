@@ -39,27 +39,43 @@ only with the production fidelity fields the coverage matrix calls P1/P2 (per-po
 colors, data-label config, number-format, axis scaling) as they are implemented — additively,
 so the seam stays stable (it "held across all four gates without a shape change", `SYNTHESIS §5`).
 
+**Model-alignment decision (OOXML-shaped, bounded — not exhaustive).** The model mirrors the
+`c:` structure and carries **typed Rust fields for what we render/edit** (the P1/P2 set). It
+deliberately does **not** model the full DrawingML long tail (`a:spPr` fills/lines/effects/
+theme, etc.) — that is effectively unbounded and we don't render it. Fidelity for everything
+we don't model comes from **retaining the source XML** (§3.2) and **patching** it on edit
+(§5), not from exhaustive modeling. This is the answer to "should we align to OOXML?": align
+*shape and rendered fields*, preserve the rest as source — avoiding a lossy
+`parse → our-model → regenerate` round-trip.
+
 ### 3.2 `ChartSpec` (engine envelope — net new)
 Wraps `Chart` with everything production needs beyond a static picture:
+- `source: SourceXml` — the **retained parsed chart XML** (+ its rels). The substrate for
+  byte-preservation, edit-patching (§5), and the fidelity accessor (§3.3). Not just opaque
+  bytes — a form we can re-serialize and targeted-patch.
 - `source_ranges: Vec<CfRange>` — parsed `c:f` per data ref (for live binding).
 - `anchor: Anchor` — `twoCellAnchor` from/to cell + EMU offsets (for in-grid placement).
-- `provenance: Provenance` — original part bytes + rels (for byte-preservation save).
-- `outcome: ParseOutcome` — the **compatibility parse-contract** result (below).
+- `origin: Loaded | Authored` — Authored charts have no `source` (synthesize on save).
 - `dirty: bool`, `last_values` — live-binding bookkeeping.
 
-### 3.3 `ParseOutcome` (the compatibility parse-contract — functional_spec §5)
+### 3.3 Display fidelity — a **derived accessor**, not stored state (functional_spec §5)
+There is **no parse-time `Degraded` flag to keep in sync**. The compatibility category is
+*computed on demand* from the model + retained source:
 ```
-enum ParseOutcome { Supported, Degraded(Vec<DegradeReason>), Unsupported(Reason) }
+fn display_fidelity(&self) -> Fidelity   // Faithful | Degraded | Unsupported
 ```
-- **Supported** → renders faithfully.
-- **Degraded** → renders + the app shows the corner warning (functional_spec §5 / ui_design §2.2).
-  Set by: any P2/P3 feature the parser sees but the model doesn't carry; **3D chart types**
-  (parsed as their 2D equivalent — `bar3DChart→Bar`, etc.). `DegradeReason` is kept for logs,
-  not shown (UI is just "⚠ May not display as intended").
-- **Unsupported** → the app shows the placeholder. Set by: types with no 2D equivalent
-  (surface/radar/ofPie/stock/`cx:`) and hard parse failures.
-The parser is the single classifier: for each feature it *either* fills the model, *or* records
-a `DegradeReason`, *or* (if essential) returns `Unsupported`.
+- **Unsupported** — the chart-group type has no faithful rendering (surface/radar/ofPie/stock/
+  `cx:`) or the part failed to parse → placeholder.
+- **Degraded** — the retained source contains **render-affecting features our renderer does not
+  honor**, *or* the source's chart-group was a 3D type normalized to its 2D `ChartKind`
+  (`bar3DChart→Bar`, …). → renders + the corner "⚠ May not display as intended" (ui_design §2.2).
+- **Faithful** — otherwise.
+
+"Render-affecting features we don't honor" is an **explicit, curated set** (checked against the
+source), *not* "any field present" — benign fields (`c:idx`, `c:order`, layout hints) must not
+trigger a false warning. The accessor **auto-clears as we add support**: once a feature becomes
+rendered, it drops out of the unsupported set and the warning disappears with no separate
+bookkeeping. This is the clean version of §5's three buckets — derived, self-updating.
 
 ## 4. Component breakdown & flow
 
@@ -75,12 +91,13 @@ PAINT ─ ChartLayer (app): for each on-screen ChartSpec → anchor→pixel rect
           Supported/Degraded → chart_element(&Chart) [+ corner badge if Degraded]
           Unsupported        → placeholder
 
-SAVE ─ IronCalc write (chart-less) ─ splice: unedited → byte-preserve provenance
-                                             edited/authored → write-from-model (serialize Chart→chartN.xml)
+SAVE ─ IronCalc write (chart-less) ─ splice: unedited     → byte-preserve retained source
+                                             edited-loaded → PATCH retained source (changed fields only)
+                                             authored      → synthesize source from a template
                                      + patch worksheet <drawing>/_rels + [Content_Types] + multi-sheet map
 
-AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert near-empty ChartSpec (no provenance,
-                    outcome=Supported) → edit panel mutates Chart/ranges → live-binds + writes-from-model
+AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert Authored ChartSpec (no source) →
+                    edit panel mutates Chart/ranges → live-binds → synthesize source on save
 ```
 
 ### 4.1 Engine — chart I/O + binding
@@ -89,8 +106,9 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert near-empty C
   get the **dirty chart set**, re-resolve their ranges from IronCalc's current values, rebuild
   their `Chart`, and publish via the **existing worker publication seam** (charts ride the same
   lock-free snapshot path as cells — not a bespoke channel).
-- Save: `save_with_charts` extends PoC `save.rs` — byte-preserve unedited; **reflow** edited
-  charts' `numCache` from current values; **write-from-model** for authored/edited charts
+- Save: `save_with_charts` extends PoC `save.rs` — **byte-preserve** unedited; **patch the
+  retained source** for edited-loaded charts (reflow `numCache` + write back edited fields,
+  keeping `c:f` and unmodeled styling); **synthesize from a template** for authored charts
   (Phase 6); multi-sheet part map via `workbook.xml.rels`, **failing loudly** on a missing
   target part.
 
@@ -102,7 +120,8 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert near-empty C
   `Degraded` adds the corner badge; `Unsupported` → placeholder.
 - **Authoring (Phase 6):** action-bar chart-icon menu → insert; selection outline + handles on
   the layer; the right-docked **edit panel** (a chrome overlay, form-factor fixed, detail
-  deferred) mutates the `Chart`/ranges and marks it authored (→ write-from-model on save).
+  deferred) mutates the `Chart`/ranges; on save the source is patched (edited-loaded) or
+  synthesized from a template (authored).
 
 ## 5. Technical challenges (designed here)
 1. **Anchor→pixel & z-order.** Map `twoCellAnchor` (from/to cell + EMU) through the grid
@@ -111,10 +130,13 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert near-empty C
 2. **Live binding off the frame budget.** `c:f`→range parse once; range→chart index; dirty-set
    by intersection (no rescan); re-resolve only dirty charts; coalesce per frame. Cache =
    first-paint + fallback.
-3. **Save: three write modes coexisting.** Unedited = byte-preserve (PoC-proven); edited-loaded
-   = reflow cache (bounded XML edit, keep `c:f`); authored/edited-structurally =
-   **write-from-model** (serialize `Chart`→`chartN.xml` + synth drawing/anchor/rels/content-types).
-   The write-from-model serializer is the hardest new piece → its own component design in Phase 6.
+3. **Save: three write modes, source-first.** Unedited = **byte-preserve** the retained source
+   (PoC-proven). Edited-loaded = **patch the retained source** — reflow `numCache`, write back
+   the specific edited fields, keep `c:f` and all unmodeled styling (the fidelity win over a
+   lossy regenerate; same targeted-XML pattern as `open_fixups.rs`). Authored = **synthesize
+   source from a template** (no original) + drawing/anchor/rels/content-types. The
+   template-synthesizer + edit-patcher are the hardest new pieces → their own component design
+   in Phase 6.
 4. **Compatibility classification** (§3.3) — the parser is the sole classifier; deterministic
    feature→bucket mapping; 3D→2D reduction table.
 5. **Performance** — lazy parse, off-screen cull, dirty-set recompute, large-series down-sample
@@ -143,6 +165,6 @@ AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert near-empty C
 ## 8. Risks (carried from `SYNTHESIS §4/§5`, owned here)
 1. App-integration correctness (anchor/z-order/clip/scroll) — the make-or-break, front-loaded on line charts.
 2. Live-binding cost staying off the frame budget.
-3. Save write-from-model + reflow fidelity, Excel + LibreOffice acceptance.
+3. Save fidelity — source-patch (edited) + template-synthesize (authored) + reflow, Excel + LibreOffice acceptance.
 4. Real-file variety beyond agent-authored fixtures.
 5. Bounded fidelity polish (rotated axis title, horizontal-bar order, theme/`dPt` colors).

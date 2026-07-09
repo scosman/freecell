@@ -4,119 +4,145 @@ status: draft
 
 # Architecture: Charts (production)
 
-> ⚠️ **STRAWMAN — not yet reviewed.** Written ahead of process during a batch drift; parked
-> as raw input pending the step-gated `/spec new_project` review (comes after the functional
-> spec). Do **not** treat as vetted or settled.
+How the PoC's three layers land in FreeCell's crate structure, plus the net-new production
+machinery: app integration, live binding, the compatibility parse-contract, save/reflow, and
+the authoring write path. Exact engine worker/cache APIs live in the `mvp`/`mvp-gaps`
+architecture + `engine_worker` component doc; this references them.
 
-How the PoC's three layers land in FreeCell's real crate structure, plus the net-new
-production machinery (app integration, live binding, perf, save-reflow). Exact engine
-worker/cache APIs are in the existing `mvp`/`mvp-gaps` architecture + the `engine_worker`
-component doc; this references them rather than restating.
+**Organization decision (1-phase vs 2-phase):** a **single `architecture.md`** now. The
+v1-core design fits here; the deepest deferred piece — the **write-from-model serializer** and
+the **edit-panel** — gets its own component design **when Phase 6 (authoring) is planned**
+(you asked to defer that detail). Flag if you'd rather split now.
 
 ## 1. Pinned dependencies
-Mirror `app/Cargo.toml` exactly — the known-good pair `gpui`/`gpui_platform` (zed rev
-`1d217ee…`) + `gpui-component` (`a9a7341…`), `ironcalc =0.7.1`, `zip 0.6` + `roxmltree 0.19`
-(already engine deps via `open_fixups.rs`), `image`/`png` for the regression harness. No new
-heavy deps; the PoC proved the set.
+Mirror `app/Cargo.toml` exactly — `gpui`/`gpui_platform` (zed rev `1d217ee…`) +
+`gpui-component` (`a9a7341…`), `ironcalc =0.7.1`, `zip 0.6` + `roxmltree 0.19` (already engine
+deps via `open_fixups.rs`), `image`/`png` for the regression harness. No new heavy deps.
 
-## 2. Layered placement (map PoC crates → app crates by charter)
+## 2. Layered placement (PoC crates → app crates, by charter)
 
-The PoC's three concerns map cleanly onto the existing crate boundaries (which are defined
-by *what they may depend on*):
-
-| Concern (PoC crate) | Lands in | Why |
+| Concern | Lands in | Why |
 |---|---|---|
-| **`chart-model`** (gpui-free, ironcalc-free data model) | **`freecell-core`** (or a sibling `freecell-chart-model` crate) | core is exactly "pure logic types, no GPU, no engine." The model is the seam; keep it dependency-light and shared. |
-| **File layer** — load parser (`load.rs`/`xlsx.rs`) + save re-injection (`save.rs`) | **`freecell-engine`** | engine already owns IronCalc, file I/O, and the `open_fixups.rs` zip second-pass. Chart parse/save is the same shape of code, next to it. |
-| **Live binding** — resolve `c:f` → current cell values; dirty-set on edit | **`freecell-engine`** | only the engine sees IronCalc's cells + the recompute/worker. Charts become part of what the worker resolves and publishes. |
-| **Render layer** — chrome, palette, ticks, stacking, per-type renderers | **`freecell-app`** | needs gpui + gpui-component + the grid coordinate system. Lift the PoC render modules here (drop the standalone capture bins). |
+| **`chart-model`** (gpui-free, ironcalc-free) + **parse-outcome** types | **`freecell-core`** (or a dedicated `freecell-chart-model` crate) | pure logic; the stable seam. Recommend a dedicated sibling crate to keep it explicit + core lean — minor call. |
+| **File layer** — load parser + save (byte-preserve, reflow, write-from-model) | **`freecell-engine`** | owns IronCalc, file I/O, the `open_fixups.rs` zip second-pass. |
+| **Live binding** — `c:f` resolution + dirty-set | **`freecell-engine`** | only the engine sees IronCalc cells + the recompute worker. |
+| **Render + interaction** — ChartLayer, badge, placeholder, selection/manipulation, edit panel, action-bar insert | **`freecell-app`** | needs gpui + gpui-component + the grid coordinate system. |
 
-The **seam stays**: engine produces `chart-model::Chart` values (now with *live* values);
-app renders them. No layer reaches across.
+The **seam holds**: engine produces `chart-model::Chart` (now live) wrapped in `ChartSpec`;
+app renders/edits; no layer reaches across.
 
-## 3. Data flow
+## 3. Data model
+
+### 3.1 `chart-model::Chart` (core seam — kept from PoC)
+Unchanged shape (`ChartKind`, `Series`/`SeriesData`, `Axis`, `Legend`, `Color`), extended
+only with the production fidelity fields the coverage matrix calls P1/P2 (per-point `dPt`
+colors, data-label config, number-format, axis scaling) as they are implemented — additively,
+so the seam stays stable (it "held across all four gates without a shape change", `SYNTHESIS §5`).
+
+### 3.2 `ChartSpec` (engine envelope — net new)
+Wraps `Chart` with everything production needs beyond a static picture:
+- `source_ranges: Vec<CfRange>` — parsed `c:f` per data ref (for live binding).
+- `anchor: Anchor` — `twoCellAnchor` from/to cell + EMU offsets (for in-grid placement).
+- `provenance: Provenance` — original part bytes + rels (for byte-preservation save).
+- `outcome: ParseOutcome` — the **compatibility parse-contract** result (below).
+- `dirty: bool`, `last_values` — live-binding bookkeeping.
+
+### 3.3 `ParseOutcome` (the compatibility parse-contract — functional_spec §5)
+```
+enum ParseOutcome { Supported, Degraded(Vec<DegradeReason>), Unsupported(Reason) }
+```
+- **Supported** → renders faithfully.
+- **Degraded** → renders + the app shows the corner warning (functional_spec §5 / ui_design §2.2).
+  Set by: any P2/P3 feature the parser sees but the model doesn't carry; **3D chart types**
+  (parsed as their 2D equivalent — `bar3DChart→Bar`, etc.). `DegradeReason` is kept for logs,
+  not shown (UI is just "⚠ May not display as intended").
+- **Unsupported** → the app shows the placeholder. Set by: types with no 2D equivalent
+  (surface/radar/ofPie/stock/`cx:`) and hard parse failures.
+The parser is the single classifier: for each feature it *either* fills the model, *or* records
+a `DegradeReason`, *or* (if essential) returns `Unsupported`.
+
+## 4. Component breakdown & flow
 
 ```
-open .xlsx ─┬─ IronCalc load (cells, styles)                    [engine, existing]
-            └─ chart discovery: sheet→drawing→chart chain        [engine, PoC load.rs]
-                 → parse chartN.xml → ChartSpec {model + c:f ranges + anchor}
-                     (first paint uses numCache; ranges kept for live binding)
+OPEN ─ IronCalc load ─┬─ chart discovery (sheet→drawing→chart, PoC load.rs)
+                      └─ parse chartN.xml → ChartSpec{Chart, ranges, anchor, provenance, outcome}
+                          (lazy: on first paint of the owning sheet region, off open's crit path)
 
-edit cell ── IronCalc recompute ── worker publishes ── dirty charts (ranges ∩ edit) [engine]
-                                                          │
-                                          re-resolve c:f → fresh values → Chart
-                                                          │
-grid paint ── ChartLayer over cells ── chart_element(&Chart) at anchor rect        [app]
-                 (only on-screen, non-empty charts painted)
+EDIT ─ IronCalc recompute ─ worker publish ─ dirty charts = (ranges ∩ changed cells)  [engine]
+                                               └ re-resolve c:f → fresh Chart → publish (arc-swap + WorkerEvent)
 
-save .xlsx ── IronCalc write (chart-less) ── re-injection splice:                  [engine]
-                 unedited charts: byte-preserve parts
-                 edited charts:   refresh numCache from current cells, re-emit part
-                 + patch worksheet <drawing>/_rels + [Content_Types] + multi-sheet map
+PAINT ─ ChartLayer (app): for each on-screen ChartSpec → anchor→pixel rect → dispatch:
+          Supported/Degraded → chart_element(&Chart) [+ corner badge if Degraded]
+          Unsupported        → placeholder
+
+SAVE ─ IronCalc write (chart-less) ─ splice: unedited → byte-preserve provenance
+                                             edited/authored → write-from-model (serialize Chart→chartN.xml)
+                                     + patch worksheet <drawing>/_rels + [Content_Types] + multi-sheet map
+
+AUTHOR (Phase 6) ─ action-bar chart icon → type menu → insert near-empty ChartSpec (no provenance,
+                    outcome=Supported) → edit panel mutates Chart/ranges → live-binds + writes-from-model
 ```
 
-## 4. Key components
+### 4.1 Engine — chart I/O + binding
+- `discover_and_parse(path) -> Vec<ChartSpec>` (lazy per sheet).
+- Live binding: build a **range→chart index**; on recompute, intersect the changed-cell set to
+  get the **dirty chart set**, re-resolve their ranges from IronCalc's current values, rebuild
+  their `Chart`, and publish via the **existing worker publication seam** (charts ride the same
+  lock-free snapshot path as cells — not a bespoke channel).
+- Save: `save_with_charts` extends PoC `save.rs` — byte-preserve unedited; **reflow** edited
+  charts' `numCache` from current values; **write-from-model** for authored/edited charts
+  (Phase 6); multi-sheet part map via `workbook.xml.rels`, **failing loudly** on a missing
+  target part.
 
-### 4.1 `ChartSpec` — the resident, live-capable chart
-Wraps `chart-model::Chart` with what production needs beyond the PoC's static model:
-- the **`c:f` source ranges** per series (parsed but unused in the PoC) — for live binding;
-- the **anchor** (from/to cell + EMU offsets) — for in-grid positioning;
-- the **raw part bytes / provenance** — for byte-preservation save of unedited charts;
-- a **dirty flag** + last-resolved values.
-`chart-model::Chart` itself stays the pure seam; `ChartSpec` is the engine-side envelope.
+### 4.2 App — render + interaction
+- **`ChartLayer`** painted after cells, before chrome overlays; anchor→pixel via the grid's
+  coordinate system (row/col geometry from the all-styles resident cache), so scroll/zoom are
+  free; culls off-screen; resident `Vec<RenderedChart>` repainted on the dirty set.
+- **Dispatch** = PoC `chart_element(&Chart)` over `ChartKind`, extended with P1/P2 fidelity;
+  `Degraded` adds the corner badge; `Unsupported` → placeholder.
+- **Authoring (Phase 6):** action-bar chart-icon menu → insert; selection outline + handles on
+  the layer; the right-docked **edit panel** (a chrome overlay, form-factor fixed, detail
+  deferred) mutates the `Chart`/ranges and marks it authored (→ write-from-model on save).
 
-### 4.2 Live binding (engine)
-- Parse each data ref's `c:f` into a resolved range (reuse IronCalc's range parsing).
-- Maintain a **range→chart index** so an edit's changed-cell set yields the **dirty chart
-  set** by intersection (cheap; no full rescan).
-- On recompute, re-read the dirty charts' ranges from IronCalc's current values, rebuild
-  their `chart-model::Chart`, and publish via the **existing worker publication seam**
-  (arc-swap snapshot + `WorkerEvent`), so charts ride the same lock-free UI update path as
-  cell values — not a bespoke channel.
-- Cache is first-paint + fallback only.
+## 5. Technical challenges (designed here)
+1. **Anchor→pixel & z-order.** Map `twoCellAnchor` (from/to cell + EMU) through the grid
+   geometry cache; clip to viewport; paint above cells, below chrome. Scroll/zoom reuse the
+   grid's transform. *(Front-loaded on line charts, Phase 1a.)*
+2. **Live binding off the frame budget.** `c:f`→range parse once; range→chart index; dirty-set
+   by intersection (no rescan); re-resolve only dirty charts; coalesce per frame. Cache =
+   first-paint + fallback.
+3. **Save: three write modes coexisting.** Unedited = byte-preserve (PoC-proven); edited-loaded
+   = reflow cache (bounded XML edit, keep `c:f`); authored/edited-structurally =
+   **write-from-model** (serialize `Chart`→`chartN.xml` + synth drawing/anchor/rels/content-types).
+   The write-from-model serializer is the hardest new piece → its own component design in Phase 6.
+4. **Compatibility classification** (§3.3) — the parser is the sole classifier; deterministic
+   feature→bucket mapping; 3D→2D reduction table.
+5. **Performance** — lazy parse, off-screen cull, dirty-set recompute, large-series down-sample
+   for paint (full data retained for save). p50/p99 targets measured at the checkpoint.
 
-### 4.3 Render integration (app)
-- A **`ChartLayer`** painted after cells, before selection chrome (z-order), clipped to the
-  grid viewport.
-- **Anchor → pixels** uses the grid's existing coordinate system (row/col geometry from the
-  all-styles resident cache), so charts scroll/zoom for free.
-- Only **on-screen, non-empty** charts paint; a resident `Vec<RenderedChart>` keyed by
-  (sheet, chart idx) is repainted on the dirty set. Off-screen = skipped.
-- Per-type dispatch is the PoC's `chart_element(&Chart)` over `ChartKind`, lifted verbatim,
-  extended with the fidelity features (dPt colors, data labels, number formats, axis
-  scaling, rotated axis title).
+## 6. Error handling
+- Parse failure / essential-unsupported → `Unsupported` → placeholder; **workbook open never
+  breaks**; log the reason.
+- Unresolvable `c:f` → fall back to cached values → else placeholder.
+- Empty/non-numeric edited ranges → render valid points, blank rest, no crash.
+- Multi-sheet save remap missing a target part → **fail loudly** (no silent chart drop).
+- All chart errors are **per-chart, non-fatal** to the grid/app.
 
-### 4.4 Save / reflow (engine)
-- Extend PoC `save.rs`: multi-sheet worksheet→part mapping via `workbook.xml.rels`; carry
-  `styleN`/`colorsN`; **fail loudly** if a targeted worksheet part is absent (PoC risk #8).
-- **Edit-reflow:** for charts whose source cells changed since load, rewrite the chart part's
-  `numCache`/`strCache` from current values (bounded XML edit, not a full writer); untouched
-  charts byte-preserve. Keeps `c:f` intact.
+## 7. Testing strategy
+- **Engine (headless, no GPU):** unit tests for parse, `ParseOutcome` classification (incl.
+  3D→2D + placeholder types), `c:f` resolution, dirty-set intersection, save reflow, and
+  write-from-model round-trip (Phase 6).
+- **Render (`render-tests`):** lift the PoC capture harness (`xvfb`+lavapipe+`xrefresh`+`import`;
+  provision `SYNTHESIS §4.4` container prereqs in CI); **perceptual-diff-vs-baseline** (reuse
+  `round-3/C-ci-rendering` metric) with committed baseline PNGs per type/variation, incl. the
+  badge + placeholder.
+- **Real-file corpus** (Excel/LibreOffice-authored): load without breakage; save round-trip
+  re-openable in both apps (PoC risks #10/#11).
+- **Perf** (repo bench convention): first-paint, edit re-render, scroll-with-K-charts p50/p99.
 
-## 5. Performance strategy (north-star constraint)
-- **Lazy parse** charts on first paint of their sheet region, off the open critical path.
-- **Off-screen = free** (culled before paint/recompute).
-- **Dirty-set recompute** — only charts whose ranges intersect an edit; coalesced per frame;
-  the scroll path never rebuilds charts.
-- **Large-series cap/down-sample** for paint (full data retained for save).
-- Explicit **p50/p99** targets measured at the checkpoint (foreground `timeout`, forced +
-  asserted op, environment-stamped — repo bench convention): first-paint, edit re-render,
-  scroll frame time with K charts.
-
-## 6. Testing & regression
-- Lift the PoC capture harness into a **chart render-test suite** under `render-tests`
-  (gpui window under `xvfb-run`+lavapipe+`xrefresh`+`import`; the container prereqs in
-  `SYNTHESIS §4.4` must be provisioned in CI).
-- **Perceptual-diff-vs-baseline** for stability (reuse `round-3/C-ci-rendering` metric —
-  per-channel tolerance + fail-fraction), committed baseline PNGs per type/variation.
-- **Real-file corpus** of Excel/LibreOffice-authored `.xlsx` (PoC risks #10/#11): load
-  without breakage + save round-trip re-openable in both apps.
-- Engine-side unit tests for parse, range resolution, dirty-set, and save reflow (headless,
-  no GPU — matching `freecell-engine`'s headless CI charter).
-
-## 7. Risks (carried from `SYNTHESIS §4/§5`, owned here)
-1. **App-integration correctness** — anchor mapping, z-order, clipping, scroll/zoom sync (net-new; the make-or-break of this project, front-loaded on line charts).
-2. **Live-binding cost** — range-intersection + re-resolve must stay off the frame budget.
-3. **Save reflow fidelity** — refreshing caches without corrupting the part; Excel+LibreOffice acceptance.
-4. **Real-file variety** — namespaces/styling the agent-authored PoC fixtures never showed.
-5. **Bounded fidelity polish** — rotated axis title, horizontal-bar order, theme colors, dPt.
+## 8. Risks (carried from `SYNTHESIS §4/§5`, owned here)
+1. App-integration correctness (anchor/z-order/clip/scroll) — the make-or-break, front-loaded on line charts.
+2. Live-binding cost staying off the frame budget.
+3. Save write-from-model + reflow fidelity, Excel + LibreOffice acceptance.
+4. Real-file variety beyond agent-authored fixtures.
+5. Bounded fidelity polish (rotated axis title, horizontal-bar order, theme/`dPt` colors).

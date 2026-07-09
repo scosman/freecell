@@ -9,6 +9,14 @@ those sources; relative links point at the committed evidence.
 Spec: [`specs/projects/chart-proof-of-concept/`](../../specs/projects/chart-proof-of-concept/).
 Build record: 5 phase commits, `65f0751` (Phase 0) → `c754613` (Phase 4), all gates passed.
 
+> **Fidelity caveat / read this alongside the verdict:** the GO below is a go on *render
+> feasibility*, proven on a **thin structural slice** of the OOXML model (type + series data
+> + one color + title/legend/axis-titles + grouping) and only **3 agent-authored** load
+> fixtures. It is **not** a proof of OOXML *fidelity*. The feature-by-feature ledger — what's
+> validated vs. extendable vs. out, by priority — is in
+> [`ooxml-coverage-matrix.md`](ooxml-coverage-matrix.md), and building a faithful model is the
+> follow-on's largest job.
+
 ---
 
 ## 1. The verdict: **GO**

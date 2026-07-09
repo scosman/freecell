@@ -128,3 +128,12 @@ not grind through later phases once a core capability is shown unachievable.**
   into `experiments/chart-poc/SYNTHESIS.md`: **GO / NO-GO / PARTIAL-GO**, recommended scope
   (types in/out, scatter in/out, display-only vs save-preservation), known risks, and a
   rough shape for the follow-on ship-quality project.
+
+- [x] **Phase 6 — OOXML coverage matrix (added post-synthesis).** The fidelity ledger the
+  GO synthesis lacked: for every OOXML (`c:`) chart feature, one row rating
+  **priority** (P1/P2/P3) × **support** (OK validated / E-OK extendable / HEAVY / NO), with
+  the chart type(s) it applies to, then a summary of how close the prototype gets, how close
+  extending gets, and what's out. Deliverable:
+  [`experiments/chart-poc/ooxml-coverage-matrix.md`](../../../experiments/chart-poc/ooxml-coverage-matrix.md);
+  linked from `SYNTHESIS.md`. *Analysis deliverable — no build; grounds the follow-on's
+  fidelity scope.*

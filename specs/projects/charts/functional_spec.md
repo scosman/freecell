@@ -4,111 +4,137 @@ status: draft
 
 # Functional Spec: Charts (production)
 
-> ⚠️ **STRAWMAN — not yet reviewed.** Written ahead of process during a batch drift; parked
-> as raw input pending the step-gated `/spec new_project` review. Only `project_overview.md`
-> is under review right now — do **not** treat anything here as vetted or settled.
+Builds on the PoC (`../chart-proof-of-concept/`). Covers the *production* behaviors the PoC
+skipped (`SYNTHESIS.md §8`): in-app rendering, live binding, performance, production
+save/restore, OOXML fidelity — **plus** the authoring + editing extensions confirmed at the
+overview review. Where the PoC settled a behavior, this references it rather than restating.
 
-Builds on the PoC (`../chart-proof-of-concept/`). This spec covers the *production*
-behaviors the PoC deliberately skipped (`SYNTHESIS.md §8`): in-app rendering, live binding,
-performance, production save/restore, and OOXML fidelity. Where the PoC already settled a
-behavior, this doc references it rather than restating it.
+**Shape of the project:** a shippable **v1 core** (§1–§4: display + live + preserve, read-only
+in-place) followed by **end-phase extensions** (§5: authoring, then chrome editing). v1 can
+ship before the extensions land.
 
-## 1. Core behaviors
+---
 
-### 1.1 Display charts from opened files
-- On opening an `.xlsx`, FreeCell discovers every embedded chart (worksheet → drawing →
-  chart chain, already implemented) and renders it **in the grid at its anchored position**
-  (`xdr:twoCellAnchor` from/to cells → pixel rect), floating above the cells, clipped to the
-  grid viewport.
-- A chart **scrolls and zooms with the sheet** (its anchor rect is in sheet coordinates).
+## 1. Display charts from opened files (v1 core)
+
+- On open, discover every embedded chart (worksheet → drawing → chart chain, implemented in
+  the PoC) and render it **in the grid at its anchored position** (`xdr:twoCellAnchor`
+  from/to cells → pixel rect), floating above cells, clipped to the grid viewport.
+- A chart **scrolls and zooms with the sheet** (anchor is in sheet coordinates).
 - Supported types (v1): **line, column, bar, area (incl. stacked/100%), pie, doughnut,
   scatter, bubble.** An out-of-scope or unparseable chart renders a **graceful placeholder**
-  (title + anchor rectangle + "unsupported chart type" — never a crash, never a blank hole).
+  (title + anchor rectangle + "unsupported chart type") — never a crash, never a blank hole,
+  workbook still opens.
 
-### 1.2 Live data binding
-- A chart's series values come from the **current** worksheet cells its `c:f` ranges point
-  at (resolved against IronCalc), not the file's cached snapshot. Editing a cell in a
-  chart's source range **re-renders** the chart.
-- The file's `numCache`/`strCache` is used for the **first paint** (instant, no eval) and as
-  a **fallback** when a range can't be resolved; live values replace it once resolved.
-- Re-render is **incremental and debounced** — a keystroke storm coalesces; only charts whose
-  source ranges intersect the edit recompute. (Perf contract in §3.)
+## 2. Live data binding (v1 core)
 
-### 1.3 Save / restore
-- **Round-trip fidelity:** open → edit → save → reopen preserves every chart, in Excel and
-  LibreOffice, not just our own loader. Extends the PoC's single-sheet byte-preservation to
-  **multi-sheet** workbooks (sheet→part mapping via `workbook.xml.rels`) and carries all
-  chart-aux parts (`styleN`/`colorsN`).
-- **Edit-reflow:** when the user has edited a chart's source cells, the saved chart's cached
-  values are **refreshed** from IronCalc's current values (so a colleague opening the file in
-  Excel sees current data), while unedited charts are byte-preserved as-is.
-- Charts on sheets the user never touched must be **bit-stable** (no spurious diffs).
+- A chart's series values come from the **current** worksheet cells its `c:f` ranges resolve
+  to (against IronCalc), not the file's cached snapshot. Editing a cell in a chart's source
+  range **re-renders** the chart.
+- The file's `numCache`/`strCache` is the **first paint** (instant, no eval) and the
+  **fallback** when a range can't be resolved; live values replace it once resolved.
+- Re-render is **incremental + coalesced**: only charts whose source ranges intersect the
+  edit recompute, batched per frame. Charts update **when the async recompute lands** — no
+  explicit "stale/updating" badge (default; flag if you want one).
 
-### 1.4 Per-type fidelity (what "correct" means)
+## 3. Save / restore (v1 core)
+
+- **Round-trip fidelity:** open → edit → save → reopen preserves every chart, in **Excel and
+  LibreOffice**, not just our loader. Extends the PoC single-sheet byte-preservation to
+  **multi-sheet** (sheet→part map via `workbook.xml.rels`) + carries chart-aux parts
+  (`styleN`/`colorsN`).
+- **Edit-reflow:** for a chart whose source cells changed since load, its cached values are
+  **refreshed** from IronCalc's current values on save (so Excel shows current data); charts
+  on untouched sheets are **bit-stable**.
+- The existing **`.back` backup** (mvp-gaps) before first save applies — a recovery path if a
+  save ever loses fidelity.
+
+## 4. Per-type fidelity — what "correct" means (v1 core)
+
 Baseline: everything the PoC validated (`SYNTHESIS §2`) — correct geometry, multi-series,
-grouping/stacking, synthesized palette, nice numeric axis, legend, title/axis-titles — now
-at **production quality** (not relaxed-rigor). Plus the **P1/P2** features from
-`ooxml-coverage-matrix.md` that the thin PoC model dropped, prioritized:
-- **P1:** `c:dPt` per-point / per-slice colors (esp. pie), series colors incl. **theme
-  colors** (`schemeClr`+tint), value-axis title **rotated** vertical, horizontal-bar
+grouping/stacking, synthesized palette, nice numeric axis, legend, title/axis-titles — now at
+**production quality**. Plus the prioritized `ooxml-coverage-matrix.md` features the thin PoC
+model dropped:
+- **P1 (v1 must-have):** `c:dPt` per-point / per-slice colors (esp. pie), series colors incl.
+  **theme colors** (`schemeClr`+tint), value-axis title **rotated** vertical, horizontal-bar
   category order matching Excel.
-- **P2:** data labels (`c:dLbls` show val/percent/name), number formats (`c:numFmt`), axis
-  scaling (min/max, reversed), gridline toggles, markers, `c:smooth`, gap/overlap, pie
-  rotation/explosion, live `c:f` (see §1.2).
-- **Out (this project):** log/date axes (HEAVY), pattern fills, combo, and all §8 items.
+- **P2 (v1 target, deferrable per item):** data labels (`c:dLbls` val/percent/name), number
+  formats (`c:numFmt`), axis scaling (min/max, reversed), gridline toggles, markers,
+  `c:smooth`, gap/overlap, pie rotation/explosion.
+- **Out (this project):** log/date axes, pattern fills, combo, and the §7 items.
 
-## 2. User-facing surface & interaction
+**Interaction in the v1 core:** charts are **read-only, in-place** — not selectable, movable,
+resizable, or deletable, and no hover/tooltips. Manipulation arrives with authoring (§5.A).
 
-- **v1 = read-only, in-place.** Charts render and update; they are **not** selectable,
-  movable, resizable, or deletable in v1 (fast-follow phase, `implementation_plan.md`).
-- **No authoring** (create/insert/retype/re-range a chart) in this project.
-- **Hover/tooltips:** out for v1 (the PoC noted candlestick/pie lack them; not a v1 need).
-  Value read-off comes from axis + optional data labels.
+---
 
-## 3. Constraints
+## 5. Authoring & editing (end-phase extensions — after the v1 core ships)
 
-- **Performance (FreeCell's north star — huge sheets):**
-  - Chart discovery/parse is **lazy / off the open path's critical section** — opening a
-    workbook with charts must not regress open time meaningfully; parse on first paint of the
-    owning sheet region.
-  - A chart **off-screen** costs ~nothing (no paint, no recompute).
-  - An edit that touches N charts' ranges recomputes **only those N**, coalesced per frame;
-    the scroll path must stay at the grid's frame budget with charts present.
-  - Establish explicit p50/p99 targets (per repo bench convention) at the checkpoint:
-    first-paint latency, re-render latency on edit, and scroll frame time with K charts
-    visible.
-- **Compatibility:** classic `c:` charts; pinned gpui/gpui-component/IronCalc versions
-  (mirror `app/Cargo.toml`). Saved files valid in Excel + LibreOffice.
-- **Robustness:** a malformed / unexpected chart part **never** breaks workbook open or the
-  grid — it degrades to the placeholder and logs. Real-world chart XML variety (odd
-  namespaces, richer styling) must be tolerated (PoC risk #11 — real-file corpus needed).
+Two **separate, sequenced** stages. These require a **write-from-model** path (synthesize
+chart XML from `chart-model` — the coverage-matrix "write chart XML" item); the writer is
+built in Stage A.
 
-## 4. Edge cases & error handling
+### 5.A — Minimal authoring (first extension stage)
+- **Insert a chart:** select a data range → *Insert chart* → choose an in-scope type →
+  FreeCell creates a chart with **sensible defaults** (series/categories inferred from the
+  range shape, default palette, auto axes, legend when multi-series), anchored near the
+  selection.
+- **Manipulate:** **select / move / resize / delete** a chart object in the grid.
+- **Change type** (among in-scope types) and **re-range** (re-pick the source range) of an
+  existing chart.
+- **Authored-chart styling is FreeCell-native** (our palette/defaults) — a valid `.xlsx` that
+  opens correctly in Excel/LibreOffice but does **not** pixel-match Excel's default theme.
 
-- Unsupported/parse-failed chart → placeholder (§1.1), workbook still opens.
-- Chart `c:f` range can't be resolved (deleted sheet, bad ref) → fall back to cached values;
-  if none, placeholder.
-- Chart source range edited to empty / non-numeric → render what's valid, blank the rest, no
-  crash.
-- Merged/inserted/deleted rows or columns shifting a chart's ranges → live binding resolves
-  against current cell addresses (range adjustment is IronCalc's job; we read current values).
-- Very large series (10k+ points) → down-sample or cap for paint (perf), full data preserved
-  for save.
-- Multi-sheet save where IronCalc's output part order differs from input → explicit
-  sheet→part remap; **fail loudly** rather than silently drop a chart (PoC risk #8).
+### 5.B — Chrome editing (second extension stage)
+- Edit **title** text; **legend** on/off + position; **axis titles**; **series colors**;
+  **data-label** toggles (show value / percent / name).
 
-## 5. Success criteria
+### Edit contract (applies to editing a chart that was *loaded from a file*)
+- Editing a loaded chart switches it from byte-preservation to **written-from-our-model** on
+  save. Styling our model does not capture (gradients, theme effects, unmodeled fields) **may
+  be lost** on that first edit — an accepted, documented behavior (the `.back` backup gives a
+  recovery path). Untouched loaded charts remain byte-preserved.
 
-- The **line-chart checkpoint** (implementation_plan): a real `.xlsx` line chart opens,
-  renders in-grid at its anchor, updates live on edit, survives save/reopen in Excel +
-  LibreOffice, and meets the agreed perf targets — validated by a human review/tuning pass.
-- **v1 done:** all in-scope types reach the same bar; the fidelity P1 set is honored; a
-  real-file corpus loads without breakage; a perceptual-diff regression suite guards
-  rendering.
+## 6. Edge cases & error handling
 
-## 6. Out of scope (this project)
+- Unsupported / parse-failed chart → placeholder (§1); workbook still opens.
+- `c:f` range unresolvable (deleted sheet / bad ref) → fall back to cached values; if none →
+  placeholder.
+- Source range edited to empty / non-numeric → render what's valid, blank the rest, no crash.
+- Row/col insert-delete shifting a chart's ranges → live binding resolves against current cell
+  addresses (range adjustment is IronCalc's job; we read current values).
+- Very large series (10k+ points) → down-sample / cap for **paint** (perf); full data retained
+  for **save**.
+- Multi-sheet save where IronCalc's output part order differs from input → explicit sheet→part
+  remap; **fail loudly** rather than silently drop a chart (PoC risk #8).
+- (Authoring) insert with no/invalid selection → prompt / no-op, never a broken chart.
+- (Editing) editing a loaded chart → per the §5 edit contract; `.back` backup on first save.
 
-Chart authoring/editing UI; selection/move/resize (deferred to a named fast-follow phase,
-not v1); hover/tooltips; log & date axes; pattern fills; combo/stock/radar/surface/3D/ofPie/
-multi-ring-doughnut/`cx:` types; live collaboration; chart printing/export beyond `.xlsx`
-round-trip.
+## 7. Constraints
+
+- **Performance (north star):** lazy parse off the open critical path; off-screen charts cost
+  ~nothing; an edit recomputes only the intersecting charts, coalesced per frame; scroll stays
+  at frame budget with charts present. Explicit **p50/p99** targets (first-paint, edit
+  re-render, scroll frame time with K charts) set + measured **at the line-chart checkpoint**,
+  per the repo bench convention (foreground `timeout`, forced + asserted, env-stamped).
+- **Compatibility:** classic `c:` charts; pinned gpui/gpui-component/IronCalc (mirror
+  `app/Cargo.toml`); saved files valid in Excel + LibreOffice.
+- **Robustness:** a malformed/unexpected chart part never breaks workbook open or the grid —
+  degrade to placeholder + log. Tolerate real-world XML variety (odd namespaces, richer
+  styling) — a real-file corpus is required (PoC risks #10/#11).
+
+## 8. Success criteria
+
+- **Line-chart checkpoint** (implementation_plan): a real `.xlsx` line chart opens, renders
+  in-grid at its anchor, updates live on edit, survives save/reopen in Excel + LibreOffice,
+  and meets the agreed perf targets — validated by a human review/tuning pass.
+- **v1 core done:** all in-scope types at that bar; the P1 fidelity set honored; a real-file
+  corpus loads without breakage; a perceptual-diff regression suite guards rendering.
+- **Extensions done (each stage):** 5.A — insert/move/resize/delete/retype/re-range produce
+  valid charts that round-trip; 5.B — chrome edits apply and round-trip.
+
+## 9. Out of scope (this project)
+
+Log & date axes; pattern fills; **combo / stock / radar / surface / 3D / ofPie / multi-ring
+doughnut / `cx:` extended** chart types; hover/tooltips; rich Excel-parity chart editor
+(beyond 5.A+5.B); live collaboration; chart printing/export beyond `.xlsx` round-trip.

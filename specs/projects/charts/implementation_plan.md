@@ -4,6 +4,10 @@ status: draft
 
 # Implementation Plan: Charts (production)
 
+> ⚠️ **STRAWMAN — not yet reviewed.** Written ahead of process during a batch drift; parked
+> as raw input pending the step-gated `/spec new_project` review (the last step). Do **not**
+> treat as vetted or settled.
+
 Risk-ordered. The governing idea (your guidance): **de-risk the whole pipeline on ONE type —
 line — end to end, then stop for a human review/tuning checkpoint**, and only then grind out
 the remaining types. The scariest work is *app integration + live binding + save/reflow +

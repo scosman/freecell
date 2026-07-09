@@ -4,6 +4,10 @@ status: draft
 
 # Functional Spec: Charts (production)
 
+> ⚠️ **STRAWMAN — not yet reviewed.** Written ahead of process during a batch drift; parked
+> as raw input pending the step-gated `/spec new_project` review. Only `project_overview.md`
+> is under review right now — do **not** treat anything here as vetted or settled.
+
 Builds on the PoC (`../chart-proof-of-concept/`). This spec covers the *production*
 behaviors the PoC deliberately skipped (`SYNTHESIS.md §8`): in-app rendering, live binding,
 performance, production save/restore, and OOXML fidelity. Where the PoC already settled a

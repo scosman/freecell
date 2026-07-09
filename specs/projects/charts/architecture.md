@@ -4,6 +4,10 @@ status: draft
 
 # Architecture: Charts (production)
 
+> ⚠️ **STRAWMAN — not yet reviewed.** Written ahead of process during a batch drift; parked
+> as raw input pending the step-gated `/spec new_project` review (comes after the functional
+> spec). Do **not** treat as vetted or settled.
+
 How the PoC's three layers land in FreeCell's real crate structure, plus the net-new
 production machinery (app integration, live binding, perf, save-reflow). Exact engine
 worker/cache APIs are in the existing `mvp`/`mvp-gaps` architecture + the `engine_worker`

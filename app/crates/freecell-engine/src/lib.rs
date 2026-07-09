@@ -23,6 +23,7 @@
 //! engine re-read (the load-bearing contract).
 
 pub(crate) mod cache;
+pub mod chart;
 pub mod document;
 pub mod fixtures;
 pub mod instrument;

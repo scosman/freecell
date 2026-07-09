@@ -1,0 +1,15 @@
+[package]
+name = "freecell-chart-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The OOXML-shaped chart data model (charts/functional_spec §2): the stable seam between the engine file layer (parse into it) and the app render layer (render from it). gpui-free and ironcalc-free on purpose, so it builds and tests anywhere with no GPU/display."
+
+[lib]
+name = "freecell_chart_model"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -9,6 +9,13 @@ description = "IronCalc adapter, evaluation worker, style/geometry caches, and f
 
 [dependencies]
 freecell-core.workspace = true
+# Chart file layer (`chart` module, charts/architecture §2): parses the OOXML `c:` chart XML
+# into the gpui-free/ironcalc-free `freecell-chart-model` seam and re-injects chart parts on
+# save. `zip` (OPC package) + `roxmltree` (XML) do the second pass; `anyhow` carries its errors.
+freecell-chart-model.workspace = true
+zip.workspace = true
+roxmltree.workspace = true
+anyhow.workspace = true
 ironcalc_base.workspace = true
 # Phase 3 (Document I/O): `ironcalc` is the umbrella crate carrying the xlsx load/save API
 # (`import::load_from_xlsx`, `export::save_xlsx_to_writer`, `error::XlsxError`); `thiserror`
@@ -33,11 +40,9 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-[dev-dependencies]
-# Test-only: `worker::run` tests build an `.xlsx` on the fly (`merged_fixture`). The former
-# production use (the deleted `open_fixups`/`open_repair` import workarounds) is gone now that
-# the pinned IronCalc build handles theme/indexed/number-format import + optional `xfId` itself.
-zip = "0.6"
+# `worker::run` tests build an `.xlsx` on the fly (`merged_fixture`) with `zip`; it is now a
+# runtime dependency (the `chart` file layer needs it), so it resolves for tests too and needs
+# no separate dev-dependency entry.
 
 [features]
 # Exposes `DocumentClient::detached()` — a worker-less client for headless UI tests, so a

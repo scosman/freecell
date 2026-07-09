@@ -6,6 +6,7 @@
 //! dependency rule: `render-tests → freecell-app (grid)`). Nothing engine-specific lives
 //! here; the grid reads only `freecell-core` read models (`components/grid.md`).
 
+pub mod chart;
 pub mod chrome;
 pub mod grid;
 pub mod shell;

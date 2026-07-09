@@ -1,7 +1,7 @@
-<img width="128" height="128" alt="sourceMacOS-1024x1024@2x" src="https://github.com/user-attachments/assets/9a9f7d98-7155-47df-98d2-67daec184ee1" />
+<img width="96" height="96" alt="sourceMacOS-1024x1024@2x" src="https://github.com/user-attachments/assets/9a9f7d98-7155-47df-98d2-67daec184ee1" />
 
 # FreeCell
-The open spreadsheet app
+### The open spreadsheet app
 
 - Free and OSS
 - GPU accelerated rendering: your bar graphs at 240fps

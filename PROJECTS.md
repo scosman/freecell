@@ -82,11 +82,13 @@ registry: each entry is a short description plus a pointer to a design note unde
   → [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md)
 
 - **Pre-Distribution Security & License Audit** — *Future, MANDATORY before shipping any
-  binary.* Re-audit `cargo-deny`: resolve the GPL `ztracing` license exception (zed#55470)
-  and the quick-xml ≥0.41 DoS advisories (transitive via ironcalc's xlsx reader + zed's
-  wayland/atspi stack), tighten bans/sources. No safe upgrade exists at the pinned gpui/
-  ironcalc revs today; FreeCell ships no binaries yet, so the documented posture is
-  acceptable for now. → [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)
+  binary.* Re-audit `cargo-deny`: the GPL `ztracing`/`zlog`/`ztracing_macro` blocker
+  (zed#55470) is **resolved** — replaced by permissively-licensed no-op stubs via `[patch]`
+  (`app/vendor/`), so no GPL code is compiled or linked. Still open: the quick-xml ≥0.41 DoS
+  advisories (transitive via ironcalc's xlsx reader + zed's wayland/atspi stack), tighten
+  bans/sources. No safe upgrade for those exists at the pinned gpui/ironcalc revs today;
+  FreeCell ships no binaries yet, so the documented posture is acceptable for now.
+  → [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)
 
 - **Windows Port** — *Future (packaging wired 2026-07-05; app build not a real target).*
   Make FreeCell compile + run on Windows (GPUI DirectX backend, `cfg(windows)` dep split,

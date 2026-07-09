@@ -48,6 +48,10 @@ Known placeholders the build will resolve (append the resolution here):
   and pinned git forks; the load-bearing gate is licenses (the documented GPL `ztracing`
   exception, all three GPL-3.0 SPDX spellings, tracked vs zed#55470). P13 hardening may
   tighten bans/sources. (`app/deny.toml`)
+  - **[Resolved 2026-07-09] The GPL `ztracing` exception is gone** — `ztracing`/`zlog`/
+    `ztracing_macro` are replaced by permissively-licensed no-op stubs via `[patch]`
+    (`app/vendor/`); no GPL code is compiled/linked and `deny.toml` `exceptions` is now
+    empty. See `app/vendor/README.md` + `projects/pre-distribution-security-audit.md`.
 - [Phase 1] `perf-gates.yml` is DEFINED but a placeholder (builds the workspace, prints a
   TODO) — the perf harness + committed buffered thresholds are Phase 12. The Phase-1
   `checks.yml` render step runs the spike as `continue-on-error` (informational); Phase 7
@@ -1082,8 +1086,9 @@ tracked home (nothing silently lost); "MVP-scope" = intentional §8 omission.
 - Bundled Inter (§3.3) → `projects/bundled-inter-font.md`.
 - macOS Finder open-file `on_open_urls` (§2.1; Phase 10) → CLI argv wired; macOS Finder assoc is a
   documented gap.
-- GPL `ztracing` + quick-xml DoS + bans/sources leniency → `projects/pre-distribution-security-audit.md`
-  (MANDATORY pre-distribution).
+- GPL `ztracing` (**resolved 2026-07-09** — replaced by permissively-licensed no-op stubs via
+  `[patch]`, `app/vendor/`; no GPL compiled/linked) + quick-xml DoS + bans/sources leniency →
+  `projects/pre-distribution-security-audit.md` (MANDATORY pre-distribution).
 - Save fidelity silent-strip (§5.2) → intentional; warn-and-strip is `projects/xlsx-preservation.md`.
 
 **MVP-scope (intentional §8 omissions, already tracked)**

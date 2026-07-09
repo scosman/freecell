@@ -1,13 +1,15 @@
 # cargo-deny configuration for the FreeCell workspace (architecture.md §9).
 #
 # CI runs `cargo deny check` with `working-directory: app` (checks.yml, pinned
-# cargo-deny 0.19.9). The load-bearing item is
-# the license gate: the GPL zed tracing crates (ztracing / ztracing_macro / zlog, pulled
-# transitively via gpui/zed) are allowed by a DOCUMENTED, TEMPORARY exception tracked
-# against zed#55470 and MUST be resolved before any binary distribution. FreeCell ships
-# no binaries yet, so this is acceptable for now.
+# cargo-deny 0.19.9). The former load-bearing item — the GPL-3.0 zed tracing crates
+# (ztracing / ztracing_macro / zlog, pulled transitively via gpui/zed, tracked as zed#55470)
+# — is now RESOLVED: they are replaced at build time by permissively-licensed no-op stubs
+# (`[patch]` in Cargo.toml -> vendor/ztracing{,_macro}), so no GPL code is compiled, linked,
+# or present in Cargo.lock. There is therefore NO license exception here; if a gpui rev bump
+# ever reintroduces a GPL crate, this gate fails loudly rather than silently allowing it.
+# See vendor/README.md + projects/pre-distribution-security-audit.md.
 #
-# Every `ignore`/`exception` below is a TRANSITIVE dep of gpui/zed at the pinned rev with
+# Every remaining `ignore` below is a TRANSITIVE dep of gpui/zed at the pinned rev with
 # NO safe upgrade available (we do not control zed's lockfile). They are documented, not
 # silently skipped ("cargo-deny clean-or-documented", P13) — see DECISIONS_TO_REVIEW.md.
 # Re-audit this whole block on every gpui rev bump and before any binary distribution.
@@ -64,16 +66,13 @@ allow = [
 ]
 
 # ---------------------------------------------------------------------------------
-# Per-crate license exceptions. The zed GPL tracing family is the exception architecture
-# §9 mandates be documented (tracked vs zed#55470). The crates that actually declare
-# `GPL-3.0-or-later` are `zlog` and `ztracing_macro` (and `ztracing` itself); all three
-# GPL-3.0 SPDX spellings are listed so the exception matches whatever each declares.
+# No per-crate license exceptions. The zed GPL tracing family (ztracing / ztracing_macro /
+# zlog) that architecture §9 required be documented here is no longer in the graph — it is
+# replaced by the permissively-licensed vendor/ stubs (see the header note + vendor/README.md).
+# Keep this empty: a GPL crate reappearing after a gpui bump should FAIL the gate, not be
+# waved through.
 # ---------------------------------------------------------------------------------
-exceptions = [
-    { name = "ztracing", allow = ["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"] },
-    { name = "ztracing_macro", allow = ["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"] },
-    { name = "zlog", allow = ["GPL-3.0", "GPL-3.0-only", "GPL-3.0-or-later"] },
-]
+exceptions = []
 
 [bans]
 # gpui/zed's dependency tree carries many duplicate crate versions; deduping them is not

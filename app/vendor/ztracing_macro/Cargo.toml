@@ -1,0 +1,12 @@
+# Permissively-licensed no-op stub that replaces zed's GPL-3.0-or-later `ztracing_macro`
+# crate at build time via `[patch]` in `app/Cargo.toml`. See `app/vendor/README.md`.
+[package]
+name = "ztracing_macro"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "No-op stub for zed's ztracing_macro (permissively licensed; see app/vendor/README.md)"
+publish = false
+
+[lib]
+proc-macro = true

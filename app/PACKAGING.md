@@ -119,8 +119,9 @@ future work. See
 [`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md),
 and note the **mandatory**
 [`projects/pre-distribution-security-audit.md`](../projects/pre-distribution-security-audit.md)
-(license/advisory re-audit — the GPL `ztracing` transitive dep is a distribution blocker)
-must be resolved before shipping any binary.
+(license/advisory re-audit) must be resolved before shipping any binary. The GPL `ztracing`
+distribution blocker is already handled — replaced by permissively-licensed no-op stubs via
+`[patch]` (`app/vendor/`), so no GPL code is compiled or linked.
 
 ## Verification status
 

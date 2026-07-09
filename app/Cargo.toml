@@ -6,6 +6,13 @@ members = [
     "crates/freecell-app",
     "render-tests",
 ]
+# `vendor/*` holds the permissively-licensed no-op stubs that replace zed's GPL-3.0 tracing
+# shims via `[patch]` below. They are build-time substitutes, not app crates, so they are
+# excluded from the workspace (own license/edition, not workspace-linted). See vendor/README.md.
+exclude = [
+    "vendor/ztracing",
+    "vendor/ztracing_macro",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -94,3 +101,16 @@ opt-level = 3
 [patch.crates-io]
 ironcalc = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
 ironcalc_base = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
+
+# ---------------------------------------------------------------------------------
+# GPL ship blocker (zed#55470). gpui pulls `sum_tree` -> `ztracing` -> `zlog` +
+# `ztracing_macro`, all GPL-3.0-or-later. FreeCell never sets `ZTRACING`, so these compile to
+# no-op shims and `sum_tree` uses only the pass-through `#[instrument]` — the GPL code is
+# unused. Substitute our own permissively-licensed no-op stubs so the GPL crates are neither
+# compiled nor linked (replaces the former license exception in deny.toml). The `ztracing`
+# stub drops the `zlog` dependency, so `zlog` (whose only dependent was `ztracing`) leaves the
+# graph too. See vendor/README.md + projects/pre-distribution-security-audit.md.
+# ---------------------------------------------------------------------------------
+[patch."https://github.com/zed-industries/zed"]
+ztracing = { path = "vendor/ztracing" }
+ztracing_macro = { path = "vendor/ztracing_macro" }

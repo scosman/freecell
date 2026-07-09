@@ -15,13 +15,20 @@
 //!   **source** XML, the live-binding **source ranges**, the in-grid **anchor**, and the
 //!   chart's **origin**.
 //!
+//! On top of those sits the **derived** [`Fidelity`] accessor
+//! ([`ChartSpec::display_fidelity`], P3): how faithfully the renderer can draw a chart
+//! (`Faithful` / `Degraded` / `Unsupported`), computed on demand from the model + retained
+//! source rather than stored, so it auto-clears as renderer support lands.
+//!
 //! The model is **OOXML-shaped but bounded, not exhaustive** (architecture §3.1): it carries
 //! typed fields for what we render/edit; the rendered P1/P2 fidelity fields are added
 //! additively with their phases (P6/P12/P13), and the unbounded DrawingML long tail is
 //! preserved via [`ChartSpec`]'s retained source rather than modeled.
 
+mod fidelity;
 mod spec;
 
+pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
 pub use spec::{Anchor, AnchorCell, CfRange, ChartSpec, Origin, SourcePart, SourceXml};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.

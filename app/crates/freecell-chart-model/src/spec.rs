@@ -8,7 +8,7 @@
 //! crate — so the same value the engine *produces* on load is the value the app *consumes*
 //! to place and render a chart, with neither layer reaching across the seam.
 
-use crate::Chart;
+use crate::{source_fidelity, Chart, Fidelity};
 
 /// One corner of an `xdr:twoCellAnchor` (its `<xdr:from>` / `<xdr:to>`): a 0-based sheet cell
 /// plus an intra-cell offset in **EMUs** (English Metric Units, 914 400 per inch) from that
@@ -219,6 +219,24 @@ impl ChartSpec {
     pub fn is_authored(&self) -> bool {
         matches!(self.origin, Origin::Authored)
     }
+
+    /// The chart's [`Fidelity`] — how faithfully the renderer can draw it (charts/
+    /// functional_spec §5, architecture §3.3).
+    ///
+    /// This is a **derived accessor, not stored state**: there is no parse-time flag to keep in
+    /// sync. It is computed on demand — for a [loaded](Origin::Loaded) chart, by classifying its
+    /// retained [`SourceXml`] (see [`source_fidelity`] for the buckets and the curated
+    /// render-affecting set); an [authored](Origin::Authored) chart has no source and is
+    /// [`Fidelity::Faithful`] by construction (it is built from our own model using only
+    /// features we render). Because it reads the source live, it **auto-clears as renderer
+    /// support lands** — a feature that starts rendering drops out of the degrading set with no
+    /// separate bookkeeping.
+    pub fn display_fidelity(&self) -> Fidelity {
+        match &self.origin {
+            Origin::Loaded { source } => source_fidelity(&source.chart_xml),
+            Origin::Authored => Fidelity::Faithful,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +361,41 @@ mod tests {
         let mut moved = spec.clone();
         moved.anchor.to.row = 20;
         assert_ne!(moved, spec, "a different anchor makes specs unequal");
+    }
+
+    #[test]
+    fn loaded_spec_display_fidelity_reads_source() {
+        let anchor = Anchor::new(AnchorCell::new(0, 0), AnchorCell::new(6, 12));
+        let spec = |chart_xml: &str| {
+            ChartSpec::loaded(
+                sample_chart(),
+                SourceXml::new(chart_xml),
+                Vec::new(),
+                anchor,
+            )
+        };
+
+        // A plain supported group renders as authored.
+        assert_eq!(
+            spec("<c:lineChart/>").display_fidelity(),
+            Fidelity::Faithful
+        );
+        // A 3-D group is degraded to its 2-D equivalent.
+        assert_eq!(
+            spec("<c:bar3DChart/>").display_fidelity(),
+            Fidelity::Degraded
+        );
+        // A type with no 2-D equivalent falls back to the placeholder.
+        assert_eq!(
+            spec("<c:surfaceChart/>").display_fidelity(),
+            Fidelity::Unsupported
+        );
+    }
+
+    #[test]
+    fn authored_spec_is_faithful() {
+        let anchor = Anchor::new(AnchorCell::new(2, 2), AnchorCell::new(8, 14));
+        let spec = ChartSpec::authored(sample_chart(), anchor);
+        assert_eq!(spec.display_fidelity(), Fidelity::Faithful);
     }
 }

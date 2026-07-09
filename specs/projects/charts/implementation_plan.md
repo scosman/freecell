@@ -24,7 +24,7 @@ those docs — this is the ordered checklist.
 - [x] **P2 — Chart data model.** Widen `chart-model` to the OOXML-bounded typed shape; add
   `ChartSpec` (retained `source`, `ranges`, `anchor`, `origin`). *Exit:* model + `ChartSpec`
   with unit tests; nothing renders differently yet.
-- [ ] **P3 — Derived fidelity accessor.** `display_fidelity()` (Faithful/Degraded/Unsupported)
+- [x] **P3 — Derived fidelity accessor.** `display_fidelity()` (Faithful/Degraded/Unsupported)
   over model+source; 3D→2D normalization; curated "render-affecting unsupported" set.
   *Exit:* pure-logic unit tests (3D⇒Degraded, surface/radar⇒Unsupported).
 - [ ] **P4 — Render-test harness.** Lift the capture harness into `render-tests` (headless

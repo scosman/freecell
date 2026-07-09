@@ -12,12 +12,21 @@ allowed/ignored **with documented rationale**. We do not control those lockfiles
 is no safe upgrade at the pinned revs. Every item below **must be re-audited on any gpui/
 ironcalc rev bump and resolved before distribution.**
 
-## Current posture (re-audited Phase 13 — unchanged; still no safe upgrade at the pinned revs)
+## Current posture (re-audited Phase 13 — unchanged except the GPL blocker, now resolved)
 
-**License exception (architecture §9, tracked vs zed#55470):**
+**License — GPL blocker RESOLVED (was architecture §9, tracked vs zed#55470):**
 - GPL-3.0 zed tracing crates `ztracing` / `ztracing_macro` / `zlog` (transitive via
-  gpui/zed). Allowed via per-crate `exceptions` in `deny.toml`. **GPL in a distributed
-  binary is the load-bearing risk** — must be removed or replaced before shipping.
+  gpui/zed → `sum_tree`). **No longer in the dependency graph.** They are functionally
+  unused in FreeCell — `ztracing` only does real work when the `ZTRACING` env var is set (a
+  Tracy build we never make), and `sum_tree` uses only its pass-through `#[instrument]`. So
+  they are replaced at build time by permissively-licensed (MIT OR Apache-2.0) no-op stubs
+  we own (`app/vendor/ztracing{,_macro}`), wired via `[patch."https://github.com/zed-industries/zed"]`
+  in `app/Cargo.toml`. The `ztracing` stub drops the `zlog` dependency, so GPL `zlog` (whose
+  only dependent was `ztracing`) leaves the graph too. Result: **no GPL-3.0 code is compiled,
+  linked, or present in `Cargo.lock`.** The former `deny.toml` `exceptions` are removed; a
+  GPL crate reappearing after a gpui bump now FAILS the license gate instead of being waved
+  through. Verify: `cd app && cargo tree -i ztracing` shows the local stub (and
+  `cargo tree -i zlog` → "did not match any packages"). See `app/vendor/README.md`.
 - `bzip2-1.0.6` license (permissive, BSD-like; via `async_zip` → zed util) added to
   `allow`.
 
@@ -52,7 +61,11 @@ forks; tightening (`allow-git` enumeration, dedupe) is pre-distribution hardenin
 ## Work when picked up (before shipping any binary)
 
 1. Re-run `cargo deny check` on the then-current gpui/ironcalc revs.
-2. Resolve or replace the **GPL ztracing** dependency (the distribution blocker).
+2. ~~Resolve or replace the **GPL ztracing** dependency (the distribution blocker).~~ **Done**
+   — replaced by permissively-licensed no-op stubs via `[patch]` (`app/vendor/`); see Current
+   posture. On any gpui bump, re-confirm the stubs still match (`cargo tree -i ztracing`,
+   `cargo tree -i zlog`) and that `ztracing`'s public API hasn't grown a surface `sum_tree`
+   now uses.
 3. Bump to a **zed/wayland/zbus** rev carrying **quick-xml ≥ 0.41** (clears both DoS
    advisories — quick-xml is on the desktop-protocol/build path, not the xlsx path).
 4. Re-evaluate each remaining ignored advisory for an available upgrade.

@@ -1,0 +1,15 @@
+# Permissively-licensed no-op stub that replaces zed's GPL-3.0-or-later `ztracing` crate at
+# build time via `[patch]` in `app/Cargo.toml`. Dropping the real crate's `zlog` dependency
+# here is what makes GPL `zlog` fall out of the graph entirely. See `app/vendor/README.md`.
+[package]
+name = "ztracing"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "No-op stub for zed's ztracing (permissively licensed; see app/vendor/README.md)"
+publish = false
+
+[dependencies]
+# `tracing` (MIT) only for the `Level` / `field` re-exports, matching upstream's public API.
+tracing = "0.1"
+ztracing_macro = { path = "../ztracing_macro" }

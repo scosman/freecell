@@ -337,9 +337,10 @@ slow and occasionally flaky and not worth spending on every push. `checks`, `ren
    workspace build** (`cargo build --workspace` — freecell-app compiles **and links** on
    Linux); `cargo test --workspace` (core + engine + app logic + render-tests' GPUI-free
    unit tests — the pixel cases self-skip without `FREECELL_RENDER`, so the crate stays
-   compiled + covered); `cargo-deny check` (licenses/advisories — with a documented
-   temporary exception for the GPL `ztracing` transitive dep, tracked against zed #55470;
-   must be resolved before any binary distribution). Disk/speed: **no free-disk prune
+   compiled + covered); `cargo-deny check` (licenses/advisories — the GPL `ztracing`
+   transitive dep (zed #55470) is now replaced by permissively-licensed no-op stubs via
+   `[patch]` (`app/vendor/`), so no GPL code is compiled/linked and no license exception is
+   needed; see `projects/pre-distribution-security-audit.md`). Disk/speed: **no free-disk prune
    needed here** — `CARGO_INCREMENTAL=0` + `CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only`
    keep the build+test `target/` peak ~6.3 GB (well under the ~14 GB free on `ubuntu-24.04`),
    and `Swatinem/rust-cache` (`cache-on-failure: true`) makes a warm run ~3 min.

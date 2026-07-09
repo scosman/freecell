@@ -1,49 +1,45 @@
+<img width="128" height="128" alt="sourceMacOS-1024x1024@2x" src="https://github.com/user-attachments/assets/9a9f7d98-7155-47df-98d2-67daec184ee1" />
+
 # FreeCell
+The open spreadsheet app
 
-A GPU-rendered (GPUI, à la Zed/Ghostty), Rust, **Excel-compatible spreadsheet** built to
-be **stupid-fast on huge sheets** (Excel-max = 1,048,576 rows × 16,384 cols). Engine =
-[IronCalc](https://github.com/ironcalc/ironcalc); UI = [GPUI](https://github.com/zed-industries/zed)
-(a custom raw-GPUI virtualized grid + [gpui-component](https://github.com/longbridge/gpui-component)
-for chrome).
+- Free and OSS
+- GPU accelerated rendering: your bar graphs at 240fps
+- Insanely fast and light: Rust-based, 8MB total size, launches in 0.060s
+- 90% Excel formula compatibility and growing
+- Built with the excellent IronCalc and GPUI libraries.
 
-The **MVP app lives in [`app/`](app/)** — a self-contained Cargo workspace that opens /
-edits / saves real `.xlsx` files, stays smooth on a million-row sheet, applies basic
-formatting, and manages multiple sheets. It is a **workable functional proof of concept**,
-not a design-polished or feature-complete product (see `specs/projects/mvp/functional_spec.md`).
+[![Download for macOS](https://img.shields.io/badge/Download_for_macOS-1d1d1f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/scosman/FreeCell/releases) [![Download for macOS](https://img.shields.io/badge/Download_for_Windows-1d1d1f?style=for-the-badge&logo=pcgamingwiki&logoColor=white)](https://github.com/scosman/FreeCell/releases) [![Download for macOS](https://img.shields.io/badge/Download_for_Linux-1d1d1f?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/scosman/FreeCell/releases)
 
-**Platforms:** macOS (primary, Metal) + Linux (blade/Vulkan). Windows is out of scope.
+### Features
 
-## Repository layout
+It’s a spreadsheet. It has the most of the features you’d come to expect including:
 
-| Path | What |
-|---|---|
-| [`app/`](app/) | **The FreeCell application** — Cargo workspace (`freecell-core` / `freecell-engine` / `freecell-app` + `render-tests`). See [`app/README.md`](app/README.md) for build/run/test. |
-| [`specs/projects/mvp/`](specs/projects/mvp/) | The spec-driven build artifacts for the MVP: overview → functional spec → architecture → UI design → components → implementation plan → phase plans, plus the Phase-13 **coverage matrix** + **smoke checklist** and the `DECISIONS_TO_REVIEW.md` log. Managed via the `spec` skill. |
-| [`experiments/`](experiments/) | De-risking experiments (Phase-1 `00`–`06` + `round-2/` + `round-3/`), each an independent Cargo project with `findings.md` + committed `results/`. Frozen; the app **ports** (never path-depends on) POC code. |
-| [`GAPS.md`](GAPS.md) | **Running log of known gaps, deferred behaviors & limitations** — the durable place we append gaps so none are lost (e.g. the MVP's deferred type-aware alignment, macOS Finder-open, input-cap message text). |
-| [`PROJECTS.md`](PROJECTS.md) + [`projects/`](projects/) | The "save for later" backlog — optimizations/features/goals off the MVP critical path (e.g. `.xlsx` preservation, bundled Inter, type-aware alignment, pre-distribution security audit). Distinct from `specs/projects/`. |
-| [`CLAUDE.md`](CLAUDE.md) | Project conventions (benchmark discipline, commit cadence, the projects backlog rule). |
-| [`.github/workflows/`](.github/workflows/) | CI: `checks.yml` (Linux, required), `perf-gates.yml` (Linux, required), `macos-verify.yml` (manual/weekly), `release.yml` (tag `v*` / dispatch — `cargo-packager` bundles, uploaded as run artifacts; see [`app/PACKAGING.md`](app/PACKAGING.md)). |
+- 90% compatibility with Excel formulas, and growing thanks to the IronCalc team
+- 100% local software: no cloud, no analytics
+- XLSX file support: compatible with Excel files using the OOXML open format
+- Formatting: all the text formatting, borders, fills and sizing you’re used to
+- Cross platform: works in Mac, Windows and Linux
+- Native: compiled, not web app or rendering.
+- Speed: it’s ridiculously fast. Sheets that take 30s to open in Apple Numbers open in <1s in FreeCell.
 
-## Quick start
+What’s not included (yet):
+- Charts
+- Pivot tables
+- Merged cells
+- Dynamic arrays - functions like UNIQUE/FILTER/SORT
+- Clippy
 
-```sh
-cd app
-cargo build --workspace          # builds freecell-app on Linux + macOS
-cargo run -p freecell-app        # launches FreeCell (Welcome window)
-cargo run -p freecell-app -- path/to/Book.xlsx   # opens a workbook directly (CLI argv)
-cargo test --workspace           # core + engine + app logic tests
-```
+### FAQ
 
-Full build prerequisites, the render-test + perf harness usage, and the human baseline
-process are in [`app/README.md`](app/README.md) and
-[`app/render-tests/README.md`](app/render-tests/README.md). The system-level design is in
-[`specs/projects/mvp/architecture.md`](specs/projects/mvp/architecture.md).
+**Why?** Honestly, to see if I could. 
 
-## Status
+I’ve been building more and more software with agentic engineering. This project came out of the question: can I recreate an app that hundreds of people have been working on for decades, with decent quality, in a short amount of time.
 
-The MVP is built across Phases 1–13 (each a committed, tested phase — see
-`specs/projects/mvp/implementation_plan.md`). Phase 13 is the hardening & completion sweep:
-a coverage matrix proving every spec behavior is tested or documented-manual, an eyeballed
-render-baseline suite, a recorded smoke checklist, and a finalized decisions log. The
-`checks` + `perf-gates` CI jobs are the required-green gates.
+**How is it built** FreeCell is built in Rust. It’s an agentic engineering project (vibe coding but with tests), using the [vibe crafting skill](https://github.com/scosman/vibe-crafting).
+
+**What engine does it use** Its core spreadsheet engine is [IronCalc](https://www.ironcalc.com). It’s a Rust-based, Excel compatible spreadsheet framework.
+
+**What rendering system does it uses** It uses the [GPUI](https://gpui.rs) library, the same library behind the Zed editor. Plus [GPUI-component](https://github.com/longbridge/gpui-component).
+
+**Why GPU rendering?** I enjoy the speed of apps like [Zed](https://zed.dev) and [Ghostty](https://ghostty.org). A spreadsheet is largely custom UI components with minimal reuse of system controls, so it’s a good fit for GPU rendering. The result: it’s buttery smooth even on the largest sheets and works on all major platforms. 

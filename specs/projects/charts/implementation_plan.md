@@ -21,7 +21,7 @@ those docs — this is the ordered checklist.
 - [x] **P1 — Crate scaffolding & placement.** Move PoC crates into homes by charter
   (`chart-model`→core/dedicated crate; file layer→`freecell-engine`; render→`freecell-app`).
   *Exit:* workspace compiles; PoC unit tests pass; zero behavior change for non-chart files.
-- [ ] **P2 — Chart data model.** Widen `chart-model` to the OOXML-bounded typed shape; add
+- [x] **P2 — Chart data model.** Widen `chart-model` to the OOXML-bounded typed shape; add
   `ChartSpec` (retained `source`, `ranges`, `anchor`, `origin`). *Exit:* model + `ChartSpec`
   with unit tests; nothing renders differently yet.
 - [ ] **P3 — Derived fidelity accessor.** `display_fidelity()` (Faithful/Degraded/Unsupported)

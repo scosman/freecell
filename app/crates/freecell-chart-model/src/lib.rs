@@ -4,12 +4,25 @@
 //! It is the **stable seam** between the two chart layers: `freecell-engine::chart`
 //! parses chart XML *into* this model, and `freecell-app::chart` renders *from* it. It is
 //! deliberately **gpui-free and ironcalc-free** so it builds and tests anywhere with no
-//! GPU/display, and neither layer can reach across it. Lifted from the chart PoC
-//! (`experiments/chart-poc/chart-model`); later phases widen it additively (P2/P3).
+//! GPU/display, and neither layer can reach across it.
 //!
-//! Values come from the chart XML's **cached** `<c:numCache>` / `<c:strCache>`, so no
-//! formula evaluation is needed to render — the model only ever holds concrete numbers
-//! and strings.
+//! Two layers of shape live here:
+//! - [`Chart`] — the **render seam**: the static chart picture (kind, series, axes, legend),
+//!   lifted from the chart PoC. Values come from the chart XML's **cached**
+//!   `<c:numCache>` / `<c:strCache>`, so no formula evaluation is needed to render — the model
+//!   only ever holds concrete numbers and strings.
+//! - [`ChartSpec`] — the **production envelope** (P2): a [`Chart`] wrapped with the retained
+//!   **source** XML, the live-binding **source ranges**, the in-grid **anchor**, and the
+//!   chart's **origin**.
+//!
+//! The model is **OOXML-shaped but bounded, not exhaustive** (architecture §3.1): it carries
+//! typed fields for what we render/edit; the rendered P1/P2 fidelity fields are added
+//! additively with their phases (P6/P12/P13), and the unbounded DrawingML long tail is
+//! preserved via [`ChartSpec`]'s retained source rather than modeled.
+
+mod spec;
+
+pub use spec::{Anchor, AnchorCell, CfRange, ChartSpec, Origin, SourcePart, SourceXml};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
 ///

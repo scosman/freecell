@@ -5,10 +5,10 @@ status: draft
 # Implementation Plan: Charts (production)
 
 Rebuilt into **small, CR-sized phases** — each one coherent goal, one clean commit,
-reviewable in a sitting. Risk-ordered: **line chart proven end-to-end (component → app →
-live → save) before any other type**, with a **blocking human review/tuning checkpoint**
-after it. v1 ships after the fidelity/robustness phases; authoring + editing follow as their
-own phases (v1 can ship first).
+reviewable in a sitting. Risk-ordered: **line chart proven *and hardened to production
+quality* before any other type**, with a **blocking human review/tuning checkpoint** after the
+line slice. Each new type then slots onto the hardened pipeline; v1 ships once all types pass a
+final cross-type gate. Authoring + editing follow as their own phases (v1 can ship first).
 
 Refs: `functional_spec.md`, `ui_design.md`, `architecture.md`. Reusable PoC assets:
 `SYNTHESIS.md §5`; fidelity targets: `ooxml-coverage-matrix.md`. Each phase's detail lives in
@@ -48,12 +48,11 @@ those docs — this is the ordered checklist.
 
 ## App integration — line chart end-to-end
 
-- [ ] **P8 — Render line chart in the spreadsheet.** `ChartLayer` over cells: anchor→pixel via
-  grid geometry, clip to viewport, scroll/zoom with the sheet, cull off-screen; corner badge on
-  `Degraded`, placeholder on `Unsupported`. Cache values (static). *Exit:* opening a real file
-  shows its line chart in place, correctly positioned.
-- [ ] **P9 — Live binding.** Parse `c:f`; range→chart index; on recompute, re-resolve the dirty
-  charts and publish via the worker seam. *Exit:* editing a source cell re-renders the line
+- [ ] **P8 — Render line chart in the spreadsheet.** `ChartLayer` over cells: anchor→pixel,
+  clip, scroll/zoom, cull; corner badge on `Degraded`, placeholder on `Unsupported`. Cache
+  values (static). *Exit:* opening a real file shows its line chart in place.
+- [ ] **P9 — Live binding.** Parse `c:f`; range→chart index; re-resolve dirty charts on
+  recompute and publish via the worker seam. *Exit:* editing a source cell re-renders the line
   chart; only intersecting charts recompute.
 - [ ] **P10 — Save / restore (source-first).** Byte-preserve unedited; **patch retained source**
   on reflow; multi-sheet part map; fail loudly on missing part. *Exit:* open→edit→save→reopen
@@ -65,57 +64,69 @@ those docs — this is the ordered checklist.
 ## 🚦 CHECKPOINT — human review & tuning  *(BLOCKING)*
 Human review of the whole line slice on real files (render vs Excel, in-grid behavior,
 live feel, badge/placeholder, save/restore in both apps, perf); budgeted **tuning** pass;
-GO/loop/re-plan decision. **No type phase starts until this passes.**
+GO/loop/re-plan decision. **No hardening or type phase starts until this passes.**
 
-## New graph types — one phase each (render + type fidelity + render-tests; reuse anchor/bind/save)
+## Harden the line chart to production quality  *(before any other type)*
+Build the cross-cutting fidelity + robustness + CI machinery **proven on line first**; each is
+reusable infra the types then inherit. (Type-specific fills/labels land with each type.)
 
-- [ ] **P12 — Column & bar.** Both orientations; clustered/stacked/100%; `gapWidth`/`overlap`;
-  **Excel horizontal-bar category order**. *Exit:* renders/binds/saves in-grid; baselines.
-- [ ] **P13 — Area.** Standard/stacked/100% (hand-rolled polygon fork). *Exit:* same bar.
-- [ ] **P14 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;
-  rotation/explosion; on-slice % labels. *Exit:* same bar.
-- [ ] **P15 — Scatter.** Two numeric axes + dots; `scatterStyle`. *Exit:* same bar.
-- [ ] **P16 — Bubble.** Scatter + `bubbleSize`→radius (√-area + clamp). *Exit:* same bar.
+- [ ] **P12 — Data labels & number formats.** `c:dLbls` (val/percent/cat/legendKey) + `numFmt`,
+  exercised on line. *Exit:* baselines; the accessor's unsupported set shrinks accordingly.
+- [ ] **P13 — Axis breadth & line styling.** `scaling` min/max, reversed, gridline toggles;
+  `a:ln` stroke width/color; alpha; legend positions. *Exit:* baselines.
+- [ ] **P14 — Robustness on real files (line + graceful degrade).** A real Excel/LibreOffice
+  corpus loads without breakage; line charts render; every *other* type degrades to
+  placeholder/warning cleanly; edge cases (unresolved `c:f`, empty ranges, row/col shifts).
+  *Exit:* corpus green; workbook open never breaks.
+- [ ] **P15 — Regression + external round-trip CI + line perf hardening.** Perceptual-diff suite
+  + save→reopen (Excel + LibreOffice) wired into CI for line; many-line-charts/large-series
+  perf. *Exit:* **a production-robust line chart** — the pipeline (render→fidelity→robust→CI) is
+  proven end-to-end on one type.
 
-## Fidelity & robustness → v1 ships
+## New graph types — one phase each  *(each slots onto the hardened pipeline)*
+Each: renderer + type fidelity + reuse anchor/bind/save + its own regression baselines +
+round-trip. Ordered by prevalence/ROI.
 
-- [ ] **P17 — Data labels & number formats.** Cross-cutting `c:dLbls`
-  (val/percent/cat/legendKey) + `numFmt`, shared by all types. *Exit:* baselines per type.
-- [ ] **P18 — Axis & fill breadth.** `scaling` min/max, reversed, gridline toggles; gradient
-  fills, `a:ln` stroke, alpha; legend positions. *Exit:* baselines; unsupported set curated so
-  handled features drop their warning.
-- [ ] **P19 — Robustness on real files.** Real Excel/LibreOffice corpus loads without breakage;
-  correct Degraded/Unsupported; edge cases (unresolved `c:f`, empty ranges, row/col shifts).
-  *Exit:* corpus green; open never breaks.
-- [ ] **P20 — Regression + external round-trip CI + perf hardening.** Perceptual-diff suite
-  green across all types (+ badge/placeholder); save→reopen in Excel + LibreOffice in CI;
-  many-charts/large-series perf. *Exit:* **v1 SHIPPABLE** (display + preserve).
+- [ ] **P16 — Column & bar.** Both orientations; clustered/stacked/100%; `gapWidth`/`overlap`;
+  **Excel horizontal-bar category order**; per-type fills.
+- [ ] **P17 — Area.** Standard/stacked/100% (hand-rolled polygon fork); fills.
+- [ ] **P18 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;
+  rotation/explosion; on-slice % labels.
+- [ ] **P19 — Scatter.** Two numeric axes + dots; `scatterStyle`.
+- [ ] **P20 — Bubble.** Scatter + `bubbleSize`→radius (√-area + clamp).
+
+## v1 ship gate
+
+- [ ] **P21 — Cross-type sweep → v1 ships.** Full perceptual-diff + external round-trip suites
+  green across **all** types (+ badge/placeholder); mixed-type / many-charts / huge-sheet perf
+  re-measured. *Exit:* **v1 SHIPPABLE** (display + live + preserve, all in-scope types).
 
 ## Authoring — Stage A  *(end-phase; v1 can ship first)*
 
-- [ ] **P21 — Write path (component design + impl).** Design doc for the write path + edit
+- [ ] **P22 — Write path (component design + impl).** Design doc for the write path + edit
   panel, then **write-from-model** (authored) + **source-patch** (edited). *Exit:* a
   model-built chart serializes to a valid `.xlsx` reopenable in Excel + LibreOffice; round-trip
   tests.
-- [ ] **P22 — Insert flow.** Action-bar chart-icon menu (type glyphs) → insert a near-empty
+- [ ] **P23 — Insert flow.** Action-bar chart-icon menu (type glyphs) → insert a near-empty
   chart of that type → it appears in the grid. *Exit:* insert a line chart via the UI; it
   renders + saves.
-- [ ] **P23 — Manipulate.** Select (outline + handles), move, resize, delete on the ChartLayer.
+- [ ] **P24 — Manipulate.** Select (outline + handles), move, resize, delete on the ChartLayer.
   *Exit:* manipulation persists to the anchor and round-trips.
-- [ ] **P24 — Edit panel + range/type.** Right-docked panel skeleton; set data **range** and
+- [ ] **P25 — Edit panel + range/type.** Right-docked panel skeleton; set data **range** and
   chart **type**. *Exit:* a near-empty inserted chart can be shaped into a real one.
 
 ## Editing — Stage B  *(end-phase)*
 
-- [ ] **P25 — Chrome editing.** Title, legend on/off + position, axis titles, series colors,
-  data-label toggles via the panel. *Exit:* chrome edits apply live + round-trip; edit contract
-  (patch preserves unmodeled styling) holds.
+- [ ] **P26 — Chrome editing.** Title, legend on/off + position, axis titles, series colors,
+  data-label toggles via the panel. *Exit:* chrome edits apply live + round-trip; the edit
+  contract (patch preserves unmodeled styling) holds.
 
 ---
 
 ### Why this order
-Line chart goes **component → engine load → in-grid → live → save → perf → checkpoint**
-before any other type, so the one-time integration risks (anchor mapping, live binding,
-source-first save, perf) are paid once and *reviewed* before replication. After the
-checkpoint, each type is a small, independent CR on the proven pipeline. The one genuinely new
-subsystem — the write path — is isolated to P21, gating authoring/editing only.
+Line chart goes **component → engine load → in-grid → live → save → perf → checkpoint → full
+hardening (fidelity + robustness + CI)** before any other type — so the *entire* production
+pipeline, not just rendering, is proven and reviewed on one type. Each new type (P16–20) is
+then a small CR that inherits that hardened machinery, and P21 confirms the suite across all of
+them. The one genuinely new subsystem — the write path — is isolated to P22, gating only
+authoring/editing.

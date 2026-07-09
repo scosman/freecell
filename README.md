@@ -48,3 +48,17 @@ I’ve been building more and more software with agentic engineering. This proje
 **What rendering system does it use** It uses the [GPUI](https://gpui.rs) library, the same library behind the Zed editor. Plus [GPUI-component](https://github.com/longbridge/gpui-component).
 
 **Why GPU rendering?** I enjoy the speed of apps like [Zed](https://zed.dev) and [Ghostty](https://ghostty.org). A spreadsheet is largely custom UI components with minimal reuse of system controls, so it’s a good fit for GPU rendering. The result: it’s buttery smooth even on the largest sheets and works on all major platforms. 
+
+### Running from Source
+
+```sh
+cd App
+cargo run -p freecell-app
+```
+
+### Building from Source
+
+```sh
+cd App
+./scripts/package.sh
+```

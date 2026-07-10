@@ -26,6 +26,7 @@ use ironcalc_base::locale::get_locale;
 use ironcalc_base::types::{CellType, Font, Style, Worksheet};
 use ironcalc_base::Model;
 
+use crate::chart::binding::CellData; // engine-free resolved value the live-binding read produces
 use crate::UserModel; // the crate's single canonical path to the IronCalc workbook type
 use ironcalc_base::BorderArea;
 use ironcalc_base::ClipboardData;
@@ -346,6 +347,26 @@ impl WorkbookDocument {
         self.model
             .get_cell_content(sheet, row, col)
             .map_err(CellQueryError)
+    }
+
+    /// The **evaluated** value of a cell as an engine-free [`CellData`] — the read chart live
+    /// binding resolves its `c:f` source ranges through (charts/architecture §4.1). Unlike
+    /// [`formatted_value`](Self::formatted_value) it yields the raw `f64` (not a display string), so
+    /// a numeric series binds without a lossy string round-trip. A read error / out-of-range cell is
+    /// [`CellData::Empty`]. No IronCalc type escapes: the inner [`CellValue`] is mapped here.
+    pub(crate) fn cell_value(&self, sheet: u32, cell: CellRef) -> CellData {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        match self
+            .model
+            .get_model()
+            .get_cell_value_by_index(sheet, row, col)
+        {
+            Ok(CellValue::Number(n)) => CellData::Number(n),
+            Ok(CellValue::String(s)) => CellData::Text(s),
+            Ok(CellValue::Boolean(b)) => CellData::Bool(b),
+            Ok(CellValue::None) | Err(_) => CellData::Empty,
+        }
     }
 
     /// The raw IronCalc worksheet at `sheet_idx` — the enumeration source the Phase-5 cache

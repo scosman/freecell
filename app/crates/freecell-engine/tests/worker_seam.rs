@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use freecell_chart_model::SeriesData;
 use freecell_core::{CellRange, CellRef, SheetId};
 use freecell_engine::{
-    fixtures, Command, DocumentClient, DocumentSource, EditRejectedReason, SheetMeta, StyleAttr,
-    WorkerEvent, WorkerEventReceiver,
+    fixtures, ChartSnapshot, Command, DocumentClient, DocumentSource, EditRejectedReason,
+    SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
 };
 use tempfile::tempdir;
 
@@ -731,5 +732,110 @@ fn overflow_paste_is_rejected_through_worker() {
             })
         ),
         "an overflowing paste is rejected; got {rejected:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P9 — live binding: charts ride the publication seam (charts/architecture §4.1, functional_spec §2)
+// ---------------------------------------------------------------------------------------------
+
+/// The value points of one series in the latest chart snapshot (category/value → its `values`,
+/// scatter → its `y`), for the chart anchored on `sheet`.
+fn snapshot_series_values(
+    snapshot: &ChartSnapshot,
+    sheet: SheetId,
+    chart_idx: usize,
+    series_idx: usize,
+) -> Vec<f64> {
+    let specs = &snapshot
+        .sheets
+        .iter()
+        .find(|(s, _)| *s == sheet)
+        .expect("the anchor sheet carries charts")
+        .1;
+    match &specs[chart_idx].chart.series[series_idx].data {
+        SeriesData::CategoryValue { values, .. } => values.clone(),
+        SeriesData::Xy { y, .. } => y.clone(),
+    }
+}
+
+/// Spawn a worker over a freshly written single-line-chart fixture; returns the client, receiver,
+/// and the (first) sheet id. Waits until the worker has discovered + published its charts.
+fn spawn_line_fixture() -> (DocumentClient, WorkerEventReceiver, SheetId) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("line.xlsx");
+    freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
+    let sheet = sheets[0].id;
+    // `poll_until` returns only once discovery (which reads the file) has published the charts, so
+    // `dir` stays alive across the read; nothing reads the file after this helper returns.
+    poll_until(
+        || client.chart_snapshot().version >= 1,
+        "the worker discovers + publishes the file's charts on load",
+    );
+    (client, rx, sheet)
+}
+
+#[test]
+fn opened_line_chart_is_published_on_the_seam() {
+    let (client, _rx, sheet) = spawn_line_fixture();
+    let snap = client.chart_snapshot();
+    assert!(snap.version >= 1, "charts publish a non-empty version");
+    assert_eq!(snap.sheets.len(), 1, "one anchor sheet");
+    let (snap_sheet, specs) = &snap.sheets[0];
+    assert_eq!(*snap_sheet, sheet, "anchored to the first sheet (P8/P9)");
+    assert_eq!(specs.len(), 1, "the fixture has one line chart");
+    // First paint uses the file's cached values (the Widgets series = B2:B5).
+    assert_eq!(
+        snapshot_series_values(&snap, sheet, 0, 0),
+        vec![120.0, 150.0, 90.0, 170.0],
+    );
+}
+
+#[test]
+fn editing_a_source_cell_reresolves_the_chart() {
+    let (client, rx, sheet) = spawn_line_fixture();
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    let base_version = client.chart_snapshot().version;
+
+    // Edit B2 (the first Widgets value) — a cell inside the chart's B2:B5 value range.
+    client.send(set_input(sheet, 1, 1, "999"));
+    poll_until(
+        || {
+            let snap = client.chart_snapshot();
+            snapshot_series_values(&snap, sheet, 0, 0).first() == Some(&999.0)
+        },
+        "editing a source cell re-resolves the line chart's first value",
+    );
+    let snap = client.chart_snapshot();
+    // The rest of the series still tracks its (unedited) cells.
+    assert_eq!(
+        snapshot_series_values(&snap, sheet, 0, 0),
+        vec![999.0, 150.0, 90.0, 170.0],
+    );
+    assert!(
+        snap.version > base_version,
+        "a re-resolve bumps the snapshot version"
+    );
+}
+
+#[test]
+fn disjoint_edit_does_not_recompute_charts() {
+    let (client, rx, sheet) = spawn_line_fixture();
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    let base_version = client.chart_snapshot().version;
+
+    // K9 is outside every chart range (the fixture uses cols A–C, rows 1–5).
+    client.send(set_input(sheet, 8, 10, "42"));
+    poll_until(
+        || published_text(&client, 8, 10) == "42",
+        "the disjoint edit itself publishes",
+    );
+    assert_eq!(
+        client.chart_snapshot().version,
+        base_version,
+        "only intersecting charts recompute — a disjoint edit leaves the chart snapshot untouched",
     );
 }

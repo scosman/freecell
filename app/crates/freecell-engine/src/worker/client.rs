@@ -13,6 +13,7 @@ use parking_lot::RwLock;
 
 use crate::document::DocumentSource;
 
+use super::charts::ChartSnapshot;
 use super::protocol::{Command, WorkerEvent};
 use super::run::Worker;
 
@@ -39,6 +40,10 @@ pub(super) struct Shared {
     /// The resident style/geometry cache. Created empty here; **populated in Phase 5** (the
     /// worker owns the writes, the grid reads per frame).
     pub(super) caches: Arc<RwLock<SheetCaches>>,
+    /// The latest published live-bound charts (P9). Rides the same wait-free `arc_swap` path as
+    /// [`publication`](Self::publication); stored by the worker before the `Published` bump and
+    /// installed UI-side on a version change (charts/architecture §4.1).
+    pub(super) chart_snapshot: Arc<ArcSwap<ChartSnapshot>>,
 }
 
 impl Shared {
@@ -48,6 +53,7 @@ impl Shared {
             generation: AtomicU64::new(0),
             committed_ops: AtomicU64::new(0),
             caches: Arc::new(RwLock::new(SheetCaches::new())),
+            chart_snapshot: Arc::new(ArcSwap::from_pointee(ChartSnapshot::empty())),
         }
     }
 }
@@ -123,6 +129,21 @@ impl DocumentClient {
     /// The resident style/geometry cache (populated in Phase 5).
     pub fn caches(&self) -> Arc<RwLock<SheetCaches>> {
         Arc::clone(&self.shared.caches)
+    }
+
+    /// The latest published live-bound charts (P9) — a wait-free `arc_swap` load. The UI reads this
+    /// on `Loaded` / `Published` and installs it into the grid when its
+    /// [`version`](crate::ChartSnapshot::version) changed.
+    pub fn chart_snapshot(&self) -> Arc<ChartSnapshot> {
+        self.shared.chart_snapshot.load_full()
+    }
+
+    /// Test-only: publish a [`ChartSnapshot`] into the shared swap, so a headless window/view test
+    /// can drive the seam-fed chart install (its version-gating + dropped-sheet clear) without a
+    /// real worker. Behind `test-support`, so it can never reach a release build.
+    #[cfg(feature = "test-support")]
+    pub fn set_chart_snapshot(&self, snapshot: ChartSnapshot) {
+        self.shared.chart_snapshot.store(Arc::new(snapshot));
     }
 
     /// The current generation counter — the UI treats a change as "repaint from the

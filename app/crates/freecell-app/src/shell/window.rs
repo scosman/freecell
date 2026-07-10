@@ -127,6 +127,14 @@ pub struct WorkbookWindow {
     pending_save_req: Option<u64>,
     next_req_id: u64,
 
+    /// The [`ChartSnapshot`](freecell_engine::ChartSnapshot) version last installed into the grid
+    /// (P9). The worker bumps the snapshot version on load and on each dirty re-resolve; the window
+    /// re-installs only when this differs, so a scroll-only publish never rebuilds the charts.
+    installed_chart_version: u64,
+    /// The sheets that currently have charts installed — so a snapshot that drops a sheet's charts
+    /// can clear them.
+    installed_chart_sheets: Vec<SheetId>,
+
     /// Keeps the worker→UI event task alive for the window's lifetime.
     _event_task: gpui::Task<()>,
 }
@@ -269,6 +277,8 @@ impl WorkbookWindow {
             pending_save_path: None,
             pending_save_req: None,
             next_req_id: 0,
+            installed_chart_version: 0,
+            installed_chart_sheets: Vec::new(),
             _event_task: event_task,
         }
     }
@@ -293,44 +303,39 @@ impl WorkbookWindow {
         })
     }
 
-    /// Loads the opened file's embedded charts into the grid's **ChartLayer** (P8,
-    /// `charts/functional_spec.md §1`, `architecture.md §4.1–4.2`). Parsing walks the OPC package
-    /// (`discover_and_parse`), so it runs on a **background** executor to keep it off the frame /
-    /// UI thread (lazy-parse tuning is P11); the resolved `ChartSpec`s are then installed on the
-    /// grid's active sheet. **Per-chart non-fatal** (`architecture.md §6`): a parse error just logs
-    /// and leaves the sheet chart-less — a broken chart never breaks the open. New (unsaved)
-    /// workbooks have no file to read, so this is a no-op for them.
+    /// Installs the worker's live-bound charts into the grid's **ChartLayer** from the publication
+    /// seam (P9, `charts/functional_spec.md §2`, `architecture.md §4.1`). The worker owns chart
+    /// discovery + live binding; the window just reads the wait-free
+    /// [`ChartSnapshot`](freecell_engine::ChartSnapshot) on `Loaded` / `Published` and installs it
+    /// when its version changed — so an edit that re-resolves a chart repaints it, while a
+    /// scroll-only publish (or an edit touching no chart) is a no-op. A chart-less / unsaved workbook
+    /// publishes the empty (version 0) snapshot, so this never installs anything for it.
     ///
-    /// Multi-sheet placement (correlating each chart's worksheet to its `SheetId`) rides with live
-    /// binding (P9); this phase attaches the discovered charts to the active (first) sheet, correct
-    /// for the single-sheet files the line slice targets.
-    fn load_charts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.opened_from.clone() else {
-            return; // an unsaved workbook has no file to read
-        };
-        let sheet = self.grid.read(cx).active_sheet();
-        cx.spawn_in(window, async move |this, cx| {
-            let specs = cx
-                .background_executor()
-                .spawn(async move { freecell_engine::chart::discover_and_parse(&path) })
-                .await;
-            let specs = match specs {
-                Ok(specs) => specs,
-                Err(err) => {
-                    tracing::warn!("chart discovery failed: {err:#}");
-                    return;
-                }
-            };
-            if specs.is_empty() {
-                return; // nothing to draw — leave the ChartLayer untouched
+    /// Multi-sheet anchor placement (correlating each chart's worksheet to its `SheetId`) is still
+    /// P10; the worker anchors all charts to the first sheet, so a snapshot carries one entry today.
+    fn sync_charts(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.client.chart_snapshot();
+        if snapshot.version == self.installed_chart_version {
+            return; // charts unchanged since the last install
+        }
+        // Clear any sheet that no longer carries charts, then (re)install the current set.
+        let present: Vec<SheetId> = snapshot.sheets.iter().map(|(sheet, _)| *sheet).collect();
+        let dropped: Vec<SheetId> = self
+            .installed_chart_sheets
+            .iter()
+            .filter(|s| !present.contains(s))
+            .copied()
+            .collect();
+        self.grid.update(cx, |g, cx| {
+            for sheet in dropped {
+                g.set_sheet_charts(sheet, Vec::new(), cx);
             }
-            this.update_in(cx, |this, _window, cx| {
-                this.grid
-                    .update(cx, |g, cx| g.set_sheet_charts(sheet, specs, cx));
-            })
-            .ok();
-        })
-        .detach();
+            for (sheet, specs) in &snapshot.sheets {
+                g.set_sheet_charts(*sheet, specs.clone(), cx);
+            }
+        });
+        self.installed_chart_sheets = present;
+        self.installed_chart_version = snapshot.version;
     }
 
     /// Folds a worker event (`components/engine_worker.md`), routing each to the window's
@@ -342,10 +347,11 @@ impl WorkbookWindow {
                 self.grid.update(cx, |g, cx| g.set_loading(None, cx));
                 self.reconcile_sheets(sheets, window, cx);
                 self.refresh_dirty(window, cx);
-                // Discover + parse this file's embedded charts and hand them to the grid's
-                // ChartLayer (P8, `charts/architecture.md §4.1–4.2`). Off the UI thread + per-chart
-                // non-fatal, so a chart-less or broken-chart file loads exactly as before.
-                self.load_charts(window, cx);
+                // Install this file's live-bound charts from the worker's publication seam (P9,
+                // `charts/architecture.md §4.1`). The worker discovered + bound them before the
+                // first publish; per-chart non-fatal, so a chart-less/broken-chart file loads as
+                // before. Live re-resolves arrive on later `Published` events.
+                self.sync_charts(cx);
                 // The document finished loading → the welcome window (if still up) can close.
                 FreeCellApp::note_window_loaded(self.key, cx);
                 cx.notify();
@@ -366,6 +372,9 @@ impl WorkbookWindow {
                 // A fresh generation is available — repaint the grid from the new publication
                 // (the grid re-reads the `ArcSwap` each frame; `notify` schedules that frame).
                 self.grid.update(cx, |_g, cx| cx.notify());
+                // Install any live-bound chart changes that rode this publish (P9). Version-gated,
+                // so a scroll-only publish is a no-op.
+                self.sync_charts(cx);
                 self.refresh_dirty(window, cx);
             }
             WorkerEvent::StyleCacheUpdated { sheet } => {
@@ -867,6 +876,14 @@ impl WorkbookWindow {
     #[cfg(test)]
     pub(crate) fn grid_for_test(&self) -> Entity<GridView> {
         self.grid.clone()
+    }
+
+    /// Test seam: the window's worker client, so a test can publish a `ChartSnapshot` into the seam
+    /// (via `DocumentClient::set_chart_snapshot`) and then drive `sync_charts` through an injected
+    /// `Published` event.
+    #[cfg(test)]
+    pub(crate) fn client_for_test(&self) -> std::rc::Rc<DocumentClient> {
+        self.client.clone()
     }
 
     /// Test seam: the composed chrome entity.

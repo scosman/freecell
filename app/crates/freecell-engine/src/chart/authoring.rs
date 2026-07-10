@@ -545,6 +545,14 @@ fn line_fixture_chart() -> String {
     chart_space(LINE_CHART_TITLE, &group, true)
 }
 
+/// The line-fixture chart part XML (two cat/val series over the `Data` grid) — exposed for the
+/// live-binding (`chart::binding`) and worker-seam tests, which need the exact part
+/// [`write_line_fixture`] embeds so their `c:f` role/range assertions can't drift from the file.
+#[cfg(test)]
+pub(crate) fn line_chart_xml_for_test() -> String {
+    line_fixture_chart()
+}
+
 /// The chart part's `_rels` — the `chartStyle`/`chartColorStyle` aux parts every modern Excel
 /// chart carries (retained byte-for-byte by the load path, never parsed by us).
 fn line_chart_rels() -> String {

@@ -32,8 +32,10 @@ use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
 use crate::cache;
+use crate::chart::binding::{CellData, ChartBindings};
 use crate::document::{DocumentSource, FontFlag, WorkbookDocument};
 
+use super::charts::ChartSnapshot;
 use super::client::Shared;
 use super::protocol::{Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr, WorkerEvent};
 
@@ -152,6 +154,12 @@ pub(super) struct Worker {
     /// The range clipboard slot (`architecture.md §6`): `Some` after a copy/cut, replaced by the
     /// next copy/cut, and cleared after a cut is pasted (single-use).
     clipboard: Option<ClipboardSlot>,
+    /// The live-bound charts this workbook owns (P9, charts/architecture §4.1) — the range→chart
+    /// index the worker re-resolves on edit. Empty for a new/unopened or chart-less workbook.
+    charts: ChartBindings,
+    /// The published [`ChartSnapshot`] version — bumped on load (when charts exist) and on each
+    /// dirty re-resolve, so the UI installs charts only when they actually change.
+    chart_version: u64,
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -192,6 +200,8 @@ impl Worker {
             undo_touches: Vec::new(),
             redo_touches: Vec::new(),
             clipboard: None,
+            charts: ChartBindings::default(),
+            chart_version: 0,
         };
 
         // Point the active sheet at the first sheet's real stable id, and seed an empty
@@ -214,6 +224,25 @@ impl Worker {
         worker.emit(WorkerEvent::StyleCacheUpdated {
             sheet: worker.active_sheet,
         });
+
+        // Discover + bind this file's embedded charts for live binding (P9, charts/architecture
+        // §4.1). Runs after `Loaded` (the grid's geometry/styles already paint) but before the loop
+        // processes the first `SetViewport`, so the charts are in the snapshot by the first
+        // `Published`. Reads the file's cached values as first paint — no model eval (SP2). Per-chart
+        // non-fatal (a broken chart is skipped by `discover_and_parse`); a discovery failure just
+        // leaves the workbook chart-less. Anchored to the first sheet (single-sheet placement;
+        // multi-sheet anchor mapping is P10). (Lazy/off-critical-path parsing is P11.)
+        if let DocumentSource::OpenFile(path) = &source {
+            match crate::chart::discover_and_parse(path) {
+                Ok(specs) if !specs.is_empty() => {
+                    worker.charts = ChartBindings::from_specs(specs, worker.active_sheet);
+                    worker.chart_version = 1;
+                    worker.store_chart_snapshot();
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!("chart discovery failed: {err:#}"),
+            }
+        }
 
         worker.run(cmd_rx);
     }
@@ -467,12 +496,21 @@ impl Worker {
                 self.shared
                     .committed_ops
                     .store(self.ops_seen, Ordering::Release);
+
+                // Record the batch's edited-cell set (this pops/pushes the undo-redo touch stacks)
+                // so both the chart re-resolve and the style-cache mirror below read the same ranges.
+                let (refresh, rebuild) = self.collect_edited_ranges(applied_ops);
+                // Re-resolve any charts whose source ranges the edit touched, BEFORE publishing, so
+                // the edit's single `Published` carries fresh cells AND fresh charts (P9,
+                // charts/architecture §4.1). Only intersecting charts recompute.
+                self.reresolve_charts(&refresh, &rebuild);
+
                 self.publish();
                 self.emit(WorkerEvent::Published);
 
-                // Mirror the applied ops into the style/geometry cache (re-read touched cells;
-                // maintain the undo/redo touch-set stacks), then ship `StyleCacheUpdated` deltas.
-                self.mirror_applied_ops(applied_ops, &sheets_before);
+                // Mirror the applied ops into the style/geometry cache (re-read touched cells) and
+                // ship `StyleCacheUpdated` deltas. Ordered after `Published` (unchanged event order).
+                self.apply_cache_refresh(refresh, rebuild, &sheets_before);
 
                 // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the
                 // tab bar. Compared by value so undo/redo of a sheet op is caught too.
@@ -740,6 +778,9 @@ impl Worker {
         self.shared
             .committed_ops
             .store(self.ops_seen, Ordering::Release);
+        // Re-resolve any charts the pasted values touched, before the publish (P9) — a paste into a
+        // source range re-renders the chart on the same `Published`.
+        self.reresolve_charts(&touched, &[]);
         self.publish();
         self.emit(WorkerEvent::Published);
 
@@ -886,11 +927,15 @@ impl Worker {
         }
     }
 
-    /// Mirror a batch's applied ops into the resident cache (`components/style_cache.md
-    /// §Lifecycle`): maintain the undo/redo touch-set stacks, reconcile the caches map when the
-    /// sheet set changed, re-read the touched cells, and emit `StyleCacheUpdated` per changed
-    /// sheet. Runs after the eval + publish (styles don't depend on the recompute).
-    fn mirror_applied_ops(&mut self, applied_ops: Vec<AppliedOp>, sheets_before: &[SheetMeta]) {
+    /// Record a batch's applied ops against the undo/redo touch-set stacks and return the cells the
+    /// batch changed: `(refresh_ranges, rebuild_sheets)`. This is the state-mutating half of the
+    /// post-eval bookkeeping — it pushes new touches (clearing redo) and pops on undo/redo, so it
+    /// runs **exactly once** per batch. Both the chart re-resolve and the style-cache mirror
+    /// ([`apply_cache_refresh`](Self::apply_cache_refresh)) consume the returned ranges.
+    fn collect_edited_ranges(
+        &mut self,
+        applied_ops: Vec<AppliedOp>,
+    ) -> (Vec<(SheetId, CellRange)>, Vec<SheetId>) {
         let mut refresh: Vec<(SheetId, CellRange)> = Vec::new();
         // Sheets whose whole cache must be rebuilt (a resize / insert / delete, or the undo/redo
         // of one — the region touched is unbounded so a per-cell mirror can't express it).
@@ -927,7 +972,20 @@ impl Worker {
                 }
             }
         }
+        (refresh, rebuild)
+    }
 
+    /// Mirror a batch's edited cells into the resident cache (`components/style_cache.md
+    /// §Lifecycle`): reconcile the caches map when the sheet set changed, re-read the touched cells,
+    /// and emit `StyleCacheUpdated` per changed sheet. Consumes the `(refresh, rebuild)` from
+    /// [`collect_edited_ranges`](Self::collect_edited_ranges). Runs after the eval + publish (styles
+    /// don't depend on the recompute).
+    fn apply_cache_refresh(
+        &mut self,
+        refresh: Vec<(SheetId, CellRange)>,
+        mut rebuild: Vec<SheetId>,
+        sheets_before: &[SheetMeta],
+    ) {
         // When the sheet-id SET changed (delete, or undo-of-add), drop caches for absent sheets.
         // A returning sheet (undo-of-delete) rebuilds lazily on its next activation.
         let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
@@ -1135,6 +1193,52 @@ impl Worker {
             Ok(merges) if blocked(&merges) => Err(EditRejectedReason::MergedCells),
             _ => Ok(()),
         }
+    }
+
+    /// Re-resolve the charts whose source ranges the edit touched, and store a fresh
+    /// [`ChartSnapshot`] iff any changed (P9, charts/architecture §4.1, §5 challenge 2). The dirty
+    /// set is the range→chart index intersected with the edit's `refresh` cells (+ any structurally
+    /// `rebuilt` data sheet); only those charts read live values. Runs **before** the `Published`
+    /// bump so the fresh charts ride the same event that repaints the cells. Cheap when nothing
+    /// intersects — a disjoint edit does no reads and leaves the snapshot untouched.
+    fn reresolve_charts(&mut self, refresh: &[(SheetId, CellRange)], rebuilt: &[SheetId]) {
+        if self.charts.is_empty() {
+            return;
+        }
+        // A `c:f` sheet name → stable id against the current model. Owned (`move`), so it never
+        // borrows `self` while `self.charts` is mutated below.
+        let props = self.doc.sheet_properties();
+        let resolve_sheet = move |name: &str| -> Option<SheetId> {
+            props
+                .iter()
+                .find(|(_, n)| n == name)
+                .map(|(id, _)| SheetId(*id))
+        };
+        let indices = self.charts.dirty_indices(refresh, rebuilt, &resolve_sheet);
+        if indices.is_empty() {
+            return; // disjoint edit — nothing recomputes (charts/functional_spec §2)
+        }
+        // Live cell reader over the doc — a disjoint field borrow from `self.charts` below.
+        let doc = &self.doc;
+        let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
+            match resolve_idx(doc, sheet) {
+                Ok(idx) => doc.cell_value(idx, cell),
+                Err(_) => CellData::Empty,
+            }
+        };
+        if self.charts.reresolve(&indices, &resolve_sheet, &read_cell) {
+            self.chart_version += 1;
+            self.store_chart_snapshot();
+        }
+    }
+
+    /// Store the current bound charts as the published [`ChartSnapshot`] (charts/architecture §4.1),
+    /// riding the same wait-free `arc_swap` container as the cell publication.
+    fn store_chart_snapshot(&self) {
+        self.shared.chart_snapshot.store(Arc::new(ChartSnapshot {
+            version: self.chart_version,
+            sheets: self.charts.specs_by_sheet(),
+        }));
     }
 
     /// Publish the active sheet's viewport snapshot, THEN bump the generation — a bump always
@@ -1572,6 +1676,8 @@ mod tests {
             undo_touches: Vec::new(),
             redo_touches: Vec::new(),
             clipboard: None,
+            charts: ChartBindings::default(),
+            chart_version: 0,
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;
@@ -3596,6 +3702,8 @@ mod tests {
             undo_touches: Vec::new(),
             redo_touches: Vec::new(),
             clipboard: None,
+            charts: ChartBindings::default(),
+            chart_version: 0,
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;

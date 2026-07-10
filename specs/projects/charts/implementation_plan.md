@@ -51,7 +51,7 @@ those docs — this is the ordered checklist.
 - [x] **P8 — Render line chart in the spreadsheet.** `ChartLayer` over cells: anchor→pixel,
   clip, scroll/zoom, cull; corner badge on `Degraded`, placeholder on `Unsupported`. Cache
   values (static). *Exit:* opening a real file shows its line chart in place.
-- [ ] **P9 — Live binding.** Parse `c:f`; range→chart index; re-resolve dirty charts on
+- [x] **P9 — Live binding.** Parse `c:f`; range→chart index; re-resolve dirty charts on
   recompute and publish via the worker seam. *Exit:* editing a source cell re-renders the line
   chart; only intersecting charts recompute.
 - [ ] **P10 — Save / restore (source-first).** Byte-preserve unedited; **patch retained source**

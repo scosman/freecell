@@ -348,7 +348,10 @@ fn read_related_parts<R: std::io::Read + std::io::Seek>(
 // ---------------------------------------------------------------------------------------------
 
 /// The chart-group element tag names this PoC understands, in the order they're checked.
-const CHART_GROUP_TAGS: &[&str] = &[
+/// `pub(super)` so the live-binding [`binding`](super::binding) parser finds the **same** first
+/// chart-group as [`parse_chart_xml`], keeping its per-series role refs aligned 1:1 with the
+/// parsed [`Chart`]'s series (combo charts read only the first group — functional_spec §10).
+pub(super) const CHART_GROUP_TAGS: &[&str] = &[
     "barChart",
     "lineChart",
     "areaChart",

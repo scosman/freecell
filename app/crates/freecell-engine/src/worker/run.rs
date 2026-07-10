@@ -33,7 +33,8 @@ use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, Published
 
 use crate::cache;
 use crate::chart::binding::{CellData, ChartBindings};
-use crate::document::{DocumentSource, FontFlag, WorkbookDocument};
+use crate::document::{DocumentSource, FontFlag, SaveError, WorkbookDocument};
+use std::path::Path;
 
 use super::charts::ChartSnapshot;
 use super::client::Shared;
@@ -160,6 +161,13 @@ pub(super) struct Worker {
     /// The published [`ChartSnapshot`] version — bumped on load (when charts exist) and on each
     /// dirty re-resolve, so the UI installs charts only when they actually change.
     chart_version: u64,
+    /// The file whose chart machinery (drawings, chart parts, content-type overrides) a
+    /// chart-preserving save re-injects into the model body (P10, charts/architecture §4.1/§5):
+    /// the opened path on load, then the last path successfully saved (a chart-preserving save
+    /// writes a self-contained superset, so the just-saved file is a valid source for the next
+    /// save — surviving a Save-As away from a since-deleted original). `None` for a workbook never
+    /// opened from a file; then save falls through to the plain (chart-less) writer.
+    chart_source_path: Option<PathBuf>,
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -202,6 +210,10 @@ impl Worker {
             clipboard: None,
             charts: ChartBindings::default(),
             chart_version: 0,
+            chart_source_path: match &source {
+                DocumentSource::OpenFile(path) => Some(path.clone()),
+                DocumentSource::NewWorkbook => None,
+            },
         };
 
         // Point the active sheet at the first sheet's real stable id, and seed an empty
@@ -229,13 +241,15 @@ impl Worker {
         // §4.1). Runs after `Loaded` (the grid's geometry/styles already paint) but before the loop
         // processes the first `SetViewport`, so the charts are in the snapshot by the first
         // `Published`. Reads the file's cached values as first paint — no model eval (SP2). Per-chart
-        // non-fatal (a broken chart is skipped by `discover_and_parse`); a discovery failure just
-        // leaves the workbook chart-less. Anchored to the first sheet (single-sheet placement;
-        // multi-sheet anchor mapping is P10). (Lazy/off-critical-path parsing is P11.)
+        // non-fatal (a broken chart is skipped); a discovery failure just leaves the workbook
+        // chart-less. Each chart is anchored to its **own** worksheet's `SheetId` via the P10
+        // `workbook.xml.rels` part map (grouped discovery); a name that doesn't resolve falls back to
+        // the active sheet. (Lazy/off-critical-path parsing is P11.)
         if let DocumentSource::OpenFile(path) = &source {
-            match crate::chart::discover_and_parse(path) {
-                Ok(specs) if !specs.is_empty() => {
-                    worker.charts = ChartBindings::from_specs(specs, worker.active_sheet);
+            match crate::chart::discover_and_parse_by_sheet(path) {
+                Ok(groups) if groups.iter().any(|(_, specs)| !specs.is_empty()) => {
+                    let by_id = worker.groups_to_sheet_ids(groups);
+                    worker.charts = ChartBindings::from_specs_by_sheet(by_id);
                     worker.chart_version = 1;
                     worker.store_chart_snapshot();
                 }
@@ -367,7 +381,7 @@ impl Worker {
         }
 
         for (path, req_id) in saves {
-            match self.doc.save(&path) {
+            match self.save_workbook(&path) {
                 Ok(()) => self.emit(WorkerEvent::Saved {
                     req_id,
                     ops_seen: self.ops_seen,
@@ -1232,6 +1246,69 @@ impl Worker {
         }
     }
 
+    /// Map each grouped-discovery `(sheet name, (part, spec)…)` group to its `(SheetId, …)` anchor —
+    /// resolving the name against the current model (P10 multi-sheet chart→SheetId placement). A
+    /// name that doesn't resolve (a deleted/renamed data sheet the drawing outlived) falls back to
+    /// the active sheet, so its charts still paint on the visible sheet rather than vanishing.
+    fn groups_to_sheet_ids(
+        &self,
+        groups: crate::chart::load::ChartsBySheet,
+    ) -> Vec<(SheetId, crate::chart::load::SheetCharts)> {
+        let props = self.doc.sheet_properties();
+        groups
+            .into_iter()
+            .map(|(name, specs)| {
+                let id = props
+                    .iter()
+                    .find(|(_, n)| *n == name)
+                    .map(|(id, _)| SheetId(*id))
+                    .unwrap_or(self.active_sheet);
+                (id, specs)
+            })
+            .collect()
+    }
+
+    /// The current name of the worksheet with stable id `sheet` (against the live model), or `None`
+    /// if that sheet no longer exists (deleted in-session). The rename-safe key the chart-preserving
+    /// save resolves each chart's host worksheet through.
+    fn sheet_name_of(&self, sheet: SheetId) -> Option<String> {
+        self.doc
+            .sheet_properties()
+            .into_iter()
+            .find(|(id, _)| SheetId(*id) == sheet)
+            .map(|(_, name)| name)
+    }
+
+    /// Save the workbook to `path` (`Command::Save` / Save-As), **preserving embedded charts**
+    /// (P10, charts/architecture §4.1/§5). When the workbook was opened from a file *and* carries
+    /// live charts, it re-injects that file's chart machinery into the current model body and
+    /// writes the result atomically — an unedited chart byte-for-byte, an edited chart with its
+    /// caches reflowed to current values. Otherwise (a new workbook, or one with no charts) it
+    /// takes the plain atomic writer, so the **non-chart save path is behaviorally identical to
+    /// before**. On success the just-saved file becomes the chart source for the next save (it is a
+    /// self-contained superset). A missing target part surfaces as a [`SaveError`] (fail loudly).
+    fn save_workbook(&mut self, path: &Path) -> Result<(), SaveError> {
+        let Some(original) = self.chart_source_path.clone() else {
+            return self.doc.save(path); // never opened from a file → nothing to re-inject
+        };
+        if self.charts.is_empty() {
+            return self.doc.save(path); // opened file has no charts → unchanged save path
+        }
+
+        let model_bytes = self.doc.to_xlsx_bytes()?;
+        // Each chart's host worksheet is resolved through its stable anchor `SheetId` → CURRENT name,
+        // so a renamed sheet still maps and a deleted one drops gracefully (never a save failure).
+        let live = self.charts.live_charts(|id| self.sheet_name_of(id));
+        let (final_bytes, _report) =
+            crate::chart::reinject_live_charts(&original, &model_bytes, &live)
+                .map_err(|e| SaveError::Serialize(format!("charts couldn't be saved: {e:#}")))?;
+        crate::document::write_xlsx_bytes_atomic(path, &final_bytes)?;
+        // The written file now carries every chart part + drawing — a valid source for re-injecting
+        // on the next save (e.g. after a Save-As, even if the original is later removed).
+        self.chart_source_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
     /// Store the current bound charts as the published [`ChartSnapshot`] (charts/architecture §4.1),
     /// riding the same wait-free `arc_swap` container as the cell publication.
     fn store_chart_snapshot(&self) {
@@ -1678,6 +1755,7 @@ mod tests {
             clipboard: None,
             charts: ChartBindings::default(),
             chart_version: 0,
+            chart_source_path: None,
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;
@@ -3704,6 +3782,7 @@ mod tests {
             clipboard: None,
             charts: ChartBindings::default(),
             chart_version: 0,
+            chart_source_path: None,
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;

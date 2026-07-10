@@ -375,6 +375,10 @@ pub fn resolve_chart(
 #[derive(Clone, Debug)]
 struct BoundChart {
     anchor_sheet: SheetId,
+    /// The chart's `xl/charts/chartN.xml` part — the stable key the source-first save re-injects +
+    /// reflows on (P10). Set at discovery; empty only for the single-sheet `from_specs` convenience
+    /// (never used by the save path).
+    chart_part: String,
     spec: ChartSpec,
     binding: ChartBinding,
 }
@@ -425,23 +429,39 @@ pub struct ChartBindings {
 }
 
 impl ChartBindings {
-    /// Bind the discovered charts, anchoring them all to `anchor_sheet` (single-sheet placement;
-    /// multi-sheet anchor mapping is P10). Each chart's binding is parsed from its retained source
-    /// XML; an authored chart (no source) gets an empty binding. The specs keep their file-cached
-    /// values as first paint — no model read here.
+    /// Bind the discovered charts, anchoring them all to `anchor_sheet` (single-sheet convenience;
+    /// used by tests). Chart parts are unknown here (empty) — this path is never the save path.
     pub fn from_specs(specs: Vec<ChartSpec>, anchor_sheet: SheetId) -> Self {
-        let charts = specs
+        Self::from_specs_by_sheet(vec![(
+            anchor_sheet,
+            specs.into_iter().map(|s| (String::new(), s)).collect(),
+        )])
+    }
+
+    /// Bind discovered charts anchored to **their own** worksheet's [`SheetId`] (multi-sheet
+    /// placement, P10 — the item P8/P9 deferred for lack of the `workbook.xml.rels` part map).
+    /// Each group pairs an anchor sheet with `(chart_part, spec)` pairs discovered on it
+    /// ([`discover_and_parse_by_sheet`](super::load::discover_and_parse_by_sheet), mapped
+    /// name→`SheetId` by the caller). Each chart carries its part so the save can re-inject +
+    /// reflow it without re-deriving the association. Within a group, each chart's binding is parsed
+    /// from its retained source XML (an authored chart gets an empty binding); the specs keep their
+    /// file-cached values as first paint — no model read here.
+    pub fn from_specs_by_sheet(groups: Vec<(SheetId, super::load::SheetCharts)>) -> Self {
+        let charts = groups
             .into_iter()
-            .map(|spec| {
-                let binding = spec
-                    .source()
-                    .map(|s| parse_chart_binding(&s.chart_xml))
-                    .unwrap_or_default();
-                BoundChart {
-                    anchor_sheet,
-                    spec,
-                    binding,
-                }
+            .flat_map(|(anchor_sheet, specs)| {
+                specs.into_iter().map(move |(chart_part, spec)| {
+                    let binding = spec
+                        .source()
+                        .map(|s| parse_chart_binding(&s.chart_xml))
+                        .unwrap_or_default();
+                    BoundChart {
+                        anchor_sheet,
+                        chart_part,
+                        spec,
+                        binding,
+                    }
+                })
             })
             .collect();
         Self { charts }
@@ -449,6 +469,26 @@ impl ChartBindings {
 
     pub fn is_empty(&self) -> bool {
         self.charts.is_empty()
+    }
+
+    /// Each bound chart as a [`LiveChart`](super::save::LiveChart) the source-first save consumes
+    /// (`worker::run`, charts/architecture §5), in discovery order: its own chart part, its current
+    /// (live-resolved) values, and the **current** name of its anchor worksheet — resolved through
+    /// `resolve_name` (`SheetId` → current name; `None` when that sheet was deleted, so the save
+    /// drops the chart rather than mis-placing it). Resolving here (not by original name) is what
+    /// makes save survive an in-session sheet rename.
+    pub fn live_charts(
+        &self,
+        resolve_name: impl Fn(SheetId) -> Option<String>,
+    ) -> Vec<super::save::LiveChart> {
+        self.charts
+            .iter()
+            .map(|bc| super::save::LiveChart {
+                sheet_name: resolve_name(bc.anchor_sheet),
+                chart_part: bc.chart_part.clone(),
+                chart: bc.spec.chart.clone(),
+            })
+            .collect()
     }
 
     /// The indices of the charts the edit touched (the dirty set) — the range index intersected with
@@ -721,6 +761,7 @@ mod tests {
             charts: vec![
                 BoundChart {
                     anchor_sheet: SheetId(0),
+                    chart_part: "xl/charts/chart1.xml".into(),
                     spec: spec_for("<c:lineChart/>"),
                     binding: ChartBinding {
                         series: vec![SeriesBinding {
@@ -732,6 +773,7 @@ mod tests {
                 },
                 BoundChart {
                     anchor_sheet: SheetId(0),
+                    chart_part: "xl/charts/chart2.xml".into(),
                     spec: spec_for("<c:lineChart/>"),
                     binding: ChartBinding {
                         series: vec![SeriesBinding {
@@ -757,5 +799,39 @@ mod tests {
         // A structural rebuild of the Data sheet touches every chart bound to it.
         let structural = bindings.dirty_indices(&[], &[SheetId(0)], &resolver);
         assert_eq!(structural, vec![0, 1]);
+    }
+
+    #[test]
+    fn from_specs_by_sheet_anchors_each_group_to_its_sheet() {
+        // Two charts on two different worksheets (multi-sheet placement, P10).
+        let bindings = ChartBindings::from_specs_by_sheet(vec![
+            (
+                SheetId(0),
+                vec![("xl/charts/chart1.xml".into(), spec_for("<c:lineChart/>"))],
+            ),
+            (
+                SheetId(3),
+                vec![
+                    ("xl/charts/chart2.xml".into(), spec_for("<c:lineChart/>")),
+                    ("xl/charts/chart3.xml".into(), spec_for("<c:barChart/>")),
+                ],
+            ),
+        ]);
+        let by_sheet = bindings.specs_by_sheet();
+        assert_eq!(by_sheet.len(), 2);
+        assert_eq!(by_sheet[0].0, SheetId(0));
+        assert_eq!(by_sheet[0].1.len(), 1);
+        assert_eq!(by_sheet[1].0, SheetId(3));
+        assert_eq!(by_sheet[1].1.len(), 2);
+
+        // Each chart's live descriptor carries its own part + the resolved (current) sheet name.
+        let names = |id: SheetId| (id == SheetId(0)).then(|| "Data".to_string());
+        let live = bindings.live_charts(names);
+        assert_eq!(live.len(), 3);
+        assert_eq!(live[0].chart_part, "xl/charts/chart1.xml");
+        assert_eq!(live[0].sheet_name.as_deref(), Some("Data"));
+        // Sheet 3 doesn't resolve here → its charts report a deleted host (None).
+        assert_eq!(live[1].chart_part, "xl/charts/chart2.xml");
+        assert_eq!(live[1].sheet_name, None);
     }
 }

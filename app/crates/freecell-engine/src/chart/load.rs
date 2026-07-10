@@ -31,6 +31,15 @@ pub struct DiscoveredChart {
     pub anchor: Anchor,
 }
 
+/// One discovered chart: its `xl/charts/chartN.xml` part paired with its parsed [`ChartSpec`]. The
+/// part is the stable key the source-first save re-injects + reflows on (P10).
+pub type PartAndSpec = (String, ChartSpec);
+/// The charts on one worksheet, in document order (part + spec each).
+pub type SheetCharts = Vec<PartAndSpec>;
+/// Charts grouped by their owning worksheet **name**, in discovery order — the shape
+/// [`discover_and_parse_by_sheet`] returns and the worker binds by `SheetId`.
+pub type ChartsBySheet = Vec<(String, SheetCharts)>;
+
 /// The charts carried by one worksheet's single `<drawing>`, plus everything the save
 /// re-injection needs to patch that worksheet. Discovered by [`discover`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,6 +283,53 @@ pub fn discover_and_parse(path: &Path) -> Result<Vec<ChartSpec>> {
         }
     }
     Ok(specs)
+}
+
+/// Discovers every embedded chart and parses it into a [`ChartSpec`], **grouped by the name of the
+/// worksheet it is anchored on** (charts/architecture §4.1). This is the multi-sheet placement P9
+/// deferred to P10: it resolves each chart-bearing worksheet's part → **sheet name** via
+/// `xl/_rels/workbook.xml.rels` (the same [`workbook_sheet_parts`](xlsx::workbook_sheet_parts) map
+/// the save part-map uses), so the worker can anchor each chart to its own `SheetId` instead of
+/// pinning them all to the first sheet.
+///
+/// Groups come back in worksheet-discovery order; within a group, each chart is paired with its
+/// **package part** (`xl/charts/chartN.xml`) in document order — the part the save later keys its
+/// re-injection + reflow on, so the worker never has to re-derive the chart↔part association.
+/// Per-chart resilience matches [`discover_and_parse`] — an unparseable chart is skipped + logged,
+/// never fatal to the load. A worksheet whose name can't be resolved falls back to its part name as
+/// the group key (still distinct per worksheet).
+pub fn discover_and_parse_by_sheet(path: &Path) -> Result<ChartsBySheet> {
+    let sheets = discover(path)?;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading {} as a zip", path.display()))?;
+
+    let part_to_name: std::collections::HashMap<String, String> =
+        xlsx::workbook_sheet_parts(&mut archive)?
+            .into_iter()
+            .map(|(name, part)| (part, name))
+            .collect();
+
+    let mut groups: ChartsBySheet = Vec::new();
+    for sheet in &sheets {
+        let sheet_name = part_to_name
+            .get(&sheet.sheet_part)
+            .cloned()
+            .unwrap_or_else(|| sheet.sheet_part.clone());
+        let mut specs = Vec::new();
+        for dc in &sheet.charts {
+            match parse_discovered_chart(&mut archive, dc) {
+                Ok(spec) => specs.push((dc.part.clone(), spec)),
+                Err(err) => {
+                    tracing::warn!(chart_part = %dc.part, "skipping unparseable chart: {err:#}");
+                }
+            }
+        }
+        if !specs.is_empty() {
+            groups.push((sheet_name, specs));
+        }
+    }
+    Ok(groups)
 }
 
 /// Parses one discovered chart into a [`ChartSpec`] — read the part, map it to a [`Chart`], and
@@ -902,6 +958,33 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert!(matches!(specs[0].chart.kind, ChartKind::Line { .. }));
         assert_eq!(specs[0].display_fidelity(), Fidelity::Faithful);
+    }
+
+    /// P10: `discover_and_parse_by_sheet` associates each chart with the **name** of the worksheet
+    /// it is anchored on (via the `workbook.xml.rels` part map), grouping the two-sheet fixture's
+    /// column chart under "Data" and its line chart under "Summary".
+    #[test]
+    fn discover_and_parse_by_sheet_groups_charts_by_owning_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_sheet.xlsx");
+        authoring::write_two_sheet_fixture(&path).unwrap();
+
+        let groups = discover_and_parse_by_sheet(&path).unwrap();
+        assert_eq!(groups.len(), 2);
+        let (data_name, data_specs) = &groups[0];
+        let (summary_name, summary_specs) = &groups[1];
+        assert_eq!(data_name, "Data");
+        assert_eq!(summary_name, "Summary");
+        assert_eq!(data_specs.len(), 1);
+        assert_eq!(summary_specs.len(), 1);
+        // Each spec is paired with its own chart part, in discovery order.
+        assert_eq!(data_specs[0].0, "xl/charts/chart1.xml");
+        assert_eq!(summary_specs[0].0, "xl/charts/chart2.xml");
+        assert!(matches!(data_specs[0].1.chart.kind, ChartKind::Bar { .. }));
+        assert!(matches!(
+            summary_specs[0].1.chart.kind,
+            ChartKind::Line { .. }
+        ));
     }
 
     #[test]

@@ -98,6 +98,36 @@ pub fn parse_rels(xml: &str) -> Result<Rels> {
     Ok(map)
 }
 
+/// The worksheet **name → package part** correspondence of a workbook: reads
+/// `xl/workbook.xml` (`<sheet name=… r:id=…>`, in workbook order) and resolves each `r:id`
+/// through `xl/_rels/workbook.xml.rels` into an absolute part name. Returns `(name, part)`
+/// pairs in workbook order.
+///
+/// This is the part map P9 deferred to P10: it lets save map an *original* chart-bearing
+/// worksheet to IronCalc's **regenerated** worksheet **by name** (IronCalc may renumber the
+/// `sheetN.xml` parts), and lets discovery associate a chart with its owning worksheet's
+/// `SheetId`. A `<sheet>` whose `r:id` has no matching relationship is skipped.
+pub fn workbook_sheet_parts<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<Vec<(String, String)>> {
+    const WORKBOOK_PART: &str = "xl/workbook.xml";
+    let workbook_xml =
+        read_entry_from(archive, WORKBOOK_PART).context("reading xl/workbook.xml")?;
+    let rels = parse_rels(&read_entry_from(archive, &rels_part_for(WORKBOOK_PART))?)?;
+
+    let doc = roxmltree::Document::parse(&workbook_xml).context("parsing xl/workbook.xml")?;
+    let mut out = Vec::new();
+    for sheet in doc.descendants().filter(|n| n.tag_name().name() == "sheet") {
+        let (Some(name), Some(rel_id)) = (attr(&sheet, "name"), attr(&sheet, "id")) else {
+            continue;
+        };
+        if let Some(rel) = rels.get(rel_id) {
+            out.push((name.to_string(), resolve_target(WORKBOOK_PART, &rel.target)));
+        }
+    }
+    Ok(out)
+}
+
 /// The `_rels` part name for a part — e.g. `xl/worksheets/sheet1.xml` →
 /// `xl/worksheets/_rels/sheet1.xml.rels`.
 pub fn rels_part_for(part: &str) -> String {

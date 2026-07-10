@@ -839,3 +839,291 @@ fn disjoint_edit_does_not_recompute_charts() {
         "only intersecting charts recompute — a disjoint edit leaves the chart snapshot untouched",
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// P10 — save/restore: `Command::Save` preserves + reflows charts (charts/architecture §4.1/§5)
+// ---------------------------------------------------------------------------------------------
+
+/// The reopened first value of a chart's first series, from `discover_and_parse`.
+fn reopened_first_value(path: &std::path::Path, chart_idx: usize) -> f64 {
+    let specs = freecell_engine::chart::discover_and_parse(path).unwrap();
+    match &specs[chart_idx].chart.series[0].data {
+        SeriesData::CategoryValue { values, .. } => values[0],
+        SeriesData::Xy { y, .. } => y[0],
+    }
+}
+
+/// Every zip entry's decompressed bytes (name → bytes) — robust content equality that ignores
+/// zip framing (timestamps, compression).
+fn zip_entry_contents(path: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let mut map = std::collections::BTreeMap::new();
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i).unwrap();
+        let name = e.name().to_string();
+        let mut bytes = Vec::new();
+        e.read_to_end(&mut bytes).unwrap();
+        map.insert(name, bytes);
+    }
+    map
+}
+
+/// The app's `Command::Save` on an opened chart workbook preserves untouched charts byte-for-byte
+/// and patches an edited one — the end-to-end save the post-P11 human checkpoint reviews, driven
+/// through the worker command seam (the closest headless seam to the UI's Save action).
+#[test]
+fn save_through_worker_preserves_and_patches_charts() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("charts_basic.xlsx");
+    freecell_engine::chart::authoring::write_fixture(&path).unwrap();
+
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path.clone()));
+    let sheet = sheets[0].id;
+    poll_until(
+        || client.chart_snapshot().version >= 1,
+        "the worker discovers + publishes the file's charts on load",
+    );
+
+    // Edit B2 (Widgets Q1) — feeds the column chart (idx 0) and the line chart (idx 1), NOT the
+    // pie (idx 2, which reads column D). Wait until the reflow lands in the snapshot.
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    client.send(set_input(sheet, 1, 1, "999"));
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0).first() == Some(&999.0),
+        "editing B2 re-resolves the charts that read column B",
+    );
+
+    // Save through the worker's Save command.
+    let out = dir.path().join("out.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 11,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 11, .. })).is_some());
+
+    // Reopen: the two edited charts reflect 999; the untouched pie is byte-identical to the
+    // original part; IronCalc accepts the saved package.
+    assert_eq!(
+        reopened_first_value(&out, 0),
+        999.0,
+        "column chart reflowed"
+    );
+    assert_eq!(reopened_first_value(&out, 1), 999.0, "line chart reflowed");
+    assert_eq!(
+        freecell_engine::chart::xlsx::read_entry(&out, "xl/charts/chart3.xml").unwrap(),
+        freecell_engine::chart::xlsx::read_entry(&path, "xl/charts/chart3.xml").unwrap(),
+        "the untouched pie chart is byte-stable",
+    );
+    freecell_engine::WorkbookDocument::open(&out).expect("saved workbook reopens in the engine");
+}
+
+/// A chartless workbook still saves through the **plain** path — the P10 wiring must not change
+/// the non-chart save. The worker-saved file's contents equal a direct `WorkbookDocument::save`
+/// of the same workbook (the pre-P10 behavior).
+#[test]
+fn chartless_workbook_save_matches_plain_save() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("plain.xlsx");
+    fixtures::multi_sheet().save(&src).unwrap();
+
+    let (client, rx, _sheets) = spawn(DocumentSource::OpenFile(src.clone()));
+    let via_worker = dir.path().join("via_worker.xlsx");
+    client.send(Command::Save {
+        path: via_worker.clone(),
+        req_id: 12,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 12, .. })).is_some());
+
+    // Reference: the pre-P10 path — open the same file + plain save.
+    let via_plain = dir.path().join("via_plain.xlsx");
+    freecell_engine::WorkbookDocument::open(&src)
+        .unwrap()
+        .save(&via_plain)
+        .unwrap();
+
+    assert_eq!(
+        zip_entry_contents(&via_worker),
+        zip_entry_contents(&via_plain),
+        "a chartless workbook saves identically to the plain writer",
+    );
+    // And it carries no chart machinery.
+    assert!(zip_entry_contents(&via_worker)
+        .keys()
+        .all(|n| !n.starts_with("xl/charts/") && !n.starts_with("xl/drawings/")));
+}
+
+/// Spawn a worker over a chart fixture at a **kept-alive** temp path — the returned `TempDir` must
+/// outlive the client, because a chart-preserving save re-reads the original file (charts, drawings,
+/// content-types live there, not in the model). Waits until the charts are published on load.
+fn spawn_over_chart_file(
+    write: impl FnOnce(&std::path::Path),
+) -> (
+    DocumentClient,
+    WorkerEventReceiver,
+    Vec<SheetMeta>,
+    tempfile::TempDir,
+) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("book.xlsx");
+    write(&path);
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
+    poll_until(
+        || client.chart_snapshot().version >= 1,
+        "the worker discovers + publishes the file's charts on load",
+    );
+    (client, rx, sheets, dir)
+}
+
+/// The reopened chart's first value + owning sheet name, via grouped discovery.
+fn reopened_group_first_value(path: &std::path::Path, group: usize) -> (String, f64) {
+    let groups = freecell_engine::chart::discover_and_parse_by_sheet(path).unwrap();
+    let (name, charts) = &groups[group];
+    let v = match &charts[0].1.chart.series[0].data {
+        SeriesData::CategoryValue { values, .. } => values[0],
+        SeriesData::Xy { y, .. } => y[0],
+    };
+    (name.clone(), v)
+}
+
+/// P10 Critical fix: renaming a chart's host sheet in-session still SAVES (pre-P10 the plain save
+/// succeeded by dropping the chart; the first cut regressed to a total SaveFailed). The chart
+/// follows the rename onto the renamed worksheet and keeps its edited value.
+#[test]
+fn save_after_renaming_the_chart_host_sheet() {
+    let (client, rx, sheets, _keep) = spawn_over_chart_file(|p| {
+        freecell_engine::chart::authoring::write_line_fixture(p).unwrap()
+    });
+    let sheet = sheets[0].id;
+
+    // Edit B2 (feeds the line chart) while the sheet is still "Data" → the reflow lands.
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    client.send(set_input(sheet, 1, 1, "999"));
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0).first() == Some(&999.0),
+        "editing B2 re-resolves the line chart",
+    );
+
+    // Rename the host sheet, THEN save.
+    client.send(Command::RenameSheet {
+        sheet,
+        name: "Data2".to_string(),
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::SheetsChanged { .. })).is_some());
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("renamed.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 21,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 21, .. })).is_some());
+
+    // The chart is present on the RENAMED sheet, with the edited value.
+    freecell_engine::WorkbookDocument::open(&out_path).expect("saved workbook reopens");
+    assert_eq!(
+        reopened_group_first_value(&out_path, 0),
+        ("Data2".to_string(), 999.0)
+    );
+}
+
+/// P10 Critical fix: deleting a chart's host sheet in-session SAVES (no SaveFailed); that chart is
+/// dropped gracefully while charts on surviving sheets are preserved.
+#[test]
+fn save_after_deleting_the_chart_host_sheet_succeeds() {
+    let (client, rx, sheets, _keep) = spawn_over_chart_file(|p| {
+        freecell_engine::chart::authoring::write_two_sheet_fixture(p).unwrap()
+    });
+    // Two sheets: Data (column chart) + Summary (line chart). Delete Summary.
+    let summary = sheets.iter().find(|s| s.name == "Summary").unwrap().id;
+    client.send(Command::DeleteSheet { sheet: summary });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::SheetsChanged { .. })).is_some());
+
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("deleted.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 22,
+    });
+    // The save SUCCEEDS (not SaveFailed) despite the deleted chart-bearing sheet.
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 22, .. })).is_some());
+
+    // Only the surviving sheet's chart comes back.
+    freecell_engine::WorkbookDocument::open(&out_path).expect("saved workbook reopens");
+    let specs = freecell_engine::chart::discover_and_parse(&out_path).unwrap();
+    assert_eq!(specs.len(), 1);
+}
+
+/// P10 Moderate fix (arch §6, no silent chart drop): saving after editing a SUPPORTED chart must
+/// byte-preserve an UNSUPPORTED chart that lives alone on another sheet (it was never bound, but its
+/// host sheet survives) — driven through the worker's real `Command::Save`.
+#[test]
+fn save_preserves_an_unsupported_chart_on_a_surviving_sheet() {
+    let (client, rx, sheets, fixture_dir) = spawn_over_chart_file(|p| {
+        freecell_engine::chart::authoring::write_two_sheet_supported_plus_unsupported_fixture(p)
+            .unwrap()
+    });
+    let original = fixture_dir.path().join("book.xlsx");
+    let data = sheets.iter().find(|s| s.name == "Data").unwrap().id;
+
+    // Edit B2 (feeds the supported column chart on Data); wait for the reflow.
+    client.send(full_viewport(data));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    client.send(set_input(data, 1, 1, "999"));
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), data, 0, 0).first() == Some(&999.0),
+        "editing B2 re-resolves the supported chart",
+    );
+
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("mixed.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 24,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 24, .. })).is_some());
+
+    freecell_engine::WorkbookDocument::open(&out_path).expect("saved workbook reopens");
+    // The supported chart is present + patched.
+    assert_eq!(
+        reopened_group_first_value(&out_path, 0),
+        ("Data".to_string(), 999.0)
+    );
+    // The UNSUPPORTED chart on the OTHER sheet survived byte-identically (no silent drop).
+    assert_eq!(
+        freecell_engine::chart::xlsx::read_entry(&out_path, "xl/charts/chart2.xml").unwrap(),
+        freecell_engine::chart::xlsx::read_entry(&original, "xl/charts/chart2.xml").unwrap(),
+    );
+}
+
+/// P10: the chart save path keeps the plain path's atomicity — a failure (destination is an
+/// existing non-empty directory, so the rename fails) leaves that destination byte-identical and
+/// litters no temp file.
+#[test]
+fn chart_save_atomic_on_failure_leaves_destination_untouched() {
+    let (client, rx, _sheets, _keep) = spawn_over_chart_file(|p| {
+        freecell_engine::chart::authoring::write_line_fixture(p).unwrap()
+    });
+
+    let target_dir = tempdir().unwrap();
+    let target = target_dir.path().join("book.xlsx");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep.txt"), b"original").unwrap();
+
+    client.send(Command::Save {
+        path: target.clone(),
+        req_id: 23,
+    });
+    assert!(wait_for(&rx, |e| matches!(
+        e,
+        WorkerEvent::SaveFailed { req_id: 23, .. }
+    ))
+    .is_some());
+
+    assert!(target.is_dir());
+    assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"original");
+    // No temp-file litter beside the target.
+    let entries: Vec<_> = std::fs::read_dir(target_dir.path()).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+}

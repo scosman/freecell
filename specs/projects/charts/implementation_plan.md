@@ -54,7 +54,7 @@ those docs — this is the ordered checklist.
 - [x] **P9 — Live binding.** Parse `c:f`; range→chart index; re-resolve dirty charts on
   recompute and publish via the worker seam. *Exit:* editing a source cell re-renders the line
   chart; only intersecting charts recompute.
-- [ ] **P10 — Save / restore (source-first).** Byte-preserve unedited; **patch retained source**
+- [x] **P10 — Save / restore (source-first).** Byte-preserve unedited; **patch retained source**
   on reflow; multi-sheet part map; fail loudly on missing part. *Exit:* open→edit→save→reopen
   keeps the line chart in **Excel + LibreOffice**; untouched charts bit-stable.
 - [ ] **P11 — Line perf + baselines.** Lazy parse off open's critical path; off-screen free;

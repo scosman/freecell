@@ -12,7 +12,7 @@
 //! the command/event loop, caches, and `Publication` build land in Phases 4–5.
 
 use std::fs::File;
-use std::io::{self, BufWriter, ErrorKind, Read};
+use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
@@ -240,15 +240,7 @@ impl WorkbookDocument {
     /// `components/engine_worker.md §File I/O`).
     pub fn save(&self, path: &Path) -> Result<(), SaveError> {
         crate::instrument::record_engine_call();
-        let dir = destination_dir(path);
-
-        // Same-directory temp file → the final rename is a same-filesystem atomic op.
-        let temp = NamedTempFile::new_in(&dir).map_err(|e| {
-            SaveError::Io(format!(
-                "couldn't create a temporary file in {}: {e}",
-                dir.display()
-            ))
-        })?;
+        let temp = new_temp_beside(path)?;
 
         // Serialize the model into the temp file (buffered — the zip writer does many small
         // writes). `save_xlsx_to_writer` takes the writer by value and hands it back.
@@ -259,17 +251,18 @@ impl WorkbookDocument {
             .into_inner()
             .map_err(|e| SaveError::Io(e.to_string()))?;
 
-        // Flush data + metadata to disk BEFORE the rename makes the file visible at `path`.
-        temp.as_file()
-            .sync_all()
-            .map_err(|e| SaveError::Io(e.to_string()))?;
+        persist_atomically(temp, path)
+    }
 
-        // Atomic rename over the target. On failure the temp file (returned inside the
-        // error) drops and is cleaned up, and `path` is never touched.
-        temp.persist(path)
-            .map_err(|e| SaveError::Io(e.error.to_string()))?;
-
-        Ok(())
+    /// Serializes the current model to an in-memory `.xlsx` zip (IronCalc's chart-less writer
+    /// output) — the reinject base the chart-preserving save path (`worker::run`) splices the
+    /// original file's charts back into (charts/architecture §4.1, §5). Unlike [`save`](Self::save)
+    /// this does no disk I/O; the worker writes the reinjected bytes atomically.
+    pub(crate) fn to_xlsx_bytes(&self) -> Result<Vec<u8>, SaveError> {
+        crate::instrument::record_engine_call();
+        let cursor = save_xlsx_to_writer(self.model.get_model(), Cursor::new(Vec::new()))
+            .map_err(map_writer_error)?;
+        Ok(cursor.into_inner())
     }
 
     /// The workbook's sheet names, in workbook order.
@@ -1205,6 +1198,44 @@ fn destination_dir(path: &Path) -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+/// A fresh temp file in `path`'s destination directory — the staging file for an atomic save
+/// (same filesystem as the target, so the final rename is atomic).
+fn new_temp_beside(path: &Path) -> Result<NamedTempFile, SaveError> {
+    let dir = destination_dir(path);
+    NamedTempFile::new_in(&dir).map_err(|e| {
+        SaveError::Io(format!(
+            "couldn't create a temporary file in {}: {e}",
+            dir.display()
+        ))
+    })
+}
+
+/// Flushes `temp` to disk, then atomically renames it over `path`. On any failure `path` is left
+/// untouched (`functional_spec.md §5.2`): the temp file (returned inside the error) drops and is
+/// cleaned up. Shared by [`WorkbookDocument::save`] and [`write_xlsx_bytes_atomic`] so both save
+/// paths keep the identical durability contract.
+fn persist_atomically(temp: NamedTempFile, path: &Path) -> Result<(), SaveError> {
+    // Flush data + metadata to disk BEFORE the rename makes the file visible at `path`.
+    temp.as_file()
+        .sync_all()
+        .map_err(|e| SaveError::Io(e.to_string()))?;
+    temp.persist(path)
+        .map_err(|e| SaveError::Io(e.error.to_string()))?;
+    Ok(())
+}
+
+/// Atomically writes pre-serialized `.xlsx` `bytes` to `path` (temp file beside the target +
+/// fsync + rename) — the same durability contract as [`WorkbookDocument::save`], but for bytes
+/// the chart-preserving save path has already assembled (IronCalc body + re-injected charts).
+/// On any failure `path` is untouched.
+pub(crate) fn write_xlsx_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
+    let mut temp = new_temp_beside(path)?;
+    temp.write_all(bytes)
+        .map_err(|e| SaveError::Io(e.to_string()))?;
+    temp.flush().map_err(|e| SaveError::Io(e.to_string()))?;
+    persist_atomically(temp, path)
 }
 
 /// Classifies a file by its leading magic bytes so open failures can be typed precisely

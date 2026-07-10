@@ -671,6 +671,155 @@ fn unsupported_surface_chart() -> String {
     chart_space("Terrain", &group, false)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Two-sheet fixture (P10 — the multi-sheet save part map + chart→SheetId grouping)
+// ---------------------------------------------------------------------------------------------
+
+/// The two worksheet names in the two-sheet fixture, in workbook order.
+pub const TWO_SHEET_NAMES: [&str; 2] = ["Data", "Summary"];
+
+/// The two chart parts in the two-sheet fixture: `chart1` anchored on **Data**, `chart2` anchored
+/// on **Summary** (the association the save part map + grouped discovery must get right).
+pub const TWO_SHEET_CHART_PARTS: [&str; 2] = ["xl/charts/chart1.xml", "xl/charts/chart2.xml"];
+
+/// Writes a valid, IronCalc-openable **two-worksheet** `.xlsx` to `path`: sheet "Data" carries a
+/// column chart, sheet "Summary" a line chart, each on its own `<drawing>`. Exercises the P10
+/// multi-sheet save part map (sheet→drawing mapped by name across IronCalc's regenerated parts)
+/// and the chart→owning-sheet grouping. Both charts read the `Data` grid's cached values (a chart's
+/// data sheet is independent of the worksheet it is *anchored* on — what this fixture varies).
+pub fn write_two_sheet_fixture(path: &Path) -> Result<()> {
+    write_two_sheet(path, column_chart(), line_chart())
+}
+
+/// A two-sheet fixture whose two chart parts are **byte-identical** (both the column chart) — for
+/// the save wrong-patch test: two twins bound to different sheets must each be patched with their
+/// OWN live values, not the first XML match (charts/architecture §5).
+pub fn write_two_sheet_twin_charts_fixture(path: &Path) -> Result<()> {
+    write_two_sheet(path, column_chart(), column_chart())
+}
+
+/// A two-sheet fixture: a SUPPORTED column chart on "Data" (chart1) + an UNSUPPORTED surface chart
+/// alone on "Summary" (chart2, which the loader skips → never bound). For the save no-silent-drop
+/// test (architecture §6): editing Data and saving must **byte-preserve** Summary's unsupported
+/// chart (best-effort carry, its host sheet survives), not drop it.
+pub fn write_two_sheet_supported_plus_unsupported_fixture(path: &Path) -> Result<()> {
+    write_two_sheet(path, column_chart(), unsupported_surface_chart())
+}
+
+/// Writes a valid two-worksheet workbook ("Data" + "Summary"), each with its own drawing anchoring
+/// one chart part (`chart1_body` on Data, `chart2_body` on Summary).
+fn write_two_sheet(path: &Path, chart1_body: String, chart2_body: String) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut zw = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let parts: &[(&str, String)] = &[
+        ("[Content_Types].xml", two_sheet_content_types()),
+        ("_rels/.rels", root_rels()),
+        ("xl/workbook.xml", two_sheet_workbook()),
+        ("xl/_rels/workbook.xml.rels", two_sheet_workbook_rels()),
+        ("xl/styles.xml", styles()),
+        ("xl/sharedStrings.xml", shared_strings()),
+        ("xl/worksheets/sheet1.xml", worksheet()),
+        ("xl/worksheets/_rels/sheet1.xml.rels", sheet_drawing_rels(1)),
+        ("xl/worksheets/sheet2.xml", summary_worksheet()),
+        ("xl/worksheets/_rels/sheet2.xml.rels", sheet_drawing_rels(2)),
+        ("xl/drawings/drawing1.xml", one_chart_drawing(5, 0, 15, 10)),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels",
+            one_chart_drawing_rels(1),
+        ),
+        ("xl/drawings/drawing2.xml", one_chart_drawing(5, 0, 15, 10)),
+        (
+            "xl/drawings/_rels/drawing2.xml.rels",
+            one_chart_drawing_rels(2),
+        ),
+        ("xl/charts/chart1.xml", chart1_body),
+        ("xl/charts/chart2.xml", chart2_body),
+    ];
+    for (name, body) in parts {
+        zw.start_file(*name, opts)
+            .with_context(|| format!("starting zip entry {name}"))?;
+        zw.write_all(body.as_bytes())
+            .with_context(|| format!("writing zip entry {name}"))?;
+    }
+    zw.finish().context("finishing two-sheet fixture zip")?;
+    Ok(())
+}
+
+fn two_sheet_content_types() -> String {
+    format!(
+        r#"{DECL}
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="xml" ContentType="application/xml"/>
+ <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+ <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+ <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+ <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+ <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+ <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+ <Override PartName="/xl/drawings/drawing2.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+ <Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+ <Override PartName="/xl/charts/chart2.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+</Types>"#
+    )
+}
+
+fn two_sheet_workbook() -> String {
+    format!(
+        r#"{DECL}
+<workbook xmlns="{NS_MAIN}" xmlns:r="{NS_REL}">
+ <sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Summary" sheetId="2" r:id="rId2"/></sheets>
+</workbook>"#
+    )
+}
+
+fn two_sheet_workbook_rels() -> String {
+    format!(
+        r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="{NS_REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{NS_REL}/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="{NS_REL}/styles" Target="styles.xml"/><Relationship Id="rId4" Type="{NS_REL}/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#
+    )
+}
+
+/// The "Summary" worksheet: a minimal grid (so IronCalc accepts it) plus a `<drawing r:id="rId1"/>`
+/// anchoring its chart.
+fn summary_worksheet() -> String {
+    format!(
+        r#"{DECL}
+<worksheet xmlns="{NS_MAIN}" xmlns:r="{NS_REL}"><dimension ref="A1"/><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/><sheetData/><drawing r:id="rId1"/></worksheet>"#
+    )
+}
+
+/// A worksheet `_rels` pointing its `rId1` `<drawing>` at `../drawings/drawing{n}.xml`.
+fn sheet_drawing_rels(n: u32) -> String {
+    format!(
+        r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="{NS_REL}/drawing" Target="../drawings/drawing{n}.xml"/></Relationships>"#
+    )
+}
+
+/// A single-frame drawing whose one `twoCellAnchor` references the drawing's `rId1` chart.
+fn one_chart_drawing(from_row: u32, from_col: u32, to_row: u32, to_col: u32) -> String {
+    format!(
+        r#"{DECL}
+<xdr:wsDr xmlns:xdr="{NS_XDR}" xmlns:a="{NS_A}">
+ {frame}
+</xdr:wsDr>"#,
+        frame = anchor(1, from_row, from_col, to_row, to_col),
+    )
+}
+
+/// A drawing `_rels` pointing its `rId1` chart at `../charts/chart{n}.xml`.
+fn one_chart_drawing_rels(n: u32) -> String {
+    format!(
+        r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="{NS_REL}/chart" Target="../charts/chart{n}.xml"/></Relationships>"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,6 +908,31 @@ mod tests {
         // invisible to IronCalc — it has no chart model).
         assert_eq!(model.workbook.worksheets.len(), 1);
         assert_eq!(model.workbook.worksheets[0].name, "Data");
+    }
+
+    /// The two-sheet fixture is a valid workbook IronCalc opens, with both named worksheets and a
+    /// chart on each (the multi-sheet save/anchor coverage, P10).
+    #[test]
+    fn two_sheet_fixture_loads_in_ironcalc_with_both_charts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_sheet.xlsx");
+        write_two_sheet_fixture(&path).unwrap();
+
+        let model =
+            ironcalc::import::load_from_xlsx(path.to_str().unwrap(), "en", "UTC", "en").unwrap();
+        let names: Vec<&str> = model
+            .workbook
+            .worksheets
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(names, TWO_SHEET_NAMES);
+
+        // Both drawings/charts are discoverable (one per sheet).
+        let charts = load_charts_from_xlsx(&path).unwrap();
+        assert_eq!(charts.len(), 2);
+        assert!(matches!(charts[0].kind, ChartKind::Bar { .. }));
+        assert!(matches!(charts[1].kind, ChartKind::Line { .. }));
     }
 
     /// The line fixture (with its chart `_rels` + colors/style aux parts) is also a valid

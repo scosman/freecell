@@ -38,7 +38,7 @@ use freecell_chart_model::{
 
 use super::chrome::chart_frame;
 use super::style::{
-    hsla, resolve_series_hsla, AXIS_STROKE, AXIS_TITLE_TEXT, GRID_STROKE, MUTED_TEXT,
+    hsla, resolve_series_hsla, with_alpha, AXIS_STROKE, AXIS_TITLE_TEXT, GRID_STROKE, MUTED_TEXT,
 };
 use super::ticks::{format_tick, NiceScale};
 
@@ -53,8 +53,15 @@ const PLOT_RIGHT_GAP: f32 = 16.0;
 const POINT_INSET: f32 = 10.0;
 /// Roughly how many value-axis ticks to aim for.
 const TARGET_TICKS: usize = 5;
-/// Line stroke width.
-const LINE_WIDTH: f32 = 2.0;
+/// Default series line weight in **points** when a series carries no `a:ln@w` — Excel's default
+/// line-series weight (`a:ln w="28440"` ≈ 2.25pt), visibly heavier than a gridline (P13, obs. B).
+const DEFAULT_LINE_WIDTH_PT: f32 = 2.25;
+/// Points → device px for line weights at the chart render scale. Chosen so the Excel-default
+/// 2.25pt reads as a clearly heavy ~2.7px stroke against the thin gridlines.
+const PT_TO_PX: f32 = 1.2;
+/// Clamp range for a resolved line width in px (a hostile `a:ln@w` can't produce a hairline or a slab).
+const MIN_LINE_PX: f32 = 1.0;
+const MAX_LINE_PX: f32 = 8.0;
 /// Default marker diameter — also the round dot drawn when a series specifies no marker.
 const DOT_SIZE: f32 = 6.0;
 /// Stroke width for the open-shape markers (plus / x / dash).
@@ -71,16 +78,24 @@ const LABEL_SWATCH: f32 = 8.0;
 /// Gap between the legend-key swatch and the label text.
 const LABEL_SWATCH_GAP: f32 = 3.0;
 
-/// One line: its per-category values, its resolved color, its marker (already resolved from the
-/// series' explicit color/theme reference or the palette cycle, and its `c:marker`), its data
-/// labels (`c:dLbls`, P12), and its name (for the series-name label part).
+/// One line: its per-category values, its resolved color (the series' `a:ln`/fill/theme/palette
+/// color with any `a:ln` alpha applied, P13), its resolved stroke **width** in px (from `a:ln@w`,
+/// else the Excel-like default, P13), its marker (`c:marker`, P6), its data labels (`c:dLbls`, P12),
+/// and its name (for the series-name label part).
 #[derive(Clone)]
 struct LineSeries {
     values: Vec<f64>,
     color: Hsla,
+    width_px: f32,
     marker: Option<Marker>,
     data_labels: Option<DataLabels>,
     name: Option<String>,
+}
+
+/// Resolve a series' `a:ln@w` (in points) to a clamped device-px stroke width, falling back to the
+/// Excel-like default weight when the series carries no explicit width (P13).
+fn line_width_px(width_pt: Option<f32>) -> f32 {
+    (width_pt.unwrap_or(DEFAULT_LINE_WIDTH_PT) * PT_TO_PX).clamp(MIN_LINE_PX, MAX_LINE_PX)
 }
 
 /// A multi-series line plot over the raw `Line` primitive with ONE shared value scale
@@ -89,12 +104,20 @@ struct LineSeries {
 pub struct LinePlot {
     categories: Vec<SharedString>,
     series: Vec<LineSeries>,
-    /// The single value domain shared by every series (the union of all their values, nice-d).
+    /// The single value domain shared by every series (the union of all their values, nice-d, then
+    /// clamped to any explicit `c:scaling` min/max, P13).
     scale: NiceScale,
     /// Whether to draw curved (`c:smooth`) rather than straight segments.
     smooth: bool,
     /// The value-axis `c:numFmt` format code, applied to tick labels when present.
     value_format: Option<String>,
+    /// Value axis reversed (`c:scaling/c:orientation val="maxMin"`) — max at the bottom (P13).
+    value_reversed: bool,
+    /// Category axis reversed — categories run right→left (P13).
+    category_reversed: bool,
+    /// Draw the value-axis major gridlines (`c:majorGridlines`; the line renderer's gridlines are
+    /// horizontal, off the value axis). `false` suppresses them (P13).
+    major_gridlines: bool,
 }
 
 impl LinePlot {
@@ -119,9 +142,18 @@ impl LinePlot {
             if categories.is_none() {
                 categories = Some(cats.iter().map(|c| c.label().into()).collect());
             }
+            // The line color prefers the `a:ln` stroke color, then the series fill/theme color, then
+            // the palette cycle; any `a:ln` alpha is applied to it. The width comes from `a:ln@w`.
+            let stroke = s.stroke;
+            let base = resolve_series_hsla(stroke.and_then(|st| st.color).or(s.color), i);
+            let color = match stroke.and_then(|st| st.alpha) {
+                Some(alpha) => with_alpha(base, alpha),
+                None => base,
+            };
             series.push(LineSeries {
                 values: values.clone(),
-                color: resolve_series_hsla(s.color, i),
+                color,
+                width_px: line_width_px(stroke.and_then(|st| st.width_pt)),
                 marker: s.marker,
                 data_labels: s.data_labels.clone(),
                 name: s.name.clone(),
@@ -133,12 +165,14 @@ impl LinePlot {
             return None;
         }
 
-        // The SHARED value domain: nice-d over the union of EVERY series' values, so all lines
-        // are drawn against one scale and their heights compare directly.
+        // The SHARED value domain: nice-d over the union of EVERY series' values (so all lines are
+        // drawn against one scale and their heights compare directly), then clamped to any explicit
+        // `c:scaling` min/max the value axis carries (P13).
         let scale = NiceScale::spanning(
             series.iter().flat_map(|s| s.values.iter().copied()),
             TARGET_TICKS,
-        );
+        )
+        .bounded(chart.val_axis.min, chart.val_axis.max, TARGET_TICKS);
 
         Some(Self {
             categories,
@@ -146,6 +180,9 @@ impl LinePlot {
             scale,
             smooth,
             value_format: chart.val_axis.number_format.clone(),
+            value_reversed: chart.val_axis.reversed,
+            category_reversed: chart.cat_axis.reversed,
+            major_gridlines: chart.val_axis.major_gridlines,
         })
     }
 
@@ -312,27 +349,43 @@ impl Plot for LinePlot {
             self.categories.clone(),
             vec![plot_left + POINT_INSET, plot_right - POINT_INSET],
         );
-        // Precompute each category's x pixel once and share it across every series.
+        // Precompute each category's x pixel once and share it across every series. A reversed
+        // category axis mirrors each x about the center of the point range, so categories run
+        // right→left (labels + line follow the same mirrored xs, so they stay in sync) (P13).
+        let (inset_left, inset_right) = (plot_left + POINT_INSET, plot_right - POINT_INSET);
         let xs: Vec<f32> = self
             .categories
             .iter()
-            .map(|c| point_scale.tick(c).unwrap_or(plot_left))
+            .map(|c| {
+                let x = point_scale.tick(c).unwrap_or(plot_left);
+                if self.category_reversed {
+                    inset_left + inset_right - x
+                } else {
+                    x
+                }
+            })
             .collect();
 
-        // Value axis: the ONE shared nice domain -> pixel range (inverted: min at the bottom).
-        let value_scale = ScaleLinear::new(
-            vec![self.scale.min, self.scale.max],
-            vec![plot_bottom, plot_top],
-        );
+        // Value axis: the ONE shared nice domain -> pixel range. Normally inverted (min at the
+        // bottom); a reversed value axis (`c:orientation maxMin`) puts max at the bottom (P13).
+        let value_range = if self.value_reversed {
+            vec![plot_top, plot_bottom]
+        } else {
+            vec![plot_bottom, plot_top]
+        };
+        let value_scale = ScaleLinear::new(vec![self.scale.min, self.scale.max], value_range);
         let ticks = self.scale.ticks();
 
-        // Gridlines at each nice tick (horizontal, for the value axis).
-        let grid_ys: Vec<f32> = ticks.iter().filter_map(|t| value_scale.tick(t)).collect();
-        Grid::new()
-            .stroke(hsla(GRID_STROKE))
-            .dash_array(&[px(4.), px(2.)])
-            .y(grid_ys)
-            .paint(&bounds, window);
+        // Gridlines at each nice tick (horizontal, for the value axis) — only when the value axis
+        // carries `c:majorGridlines` (P13; Excel's default line chart does).
+        if self.major_gridlines {
+            let grid_ys: Vec<f32> = ticks.iter().filter_map(|t| value_scale.tick(t)).collect();
+            Grid::new()
+                .stroke(hsla(GRID_STROKE))
+                .dash_array(&[px(4.), px(2.)])
+                .y(grid_ys)
+                .paint(&bounds, window);
+        }
 
         // Axes + labels: value labels left of the value axis (formatted through the axis numFmt
         // when present), category labels below the baseline.
@@ -377,7 +430,7 @@ impl Plot for LinePlot {
                     v.is_finite().then(|| scale_for_line.tick(&v)).flatten()
                 })
                 .stroke(stroke)
-                .stroke_width(px(LINE_WIDTH))
+                .stroke_width(px(s.width_px))
                 .stroke_style(stroke_style)
                 .paint(&bounds, window);
 
@@ -528,7 +581,7 @@ pub fn line_element(chart: &Chart) -> Option<gpui::AnyElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freecell_chart_model::{Axis, Category, Grouping, Legend, Series};
+    use freecell_chart_model::{Axis, Category, Color, Grouping, Legend, LineStroke, Series};
 
     fn q_categories() -> Vec<Category> {
         vec![
@@ -715,6 +768,89 @@ mod tests {
             plot.series[0].color, expected,
             "a schemeClr=accent1 series must resolve to the Office accent1 color"
         );
+    }
+
+    #[test]
+    fn explicit_bounds_override_the_shared_scale() {
+        // A value axis with explicit min/max clamps the shared domain to exactly those bounds
+        // (P13), overriding the auto nice-scale that would otherwise zoom to the data.
+        let mut chart = three_series_line();
+        chart.val_axis = Axis::titled("Units").with_bounds(Some(0.0), Some(200.0));
+        let plot = LinePlot::multi_series(&chart).expect("plot");
+        assert_eq!(plot.scale.min, 0.0);
+        assert_eq!(plot.scale.max, 200.0);
+
+        // With no explicit bounds the scale auto-ranges to the data (min > 0 here, data floor 32).
+        let auto = LinePlot::multi_series(&three_series_line()).expect("plot");
+        assert!(auto.scale.min > 0.0, "auto scale zooms to the data");
+    }
+
+    #[test]
+    fn axis_orientation_and_gridline_flags_carry_from_the_model() {
+        // Defaults: not reversed, major gridlines on (Excel value-axis default).
+        let plot = LinePlot::multi_series(&three_series_line()).expect("plot");
+        assert!(!plot.value_reversed && !plot.category_reversed);
+        assert!(plot.major_gridlines);
+
+        let mut chart = three_series_line();
+        chart.val_axis = Axis::titled("Units").reversed().without_major_gridlines();
+        chart.cat_axis = Axis::titled("Quarter").reversed();
+        let plot = LinePlot::multi_series(&chart).expect("plot");
+        assert!(plot.value_reversed, "valAx maxMin → value axis reversed");
+        assert!(
+            plot.category_reversed,
+            "catAx maxMin → category axis reversed"
+        );
+        assert!(
+            !plot.major_gridlines,
+            "no majorGridlines → gridlines suppressed"
+        );
+    }
+
+    #[test]
+    fn stroke_width_honors_a_ln_and_defaults_heavier() {
+        // A series with no `a:ln` uses the Excel-like default weight (2.25pt → ~2.7px).
+        let plain = LinePlot::multi_series(&three_series_line()).expect("plot");
+        let expected_default = DEFAULT_LINE_WIDTH_PT * PT_TO_PX;
+        assert!((plain.series[0].width_px - expected_default).abs() < 1e-3);
+        assert!(
+            plain.series[0].width_px > 2.0,
+            "default line is heavier than the old 2.0px hairline"
+        );
+
+        // A series carrying `a:ln w="28440"` (~2.24pt) resolves to ~2.24pt × PT_TO_PX px.
+        let mut chart = three_series_line();
+        chart.series[0] = chart.series[0]
+            .clone()
+            .with_stroke(LineStroke::new().with_width_emu(28_440));
+        let styled = LinePlot::multi_series(&chart).expect("plot");
+        let expected = 2.24 * PT_TO_PX;
+        assert!(
+            (styled.series[0].width_px - expected).abs() < 0.05,
+            "w=28440 should map to ~{expected}px, got {}",
+            styled.series[0].width_px
+        );
+    }
+
+    #[test]
+    fn stroke_color_and_alpha_apply_to_the_line() {
+        let mut chart = three_series_line();
+        chart.series[0] = chart.series[0].clone().with_stroke(
+            LineStroke::new()
+                .with_color(Color::from_hex(0x123456))
+                .with_alpha(0.4),
+        );
+        let plot = LinePlot::multi_series(&chart).expect("plot");
+        // The stroke color wins over the palette, and the alpha rides on the resolved Hsla.
+        let expected = with_alpha(
+            super::super::style::model_hsla(Color::from_hex(0x123456)),
+            0.4,
+        );
+        assert_eq!(plot.series[0].color, expected);
+        assert!((plot.series[0].color.a - 0.4).abs() < 1e-6);
+
+        // A series with no stroke stays fully opaque on its palette color.
+        assert!((plot.series[1].color.a - 1.0).abs() < 1e-6);
     }
 
     #[test]

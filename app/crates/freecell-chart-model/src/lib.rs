@@ -30,6 +30,7 @@ mod label;
 mod marker;
 mod numfmt;
 mod spec;
+mod stroke;
 mod theme;
 
 pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
@@ -37,13 +38,15 @@ pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};
 pub use numfmt::apply_number_format;
 pub use spec::{Anchor, AnchorCell, CfRange, ChartSpec, Origin, SourcePart, SourceXml};
+pub use stroke::LineStroke;
 pub use theme::{ChartColor, ThemePalette, ThemeSlot};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
 ///
 /// This is the concrete resolved color. Theme-slot references (`<a:schemeClr>`) and their
 /// `lumMod`/`lumOff` tints are modeled by [`ChartColor`] (P6), which resolves to a [`Color`]
-/// against a [`ThemePalette`]; alpha is still out of scope (P13).
+/// against a [`ThemePalette`]; opacity (`a:alpha`) rides on the [`LineStroke`] that carries a color
+/// (P13), applied by the renderer, rather than on this opaque RGB triple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -167,6 +170,9 @@ pub struct Series {
     pub color: Option<ChartColor>,
     pub marker: Option<Marker>,
     pub data_labels: Option<DataLabels>,
+    /// `c:spPr/a:ln` — the series line's stroke (width / color / alpha, P13); `None` leaves the
+    /// renderer's Excel-like default weight in the series/palette color.
+    pub stroke: Option<LineStroke>,
 }
 
 impl Series {
@@ -182,6 +188,7 @@ impl Series {
             color: None,
             marker: None,
             data_labels: None,
+            stroke: None,
         }
     }
 
@@ -193,6 +200,7 @@ impl Series {
             color: None,
             marker: None,
             data_labels: None,
+            stroke: None,
         }
     }
 
@@ -215,6 +223,12 @@ impl Series {
         self
     }
 
+    /// Set the series' line stroke (`c:spPr/a:ln`, builder style).
+    pub fn with_stroke(mut self, stroke: LineStroke) -> Self {
+        self.stroke = Some(stroke);
+        self
+    }
+
     /// Number of data points in this series.
     pub fn len(&self) -> usize {
         match &self.data {
@@ -228,35 +242,94 @@ impl Series {
     }
 }
 
-/// An axis — its title (`c:valAx` / `c:catAx` `c:title`) and its number format (`c:numFmt`
-/// `formatCode`, applied to tick labels, P6). The scale/tick generation is the renderer's business
-/// (functional_spec §2); `number_format` only governs how each tick number is *rendered*
-/// ([`apply_number_format`]).
-#[derive(Clone, Debug, Default, PartialEq)]
+/// An axis — its title (`c:valAx` / `c:catAx` `c:title`), number format (`c:numFmt`
+/// `formatCode`, applied to tick labels, P6), scaling bounds/orientation (`c:scaling`, P13), and
+/// gridline toggles (`c:majorGridlines` / `c:minorGridlines`, P13). The scale/tick generation is the
+/// renderer's business (functional_spec §2); the fields here only *modulate* it —
+/// `number_format` governs how each tick number is *rendered* ([`apply_number_format`]), `min`/`max`
+/// override the auto-computed domain, `reversed` flips the axis direction, and the gridline flags
+/// gate whether the renderer draws them.
+///
+/// The line renderer reads the **value axis** gridline flags (its gridlines are horizontal, off the
+/// value axis) and both axes' `min`/`max`/`reversed`. A category axis' gridline flags are modeled for
+/// round-trip/fidelity but unused by the line renderer (it draws no vertical gridlines).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Axis {
     pub title: Option<String>,
     /// The `c:numFmt` format code (e.g. `"0%"`, `"$#,##0"`); `None` = general number formatting.
     pub number_format: Option<String>,
+    /// `c:scaling/c:min` — an explicit axis minimum; `None` = auto (nice-scale computed).
+    pub min: Option<f64>,
+    /// `c:scaling/c:max` — an explicit axis maximum; `None` = auto.
+    pub max: Option<f64>,
+    /// `c:scaling/c:orientation val="maxMin"` — the axis runs high→low (reversed). `false` = the
+    /// default `minMax` (low→high).
+    pub reversed: bool,
+    /// `c:majorGridlines` present — draw major gridlines. Defaults to `true` (Excel's value-axis
+    /// default, and the pre-P13 always-on behavior); a file with no `c:majorGridlines` parses `false`.
+    pub major_gridlines: bool,
+    /// `c:minorGridlines` present. Defaults to `false` (Excel rarely emits them). The line renderer
+    /// does **not** draw minor gridlines yet, so an authored `c:minorGridlines` is classified
+    /// [`Degraded`](crate::Fidelity::Degraded) (honestly badged, not silently dropped — fidelity.rs
+    /// `unsupported_minor_gridlines`) rather than rendered; the flag still round-trips.
+    pub minor_gridlines: bool,
+}
+
+impl Default for Axis {
+    fn default() -> Self {
+        Self {
+            title: None,
+            number_format: None,
+            min: None,
+            max: None,
+            reversed: false,
+            major_gridlines: true,
+            minor_gridlines: false,
+        }
+    }
 }
 
 impl Axis {
     pub fn untitled() -> Self {
-        Self {
-            title: None,
-            number_format: None,
-        }
+        Self::default()
     }
 
     pub fn titled(title: impl Into<String>) -> Self {
         Self {
             title: Some(title.into()),
-            number_format: None,
+            ..Self::default()
         }
     }
 
     /// Set the axis tick number format (`c:numFmt` format code, builder style).
     pub fn with_number_format(mut self, format_code: impl Into<String>) -> Self {
         self.number_format = Some(format_code.into());
+        self
+    }
+
+    /// Set explicit scaling bounds (`c:scaling/c:min` + `c:max`, builder style). Either may be
+    /// `None` to leave that end auto-scaled.
+    pub fn with_bounds(mut self, min: Option<f64>, max: Option<f64>) -> Self {
+        self.min = min;
+        self.max = max;
+        self
+    }
+
+    /// Mark the axis reversed (`c:orientation val="maxMin"`, builder style).
+    pub fn reversed(mut self) -> Self {
+        self.reversed = true;
+        self
+    }
+
+    /// Turn off major gridlines (a file with no `c:majorGridlines`, builder style).
+    pub fn without_major_gridlines(mut self) -> Self {
+        self.major_gridlines = false;
+        self
+    }
+
+    /// Turn on minor gridlines (`c:minorGridlines`, builder style).
+    pub fn with_minor_gridlines(mut self) -> Self {
+        self.minor_gridlines = true;
         self
     }
 }
@@ -377,6 +450,53 @@ mod tests {
         let ax = Axis::titled("Revenue").with_number_format("$#,##0");
         assert_eq!(ax.title.as_deref(), Some("Revenue"));
         assert_eq!(ax.number_format.as_deref(), Some("$#,##0"));
+    }
+
+    #[test]
+    fn axis_scaling_builder_and_defaults() {
+        // Defaults: no bounds, not reversed, major gridlines ON (Excel value-axis default), minor OFF.
+        let d = Axis::untitled();
+        assert_eq!((d.min, d.max), (None, None));
+        assert!(!d.reversed);
+        assert!(d.major_gridlines, "major gridlines default on");
+        assert!(!d.minor_gridlines, "minor gridlines default off");
+        // `titled` shares the same defaults.
+        assert!(Axis::titled("V").major_gridlines);
+
+        // Builders compose without disturbing unrelated fields.
+        let ax = Axis::titled("V")
+            .with_bounds(Some(0.0), Some(100.0))
+            .reversed()
+            .without_major_gridlines()
+            .with_minor_gridlines();
+        assert_eq!((ax.min, ax.max), (Some(0.0), Some(100.0)));
+        assert!(ax.reversed);
+        assert!(!ax.major_gridlines);
+        assert!(ax.minor_gridlines);
+        assert_eq!(ax.title.as_deref(), Some("V"));
+
+        // A half-open bound leaves the other end auto.
+        let half = Axis::untitled().with_bounds(None, Some(50.0));
+        assert_eq!((half.min, half.max), (None, Some(50.0)));
+    }
+
+    #[test]
+    fn series_carries_line_stroke() {
+        let base = Series::category_value(Some("s"), vec![], vec![]);
+        assert_eq!(base.stroke, None, "constructors default stroke to None");
+        let styled = base.with_stroke(
+            LineStroke::new()
+                .with_width_emu(28_440)
+                .with_color(Color::from_hex(0x4A7EBB))
+                .with_alpha(0.6),
+        );
+        let stroke = styled.stroke.expect("stroke set");
+        assert!((stroke.width_pt.unwrap() - 2.24).abs() < 0.01);
+        assert_eq!(
+            stroke.color,
+            Some(ChartColor::Rgb(Color::from_hex(0x4A7EBB)))
+        );
+        assert_eq!(stroke.alpha, Some(0.6));
     }
 
     /// The model "round-trips" in the sense that a chart built through the public API

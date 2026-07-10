@@ -72,7 +72,7 @@ reusable infra the types then inherit. (Type-specific fills/labels land with eac
 
 - [x] **P12 — Data labels & number formats.** `c:dLbls` (val/percent/cat/legendKey) + `numFmt`,
   exercised on line. *Exit:* baselines; the accessor's unsupported set shrinks accordingly.
-- [ ] **P13 — Axis breadth & line styling.** `scaling` min/max, reversed, gridline toggles;
+- [x] **P13 — Axis breadth & line styling.** `scaling` min/max, reversed, gridline toggles;
   `a:ln` stroke width/color; alpha; legend positions. *Exit:* baselines.
 - [ ] **P14 — Robustness on real files (line + graceful degrade).** A real Excel/LibreOffice
   corpus loads without breakage; line charts render; every *other* type degrades to

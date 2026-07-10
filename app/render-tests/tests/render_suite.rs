@@ -321,6 +321,13 @@ chart_render_cases! {
     // labels / share-of-total (chart_line_percent_labels), and composed series+category+value
     // labels with a legend-key swatch (chart_line_named_labels).
     chart_line_value_labels, chart_line_percent_labels, chart_line_named_labels,
+    // P13 — axis breadth & line styling: reversed category axis (chart_line_reversed), explicit
+    // value-axis min/max scaling (chart_line_scaled), gridlines-off (chart_line_no_gridlines),
+    // `a:ln` width/color/alpha styling (chart_line_styled), and a bottom-placed legend
+    // (chart_line_legend_bottom). These also carry the tuned fonts + the true-rotated value-axis
+    // title (P13 observations A/B), which move every existing chart_line_* baseline.
+    chart_line_reversed, chart_line_scaled, chart_line_no_gridlines, chart_line_styled,
+    chart_line_legend_bottom,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

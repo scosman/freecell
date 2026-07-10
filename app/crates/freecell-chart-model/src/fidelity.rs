@@ -31,10 +31,11 @@
 //! not-yet-supported degrades the chart. The set is deliberately curated to fire **only when a
 //! feature is actually active** — benign/default forms (a `General` number format, a `minMax`
 //! orientation, an all-zero `dLbls`) must **not** raise a false warning (architecture §3.3).
-//! Excluded on the same grounds: the `scaling` wrapper (always present), gridline toggles (we
-//! draw gridlines anyway), `varyColors` (matches our palette), `gapWidth`/`overlap`/`firstSliceAng`
-//! (written at defaults on nearly every bar/pie), and `schemeClr` (a theme reference we now
-//! resolve to a color, P6).
+//! Excluded on the same grounds: the `scaling` wrapper (always present), the **major**-gridline
+//! toggle (`c:majorGridlines` — the line renderer honors it, P13, so its presence *or absence*
+//! renders as authored; **minor** gridlines are a different story — see below), `varyColors`
+//! (matches our palette), `gapWidth`/`overlap`/`firstSliceAng` (written at defaults on nearly every
+//! bar/pie), and `schemeClr` (a theme reference we now resolve to a color, P6).
 //!
 //! **Auto-dropped / scoped as support arrives.** `smooth` (curved lines) **renders faithfully as
 //! of P6** (on `lineChart`, the only group that draws it), so it left this set. `c:marker` symbols
@@ -50,6 +51,14 @@
 //! scientific / fractions / multi-section / conditional — see
 //! [`renders_faithfully`](crate::numfmt::renders_faithfully)) still warns. Entries auto-drop /
 //! re-scope with no separate bookkeeping (architecture §3.3).
+//!
+//! **Partially-honored features degrade on their *un*-rendered variants (P13).** The line renderer
+//! draws a **plain solid** `a:ln` (width / color / alpha) and **major** gridlines, but not every
+//! variant, so the un-rendered ones keep their honest badge rather than silently misleading
+//! (functional_spec §5): a non-solid line stroke — a preset/custom dash or a compound line — renders
+//! as a solid line ([`unsupported_line_stroke`]), and an authored `c:minorGridlines` renders without
+//! its minor lines ([`unsupported_minor_gridlines`]). Both are line-scoped, like the scaling/marker/
+//! label features above.
 
 /// How faithfully the renderer can draw a chart, derived from its model + retained source
 /// (charts/functional_spec §5, architecture §3.3). Consumed by the render/UI layer (P8):
@@ -110,16 +119,17 @@ const UNSUPPORTED_CHART_GROUPS: &[&str] = &[
 ///   only where a non-solid fill is *actually used* — a reliable "we can't draw this" signal —
 ///   whereas `schemeClr` is a pervasive solid-color reference throughout text/chrome that we
 ///   *do* resolve to a color, so its presence is not by itself a fidelity loss.
-/// - `c:min` / `c:max` — explicit axis-scaling bounds (written only when set).
 ///
-/// The value-aware / context-scoped features (`numFmt` codes we approximate, reversed
-/// `orientation`, `dLbls` toggles line-scoped, the line-scoped marker check, and per-point `dLbl`
-/// overrides) need their value/context inspected and are handled by dedicated detectors below.
-/// `c:smooth` left the set entirely in P6 (rendered on line, and line is the only group that draws
-/// it); `c:marker` and shown `c:dLbls` are now **scoped** — Faithful on a `lineChart` (P6 renders
-/// every symbol, P12 draws labels) but still degrading on a non-line group (see
-/// [`unsupported_marker`] / [`unsupported_data_labels`]).
-const RENDER_AFFECTING_PRESENCE_MARKERS: &[&str] = &["dPt", "gradFill", "pattFill", "min", "max"];
+/// The value-aware / context-scoped features (`numFmt` codes we approximate, axis `scaling`
+/// min/max/reversed line-scoped, `dLbls` toggles line-scoped, the line-scoped marker check, and
+/// per-point `dLbl` overrides) need their value/context inspected and are handled by dedicated
+/// detectors below. `c:smooth` left the set entirely in P6 (rendered on line, and line is the only
+/// group that draws it); `c:marker` and shown `c:dLbls` are now **scoped** — Faithful on a
+/// `lineChart` (P6 renders every symbol, P12 draws labels) but still degrading on a non-line group
+/// (see [`unsupported_marker`] / [`unsupported_data_labels`]). `c:min`/`c:max` and the reversed
+/// `orientation` left the presence set in **P13**: the line renderer now honors axis scaling, so
+/// they are line-scoped in [`unsupported_axis_scaling`].
+const RENDER_AFFECTING_PRESENCE_MARKERS: &[&str] = &["dPt", "gradFill", "pattFill"];
 
 /// Map a **3-D** chart-group element local-name to its **2-D** equivalent element local-name
 /// (charts/functional_spec §5): `bar3DChart→barChart`, `line3DChart→lineChart`,
@@ -184,7 +194,9 @@ fn has_render_affecting_unsupported_feature(xml: &str) -> bool {
     RENDER_AFFECTING_PRESENCE_MARKERS
         .iter()
         .any(|marker| contains_element(xml, marker))
-        || axis_reversed(xml)
+        || unsupported_axis_scaling(xml)
+        || unsupported_minor_gridlines(xml)
+        || unsupported_line_stroke(xml)
         || unsupported_number_format(xml)
         || unsupported_data_labels(xml)
         || unsupported_marker(xml)
@@ -197,8 +209,63 @@ fn is_extended_chart(xml: &str) -> bool {
     xml.contains("chartex")
 }
 
-/// `c:orientation val="maxMin"` — a reversed axis we don't honor. The default `minMax` is
-/// benign and present on essentially every axis.
+/// Axis `c:scaling` features the renderer honors only on a **line** chart (P13): explicit
+/// `c:min`/`c:max` bounds and a reversed `c:orientation val="maxMin"`. On a `lineChart` the renderer
+/// applies all three, so they are Faithful; on a group whose renderer ignores scaling
+/// (bar/area/pie/scatter — their phases are P16+) any of them still renders wrong → Degraded. The
+/// default `minMax` orientation and an absent min/max are benign (present on essentially every
+/// axis), so only the *active* forms are inspected. Same textual-classifier combo caveat as
+/// [`unsupported_marker`]: a combo part holding a `lineChart` treats scaling on the other group as
+/// Faithful (revisit with real multi-group parsing).
+fn unsupported_axis_scaling(xml: &str) -> bool {
+    if is_line_chart(xml) {
+        return false;
+    }
+    axis_reversed(xml) || contains_element(xml, "min") || contains_element(xml, "max")
+}
+
+/// `c:minorGridlines` on a **line** chart (P13). The line renderer draws only **major** gridlines,
+/// so an authored minor-gridline set renders without its lines → Degraded. Major-gridline on/off
+/// stays Faithful (honored). Line-scoped like the other P13 axis features; `c:minorGridlines` is
+/// written only when authored (Excel omits it by default), so its presence is a safe active-trigger.
+fn unsupported_minor_gridlines(xml: &str) -> bool {
+    is_line_chart(xml) && contains_element(xml, "minorGridlines")
+}
+
+/// A series line stroke style the renderer does not draw (P13). The line renderer paints a **plain
+/// solid** `a:ln` (honoring width / color / alpha), so an *active* non-solid stroke sub-feature
+/// renders as a solid line and silently misleads → Degraded (functional_spec §5). Detected:
+/// - a preset dash (`a:prstDash` `val` != `solid`) or a custom dash (`a:custDash`) — dashed / dotted
+///   lines we draw solid (the misleading forecast/target-line case);
+/// - a compound / multi-line stroke (`a:ln@cmpd` != `sng`) — double / thick-thin lines we draw as one.
+///
+/// **Deliberately *not* degrading:** plain **joins** (`a:round` / `a:bevel` / `a:miter`) and line
+/// **caps**. `<a:round/>` is the pervasive default join Excel writes on nearly every series `a:ln`
+/// (a benign default like the always-present `scaling` wrapper), and caps are imperceptible on a thin
+/// stroke, so treating them as degrading would false-badge real files.
+///
+/// Line-scoped: only the line renderer claims to draw `a:ln`. Same textual-classifier caveat as
+/// [`unsupported_marker`]: a `prstDash`/`cmpd` can't be bound to its owning element, so a dashed
+/// *gridline* `a:ln` in a line part also degrades — acceptable (a dashed *series* line is the case
+/// that matters, and we'd rather badge than risk a silent miss).
+fn unsupported_line_stroke(xml: &str) -> bool {
+    if !is_line_chart(xml) {
+        return false;
+    }
+    // A preset dash other than solid (an absent `val` is malformed → treated as the benign solid).
+    any_opening_tag(xml, "prstDash", |attrs| {
+        !matches!(attr_value(attrs, "val"), None | Some("solid"))
+    })
+        // A custom dash pattern.
+        || contains_element(xml, "custDash")
+        // A compound (multi-line) stroke — `cmpd` on the `a:ln` other than single.
+        || any_opening_tag(xml, "ln", |attrs| {
+            !matches!(attr_value(attrs, "cmpd"), None | Some("sng"))
+        })
+}
+
+/// `c:orientation val="maxMin"` — a reversed axis. The default `minMax` is benign and present on
+/// essentially every axis.
 fn axis_reversed(xml: &str) -> bool {
     any_opening_tag(xml, "orientation", |attrs| {
         attr_value(attrs, "val") == Some("maxMin")
@@ -579,18 +646,6 @@ mod tests {
                 "<c:spPr><a:pattFill prst=\"pct5\"/></c:spPr>",
             ),
             (
-                "explicit max",
-                "<c:valAx><c:scaling><c:max val=\"100\"/></c:scaling></c:valAx>",
-            ),
-            (
-                "explicit min",
-                "<c:valAx><c:scaling><c:min val=\"0\"/></c:scaling></c:valAx>",
-            ),
-            (
-                "reversed axis",
-                "<c:catAx><c:scaling><c:orientation val=\"maxMin\"/></c:scaling></c:catAx>",
-            ),
-            (
                 // A conditional format whose value contains an unescaped `>` — a format we only
                 // approximate (the condition is dropped), and also exercises the quote-aware tag
                 // scan (a naive `find('>')` would truncate the attribute and miss the code).
@@ -780,6 +835,103 @@ mod tests {
                 "scatter + {symbol} marker → Faithful"
             );
         }
+    }
+
+    #[test]
+    fn axis_scaling_is_line_scoped() {
+        // P13's LINE renderer honors explicit min/max bounds and a reversed orientation, so on a
+        // `lineChart` they are Faithful (the accessor auto-drops the feature for the group that
+        // honors it). The same scaling on a group whose renderer ignores it (bar/area/pie/scatter,
+        // their phases are P16+) still renders wrong → Degraded.
+        for scaling in [
+            "<c:valAx><c:scaling><c:min val=\"0\"/><c:max val=\"100\"/></c:scaling></c:valAx>",
+            "<c:catAx><c:scaling><c:orientation val=\"maxMin\"/></c:scaling></c:catAx>",
+        ] {
+            assert_eq!(
+                source_fidelity(&format!("<c:lineChart>{scaling}</c:lineChart>")),
+                Fidelity::Faithful,
+                "line honors scaling → Faithful: {scaling}"
+            );
+            for group in ["barChart", "areaChart", "pieChart", "scatterChart"] {
+                assert_eq!(
+                    source_fidelity(&format!("<c:{group}>{scaling}</c:{group}>")),
+                    Fidelity::Degraded,
+                    "{group} ignores scaling → Degraded: {scaling}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn major_gridline_toggle_is_faithful_but_minor_degrades() {
+        // The line renderer honors the MAJOR gridline toggle (P13), so `c:majorGridlines` present or
+        // absent both render as authored — never a badge.
+        for xml in [
+            "<c:lineChart/><c:valAx><c:majorGridlines/></c:valAx>",
+            "<c:lineChart/><c:valAx></c:valAx>",
+        ] {
+            assert_eq!(
+                source_fidelity(xml),
+                Fidelity::Faithful,
+                "major gridline toggle is honored → Faithful: {xml}"
+            );
+        }
+        // MINOR gridlines are NOT drawn (the renderer draws only major), so an authored
+        // `c:minorGridlines` renders without them → Degraded (honest badge, not a silent drop).
+        assert_eq!(
+            source_fidelity("<c:lineChart/><c:valAx><c:minorGridlines/></c:valAx>"),
+            Fidelity::Degraded,
+            "minor gridlines are not rendered → Degraded"
+        );
+    }
+
+    #[test]
+    fn non_solid_line_stroke_degrades_but_plain_solid_is_faithful() {
+        // The line renderer draws a PLAIN SOLID a:ln (width/color/alpha), so a non-solid stroke
+        // sub-feature renders as solid and must degrade (a dashed forecast line drawn solid would
+        // silently mislead — functional_spec §5).
+        for (label, ln) in [
+            (
+                "preset dash",
+                "<c:spPr><a:ln w=\"28440\"><a:solidFill><a:srgbClr val=\"4a7ebb\"/></a:solidFill><a:prstDash val=\"dash\"/></a:ln></c:spPr>",
+            ),
+            (
+                "custom dash",
+                "<c:spPr><a:ln w=\"28440\"><a:custDash><a:ds d=\"400000\" sp=\"200000\"/></a:custDash></a:ln></c:spPr>",
+            ),
+            (
+                "compound (double) line",
+                "<c:spPr><a:ln w=\"38100\" cmpd=\"dbl\"><a:solidFill><a:srgbClr val=\"4a7ebb\"/></a:solidFill></a:ln></c:spPr>",
+            ),
+        ] {
+            assert_eq!(
+                source_fidelity(&format!("<c:lineChart><c:ser>{ln}</c:ser></c:lineChart>")),
+                Fidelity::Degraded,
+                "non-solid line stroke ({label}) → Degraded"
+            );
+        }
+
+        // A PLAIN solid a:ln (width + color + alpha, plus the pervasive default round join and an
+        // explicit `prstDash val="solid"`) is exactly what we render → Faithful, no false badge.
+        let solid = "<c:spPr><a:ln w=\"28440\" cmpd=\"sng\"><a:solidFill><a:srgbClr val=\"4a7ebb\"><a:alpha val=\"60000\"/></a:srgbClr></a:solidFill><a:prstDash val=\"solid\"/><a:round/></a:ln></c:spPr>";
+        assert_eq!(
+            source_fidelity(&format!(
+                "<c:lineChart><c:ser>{solid}</c:ser></c:lineChart>"
+            )),
+            Fidelity::Faithful,
+            "a plain solid width/color/alpha a:ln with the default round join → Faithful"
+        );
+
+        // The default a:ln Excel emits on every series (a solid fill + `<a:round/>` join, no dash)
+        // must NOT degrade — the exact shape from the reference workbook's chart1.xml.
+        let excel_default = "<c:spPr><a:solidFill><a:srgbClr val=\"4a7ebb\"/></a:solidFill><a:ln w=\"28440\"><a:solidFill><a:srgbClr val=\"4a7ebb\"/></a:solidFill><a:round/></a:ln></c:spPr>";
+        assert_eq!(
+            source_fidelity(&format!(
+                "<c:lineChart><c:ser>{excel_default}</c:ser></c:lineChart>"
+            )),
+            Fidelity::Faithful,
+            "Excel's default solid a:ln with a round join → Faithful"
+        );
     }
 
     #[test]

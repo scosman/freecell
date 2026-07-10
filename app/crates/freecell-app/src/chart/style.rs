@@ -25,9 +25,29 @@ pub const AXIS_STROKE: u32 = 0x9CA3AF;
 /// Gridline stroke.
 pub const GRID_STROKE: u32 = 0xE5E7EB;
 
+// Font sizes/weights tuned toward Excel's chart proportions (P13, observation B). Excel's default
+// line chart draws the TITLE bold + noticeably larger than the axis titles, axis titles **bold** at
+// the tick-label size, and tick/legend text regular. We bundle Inter (not Calibri), so we match the
+// weight/size proportions, not the typeface (an accepted GAP).
+/// Chart title font size — bold, the largest text in the chart (Excel emits ~18pt).
+pub const TITLE_FONT_SIZE: f32 = 18.0;
+/// Axis-title (value/category caption) font size — drawn **bold** (Excel axis titles are bold).
+pub const AXIS_TITLE_FONT_SIZE: f32 = 12.0;
+/// Legend entry font size.
+pub const LEGEND_FONT_SIZE: f32 = 11.0;
+
 /// Convert a packed `0xRRGGBB` value to a gpui `Hsla`.
 pub fn hsla(hex: u32) -> Hsla {
     Hsla::from(rgb(hex))
+}
+
+/// Apply an opacity `alpha` (fraction in `0..=1`) to an `Hsla` — the `a:ln/a:alpha` of a line
+/// stroke (P13). `alpha` is clamped to `0..=1`.
+pub fn with_alpha(color: Hsla, alpha: f32) -> Hsla {
+    Hsla {
+        a: alpha.clamp(0.0, 1.0),
+        ..color
+    }
 }
 
 /// Convert a [`freecell_chart_model::Color`] to a gpui `Hsla`.

@@ -98,6 +98,32 @@ impl NiceScale {
         Self::new(lo, hi, target_ticks)
     }
 
+    /// Override either domain bound with an explicit value (`c:scaling/c:min` / `c:max`, P13),
+    /// keeping the auto-computed value for an end left `None`, then recompute a nice tick `step`
+    /// over the resulting span. Unlike [`new`](NiceScale::new), the explicit bounds are used
+    /// **exactly** (not snapped outward), matching Excel's fixed min/max axis. An inverted or
+    /// degenerate result (`max <= min`) keeps the original step so tick generation never divides by
+    /// a non-positive step.
+    ///
+    /// **Author-inverted bounds (`min > max`) are not an error and not a reversed axis.** They are
+    /// left as-is here (min above max); the renderer maps them through gpui's `ScaleLinear`, which
+    /// sorts the domain via its `minmax` — so they are effectively **normalized to `[max, min]`**
+    /// (crash-safe, not honored as a `maxMin` reversal — reversing is the separate `orientation`
+    /// flag, [`Axis::reversed`](freecell_chart_model::Axis::reversed)) and **not flagged**.
+    pub fn bounded(mut self, min: Option<f64>, max: Option<f64>, target_ticks: usize) -> Self {
+        if let Some(mn) = min.filter(|v| v.is_finite()) {
+            self.min = mn;
+        }
+        if let Some(mx) = max.filter(|v| v.is_finite()) {
+            self.max = mx;
+        }
+        if self.max > self.min {
+            let target = target_ticks.max(1) as f64;
+            self.step = nice_num((self.max - self.min) / target, true).max(f64::MIN_POSITIVE);
+        }
+        self
+    }
+
     /// The tick positions from `min` to `max` inclusive, spaced by `step`.
     pub fn ticks(&self) -> Vec<f64> {
         let mut ticks = Vec::new();
@@ -245,6 +271,30 @@ mod tests {
         // Empty input is a safe unit scale, not a panic.
         let e = NiceScale::spanning([], 5);
         assert!(e.step > 0.0 && !e.ticks().is_empty());
+    }
+
+    #[test]
+    fn bounded_forces_explicit_ends_exactly() {
+        // Explicit min+max are used exactly (not snapped outward like `new`), with a nice step.
+        let s = NiceScale::spanning([32.0, 91.0, 55.0], 5).bounded(Some(0.0), Some(100.0), 5);
+        assert_eq!(s.min, 0.0, "explicit min is exact");
+        assert_eq!(s.max, 100.0, "explicit max is exact");
+        assert_eq!(s.step, 20.0);
+        assert_eq!(s.ticks().first().copied(), Some(0.0));
+        assert_eq!(s.ticks().last().copied(), Some(100.0));
+
+        // A single overridden end keeps the auto value for the other.
+        let auto = NiceScale::spanning([32.0, 91.0, 55.0], 5);
+        let one = auto.bounded(Some(0.0), None, 5);
+        assert_eq!(one.min, 0.0);
+        assert_eq!(one.max, auto.max, "un-overridden end keeps the auto bound");
+
+        // No overrides is a no-op (same as the auto scale).
+        assert_eq!(auto.bounded(None, None, 5), auto);
+
+        // A non-finite override is ignored (the auto bound stays), never producing a bad domain.
+        let guarded = auto.bounded(Some(f64::NAN), None, 5);
+        assert_eq!(guarded.min, auto.min);
     }
 
     #[test]

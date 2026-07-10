@@ -12,8 +12,9 @@ use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
 use freecell_chart_model::{
-    Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart, ChartKind, ChartSpec,
-    DataLabelPosition, DataLabels, Grouping, Legend, LegendPosition, Series, SourcePart, SourceXml,
+    Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart, ChartColor, ChartKind, ChartSpec,
+    Color, DataLabelPosition, DataLabels, Grouping, Legend, LegendPosition, LineStroke, Series,
+    SourcePart, SourceXml, ThemeSlot,
 };
 
 use super::xlsx::{self, attr};
@@ -610,12 +611,72 @@ fn parse_series(
     if let Some(c) = color {
         series = series.with_color(c);
     }
+    if let Some(stroke) = parse_series_stroke(ser) {
+        series = series.with_stroke(stroke);
+    }
     // A series `c:dLbls` (even all-off, an explicit "no labels") overrides the chart-level default;
     // a series with none inherits the chart-level default.
     if let Some(labels) = parse_data_labels_of(ser).or_else(|| default_labels.cloned()) {
         series = series.with_data_labels(labels);
     }
     Ok(series)
+}
+
+/// The series line stroke from `c:ser/c:spPr/a:ln` (P13): its width (`@w`, EMU→pt), its own
+/// `a:solidFill` color (sRGB or a `schemeClr` theme reference), and that fill's `a:alpha`. Returns
+/// `None` when there is no `a:ln`, or when it carries nothing we model (e.g. only `a:round`), so a
+/// plain series leaves the renderer's default weight.
+fn parse_series_stroke(ser: &Node) -> Option<LineStroke> {
+    let ln = child(ser, "spPr").and_then(|sp| child(&sp, "ln"))?;
+    let width_pt = attr(&ln, "w")
+        .and_then(|w| w.trim().parse::<i64>().ok())
+        .map(LineStroke::width_pt_from_emu);
+    let (color, alpha) = match parse_solid_fill(&ln) {
+        Some((c, a)) => (Some(c), a),
+        None => (None, None),
+    };
+    if width_pt.is_none() && color.is_none() && alpha.is_none() {
+        return None;
+    }
+    Some(LineStroke {
+        width_pt,
+        color,
+        alpha,
+    })
+}
+
+/// Reads a `<a:solidFill>` child of `node` into a [`ChartColor`] plus an optional alpha fraction.
+/// Handles both an explicit `a:srgbClr` and a `a:schemeClr` theme reference (with `lumMod`/`lumOff`
+/// tint), mirroring [`freecell_chart_model::ChartColor`]. The `a:alpha` (per-mille `val`) rides on
+/// the color element and is returned as a `0..=1` fraction.
+fn parse_solid_fill(node: &Node) -> Option<(ChartColor, Option<f32>)> {
+    let solid = child(node, "solidFill")?;
+    if let Some(srgb) = child(&solid, "srgbClr") {
+        let v = u32::from_str_radix(attr(&srgb, "val")?.trim(), 16).ok()?;
+        return Some((ChartColor::Rgb(Color::from_hex(v)), alpha_fraction(&srgb)));
+    }
+    if let Some(scheme) = child(&solid, "schemeClr") {
+        let slot = ThemeSlot::from_ooxml(attr(&scheme, "val")?)?;
+        let color = ChartColor::Theme {
+            slot,
+            lum_mod: per_mille_fraction(&scheme, "lumMod"),
+            lum_off: per_mille_fraction(&scheme, "lumOff"),
+        };
+        return Some((color, alpha_fraction(&scheme)));
+    }
+    None
+}
+
+/// The `a:alpha` fraction (`val` per-mille ÷ 100000, so `50000` → `0.5`) on a color element, if present.
+fn alpha_fraction(color_el: &Node) -> Option<f32> {
+    per_mille_fraction(color_el, "alpha")
+}
+
+/// The `val` per-mille (÷ 100000) of a color element's named child (`lumMod`/`lumOff`/`alpha`), if present.
+fn per_mille_fraction(color_el: &Node, name: &str) -> Option<f32> {
+    child_val(color_el, name)
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .map(|per_mille| per_mille / 100_000.0)
 }
 
 /// The [`DataLabels`] of a node's direct-child `c:dLbls`, if present. Returns `None` when the
@@ -751,26 +812,59 @@ fn parse_axes(plot_area: &Node, is_scatter: bool) -> (Axis, Axis) {
             .children()
             .filter(|n| n.tag_name().name() == "valAx")
             .collect();
-        let x = val_axes.first().and_then(axis_title);
-        let y = val_axes.get(1).and_then(axis_title);
-        return (axis(x), axis(y));
+        let x = val_axes.first().map(axis_from_node).unwrap_or_default();
+        let y = val_axes.get(1).map(axis_from_node).unwrap_or_default();
+        return (x, y);
     }
     let cat = plot_area
         .children()
         .find(|n| n.tag_name().name() == "catAx")
-        .and_then(|n| axis_title(&n));
+        .map(|n| axis_from_node(&n))
+        .unwrap_or_default();
     let val = plot_area
         .children()
         .find(|n| n.tag_name().name() == "valAx")
-        .and_then(|n| axis_title(&n));
-    (axis(cat), axis(val))
+        .map(|n| axis_from_node(&n))
+        .unwrap_or_default();
+    (cat, val)
 }
 
-fn axis(title: Option<String>) -> Axis {
-    match title {
-        Some(t) => Axis::titled(t),
-        None => Axis::untitled(),
+/// Build an [`Axis`] from a `c:catAx`/`c:valAx` node: its title, tick `c:numFmt` (P6), scaling
+/// bounds/orientation (`c:scaling`, P13), and gridline toggles (`c:majorGridlines` /
+/// `c:minorGridlines`, P13). An absent axis falls back to [`Axis::default`] (auto scale, major
+/// gridlines on — Excel's value-axis default).
+fn axis_from_node(ax: &Node) -> Axis {
+    let (min, max, reversed) = axis_scaling(ax);
+    Axis {
+        title: axis_title(ax),
+        number_format: axis_number_format(ax),
+        min,
+        max,
+        reversed,
+        major_gridlines: child(ax, "majorGridlines").is_some(),
+        minor_gridlines: child(ax, "minorGridlines").is_some(),
     }
+}
+
+/// The axis tick `c:numFmt/@formatCode`, if it names a non-`General` format. The pervasive
+/// `General`/empty default reads as "no explicit format" (the renderer's general formatting).
+fn axis_number_format(ax: &Node) -> Option<String> {
+    child(ax, "numFmt")
+        .and_then(|n| attr(&n, "formatCode"))
+        .map(str::trim)
+        .filter(|code| !code.is_empty() && !code.eq_ignore_ascii_case("General"))
+        .map(str::to_string)
+}
+
+/// The axis `c:scaling` — explicit `c:min`/`c:max` bounds (parsed as `f64`) and whether
+/// `c:orientation` is `maxMin` (reversed). Absent scaling / bounds leave `None` / `false`.
+fn axis_scaling(ax: &Node) -> (Option<f64>, Option<f64>, bool) {
+    let Some(scaling) = child(ax, "scaling") else {
+        return (None, None, false);
+    };
+    let bound = |name| child_val(&scaling, name).and_then(|v| v.trim().parse::<f64>().ok());
+    let reversed = child_val(&scaling, "orientation").as_deref() == Some("maxMin");
+    (bound("min"), bound("max"), reversed)
 }
 
 /// The title text of a `c:catAx`/`c:valAx` (concatenated `a:t` runs under its `c:title`).
@@ -940,6 +1034,134 @@ mod tests {
     fn missing_chart_group_is_an_error() {
         let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea/></c:chart></c:chartSpace>"#;
         assert!(parse_chart_xml(xml).is_err());
+    }
+
+    // --- P13: axis scaling / gridlines / numFmt + a:ln line stroke -------------------------
+
+    #[test]
+    fn parses_axis_scaling_gridlines_and_numfmt() {
+        // A reversed category axis (no gridlines), and a value axis with explicit bounds, a
+        // majorGridlines child, and a currency tick numFmt — the P13 axis breadth.
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart><c:plotArea>
+            <c:lineChart><c:ser/></c:lineChart>
+            <c:catAx>
+              <c:scaling><c:orientation val="maxMin"/></c:scaling>
+            </c:catAx>
+            <c:valAx>
+              <c:scaling><c:orientation val="minMax"/><c:min val="0"/><c:max val="2000"/></c:scaling>
+              <c:majorGridlines/>
+              <c:numFmt formatCode="$#,##0" sourceLinked="0"/>
+            </c:valAx>
+          </c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        // Category axis: reversed, no gridlines parsed (absent → false).
+        assert!(
+            chart.cat_axis.reversed,
+            "catAx orientation maxMin → reversed"
+        );
+        assert!(
+            !chart.cat_axis.major_gridlines,
+            "catAx has no majorGridlines"
+        );
+        // Value axis: explicit bounds, major gridlines on, currency numFmt, not reversed.
+        assert_eq!(chart.val_axis.min, Some(0.0));
+        assert_eq!(chart.val_axis.max, Some(2000.0));
+        assert!(!chart.val_axis.reversed);
+        assert!(chart.val_axis.major_gridlines, "valAx has majorGridlines");
+        assert_eq!(chart.val_axis.number_format.as_deref(), Some("$#,##0"));
+    }
+
+    #[test]
+    fn absent_scaling_leaves_axis_defaults() {
+        // A value axis with no scaling/gridlines: auto bounds, not reversed; the absent
+        // majorGridlines parses false (Excel: absence = off).
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart><c:plotArea>
+            <c:lineChart><c:ser/></c:lineChart>
+            <c:catAx/>
+            <c:valAx/>
+          </c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        assert_eq!((chart.val_axis.min, chart.val_axis.max), (None, None));
+        assert!(!chart.val_axis.reversed);
+        assert!(!chart.val_axis.major_gridlines);
+        assert!(!chart.val_axis.minor_gridlines);
+        assert_eq!(chart.val_axis.number_format, None);
+    }
+
+    #[test]
+    fn parses_series_line_stroke() {
+        // Excel's default line series: `a:ln w="28440"` with its own solid fill carrying an alpha.
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+                                   xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser>
+              <c:spPr>
+                <a:solidFill><a:srgbClr val="4a7ebb"/></a:solidFill>
+                <a:ln w="28440">
+                  <a:solidFill><a:srgbClr val="4a7ebb"><a:alpha val="60000"/></a:srgbClr></a:solidFill>
+                  <a:round/>
+                </a:ln>
+              </c:spPr>
+            </c:ser>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        let stroke = chart.series[0].stroke.expect("a:ln parsed into a stroke");
+        assert!(
+            (stroke.width_pt.unwrap() - 2.24).abs() < 0.01,
+            "w=28440 → 2.24pt"
+        );
+        assert_eq!(
+            stroke.color,
+            Some(ChartColor::Rgb(Color::from_hex(0x4A7EBB)))
+        );
+        assert!(
+            (stroke.alpha.unwrap() - 0.6).abs() < 1e-4,
+            "alpha 60000 → 0.6"
+        );
+    }
+
+    #[test]
+    fn scheme_colored_stroke_resolves_theme_reference() {
+        // A themed line stroke (`a:schemeClr` + tint) parses to a ChartColor::Theme.
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+                                   xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser><c:spPr><a:ln w="19050">
+              <a:solidFill><a:schemeClr val="accent2"><a:lumMod val="75000"/></a:schemeClr></a:solidFill>
+            </a:ln></c:spPr></c:ser>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let stroke = parse_chart_xml(xml).unwrap().series[0].stroke.unwrap();
+        assert_eq!(
+            stroke.color,
+            Some(ChartColor::Theme {
+                slot: ThemeSlot::Accent2,
+                lum_mod: Some(0.75),
+                lum_off: None,
+            })
+        );
+        assert!(
+            (stroke.width_pt.unwrap() - 1.5).abs() < 0.01,
+            "w=19050 → 1.5pt"
+        );
+    }
+
+    #[test]
+    fn plain_series_has_no_stroke() {
+        // A series whose spPr line carries nothing we model (only a:round) → no LineStroke.
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+                                   xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser><c:spPr><a:ln><a:round/></a:ln></c:spPr></c:ser>
+            <c:ser/>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        assert_eq!(
+            chart.series[0].stroke, None,
+            "a:ln with only a:round → None"
+        );
+        assert_eq!(chart.series[1].stroke, None, "no spPr → None");
     }
 
     // --- P12: data labels (c:dLbls) --------------------------------------------------------

@@ -13,8 +13,8 @@
 //! grid case table grows.
 
 use freecell_chart_model::{
-    Axis, Category, Chart, ChartColor, ChartKind, DataLabels, Grouping, Legend, Marker,
-    MarkerSymbol, Series, ThemeSlot,
+    Axis, Category, Chart, ChartColor, ChartKind, Color, DataLabels, Grouping, Legend,
+    LegendPosition, LineStroke, Marker, MarkerSymbol, Series, ThemeSlot,
 };
 
 /// One capturable chart fixture: a chart, and the (tight) capture viewport in device px. `name`
@@ -51,6 +51,11 @@ pub fn all() -> Vec<ChartScene> {
         chart_line_value_labels(),
         chart_line_percent_labels(),
         chart_line_named_labels(),
+        chart_line_reversed(),
+        chart_line_scaled(),
+        chart_line_no_gridlines(),
+        chart_line_styled(),
+        chart_line_legend_bottom(),
     ]
 }
 
@@ -424,6 +429,186 @@ fn chart_line_named_labels() -> ChartScene {
     }
 }
 
+/// The P13 **reversed category axis** scene: a two-series line whose category (`c:orientation
+/// maxMin`) axis runs right→left, so the months read Jun→Jan. Proves the reversed-axis rendering
+/// (`c:scaling`), distinct from the default minMax order.
+fn chart_line_reversed() -> ChartScene {
+    let chart = Chart {
+        title: Some("Backlog by Month (reversed)".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("Open"),
+                months(),
+                vec![88.0, 74.0, 63.0, 51.0, 44.0, 30.0],
+            )
+            .with_color(ChartColor::theme(ThemeSlot::Accent1)),
+            Series::category_value(
+                Some("Closed"),
+                months(),
+                vec![20.0, 33.0, 41.0, 55.0, 62.0, 79.0],
+            )
+            .with_color(ChartColor::theme(ThemeSlot::Accent2)),
+        ],
+        cat_axis: Axis::titled("Month").reversed(),
+        val_axis: Axis::titled("Tickets"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_reversed",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The P13 **explicit value-axis scaling** scene: a single-series line whose value axis is pinned to
+/// a fixed `0..100` (`c:scaling/c:min` + `c:max`) even though the data only spans ~30..85, so the
+/// line sits low in a fixed-range plot. Proves min/max override the auto nice-scale.
+fn chart_line_scaled() -> ChartScene {
+    let chart = Chart {
+        title: Some("Utilization (fixed 0–100)".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![Series::category_value(
+            Some("CPU %"),
+            months(),
+            vec![32.0, 41.0, 38.0, 55.0, 47.0, 61.0],
+        )
+        .with_color(ChartColor::theme(ThemeSlot::Accent5))
+        .with_marker(Marker::new(MarkerSymbol::Circle))],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Percent").with_bounds(Some(0.0), Some(100.0)),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_scaled",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The P13 **gridlines-off** scene: a two-series line whose value axis carries no `c:majorGridlines`,
+/// so the plot draws no horizontal gridlines (only the axis lines + data). Proves the gridline toggle
+/// is honored (distinct from every other scene, which keeps Excel's default gridlines on).
+fn chart_line_no_gridlines() -> ChartScene {
+    let chart = Chart {
+        title: Some("Signal (no gridlines)".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("A"),
+                months(),
+                vec![12.0, 19.0, 15.0, 24.0, 21.0, 30.0],
+            ),
+            Series::category_value(
+                Some("B"),
+                months(),
+                vec![22.0, 18.0, 26.0, 20.0, 29.0, 25.0],
+            ),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Level").without_major_gridlines(),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_no_gridlines",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The P13 **`a:ln` line styling** scene: a two-series line where each series carries an explicit
+/// stroke — a heavy 3pt line vs a lighter 1.5pt semi-transparent line (`a:ln w=…` + `a:solidFill`
+/// color + `a:alpha`). Proves honored stroke width, color, and alpha.
+fn chart_line_styled() -> ChartScene {
+    let chart = Chart {
+        title: Some("Line Styling".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("Heavy"),
+                months(),
+                vec![30.0, 42.0, 51.0, 60.0, 69.0, 82.0],
+            )
+            .with_stroke(
+                LineStroke::new()
+                    .with_width_emu(38_100) // 3pt
+                    .with_color(Color::from_hex(0x4A7EBB)),
+            ),
+            Series::category_value(
+                Some("Light / 40%"),
+                months(),
+                vec![70.0, 58.0, 61.0, 47.0, 52.0, 40.0],
+            )
+            .with_stroke(
+                LineStroke::new()
+                    .with_width_emu(19_050) // 1.5pt
+                    .with_color(Color::from_hex(0xBE4B48))
+                    .with_alpha(0.4),
+            ),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Value"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_styled",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The P13 **bottom legend** scene: a three-series line whose legend is placed **below** the plot
+/// (`c:legendPos val="b"`) as a horizontal bar, rather than the default right column. Proves the
+/// legend-position layout (the other placements share the mapping in `chrome::LegendPlacement`).
+fn chart_line_legend_bottom() -> ChartScene {
+    let chart = Chart {
+        title: Some("Throughput".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("North"),
+                months(),
+                vec![32.0, 41.0, 55.0, 62.0, 78.0, 91.0],
+            ),
+            Series::category_value(
+                Some("South"),
+                months(),
+                vec![74.0, 60.0, 48.0, 52.0, 63.0, 85.0],
+            ),
+            Series::category_value(
+                Some("West"),
+                months(),
+                vec![50.0, 54.0, 49.0, 58.0, 61.0, 66.0],
+            ),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend {
+            position: LegendPosition::Bottom,
+        }),
+    };
+    ChartScene {
+        name: "chart_line_legend_bottom",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +773,47 @@ mod tests {
         let dl = named.chart.series[0].data_labels.as_ref().unwrap();
         assert!(
             dl.show_series_name && dl.show_category_name && dl.show_value && dl.show_legend_key
+        );
+    }
+
+    #[test]
+    fn p13_scenes_carry_their_axis_and_line_features() {
+        // Reversed: category axis reversed (c:orientation maxMin).
+        let rev = get("chart_line_reversed").expect("reversed scene");
+        assert!(rev.chart.cat_axis.reversed, "category axis is reversed");
+        assert!(!rev.chart.val_axis.reversed, "value axis stays default");
+
+        // Scaled: explicit value-axis bounds override the auto scale.
+        let scaled = get("chart_line_scaled").expect("scaled scene");
+        assert_eq!(
+            (scaled.chart.val_axis.min, scaled.chart.val_axis.max),
+            (Some(0.0), Some(100.0)),
+            "value axis pinned to 0..100"
+        );
+
+        // No gridlines: value axis major gridlines off.
+        let no_grid = get("chart_line_no_gridlines").expect("no-gridlines scene");
+        assert!(
+            !no_grid.chart.val_axis.major_gridlines,
+            "value-axis gridlines are off"
+        );
+
+        // Styled: each series carries an a:ln stroke (heavy + alpha).
+        let styled = get("chart_line_styled").expect("styled scene");
+        let heavy = styled.chart.series[0].stroke.expect("heavy stroke");
+        let light = styled.chart.series[1].stroke.expect("light stroke");
+        assert!(
+            heavy.width_pt.unwrap() > light.width_pt.unwrap(),
+            "heavy > light"
+        );
+        assert_eq!(light.alpha, Some(0.4), "light series is 40% opacity");
+
+        // Legend bottom: legend placed below the plot.
+        let bottom = get("chart_line_legend_bottom").expect("legend-bottom scene");
+        assert_eq!(
+            bottom.chart.legend.map(|l| l.position),
+            Some(LegendPosition::Bottom),
+            "legend is bottom-placed"
         );
     }
 }

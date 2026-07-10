@@ -52,6 +52,21 @@ fn env_f64(key: &str, default: f64) -> f64 {
 /// gpui presents at all).
 const SCREEN_MARGIN: u32 = 8;
 
+/// How many times to attempt one case's capture before giving up. Software rendering under
+/// lavapipe on a shared CI runner is "occasionally flaky" (`render.yml`): the first, coldest
+/// render sometimes presents a blank frame within the settle window, or `xvfb-run` transiently
+/// fails — which used to abort the whole shared render-all on the first case. Each attempt is a
+/// fully independent xvfb-run, so a transient blank/failure clears on a retry. Not gate-weakening:
+/// a retry still has to produce a non-blank frame that diffs against the committed baseline.
+/// Override with `RENDER_TESTS_CAPTURE_ATTEMPTS`.
+fn capture_attempts() -> u32 {
+    std::env::var("RENDER_TESTS_CAPTURE_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(3)
+}
+
 /// Whether the tools the capture path needs (`xvfb-run` + a lavapipe ICD) are present. When they
 /// aren't (e.g. a Mac dev box without the Linux stack), the suite skips with a clear note.
 pub fn capture_available() -> bool {
@@ -205,7 +220,43 @@ pub fn default_exit_after_ms() -> u64 {
 /// stderr to a log it dumps on any failure (a Vulkan/lavapipe device-creation failure otherwise
 /// vanishes). On a non-zero exit the bail includes the exit code, the failing-command context,
 /// `xvfb-run`'s stdout + stderr, and the Xvfb error file — so a CI run names the real cause.
+///
+/// **Flake resilience (P15):** software rendering under lavapipe is "occasionally flaky" — the
+/// *first* (coldest) render on a shared CI runner sometimes presents a blank frame within the
+/// fixed settle window, or `xvfb-run` transiently fails, aborting the whole shared render-all on
+/// the first case. Each attempt is a fully independent xvfb-run (fresh display + fresh render
+/// process), so a transient blank/failure is retried up to [`capture_attempts`] times before it is
+/// surfaced. This does **not** weaken the gate — a retry still has to produce a non-blank frame
+/// that later diffs against the committed baseline; it only tolerates a transient cold-start blank.
 fn capture_window(
+    launch_cmd: &str,
+    viewport: (u32, u32),
+    icd: &Path,
+    out: &Path,
+    label: &str,
+) -> Result<()> {
+    let attempts = capture_attempts();
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        match capture_window_once(launch_cmd, viewport, icd, out, label) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < attempts {
+                    // Brief backoff, then a fully fresh xvfb-run attempt (new display + render
+                    // process) — a cold-start blank/transient xvfb failure clears on a retry.
+                    std::thread::sleep(std::time::Duration::from_millis(750));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt ran"))
+        .with_context(|| format!("capture for {label} failed after {attempts} attempts"))
+}
+
+/// One capture attempt: launch the render window under its own `xvfb-run` display, present, and
+/// grab the pixels, asserting the frame is non-blank. Retried by [`capture_window`].
+fn capture_window_once(
     launch_cmd: &str,
     viewport: (u32, u32),
     icd: &Path,

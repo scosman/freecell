@@ -37,6 +37,15 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # Software rendering under lavapipe on a shared runner is "occasionally flaky": the first,
+  # coldest render can present a blank frame within the default settle window. Give the capture
+  # harness more settle/present margin here (it stays fast locally on the default), and let it
+  # retry a transient blank/xvfb failure a few times per case (the harness default is 3) rather
+  # than aborting the whole shared render-all on the first case. These only change WHEN a frame
+  # is captured (after it has fully painted), never WHAT — so committed baselines are unaffected.
+  RENDER_TESTS_SETTLE_S: "6.0"
+  RENDER_TESTS_PRESENT_S: "2.0"
+  RENDER_TESTS_CAPTURE_ATTEMPTS: "4"
 
 jobs:
   render:

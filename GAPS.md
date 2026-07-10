@@ -101,6 +101,26 @@ FreeCell now builds against our fork (`scosman/ironcalc#freecell-fixes`), which 
 `open_fixups` + `open_repair` (and the `zip`/`roxmltree` prod deps) were deleted. See
 `specs/projects/ironcalc-upstreaming/`.
 
+## Engine (fork) — `.xlsx` table styles not resolved (2026-07-10)
+
+Surfaced diagnosing the "Personal Monthly Budget" template (the font-name loss fixed in
+`2b01b85` was the *smaller* half of that file's fidelity loss). Excel **table styles** — the
+formatting Excel derives from a workbook's `<tableStyles>` / `<tableStyleElement>` → dxfs, and
+from built-in theme-derived styles — are parsed as *geometry* but never resolved into per-cell
+styles, so table-styled cells render unstyled. **Full spec + design home:
+[`specs/projects/xlsx-table-styles/`](specs/projects/xlsx-table-styles/).**
+
+| Gap | Severity | Current behavior | Root cause |
+|-----|----------|------------------|------------|
+| **Excel table styles not resolved → teal section-header fills, thin data-cell borders, and bold Subtotal/total rows are lost** | Moderate–High (breaks the look of real templates and "Format as Table" files — a common case, not a corner) | Table-styled cells resolve unstyled; only *direct* cell fills/borders render (the "gray summary box renders, teal header doesn't" clue). Values, number formats, and (post-`2b01b85`) font names are correct. | Fork parses table geometry but (1) never parses `<tableStyles>` (`base` `Styles` has `dxfs` but no table-style catalog) nor overlays it in `get_style_for_cell` — that resolver is a plain style-index lookup; (2) `tableStyleInfo` parsing drops the style `name` + stripe flags (searches wrong element tag `tableInfo` vs `tableStyleInfo`) and copy-pastes `headerRowDxfId`→`dataDxfId`. Built-in theme-derived styles (`TableStyleMedium2` etc.) are a larger, separately-scoped sub-problem. |
+
+Acceptance signal: the three `#[ignore]`d tests in
+`app/crates/freecell-engine/tests/personal_monthly_budget_fixture.rs` (B12 teal+bold, C13
+borders, B23 bold) flip green. Two smaller **related** items are already tracked separately and
+are *not* duplicated here: render-time Inter fallback for unavailable *explicit* fonts (in
+"Engine defaults — cross-app fidelity" above) and text overflow / title-clipping (in "Post-MVP
+UX features … Text overflow into empty neighbors + wrap" below).
+
 ## Engine defaults — cross-app fidelity (surfaced by the IronCalc upgrade, 2026-07)
 
 Identified while migrating FreeCell onto the fork (`specs/projects/ironcalc-upstreaming`). Neither

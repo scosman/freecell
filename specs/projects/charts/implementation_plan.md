@@ -48,7 +48,7 @@ those docs — this is the ordered checklist.
 
 ## App integration — line chart end-to-end
 
-- [ ] **P8 — Render line chart in the spreadsheet.** `ChartLayer` over cells: anchor→pixel,
+- [x] **P8 — Render line chart in the spreadsheet.** `ChartLayer` over cells: anchor→pixel,
   clip, scroll/zoom, cull; corner badge on `Degraded`, placeholder on `Unsupported`. Cache
   values (static). *Exit:* opening a real file shows its line chart in place.
 - [ ] **P9 — Live binding.** Parse `c:f`; range→chart index; re-resolve dirty charts on

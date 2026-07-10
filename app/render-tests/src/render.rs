@@ -66,6 +66,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let mirror = case.mirror;
     let in_cell = case.in_cell;
     let titlebar = case.titlebar;
+    let charts = case.charts;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
@@ -105,8 +106,13 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     if let Some((row, col)) = reveal {
                         view.scroll_cell_into_view(row, col, cx);
                     }
-                    // Editing-feel overlays (Phase 2): a live mirror and/or an open in-cell editor.
                     let sheet = view.active_sheet();
+                    // In-grid charts (P8): install the case's ChartLayer on the active sheet, so the
+                    // grid paints them over the cells at each chart's anchor rect.
+                    if !charts.is_empty() {
+                        view.set_sheet_charts(sheet, charts, cx);
+                    }
+                    // Editing-feel overlays (Phase 2): a live mirror and/or an open in-cell editor.
                     if let Some((row, col, text)) = mirror {
                         view.set_edit_state(
                             Some((sheet, CellRef::new(row, col), text.into())),

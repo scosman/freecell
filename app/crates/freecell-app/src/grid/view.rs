@@ -24,6 +24,8 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
 use gpui_component::{Icon, IconName, Sizable as _};
 
+use freecell_chart_model::ChartSpec;
+
 use freecell_core::cache::SheetCaches;
 use freecell_core::color::Rgb;
 use freecell_core::publication::{CellKind, Publication};
@@ -35,6 +37,7 @@ use freecell_core::{
     RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
+use super::chart_layer::{self, RenderedChart};
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
     self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
@@ -185,6 +188,13 @@ pub struct GridView {
     incell_input: Option<Entity<InputState>>,
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
+
+    /// The charts painted on each sheet's **ChartLayer** (P8, `charts/architecture.md §4.2`),
+    /// keyed by sheet. Each [`RenderedChart`] is resolved once from a [`ChartSpec`] at install
+    /// time ([`GridView::set_sheet_charts`]) — its values are static this phase (live rebinding is
+    /// P9). The render path paints only the active sheet's charts, mapping each anchor to a pixel
+    /// rect and culling the off-screen ones.
+    charts: HashMap<SheetId, Vec<RenderedChart>>,
 }
 
 /// A live-resize preview applied to **one** axis as a cheap **O(1) per-track delta**, NOT a
@@ -299,6 +309,18 @@ impl Frame {
     }
 }
 
+/// The frame's committed (pre-scroll) column/row start offsets are exactly what a chart anchor
+/// maps against (`charts/architecture.md §5` challenge 1) — so the ChartLayer reads the same
+/// geometry (incl. a live resize preview) the cells do, and scroll/zoom come free.
+impl chart_layer::GridGeometry for Frame {
+    fn col_start(&self, col: u32) -> f64 {
+        self.col_offset(col)
+    }
+    fn row_start(&self, row: u32) -> f64 {
+        self.row_offset(row)
+    }
+}
+
 /// Optional per-frame timing captured by [`GridView::build_grid_layers`] for the Phase-12
 /// perf harness (`freecell_core::perf`). `None` on the normal render path — zero overhead
 /// (no `Instant` is even read).
@@ -350,7 +372,28 @@ impl GridView {
             incell_open: None,
             incell_input: None,
             incell_cap: None,
+            charts: HashMap::new(),
         }
+    }
+
+    /// Installs the charts to paint on `sheet`'s **ChartLayer** (P8, `charts/architecture.md §4.2`).
+    /// Each [`ChartSpec`] is resolved once into a [`RenderedChart`] (its render picture + anchor +
+    /// derived fidelity) — values are static this phase (live rebinding is P9). An empty list clears
+    /// the sheet's charts. The engine produces the specs on open (`discover_and_parse`); the window
+    /// hands them here for the sheet they belong to.
+    pub fn set_sheet_charts(
+        &mut self,
+        sheet: SheetId,
+        specs: Vec<ChartSpec>,
+        cx: &mut Context<Self>,
+    ) {
+        if specs.is_empty() {
+            self.charts.remove(&sheet);
+        } else {
+            let rendered = specs.iter().map(RenderedChart::from_spec).collect();
+            self.charts.insert(sheet, rendered);
+        }
+        cx.notify();
     }
 
     /// Installs the reused in-cell editor input the chrome owns, so the grid can render the overlay
@@ -1835,6 +1878,54 @@ impl GridView {
                 .into_any_element(),
         );
 
+        // ---- ChartLayer: charts painted OVER the cells, BELOW the header/chrome layers, clipped
+        // to the content area (P8, `charts/architecture.md §4.2`, `ui_design.md §1`). Each chart's
+        // `twoCellAnchor` maps to a content-local pixel rect through the same frame geometry the
+        // cells use (so scroll/zoom are free); off-screen charts are culled; the dispatch draws the
+        // plot (+ a corner badge when Degraded) or the placeholder (Unsupported). Read-only this
+        // phase — the chart divs register no listeners, so the grid's coordinate hit-testing is
+        // unaffected. When the active sheet has no charts, nothing is pushed (no baseline change).
+        if let Some(charts) = self.charts.get(&self.active_sheet) {
+            let mut chart_children: Vec<AnyElement> = Vec::with_capacity(charts.len());
+            for rendered in charts {
+                let rect = chart_layer::anchor_rect(
+                    &rendered.anchor,
+                    frame,
+                    frame.scroll_x,
+                    frame.scroll_y,
+                );
+                if rect.is_offscreen(frame.content_w, frame.content_h) {
+                    continue;
+                }
+                chart_children.push(
+                    div()
+                        .absolute()
+                        .left(px(rect.x))
+                        .top(px(rect.y))
+                        .w(px(rect.w))
+                        .h(px(rect.h))
+                        .child(crate::chart::in_grid_chart_element(
+                            &rendered.chart,
+                            rendered.fidelity,
+                        ))
+                        .into_any_element(),
+                );
+            }
+            if !chart_children.is_empty() {
+                root_children.push(
+                    div()
+                        .absolute()
+                        .left(px(frame.row_header_w))
+                        .top(px(COL_HEADER_H))
+                        .w(px(frame.content_w as f32))
+                        .h(px(frame.content_h as f32))
+                        .overflow_hidden()
+                        .children(chart_children)
+                        .into_any_element(),
+                );
+            }
+        }
+
         // ---- Header layer (fixed, opaque, clipped to its strip) ---------------------
         let (sel_r0, sel_r1) = (range.start.row, range.end.row);
         let (sel_c0, sel_c1) = (range.start.col, range.end.col);
@@ -2993,6 +3084,19 @@ impl GridView {
         self.drag.is_some()
     }
 
+    /// The derived fidelity of each installed chart on `sheet`, in install order (P8 test
+    /// introspection — proves `set_sheet_charts` resolves + classifies the specs).
+    #[cfg(test)]
+    pub(crate) fn sheet_chart_fidelities(
+        &self,
+        sheet: SheetId,
+    ) -> Vec<freecell_chart_model::Fidelity> {
+        self.charts
+            .get(&sheet)
+            .map(|charts| charts.iter().map(|c| c.fidelity).collect())
+            .unwrap_or_default()
+    }
+
     /// The cell the in-cell overlay currently covers, if open (test introspection for BUG #5 — the
     /// commit/cancel handlers close it, which proves an in-cell key command routed through the grid).
     #[cfg(test)]
@@ -3084,6 +3188,68 @@ mod tests {
             "a deep scroll must change the visible row range"
         );
         assert!(deep.0.start > origin.0.start, "scrolled downward");
+    }
+
+    // ---- ChartLayer install (P8, `charts/architecture.md §4.2`) ----------------------------
+
+    /// `set_sheet_charts` resolves each spec into a `RenderedChart`, deriving its display fidelity
+    /// from the retained source — a Faithful line, a Degraded (3-D→2-D) chart, and an Unsupported
+    /// group, in order; an empty list then clears them.
+    #[gpui::test]
+    fn set_sheet_charts_stores_and_derives_fidelity(cx: &mut TestAppContext) {
+        use freecell_chart_model::{
+            Anchor, AnchorCell, Axis, Category, Chart, ChartKind, Fidelity, Grouping, Legend,
+            Series, SourceXml,
+        };
+
+        let line = || Chart {
+            title: Some("Sales".into()),
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![Series::category_value(
+                Some("A"),
+                vec![Category::Text("Q1".into()), Category::Text("Q2".into())],
+                vec![1.0, 2.0],
+            )],
+            cat_axis: Axis::untitled(),
+            val_axis: Axis::untitled(),
+            legend: Some(Legend::default()),
+        };
+        let anchor = Anchor::new(AnchorCell::new(1, 1), AnchorCell::new(6, 14));
+        let spec = |xml: &str| ChartSpec::loaded(line(), SourceXml::new(xml), Vec::new(), anchor);
+
+        let grid = grid(cx);
+        let fidelities = grid.update(cx, |g, cx| {
+            let sheet = g.active_sheet();
+            g.set_sheet_charts(
+                sheet,
+                vec![
+                    spec("<c:lineChart/>"),
+                    spec("<c:bar3DChart/>"),
+                    spec("<c:surfaceChart/>"),
+                ],
+                cx,
+            );
+            g.sheet_chart_fidelities(sheet)
+        });
+        assert_eq!(
+            fidelities,
+            vec![
+                Fidelity::Faithful,
+                Fidelity::Degraded,
+                Fidelity::Unsupported
+            ]
+        );
+
+        // An empty install clears the sheet's charts.
+        let cleared = grid.update(cx, |g, cx| {
+            let sheet = g.active_sheet();
+            g.set_sheet_charts(sheet, Vec::new(), cx);
+            g.sheet_chart_fidelities(sheet)
+        });
+        assert!(cleared.is_empty(), "an empty install clears the ChartLayer");
     }
 
     // ---- Editing-feel input triggers (`components/edit_controller.md §Grid integration`) ----

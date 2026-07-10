@@ -12,6 +12,7 @@
 //! motions dispatched through `freecell_core::apply_motion`, and the `SelectionChanged` /
 //! `ClearCells` events (`components/grid.md §Input`, `ui_design.md §5–6`).
 
+pub mod chart_layer;
 pub mod fixtures;
 pub mod input;
 pub mod layout;

@@ -255,6 +255,10 @@ render_cases! {
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
     grid_selection_scrolled, grid_variable_geometry, grid_loading_overlay,
     grid_scrollbars_visible, grid_mixed_content,
+    // In-grid charts (P8): the ChartLayer painted over cells — a line chart in place, the Degraded
+    // corner badge, the Unsupported placeholder, and a scrolled/clipped chart.
+    grid_chart_line, grid_chart_degraded_badge, grid_chart_unsupported_placeholder,
+    grid_chart_scrolled_clipped,
     // Editing feel (Phase 2): live mirror + in-cell editor overlay
     cell_mirror_typing, incell_editor_open,
     // Fonts (Phase 5): family + size + row auto-grow

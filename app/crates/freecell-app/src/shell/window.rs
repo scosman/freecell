@@ -293,6 +293,46 @@ impl WorkbookWindow {
         })
     }
 
+    /// Loads the opened file's embedded charts into the grid's **ChartLayer** (P8,
+    /// `charts/functional_spec.md §1`, `architecture.md §4.1–4.2`). Parsing walks the OPC package
+    /// (`discover_and_parse`), so it runs on a **background** executor to keep it off the frame /
+    /// UI thread (lazy-parse tuning is P11); the resolved `ChartSpec`s are then installed on the
+    /// grid's active sheet. **Per-chart non-fatal** (`architecture.md §6`): a parse error just logs
+    /// and leaves the sheet chart-less — a broken chart never breaks the open. New (unsaved)
+    /// workbooks have no file to read, so this is a no-op for them.
+    ///
+    /// Multi-sheet placement (correlating each chart's worksheet to its `SheetId`) rides with live
+    /// binding (P9); this phase attaches the discovered charts to the active (first) sheet, correct
+    /// for the single-sheet files the line slice targets.
+    fn load_charts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.opened_from.clone() else {
+            return; // an unsaved workbook has no file to read
+        };
+        let sheet = self.grid.read(cx).active_sheet();
+        cx.spawn_in(window, async move |this, cx| {
+            let specs = cx
+                .background_executor()
+                .spawn(async move { freecell_engine::chart::discover_and_parse(&path) })
+                .await;
+            let specs = match specs {
+                Ok(specs) => specs,
+                Err(err) => {
+                    tracing::warn!("chart discovery failed: {err:#}");
+                    return;
+                }
+            };
+            if specs.is_empty() {
+                return; // nothing to draw — leave the ChartLayer untouched
+            }
+            this.update_in(cx, |this, _window, cx| {
+                this.grid
+                    .update(cx, |g, cx| g.set_sheet_charts(sheet, specs, cx));
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Folds a worker event (`components/engine_worker.md`), routing each to the window's
     /// lifecycle state, the grid (repaint), and/or the chrome (data row, tabs, spinner).
     fn on_worker_event(&mut self, event: WorkerEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -302,6 +342,10 @@ impl WorkbookWindow {
                 self.grid.update(cx, |g, cx| g.set_loading(None, cx));
                 self.reconcile_sheets(sheets, window, cx);
                 self.refresh_dirty(window, cx);
+                // Discover + parse this file's embedded charts and hand them to the grid's
+                // ChartLayer (P8, `charts/architecture.md §4.1–4.2`). Off the UI thread + per-chart
+                // non-fatal, so a chart-less or broken-chart file loads exactly as before.
+                self.load_charts(window, cx);
                 // The document finished loading → the welcome window (if still up) can close.
                 FreeCellApp::note_window_loaded(self.key, cx);
                 cx.notify();

@@ -10,8 +10,9 @@
 //!
 //! Lifted from the chart PoC (`experiments/chart-poc/chart-render`), library-only: the capture
 //! harness + example scenes are lifted into `render-tests` in P4, and the production line
-//! renderer / in-grid `ChartLayer` land in P5 / P8. This is the placed baseline — dormant
-//! library code, not yet wired into the grid.
+//! renderer lands in P5/P6. As of **P8** the renderer is wired into the grid — [`in_grid`] adds
+//! the in-grid **ChartLayer** dispatch (fidelity → plot + badge / placeholder), which the grid
+//! ([`crate::grid`]) paints over cells at each chart's anchor rect.
 
 pub mod palette;
 pub mod stacking;
@@ -20,10 +21,13 @@ pub mod ticks;
 pub mod area;
 pub mod bar;
 pub mod chrome;
+pub mod in_grid;
 pub mod line;
 pub mod pie;
 pub mod scatter;
 pub mod style;
+
+pub use in_grid::{in_grid_chart_element, render_mode, RenderMode};
 
 use freecell_chart_model::{Chart, ChartKind};
 

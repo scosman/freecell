@@ -42,6 +42,10 @@ path = "src/bin/perf_harness.rs"
 freecell-core.workspace = true
 freecell-engine.workspace = true
 freecell-app.workspace = true
+# The chart data model (charts P4): `chart_scene` builds `Chart` fixtures the chart render
+# path draws through `freecell_app::chart::chart_element`. A direct dep (not just the
+# transitive one via `freecell-app`) so the fixtures can name the model types.
+freecell-chart-model.workspace = true
 # Phase 12: the perf report is serialized here (`freecell-core` stays serde-free).
 serde_json.workspace = true
 # `arc-swap` builds the `GridDataSources.publication` slot the grid loads per frame;

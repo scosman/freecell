@@ -48,6 +48,28 @@ render-tests/scripts/render_tests.sh generate [--only <prefix>]
   the GPUI-free perceptual-diff unit tests (`tests/perceptual_diff.rs`) still run; CI runs
   the real gate via `render_tests.sh` (a required step in `checks.yml`).
 
+## Chart scenes (charts project, P4)
+
+Alongside the grid case table, the suite renders **chart** fixtures through the real chart
+widgets (`freecell_app::chart::chart_element`). These live in a parallel table,
+`src/chart_scene.rs` (`chart_scene::all()`), each a static `freecell_chart_model::Chart` + a
+capture viewport — no engine, since the chart model already holds cached values. The chart is
+rendered **standalone** in its own window (the in-grid `ChartLayer` is a later phase), captured
+by the **same** Xvfb + lavapipe + `xrefresh` + `import` mechanism as the grid, and
+perceptual-diffed against a committed baseline.
+
+Chart scene names are prefixed `chart_` (so they never collide with a grid case name), which
+makes them independently selectable:
+
+```sh
+render-tests/scripts/render_tests.sh test chart_          # run ONLY the chart pixel tests
+render-tests/scripts/render_tests.sh generate --only chart_   # (re)generate ONLY chart baselines
+```
+
+Adding a chart scene mirrors adding a grid case: add a row to `chart_scene::all()`, add its name
+to `chart_render_cases! { … }` in `tests/render_suite.rs` (`chart_scene_names_match_table` fails
+the build if they drift), then generate + eyeball + commit its baseline.
+
 ## Font: bundled Inter (cross-platform)
 
 The grid + chrome render in **Inter**, vendored under

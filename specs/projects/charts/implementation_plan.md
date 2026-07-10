@@ -27,7 +27,7 @@ those docs — this is the ordered checklist.
 - [x] **P3 — Derived fidelity accessor.** `display_fidelity()` (Faithful/Degraded/Unsupported)
   over model+source; 3D→2D normalization; curated "render-affecting unsupported" set.
   *Exit:* pure-logic unit tests (3D⇒Degraded, surface/radar⇒Unsupported).
-- [ ] **P4 — Render-test harness.** Lift the capture harness into `render-tests` (headless
+- [x] **P4 — Render-test harness.** Lift the capture harness into `render-tests` (headless
   `xvfb`+lavapipe+`xrefresh`; perceptual-diff; container prereqs). *Exit:* one PoC scene
   renders headless + diffs green in CI.
 

@@ -8,17 +8,20 @@
 //! Module split by dependency edge:
 //! - [`diff`] is GPUI-free (pure `image`), so the perceptual-diff logic is unit-tested
 //!   everywhere (it needs no display).
-//! - [`scene`] / [`cases`] describe + realize fixtures through the engine.
-//! - [`render`] (gpui) opens the window; [`capture`] drives `xrefresh` + `import` around it.
+//! - [`scene`] / [`cases`] describe + realize grid fixtures through the engine; [`chart_scene`]
+//!   describes chart fixtures (static [`freecell_chart_model::Chart`] data — no engine).
+//! - [`render`] (gpui) opens the window (the real grid, or a standalone chart widget);
+//!   [`capture`] drives `xrefresh` + `import` around it — the same headless mechanism for both.
 
 pub mod capture;
 pub mod cases;
+pub mod chart_scene;
 pub mod diff;
 pub mod perf;
 pub mod render;
 pub mod scene;
 
-pub use capture::{capture_available, render_all, sibling_render_scene_bin};
+pub use capture::{capture_available, render_all, render_charts, sibling_render_scene_bin};
 pub use diff::{diff_image, diff_images, diff_png_files, DiffOptions, DiffReport};
 
 #[cfg(test)]

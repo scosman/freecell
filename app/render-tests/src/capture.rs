@@ -12,6 +12,12 @@
 //!
 //! Because each case owns its display, the harness needs **no ambient `DISPLAY`** — only
 //! `xvfb-run` + the lavapipe ICD, both discovered here.
+//!
+//! The mechanism is identical for the grid ([`render_all`], the real `GridView`) and for a
+//! standalone chart widget ([`render_charts`]): both build a `launch_cmd` that opens a
+//! viewport-sized window and self-quits, then thread it through the same `capture_window` core.
+//! The two paths differ only in which `render_scene` sub-command they launch (`--case` vs
+//! `--chart`) and which fixture table they iterate.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -20,6 +26,7 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::cases::{self, RenderCase};
+use crate::chart_scene;
 
 /// Seconds to let `render_scene` init Vulkan, create the window, and render the first frame
 /// before forcing presentation. Override with `RENDER_TESTS_SETTLE_S`.
@@ -123,17 +130,82 @@ pub fn render_all(
     Ok(rendered)
 }
 
-/// Render + capture a single case into `out_dir/<name>.png` under its own Xvfb display.
+/// Render every chart scene (or those whose name starts with `only`) into `out_dir` as
+/// `<name>.png`, using `render_scene_bin`. Returns the rendered scene names. The chart analogue
+/// of [`render_all`] — same Xvfb capture core, launching the `render_scene --chart` sub-command
+/// over a standalone chart widget instead of the grid.
+pub fn render_charts(
+    render_scene_bin: &Path,
+    out_dir: &Path,
+    only: Option<&str>,
+) -> Result<Vec<String>> {
+    let icd = lavapipe_icd()
+        .ok_or_else(|| anyhow!("no lavapipe ICD found (install mesa-vulkan-drivers)"))?;
+    if !which("xvfb-run") {
+        bail!("xvfb-run not found (install xvfb); the render suite needs a virtual display");
+    }
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+
+    let mut rendered = Vec::new();
+    for scene in chart_scene::all() {
+        if let Some(prefix) = only {
+            if !scene.name.starts_with(prefix) {
+                continue;
+            }
+        }
+        let out = out_dir.join(format!("{}.png", scene.name));
+        let launch = format!(
+            "{bin} --chart {name} --exit-after-ms {ms}",
+            bin = shell_quote(path_str(render_scene_bin)?),
+            name = scene.name,
+            ms = default_exit_after_ms(),
+        );
+        capture_window(&launch, scene.viewport, &icd, &out, scene.name)
+            .with_context(|| format!("rendering chart scene {}", scene.name))?;
+        rendered.push(scene.name.to_string());
+    }
+    Ok(rendered)
+}
+
+/// Render + capture a single grid case into `out_dir/<name>.png` under its own Xvfb display.
 fn render_one(
     render_scene_bin: &Path,
     icd: &Path,
     case: &RenderCase,
     out_dir: &Path,
 ) -> Result<()> {
-    let (w, h) = case.viewport;
     let out = out_dir.join(format!("{}.png", case.name));
+    let launch = format!(
+        "{bin} --case {name} --exit-after-ms {ms}",
+        bin = shell_quote(path_str(render_scene_bin)?),
+        name = case.name,
+        ms = default_exit_after_ms(),
+    );
+    capture_window(&launch, case.viewport, icd, &out, case.name)
+}
 
-    let script = capture_script(render_scene_bin, icd, case, &out)?;
+/// The exit-after-ms a launched renderer uses so it outlives the settle + present + capture
+/// window (the script kills the child afterward regardless).
+pub fn default_exit_after_ms() -> u64 {
+    ((settle_s() + present_s()) * 1000.0) as u64 + 8000
+}
+
+/// Launch `launch_cmd` (a shell command that starts a viewport-sized render window in the
+/// background and self-quits) under its own `xvfb-run` display sized to `viewport`, force
+/// presentation with `xrefresh`, find the `WxH` window, capture it to `out`, and assert the
+/// capture is non-blank. The reusable core of both the grid ([`render_all`]) and chart
+/// ([`render_charts`]) paths. `launch_cmd` must NOT background itself (`&`) — the script does.
+/// `label` names the fixture in error messages.
+fn capture_window(
+    launch_cmd: &str,
+    viewport: (u32, u32),
+    icd: &Path,
+    out: &Path,
+    label: &str,
+) -> Result<()> {
+    let (w, h) = viewport;
+    let script = capture_script(launch_cmd, icd, viewport, out)?;
     let screen = format!("-screen 0 {}x{}x24", w + SCREEN_MARGIN, h + SCREEN_MARGIN);
 
     let output = Command::new("xvfb-run")
@@ -150,7 +222,7 @@ fn render_one(
 
     // Guard against a silent blank (the window failed to present): a failed present yields a
     // single uniform colour, so a non-blank capture must have at least two distinct colours.
-    let colors = unique_colors(&out).with_context(|| {
+    let colors = unique_colors(out).with_context(|| {
         format!(
             "reading captured {} (xvfb stderr: {})",
             out.display(),
@@ -159,8 +231,7 @@ fn render_one(
     })?;
     if colors <= 1 {
         bail!(
-            "capture for {} is blank ({colors} unique colour(s)); xvfb stderr:\n{}",
-            case.name,
+            "capture for {label} is blank ({colors} unique colour(s)); xvfb stderr:\n{}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -168,28 +239,25 @@ fn render_one(
 }
 
 /// The per-case bash script run inside `xvfb-run`: launch the renderer, force presentation with
-/// `xrefresh`, find the grid window by its size, and capture it by id.
+/// `xrefresh`, find the render window by its size, and capture it by id.
 fn capture_script(
-    render_scene_bin: &Path,
+    launch_cmd: &str,
     icd: &Path,
-    case: &RenderCase,
+    viewport: (u32, u32),
     out: &Path,
 ) -> Result<String> {
-    let (w, h) = case.viewport;
-    let bin = shell_quote(path_str(render_scene_bin)?);
+    let (w, h) = viewport;
     let icd = shell_quote(path_str(icd)?);
     let out = shell_quote(path_str(out)?);
     let settle = settle_s();
     let present = present_s();
-    // exit-after-ms must outlast settle + present + capture; the script kills the child anyway.
-    let exit_after_ms = ((settle + present) * 1000.0) as u64 + 8000;
 
     Ok(format!(
         r#"set -u
 export VK_ICD_FILENAMES={icd}
 export LIBGL_ALWAYS_SOFTWARE=1
 export ZED_ALLOW_EMULATED_GPU=1
-{bin} --case {case} --exit-after-ms {exit_after_ms} >/dev/null 2>&1 &
+{launch_cmd} >/dev/null 2>&1 &
 APP=$!
 sleep {settle}
 xrefresh >/dev/null 2>&1 || true
@@ -205,7 +273,6 @@ fi
 kill -KILL $APP >/dev/null 2>&1 || true
 exit $rc
 "#,
-        case = case.name,
     ))
 }
 

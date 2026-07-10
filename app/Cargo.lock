@@ -5587,6 +5587,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "freecell-app",
+ "freecell-chart-model",
  "freecell-core",
  "freecell-engine",
  "gpui",

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use render_tests::diff::{diff_image, diff_png_files, DiffOptions};
-use render_tests::{capture_available, render_all};
+use render_tests::{capture_available, render_all, render_charts};
 
 /// The outcome of the one-time render-all.
 enum Rendered {
@@ -28,6 +28,10 @@ enum Rendered {
 }
 
 static RENDERED: OnceLock<Rendered> = OnceLock::new();
+
+/// The chart scenes' one-time render, independent of the grid's [`RENDERED`] so that filtering to
+/// the `chart_` tests renders **only** the chart scenes (the grid `OnceLock` stays cold).
+static CHART_RENDERED: OnceLock<Rendered> = OnceLock::new();
 
 fn baselines_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("baselines")
@@ -91,6 +95,27 @@ fn rendered() -> &'static Rendered {
     })
 }
 
+/// Render every chart scene once (guarded exactly like the grid [`rendered`]), returning where
+/// the captures live (or why they don't). Kept separate from [`rendered`] so the two suites are
+/// independent — a `chart_`-filtered run never triggers the grid render, and vice-versa.
+fn chart_rendered() -> &'static Rendered {
+    CHART_RENDERED.get_or_init(|| {
+        let want_render = std::env::var("FREECELL_RENDER").ok().as_deref() == Some("1");
+        match gate(want_render, capture_available()) {
+            Gate::Skip(reason) => Rendered::Skipped(reason),
+            Gate::Fail(reason) => Rendered::Failed(reason),
+            Gate::Render => {
+                let bin = Path::new(env!("CARGO_BIN_EXE_render_scene"));
+                let out = target_subdir("chart-render-actual");
+                match render_charts(bin, &out, None) {
+                    Ok(_) => Rendered::Ok(out),
+                    Err(err) => Rendered::Failed(format!("{err:#}")),
+                }
+            }
+        }
+    })
+}
+
 /// The committed baseline path for `name`, or an **actionable** error (telling the human to
 /// regenerate) when it is missing — not a panic deep in the diff. Pure (no display), so the
 /// missing-baseline contract is testable without rendering.
@@ -134,6 +159,43 @@ fn check_case(name: &str) {
         }
         Err(err) => {
             // A dimension mismatch (a size change) is a hard failure; still surface the pair.
+            write_failure_artifacts(name, &baseline, &actual, &opts);
+            panic!(
+                "{name}: {err:#} (artifacts in {})",
+                target_subdir("render-failures").display()
+            );
+        }
+    }
+}
+
+/// Diff one chart scene's fresh capture against its committed baseline — the chart analogue of
+/// [`check_case`], reusing the same baseline / diff / failure-artifact machinery over the chart
+/// [`chart_rendered`] captures.
+fn check_chart_case(name: &str) {
+    let dir = match chart_rendered() {
+        Rendered::Skipped(reason) => {
+            eprintln!("chart render suite skipped ({name}): {reason}");
+            return;
+        }
+        Rendered::Failed(err) => panic!("chart render-all failed for the suite: {err}"),
+        Rendered::Ok(dir) => dir,
+    };
+
+    let actual = dir.join(format!("{name}.png"));
+    let baseline = require_baseline(name).unwrap_or_else(|msg| panic!("{msg}"));
+
+    let opts = DiffOptions::default();
+    match diff_png_files(&baseline, &actual, &opts) {
+        Ok(report) if report.passed => {}
+        Ok(report) => {
+            write_failure_artifacts(name, &baseline, &actual, &opts);
+            panic!(
+                "{name}: chart render differs from baseline — {} (artifacts in {})",
+                report.summary(),
+                target_subdir("render-failures").display()
+            );
+        }
+        Err(err) => {
             write_failure_artifacts(name, &baseline, &actual, &opts);
             panic!(
                 "{name}: {err:#} (artifacts in {})",
@@ -225,6 +287,42 @@ fn case_names_match_table() {
     assert_eq!(
         names, table,
         "the render_cases! macro list and cases::all() have drifted — keep them in sync"
+    );
+}
+
+/// Generate one `#[test]` per chart scene (calling [`check_chart_case`]) + a `CHART_SCENE_NAMES`
+/// slice used to guard drift against `chart_scene::all()`. Named `chart_*` so `render_tests.sh
+/// test chart_` runs only these (and thus renders only the chart scenes).
+macro_rules! chart_render_cases {
+    ($($name:ident),+ $(,)?) => {
+        const CHART_SCENE_NAMES: &[&str] = &[$(stringify!($name)),+];
+        $(
+            #[test]
+            fn $name() { check_chart_case(stringify!($name)); }
+        )+
+    };
+}
+
+chart_render_cases! {
+    // P4 — the one make-or-break multi-series line scene that proves the chart render → capture →
+    // diff path. Later phases (P5+) add rows here as each production renderer lands.
+    chart_line_multi,
+}
+
+/// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift
+/// guard as `case_names_match_table`, for the chart fixtures.
+#[test]
+fn chart_scene_names_match_table() {
+    let mut table: Vec<&str> = render_tests::chart_scene::all()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    table.sort_unstable();
+    let mut names: Vec<&str> = CHART_SCENE_NAMES.to_vec();
+    names.sort_unstable();
+    assert_eq!(
+        names, table,
+        "the chart_render_cases! macro list and chart_scene::all() have drifted — keep them in sync"
     );
 }
 

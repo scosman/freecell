@@ -67,16 +67,21 @@ compiles render-tests and runs its GPUI-free unit tests, but the actual **pixel 
 not covered automatically**. So the **agent must decide when render coverage is needed and
 drive it** — there is no safety net.
 
-**Scope — what the suite actually covers.** Every render case is the real `GridView` rendered
+**Scope — what the suite actually covers.** Most render cases are the real `GridView` rendered
 over an engine-driven scene: **cell / row / column / sheet rendering** (text, numbers, fonts,
 alignment, borders, fills, colors, selection overlay, in-cell editor, loading overlay,
-scrollbars, variable geometry) **plus the standalone macOS titlebar row**. That is the whole
-baseline inventory. It does **NOT** cover the **welcome window**, the **About window**, or the
-rest of the chrome (**action row, data/formula row, sheet tabs**) — none of those have
-baselines. A change **confined to those surfaces cannot move any baseline**, so **do not run
-the pixel suite for it**; validate it instead with the crate's gpui view tests + the Xvfb
-smoke launch (`xvfb-run -a cargo run -p freecell-app` opens the welcome window). If one of
-those surfaces ever gains its own baseline, update this scope note.
+scrollbars, variable geometry) **plus the standalone macOS titlebar row**. On top of that, the
+suite also baselines **chart render scenes** (`chart_*` cases) — the real `freecell_app::chart`
+widgets rendered **standalone** from chart-model fixtures (no grid, no engine; charts project
+P4+). So a change to the **chart render code** (`freecell_app::chart`, from P5 onward) is
+**in-scope** and follows the same run-it/validate rules below as a grid/cell/sheet or titlebar
+change. Together, the grid + titlebar + chart scenes are the whole baseline inventory. It does
+**NOT** cover the **welcome window**, the **About window**, or the rest of the chrome (**action
+row, data/formula row, sheet tabs**) — none of those have baselines. A change **confined to
+those surfaces cannot move any baseline**, so **do not run the pixel suite for it**; validate it
+instead with the crate's gpui view tests + the Xvfb smoke launch (`xvfb-run -a cargo run -p
+freecell-app` opens the welcome window). If one of those surfaces ever gains its own baseline,
+update this scope note.
 
 **Cost — it's slow; time it strategically.** The suite software-renders every case under
 lavapipe: a **full** run takes **many minutes**, blocks your turn, and **busts the prompt

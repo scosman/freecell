@@ -91,7 +91,7 @@ The real minimal shipping version. Basic authoring + editing land **on the harde
 before any breadth — a blocker here must surface before we've built five more renderers. The one
 genuinely new subsystem, the write path, is isolated to P16.
 
-- [ ] **P16 — Write path (component design + impl).** Design doc for the write path + edit
+- [x] **P16 — Write path (component design + impl).** Design doc for the write path + edit
   panel, then **write-from-model** (authored) + **source-patch** (edited). *Exit:* a
   model-built chart serializes to a valid `.xlsx` reopenable in Excel + LibreOffice; round-trip
   tests.

@@ -1380,6 +1380,84 @@ fn write_package(path: &Path, parts: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Write-from-model authored fixture (P16 — the write path's own end-to-end artifact)
+// ---------------------------------------------------------------------------------------------
+
+/// Writes an **authored** single line-chart `.xlsx` to `path` (creating parent dirs) via the
+/// write-from-model path (charts/components/write-path §2–§3) — the counterpart to the *loaded*
+/// fixtures above. Unlike them it does **not** hand-write chart XML: it builds a real IronCalc
+/// workbook (`Sheet1` with the `CATEGORIES`/`WIDGETS` grid in `A1:B4` + the series name in `C1`),
+/// then serializes an authored line [`Chart`] that **references those cells** into it through
+/// [`write_authored_charts`]. Because the data lives in real cells, the chart survives an external
+/// round-trip (Excel / LibreOffice re-read the `c:f`s) — the artifact the P16 external round-trip
+/// gate consumes.
+pub fn write_authored_line_fixture(path: &Path) -> Result<()> {
+    use freecell_chart_model::{Category, Chart, ChartKind, Color, Grouping, Legend, Series};
+    use freecell_core::CellRef;
+
+    use crate::chart::write::{write_authored_charts, AuthoredChart, SeriesRefs};
+    use crate::document::WorkbookDocument;
+
+    // 1. A real IronCalc workbook holding the chart's source data on Sheet1.
+    let mut doc = WorkbookDocument::new_empty()
+        .map_err(|e| anyhow::anyhow!("new workbook for authored fixture: {e:?}"))?;
+    for (i, cat) in CATEGORIES.iter().enumerate() {
+        doc.set_cell_input(0, CellRef::new(i as u32, 0), cat)
+            .map_err(|e| anyhow::anyhow!("setting category cell: {e}"))?;
+    }
+    for (i, v) in WIDGETS.iter().enumerate() {
+        doc.set_cell_input(0, CellRef::new(i as u32, 1), &fmt_num(*v))
+            .map_err(|e| anyhow::anyhow!("setting value cell: {e}"))?;
+    }
+    doc.set_cell_input(0, CellRef::new(0, 2), "Widgets")
+        .map_err(|e| anyhow::anyhow!("setting series-name cell: {e}"))?;
+    doc.evaluate();
+    let model_bytes = doc
+        .to_xlsx_bytes()
+        .map_err(|e| anyhow::anyhow!("serializing authored-fixture model: {e:?}"))?;
+
+    // 2. The authored line chart, referencing those cells.
+    let chart = Chart {
+        title: Some("Authored Sales".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![Series::category_value(
+            Some("Widgets"),
+            CATEGORIES
+                .iter()
+                .map(|c| Category::Text((*c).into()))
+                .collect(),
+            WIDGETS.to_vec(),
+        )
+        .with_color(Color::from_hex(0x4472C4))],
+        cat_axis: freecell_chart_model::Axis::titled("Quarter"),
+        val_axis: freecell_chart_model::Axis::titled("Units (thousands)"),
+        legend: Some(Legend::default()),
+    };
+    let authored = AuthoredChart {
+        sheet_name: "Sheet1".into(),
+        chart_part: "xl/charts/chart1.xml".into(),
+        chart,
+        anchor: Anchor::new(AnchorCell::new(4, 1), AnchorCell::new(12, 16)),
+        refs: vec![SeriesRefs {
+            name: Some("Sheet1!$C$1".into()),
+            categories: Some("Sheet1!$A$1:$A$4".into()),
+            values: Some("Sheet1!$B$1:$B$4".into()),
+        }],
+    };
+
+    // 3. Serialize the chart into the workbook and write it out.
+    let (bytes, _report) = write_authored_charts(&model_bytes, &[authored])?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,16 +14,21 @@
 //!   and re-resolves a dirty chart's values from the current model — the live-binding machinery the
 //!   worker drives (charts/architecture §4.1). gpui-free and IronCalc-free (it reads through
 //!   closures).
+//! - [`write`] is the **write-from-model** path (P16): it *synthesizes* chart XML (+ drawing / rels /
+//!   content-types) from an **authored** [`freecell_chart_model::Chart`] into a workbook — the inverse
+//!   of [`load`], and the third save write-mode beside [`save`]'s byte-preserve + edit-patch.
 //! - [`authoring`] programmatically writes example `.xlsx` fixtures (used by the tests).
 //! - [`xlsx`] holds the shared zip + OPC-relationship helpers.
 //!
 //! Lifted from the chart PoC (`experiments/chart-poc/load-save`), extended through live binding
-//! (P9) and source-first save — byte-preserve + edit-reflow patch + multi-sheet part map (P10).
+//! (P9), source-first save — byte-preserve + edit-reflow patch + multi-sheet part map (P10) — and
+//! the write-from-model authoring path (P16).
 
 pub mod authoring;
 pub mod binding;
 pub mod load;
 pub mod save;
+pub mod write;
 pub mod xlsx;
 
 pub use binding::{parse_cf, CellData, ChartBinding, ChartBindings};
@@ -34,4 +39,8 @@ pub use load::{
 };
 pub use save::{
     patch_chart_source, reinject, reinject_live_charts, save_with_charts, LiveChart, SaveReport,
+};
+pub use write::{
+    serialize_chart_xml, synthesize_drawing_xml, write_authored_charts, AuthoredChart,
+    AuthoredWriteReport, SeriesRefs,
 };

@@ -232,7 +232,7 @@ fn live_sheet_targets(
 /// A `sheet name → output worksheet part` map read from an IronCalc-serialized workbook body.
 /// Duplicate sheet names are invalid `.xlsx` (Excel forbids them) and unreachable through a loaded
 /// workbook; if two ever collided the `collect` keeps the last (defensive last-write-wins).
-fn name_to_part_map(bytes: &[u8]) -> Result<HashMap<String, String>> {
+pub(super) fn name_to_part_map(bytes: &[u8]) -> Result<HashMap<String, String>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).context("reading model zip")?;
     Ok(xlsx::workbook_sheet_parts(&mut zip)?.into_iter().collect())
 }
@@ -461,7 +461,7 @@ fn drawing_chain_parts<R: Read + std::io::Seek>(
 
 /// Injects `<drawing r:id="{rel_id}"/>` before `</worksheet>` (idempotent) and ensures the
 /// worksheet root binds the `r:` prefix the injected element needs.
-fn patch_worksheet(ws: &str, rel_id: &str) -> Result<String> {
+pub(super) fn patch_worksheet(ws: &str, rel_id: &str) -> Result<String> {
     let ws = ensure_r_namespace(ws)?;
     if ws.contains("<drawing ") || ws.contains("<drawing/>") {
         return Ok(ws); // already anchored (nothing to do)
@@ -475,7 +475,7 @@ fn patch_worksheet(ws: &str, rel_id: &str) -> Result<String> {
 
 /// Ensures the `<worksheet …>` root declares `xmlns:r` (IronCalc may omit it when the sheet
 /// has no relationship-bearing elements — but our injected `<drawing r:id>` needs the prefix).
-fn ensure_r_namespace(ws: &str) -> Result<String> {
+pub(super) fn ensure_r_namespace(ws: &str) -> Result<String> {
     let start = ws
         .find("<worksheet")
         .ok_or_else(|| anyhow!("no <worksheet root element"))?;
@@ -562,7 +562,7 @@ fn declared_part_names(ct: &str) -> Result<HashSet<String>> {
 
 /// Builds a worksheet `_rels` part: IronCalc's existing relationships (if any) plus the drawing
 /// relationship we re-inject.
-fn build_sheet_rels(
+pub(super) fn build_sheet_rels(
     existing: Option<&str>,
     rel_id: &str,
     drawing_target: &str,
@@ -603,7 +603,7 @@ fn build_sheet_rels(
 
 /// The path of `to_part` relative to the directory of `from_part` (both package-absolute).
 /// Example: `xl/worksheets/sheet1.xml`, `xl/drawings/drawing1.xml` → `../drawings/drawing1.xml`.
-fn relative_part(from_part: &str, to_part: &str) -> String {
+pub(super) fn relative_part(from_part: &str, to_part: &str) -> String {
     let from_dir: Vec<&str> = from_part.split('/').collect();
     let from_dir = &from_dir[..from_dir.len().saturating_sub(1)]; // drop the file name
     let to: Vec<&str> = to_part.split('/').collect();
@@ -618,7 +618,7 @@ fn relative_part(from_part: &str, to_part: &str) -> String {
     segs.join("/")
 }
 
-fn read_named_bytes<R: Read + std::io::Seek>(
+pub(super) fn read_named_bytes<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Result<Vec<u8>> {
@@ -631,7 +631,7 @@ fn read_named_bytes<R: Read + std::io::Seek>(
     Ok(buf)
 }
 
-fn read_named_string<R: Read + std::io::Seek>(
+pub(super) fn read_named_string<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Result<String> {
@@ -639,7 +639,7 @@ fn read_named_string<R: Read + std::io::Seek>(
         .with_context(|| format!("zip entry {name} is not UTF-8"))
 }
 
-fn write_part<W: Write + std::io::Seek>(
+pub(super) fn write_part<W: Write + std::io::Seek>(
     zw: &mut zip::ZipWriter<W>,
     opts: zip::write::FileOptions,
     name: &str,
@@ -785,7 +785,11 @@ fn push_name_cache(src: &str, ser: &Node, name: &str, edits: &mut Vec<(Range<usi
 /// Rebuild a `numCache` element string with the same namespace `prefix`, preserving `format_code`
 /// if the original carried one. Non-finite values are omitted (sparse blanks); `ptCount` keeps the
 /// full length so blanked points still hold their axis slot.
-fn rebuild_num_cache(prefix: &str, format_code: Option<&str>, values: &[f64]) -> String {
+///
+/// Shared with the write-from-model serializer ([`super::write`]) so an **authored** value cache is
+/// byte-identical to a **reflowed** one (charts/components/write-path §4 — the reconciliation
+/// invariant).
+pub(super) fn rebuild_num_cache(prefix: &str, format_code: Option<&str>, values: &[f64]) -> String {
     let mut s = format!("<{prefix}numCache>");
     if let Some(fc) = format_code {
         s.push_str(&format!(
@@ -806,8 +810,9 @@ fn rebuild_num_cache(prefix: &str, format_code: Option<&str>, values: &[f64]) ->
     s
 }
 
-/// Rebuild a `strCache` element string with the same namespace `prefix`.
-fn rebuild_str_cache(prefix: &str, values: &[String]) -> String {
+/// Rebuild a `strCache` element string with the same namespace `prefix`. Shared with the
+/// write-from-model serializer ([`super::write`]) — see [`rebuild_num_cache`].
+pub(super) fn rebuild_str_cache(prefix: &str, values: &[String]) -> String {
     let mut s = format!("<{prefix}strCache>");
     s.push_str(&format!("<{prefix}ptCount val=\"{}\"/>", values.len()));
     for (idx, v) in values.iter().enumerate() {
@@ -844,7 +849,7 @@ fn cache_format_code(cache: &Node) -> Option<String> {
 
 /// Format a value for a cache `<c:v>`: whole numbers without a decimal point (matching Excel's
 /// `numCache`), other values with Rust's default `f64` formatting.
-fn fmt_cache_num(v: f64) -> String {
+pub(super) fn fmt_cache_num(v: f64) -> String {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {
@@ -853,7 +858,7 @@ fn fmt_cache_num(v: f64) -> String {
 }
 
 /// Minimal XML text escaping for reflowed cached strings.
-fn escape_xml(s: &str) -> String {
+pub(super) fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

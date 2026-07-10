@@ -332,6 +332,80 @@ pub fn discover_and_parse_by_sheet(path: &Path) -> Result<ChartsBySheet> {
     Ok(groups)
 }
 
+/// Discovers + parses **only** the charts anchored on the one worksheet whose package part is
+/// `sheet_part` (e.g. `xl/worksheets/sheet2.xml`) — the worker's **per-sheet lazy discovery**
+/// primitive (charts/architecture §5 challenge 5, "lazy parse"). Keying on the **stable package
+/// part** (never the live sheet name) is what keeps discovery rename-safe: the worker captures each
+/// [`SheetId`](freecell_core::SheetId) → part correspondence once at open (before any in-session
+/// rename) and drives both this and the save-time sweep off it, so a sheet renamed before it is
+/// painted still resolves to its charts. Only that worksheet's chart XML is read — nothing is parsed
+/// for sheets the user never visits. Returns an **empty** list when the sheet has no `<drawing>` /
+/// no charts, or when `sheet_part` isn't in the package. Per-chart resilience matches
+/// [`discover_and_parse`] (an unparseable chart is skipped + logged, never fatal).
+pub fn discover_and_parse_for_part(path: &Path, sheet_part: &str) -> Result<SheetCharts> {
+    let sheets = discover(path)?;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading {} as a zip", path.display()))?;
+    match sheets.iter().find(|s| s.sheet_part == sheet_part) {
+        Some(sheet) => Ok(parse_sheet_charts(&mut archive, sheet)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Discovers + parses **only** the charts anchored on the one worksheet named `sheet_name`,
+/// resolving the name → its package part via the `workbook.xml.rels` map. A name-keyed convenience
+/// (used by the perf harness + tests over a fresh fixture, where names match the file); the worker
+/// uses the rename-safe part-keyed [`discover_and_parse_for_part`] instead. Returns empty when the
+/// name isn't a file worksheet or its sheet carries no charts.
+pub fn discover_and_parse_for_sheet(path: &Path, sheet_name: &str) -> Result<SheetCharts> {
+    let sheets = discover(path)?;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading {} as a zip", path.display()))?;
+    let name_to_part: std::collections::HashMap<String, String> =
+        xlsx::workbook_sheet_parts(&mut archive)?
+            .into_iter()
+            .collect();
+    let Some(target_part) = name_to_part.get(sheet_name) else {
+        return Ok(Vec::new());
+    };
+    match sheets.iter().find(|s| &s.sheet_part == target_part) {
+        Some(sheet) => Ok(parse_sheet_charts(&mut archive, sheet)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The workbook's `SheetId`-independent **name → worksheet-part** map, read straight from the file's
+/// `workbook.xml.rels` (no chart XML parsed). The worker joins this with the model's at-open sheet
+/// names to capture the stable `SheetId → part` correspondence that makes lazy discovery + save
+/// rename-safe (P11 CR fix). Returns `(sheet name, worksheet part)` pairs in workbook order.
+pub fn workbook_sheet_parts(path: &Path) -> Result<Vec<(String, String)>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading {} as a zip", path.display()))?;
+    xlsx::workbook_sheet_parts(&mut archive)
+}
+
+/// Parse every chart anchored on one worksheet's `<drawing>` into `(part, ChartSpec)` pairs, in
+/// document order. Per-chart non-fatal (an unparseable chart is skipped + logged). Shared by the
+/// part- and name-keyed per-sheet discovery entry points.
+fn parse_sheet_charts<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    sheet: &SheetDrawing,
+) -> SheetCharts {
+    let mut specs = Vec::new();
+    for dc in &sheet.charts {
+        match parse_discovered_chart(archive, dc) {
+            Ok(spec) => specs.push((dc.part.clone(), spec)),
+            Err(err) => {
+                tracing::warn!(chart_part = %dc.part, "skipping unparseable chart: {err:#}");
+            }
+        }
+    }
+    specs
+}
+
 /// Parses one discovered chart into a [`ChartSpec`] — read the part, map it to a [`Chart`], and
 /// gather its `c:f` ranges + retained source (XML + related parts). Fallible so
 /// [`discover_and_parse`] can treat a failure as per-chart non-fatal (skip + log).
@@ -985,6 +1059,63 @@ mod tests {
             summary_specs[0].1.chart.kind,
             ChartKind::Line { .. }
         ));
+    }
+
+    /// P11 lazy discovery: `discover_and_parse_for_sheet` parses **only** the named worksheet's
+    /// charts — the two-sheet fixture's column chart under "Data", its line chart under "Summary",
+    /// and nothing for an unknown sheet name.
+    #[test]
+    fn discover_and_parse_for_sheet_parses_only_the_named_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_sheet.xlsx");
+        authoring::write_two_sheet_fixture(&path).unwrap();
+
+        let data = discover_and_parse_for_sheet(&path, "Data").unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].0, "xl/charts/chart1.xml");
+        assert!(matches!(data[0].1.chart.kind, ChartKind::Bar { .. }));
+
+        let summary = discover_and_parse_for_sheet(&path, "Summary").unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].0, "xl/charts/chart2.xml");
+        assert!(matches!(summary[0].1.chart.kind, ChartKind::Line { .. }));
+
+        // An unknown sheet name (an in-session add, or a rename before first paint) → nothing.
+        assert!(discover_and_parse_for_sheet(&path, "Nope")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// P11 CR: the rename-safe part-keyed discovery + the stable name→part map the worker joins at
+    /// open. `discover_and_parse_for_part` finds each sheet's charts by its STABLE worksheet part
+    /// (never the mutable name), and `workbook_sheet_parts` exposes the name→part correspondence.
+    #[test]
+    fn discover_and_parse_for_part_keys_on_the_stable_worksheet_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_sheet.xlsx");
+        authoring::write_two_sheet_fixture(&path).unwrap();
+
+        let parts = workbook_sheet_parts(&path).unwrap();
+        let data_part = parts.iter().find(|(n, _)| n == "Data").unwrap().1.clone();
+        let summary_part = parts
+            .iter()
+            .find(|(n, _)| n == "Summary")
+            .unwrap()
+            .1
+            .clone();
+
+        let data = discover_and_parse_for_part(&path, &data_part).unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(matches!(data[0].1.chart.kind, ChartKind::Bar { .. }));
+
+        let summary = discover_and_parse_for_part(&path, &summary_part).unwrap();
+        assert_eq!(summary.len(), 1);
+        assert!(matches!(summary[0].1.chart.kind, ChartKind::Line { .. }));
+
+        // An unknown part (an in-session-added worksheet) → nothing.
+        assert!(discover_and_parse_for_part(&path, "xl/worksheets/nope.xml")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

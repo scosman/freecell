@@ -38,6 +38,13 @@ path = "src/bin/generate_baselines.rs"
 name = "perf_harness"
 path = "src/bin/perf_harness.rs"
 
+# Charts P11: the chart perf harness — measures p50/p99 for first-paint / edit-rerender /
+# scroll-with-K, all headless (no GPU). Run FOREGROUND: `cargo run -p render-tests --release
+# --bin chart_perf` (see the bin's module docs). Writes results/chart-perf.json.
+[[bin]]
+name = "chart_perf"
+path = "src/bin/chart_perf.rs"
+
 [dependencies]
 freecell-core.workspace = true
 freecell-engine.workspace = true

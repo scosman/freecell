@@ -8,6 +8,8 @@
 //! crate — so the same value the engine *produces* on load is the value the app *consumes*
 //! to place and render a chart, with neither layer reaching across the seam.
 
+use std::sync::Arc;
+
 use crate::{source_fidelity, Chart, Fidelity};
 
 /// One corner of an `xdr:twoCellAnchor` (its `<xdr:from>` / `<xdr:to>`): a 0-based sheet cell
@@ -146,7 +148,14 @@ impl SourceXml {
 pub enum Origin {
     /// Parsed from an opened `.xlsx`; carries its retained [`SourceXml`] so save can
     /// byte-preserve it or targeted-patch it (charts/architecture §5).
-    Loaded { source: SourceXml },
+    ///
+    /// The source is held behind an [`Arc`] so cloning a [`ChartSpec`] — which the worker does on
+    /// **every** intersecting edit to build the published snapshot (P9/P11) — bumps a refcount
+    /// instead of deep-copying the (potentially large) chart XML + related parts. Only the render
+    /// [`Chart`], the value that actually changes on a re-resolve, is cloned. The app shares the
+    /// same `Arc` when it reads the snapshot, so an on-grid chart holds no independent copy of its
+    /// retained source (charts/architecture §5 challenge 5, "off-screen free").
+    Loaded { source: Arc<SourceXml> },
     /// Built in-app via authoring (P22+). Has no retained source — the write path synthesizes
     /// chart XML from a template on save.
     Authored,
@@ -187,7 +196,9 @@ impl ChartSpec {
             chart,
             source_ranges,
             anchor,
-            origin: Origin::Loaded { source },
+            origin: Origin::Loaded {
+                source: Arc::new(source),
+            },
         }
     }
 
@@ -205,7 +216,7 @@ impl ChartSpec {
     /// The retained source XML — `Some` iff this chart was loaded from a file.
     pub fn source(&self) -> Option<&SourceXml> {
         match &self.origin {
-            Origin::Loaded { source } => Some(source),
+            Origin::Loaded { source } => Some(source.as_ref()),
             Origin::Authored => None,
         }
     }

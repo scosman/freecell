@@ -767,11 +767,14 @@ fn spawn_line_fixture() -> (DocumentClient, WorkerEventReceiver, SheetId) {
     freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
     let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
     let sheet = sheets[0].id;
-    // `poll_until` returns only once discovery (which reads the file) has published the charts, so
-    // `dir` stays alive across the read; nothing reads the file after this helper returns.
+    // Lazy discovery (P11): charts are parsed on the **first paint** of their sheet, not on open, so
+    // send a viewport (the real app always does) to trigger it. `poll_until` returns only once
+    // discovery (which reads the file) has published the charts, so `dir` stays alive across the
+    // read; nothing reads the file after this helper returns.
+    client.send(full_viewport(sheet));
     poll_until(
         || client.chart_snapshot().version >= 1,
-        "the worker discovers + publishes the file's charts on load",
+        "the worker discovers + publishes the file's charts on the first paint",
     );
     (client, rx, sheet)
 }
@@ -841,6 +844,75 @@ fn disjoint_edit_does_not_recompute_charts() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// P11 — perf: lazy parse off open's critical path + coalesced recompute (charts/architecture §5)
+// ---------------------------------------------------------------------------------------------
+
+/// Lazy parse (P11): on open — before any paint — the file's charts are NOT parsed. The snapshot
+/// stays the empty version 0 until the sheet is first painted (a `SetViewport`), which then
+/// discovers + publishes them. This is what keeps chart parsing off the first-paint critical path.
+#[test]
+fn charts_are_not_discovered_until_first_paint() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("line.xlsx");
+    freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
+    let (client, _rx, sheets) = spawn(DocumentSource::OpenFile(path));
+    let sheet = sheets[0].id;
+
+    // No command has been sent since `Loaded`, so the worker is parked — no chart was parsed.
+    assert_eq!(
+        client.chart_snapshot().version,
+        0,
+        "charts are not discovered on open (off the critical path) — only on first paint",
+    );
+
+    // The first paint of the sheet triggers discovery → the chart publishes.
+    client.send(full_viewport(sheet));
+    poll_until(
+        || client.chart_snapshot().version >= 1,
+        "the first paint discovers + publishes the chart",
+    );
+    let snap = client.chart_snapshot();
+    assert_eq!(snap.sheets.len(), 1);
+    assert_eq!(
+        snap.sheets[0].1.len(),
+        1,
+        "the fixture's one line chart is now bound"
+    );
+}
+
+/// Coalesced dirty-set recompute (P11): two edits to two cells in one chart's source range — however
+/// the worker batches them (one drained recompute, or two) — converge the chart to reflect BOTH,
+/// advancing the snapshot. (Structural coalescing of a single drained batch into one recompute is
+/// covered deterministically by `binding::coalesced_multi_edit_recompute_is_one_pass`.)
+#[test]
+fn coalesced_edits_converge_the_chart() {
+    let (client, rx, sheet) = spawn_line_fixture();
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    let base_version = client.chart_snapshot().version;
+
+    // Two edits inside the Widgets B2:B5 value range.
+    client.send(set_input(sheet, 1, 1, "111")); // B2
+    client.send(set_input(sheet, 2, 1, "222")); // B3
+    poll_until(
+        || {
+            let v = snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0);
+            v.first() == Some(&111.0) && v.get(1) == Some(&222.0)
+        },
+        "both edits converge into the chart's values",
+    );
+    let snap = client.chart_snapshot();
+    assert_eq!(
+        snapshot_series_values(&snap, sheet, 0, 0),
+        vec![111.0, 222.0, 90.0, 170.0],
+    );
+    assert!(
+        snap.version > base_version,
+        "the re-resolve advanced the snapshot version",
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // P10 — save/restore: `Command::Save` preserves + reflows charts (charts/architecture §4.1/§5)
 // ---------------------------------------------------------------------------------------------
 
@@ -880,15 +952,15 @@ fn save_through_worker_preserves_and_patches_charts() {
 
     let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path.clone()));
     let sheet = sheets[0].id;
+    // Lazy discovery (P11): the first paint of the sheet discovers + publishes its charts.
+    client.send(full_viewport(sheet));
     poll_until(
         || client.chart_snapshot().version >= 1,
-        "the worker discovers + publishes the file's charts on load",
+        "the worker discovers + publishes the file's charts on the first paint",
     );
 
     // Edit B2 (Widgets Q1) — feeds the column chart (idx 0) and the line chart (idx 1), NOT the
     // pie (idx 2, which reads column D). Wait until the reflow lands in the snapshot.
-    client.send(full_viewport(sheet));
-    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
     client.send(set_input(sheet, 1, 1, "999"));
     poll_until(
         || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0).first() == Some(&999.0),
@@ -917,6 +989,106 @@ fn save_through_worker_preserves_and_patches_charts() {
         "the untouched pie chart is byte-stable",
     );
     freecell_engine::WorkbookDocument::open(&out).expect("saved workbook reopens in the engine");
+}
+
+/// P11 lazy parse + save correctness: saving a chart workbook **without ever painting** its sheet
+/// (so lazy discovery never ran) must still preserve the chart — the save forces a full sweep first.
+#[test]
+fn save_preserves_charts_when_their_sheet_was_never_painted() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("line.xlsx");
+    freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
+    let (client, rx, _sheets) = spawn(DocumentSource::OpenFile(path));
+
+    // No viewport is ever sent — the chart's sheet is never painted, so nothing was discovered.
+    assert_eq!(
+        client.chart_snapshot().version,
+        0,
+        "nothing discovered before the save"
+    );
+
+    let out = dir.path().join("out.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 31,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 31, .. })).is_some());
+
+    // The save's full sweep discovered + preserved the chart despite it never being painted.
+    freecell_engine::WorkbookDocument::open(&out).expect("saved workbook reopens");
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(
+        specs.len(),
+        1,
+        "the never-painted chart is preserved by the save-time full sweep",
+    );
+    assert!(matches!(
+        specs[0].chart.kind,
+        freecell_chart_model::ChartKind::Line { .. }
+    ));
+}
+
+/// P11 CR (Critical, rename-robustness): renaming a chart's host sheet that was **never painted**
+/// must NOT hide or drop the chart. Lazy discovery keys on the sheet's **stable file worksheet part**
+/// (captured at open), not its mutable live name — so after a rename-before-paint, (a) painting the
+/// renamed sheet still discovers its chart, and (b) saving preserves it on the **new** name. The
+/// pre-fix name-keyed logic silently lost it (discover-by-current-name found nothing in the file).
+#[test]
+fn rename_before_paint_still_discovers_and_saves_the_chart() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("two_sheet.xlsx");
+    // Data (column chart) + Summary (line chart); Summary is NOT the active sheet.
+    freecell_engine::chart::authoring::write_two_sheet_fixture(&path).unwrap();
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path.clone()));
+    let summary = sheets.iter().find(|s| s.name == "Summary").unwrap().id;
+
+    // Rename Summary → "Renamed" WITHOUT ever painting it — its line chart was never discovered.
+    client.send(Command::RenameSheet {
+        sheet: summary,
+        name: "Renamed".to_string(),
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::SheetsChanged { .. })).is_some());
+    assert_eq!(
+        client.chart_snapshot().version,
+        0,
+        "nothing is discovered before the sheet is painted",
+    );
+
+    // (a) Painting the renamed sheet discovers its chart — keyed by the stable part, not the name.
+    client.send(Command::SetViewport {
+        sheet: summary,
+        rows: 0..64,
+        cols: 0..16,
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .any(|(s, specs)| *s == summary && !specs.is_empty())
+        },
+        "painting the renamed-before-paint sheet discovers its chart",
+    );
+
+    // (b) Saving preserves that chart on the NEW sheet name.
+    let out = dir.path().join("out.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 41,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 41, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("saved workbook reopens");
+    let groups = freecell_engine::chart::discover_and_parse_by_sheet(&out).unwrap();
+    let (name, charts) = groups
+        .iter()
+        .find(|(n, _)| n == "Renamed")
+        .expect("the renamed sheet carries its line chart in the saved file");
+    assert_eq!(name, "Renamed");
+    assert!(matches!(
+        charts[0].1.chart.kind,
+        freecell_chart_model::ChartKind::Line { .. }
+    ));
 }
 
 /// A chartless workbook still saves through the **plain** path — the P10 wiring must not change
@@ -969,9 +1141,28 @@ fn spawn_over_chart_file(
     let path = dir.path().join("book.xlsx");
     write(&path);
     let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
-    poll_until(
-        || client.chart_snapshot().version >= 1,
-        "the worker discovers + publishes the file's charts on load",
+    // Lazy discovery (P11): charts bind on the **first paint** of their sheet, so paint EVERY sheet
+    // to discover + bind all charts to their real `SheetId`s — exactly as eager discovery did on
+    // load. The rename/delete-host save tests depend on that binding existing *before* the
+    // structural sheet op (so a deleted host's chart drops, a renamed host's follows). A trailing
+    // `GetCellContent` read is a FIFO fence: its reply proves every viewport (and its lazy
+    // discovery) has been processed. A final viewport returns the active sheet to the first one.
+    for meta in &sheets {
+        client.send(Command::SetViewport {
+            sheet: meta.id,
+            rows: 0..64,
+            cols: 0..16,
+        });
+    }
+    client.send(full_viewport(sheets[0].id));
+    client.send(Command::GetCellContent {
+        sheet: sheets[0].id,
+        cell: CellRef::new(0, 0),
+        req_id: u64::MAX,
+    });
+    assert!(
+        wait_for(&rx, |e| matches!(e, WorkerEvent::CellContent { req_id: u64::MAX, .. })).is_some(),
+        "the read fence must reply once every sheet's first paint (and lazy discovery) is processed",
     );
     (client, rx, sheets, dir)
 }

@@ -37,7 +37,7 @@ use freecell_core::{
     RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
-use super::chart_layer::{self, RenderedChart};
+use super::chart_layer::{self, ChartPlacement};
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
     self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
@@ -189,12 +189,24 @@ pub struct GridView {
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
 
-    /// The charts painted on each sheet's **ChartLayer** (P8, `charts/architecture.md §4.2`),
-    /// keyed by sheet. Each [`RenderedChart`] is resolved once from a [`ChartSpec`] at install
-    /// time ([`GridView::set_sheet_charts`]) — its values are static this phase (live rebinding is
-    /// P9). The render path paints only the active sheet's charts, mapping each anchor to a pixel
-    /// rect and culling the off-screen ones.
-    charts: HashMap<SheetId, Vec<RenderedChart>>,
+    /// The charts painted on each sheet's **ChartLayer** (P8/P11, `charts/architecture.md §4.2`,
+    /// §5 challenge 5), keyed by sheet. See [`SheetChartLayer`]: the per-sheet spec list is **shared**
+    /// with the engine's published snapshot (no app-side copy), and the per-frame scan reads only the
+    /// tiny [`ChartPlacement`]s, materializing the heavy render `Chart` for the on-screen few.
+    charts: HashMap<SheetId, SheetChartLayer>,
+}
+
+/// One sheet's installed charts (P11, `charts/architecture.md §5` challenge 5, "off-screen free").
+///
+/// `specs` is the **shared** `Arc<[ChartSpec]>` the engine published — the grid holds a refcount, not
+/// a copy, so a sheet with K charts adds no independent resident duplicate of their render pictures
+/// or retained source. `placements` is one tiny [`ChartPlacement`] per spec (anchor + derived
+/// fidelity), classified once at install so the per-frame cull scan never re-parses source XML. The
+/// heavy `specs[i].chart` is borrowed **only** for a chart that is currently on-screen; an off-screen
+/// chart contributes nothing but its placement to the scan (and re-materializes when it scrolls in).
+struct SheetChartLayer {
+    specs: Arc<[ChartSpec]>,
+    placements: Vec<ChartPlacement>,
 }
 
 /// A live-resize preview applied to **one** axis as a cheap **O(1) per-track delta**, NOT a
@@ -376,24 +388,74 @@ impl GridView {
         }
     }
 
-    /// Installs the charts to paint on `sheet`'s **ChartLayer** (P8, `charts/architecture.md §4.2`).
-    /// Each [`ChartSpec`] is resolved once into a [`RenderedChart`] (its render picture + anchor +
-    /// derived fidelity) — values are static this phase (live rebinding is P9). An empty list clears
-    /// the sheet's charts. The engine produces the specs on open (`discover_and_parse`); the window
-    /// hands them here for the sheet they belong to.
+    /// Installs the charts to paint on `sheet`'s **ChartLayer** (P8/P11, `charts/architecture.md
+    /// §4.2`, §5 challenge 5). `specs` is the **shared** `Arc<[ChartSpec]>` the engine published: the
+    /// grid keeps the `Arc` (a refcount bump — no per-chart copy of its render picture / retained
+    /// source) and derives one tiny [`ChartPlacement`] per spec (anchor + fidelity) for the per-frame
+    /// cull scan. An empty install clears the sheet's charts. Live re-resolves arrive as fresh
+    /// snapshots on later `Published` events (P9); each is installed here, replacing the shared slice.
     pub fn set_sheet_charts(
         &mut self,
         sheet: SheetId,
-        specs: Vec<ChartSpec>,
+        specs: Arc<[ChartSpec]>,
         cx: &mut Context<Self>,
     ) {
         if specs.is_empty() {
             self.charts.remove(&sheet);
         } else {
-            let rendered = specs.iter().map(RenderedChart::from_spec).collect();
-            self.charts.insert(sheet, rendered);
+            let placements = specs.iter().map(ChartPlacement::from_spec).collect();
+            self.charts
+                .insert(sheet, SheetChartLayer { specs, placements });
         }
         cx.notify();
+    }
+
+    /// The charts of `layer` that fall within the content viewport at the given scroll, as
+    /// `(spec index, content-local rect)` pairs — the on-screen set the ChartLayer materializes (P11
+    /// "off-screen free"). Scans only the tiny [`ChartPlacement`]s (never the heavy `Chart`), mapping
+    /// each anchor to a rect and dropping the ones [`is_offscreen`](chart_layer::ChartRect::is_offscreen)
+    /// culls. The single source of truth for both the paint loop and its test helper.
+    fn visible_charts(
+        layer: &SheetChartLayer,
+        geom: &impl chart_layer::GridGeometry,
+        scroll_x: f64,
+        scroll_y: f64,
+        content_w: f64,
+        content_h: f64,
+    ) -> Vec<(usize, chart_layer::ChartRect)> {
+        layer
+            .placements
+            .iter()
+            .enumerate()
+            .filter_map(|(i, placement)| {
+                let rect = chart_layer::anchor_rect(&placement.anchor, geom, scroll_x, scroll_y);
+                (!rect.is_offscreen(content_w, content_h)).then_some((i, rect))
+            })
+            .collect()
+    }
+
+    /// Test introspection for P11 "off-screen free": the spec indices of `sheet`'s charts that are
+    /// on-screen at the given scroll/viewport (against a supplied geometry) — proving off-screen
+    /// charts are culled out of the materialized set and re-enter it when scrolled back into view.
+    #[cfg(test)]
+    pub(crate) fn on_screen_chart_indices(
+        &self,
+        sheet: SheetId,
+        geom: &impl chart_layer::GridGeometry,
+        scroll_x: f64,
+        scroll_y: f64,
+        content_w: f64,
+        content_h: f64,
+    ) -> Vec<usize> {
+        self.charts
+            .get(&sheet)
+            .map(|layer| {
+                Self::visible_charts(layer, geom, scroll_x, scroll_y, content_w, content_h)
+                    .into_iter()
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Installs the reused in-cell editor input the chrome owns, so the grid can render the overlay
@@ -1885,18 +1947,21 @@ impl GridView {
         // plot (+ a corner badge when Degraded) or the placeholder (Unsupported). Read-only this
         // phase — the chart divs register no listeners, so the grid's coordinate hit-testing is
         // unaffected. When the active sheet has no charts, nothing is pushed (no baseline change).
-        if let Some(charts) = self.charts.get(&self.active_sheet) {
-            let mut chart_children: Vec<AnyElement> = Vec::with_capacity(charts.len());
-            for rendered in charts {
-                let rect = chart_layer::anchor_rect(
-                    &rendered.anchor,
-                    frame,
-                    frame.scroll_x,
-                    frame.scroll_y,
-                );
-                if rect.is_offscreen(frame.content_w, frame.content_h) {
-                    continue;
-                }
+        if let Some(layer) = self.charts.get(&self.active_sheet) {
+            // The per-frame scan touches only the tiny `placements` (P11 "off-screen free", via
+            // [`on_screen_charts`]): off-screen charts are culled without ever borrowing their heavy
+            // render `Chart`; the shared `specs[i].chart` is materialized only for the on-screen few
+            // (re-materialized when a chart scrolls back into view).
+            let visible = Self::visible_charts(
+                layer,
+                frame,
+                frame.scroll_x,
+                frame.scroll_y,
+                frame.content_w,
+                frame.content_h,
+            );
+            let mut chart_children: Vec<AnyElement> = Vec::with_capacity(visible.len());
+            for (i, rect) in visible {
                 chart_children.push(
                     div()
                         .absolute()
@@ -1905,8 +1970,8 @@ impl GridView {
                         .w(px(rect.w))
                         .h(px(rect.h))
                         .child(crate::chart::in_grid_chart_element(
-                            &rendered.chart,
-                            rendered.fidelity,
+                            &layer.specs[i].chart,
+                            layer.placements[i].fidelity,
                         ))
                         .into_any_element(),
                 );
@@ -3093,7 +3158,7 @@ impl GridView {
     ) -> Vec<freecell_chart_model::Fidelity> {
         self.charts
             .get(&sheet)
-            .map(|charts| charts.iter().map(|c| c.fidelity).collect())
+            .map(|layer| layer.placements.iter().map(|p| p.fidelity).collect())
             .unwrap_or_default()
     }
 
@@ -3225,11 +3290,11 @@ mod tests {
             let sheet = g.active_sheet();
             g.set_sheet_charts(
                 sheet,
-                vec![
+                Arc::from(vec![
                     spec("<c:lineChart/>"),
                     spec("<c:bar3DChart/>"),
                     spec("<c:surfaceChart/>"),
-                ],
+                ]),
                 cx,
             );
             g.sheet_chart_fidelities(sheet)
@@ -3246,10 +3311,96 @@ mod tests {
         // An empty install clears the sheet's charts.
         let cleared = grid.update(cx, |g, cx| {
             let sheet = g.active_sheet();
-            g.set_sheet_charts(sheet, Vec::new(), cx);
+            g.set_sheet_charts(sheet, Arc::from(Vec::new()), cx);
             g.sheet_chart_fidelities(sheet)
         });
         assert!(cleared.is_empty(), "an empty install clears the ChartLayer");
+    }
+
+    /// P11 "off-screen free": the ChartLayer materializes only the on-screen charts and culls the
+    /// off-screen ones from the build; a chart that scrolls out is freed from the materialized set
+    /// and re-materializes when it scrolls back in. Driven through the grid's placement-based cull
+    /// against a mock geometry (the paint loop uses the same [`GridView::visible_charts`]).
+    #[gpui::test]
+    fn offscreen_charts_are_freed_and_rematerialize_on_scrollback(cx: &mut TestAppContext) {
+        use freecell_chart_model::{
+            Anchor, AnchorCell, Axis, Category, Chart, ChartKind, Grouping, Legend, Series,
+            SourceXml,
+        };
+
+        // A uniform grid geometry (100 px columns, 24 px rows) so the anchor→pixel mapping is exact.
+        struct UniformGeom;
+        impl chart_layer::GridGeometry for UniformGeom {
+            fn col_start(&self, col: u32) -> f64 {
+                col as f64 * 100.0
+            }
+            fn row_start(&self, row: u32) -> f64 {
+                row as f64 * 24.0
+            }
+        }
+
+        let line = || Chart {
+            title: Some("S".into()),
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![Series::category_value(
+                Some("A"),
+                vec![Category::Text("Q1".into())],
+                vec![1.0],
+            )],
+            cat_axis: Axis::untitled(),
+            val_axis: Axis::untitled(),
+            legend: Some(Legend::default()),
+        };
+        // Three charts spread far apart horizontally: cols 0–5, 20–25, 40–45 (x ≈ 0, 2000, 4000 px).
+        let spec_at = |from_col: u32, to_col: u32| {
+            ChartSpec::loaded(
+                line(),
+                SourceXml::new("<c:lineChart/>"),
+                Vec::new(),
+                Anchor::new(AnchorCell::new(from_col, 0), AnchorCell::new(to_col, 5)),
+            )
+        };
+        let specs = Arc::from(vec![spec_at(0, 5), spec_at(20, 25), spec_at(40, 45)]);
+
+        let grid = grid(cx);
+        let sheet = grid.update(cx, |g, cx| {
+            let s = g.active_sheet();
+            g.set_sheet_charts(s, specs, cx);
+            s
+        });
+
+        let geom = UniformGeom;
+        let (cw, ch) = (600.0_f64, 300.0_f64);
+
+        let on_screen = |cx: &mut TestAppContext, scroll_x: f64| {
+            grid.update(cx, |g, _cx| {
+                g.on_screen_chart_indices(sheet, &geom, scroll_x, 0.0, cw, ch)
+            })
+        };
+
+        // At the origin only chart 0 (x 0..500) is on-screen; the far ones are freed (culled).
+        assert_eq!(
+            on_screen(cx, 0.0),
+            vec![0],
+            "only the on-screen chart is materialized",
+        );
+
+        // Scroll right so chart 1 (cols 20–25) maps into the viewport; chart 0 is now freed.
+        assert_eq!(
+            on_screen(cx, 2000.0),
+            vec![1],
+            "a previously off-screen chart re-materializes; the scrolled-away one is freed",
+        );
+
+        // Scroll back to the origin → chart 0 re-materializes (correct on scroll-back).
+        assert_eq!(
+            on_screen(cx, 0.0),
+            vec![0],
+            "scrolling back re-materializes the origin chart",
+        );
     }
 
     // ---- Editing-feel input triggers (`components/edit_controller.md §Grid integration`) ----

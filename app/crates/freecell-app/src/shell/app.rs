@@ -1591,7 +1591,7 @@ mod tests {
         // 1) A v1 snapshot with one chart installs on the next Published.
         client.set_chart_snapshot(ChartSnapshot {
             version: 1,
-            sheets: vec![(sheet, vec![chart_spec_for_test()])],
+            sheets: vec![(sheet, std::sync::Arc::from(vec![chart_spec_for_test()]))],
         });
         inject_published(cx);
         assert_eq!(

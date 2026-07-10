@@ -23,7 +23,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Instant;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use freecell_core::input_cap::validate_input;
 use freecell_core::merge_guard::{blocks_col_op, blocks_row_op};
@@ -168,6 +168,24 @@ pub(super) struct Worker {
     /// save — surviving a Save-As away from a since-deleted original). `None` for a workbook never
     /// opened from a file; then save falls through to the plain (chart-less) writer.
     chart_source_path: Option<PathBuf>,
+    /// The sheets whose chart drawings have already been **walked** (P11 lazy discovery,
+    /// charts/architecture §5 challenge 5). A sheet is inserted the first time it is painted so its
+    /// zip is walked **at most once** — even if it carries no charts (so we don't re-parse on every
+    /// scroll). Correctness (never double-binding a chart) is `ChartBindings::add_missing`'s job;
+    /// this set is purely the "walk each sheet once" guard.
+    discovered_chart_sheets: HashSet<SheetId>,
+    /// Set once every sheet's charts have been discovered — after the save-time full sweep
+    /// (`ensure_all_charts_discovered`), or for a workbook that was never opened from a file. Short-
+    /// circuits all further lazy per-sheet walks.
+    charts_fully_discovered: bool,
+    /// The **stable** `SheetId → file worksheet part` map (e.g. `xl/worksheets/sheet2.xml`),
+    /// captured **once at open** by joining the model's at-open sheet names with the file's
+    /// `workbook.xml.rels` name→part map (P11 CR fix). Keying lazy discovery + the save sweep on
+    /// this — rather than the *current* sheet name — is what keeps them **rename-safe**: a sheet
+    /// renamed in-session keeps its `SheetId`, so its charts still resolve to their file part, and
+    /// the chart follows the rename on save (`live_sheet_targets` resolves `SheetId → current
+    /// name`). Empty for a workbook never opened from a file, or if the map couldn't be read.
+    chart_sheet_parts: HashMap<SheetId, String>,
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -214,6 +232,11 @@ impl Worker {
                 DocumentSource::OpenFile(path) => Some(path.clone()),
                 DocumentSource::NewWorkbook => None,
             },
+            discovered_chart_sheets: HashSet::new(),
+            // A workbook never opened from a file has no charts to discover — start "fully
+            // discovered" so save takes the plain path without a wasted walk.
+            charts_fully_discovered: matches!(source, DocumentSource::NewWorkbook),
+            chart_sheet_parts: HashMap::new(),
         };
 
         // Point the active sheet at the first sheet's real stable id, and seed an empty
@@ -237,25 +260,18 @@ impl Worker {
             sheet: worker.active_sheet,
         });
 
-        // Discover + bind this file's embedded charts for live binding (P9, charts/architecture
-        // §4.1). Runs after `Loaded` (the grid's geometry/styles already paint) but before the loop
-        // processes the first `SetViewport`, so the charts are in the snapshot by the first
-        // `Published`. Reads the file's cached values as first paint — no model eval (SP2). Per-chart
-        // non-fatal (a broken chart is skipped); a discovery failure just leaves the workbook
-        // chart-less. Each chart is anchored to its **own** worksheet's `SheetId` via the P10
-        // `workbook.xml.rels` part map (grouped discovery); a name that doesn't resolve falls back to
-        // the active sheet. (Lazy/off-critical-path parsing is P11.)
+        // Chart **XML parsing** is lazy + off open's critical path (P11, charts/architecture §5
+        // challenge 5): no chart part is parsed here — that would block the first
+        // `SetViewport → Published` (first cell-value paint) behind a zip walk. Each sheet's charts
+        // are parsed the first time that sheet is painted (`ensure_sheet_charts_discovered`, run
+        // **after** the viewport publish), and a save forces a full sweep so a never-painted chart
+        // sheet is still preserved. What we DO capture eagerly is the tiny, rename-safe
+        // `SheetId → file worksheet part` map — no chart XML, just `workbook.xml.rels` — joined while
+        // the model's sheet names still match the file. Both discovery paths key off this stable
+        // part (not the mutable live name), so a sheet renamed before it is painted still resolves to
+        // its charts and follows the rename on save (P11 CR fix).
         if let DocumentSource::OpenFile(path) = &source {
-            match crate::chart::discover_and_parse_by_sheet(path) {
-                Ok(groups) if groups.iter().any(|(_, specs)| !specs.is_empty()) => {
-                    let by_id = worker.groups_to_sheet_ids(groups);
-                    worker.charts = ChartBindings::from_specs_by_sheet(by_id);
-                    worker.chart_version = 1;
-                    worker.store_chart_snapshot();
-                }
-                Ok(_) => {}
-                Err(err) => tracing::warn!("chart discovery failed: {err:#}"),
-            }
+            worker.chart_sheet_parts = worker.build_chart_sheet_part_map(path);
         }
 
         worker.run(cmd_rx);
@@ -286,6 +302,10 @@ impl Worker {
         // the undo stack — they can't ride the generic coalesced edit path.
         let mut font_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
+        // Every sheet activated in this drained batch (in order), so lazy chart discovery walks
+        // EACH one — not just the batch's final active sheet (a batch that activates A then B must
+        // still discover A's charts, P11 CR Mild #1).
+        let mut activated_sheets: Vec<SheetId> = Vec::new();
         let mut shutdown = false;
 
         for cmd in batch {
@@ -297,6 +317,9 @@ impl Worker {
                     self.active_sheet = sheet;
                     self.viewport = Some(clamp_viewport(rows, cols));
                     viewport_changed = true;
+                    if !activated_sheets.contains(&sheet) {
+                        activated_sheets.push(sheet);
+                    }
                 }
                 Command::GetCellContent {
                     sheet,
@@ -350,6 +373,14 @@ impl Worker {
             self.emit(WorkerEvent::StyleCacheUpdated {
                 sheet: self.active_sheet,
             });
+        }
+
+        // Lazy chart discovery (P11, charts/architecture §5 challenge 5): the first time a sheet is
+        // painted, walk + bind its charts — AFTER the viewport publish above, so the cells paint
+        // first and the parse is off the first-paint critical path. Walks EACH sheet the batch
+        // activated (not just the final one). A no-op on every later frame.
+        for sheet in activated_sheets {
+            self.ensure_sheet_charts_discovered(sheet);
         }
 
         // Font ops after the edit batch (each is standalone: its own style paste + auto-grow +
@@ -1246,26 +1277,114 @@ impl Worker {
         }
     }
 
-    /// Map each grouped-discovery `(sheet name, (part, spec)…)` group to its `(SheetId, …)` anchor —
-    /// resolving the name against the current model (P10 multi-sheet chart→SheetId placement). A
-    /// name that doesn't resolve (a deleted/renamed data sheet the drawing outlived) falls back to
-    /// the active sheet, so its charts still paint on the visible sheet rather than vanishing.
-    fn groups_to_sheet_ids(
-        &self,
-        groups: crate::chart::load::ChartsBySheet,
-    ) -> Vec<(SheetId, crate::chart::load::SheetCharts)> {
+    /// Capture the **stable** `SheetId → file worksheet part` map at open (P11 CR fix): the file's
+    /// `workbook.xml.rels` name→part map joined with the model's **at-open** sheet names (which still
+    /// match the file). No chart XML is parsed — this is the tiny, eager half of "lazy parse off the
+    /// critical path"; the heavy chart XML still defers to first paint. A read failure yields an
+    /// empty map (the workbook opens chart-less rather than failing) and is logged.
+    ///
+    /// **Join assumption:** the map is built by **exact name-equality** between the file's
+    /// `workbook.xml` `<sheet name>` and the model's at-open `sheet_properties()` name — i.e. it
+    /// assumes IronCalc loads sheet names byte-identical to the file's `<sheets>` (true at open;
+    /// both derive from the same `workbook.xml`). A sheet whose name fails to join is filter-mapped
+    /// out, so its charts degrade to **chart-less** (never discovered/saved) rather than
+    /// mis-anchored — matching the "workbook open never breaks on charts" invariant.
+    fn build_chart_sheet_part_map(&self, path: &Path) -> HashMap<SheetId, String> {
+        let file_parts = match crate::chart::workbook_sheet_parts(path) {
+            Ok(parts) => parts,
+            Err(err) => {
+                tracing::warn!("chart sheet-part map unreadable; opening chart-less: {err:#}");
+                return HashMap::new();
+            }
+        };
         let props = self.doc.sheet_properties();
-        groups
+        file_parts
             .into_iter()
-            .map(|(name, specs)| {
-                let id = props
+            .filter_map(|(name, part)| {
+                props
                     .iter()
                     .find(|(_, n)| *n == name)
-                    .map(|(id, _)| SheetId(*id))
-                    .unwrap_or(self.active_sheet);
-                (id, specs)
+                    .map(|(id, _)| (SheetId(*id), part))
             })
             .collect()
+    }
+
+    /// Walk + bind `sheet`'s charts the first time it is painted (P11 lazy discovery,
+    /// charts/architecture §5 challenge 5). Runs after the viewport publish, so the parse is off the
+    /// first-paint critical path — the cells are already on screen; the charts ride the **next**
+    /// `Published`, exactly as a live re-resolve does (P9). Keyed on the sheet's **stable file part**
+    /// (via [`chart_sheet_parts`](Self::chart_sheet_parts)), NOT its live name, so a sheet renamed
+    /// before it is painted still resolves to its charts (P11 CR fix). A no-op once the sheet has been
+    /// walked, once every sheet has been discovered, or for a non-file / in-session-added sheet.
+    fn ensure_sheet_charts_discovered(&mut self, sheet: SheetId) {
+        if self.charts_fully_discovered {
+            return;
+        }
+        let Some(path) = self.chart_source_path.clone() else {
+            return; // never opened from a file → nothing to discover
+        };
+        if !self.discovered_chart_sheets.insert(sheet) {
+            return; // already walked this sheet (walk each at most once)
+        }
+        let Some(part) = self.chart_sheet_parts.get(&sheet).cloned() else {
+            return; // not a file worksheet (added in-session) → no file charts
+        };
+        match crate::chart::discover_and_parse_for_part(&path, &part) {
+            Ok(specs) => {
+                if self.charts.add_missing(vec![(sheet, specs)]) {
+                    self.chart_version += 1;
+                    self.store_chart_snapshot();
+                    self.emit(WorkerEvent::Published);
+                }
+            }
+            Err(err) => tracing::warn!(%part, "lazy chart discovery failed: {err:#}"),
+        }
+    }
+
+    /// Discover + bind **every** file worksheet's charts (P11), so a chart-preserving save never
+    /// drops a chart whose sheet the user never painted. Runs once at the top of
+    /// [`save_workbook`](Self::save_workbook); a no-op after the first full sweep. Iterates the
+    /// **stable** `SheetId → file part` map, so each chart binds to its real `SheetId` regardless of
+    /// any in-session rename — a renamed host's chart follows the rename, a deleted host's `SheetId`
+    /// no longer resolves so `live_sheet_targets` drops it (the P10 delete outcome), and the
+    /// active-sheet-fallback mis-anchoring bug is impossible. Merges through
+    /// [`add_missing`](ChartBindings::add_missing), so charts already bound lazily (and their
+    /// live-resolved values) are kept untouched. A discovery failure is logged (the save then
+    /// proceeds with whatever was already bound, rather than aborting the user's save).
+    fn ensure_all_charts_discovered(&mut self) {
+        if self.charts_fully_discovered {
+            return;
+        }
+        if self.chart_source_path.is_none() {
+            self.charts_fully_discovered = true;
+            return; // never opened from a file → nothing to discover
+        }
+        let path = self.chart_source_path.clone().expect("checked Some above");
+        // Snapshot the stable map so we don't borrow `self` while binding into `self.charts`.
+        let sheet_parts: Vec<(SheetId, String)> = self
+            .chart_sheet_parts
+            .iter()
+            .map(|(id, part)| (*id, part.clone()))
+            .collect();
+        let mut added = false;
+        for (sheet, part) in sheet_parts {
+            self.discovered_chart_sheets.insert(sheet);
+            match crate::chart::discover_and_parse_for_part(&path, &part) {
+                Ok(specs) if !specs.is_empty() => {
+                    if self.charts.add_missing(vec![(sheet, specs)]) {
+                        added = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%part, "chart discovery for save failed: {err:#}"),
+            }
+        }
+        self.charts_fully_discovered = true;
+        if added {
+            self.chart_version += 1;
+            self.store_chart_snapshot();
+            self.emit(WorkerEvent::Published);
+        }
     }
 
     /// The current name of the worksheet with stable id `sheet` (against the live model), or `None`
@@ -1288,6 +1407,10 @@ impl Worker {
     /// before**. On success the just-saved file becomes the chart source for the next save (it is a
     /// self-contained superset). A missing target part surfaces as a [`SaveError`] (fail loudly).
     fn save_workbook(&mut self, path: &Path) -> Result<(), SaveError> {
+        // Charts are discovered lazily per painted sheet (P11), so before a save force a full sweep
+        // — otherwise a chart on a sheet the user never scrolled to would be silently dropped by the
+        // chart-less writer.
+        self.ensure_all_charts_discovered();
         let Some(original) = self.chart_source_path.clone() else {
             return self.doc.save(path); // never opened from a file → nothing to re-inject
         };
@@ -1756,6 +1879,9 @@ mod tests {
             charts: ChartBindings::default(),
             chart_version: 0,
             chart_source_path: None,
+            discovered_chart_sheets: HashSet::new(),
+            charts_fully_discovered: true,
+            chart_sheet_parts: HashMap::new(),
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;
@@ -3783,6 +3909,9 @@ mod tests {
             charts: ChartBindings::default(),
             chart_version: 0,
             chart_source_path: None,
+            discovered_chart_sheets: HashSet::new(),
+            charts_fully_discovered: true,
+            chart_sheet_parts: HashMap::new(),
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;

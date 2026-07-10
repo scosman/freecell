@@ -1,0 +1,50 @@
+{
+  "name": "freecell-chart-perf",
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "renderer": "assumed Mesa lavapipe / software Vulkan (ICD presence enforced by perf.sh) — CPU render-build path measured; GPU present NOT measured",
+    "profile": "release",
+    "commit": "a5cf260"
+  },
+  "note": "P11 chart perf: headless CPU render/engine path. Targets are ratified at the post-P11 human checkpoint; scroll is reported vs the repo's frame budgets for reference.",
+  "ops": {
+    "first_paint": {
+      "count": 280,
+      "p50_ns": 369149,
+      "p99_ns": 435108,
+      "max_ns": 454596,
+      "p50": "369.15 µs",
+      "p99": "435.11 µs",
+      "max": "454.60 µs"
+    },
+    "edit_rerender": {
+      "count": 2800,
+      "p50_ns": 1873,
+      "p99_ns": 2580,
+      "max_ns": 24811,
+      "p50": "1.87 µs",
+      "p99": "2.58 µs",
+      "max": "24.81 µs"
+    },
+    "scroll_with_k": {
+      "k": 1000,
+      "max_on_screen": 2,
+      "distinct_scroll_positions": 4380,
+      "reference_frame_target_ns": 8333333,
+      "reference_frame_worst_ns": 16666667,
+      "stats": {
+        "count": 4360,
+        "p50_ns": 6370,
+        "p99_ns": 14091,
+        "max_ns": 36686,
+        "p50": "6.37 µs",
+        "p99": "14.09 µs",
+        "max": "36.69 µs"
+      }
+    }
+  }
+}

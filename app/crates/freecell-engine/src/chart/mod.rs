@@ -28,8 +28,9 @@ pub mod xlsx;
 
 pub use binding::{parse_cf, CellData, ChartBinding, ChartBindings};
 pub use load::{
-    discover, discover_and_parse, discover_and_parse_by_sheet, load_charts_from_xlsx,
-    parse_chart_xml, DiscoveredChart, SheetDrawing,
+    discover, discover_and_parse, discover_and_parse_by_sheet, discover_and_parse_for_part,
+    discover_and_parse_for_sheet, load_charts_from_xlsx, parse_chart_xml, workbook_sheet_parts,
+    DiscoveredChart, SheetDrawing,
 };
 pub use save::{
     patch_chart_source, reinject, reinject_live_charts, save_with_charts, LiveChart, SaveReport,

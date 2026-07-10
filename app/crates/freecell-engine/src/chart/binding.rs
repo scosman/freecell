@@ -16,6 +16,9 @@
 //! The retained raw [`CfRange`](freecell_chart_model::CfRange) refs stay as-loaded on the spec; this
 //! module is where they become structured, sheet-resolved ranges.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use roxmltree::{Document, Node};
 
 use freecell_chart_model::{Category, Chart, ChartSpec, Series, SeriesData};
@@ -471,6 +474,40 @@ impl ChartBindings {
         self.charts.is_empty()
     }
 
+    /// Append the charts in `groups` that aren't **already bound**, anchoring each to its group's
+    /// sheet, and return whether anything was added (charts/architecture §5 challenge 5, lazy
+    /// discovery). Dedup is by `chart_part` — the stable package key — so it is robust to a group
+    /// that a name-fallback anchored onto an already-loaded sheet, and it never re-binds (or
+    /// clobbers the live-resolved values of) a chart the worker already owns. Both the **per-sheet
+    /// lazy** path (one group) and the **save-time full sweep** (all groups) funnel through here, so
+    /// a chart is bound exactly once regardless of which path reaches it first. Each new chart's
+    /// binding is parsed from its retained source XML; the spec keeps its file-cached values as
+    /// first paint.
+    pub fn add_missing(&mut self, groups: Vec<(SheetId, super::load::SheetCharts)>) -> bool {
+        let mut existing: HashSet<String> =
+            self.charts.iter().map(|bc| bc.chart_part.clone()).collect();
+        let mut added = false;
+        for (anchor_sheet, specs) in groups {
+            for (chart_part, spec) in specs {
+                if !existing.insert(chart_part.clone()) {
+                    continue; // already bound (visited earlier, or a name-fallback duplicate)
+                }
+                let binding = spec
+                    .source()
+                    .map(|s| parse_chart_binding(&s.chart_xml))
+                    .unwrap_or_default();
+                self.charts.push(BoundChart {
+                    anchor_sheet,
+                    chart_part,
+                    spec,
+                    binding,
+                });
+                added = true;
+            }
+        }
+        added
+    }
+
     /// Each bound chart as a [`LiveChart`](super::save::LiveChart) the source-first save consumes
     /// (`worker::run`, charts/architecture §5), in discovery order: its own chart part, its current
     /// (live-resolved) values, and the **current** name of its anchor worksheet — resolved through
@@ -539,13 +576,17 @@ impl ChartBindings {
         changed
     }
 
-    /// The current specs grouped by the sheet they're anchored on — the payload for a
-    /// [`ChartSnapshot`](crate::ChartSnapshot). Preserves discovery order within each sheet.
+    /// The current specs grouped by the sheet they're anchored on, each group behind an
+    /// [`Arc`] — the payload for a [`ChartSnapshot`](crate::ChartSnapshot). Preserves discovery
+    /// order within each sheet.
     ///
-    // P11: this deep-clones every chart's full `ChartSpec` (incl. its retained source XML) on each
-    // intersecting edit. Fine at the line-slice's chart counts / XML sizes; if either grows, wrap the
-    // specs in `Arc` (or split the render `Chart` from the heavy source) so a re-resolve clones cheap.
-    pub fn specs_by_sheet(&self) -> Vec<(SheetId, Vec<ChartSpec>)> {
+    /// The per-sheet list is an `Arc<[ChartSpec]>` so the app shares the **same allocation** the
+    /// worker publishes (zero app-side duplicate — charts/architecture §5 challenge 5, "off-screen
+    /// free"). Building it clones each bound spec once; since P11 put the heavy retained source
+    /// behind an `Arc` (`Origin::Loaded`), that clone bumps a refcount rather than deep-copying the
+    /// chart XML — only the render `Chart` (the value a re-resolve actually changed) is copied. So
+    /// an intersecting edit rebuilds the snapshot in O(chart values), not O(source bytes).
+    pub fn specs_by_sheet(&self) -> Vec<(SheetId, Arc<[ChartSpec]>)> {
         let mut out: Vec<(SheetId, Vec<ChartSpec>)> = Vec::new();
         for bc in &self.charts {
             match out.iter_mut().find(|(s, _)| *s == bc.anchor_sheet) {
@@ -553,7 +594,9 @@ impl ChartBindings {
                 None => out.push((bc.anchor_sheet, vec![bc.spec.clone()])),
             }
         }
-        out
+        out.into_iter()
+            .map(|(sheet, specs)| (sheet, Arc::from(specs)))
+            .collect()
     }
 }
 
@@ -833,5 +876,109 @@ mod tests {
         // Sheet 3 doesn't resolve here → its charts report a deleted host (None).
         assert_eq!(live[1].chart_part, "xl/charts/chart2.xml");
         assert_eq!(live[1].sheet_name, None);
+    }
+
+    // --- P11: lazy-discovery merge + coalesced recompute ------------------------------------
+
+    #[test]
+    fn add_missing_dedupes_by_chart_part_and_appends_new() {
+        // Start with chart1 bound (a lazily-painted sheet).
+        let mut bindings = ChartBindings::from_specs_by_sheet(vec![(
+            SheetId(0),
+            vec![("xl/charts/chart1.xml".into(), spec_for("<c:lineChart/>"))],
+        )]);
+
+        // Re-adding chart1 (e.g. the save-time full sweep re-reaching an already-painted sheet) is a
+        // NO-OP — never re-binds it or clobbers its live values.
+        let re_added = bindings.add_missing(vec![(
+            SheetId(0),
+            vec![("xl/charts/chart1.xml".into(), spec_for("<c:barChart/>"))],
+        )]);
+        assert!(!re_added, "an already-bound chart part is not re-added");
+        assert_eq!(bindings.specs_by_sheet()[0].1.len(), 1);
+
+        // A not-yet-seen part IS appended (the save-time sweep picking up a never-painted sheet).
+        let added = bindings.add_missing(vec![(
+            SheetId(3),
+            vec![("xl/charts/chart2.xml".into(), spec_for("<c:barChart/>"))],
+        )]);
+        assert!(added, "a new chart part is appended");
+        let by_sheet = bindings.specs_by_sheet();
+        assert_eq!(by_sheet.len(), 2);
+        assert_eq!(by_sheet[1].0, SheetId(3));
+        assert_eq!(by_sheet[1].1.len(), 1);
+    }
+
+    #[test]
+    fn coalesced_multi_edit_recompute_is_one_pass() {
+        // Two charts on the same sheet: chart 0 reads B2:B3, chart 1 reads D2:D3 (disjoint columns),
+        // both categorised on A2:A3. This is the shape the worker coalesces: a single drained edit
+        // batch that touches BOTH charts' ranges must re-resolve them in ONE dirty-set pass, not two.
+        let bind = |val: &str| ChartBinding {
+            series: vec![SeriesBinding {
+                name: None,
+                cat: parse_cf("Data!$A$2:$A$3"),
+                val: parse_cf(val),
+            }],
+        };
+        let mut bindings = ChartBindings {
+            charts: vec![
+                BoundChart {
+                    anchor_sheet: SheetId(0),
+                    chart_part: "xl/charts/chart1.xml".into(),
+                    spec: spec_for("<c:lineChart/>"),
+                    binding: bind("Data!$B$2:$B$3"),
+                },
+                BoundChart {
+                    anchor_sheet: SheetId(0),
+                    chart_part: "xl/charts/chart2.xml".into(),
+                    spec: spec_for("<c:lineChart/>"),
+                    binding: bind("Data!$D$2:$D$3"),
+                },
+            ],
+        };
+
+        let mut model = FakeModel::one_sheet("Data");
+        model.set(cell(1, 1), CellData::Number(10.0)); // B2
+        model.set(cell(2, 1), CellData::Number(20.0)); // B3
+        model.set(cell(1, 3), CellData::Number(30.0)); // D2
+        model.set(cell(2, 3), CellData::Number(40.0)); // D3
+        let resolver = model.resolver();
+        let reader = model.reader();
+
+        // ONE coalesced edit set covering cells in BOTH charts' value ranges → BOTH charts dirty.
+        let edited = &[(SheetId(0), range("B2")), (SheetId(0), range("D2"))];
+        let dirty = bindings.dirty_indices(edited, &[], &resolver);
+        assert_eq!(
+            dirty,
+            vec![0, 1],
+            "both charts are selected in one dirty pass"
+        );
+
+        // ONE re-resolve pass updates both (the coalesced recompute), reporting a real change.
+        let changed = bindings.reresolve(&dirty, &resolver, &reader);
+        assert!(changed, "the coalesced re-resolve changed the charts");
+
+        // ONE snapshot then carries both charts' fresh values — the single publish the worker emits.
+        let snap = bindings.specs_by_sheet();
+        assert_eq!(snap.len(), 1);
+        let value0 = match &snap[0].1[0].chart.series[0].data {
+            SeriesData::CategoryValue { values, .. } => values.clone(),
+            other => panic!("expected CategoryValue, got {other:?}"),
+        };
+        let value1 = match &snap[0].1[1].chart.series[0].data {
+            SeriesData::CategoryValue { values, .. } => values.clone(),
+            other => panic!("expected CategoryValue, got {other:?}"),
+        };
+        assert_eq!(
+            value0,
+            vec![10.0, 20.0],
+            "chart 0 reflects its edited B-column"
+        );
+        assert_eq!(
+            value1,
+            vec![30.0, 40.0],
+            "chart 1 reflects its edited D-column"
+        );
     }
 }

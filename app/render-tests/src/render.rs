@@ -110,7 +110,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     // In-grid charts (P8): install the case's ChartLayer on the active sheet, so the
                     // grid paints them over the cells at each chart's anchor rect.
                     if !charts.is_empty() {
-                        view.set_sheet_charts(sheet, charts, cx);
+                        view.set_sheet_charts(sheet, std::sync::Arc::from(charts), cx);
                     }
                     // Editing-feel overlays (Phase 2): a live mirror and/or an open in-cell editor.
                     if let Some((row, col, text)) = mirror {

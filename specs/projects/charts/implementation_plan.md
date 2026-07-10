@@ -57,7 +57,7 @@ those docs — this is the ordered checklist.
 - [x] **P10 — Save / restore (source-first).** Byte-preserve unedited; **patch retained source**
   on reflow; multi-sheet part map; fail loudly on missing part. *Exit:* open→edit→save→reopen
   keeps the line chart in **Excel + LibreOffice**; untouched charts bit-stable.
-- [ ] **P11 — Line perf + baselines.** Lazy parse off open's critical path; off-screen free;
+- [x] **P11 — Line perf + baselines.** Lazy parse off open's critical path; off-screen free;
   coalesced dirty-set recompute. *Exit:* p50/p99 first-paint / edit-rerender / scroll-with-K
   measured vs targets; committed perceptual-diff baselines.
 

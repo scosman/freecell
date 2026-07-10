@@ -311,8 +311,10 @@ impl WorkbookWindow {
     /// scroll-only publish (or an edit touching no chart) is a no-op. A chart-less / unsaved workbook
     /// publishes the empty (version 0) snapshot, so this never installs anything for it.
     ///
-    /// Multi-sheet anchor placement (correlating each chart's worksheet to its `SheetId`) is still
-    /// P10; the worker anchors all charts to the first sheet, so a snapshot carries one entry today.
+    /// The snapshot is grouped by anchor worksheet (multi-sheet, P10); charts are discovered lazily
+    /// on a sheet's first paint (P11), so a version bump can carry newly-parsed charts as well as
+    /// live re-resolves. Each per-sheet list is a **shared** `Arc<[ChartSpec]>` — installing it into
+    /// the grid bumps a refcount, never copies the charts (P11 "off-screen free").
     fn sync_charts(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.client.chart_snapshot();
         if snapshot.version == self.installed_chart_version {
@@ -328,9 +330,11 @@ impl WorkbookWindow {
             .collect();
         self.grid.update(cx, |g, cx| {
             for sheet in dropped {
-                g.set_sheet_charts(sheet, Vec::new(), cx);
+                g.set_sheet_charts(sheet, std::sync::Arc::from(Vec::new()), cx);
             }
             for (sheet, specs) in &snapshot.sheets {
+                // The per-sheet `Arc<[ChartSpec]>` is **shared** with the worker's published snapshot
+                // — this `clone` bumps a refcount, it does not copy the charts (P11 "off-screen free").
                 g.set_sheet_charts(*sheet, specs.clone(), cx);
             }
         });

@@ -8,6 +8,8 @@
 //! [`version`](ChartSnapshot::version) changed, so a scroll-only publish — or an edit that touches
 //! no chart — never re-installs.
 
+use std::sync::Arc;
+
 use freecell_chart_model::ChartSpec;
 use freecell_core::SheetId;
 
@@ -21,9 +23,12 @@ pub struct ChartSnapshot {
     /// installs into the grid iff this differs from what it last installed. The empty initial
     /// snapshot is version `0`; a file with charts publishes version `1` on load.
     pub version: u64,
-    /// Charts to paint, keyed by their anchor [`SheetId`]. The UI hands each list to
-    /// `GridView::set_sheet_charts`.
-    pub sheets: Vec<(SheetId, Vec<ChartSpec>)>,
+    /// Charts to paint, keyed by their anchor [`SheetId`]. Each per-sheet list is an
+    /// `Arc<[ChartSpec]>` so the UI installs it into `GridView::set_sheet_charts` by **sharing the
+    /// same allocation** (a refcount bump, not a deep copy) — the grid holds no independent copy of
+    /// its charts' render pictures or retained source (charts/architecture §5 challenge 5,
+    /// "off-screen free").
+    pub sheets: Vec<(SheetId, Arc<[ChartSpec]>)>,
 }
 
 impl ChartSnapshot {

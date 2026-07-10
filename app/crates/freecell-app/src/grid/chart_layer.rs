@@ -10,7 +10,7 @@
 //! content-local px — the same `offset − scroll` mapping cells use, so scroll and variable-geometry
 //! ("zoom") are free.
 
-use freecell_chart_model::{Anchor, Chart, ChartSpec, Fidelity};
+use freecell_chart_model::{Anchor, ChartSpec, Fidelity};
 
 /// EMU (English Metric Units) per CSS pixel at Excel's 96-DPI screen basis: 914 400 EMU/inch ÷
 /// 96 px/inch. An `xdr:*Anchor`'s intra-cell `colOff`/`rowOff` are in EMUs; this converts them to
@@ -77,25 +77,28 @@ pub fn anchor_rect(
     }
 }
 
-/// A chart resolved for the ChartLayer: its render picture ([`Chart`]), its in-grid [`Anchor`], and
-/// its derived [`Fidelity`] — computed **once** when charts are installed on the grid
-/// ([`set_sheet_charts`](super::GridView::set_sheet_charts)). The chart values are static this phase (live
-/// rebinding is P9), so the per-frame paint just maps the anchor and dispatches on the fidelity.
-/// This is the resident `Vec<RenderedChart>` of charts/architecture §4.2.
-#[derive(Clone, Debug)]
-pub struct RenderedChart {
-    pub chart: Chart,
+/// The **always-resident** per-chart data the ChartLayer needs to place a chart and decide whether
+/// it is on-screen: its in-grid [`Anchor`] and its derived [`Fidelity`], both [`Copy`] and tiny.
+/// Classified **once** when charts are installed ([`set_sheet_charts`](super::GridView::set_sheet_charts))
+/// so the per-frame cull scan never re-parses source XML.
+///
+/// The heavy render picture ([`Chart`](freecell_chart_model::Chart)) is deliberately **not** held
+/// here — it stays in the shared `Arc<[ChartSpec]>` the grid installs, and is touched **only** for
+/// the handful of charts actually on-screen (charts/architecture §5 challenge 5, "off-screen
+/// free"): a huge sheet with K charts scans K of these tiny placements per frame but materializes
+/// only the visible few, and an off-screen chart holds no render resources until it scrolls back in.
+#[derive(Clone, Copy, Debug)]
+pub struct ChartPlacement {
     pub anchor: Anchor,
     pub fidelity: Fidelity,
 }
 
-impl RenderedChart {
-    /// Resolve a [`ChartSpec`] for painting: keep the render [`Chart`] + [`Anchor`], and snapshot
-    /// its [`display_fidelity`](ChartSpec::display_fidelity) so the source is classified once, not
-    /// per frame.
+impl ChartPlacement {
+    /// The placement for a [`ChartSpec`]: keep its [`Anchor`], and snapshot its
+    /// [`display_fidelity`](ChartSpec::display_fidelity) so the source is classified once, not per
+    /// frame. The spec's render [`Chart`](freecell_chart_model::Chart) is left in the shared spec.
     pub fn from_spec(spec: &ChartSpec) -> Self {
         Self {
-            chart: spec.chart.clone(),
             anchor: spec.anchor,
             fidelity: spec.display_fidelity(),
         }
@@ -106,7 +109,7 @@ impl RenderedChart {
 mod tests {
     use super::*;
     use freecell_chart_model::{
-        Anchor, AnchorCell, Axis, Category, ChartKind, Grouping, Legend, Series, SourceXml,
+        Anchor, AnchorCell, Axis, Category, Chart, ChartKind, Grouping, Legend, Series, SourceXml,
     };
 
     /// A uniform mock geometry (every column `col_w` px, every row `row_h` px) — enough to check
@@ -252,26 +255,28 @@ mod tests {
     }
 
     #[test]
-    fn rendered_chart_from_spec_derives_fidelity() {
+    fn chart_placement_from_spec_derives_fidelity_and_anchor() {
         let anchor = Anchor::new(AnchorCell::new(1, 1), AnchorCell::new(6, 14));
         let spec = |xml: &str| {
             ChartSpec::loaded(sample_line_chart(), SourceXml::new(xml), Vec::new(), anchor)
         };
         assert_eq!(
-            RenderedChart::from_spec(&spec("<c:lineChart/>")).fidelity,
+            ChartPlacement::from_spec(&spec("<c:lineChart/>")).fidelity,
             Fidelity::Faithful
         );
         assert_eq!(
-            RenderedChart::from_spec(&spec("<c:bar3DChart/>")).fidelity,
+            ChartPlacement::from_spec(&spec("<c:bar3DChart/>")).fidelity,
             Fidelity::Degraded
         );
         assert_eq!(
-            RenderedChart::from_spec(&spec("<c:surfaceChart/>")).fidelity,
+            ChartPlacement::from_spec(&spec("<c:surfaceChart/>")).fidelity,
             Fidelity::Unsupported
         );
-        // The render picture + anchor are carried through unchanged.
-        let rc = RenderedChart::from_spec(&spec("<c:lineChart/>"));
-        assert_eq!(rc.chart, sample_line_chart());
-        assert_eq!(rc.anchor, anchor);
+        // The anchor is carried through; the heavy render `Chart` is NOT copied into the placement
+        // (it stays in the shared spec — "off-screen free").
+        assert_eq!(
+            ChartPlacement::from_spec(&spec("<c:lineChart/>")).anchor,
+            anchor
+        );
     }
 }

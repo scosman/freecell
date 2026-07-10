@@ -4,7 +4,7 @@
 //!
 //! The gpui-free logic (the nice-tick generator [`ticks`], the categorical [`palette`], the
 //! cumulative [`stacking`] math) lives in its own modules so it is unit-tested without a GPU;
-//! the gpui rendering lives in [`chrome`] + the per-kind widgets ([`line`], [`bar`], [`area`],
+//! the gpui rendering lives in [`chrome`] + the per-kind widgets ([`mod@line`], [`bar`], [`area`],
 //! [`pie`], [`scatter`]). [`chart_element`] dispatches a [`freecell_chart_model::Chart`] to the
 //! right widget.
 //!

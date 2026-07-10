@@ -12,7 +12,7 @@
 //!   primitive's `Natural` (curved) default.
 //! - a **numeric value axis** with readable "nice" tick labels + gridlines (our
 //!   [`NiceScale`]; the linear scale ships no tick generator);
-//! - a **category axis** (via [`ScalePoint`], which — unlike [`ScaleBand`] — honors its range
+//! - a **category axis** (via [`ScalePoint`], which — unlike `ScaleBand` — honors its range
 //!   start, so no gutter fix-up is needed);
 //! - the **multi-series color cycle** ([`series_color`]), matched swatch-for-swatch by the
 //!   legend the surrounding [`super::chrome`] frame draws.
@@ -56,7 +56,7 @@ struct LineSeries {
 }
 
 /// A multi-series line plot over the raw `Line` primitive with ONE shared value scale
-/// ([`Self::scale`]) covering every series.
+/// (the `scale` field) covering every series.
 #[derive(IntoPlot)]
 pub struct LinePlot {
     categories: Vec<SharedString>,
@@ -189,7 +189,15 @@ impl Plot for LinePlot {
             Line::new()
                 .data((0..n).collect::<Vec<usize>>())
                 .x(move |i: &usize| Some(xs[*i]))
-                .y(move |i: &usize| value_scale.tick(&values[*i]))
+                // Drop a non-finite value (NaN/Inf) rather than emit a bad point: the primitive
+                // omits a `None` point, connecting its finite neighbors with a straight segment
+                // (never panics). So an interior non-numeric cell bridges across, and a
+                // leading/trailing run leaves a visible break — "render what's valid, blank the
+                // rest" (functional_spec §7). A true per-cell break is a future-fidelity item.
+                .y(move |i: &usize| {
+                    let v = values[*i];
+                    v.is_finite().then(|| value_scale.tick(&v)).flatten()
+                })
                 .stroke(stroke)
                 .stroke_width(px(LINE_WIDTH))
                 .stroke_style(StrokeStyle::Linear)
@@ -276,6 +284,49 @@ mod tests {
         // Each series carries its own resolved color (distinct palette entries).
         assert_ne!(plot.series[0].color, plot.series[1].color);
         assert_ne!(plot.series[1].color, plot.series[2].color);
+    }
+
+    #[test]
+    fn single_series_line_builds() {
+        let mut chart = three_series_line();
+        chart.series.truncate(1);
+        let plot = LinePlot::multi_series(&chart).expect("single-series line plot");
+        assert_eq!(plot.series.len(), 1, "the one series must be kept");
+        assert_eq!(plot.categories.len(), 3);
+    }
+
+    #[test]
+    fn non_finite_values_do_not_break_the_scale() {
+        // A series with a NaN and an +Inf among finite values still builds a plot; the shared
+        // domain ignores the non-finite entries and stays finite, covering the finite values
+        // (the paint path then blanks the non-finite points — no panic, no bad scale).
+        let mut chart = three_series_line();
+        chart.series.push(Series::category_value(
+            Some("Broken"),
+            q_categories(),
+            vec![f64::NAN, 40.0, f64::INFINITY],
+        ));
+        let plot = LinePlot::multi_series(&chart).expect("plot despite non-finite values");
+        let scale = plot.shared_scale();
+        assert!(
+            scale.min.is_finite() && scale.max.is_finite() && scale.max > scale.min,
+            "shared scale must stay finite: [{}, {}]",
+            scale.min,
+            scale.max
+        );
+        // Every FINITE value across all series still fits the domain.
+        for s in &chart.series {
+            if let SeriesData::CategoryValue { values, .. } = &s.data {
+                for &v in values.iter().filter(|v| v.is_finite()) {
+                    assert!(
+                        scale.min <= v && v <= scale.max,
+                        "finite value {v} outside domain [{}, {}]",
+                        scale.min,
+                        scale.max
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -304,9 +304,12 @@ macro_rules! chart_render_cases {
 }
 
 chart_render_cases! {
-    // P4 — the one make-or-break multi-series line scene that proves the chart render → capture →
-    // diff path. Later phases (P5+) add rows here as each production renderer lands.
+    // P4 — the make-or-break multi-series line scene that proves the chart render → capture →
+    // diff path.
     chart_line_multi,
+    // P5 — production line coverage: single-series, a zero-crossing nice-tick value axis,
+    // legend-off (plot uses full width), and title/axis-title collapse (legend still shown).
+    chart_line_single, chart_line_negative, chart_line_no_legend, chart_line_no_titles,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

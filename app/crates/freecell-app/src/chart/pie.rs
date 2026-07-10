@@ -4,7 +4,8 @@
 //! **The crux is color.** gpui-component has **no auto-palette**: the stock `PieChart` paints
 //! every slice the same `chart_2`, i.e. a monochrome, unreadable disc, unless a per-slice color
 //! closure is supplied. A pie's "slices" are the **categories** of a single series, so we
-//! synthesize a distinct color per slice from the same categorical [`series_color`] cycle the
+//! synthesize a distinct color per slice from the same categorical
+//! [`series_color`](super::palette::series_color) cycle the
 //! rest of the charts use — and the legend (in [`super::chrome`]) keys slice→color off that
 //! exact same cycle, so the mapping is correct by construction.
 //!

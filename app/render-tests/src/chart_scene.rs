@@ -28,10 +28,22 @@ pub struct ChartScene {
     pub chart: Chart,
 }
 
+/// A wide viewport for multi-series scenes (title + legend + plot need the room).
+const WIDE_VP: (u32, u32) = (720, 460);
+/// A roomy default viewport for the simpler single-series / no-legend cases.
+const DEFAULT_VP: (u32, u32) = (640, 440);
+
 /// Every chart scene, rebuilt fresh per call (the `render_scene` bin looks one up by name). P4
-/// seeds exactly the one scene the exit criterion needs; later phases append rows.
+/// seeded the one make-or-break multi-series scene; P5 adds the production line coverage
+/// (single-series, a zero-crossing nice-tick axis, legend-off, and title/axis-title collapse).
 pub fn all() -> Vec<ChartScene> {
-    vec![chart_line_multi()]
+    vec![
+        chart_line_multi(),
+        chart_line_single(),
+        chart_line_negative(),
+        chart_line_no_legend(),
+        chart_line_no_titles(),
+    ]
 }
 
 /// Look a chart scene up by name.
@@ -82,7 +94,138 @@ fn chart_line_multi() -> ChartScene {
     };
     ChartScene {
         name: "chart_line_multi",
-        viewport: (720, 460),
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A single-series line (monthly website visitors) with a title, both axis titles, and a
+/// **one-entry** legend — proves the single-series render path and a single-row legend read
+/// cleanly (the production line's simplest real shape).
+fn chart_line_single() -> ChartScene {
+    let chart = Chart {
+        title: Some("Website Visitors".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![Series::category_value(
+            Some("Visitors"),
+            months(),
+            vec![42.0, 55.0, 51.0, 68.0, 74.0, 90.0],
+        )],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Visitors (thousands)"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_single",
+        viewport: DEFAULT_VP,
+        chart,
+    }
+}
+
+/// A two-series line whose values **cross zero** (negative and positive). Proves the nice-tick
+/// numeric value axis over a zero-crossing SHARED scale: the auto-ranged domain spans the negative
+/// floor to the positive ceiling, with a `0` tick and negative tick labels — not forced to a zero
+/// baseline, and not per-series.
+fn chart_line_negative() -> ChartScene {
+    let chart = Chart {
+        title: Some("Temperature Deviation".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("Station A"),
+                months(),
+                vec![-12.0, -5.0, 3.0, 8.0, 15.0, 22.0],
+            ),
+            Series::category_value(
+                Some("Station B"),
+                months(),
+                vec![-20.0, -14.0, -2.0, 5.0, 9.0, 18.0],
+            ),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Deviation"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_negative",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A two-series line with **no legend** (`legend: None`). Proves the legend is model-driven: with
+/// no legend the plot uses the full width and no legend column is drawn (the production behavior
+/// the seed lacked — it always drew a legend).
+fn chart_line_no_legend() -> ChartScene {
+    let chart = Chart {
+        title: Some("Active Users by Month".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("2023"),
+                months(),
+                vec![30.0, 34.0, 41.0, 45.0, 52.0, 60.0],
+            ),
+            Series::category_value(
+                Some("2024"),
+                months(),
+                vec![44.0, 49.0, 55.0, 62.0, 71.0, 83.0],
+            ),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Users (thousands)"),
+        legend: None,
+    };
+    ChartScene {
+        name: "chart_line_no_legend",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A three-series line with **no chart title and untitled axes**, but a legend present. Proves the
+/// title row and both axis-title captions collapse (no blank rows) while the legend still renders
+/// — the chrome is driven by the model, element by element.
+fn chart_line_no_titles() -> ChartScene {
+    let chart = Chart {
+        title: None,
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("Alpha"),
+                months(),
+                vec![18.0, 24.0, 30.0, 27.0, 33.0, 39.0],
+            ),
+            Series::category_value(
+                Some("Beta"),
+                months(),
+                vec![40.0, 36.0, 31.0, 34.0, 29.0, 25.0],
+            ),
+            Series::category_value(
+                Some("Gamma"),
+                months(),
+                vec![22.0, 26.0, 24.0, 30.0, 35.0, 32.0],
+            ),
+        ],
+        cat_axis: Axis::untitled(),
+        val_axis: Axis::untitled(),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_no_titles",
+        viewport: WIDE_VP,
         chart,
     }
 }
@@ -125,5 +268,53 @@ mod tests {
         for series in &s.chart.series {
             assert_eq!(series.len(), cats, "series must share the category axis");
         }
+    }
+
+    #[test]
+    fn production_line_scenes_cover_their_features() {
+        // Every chart_line_* scene is a line chart.
+        for name in [
+            "chart_line_multi",
+            "chart_line_single",
+            "chart_line_negative",
+            "chart_line_no_legend",
+            "chart_line_no_titles",
+        ] {
+            let s = get(name).unwrap_or_else(|| panic!("{name} scene"));
+            assert!(
+                matches!(s.chart.kind, ChartKind::Line { .. }),
+                "{name} must be a line chart"
+            );
+        }
+
+        // Single-series line: exactly one series (one-entry legend).
+        assert_eq!(get("chart_line_single").unwrap().chart.series.len(), 1);
+
+        // Negative scene: carries a value below zero (the zero-crossing shared domain).
+        let neg = get("chart_line_negative").unwrap();
+        let has_negative = neg.chart.series.iter().any(|s| match &s.data {
+            freecell_chart_model::SeriesData::CategoryValue { values, .. } => {
+                values.iter().any(|&v| v < 0.0)
+            }
+            _ => false,
+        });
+        assert!(has_negative, "chart_line_negative must cross zero");
+
+        // Legend-off scene: no legend in the model (proves the legend is model-driven).
+        assert!(
+            get("chart_line_no_legend").unwrap().chart.legend.is_none(),
+            "chart_line_no_legend must have no legend"
+        );
+
+        // Titles-off scene: no chart title and both axes untitled (chrome collapse).
+        let bare = get("chart_line_no_titles").unwrap();
+        assert!(bare.chart.title.is_none(), "no chart title");
+        assert!(
+            bare.chart.cat_axis.title.is_none(),
+            "untitled category axis"
+        );
+        assert!(bare.chart.val_axis.title.is_none(), "untitled value axis");
+        // ...but a legend is still present (it should render even with titles gone).
+        assert!(bare.chart.legend.is_some(), "legend still present");
     }
 }

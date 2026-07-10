@@ -24,7 +24,7 @@ use roxmltree::{Document, Node};
 use freecell_chart_model::{Category, Chart, ChartSpec, Series, SeriesData};
 use freecell_core::{CellRange, CellRef, SheetId};
 
-use super::load::CHART_GROUP_TAGS;
+use super::load::is_chart_group;
 
 /// One resolved cell value, read from the current model for live binding — the engine-free bridge
 /// [`WorkbookDocument::cell_value`](crate::WorkbookDocument) produces and the resolver consumes (no
@@ -171,7 +171,7 @@ pub fn parse_chart_binding(chart_xml: &str) -> ChartBinding {
         .and_then(|chart| child(&chart, "plotArea"))
         .and_then(|plot| {
             plot.children()
-                .find(|n| n.is_element() && CHART_GROUP_TAGS.contains(&n.tag_name().name()))
+                .find(|n| n.is_element() && is_chart_group(n.tag_name().name()))
         })
     else {
         return ChartBinding::default();
@@ -523,7 +523,8 @@ impl ChartBindings {
             .map(|bc| super::save::LiveChart {
                 sheet_name: resolve_name(bc.anchor_sheet),
                 chart_part: bc.chart_part.clone(),
-                chart: bc.spec.chart.clone(),
+                // An Unsupported spec has no typed chart to reflow → `None` (byte-preserved on save).
+                chart: bc.spec.chart().cloned(),
             })
             .collect()
     }
@@ -555,8 +556,14 @@ impl ChartBindings {
         let mut changed = false;
         for &i in indices {
             let bc = &mut self.charts[i];
+            // An Unsupported spec has no typed chart to re-resolve — it's static (its cached
+            // placeholder never changes on an edit), so skip it (it never enters the dirty set
+            // anyway, since its binding is empty).
+            let Some(template) = bc.spec.chart() else {
+                continue;
+            };
             let rebuilt = resolve_chart(
-                &bc.spec.chart,
+                template,
                 &bc.binding,
                 bc.anchor_sheet,
                 resolve_sheet,
@@ -568,8 +575,10 @@ impl ChartBindings {
             // repaint anyway; the equality check only spares a redundant snapshot for the ordinary
             // finite-valued case. Do NOT "fix" this into NaN-aware equality: it would add complexity
             // for no observable win (the chart is dirty either way).
-            if rebuilt != bc.spec.chart {
-                bc.spec.chart = rebuilt;
+            if bc.spec.chart() != Some(&rebuilt) {
+                if let Some(slot) = bc.spec.chart_mut() {
+                    *slot = rebuilt;
+                }
                 changed = true;
             }
         }
@@ -878,6 +887,44 @@ mod tests {
         assert_eq!(live[1].sheet_name, None);
     }
 
+    /// P14: an **Unsupported** spec (a retained surface chart) has no typed chart — it binds static:
+    /// its live descriptor carries `chart: None` (byte-preserved on save, never patched), it never
+    /// enters the dirty set (empty binding), and a forced re-resolve is a no-op that never panics on
+    /// the missing `Chart`.
+    #[test]
+    fn unsupported_spec_binds_static_and_reresolves_to_a_noop() {
+        let unsupported = ChartSpec::loaded_unsupported(
+            Some("Terrain".into()),
+            SourceXml::new("<c:surfaceChart/>"),
+            Vec::new(),
+            Anchor::new(AnchorCell::new(0, 0), AnchorCell::new(4, 8)),
+        );
+        let mut bindings = ChartBindings::from_specs_by_sheet(vec![(
+            SheetId(0),
+            vec![("xl/charts/chart1.xml".into(), unsupported)],
+        )]);
+
+        // Its live descriptor carries NO chart to reflow.
+        let live = bindings.live_charts(|id| (id == SheetId(0)).then(|| "Data".to_string()));
+        assert_eq!(live.len(), 1);
+        assert!(
+            live[0].chart.is_none(),
+            "an unsupported chart has no values to reflow"
+        );
+
+        // Not dirty on a structural rebuild (empty binding), and a forced re-resolve is a no-op.
+        let model = FakeModel::one_sheet("Data");
+        let resolver = model.resolver();
+        let reader = model.reader();
+        assert!(bindings
+            .dirty_indices(&[], &[SheetId(0)], &resolver)
+            .is_empty());
+        assert!(
+            !bindings.reresolve(&[0], &resolver, &reader),
+            "reresolve is a no-op on an unsupported spec"
+        );
+    }
+
     // --- P11: lazy-discovery merge + coalesced recompute ------------------------------------
 
     #[test]
@@ -962,11 +1009,11 @@ mod tests {
         // ONE snapshot then carries both charts' fresh values — the single publish the worker emits.
         let snap = bindings.specs_by_sheet();
         assert_eq!(snap.len(), 1);
-        let value0 = match &snap[0].1[0].chart.series[0].data {
+        let value0 = match &snap[0].1[0].chart().unwrap().series[0].data {
             SeriesData::CategoryValue { values, .. } => values.clone(),
             other => panic!("expected CategoryValue, got {other:?}"),
         };
-        let value1 = match &snap[0].1[1].chart.series[0].data {
+        let value1 = match &snap[0].1[1].chart().unwrap().series[0].data {
             SeriesData::CategoryValue { values, .. } => values.clone(),
             other => panic!("expected CategoryValue, got {other:?}"),
         };

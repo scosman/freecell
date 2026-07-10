@@ -359,13 +359,19 @@ fn str_ref(range: &str, values: &[&str]) -> String {
 
 /// A `c:numRef` (formula + `numCache`) over the `Data` sheet.
 fn num_ref(range: &str, values: &[f64]) -> String {
+    num_ref_for(&format!("Data!{range}"), values)
+}
+
+/// A `c:numRef` over an **arbitrary** `c:f` formula (e.g. a reference to a sheet that doesn't
+/// exist — the P14 corpus's unresolved-`c:f` edge case) plus a `numCache` of `values`.
+fn num_ref_for(formula: &str, values: &[f64]) -> String {
     let pts: String = values
         .iter()
         .enumerate()
         .map(|(i, v)| format!(r#"<c:pt idx="{i}"><c:v>{}</c:v></c:pt>"#, fmt_num(*v)))
         .collect();
     format!(
-        r#"<c:numRef><c:f>Data!{range}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="{n}"/>{pts}</c:numCache></c:numRef>"#,
+        r#"<c:numRef><c:f>{formula}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="{n}"/>{pts}</c:numCache></c:numRef>"#,
         n = values.len(),
     )
 }
@@ -818,6 +824,543 @@ fn one_chart_drawing_rels(n: u32) -> String {
     format!(
         r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="{NS_REL}/chart" Target="../charts/chart{n}.xml"/></Relationships>"#
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// P14 robustness corpus — many chart types + edge cases in one openable workbook, plus the
+// broken-drawing fixtures for the per-chart-resilient `discover` walk.
+// ---------------------------------------------------------------------------------------------
+
+/// The classification the loader should produce for one corpus chart (asserted by the P14 corpus
+/// robustness test).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorpusExpect {
+    /// Parses into a typed chart, Faithful (a supported group, or an edge case that still parses).
+    Faithful,
+    /// Parses into a **2-D** chart, Degraded (a 3-D source normalized to its 2-D equivalent).
+    Degraded,
+    /// Retained as an Unsupported placeholder — no typed chart, source kept, not dropped.
+    Unsupported,
+}
+
+/// One chart in the corpus fixture: its package part, a human label, and the classification the
+/// loader should produce for it.
+#[derive(Clone, Debug)]
+pub struct CorpusChart {
+    pub part: String,
+    pub label: &'static str,
+    pub expect: CorpusExpect,
+}
+
+/// Writes a valid, IronCalc-openable single-sheet workbook to `path` whose one drawing anchors a
+/// broad **corpus** of chart types + edge cases — every supported group (line/column/bar/area/pie/
+/// doughnut/scatter), every 3-D group (→ degraded 2-D), every truly-unsupported group (surface/
+/// radar/stock/ofPie/bubble), and parse edge cases (unresolved `c:f`, empty range, non-numeric
+/// cell, a groupless chartSpace, a non-XML "garbage" part). Returns the manifest of expected
+/// classifications, in the drawing's document order — the order `discover_and_parse` returns them.
+pub fn write_corpus_fixture(path: &Path) -> Result<Vec<CorpusChart>> {
+    use CorpusExpect::{Degraded, Faithful, Unsupported};
+
+    // (label, chartSpace XML, expected classification) in drawing/document order.
+    let entries: Vec<(&'static str, String, CorpusExpect)> = vec![
+        // --- Supported groups → parse Faithful (they render via the P5/PoC widgets). ---
+        (
+            "line",
+            catval_group_chart(
+                "Line",
+                "<c:lineChart><c:grouping val=\"standard\"/>",
+                "</c:lineChart>",
+            ),
+            Faithful,
+        ),
+        (
+            "column",
+            catval_group_chart(
+                "Column",
+                "<c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/>",
+                "</c:barChart>",
+            ),
+            Faithful,
+        ),
+        (
+            "bar",
+            catval_group_chart(
+                "Bar",
+                "<c:barChart><c:barDir val=\"bar\"/><c:grouping val=\"clustered\"/>",
+                "</c:barChart>",
+            ),
+            Faithful,
+        ),
+        (
+            "area",
+            catval_group_chart(
+                "Area",
+                "<c:areaChart><c:grouping val=\"standard\"/>",
+                "</c:areaChart>",
+            ),
+            Faithful,
+        ),
+        (
+            "pie",
+            catval_group_chart("Pie", "<c:pieChart>", "</c:pieChart>"),
+            Faithful,
+        ),
+        (
+            "doughnut",
+            catval_group_chart(
+                "Doughnut",
+                "<c:doughnutChart><c:holeSize val=\"50\"/>",
+                "</c:doughnutChart>",
+            ),
+            Faithful,
+        ),
+        (
+            "scatter",
+            xy_group_chart(
+                "Scatter",
+                "<c:scatterChart><c:scatterStyle val=\"lineMarker\"/>",
+                "<c:axId val=\"1\"/><c:axId val=\"2\"/></c:scatterChart>",
+            ),
+            Faithful,
+        ),
+        // --- 3-D groups → normalized to 2-D, Degraded (retained, rendered 2-D + badge). ---
+        (
+            "bar3D",
+            catval_group_chart(
+                "Bar 3D",
+                "<c:bar3DChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/>",
+                "</c:bar3DChart>",
+            ),
+            Degraded,
+        ),
+        (
+            "line3D",
+            catval_group_chart(
+                "Line 3D",
+                "<c:line3DChart><c:grouping val=\"standard\"/>",
+                "</c:line3DChart>",
+            ),
+            Degraded,
+        ),
+        (
+            "pie3D",
+            catval_group_chart("Pie 3D", "<c:pie3DChart>", "</c:pie3DChart>"),
+            Degraded,
+        ),
+        (
+            "area3D",
+            catval_group_chart(
+                "Area 3D",
+                "<c:area3DChart><c:grouping val=\"standard\"/>",
+                "</c:area3DChart>",
+            ),
+            Degraded,
+        ),
+        // --- Truly-unsupported groups → retained Unsupported placeholder (not dropped). ---
+        (
+            "surface",
+            catval_group_chart("Surface", "<c:surfaceChart>", "</c:surfaceChart>"),
+            Unsupported,
+        ),
+        (
+            "radar",
+            catval_group_chart("Radar", "<c:radarChart>", "</c:radarChart>"),
+            Unsupported,
+        ),
+        (
+            "stock",
+            catval_group_chart("Stock", "<c:stockChart>", "</c:stockChart>"),
+            Unsupported,
+        ),
+        (
+            "ofPie",
+            catval_group_chart("Bar of Pie", "<c:ofPieChart>", "</c:ofPieChart>"),
+            Unsupported,
+        ),
+        (
+            "bubble",
+            xy_group_chart("Bubble", "<c:bubbleChart>", "</c:bubbleChart>"),
+            Unsupported,
+        ),
+        // --- Parse edge cases (functional_spec §7). ---
+        ("unresolved_cf", unresolved_cf_line_chart(), Faithful),
+        ("empty_range", empty_range_line_chart(), Faithful),
+        ("nonnumeric", nonnumeric_line_chart(), Faithful),
+        ("groupless", groupless_chart(), Unsupported),
+        ("garbage", garbage_chart(), Unsupported),
+    ];
+
+    let xmls: Vec<String> = entries.iter().map(|(_, xml, _)| xml.clone()).collect();
+    write_charts_fixture(path, &xmls)?;
+    Ok(entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (label, _, expect))| CorpusChart {
+            part: format!("xl/charts/chart{}.xml", i + 1),
+            label,
+            expect,
+        })
+        .collect())
+}
+
+/// Writes a valid single-sheet workbook whose one `<drawing>` anchors `chart_xmls` (one graphic
+/// frame per chart, `chart{i}.xml`). The generic corpus builder [`write_corpus_fixture`] drives it.
+pub fn write_charts_fixture(path: &Path, chart_xmls: &[String]) -> Result<()> {
+    let n = chart_xmls.len();
+    let mut parts: Vec<(String, String)> = vec![
+        ("[Content_Types].xml".into(), corpus_content_types(n)),
+        ("_rels/.rels".into(), root_rels()),
+        ("xl/workbook.xml".into(), workbook()),
+        ("xl/_rels/workbook.xml.rels".into(), workbook_rels()),
+        ("xl/styles.xml".into(), styles()),
+        ("xl/sharedStrings.xml".into(), shared_strings()),
+        ("xl/worksheets/sheet1.xml".into(), worksheet()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels".into(),
+            worksheet_rels(),
+        ),
+        ("xl/drawings/drawing1.xml".into(), corpus_drawing(n)),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".into(),
+            corpus_drawing_rels(n),
+        ),
+    ];
+    for (i, body) in chart_xmls.iter().enumerate() {
+        parts.push((format!("xl/charts/chart{}.xml", i + 1), body.clone()));
+    }
+    write_package(path, &parts)
+}
+
+/// Writes a single-sheet workbook whose drawing references TWO charts (`rId1` line, `rId2` column)
+/// but whose drawing `_rels` maps ONLY `rId1` — a **dangling** `<c:chart r:id="rId2">`. `discover`
+/// must skip just that chart and still return the line chart (P14 per-chart-resilient walk).
+pub fn write_dangling_chart_rel_fixture(path: &Path) -> Result<()> {
+    let drawing = format!(
+        r#"{DECL}
+<xdr:wsDr xmlns:xdr="{NS_XDR}" xmlns:a="{NS_A}">
+ {a1}
+ {a2}
+</xdr:wsDr>"#,
+        a1 = anchor(1, 1, 0, 10, 10),
+        a2 = anchor(2, 12, 0, 21, 10),
+    );
+    // Only rId1 is present → rId2 (the column chart) is a dangling reference.
+    let drawing_rels = format!(
+        r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="{NS_REL}/chart" Target="../charts/chart1.xml"/></Relationships>"#
+    );
+    let parts: Vec<(String, String)> = vec![
+        ("[Content_Types].xml".into(), corpus_content_types(2)),
+        ("_rels/.rels".into(), root_rels()),
+        ("xl/workbook.xml".into(), workbook()),
+        ("xl/_rels/workbook.xml.rels".into(), workbook_rels()),
+        ("xl/styles.xml".into(), styles()),
+        ("xl/sharedStrings.xml".into(), shared_strings()),
+        ("xl/worksheets/sheet1.xml".into(), worksheet()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels".into(),
+            worksheet_rels(),
+        ),
+        ("xl/drawings/drawing1.xml".into(), drawing),
+        ("xl/drawings/_rels/drawing1.xml.rels".into(), drawing_rels),
+        (
+            "xl/charts/chart1.xml".into(),
+            catval_group_chart(
+                "Line",
+                "<c:lineChart><c:grouping val=\"standard\"/>",
+                "</c:lineChart>",
+            ),
+        ),
+        (
+            "xl/charts/chart2.xml".into(),
+            catval_group_chart(
+                "Column",
+                "<c:barChart><c:barDir val=\"col\"/>",
+                "</c:barChart>",
+            ),
+        ),
+    ];
+    write_package(path, &parts)
+}
+
+/// Writes a **two-sheet** workbook: sheet "Data" has a healthy line chart; sheet "Summary" has a
+/// `<drawing>` whose `_rels` part is **entirely missing**. `discover` must drop the Summary drawing
+/// (logged) and still return Data's line chart (P14 per-drawing-resilient walk).
+pub fn write_missing_drawing_rels_fixture(path: &Path) -> Result<()> {
+    let parts: Vec<(String, String)> = vec![
+        ("[Content_Types].xml".into(), two_sheet_content_types()),
+        ("_rels/.rels".into(), root_rels()),
+        ("xl/workbook.xml".into(), two_sheet_workbook()),
+        (
+            "xl/_rels/workbook.xml.rels".into(),
+            two_sheet_workbook_rels(),
+        ),
+        ("xl/styles.xml".into(), styles()),
+        ("xl/sharedStrings.xml".into(), shared_strings()),
+        ("xl/worksheets/sheet1.xml".into(), worksheet()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels".into(),
+            sheet_drawing_rels(1),
+        ),
+        ("xl/worksheets/sheet2.xml".into(), summary_worksheet()),
+        (
+            "xl/worksheets/_rels/sheet2.xml.rels".into(),
+            sheet_drawing_rels(2),
+        ),
+        (
+            "xl/drawings/drawing1.xml".into(),
+            one_chart_drawing(5, 0, 15, 10),
+        ),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".into(),
+            one_chart_drawing_rels(1),
+        ),
+        // drawing2 exists but its `_rels` part is DELIBERATELY OMITTED.
+        (
+            "xl/drawings/drawing2.xml".into(),
+            one_chart_drawing(5, 0, 15, 10),
+        ),
+        ("xl/charts/chart1.xml".into(), line_chart()),
+        ("xl/charts/chart2.xml".into(), column_chart()),
+    ];
+    write_package(path, &parts)
+}
+
+/// Writes a single-sheet workbook with one line chart whose own chart XML is **valid** but whose
+/// aux `_rels` (`xl/charts/_rels/chart1.xml.rels`) is **malformed** (not valid XML). The chart must
+/// be RETAINED as an Unsupported placeholder (its chart XML + anchor + ranges kept, empty related
+/// parts) rather than dropped — a broken secondary aux part never loses a chart (architecture §6).
+pub fn write_bad_aux_rels_fixture(path: &Path) -> Result<()> {
+    let line = chart_space(
+        "Broken Aux",
+        &format!(
+            "<c:lineChart><c:grouping val=\"standard\"/>{ser}</c:lineChart>",
+            ser = catval_series(0, "Series", WIDGETS_COLOR, "$B$1", "$B$2:$B$5", &WIDGETS),
+        ),
+        false,
+    );
+    let parts: Vec<(String, String)> = vec![
+        ("[Content_Types].xml".into(), corpus_content_types(1)),
+        ("_rels/.rels".into(), root_rels()),
+        ("xl/workbook.xml".into(), workbook()),
+        ("xl/_rels/workbook.xml.rels".into(), workbook_rels()),
+        ("xl/styles.xml".into(), styles()),
+        ("xl/sharedStrings.xml".into(), shared_strings()),
+        ("xl/worksheets/sheet1.xml".into(), worksheet()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels".into(),
+            worksheet_rels(),
+        ),
+        ("xl/drawings/drawing1.xml".into(), corpus_drawing(1)),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".into(),
+            corpus_drawing_rels(1),
+        ),
+        ("xl/charts/chart1.xml".into(), line),
+        // A DELIBERATELY malformed chart aux `_rels` — not well-formed XML, so `parse_rels` fails.
+        (
+            "xl/charts/_rels/chart1.xml.rels".into(),
+            "this is not valid rels XML <<<".into(),
+        ),
+    ];
+    write_package(path, &parts)
+}
+
+/// Writes a **two-sheet** workbook: sheet "Data" has a healthy line chart; sheet "Summary" has a
+/// `<drawing>` whose target drawing **part is entirely missing** (`drawing2.xml` is absent, though
+/// the sheet `_rels` references it). `discover` must drop the Summary drawing (logged) and still
+/// return Data's line chart (P14 per-drawing-resilient walk — the `discover` docstring's
+/// missing-drawing-part claim). The content types declare only the parts that exist.
+pub fn write_missing_drawing_part_fixture(path: &Path) -> Result<()> {
+    let content_types = format!(
+        r#"{DECL}
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="xml" ContentType="application/xml"/>
+ <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+ <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+ <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+ <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+ <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+ <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+ <Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+</Types>"#
+    );
+    let parts: Vec<(String, String)> = vec![
+        ("[Content_Types].xml".into(), content_types),
+        ("_rels/.rels".into(), root_rels()),
+        ("xl/workbook.xml".into(), two_sheet_workbook()),
+        (
+            "xl/_rels/workbook.xml.rels".into(),
+            two_sheet_workbook_rels(),
+        ),
+        ("xl/styles.xml".into(), styles()),
+        ("xl/sharedStrings.xml".into(), shared_strings()),
+        ("xl/worksheets/sheet1.xml".into(), worksheet()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels".into(),
+            sheet_drawing_rels(1),
+        ),
+        ("xl/worksheets/sheet2.xml".into(), summary_worksheet()),
+        // Summary's `_rels` points at drawing2, but that drawing PART is DELIBERATELY OMITTED.
+        (
+            "xl/worksheets/_rels/sheet2.xml.rels".into(),
+            sheet_drawing_rels(2),
+        ),
+        (
+            "xl/drawings/drawing1.xml".into(),
+            one_chart_drawing(5, 0, 15, 10),
+        ),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".into(),
+            one_chart_drawing_rels(1),
+        ),
+        ("xl/charts/chart1.xml".into(), line_chart()),
+    ];
+    write_package(path, &parts)
+}
+
+/// A `<c:barChart>`/`<c:lineChart>`/… chartSpace with one category/value series over the `Data`
+/// grid — the corpus body for every category/value group. `group_open`/`group_close` frame the
+/// chart-group element (with any group-level children like `barDir`).
+fn catval_group_chart(title: &str, group_open: &str, group_close: &str) -> String {
+    let group = format!(
+        "{group_open}{ser}{group_close}",
+        ser = catval_series(0, "Series", WIDGETS_COLOR, "$B$1", "$B$2:$B$5", &WIDGETS),
+    );
+    chart_space(title, &group, false)
+}
+
+/// A chartSpace with one xy series over the `Data` grid — the corpus body for scatter/bubble.
+fn xy_group_chart(title: &str, group_open: &str, group_close: &str) -> String {
+    let ser = format!(
+        r#"<c:ser><c:idx val="0"/><c:order val="0"/><c:xVal>{x}</c:xVal><c:yVal>{y}</c:yVal></c:ser>"#,
+        x = num_ref("$B$2:$B$5", &WIDGETS),
+        y = num_ref("$C$2:$C$5", &GADGETS),
+    );
+    chart_space(title, &format!("{group_open}{ser}{group_close}"), false)
+}
+
+/// A line chart whose value ref points at a sheet that does **not** exist (`Ghost!…`) but carries a
+/// cache — it parses Faithful and renders/falls back to the cache (live binding can't resolve it).
+fn unresolved_cf_line_chart() -> String {
+    let ser = format!(
+        r#"<c:ser><c:idx val="0"/><c:order val="0"/><c:val>{val}</c:val></c:ser>"#,
+        val = num_ref_for("Ghost!$B$2:$B$5", &WIDGETS),
+    );
+    chart_space(
+        "Unresolved ref",
+        &format!("<c:lineChart><c:grouping val=\"standard\"/>{ser}</c:lineChart>"),
+        false,
+    )
+}
+
+/// A line chart whose value cache is **empty** (`ptCount 0`, no points) — it must parse without a
+/// crash (a zero-length series), functional_spec §7.
+fn empty_range_line_chart() -> String {
+    let ser = r#"<c:ser><c:idx val="0"/><c:order val="0"/>
+       <c:val><c:numRef><c:f>Data!$B$2:$B$2</c:f><c:numCache><c:ptCount val="0"/></c:numCache></c:numRef></c:val></c:ser>"#;
+    chart_space(
+        "Empty range",
+        &format!("<c:lineChart><c:grouping val=\"standard\"/>{ser}</c:lineChart>"),
+        false,
+    )
+}
+
+/// A line chart whose value cache holds a **non-numeric** cell — the unparseable point is dropped,
+/// the rest parse, no crash (functional_spec §7).
+fn nonnumeric_line_chart() -> String {
+    let ser = r#"<c:ser><c:idx val="0"/><c:order val="0"/>
+       <c:val><c:numRef><c:f>Data!$B$2:$B$3</c:f><c:numCache><c:ptCount val="2"/>
+         <c:pt idx="0"><c:v>notanumber</c:v></c:pt><c:pt idx="1"><c:v>42</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#;
+    chart_space(
+        "Non-numeric",
+        &format!("<c:lineChart><c:grouping val=\"standard\"/>{ser}</c:lineChart>"),
+        false,
+    )
+}
+
+/// A structurally-valid chartSpace with a title but **no chart-group element** — `parse_chart_xml`
+/// finds no group → retained as an Unsupported placeholder (its title is salvaged).
+fn groupless_chart() -> String {
+    chart_space("Groupless", "", false)
+}
+
+/// A chart part that is **not valid XML at all** — `parse_chart_xml` fails to even parse the
+/// document → retained as an Unsupported placeholder (no title salvaged). Its host workbook still
+/// opens (IronCalc never reads chart parts).
+fn garbage_chart() -> String {
+    "This is deliberately not valid chart XML.".to_string()
+}
+
+/// The corpus `[Content_Types].xml`: the base workbook parts + one chart override per chart.
+fn corpus_content_types(n_charts: usize) -> String {
+    let mut chart_overrides = String::new();
+    for i in 1..=n_charts {
+        chart_overrides.push_str(&format!(
+            r#"<Override PartName="/xl/charts/chart{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>"#
+        ));
+    }
+    format!(
+        r#"{DECL}
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="xml" ContentType="application/xml"/>
+ <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+ <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+ <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+ <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+ <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+ {chart_overrides}
+</Types>"#
+    )
+}
+
+/// The corpus drawing: `n_charts` `twoCellAnchor` graphic frames, staggered down the sheet, each
+/// referencing `chart{i}.xml` via `rId{i}`.
+fn corpus_drawing(n_charts: usize) -> String {
+    let mut frames = String::new();
+    for i in 1..=n_charts as u32 {
+        let from_row = (i - 1) * 16;
+        frames.push_str(&anchor(i, from_row + 1, 0, from_row + 15, 10));
+        frames.push('\n');
+    }
+    format!(
+        r#"{DECL}
+<xdr:wsDr xmlns:xdr="{NS_XDR}" xmlns:a="{NS_A}">
+{frames}</xdr:wsDr>"#
+    )
+}
+
+/// The corpus drawing `_rels`: one chart relationship (`rId{i}` → `chart{i}.xml`) per chart.
+fn corpus_drawing_rels(n_charts: usize) -> String {
+    let mut rels = String::new();
+    for i in 1..=n_charts {
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{i}" Type="{NS_REL}/chart" Target="../charts/chart{i}.xml"/>"#
+        ));
+    }
+    format!(r#"{DECL}<Relationships xmlns="{NS_PKG_REL}">{rels}</Relationships>"#)
+}
+
+/// Writes a package: each `(part name, body)` becomes a deflated zip entry. The shared zip-writing
+/// tail for the corpus + broken-drawing fixtures.
+fn write_package(path: &Path, parts: &[(String, String)]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut zw = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, body) in parts {
+        zw.start_file(name.as_str(), opts)
+            .with_context(|| format!("starting zip entry {name}"))?;
+        zw.write_all(body.as_bytes())
+            .with_context(|| format!("writing zip entry {name}"))?;
+    }
+    zw.finish().context("finishing package zip")?;
+    Ok(())
 }
 
 #[cfg(test)]

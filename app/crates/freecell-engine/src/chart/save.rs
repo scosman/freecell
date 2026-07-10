@@ -106,8 +106,10 @@ pub struct LiveChart {
     /// The chart's `xl/charts/chartN.xml` part (stable across renames).
     pub chart_part: String,
     /// The chart's current (live-resolved) values — reflowed into its cache iff they differ from
-    /// the file cache.
-    pub chart: Chart,
+    /// the file cache. `None` for an **Unsupported** chart (a retained surface/radar/… with no typed
+    /// model, P14): it has no values to reflow, so it is always **byte-preserved** (never patched),
+    /// while still tracking its host sheet for the drawing re-injection.
+    pub chart: Option<Chart>,
 }
 
 /// Re-injects the workbook's **live** charts into `model_bytes` (IronCalc's chart-less zip of the
@@ -147,15 +149,17 @@ fn build_live_patches(original: &Path, live: &[LiveChart]) -> Result<BTreeMap<St
     // `ZipArchive` (or the already-read carry map) through the save so a save opens the file once.
     let mut patches = BTreeMap::new();
     for lc in live {
+        // An Unsupported chart has no typed model to reflow → never patched (byte-preserved by the
+        // reinject carry path). Don't even parse its part (a surface/radar/… part won't parse).
+        let Some(chart) = &lc.chart else {
+            continue;
+        };
         let part_xml = xlsx::read_entry(original, &lc.chart_part)
             .with_context(|| format!("reading chart part {}", lc.chart_part))?;
         let cached = parse_chart_xml(&part_xml)
             .with_context(|| format!("parsing chart part {}", lc.chart_part))?;
-        if lc.chart != cached {
-            patches.insert(
-                lc.chart_part.clone(),
-                patch_chart_source(&part_xml, &lc.chart)?,
-            );
+        if *chart != cached {
+            patches.insert(lc.chart_part.clone(), patch_chart_source(&part_xml, chart)?);
         }
     }
     Ok(patches)
@@ -672,7 +676,7 @@ pub fn patch_chart_source(chart_xml: &str, chart: &Chart) -> Result<String> {
         .and_then(|c| child(&c, "plotArea"))
         .and_then(|plot| {
             plot.children()
-                .find(|n| n.is_element() && load::CHART_GROUP_TAGS.contains(&n.tag_name().name()))
+                .find(|n| n.is_element() && load::is_chart_group(n.tag_name().name()))
         })
         .ok_or_else(|| anyhow!("no recognized chart-group element to patch"))?;
 
@@ -917,7 +921,7 @@ mod tests {
         LiveChart {
             sheet_name: Some(sheet.to_string()),
             chart_part: chart_part.to_string(),
-            chart,
+            chart: Some(chart),
         }
     }
 
@@ -1125,7 +1129,7 @@ mod tests {
         };
         let data_sheet = resolve_sheet("Data").unwrap();
         let reflowed = resolve_chart(
-            &spec.chart,
+            spec.chart().unwrap(),
             &binding,
             data_sheet,
             &resolve_sheet,
@@ -1151,8 +1155,8 @@ mod tests {
         // (a) Reopening via our loader shows the edited value; the untouched second series is kept.
         let reopened = discover_and_parse(&out).unwrap();
         assert_eq!(reopened.len(), 1);
-        assert_eq!(first_value(&reopened[0].chart), 999.0);
-        match &reopened[0].chart.series[1].data {
+        assert_eq!(first_value(reopened[0].chart().unwrap()), 999.0);
+        match &reopened[0].chart().unwrap().series[1].data {
             SeriesData::CategoryValue { values, .. } => assert_eq!(values[0], 80.0),
             other => panic!("expected CategoryValue, got {other:?}"),
         }
@@ -1251,11 +1255,11 @@ mod tests {
             assert_eq!(specs.len(), 1, "{name} has one chart");
             match name.as_str() {
                 "Data" => assert!(matches!(
-                    specs[0].1.chart.kind,
+                    specs[0].1.chart().unwrap().kind,
                     freecell_chart_model::ChartKind::Bar { .. }
                 )),
                 "Summary" => assert!(matches!(
-                    specs[0].1.chart.kind,
+                    specs[0].1.chart().unwrap().kind,
                     freecell_chart_model::ChartKind::Line { .. }
                 )),
                 other => panic!("unexpected sheet {other}"),
@@ -1298,10 +1302,10 @@ mod tests {
             LiveChart {
                 sheet_name: None, // Summary deleted in-session
                 chart_part: "xl/charts/chart2.xml".into(),
-                chart: parse_chart_xml(
-                    &xlsx::read_entry(&original, "xl/charts/chart2.xml").unwrap(),
-                )
-                .unwrap(),
+                chart: Some(
+                    parse_chart_xml(&xlsx::read_entry(&original, "xl/charts/chart2.xml").unwrap())
+                        .unwrap(),
+                ),
             },
         ];
         let (bytes, report) =
@@ -1315,7 +1319,7 @@ mod tests {
         let reopened = discover_and_parse(&out).unwrap();
         assert_eq!(reopened.len(), 1);
         assert!(matches!(
-            reopened[0].chart.kind,
+            reopened[0].chart().unwrap().kind,
             freecell_chart_model::ChartKind::Bar { .. }
         ));
         // The dropped drawing leaves NO orphaned parts or content-type overrides behind.
@@ -1366,6 +1370,50 @@ mod tests {
             xlsx::read_entry(&original, "xl/charts/chart2.xml").unwrap(),
         );
         // Summary's worksheet kept its <drawing> (proving carry, not drop).
+        assert!(xlsx::read_entry(&out, "xl/worksheets/sheet2.xml")
+            .unwrap()
+            .contains("<drawing "));
+    }
+
+    /// P14: an Unsupported chart bound with `chart: None` (as `discover_and_parse` now retains a
+    /// surface/radar/… chart) is **byte-preserved** — never parsed or patched — while its drawing
+    /// still follows its surviving host sheet. The "byte-preserve as a **bound** spec" outcome.
+    #[test]
+    fn reinject_live_charts_byte_preserves_a_bound_unsupported_chart() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("mixed.xlsx");
+        authoring::write_two_sheet_supported_plus_unsupported_fixture(&original).unwrap();
+
+        // Data's supported column chart is edited (Some); Summary's surface chart is a bound
+        // Unsupported spec (None) — the shape `ChartBindings::live_charts` now produces for it.
+        let mut supported =
+            parse_chart_xml(&xlsx::read_entry(&original, "xl/charts/chart1.xml").unwrap()).unwrap();
+        if let SeriesData::CategoryValue { values, .. } = &mut supported.series[0].data {
+            values[0] = 424.0;
+        }
+        let live = vec![
+            live_on("Data", "xl/charts/chart1.xml", supported),
+            LiveChart {
+                sheet_name: Some("Summary".into()),
+                chart_part: "xl/charts/chart2.xml".into(),
+                chart: None, // unsupported → byte-preserve, never patch
+            },
+        ];
+
+        let (bytes, report) =
+            reinject_live_charts(&original, &ironcalc_bytes(&original), &live).unwrap();
+        let out = dir.path().join("out.xlsx");
+        std::fs::write(&out, &bytes).unwrap();
+
+        // Only the supported chart is patched; the unsupported one is byte-identical to the original.
+        assert_eq!(report.patched_charts, vec!["xl/charts/chart1.xml"]);
+        assert_eq!(
+            xlsx::read_entry(&out, "xl/charts/chart2.xml").unwrap(),
+            xlsx::read_entry(&original, "xl/charts/chart2.xml").unwrap(),
+        );
+        // Both drawings survived (Data patched, Summary's unsupported carried); IronCalc reopens.
+        assert_eq!(report.charts_preserved, 2);
+        ironcalc::import::load_from_xlsx(out.to_str().unwrap(), "en", "UTC", "en").unwrap();
         assert!(xlsx::read_entry(&out, "xl/worksheets/sheet2.xml")
             .unwrap()
             .contains("<drawing "));
@@ -1435,7 +1483,9 @@ mod tests {
                 live_on("Data", part, c)
             })
             .collect();
-        if let SeriesData::CategoryValue { values, .. } = &mut live[1].chart.series[0].data {
+        if let SeriesData::CategoryValue { values, .. } =
+            &mut live[1].chart.as_mut().unwrap().series[0].data
+        {
             values[0] = 555.0;
         }
 
@@ -1455,7 +1505,7 @@ mod tests {
         }
         // Reopen: the edit survived and IronCalc accepts the package.
         let reopened = discover_and_parse(&out).unwrap();
-        assert_eq!(first_value(&reopened[1].chart), 555.0);
+        assert_eq!(first_value(reopened[1].chart().unwrap()), 555.0);
         ironcalc::import::load_from_xlsx(out.to_str().unwrap(), "en", "UTC", "en").unwrap();
     }
 }

@@ -753,7 +753,7 @@ fn snapshot_series_values(
         .find(|(s, _)| *s == sheet)
         .expect("the anchor sheet carries charts")
         .1;
-    match &specs[chart_idx].chart.series[series_idx].data {
+    match &specs[chart_idx].chart().unwrap().series[series_idx].data {
         SeriesData::CategoryValue { values, .. } => values.clone(),
         SeriesData::Xy { y, .. } => y.clone(),
     }
@@ -919,7 +919,7 @@ fn coalesced_edits_converge_the_chart() {
 /// The reopened first value of a chart's first series, from `discover_and_parse`.
 fn reopened_first_value(path: &std::path::Path, chart_idx: usize) -> f64 {
     let specs = freecell_engine::chart::discover_and_parse(path).unwrap();
-    match &specs[chart_idx].chart.series[0].data {
+    match &specs[chart_idx].chart().unwrap().series[0].data {
         SeriesData::CategoryValue { values, .. } => values[0],
         SeriesData::Xy { y, .. } => y[0],
     }
@@ -1023,7 +1023,7 @@ fn save_preserves_charts_when_their_sheet_was_never_painted() {
         "the never-painted chart is preserved by the save-time full sweep",
     );
     assert!(matches!(
-        specs[0].chart.kind,
+        specs[0].chart().unwrap().kind,
         freecell_chart_model::ChartKind::Line { .. }
     ));
 }
@@ -1086,7 +1086,7 @@ fn rename_before_paint_still_discovers_and_saves_the_chart() {
         .expect("the renamed sheet carries its line chart in the saved file");
     assert_eq!(name, "Renamed");
     assert!(matches!(
-        charts[0].1.chart.kind,
+        charts[0].1.chart().unwrap().kind,
         freecell_chart_model::ChartKind::Line { .. }
     ));
 }
@@ -1171,7 +1171,7 @@ fn spawn_over_chart_file(
 fn reopened_group_first_value(path: &std::path::Path, group: usize) -> (String, f64) {
     let groups = freecell_engine::chart::discover_and_parse_by_sheet(path).unwrap();
     let (name, charts) = &groups[group];
-    let v = match &charts[0].1.chart.series[0].data {
+    let v = match &charts[0].1.chart().unwrap().series[0].data {
         SeriesData::CategoryValue { values, .. } => values[0],
         SeriesData::Xy { y, .. } => y[0],
     };
@@ -1246,9 +1246,11 @@ fn save_after_deleting_the_chart_host_sheet_succeeds() {
     assert_eq!(specs.len(), 1);
 }
 
-/// P10 Moderate fix (arch §6, no silent chart drop): saving after editing a SUPPORTED chart must
-/// byte-preserve an UNSUPPORTED chart that lives alone on another sheet (it was never bound, but its
-/// host sheet survives) — driven through the worker's real `Command::Save`.
+/// P10/P14 (arch §6, no silent chart drop): saving after editing a SUPPORTED chart must
+/// byte-preserve an UNSUPPORTED chart that lives alone on another sheet. As of P14 the surface
+/// chart is **retained + bound** (a `chart: None` live descriptor) rather than dropped at load, so
+/// it byte-preserves via the bound path (never parsed/patched) while still following its host sheet
+/// — driven through the worker's real `Command::Save`.
 #[test]
 fn save_preserves_an_unsupported_chart_on_a_surviving_sheet() {
     let (client, rx, sheets, fixture_dir) = spawn_over_chart_file(|p| {

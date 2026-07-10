@@ -37,7 +37,7 @@ pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
 pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};
 pub use numfmt::apply_number_format;
-pub use spec::{Anchor, AnchorCell, CfRange, ChartSpec, Origin, SourcePart, SourceXml};
+pub use spec::{Anchor, AnchorCell, CfRange, ChartBody, ChartSpec, Origin, SourcePart, SourceXml};
 pub use stroke::LineStroke;
 pub use theme::{ChartColor, ThemePalette, ThemeSlot};
 

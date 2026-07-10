@@ -12,9 +12,9 @@ use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
 use freecell_chart_model::{
-    Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart, ChartColor, ChartKind, ChartSpec,
-    Color, DataLabelPosition, DataLabels, Grouping, Legend, LegendPosition, LineStroke, Series,
-    SourcePart, SourceXml, ThemeSlot,
+    normalize_3d_chart_group, Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart,
+    ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, Grouping, Legend,
+    LegendPosition, LineStroke, Series, SourcePart, SourceXml, ThemeSlot,
 };
 
 use super::xlsx::{self, attr};
@@ -61,6 +61,13 @@ pub struct SheetDrawing {
 /// Walks every worksheet in the package and returns the `<drawing>`-bearing ones with their
 /// resolved chart part names. Worksheets without a `<drawing>` (or whose drawing carries no
 /// charts) are omitted. Namespace/prefix-agnostic throughout.
+///
+/// **Per-drawing non-fatal** (charts/functional_spec §1, architecture §6, P14): a **broken drawing
+/// relationship** on one worksheet — a missing drawing `_rels` part, a missing drawing part, or an
+/// individual `<c:chart r:id>` whose `rId` is absent — drops just *that* drawing/chart (logged) and
+/// the walk continues, so the rest of the workbook and its other charts still open. Only a genuinely
+/// unreadable **package** (the zip itself won't open) is a hard error — the workbook can't open at
+/// all in that case either.
 pub fn discover(path: &Path) -> Result<Vec<SheetDrawing>> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -76,28 +83,47 @@ pub fn discover(path: &Path) -> Result<Vec<SheetDrawing>> {
 
     let mut out = Vec::new();
     for sheet_part in sheet_parts {
-        let sheet_xml = xlsx::read_entry_from(&mut archive, &sheet_part)?;
-        let Some((rel_id, drawing_part, rel_type)) =
-            worksheet_drawing(&sheet_xml, &sheet_part, &mut archive)?
-        else {
-            continue;
-        };
-        let drawing_xml = xlsx::read_entry_from(&mut archive, &drawing_part)?;
-        let charts = drawing_charts(&drawing_xml, &drawing_part, &mut archive)?;
-        if charts.is_empty() {
-            continue;
+        match discover_sheet_drawing(&mut archive, &sheet_part) {
+            Ok(Some(sheet_drawing)) => out.push(sheet_drawing),
+            Ok(None) => {} // no drawing, or a drawing with no resolvable charts
+            // A dangling drawing/rel on this worksheet drops just its drawing (never the load).
+            Err(err) => tracing::warn!(
+                sheet = %sheet_part,
+                "skipping a worksheet's broken drawing/chart relationships: {err:#}"
+            ),
         }
-        out.push(SheetDrawing {
-            sheet_part,
-            drawing_part,
-            drawing_rel_id: rel_id,
-            drawing_rel_type: rel_type,
-            charts,
-        });
     }
     // Deterministic order (zip index order is not guaranteed sorted).
     out.sort_by(|a, b| a.sheet_part.cmp(&b.sheet_part));
     Ok(out)
+}
+
+/// Resolve one worksheet's `<drawing>` chain into a [`SheetDrawing`] (part + charts), or `None`
+/// when the worksheet has no `<drawing>` / its drawing references no resolvable charts. Fallible so
+/// [`discover`] can treat a broken drawing relationship as **per-drawing non-fatal** (skip + log)
+/// rather than aborting the whole load (charts/architecture §6).
+fn discover_sheet_drawing<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    sheet_part: &str,
+) -> Result<Option<SheetDrawing>> {
+    let sheet_xml = xlsx::read_entry_from(archive, sheet_part)?;
+    let Some((rel_id, drawing_part, rel_type)) =
+        worksheet_drawing(&sheet_xml, sheet_part, archive)?
+    else {
+        return Ok(None);
+    };
+    let drawing_xml = xlsx::read_entry_from(archive, &drawing_part)?;
+    let charts = drawing_charts(&drawing_xml, &drawing_part, archive)?;
+    if charts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SheetDrawing {
+        sheet_part: sheet_part.to_string(),
+        drawing_part,
+        drawing_rel_id: rel_id,
+        drawing_rel_type: rel_type,
+        charts,
+    }))
 }
 
 /// Resolves a worksheet's `<drawing r:id>` to its drawing part via the sheet's `_rels`.
@@ -153,15 +179,22 @@ fn drawing_charts<R: std::io::Read + std::io::Seek>(
     })?;
     let rels = xlsx::parse_rels(&rels_xml)?;
 
+    // A `<c:chart r:id>` whose `rId` is absent from the drawing's `_rels` is a dangling reference:
+    // skip **that** chart (logged) and keep its siblings — the walk is per-chart resilient (P14,
+    // charts/architecture §6), never dropping a whole drawing over one broken relationship.
     let mut charts = Vec::new();
     for (rel_id, anchor) in referenced {
-        let rel = rels
-            .get(&rel_id)
-            .ok_or_else(|| anyhow!("{rels_part} has no relationship {rel_id}"))?;
-        charts.push(DiscoveredChart {
-            part: xlsx::resolve_target(drawing_part, &rel.target),
-            anchor,
-        });
+        match rels.get(&rel_id) {
+            Some(rel) => charts.push(DiscoveredChart {
+                part: xlsx::resolve_target(drawing_part, &rel.target),
+                anchor,
+            }),
+            None => tracing::warn!(
+                drawing = %drawing_part,
+                rel_id = %rel_id,
+                "drawing references a chart relationship absent from its _rels; skipping that chart"
+            ),
+        }
     }
     Ok(charts)
 }
@@ -247,23 +280,22 @@ pub fn load_charts_from_xlsx(path: &Path) -> Result<Vec<Chart>> {
 /// the retained `source_ranges` is P9.
 ///
 /// **A bad chart is per-chart non-fatal, never fatal to the load** (charts/architecture §6,
-/// functional_spec §1): a chart whose part can't be read or parsed — an unsupported group our
-/// `parse_chart_xml` doesn't recognize (surface / radar / stock / 3-D / bubble), or a malformed
-/// part — is **skipped and logged**, and the walk continues, returning the charts that did
-/// parse. Opening a workbook must never break on one broken chart.
+/// functional_spec §1). Two distinct kinds of "bad", handled differently (P14):
+/// - A chart the walk **reaches but can't parse into a typed [`Chart`]** — an unsupported group our
+///   `parse_chart_xml` doesn't recognize (surface / radar / stock / ofPie / bubble), or malformed
+///   chart XML — is **retained as an Unsupported [`ChartSpec`]** ([`ChartSpec::loaded_unsupported`]):
+///   it keeps its source XML + anchor + `c:f` ranges, its
+///   [`display_fidelity`](ChartSpec::display_fidelity) is [`Unsupported`](freecell_chart_model::Fidelity::Unsupported)
+///   so P8 renders its placeholder in-grid and P10 byte-preserves it on save, but it carries no
+///   render picture. (A **3-D** group is instead normalized to its 2-D equivalent by
+///   [`parse_chart_xml`] and classifies Degraded — it parses, it isn't dropped.)
+/// - A chart whose **part can't even be read** (a missing chart part, a malformed chart `_rels`) —
+///   there is nothing to retain — is **skipped and logged**, and the walk continues.
 ///
-/// NOTE (P8 / P14): this phase **drops** an unparseable chart entirely. The fuller handling —
-/// retaining its source so it still byte-preserves on save, and rendering an actual placeholder
-/// for it (charts/functional_spec §5 "Unsupported → placeholder") — is deferred to **P8**
-/// (placeholder render) and **P14** (cross-type graceful-degrade / real-file corpus), per the
-/// plan's risk ordering (line end-to-end first, cross-type robustness at P14). Skip-and-log is
-/// sufficient for the line-only slice while honoring the never-breaks invariant.
-///
-/// This resilience covers a chart the walk *reaches* but can't parse. It does **not** yet cover
-/// a corrupt **drawing relationship** in the shared [`discover`] walk — a missing drawing `_rels`
-/// part, or a `<c:chart r:id>` whose `rId` is absent from it — which still `?`-aborts the whole
-/// load (a package-corruption path, distinct from an unsupported chart). Making that dangling-rel
-/// case per-chart-resilient is **P14** robustness work; tracked in `phase_plans/phase_7.md`.
+/// A corrupt **drawing relationship** in the shared [`discover`] walk (a missing drawing `_rels`,
+/// an absent `<c:chart r:id>` `rId`, a missing drawing part) is likewise per-drawing non-fatal —
+/// [`discover`] drops just that drawing/chart and keeps the rest. Opening a workbook must never
+/// break on one broken chart or drawing.
 pub fn discover_and_parse(path: &Path) -> Result<Vec<ChartSpec>> {
     let sheets = discover(path)?;
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -274,11 +306,11 @@ pub fn discover_and_parse(path: &Path) -> Result<Vec<ChartSpec>> {
     for sheet in &sheets {
         for dc in &sheet.charts {
             match parse_discovered_chart(&mut archive, dc) {
+                // An unparseable-but-readable chart comes back as a retained Unsupported spec (see
+                // `parse_discovered_chart`); only a genuinely UNREADABLE part is an Err here.
                 Ok(spec) => specs.push(spec),
-                // Skip + log; the walk continues. (P8/P14 upgrade skip → retain-source +
-                // placeholder — see the fn docs.)
                 Err(err) => {
-                    tracing::warn!(chart_part = %dc.part, "skipping unparseable chart: {err:#}");
+                    tracing::warn!(chart_part = %dc.part, "skipping unreadable chart part: {err:#}");
                 }
             }
         }
@@ -322,7 +354,7 @@ pub fn discover_and_parse_by_sheet(path: &Path) -> Result<ChartsBySheet> {
             match parse_discovered_chart(&mut archive, dc) {
                 Ok(spec) => specs.push((dc.part.clone(), spec)),
                 Err(err) => {
-                    tracing::warn!(chart_part = %dc.part, "skipping unparseable chart: {err:#}");
+                    tracing::warn!(chart_part = %dc.part, "skipping unreadable chart part: {err:#}");
                 }
             }
         }
@@ -400,28 +432,81 @@ fn parse_sheet_charts<R: std::io::Read + std::io::Seek>(
         match parse_discovered_chart(archive, dc) {
             Ok(spec) => specs.push((dc.part.clone(), spec)),
             Err(err) => {
-                tracing::warn!(chart_part = %dc.part, "skipping unparseable chart: {err:#}");
+                tracing::warn!(chart_part = %dc.part, "skipping unreadable chart part: {err:#}");
             }
         }
     }
     specs
 }
 
-/// Parses one discovered chart into a [`ChartSpec`] — read the part, map it to a [`Chart`], and
-/// gather its `c:f` ranges + retained source (XML + related parts). Fallible so
-/// [`discover_and_parse`] can treat a failure as per-chart non-fatal (skip + log).
+/// Parses one discovered chart into a [`ChartSpec`], **retaining** its source + ranges + anchor
+/// regardless of whether we can build a typed [`Chart`] (charts/architecture §6, P14). A chart is
+/// **only ever fully dropped when its own chart XML part is unreadable/absent** (a genuinely missing
+/// part); everything else is retained:
+/// - a part that parses into a [`Chart`] **and** whose aux parts read → [`ChartSpec::loaded`]
+///   (Faithful/Degraded per its source);
+/// - a **readable but unparseable** part (an unsupported group, malformed chart XML), **or** a
+///   parseable part whose aux `_rels` is malformed/unreadable → [`ChartSpec::loaded_unsupported`]
+///   with the salvaged title, so it still byte-preserves on save and renders its placeholder
+///   in-grid (`display_fidelity() == Unsupported`). A broken aux `_rels` retains the chart with
+///   **empty** related parts (its own chart XML + anchor + ranges are still kept) rather than
+///   dropping it.
+///
+/// Fallible **only** when the chart XML part itself can't be read (missing/absent) — there is
+/// nothing to retain — so [`discover_and_parse`] can skip + log that narrow case.
 fn parse_discovered_chart<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     dc: &DiscoveredChart,
 ) -> Result<ChartSpec> {
     let chart_xml = xlsx::read_entry_from(archive, &dc.part)
         .with_context(|| format!("reading chart part {}", dc.part))?;
-    let chart =
-        parse_chart_xml(&chart_xml).with_context(|| format!("parsing chart part {}", dc.part))?;
     let source_ranges = parse_cf_ranges(&chart_xml);
-    let related_parts = read_related_parts(archive, &dc.part)?;
-    let source = SourceXml::new(chart_xml).with_related_parts(related_parts);
-    Ok(ChartSpec::loaded(chart, source, source_ranges, dc.anchor))
+    let parsed = parse_chart_xml(&chart_xml);
+
+    // Aux parts are **best-effort**: a malformed/unreadable aux `_rels` must NOT drop the chart (its
+    // own XML is already in hand). `None` here means "couldn't read the aux parts" → retain the chart
+    // as a placeholder with no related parts (a chart whose styling deps we can't read isn't drawn as
+    // itself). An absent `_rels` reads as `Some(empty)` (the ordinary no-aux-parts case).
+    let related_parts = match read_related_parts(archive, &dc.part) {
+        Ok(related) => Some(related),
+        Err(err) => {
+            tracing::warn!(
+                chart_part = %dc.part,
+                "chart aux _rels unreadable; retaining as an Unsupported placeholder: {err:#}"
+            );
+            None
+        }
+    };
+
+    match (parsed, related_parts) {
+        // Parses cleanly AND its aux parts read → the full render envelope.
+        (Ok(chart), Some(related)) => {
+            let source = SourceXml::new(chart_xml).with_related_parts(related);
+            Ok(ChartSpec::loaded(chart, source, source_ranges, dc.anchor))
+        }
+        // Otherwise retain as a placeholder: unparseable chart XML, or a parseable one whose aux
+        // parts failed to read. Salvage the title (from the parsed chart if we have it, else from the
+        // source text) and keep whatever source we could (related parts if they read, else none).
+        (parsed, related) => {
+            if let Err(err) = &parsed {
+                tracing::debug!(
+                    chart_part = %dc.part,
+                    "retaining unparseable chart as an Unsupported placeholder: {err:#}"
+                );
+            }
+            let title = match &parsed {
+                Ok(chart) => chart.title.clone(),
+                Err(_) => chart_title_from_xml(&chart_xml),
+            };
+            let source = SourceXml::new(chart_xml).with_related_parts(related.unwrap_or_default());
+            Ok(ChartSpec::loaded_unsupported(
+                title,
+                source,
+                source_ranges,
+                dc.anchor,
+            ))
+        }
+    }
 }
 
 /// Collects every `<c:f>` data-reference formula in a chart part, as written, in document order
@@ -491,8 +576,24 @@ pub(super) const CHART_GROUP_TAGS: &[&str] = &[
     "scatterChart",
 ];
 
+/// Whether `local_name` names a chart-group element we parse: one of the 2-D [`CHART_GROUP_TAGS`],
+/// **or** a 3-D group (`bar3DChart` / `line3DChart` / `pie3DChart` / `area3DChart`) that
+/// [`parse_chart_xml`] normalizes to its 2-D equivalent (charts/functional_spec §5, "3-D → 2-D + a
+/// compatibility flag"). Shared by [`parse_chart_xml`], the live-binding parser
+/// ([`binding`](super::binding)), and the save reflow ([`save`](super::save)) so all three agree on
+/// which element is the chart group — including the 3-D case, so a Degraded 3-D chart still
+/// live-binds + reflows off its (2-D-parsed) series.
+pub(super) fn is_chart_group(local_name: &str) -> bool {
+    CHART_GROUP_TAGS.contains(&local_name) || normalize_3d_chart_group(local_name).is_some()
+}
+
 /// Parses a single `xl/charts/chartN.xml` document (`c:chartSpace`) into a [`Chart`], reading
 /// cached values only. Returns an error if no recognized chart-group element is present.
+///
+/// A **3-D** chart group is normalized to its 2-D equivalent (`bar3DChart` → a `Bar` kind, etc.)
+/// via [`normalize_3d_chart_group`], so a 3-D chart parses (and later classifies
+/// [`Degraded`](freecell_chart_model::Fidelity::Degraded), since its retained source still names the
+/// 3-D element) rather than being dropped (charts/functional_spec §5).
 pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
     let doc = Document::parse(xml).context("parsing chart XML")?;
     let root = doc.root_element(); // c:chartSpace
@@ -501,10 +602,13 @@ pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
 
     let group = plot_area
         .children()
-        .find(|n| n.is_element() && CHART_GROUP_TAGS.contains(&n.tag_name().name()))
+        .find(|n| n.is_element() && is_chart_group(n.tag_name().name()))
         .ok_or_else(|| anyhow!("no recognized chart-group element in <c:plotArea>"))?;
 
-    let kind = parse_kind(&group)?;
+    // Normalize a 3-D group to its 2-D equivalent name before reading its kind.
+    let group_name = group.tag_name().name();
+    let kind_name = normalize_3d_chart_group(group_name).unwrap_or(group_name);
+    let kind = parse_kind(&group, kind_name)?;
     let is_scatter = matches!(kind, ChartKind::Scatter);
 
     // The chart-group-level `c:dLbls` (a direct child of the group, after the series) is the
@@ -530,10 +634,11 @@ pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
     })
 }
 
-/// The [`ChartKind`] for a chart-group element, reading `c:barDir` / `c:grouping` /
-/// `c:holeSize` as needed.
-fn parse_kind(group: &Node) -> Result<ChartKind> {
-    Ok(match group.tag_name().name() {
+/// The [`ChartKind`] for a chart-group element named `kind_name` (the group node's own name, or its
+/// 2-D equivalent when the source group was 3-D — see [`parse_chart_xml`]), reading `c:barDir` /
+/// `c:grouping` / `c:holeSize` from `group` as needed.
+fn parse_kind(group: &Node, kind_name: &str) -> Result<ChartKind> {
+    Ok(match kind_name {
         "barChart" => {
             let dir = match child_val(group, "barDir").as_deref() {
                 Some("bar") => BarDir::Bar,
@@ -788,6 +893,15 @@ fn cache_points(holder: &Node, cache_tag: &str) -> Vec<(usize, String)> {
         .collect();
     pts.sort_by_key(|(idx, _)| *idx);
     pts
+}
+
+/// The chart title salvaged straight from a chart part's XML text (`c:chart/c:title`), for the
+/// placeholder caption of a chart we could **not** parse into a [`Chart`] (an Unsupported spec,
+/// P14). Returns `None` when the part won't parse as XML at all, or carries no title.
+fn chart_title_from_xml(chart_xml: &str) -> Option<String> {
+    let doc = Document::parse(chart_xml).ok()?;
+    let chart = child(&doc.root_element(), "chart")?;
+    parse_title(&chart)
 }
 
 /// The chart title text from `c:chart/c:title` (concatenated `a:t` runs), or `None` when
@@ -1269,15 +1383,13 @@ mod tests {
         let spec = &specs[0];
 
         // Chart model (the render seam): a straight two-series line with cached values.
-        assert!(matches!(
-            spec.chart.kind,
-            ChartKind::Line { smooth: false, .. }
-        ));
-        assert_eq!(spec.chart.title.as_deref(), Some(LINE_CHART_TITLE));
-        assert_eq!(spec.chart.series.len(), 2);
-        assert_eq!(spec.chart.series[0].name.as_deref(), Some("Widgets"));
-        assert_eq!(spec.chart.series[1].name.as_deref(), Some("Gadgets"));
-        match &spec.chart.series[0].data {
+        let chart = spec.chart().expect("line chart parsed into a typed Chart");
+        assert!(matches!(chart.kind, ChartKind::Line { smooth: false, .. }));
+        assert_eq!(chart.title.as_deref(), Some(LINE_CHART_TITLE));
+        assert_eq!(chart.series.len(), 2);
+        assert_eq!(chart.series[0].name.as_deref(), Some("Widgets"));
+        assert_eq!(chart.series[1].name.as_deref(), Some("Gadgets"));
+        match &chart.series[0].data {
             SeriesData::CategoryValue { categories, values } => {
                 let cats: Vec<String> = categories.iter().map(Category::label).collect();
                 assert_eq!(cats, CATEGORIES);
@@ -1285,7 +1397,7 @@ mod tests {
             }
             other => panic!("expected CategoryValue, got {other:?}"),
         }
-        match &spec.chart.series[1].data {
+        match &chart.series[1].data {
             SeriesData::CategoryValue { values, .. } => assert_eq!(values, &GADGETS.to_vec()),
             other => panic!("expected CategoryValue, got {other:?}"),
         }
@@ -1350,15 +1462,24 @@ mod tests {
         assert_eq!(specs.len(), 3);
 
         // Kinds in drawing order: column, line, pie.
-        assert!(matches!(specs[0].chart.kind, ChartKind::Bar { .. }));
-        assert!(matches!(specs[1].chart.kind, ChartKind::Line { .. }));
+        assert!(matches!(
+            specs[0].chart().unwrap().kind,
+            ChartKind::Bar { .. }
+        ));
+        assert!(matches!(
+            specs[1].chart().unwrap().kind,
+            ChartKind::Line { .. }
+        ));
         assert_eq!(
-            specs[2].chart.kind,
+            specs[2].chart().unwrap().kind,
             ChartKind::Pie {
                 doughnut_hole: None
             }
         );
-        assert_eq!(specs[1].chart.title.as_deref(), Some(CHART_TITLES[1]));
+        assert_eq!(
+            specs[1].chart().unwrap().title.as_deref(),
+            Some(CHART_TITLES[1])
+        );
 
         // The LINE chart carries the drawing's SECOND anchor — per-chart association, not the
         // first. The fixture's second frame is from(col=11,row=5) to(col=21,row=15).
@@ -1377,23 +1498,119 @@ mod tests {
         assert_eq!(specs[1].source_ranges.len(), 6);
     }
 
-    /// One unparseable chart (an unsupported `c:surfaceChart`) must NOT abort the load or drop
-    /// the other charts: `discover_and_parse` succeeds, skips the bad chart, and returns the
-    /// parseable line chart (charts/architecture §6, functional_spec §1).
+    /// One unparseable chart (an unsupported `c:surfaceChart`) must NOT abort the load — and (P14)
+    /// must be **RETAINED** as an Unsupported spec, not dropped: `discover_and_parse` succeeds and
+    /// returns BOTH the Faithful line chart and the retained surface chart (source kept, no render
+    /// picture, `display_fidelity() == Unsupported` → placeholder). (charts/architecture §6.)
     #[test]
-    fn discover_and_parse_skips_unparseable_charts_without_failing_the_load() {
+    fn discover_and_parse_retains_unparseable_charts_as_unsupported_specs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("line_plus_unsupported.xlsx");
         authoring::write_line_plus_unsupported_fixture(&path).unwrap();
 
-        // The load SUCCEEDS (no Err) despite the surface chart being unparseable.
+        // The load SUCCEEDS (no Err) and returns BOTH charts (the surface chart is no longer
+        // dropped — it comes back as a retained Unsupported placeholder spec).
         let specs = discover_and_parse(&path).expect("load succeeds despite an unparseable chart");
+        assert_eq!(
+            specs.len(),
+            2,
+            "both charts retained (line + unsupported surface)"
+        );
 
-        // Only the parseable line chart comes through; the surface chart is skipped, not
-        // returned (and did not crash the walk).
-        assert_eq!(specs.len(), 1);
-        assert!(matches!(specs[0].chart.kind, ChartKind::Line { .. }));
+        // Chart 0: the parseable line chart, Faithful, with a render picture.
+        assert!(matches!(
+            specs[0].chart().unwrap().kind,
+            ChartKind::Line { .. }
+        ));
         assert_eq!(specs[0].display_fidelity(), Fidelity::Faithful);
+
+        // Chart 1: the surface chart, RETAINED as Unsupported — no render picture, but its source
+        // XML + anchor are kept (so P8 placeholders it and P10 byte-preserves it on save).
+        let surface = &specs[1];
+        assert_eq!(surface.display_fidelity(), Fidelity::Unsupported);
+        assert!(
+            surface.chart().is_none(),
+            "an unsupported chart carries no typed Chart"
+        );
+        assert!(
+            surface.is_loaded(),
+            "the surface chart still retains its source"
+        );
+        assert!(surface
+            .source()
+            .unwrap()
+            .chart_xml
+            .contains("<c:surfaceChart"));
+        // Its title is salvaged for the placeholder caption.
+        assert_eq!(surface.title(), Some("Terrain"));
+    }
+
+    /// P14: a **3-D** chart group normalizes to its 2-D `ChartKind` (so it parses, not drops) and
+    /// classifies **Degraded** (its retained source still names the 3-D element).
+    #[test]
+    fn three_d_chart_group_parses_as_2d_and_is_degraded() {
+        for (group, expect_bar) in [("bar3DChart", true), ("area3DChart", false)] {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+                  <c:chart><c:plotArea>
+                    <c:{group}><c:barDir val="col"/><c:grouping val="clustered"/>
+                      <c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+                    </c:{group}>
+                  </c:plotArea></c:chart></c:chartSpace>"#
+            );
+            let chart =
+                parse_chart_xml(&xml).unwrap_or_else(|e| panic!("{group} must parse: {e:#}"));
+            if expect_bar {
+                assert!(matches!(chart.kind, ChartKind::Bar { .. }), "{group} → Bar");
+            } else {
+                assert!(
+                    matches!(chart.kind, ChartKind::Area { .. }),
+                    "{group} → Area"
+                );
+            }
+            // The source still names the 3-D element → Degraded (renders 2-D + badge).
+            assert_eq!(
+                source_fidelity(&xml),
+                Fidelity::Degraded,
+                "{group} → Degraded"
+            );
+        }
+    }
+
+    /// P14 (per-chart-resilient walk): a `<c:chart r:id>` whose `rId` is absent from the drawing's
+    /// `_rels` drops just THAT chart; its sibling (a valid rId) still comes through, and the load
+    /// never errors.
+    #[test]
+    fn discover_skips_a_chart_with_a_dangling_relationship() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling_rel.xlsx");
+        authoring::write_dangling_chart_rel_fixture(&path).unwrap();
+
+        let specs = discover_and_parse(&path).expect("a dangling chart rel never fails the load");
+        // Only the resolvable chart (rId1, the line) comes through; the dangling rId2 is skipped.
+        assert_eq!(specs.len(), 1);
+        assert!(matches!(
+            specs[0].chart().unwrap().kind,
+            ChartKind::Line { .. }
+        ));
+    }
+
+    /// P14 (per-drawing-resilient walk): a worksheet whose `<drawing>` has NO `_rels` part drops
+    /// just that drawing; the OTHER sheet's chart still opens, and the load never errors.
+    #[test]
+    fn discover_skips_a_drawing_with_missing_rels_but_keeps_other_sheets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_drawing_rels.xlsx");
+        authoring::write_missing_drawing_rels_fixture(&path).unwrap();
+
+        let specs =
+            discover_and_parse(&path).expect("a missing drawing _rels never fails the load");
+        // The healthy sheet's line chart survives; the broken drawing contributes nothing.
+        assert_eq!(specs.len(), 1);
+        assert!(matches!(
+            specs[0].chart().unwrap().kind,
+            ChartKind::Line { .. }
+        ));
     }
 
     /// P10: `discover_and_parse_by_sheet` associates each chart with the **name** of the worksheet
@@ -1416,9 +1633,12 @@ mod tests {
         // Each spec is paired with its own chart part, in discovery order.
         assert_eq!(data_specs[0].0, "xl/charts/chart1.xml");
         assert_eq!(summary_specs[0].0, "xl/charts/chart2.xml");
-        assert!(matches!(data_specs[0].1.chart.kind, ChartKind::Bar { .. }));
         assert!(matches!(
-            summary_specs[0].1.chart.kind,
+            data_specs[0].1.chart().unwrap().kind,
+            ChartKind::Bar { .. }
+        ));
+        assert!(matches!(
+            summary_specs[0].1.chart().unwrap().kind,
             ChartKind::Line { .. }
         ));
     }
@@ -1435,12 +1655,18 @@ mod tests {
         let data = discover_and_parse_for_sheet(&path, "Data").unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].0, "xl/charts/chart1.xml");
-        assert!(matches!(data[0].1.chart.kind, ChartKind::Bar { .. }));
+        assert!(matches!(
+            data[0].1.chart().unwrap().kind,
+            ChartKind::Bar { .. }
+        ));
 
         let summary = discover_and_parse_for_sheet(&path, "Summary").unwrap();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].0, "xl/charts/chart2.xml");
-        assert!(matches!(summary[0].1.chart.kind, ChartKind::Line { .. }));
+        assert!(matches!(
+            summary[0].1.chart().unwrap().kind,
+            ChartKind::Line { .. }
+        ));
 
         // An unknown sheet name (an in-session add, or a rename before first paint) → nothing.
         assert!(discover_and_parse_for_sheet(&path, "Nope")
@@ -1468,11 +1694,17 @@ mod tests {
 
         let data = discover_and_parse_for_part(&path, &data_part).unwrap();
         assert_eq!(data.len(), 1);
-        assert!(matches!(data[0].1.chart.kind, ChartKind::Bar { .. }));
+        assert!(matches!(
+            data[0].1.chart().unwrap().kind,
+            ChartKind::Bar { .. }
+        ));
 
         let summary = discover_and_parse_for_part(&path, &summary_part).unwrap();
         assert_eq!(summary.len(), 1);
-        assert!(matches!(summary[0].1.chart.kind, ChartKind::Line { .. }));
+        assert!(matches!(
+            summary[0].1.chart().unwrap().kind,
+            ChartKind::Line { .. }
+        ));
 
         // An unknown part (an in-session-added worksheet) → nothing.
         assert!(discover_and_parse_for_part(&path, "xl/worksheets/nope.xml")

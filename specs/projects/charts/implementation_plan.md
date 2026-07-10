@@ -74,7 +74,7 @@ reusable infra the types then inherit. (Type-specific fills/labels land with eac
   exercised on line. *Exit:* baselines; the accessor's unsupported set shrinks accordingly.
 - [x] **P13 — Axis breadth & line styling.** `scaling` min/max, reversed, gridline toggles;
   `a:ln` stroke width/color; alpha; legend positions. *Exit:* baselines.
-- [ ] **P14 — Robustness on real files (line + graceful degrade).** A real Excel/LibreOffice
+- [x] **P14 — Robustness on real files (line + graceful degrade).** A real Excel/LibreOffice
   corpus loads without breakage; line charts render; every *other* type degrades to
   placeholder/warning cleanly; edge cases (unresolved `c:f`, empty ranges, row/col shifts).
   *Exit:* corpus green; workbook open never breaks.

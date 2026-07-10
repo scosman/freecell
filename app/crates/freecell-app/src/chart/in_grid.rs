@@ -53,17 +53,26 @@ pub fn render_mode(fidelity: Fidelity) -> RenderMode {
 
 /// Build the element painted at a chart's anchor rect, dispatching on `fidelity`
 /// (charts/architecture §4.2): the real plot for Faithful/Degraded (Degraded overlays the corner
-/// badge), or the placeholder for Unsupported. If the (supposedly renderable) kind has no widget
-/// yet, it falls back to the placeholder rather than a blank hole (functional_spec §1 — never a
-/// crash, never a blank hole). The returned element fills its container (the layer sizes it to the
-/// anchor rect).
-pub fn in_grid_chart_element(chart: &Chart, fidelity: Fidelity) -> AnyElement {
+/// badge), or the placeholder for Unsupported. `chart` is `None` for an
+/// [`Unsupported`](freecell_chart_model::ChartBody::Unsupported) spec that has no render picture
+/// (its `fidelity` is always `Unsupported`, so it takes the placeholder branch); `title` is the
+/// placeholder caption. If a (supposedly renderable) kind has no widget yet — or `chart` is `None`
+/// on a non-placeholder path (which can't happen for a well-formed spec) — it falls back to the
+/// placeholder rather than a blank hole (functional_spec §1 — never a crash, never a blank hole).
+/// The returned element fills its container (the layer sizes it to the anchor rect).
+pub fn in_grid_chart_element(
+    chart: Option<&Chart>,
+    title: Option<&str>,
+    fidelity: Fidelity,
+) -> AnyElement {
     match render_mode(fidelity) {
-        RenderMode::Placeholder => placeholder_element(chart.title.as_deref()),
-        mode @ (RenderMode::Chart | RenderMode::ChartWithBadge) => match chart_element(chart) {
-            Some(plot) => chart_with_optional_badge(plot, mode == RenderMode::ChartWithBadge),
-            None => placeholder_element(chart.title.as_deref()),
-        },
+        RenderMode::Placeholder => placeholder_element(title),
+        mode @ (RenderMode::Chart | RenderMode::ChartWithBadge) => {
+            match chart.and_then(chart_element) {
+                Some(plot) => chart_with_optional_badge(plot, mode == RenderMode::ChartWithBadge),
+                None => placeholder_element(title),
+            }
+        }
     }
 }
 

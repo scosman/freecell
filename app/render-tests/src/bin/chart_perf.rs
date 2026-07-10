@@ -312,7 +312,7 @@ fn stress_line_chart(i: usize) -> Chart {
 
 /// The first series' value list of a spec's chart (category/value → values, scatter → y).
 fn first_values(spec: &ChartSpec) -> Vec<f64> {
-    match &spec.chart.series[0].data {
+    match &spec.chart().unwrap().series[0].data {
         freecell_chart_model::SeriesData::CategoryValue { values, .. } => values.clone(),
         freecell_chart_model::SeriesData::Xy { y, .. } => y.clone(),
     }

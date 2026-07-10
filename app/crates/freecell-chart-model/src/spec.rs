@@ -161,7 +161,37 @@ pub enum Origin {
     Authored,
 }
 
-/// The production chart envelope (charts/architecture §3.2): the render seam [`Chart`] wrapped
+/// The render content of a [`ChartSpec`] — either a chart we parsed into a typed render
+/// [`Chart`], or a chart the load walk **reached but could not parse** into one (an unsupported
+/// group — surface / radar / stock / ofPie / bubble / a 3-D type with no 2-D reduction / malformed
+/// chart XML, charts/architecture §6).
+///
+/// Folding "no typed chart" into the spec this way — rather than an `Option<Chart>` plus a
+/// separate flag — makes the robustness invariant **unrepresentable-if-violated** (the same
+/// rationale as [`Origin`]): an [`Unsupported`](ChartBody::Unsupported) body has no [`Chart`],
+/// its [`display_fidelity`](ChartSpec::display_fidelity) is forced to
+/// [`Unsupported`](Fidelity::Unsupported) (→ the P8 placeholder, architecture §4.2, which does
+/// **not** use the `Chart` content), and live binding (P9) has nothing to re-resolve. The only
+/// thing salvaged for the placeholder is the chart's title.
+// The `Parsed(Chart)` variant is deliberately inline, not boxed: it is the overwhelmingly-common
+// case (this field was a plain inline `chart: Chart` before P14), and the P11 snapshot path clones
+// the render `Chart` on every intersecting edit — boxing it would add heap indirection to that hot
+// path for a rare `Unsupported` case. The size gap is expected, not an oversight.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChartBody {
+    /// A chart parsed into a typed render [`Chart`]. Its fidelity is classified from the retained
+    /// source (Faithful, or Degraded for a 3-D→2-D reduction or an unrendered feature).
+    Parsed(Chart),
+    /// A chart the load walk reached but could not parse into a typed [`Chart`]. Retained (its
+    /// source, anchor, and ranges live on the enclosing [`ChartSpec`]) so save byte-preserves it
+    /// and the grid draws its placeholder, but it carries **no** render picture — only the chart's
+    /// title (if any) for the placeholder caption.
+    Unsupported { title: Option<String> },
+}
+
+/// The production chart envelope (charts/architecture §3.2): the render [`body`](ChartSpec::body)
+/// (a typed [`Chart`], or an [`Unsupported`](ChartBody::Unsupported) placeholder marker) wrapped
 /// with everything production needs beyond a static picture — its live-binding
 /// [`source_ranges`](ChartSpec::source_ranges), its in-grid [`anchor`](ChartSpec::anchor), and
 /// its [`origin`](ChartSpec::origin) (which carries the retained source XML for a loaded
@@ -169,12 +199,12 @@ pub enum Origin {
 ///
 /// **Deferred to later phases** (kept out of this shape until their behavior is built): the
 /// `dirty` / `last_values` live-binding bookkeeping (P9 — the file cache already in
-/// `chart.series` is the fallback until then) and the derived `display_fidelity()` accessor
-/// (P3, computed over `chart` + `source`).
+/// `chart.series` is the fallback until then).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChartSpec {
-    /// The render seam — the static chart picture.
-    pub chart: Chart,
+    /// The render seam — a typed [`Chart`] picture, or an [`Unsupported`](ChartBody::Unsupported)
+    /// marker for a chart we retained but cannot draw (→ placeholder).
+    pub body: ChartBody,
     /// The `c:f` references the chart's data resolves against (for live binding, P9).
     pub source_ranges: Vec<CfRange>,
     /// The chart's `twoCellAnchor` placement in the sheet.
@@ -193,7 +223,28 @@ impl ChartSpec {
         anchor: Anchor,
     ) -> Self {
         Self {
-            chart,
+            body: ChartBody::Parsed(chart),
+            source_ranges,
+            anchor,
+            origin: Origin::Loaded {
+                source: Arc::new(source),
+            },
+        }
+    }
+
+    /// A chart **loaded from a file that we could not parse** into a typed [`Chart`] (an
+    /// unsupported group / malformed part, charts/architecture §6). It retains its source XML +
+    /// ranges + anchor — so save byte-preserves it and the grid draws its placeholder — but has no
+    /// render picture; `title` is salvaged for the placeholder caption. Its
+    /// [`display_fidelity`](Self::display_fidelity) is always [`Unsupported`](Fidelity::Unsupported).
+    pub fn loaded_unsupported(
+        title: Option<String>,
+        source: SourceXml,
+        source_ranges: Vec<CfRange>,
+        anchor: Anchor,
+    ) -> Self {
+        Self {
+            body: ChartBody::Unsupported { title },
             source_ranges,
             anchor,
             origin: Origin::Loaded {
@@ -206,10 +257,38 @@ impl ChartSpec {
     /// ranges start empty and are set as the chart is shaped (P25).
     pub fn authored(chart: Chart, anchor: Anchor) -> Self {
         Self {
-            chart,
+            body: ChartBody::Parsed(chart),
             source_ranges: Vec::new(),
             anchor,
             origin: Origin::Authored,
+        }
+    }
+
+    /// The typed render [`Chart`], or `None` for an [`Unsupported`](ChartBody::Unsupported) chart
+    /// that has no render picture (→ placeholder). The render + live-binding paths branch on this.
+    pub fn chart(&self) -> Option<&Chart> {
+        match &self.body {
+            ChartBody::Parsed(chart) => Some(chart),
+            ChartBody::Unsupported { .. } => None,
+        }
+    }
+
+    /// Mutable access to the typed render [`Chart`], or `None` for an
+    /// [`Unsupported`](ChartBody::Unsupported) chart — the live-binding re-resolve writes fresh
+    /// values through this (an Unsupported chart is static, so it is never touched).
+    pub fn chart_mut(&mut self) -> Option<&mut Chart> {
+        match &mut self.body {
+            ChartBody::Parsed(chart) => Some(chart),
+            ChartBody::Unsupported { .. } => None,
+        }
+    }
+
+    /// The chart's title — from the parsed [`Chart`], or the title salvaged for an
+    /// [`Unsupported`](ChartBody::Unsupported) chart's placeholder caption.
+    pub fn title(&self) -> Option<&str> {
+        match &self.body {
+            ChartBody::Parsed(chart) => chart.title.as_deref(),
+            ChartBody::Unsupported { title } => title.as_deref(),
         }
     }
 
@@ -235,14 +314,21 @@ impl ChartSpec {
     /// functional_spec §5, architecture §3.3).
     ///
     /// This is a **derived accessor, not stored state**: there is no parse-time flag to keep in
-    /// sync. It is computed on demand — for a [loaded](Origin::Loaded) chart, by classifying its
-    /// retained [`SourceXml`] (see [`source_fidelity`] for the buckets and the curated
-    /// render-affecting set); an [authored](Origin::Authored) chart has no source and is
-    /// [`Fidelity::Faithful`] by construction (it is built from our own model using only
-    /// features we render). Because it reads the source live, it **auto-clears as renderer
-    /// support lands** — a feature that starts rendering drops out of the degrading set with no
-    /// separate bookkeeping.
+    /// sync.
+    /// - An [`Unsupported`](ChartBody::Unsupported) body has **no** render picture, so it is always
+    ///   [`Fidelity::Unsupported`] (→ placeholder), regardless of what the source classifies as —
+    ///   drawing the placeholder is the only honest outcome (architecture §6).
+    /// - A [`Parsed`](ChartBody::Parsed) body is computed on demand — for a [loaded](Origin::Loaded)
+    ///   chart, by classifying its retained [`SourceXml`] (see [`source_fidelity`] for the buckets
+    ///   and the curated render-affecting set); an [authored](Origin::Authored) chart has no source
+    ///   and is [`Fidelity::Faithful`] by construction (built from our own model using only
+    ///   features we render). Because it reads the source live, it **auto-clears as renderer
+    ///   support lands** — a feature that starts rendering drops out of the degrading set with no
+    ///   separate bookkeeping.
     pub fn display_fidelity(&self) -> Fidelity {
+        if matches!(self.body, ChartBody::Unsupported { .. }) {
+            return Fidelity::Unsupported;
+        }
         match &self.origin {
             Origin::Loaded { source } => source_fidelity(&source.chart_xml),
             Origin::Authored => Fidelity::Faithful,
@@ -341,7 +427,8 @@ mod tests {
         );
         assert_eq!(spec.source_ranges, ranges);
         assert_eq!(spec.anchor, anchor);
-        assert_eq!(spec.chart, sample_chart());
+        assert_eq!(spec.chart(), Some(&sample_chart()));
+        assert_eq!(spec.title(), Some("Revenue"));
     }
 
     #[test]
@@ -408,5 +495,76 @@ mod tests {
         let anchor = Anchor::new(AnchorCell::new(2, 2), AnchorCell::new(8, 14));
         let spec = ChartSpec::authored(sample_chart(), anchor);
         assert_eq!(spec.display_fidelity(), Fidelity::Faithful);
+    }
+
+    #[test]
+    fn loaded_unsupported_retains_envelope_but_has_no_chart() {
+        let anchor = Anchor::new(AnchorCell::new(1, 1), AnchorCell::new(6, 12));
+        let ranges = vec![CfRange::new("Data!$B$2:$B$5")];
+        let spec = ChartSpec::loaded_unsupported(
+            Some("Terrain".into()),
+            SourceXml::new("<c:surfaceChart/>"),
+            ranges.clone(),
+            anchor,
+        );
+
+        // The envelope is retained — source, ranges, anchor — so save byte-preserves it.
+        assert!(spec.is_loaded());
+        assert_eq!(
+            spec.source().map(|s| s.chart_xml.as_str()),
+            Some("<c:surfaceChart/>")
+        );
+        assert_eq!(spec.source_ranges, ranges);
+        assert_eq!(spec.anchor, anchor);
+
+        // But there is NO render picture — only the salvaged placeholder title.
+        assert_eq!(spec.chart(), None);
+        assert_eq!(spec.title(), Some("Terrain"));
+    }
+
+    #[test]
+    fn unsupported_body_is_always_unsupported_fidelity() {
+        let anchor = Anchor::new(AnchorCell::new(0, 0), AnchorCell::new(6, 12));
+        // Even a source that WOULD classify Faithful (a plain, unrecognized-by-us group like
+        // bubbleChart) or Degraded must report Unsupported when the body could not be parsed —
+        // there is no picture to draw, so the placeholder is the only honest outcome.
+        for source in [
+            "<c:bubbleChart/>",
+            "<c:surfaceChart/>",
+            "<c:bar3DChart/>",
+            "not xml",
+        ] {
+            let spec =
+                ChartSpec::loaded_unsupported(None, SourceXml::new(source), Vec::new(), anchor);
+            assert_eq!(
+                spec.display_fidelity(),
+                Fidelity::Unsupported,
+                "an Unsupported body classifies Unsupported regardless of source {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chart_mut_round_trips_a_parsed_body_but_not_an_unsupported_one() {
+        let anchor = Anchor::new(AnchorCell::new(0, 0), AnchorCell::new(5, 10));
+        let mut parsed = ChartSpec::loaded(
+            sample_chart(),
+            SourceXml::new("<c:lineChart/>"),
+            Vec::new(),
+            anchor,
+        );
+        parsed.chart_mut().expect("parsed body").title = Some("Edited".into());
+        assert_eq!(parsed.title(), Some("Edited"));
+
+        let mut unsupported = ChartSpec::loaded_unsupported(
+            None,
+            SourceXml::new("<c:radarChart/>"),
+            Vec::new(),
+            anchor,
+        );
+        assert!(
+            unsupported.chart_mut().is_none(),
+            "an Unsupported body exposes no Chart to mutate"
+        );
     }
 }

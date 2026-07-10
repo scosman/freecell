@@ -202,7 +202,7 @@ pub struct GridView {
 /// a copy, so a sheet with K charts adds no independent resident duplicate of their render pictures
 /// or retained source. `placements` is one tiny [`ChartPlacement`] per spec (anchor + derived
 /// fidelity), classified once at install so the per-frame cull scan never re-parses source XML. The
-/// heavy `specs[i].chart` is borrowed **only** for a chart that is currently on-screen; an off-screen
+/// heavy `specs[i].chart()` is borrowed **only** for a chart that is currently on-screen; an off-screen
 /// chart contributes nothing but its placement to the scan (and re-materializes when it scrolls in).
 struct SheetChartLayer {
     specs: Arc<[ChartSpec]>,
@@ -1950,7 +1950,7 @@ impl GridView {
         if let Some(layer) = self.charts.get(&self.active_sheet) {
             // The per-frame scan touches only the tiny `placements` (P11 "off-screen free", via
             // [`on_screen_charts`]): off-screen charts are culled without ever borrowing their heavy
-            // render `Chart`; the shared `specs[i].chart` is materialized only for the on-screen few
+            // render `Chart`; the shared `specs[i].chart()` is materialized only for the on-screen few
             // (re-materialized when a chart scrolls back into view).
             let visible = Self::visible_charts(
                 layer,
@@ -1970,7 +1970,8 @@ impl GridView {
                         .w(px(rect.w))
                         .h(px(rect.h))
                         .child(crate::chart::in_grid_chart_element(
-                            &layer.specs[i].chart,
+                            layer.specs[i].chart(),
+                            layer.specs[i].title(),
                             layer.placements[i].fidelity,
                         ))
                         .into_any_element(),

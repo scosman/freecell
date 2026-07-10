@@ -13,8 +13,8 @@
 //! grid case table grows.
 
 use freecell_chart_model::{
-    Axis, Category, Chart, ChartColor, ChartKind, Grouping, Legend, Marker, MarkerSymbol, Series,
-    ThemeSlot,
+    Axis, Category, Chart, ChartColor, ChartKind, DataLabels, Grouping, Legend, Marker,
+    MarkerSymbol, Series, ThemeSlot,
 };
 
 /// One capturable chart fixture: a chart, and the (tight) capture viewport in device px. `name`
@@ -48,6 +48,9 @@ pub fn all() -> Vec<ChartScene> {
         chart_line_no_titles(),
         chart_line_markers(),
         chart_line_smooth(),
+        chart_line_value_labels(),
+        chart_line_percent_labels(),
+        chart_line_named_labels(),
     ]
 }
 
@@ -318,6 +321,109 @@ fn chart_line_smooth() -> ChartScene {
     }
 }
 
+/// Four quarters, for the label scenes (fewer points → labels don't crowd).
+fn quarters() -> Vec<Category> {
+    ["Q1", "Q2", "Q3", "Q4"]
+        .into_iter()
+        .map(|q| Category::Text(q.into()))
+        .collect()
+}
+
+/// The P12 **value data-labels** scene: a single-series line whose points carry `c:showVal` value
+/// labels formatted through a currency `numFmt` (`"$#,##0"`), so each label reads `$12,000`,
+/// `$19,000`, …, drawn above its point (the line default position). Proves value labels + label
+/// number formatting.
+fn chart_line_value_labels() -> ChartScene {
+    let chart = Chart {
+        title: Some("Monthly Revenue".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![Series::category_value(
+            Some("Revenue"),
+            months(),
+            vec![12000.0, 19000.0, 15000.0, 24000.0, 21000.0, 30000.0],
+        )
+        .with_color(ChartColor::theme(ThemeSlot::Accent1))
+        .with_marker(Marker::new(MarkerSymbol::Circle))
+        .with_data_labels(DataLabels::new().value().with_number_format("$#,##0"))],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Revenue (USD)").with_number_format("$#,##0"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_value_labels",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The P12 **percent data-labels** scene: a single-series line with `c:showPercent` labels — each
+/// point's share of the series total, rendered as `NN%` above its point. Proves the percent path
+/// (value ÷ series total), distinct from the value/currency labels above.
+fn chart_line_percent_labels() -> ChartScene {
+    let chart = Chart {
+        title: Some("Traffic Share by Month".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![Series::category_value(
+            Some("Sessions"),
+            months(),
+            vec![30.0, 45.0, 60.0, 40.0, 55.0, 70.0],
+        )
+        .with_color(ChartColor::theme(ThemeSlot::Accent4))
+        .with_marker(Marker::new(MarkerSymbol::Circle))
+        .with_data_labels(DataLabels::new().percent())],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Sessions (thousands)"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_percent_labels",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The P12 **composed data-labels** scene: a single-series line whose labels combine the series
+/// name, category name, and value (`c:showSerName`, `c:showCatName`, `c:showVal`) with a
+/// `c:showLegendKey` swatch, so each label is a color swatch followed by the joined text
+/// `North, Q1, 12`. Proves the multi-part label composition and the legend-key swatch.
+fn chart_line_named_labels() -> ChartScene {
+    let chart = Chart {
+        title: Some("Units Sold".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![Series::category_value(
+            Some("North"),
+            quarters(),
+            vec![12.0, 19.0, 15.0, 24.0],
+        )
+        .with_color(ChartColor::theme(ThemeSlot::Accent2))
+        .with_marker(Marker::new(MarkerSymbol::Circle))
+        .with_data_labels(
+            DataLabels::new()
+                .series_name()
+                .category_name()
+                .value()
+                .legend_key(),
+        )],
+        cat_axis: Axis::titled("Quarter"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_named_labels",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +559,35 @@ mod tests {
             smooth.chart.val_axis.number_format.as_deref(),
             Some("0%"),
             "smooth scene must format ticks as percentages"
+        );
+    }
+
+    #[test]
+    fn p12_scenes_carry_their_data_label_toggles() {
+        // Value labels: showVal + a currency label numFmt.
+        let value = get("chart_line_value_labels").expect("value-labels scene");
+        let dl = value.chart.series[0]
+            .data_labels
+            .as_ref()
+            .expect("value labels");
+        assert!(dl.show_value && dl.is_shown());
+        assert_eq!(dl.number_format.as_deref(), Some("$#,##0"));
+
+        // Percent labels: showPercent (the share-of-total path).
+        let percent = get("chart_line_percent_labels").expect("percent-labels scene");
+        assert!(
+            percent.chart.series[0]
+                .data_labels
+                .as_ref()
+                .unwrap()
+                .show_percent
+        );
+
+        // Composed labels: series name + category + value + legend-key swatch.
+        let named = get("chart_line_named_labels").expect("named-labels scene");
+        let dl = named.chart.series[0].data_labels.as_ref().unwrap();
+        assert!(
+            dl.show_series_name && dl.show_category_name && dl.show_value && dl.show_legend_key
         );
     }
 }

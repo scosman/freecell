@@ -317,6 +317,10 @@ chart_render_cases! {
     // P6 — line P1 fidelity: theme colors + per-series markers + currency numFmt ticks
     // (chart_line_markers), and a smooth curve + percent numFmt ticks (chart_line_smooth).
     chart_line_markers, chart_line_smooth,
+    // P12 — data labels: value labels with a currency numFmt (chart_line_value_labels), percent
+    // labels / share-of-total (chart_line_percent_labels), and composed series+category+value
+    // labels with a legend-key swatch (chart_line_named_labels).
+    chart_line_value_labels, chart_line_percent_labels, chart_line_named_labels,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

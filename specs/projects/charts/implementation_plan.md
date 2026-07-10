@@ -70,7 +70,7 @@ GO/loop/re-plan decision. **No hardening or type phase starts until this passes.
 Build the cross-cutting fidelity + robustness + CI machinery **proven on line first**; each is
 reusable infra the types then inherit. (Type-specific fills/labels land with each type.)
 
-- [ ] **P12 — Data labels & number formats.** `c:dLbls` (val/percent/cat/legendKey) + `numFmt`,
+- [x] **P12 — Data labels & number formats.** `c:dLbls` (val/percent/cat/legendKey) + `numFmt`,
   exercised on line. *Exit:* baselines; the accessor's unsupported set shrinks accordingly.
 - [ ] **P13 — Axis breadth & line styling.** `scaling` min/max, reversed, gridline toggles;
   `a:ln` stroke width/color; alpha; legend positions. *Exit:* baselines.

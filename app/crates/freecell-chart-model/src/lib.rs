@@ -26,12 +26,14 @@
 //! preserved via [`ChartSpec`]'s retained source rather than modeled.
 
 mod fidelity;
+mod label;
 mod marker;
 mod numfmt;
 mod spec;
 mod theme;
 
 pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
+pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};
 pub use numfmt::apply_number_format;
 pub use spec::{Anchor, AnchorCell, CfRange, ChartSpec, Origin, SourcePart, SourceXml};
@@ -154,13 +156,17 @@ pub enum SeriesData {
 /// One data series — a `c:ser` element. `color` mirrors the series' `c:spPr` fill — an explicit
 /// sRGB color or a theme reference ([`ChartColor`], P6); `None` means "let the renderer pick from
 /// the palette cycle". `marker` mirrors `c:marker` (the point symbol for a line/scatter series,
-/// P6); `None` leaves the marker to the renderer's default.
+/// P6); `None` leaves the marker to the renderer's default. `data_labels` mirrors `c:dLbls` (the
+/// point labels — value / percent / names / legend key, P12); `None` means no labels. The
+/// chart-group-level `c:dLbls` default is resolved into each series here at parse time
+/// ([`DataLabels`] docs), so there is no chart-level label lookup.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Series {
     pub name: Option<String>,
     pub data: SeriesData,
     pub color: Option<ChartColor>,
     pub marker: Option<Marker>,
+    pub data_labels: Option<DataLabels>,
 }
 
 impl Series {
@@ -175,6 +181,7 @@ impl Series {
             data: SeriesData::CategoryValue { categories, values },
             color: None,
             marker: None,
+            data_labels: None,
         }
     }
 
@@ -185,6 +192,7 @@ impl Series {
             data: SeriesData::Xy { x, y },
             color: None,
             marker: None,
+            data_labels: None,
         }
     }
 
@@ -198,6 +206,12 @@ impl Series {
     /// Set the series marker (builder style).
     pub fn with_marker(mut self, marker: Marker) -> Self {
         self.marker = Some(marker);
+        self
+    }
+
+    /// Set the series' data labels (`c:dLbls`, builder style).
+    pub fn with_data_labels(mut self, data_labels: DataLabels) -> Self {
+        self.data_labels = Some(data_labels);
         self
     }
 

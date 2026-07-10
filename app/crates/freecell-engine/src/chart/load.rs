@@ -12,8 +12,8 @@ use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
 use freecell_chart_model::{
-    Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart, ChartKind, ChartSpec, Grouping,
-    Legend, LegendPosition, Series, SourcePart, SourceXml,
+    Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart, ChartKind, ChartSpec,
+    DataLabelPosition, DataLabels, Grouping, Legend, LegendPosition, Series, SourcePart, SourceXml,
 };
 
 use super::xlsx::{self, attr};
@@ -506,10 +506,15 @@ pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
     let kind = parse_kind(&group)?;
     let is_scatter = matches!(kind, ChartKind::Scatter);
 
+    // The chart-group-level `c:dLbls` (a direct child of the group, after the series) is the
+    // default for every series that has no `c:dLbls` of its own (OOXML: a series `c:dLbls`
+    // *replaces* the chart-level default for that series).
+    let group_labels = parse_data_labels_of(&group);
+
     let series = group
         .children()
         .filter(|n| n.tag_name().name() == "ser")
-        .map(|ser| parse_series(&ser, is_scatter))
+        .map(|ser| parse_series(&ser, is_scatter, group_labels.as_ref()))
         .collect::<Result<Vec<_>>>()?;
 
     let (cat_axis, val_axis) = parse_axes(&plot_area, is_scatter);
@@ -575,8 +580,13 @@ fn grouping_of(group: &Node, default: Grouping) -> Grouping {
 }
 
 /// Parses one `<c:ser>` into a [`Series`]. For scatter, reads `c:xVal`/`c:yVal`; otherwise
-/// `c:cat`/`c:val`. Series name from `c:tx` cache; color from `c:spPr` solid fill.
-fn parse_series(ser: &Node, is_scatter: bool) -> Result<Series> {
+/// `c:cat`/`c:val`. Series name from `c:tx` cache; color from `c:spPr` solid fill; data labels
+/// from the series' own `c:dLbls`, falling back to the chart-group-level `default_labels`.
+fn parse_series(
+    ser: &Node,
+    is_scatter: bool,
+    default_labels: Option<&DataLabels>,
+) -> Result<Series> {
     let name = child(ser, "tx").and_then(|tx| ref_strings(&tx).into_iter().next());
     let color = parse_series_color(ser);
 
@@ -600,7 +610,52 @@ fn parse_series(ser: &Node, is_scatter: bool) -> Result<Series> {
     if let Some(c) = color {
         series = series.with_color(c);
     }
+    // A series `c:dLbls` (even all-off, an explicit "no labels") overrides the chart-level default;
+    // a series with none inherits the chart-level default.
+    if let Some(labels) = parse_data_labels_of(ser).or_else(|| default_labels.cloned()) {
+        series = series.with_data_labels(labels);
+    }
     Ok(series)
+}
+
+/// The [`DataLabels`] of a node's direct-child `c:dLbls`, if present. Returns `None` when the
+/// element is absent (so a series with no `c:dLbls` inherits the chart-level default); a
+/// present-but-all-off `c:dLbls` returns `Some` (an explicit "no labels" that overrides the
+/// default).
+fn parse_data_labels_of(parent: &Node) -> Option<DataLabels> {
+    child(parent, "dLbls").map(|dlbls| read_data_labels(&dlbls))
+}
+
+/// Reads a `<c:dLbls>` element: the five `show*` toggles, the label `c:numFmt` format code, the
+/// part `c:separator`, and the `c:dLblPos` position. Namespace/prefix-agnostic (local-name
+/// matching), like the rest of the parser.
+fn read_data_labels(dlbls: &Node) -> DataLabels {
+    // A label `c:numFmt`; `General`/empty is the benign default and reads as "no explicit format".
+    let number_format = child(dlbls, "numFmt")
+        .and_then(|n| attr(&n, "formatCode"))
+        .map(str::trim)
+        .filter(|code| !code.is_empty() && !code.eq_ignore_ascii_case("General"))
+        .map(str::to_string);
+    let separator = child(dlbls, "separator")
+        .and_then(|n| n.text())
+        .map(str::to_string);
+    let position = child_val(dlbls, "dLblPos").and_then(|v| DataLabelPosition::from_ooxml(&v));
+
+    DataLabels {
+        show_legend_key: child_bool(dlbls, "showLegendKey"),
+        show_value: child_bool(dlbls, "showVal"),
+        show_category_name: child_bool(dlbls, "showCatName"),
+        show_series_name: child_bool(dlbls, "showSerName"),
+        show_percent: child_bool(dlbls, "showPercent"),
+        number_format,
+        separator,
+        position,
+    }
+}
+
+/// Whether the first child element named `name` carries a truthy OOXML boolean `val` (`1`/`true`).
+fn child_bool(node: &Node, name: &str) -> bool {
+    matches!(child_val(node, name).as_deref(), Some("1") | Some("true"))
 }
 
 /// The series color from `c:ser/c:spPr/a:solidFill/a:srgbClr@val`, if present.
@@ -762,7 +817,7 @@ fn child_val(node: &Node, name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chart::authoring;
-    use freecell_chart_model::{Fidelity, SeriesData};
+    use freecell_chart_model::{source_fidelity, Fidelity, SeriesData};
 
     const COLUMN_CHART: &str = r#"<?xml version="1.0"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
@@ -885,6 +940,91 @@ mod tests {
     fn missing_chart_group_is_an_error() {
         let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea/></c:chart></c:chartSpace>"#;
         assert!(parse_chart_xml(xml).is_err());
+    }
+
+    // --- P12: data labels (c:dLbls) --------------------------------------------------------
+
+    #[test]
+    fn parses_series_level_data_labels_with_numfmt_separator_and_position() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser>
+              <c:dLbls>
+                <c:numFmt formatCode="$#,##0" sourceLinked="0"/>
+                <c:dLblPos val="t"/>
+                <c:showLegendKey val="1"/>
+                <c:showVal val="1"/>
+                <c:showCatName val="0"/>
+                <c:showSerName val="1"/>
+                <c:showPercent val="0"/>
+                <c:separator> </c:separator>
+              </c:dLbls>
+              <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1200</c:v></c:pt></c:numCache></c:numRef></c:val>
+            </c:ser>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        let dl = chart.series[0]
+            .data_labels
+            .as_ref()
+            .expect("series carries its dLbls");
+        assert!(dl.show_legend_key && dl.show_value && dl.show_series_name);
+        assert!(!dl.show_category_name && !dl.show_percent);
+        assert_eq!(dl.number_format.as_deref(), Some("$#,##0"));
+        assert_eq!(dl.separator.as_deref(), Some(" "));
+        assert_eq!(dl.position, Some(DataLabelPosition::Above));
+        assert!(dl.is_shown());
+    }
+
+    #[test]
+    fn chart_level_data_labels_default_applies_to_series_without_their_own() {
+        // A chart-group-level `c:dLbls` (direct child of `c:lineChart`, after the series) is the
+        // default: the first series (no dLbls of its own) inherits it; the second series' own
+        // dLbls overrides it (even though it is all-off → an explicit "no labels").
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser>
+              <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:numRef></c:val>
+            </c:ser>
+            <c:ser>
+              <c:dLbls><c:showVal val="0"/></c:dLbls>
+              <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>20</c:v></c:pt></c:numCache></c:numRef></c:val>
+            </c:ser>
+            <c:dLbls><c:showVal val="1"/></c:dLbls>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        // Series 0 inherits the chart-level default → value labels shown.
+        let s0 = chart.series[0]
+            .data_labels
+            .as_ref()
+            .expect("inherited default");
+        assert!(s0.show_value && s0.is_shown());
+        // Series 1 has its own (all-off) dLbls → overrides the default → not shown.
+        let s1 = chart.series[1].data_labels.as_ref().expect("own dLbls");
+        assert!(!s1.is_shown());
+    }
+
+    #[test]
+    fn absent_data_labels_leave_series_none() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        assert!(chart.series[0].data_labels.is_none());
+    }
+
+    #[test]
+    fn shown_data_labels_keep_a_line_chart_faithful() {
+        // The exit-criterion reconciliation: a line chart with shown value labels + a supported
+        // numFmt classifies Faithful (P12 renders both), not Degraded.
+        let xml = r##"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser>
+              <c:dLbls><c:numFmt formatCode="#,##0" sourceLinked="0"/><c:showVal val="1"/></c:dLbls>
+              <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1200</c:v></c:pt></c:numCache></c:numRef></c:val>
+            </c:ser>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"##;
+        assert_eq!(source_fidelity(xml), Fidelity::Faithful);
     }
 
     // --- P7: discover_and_parse → ChartSpec envelope --------------------------------------

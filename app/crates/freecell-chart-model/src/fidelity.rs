@@ -38,13 +38,18 @@
 //!
 //! **Auto-dropped / scoped as support arrives.** `smooth` (curved lines) **renders faithfully as
 //! of P6** (on `lineChart`, the only group that draws it), so it left this set. `c:marker` symbols
-//! are now **scoped to the renderer that honors them**: P6's line renderer paints every symbol, so
-//! a marker on a `lineChart` is Faithful — but the scatter/point renderers still draw a fixed
-//! circle and ignore `c:marker` (their marker support is a later phase), so a non-`circle`/non-`none`
-//! symbol on a **non-line** group still degrades (a wrong chart must keep its badge). `c:numFmt`
-//! remains — P6 applies a **bounded** subset to ticks, so a format code we don't parse must still
-//! warn; P12 completes numFmt and shrinks this further. Entries auto-drop / re-scope with no
-//! separate bookkeeping (architecture §3.3).
+//! and `c:dLbls` data labels are now **scoped to the renderer that honors them**: P6's line
+//! renderer paints every marker symbol and P12's draws data labels (value / percent / names /
+//! legend key), so a marker **or** a shown label on a `lineChart` is Faithful — but the
+//! scatter/point/bar/area/pie renderers still ignore them (their support is a later phase), so a
+//! non-`circle`/non-`none` marker or a shown label on a **non-line** group still degrades (a wrong
+//! chart must keep its badge). A **per-point** `c:dLbl` override degrades on any group (we draw
+//! uniform series labels, not per-point ones). `c:numFmt` is now **scoped to codes we approximate**:
+//! P6/P12 apply a **bounded** subset to ticks + labels, so a code we render exactly (`General`,
+//! percent, thousands, decimals, currency) is Faithful and only a code we fall back on (dates /
+//! scientific / fractions / multi-section / conditional — see
+//! [`renders_faithfully`](crate::numfmt::renders_faithfully)) still warns. Entries auto-drop /
+//! re-scope with no separate bookkeeping (architecture §3.3).
 
 /// How faithfully the renderer can draw a chart, derived from its model + retained source
 /// (charts/functional_spec §5, architecture §3.3). Consumed by the render/UI layer (P8):
@@ -107,11 +112,13 @@ const UNSUPPORTED_CHART_GROUPS: &[&str] = &[
 ///   *do* resolve to a color, so its presence is not by itself a fidelity loss.
 /// - `c:min` / `c:max` — explicit axis-scaling bounds (written only when set).
 ///
-/// The value-aware features still tracked (`numFmt`, `orientation`, `dLbls` toggles, and the
-/// **line-scoped** marker check) need their value/context inspected and are handled by dedicated
-/// detectors below. `c:smooth` left the set entirely in P6 (rendered on line, and line is the only
-/// group that draws it); `c:marker` is now **scoped** — Faithful on a `lineChart` (P6 renders every
-/// symbol) but still degrading on a non-line group (see [`unsupported_marker`]).
+/// The value-aware / context-scoped features (`numFmt` codes we approximate, reversed
+/// `orientation`, `dLbls` toggles line-scoped, the line-scoped marker check, and per-point `dLbl`
+/// overrides) need their value/context inspected and are handled by dedicated detectors below.
+/// `c:smooth` left the set entirely in P6 (rendered on line, and line is the only group that draws
+/// it); `c:marker` and shown `c:dLbls` are now **scoped** — Faithful on a `lineChart` (P6 renders
+/// every symbol, P12 draws labels) but still degrading on a non-line group (see
+/// [`unsupported_marker`] / [`unsupported_data_labels`]).
 const RENDER_AFFECTING_PRESENCE_MARKERS: &[&str] = &["dPt", "gradFill", "pattFill", "min", "max"];
 
 /// Map a **3-D** chart-group element local-name to its **2-D** equivalent element local-name
@@ -178,8 +185,8 @@ fn has_render_affecting_unsupported_feature(xml: &str) -> bool {
         .iter()
         .any(|marker| contains_element(xml, marker))
         || axis_reversed(xml)
-        || custom_number_format(xml)
-        || data_labels_shown(xml)
+        || unsupported_number_format(xml)
+        || unsupported_data_labels(xml)
         || unsupported_marker(xml)
 }
 
@@ -198,15 +205,42 @@ fn axis_reversed(xml: &str) -> bool {
     })
 }
 
-/// A `c:numFmt` with a `formatCode` that is neither empty nor `General` — a number format we
-/// don't yet apply (P12). `formatCode="General"` (the pervasive default) is benign.
-fn custom_number_format(xml: &str) -> bool {
+/// A `c:numFmt` whose `formatCode` the applier does not render **exactly** (see
+/// [`renders_faithfully`](crate::numfmt::renders_faithfully)) — a date / scientific / fraction /
+/// multi-section / conditional code we approximate with general formatting. As of P12 the applier
+/// drives both axis ticks (P6) and data labels, so a code it renders exactly (`General`, percent,
+/// thousands, decimals, currency) is Faithful and no longer degrades; `formatCode="General"` (the
+/// pervasive default) is benign.
+fn unsupported_number_format(xml: &str) -> bool {
     any_opening_tag(xml, "numFmt", |attrs| {
         match attr_value(attrs, "formatCode") {
-            Some(code) => !code.is_empty() && !code.eq_ignore_ascii_case("General"),
+            Some(code) => !crate::numfmt::renders_faithfully(code),
             None => false,
         }
     })
+}
+
+/// Data-label features the renderer does not draw as authored. Two cases degrade:
+/// - a **per-point** label override (`<c:dLbl>` — an idx-keyed custom text / position / deletion)
+///   on **any** group: we draw uniform series labels, not per-point overrides. Boundary-matched so
+///   it does **not** fire on the plural `<c:dLbls>` container.
+/// - **shown** series/chart-level labels (`data_labels_shown`) on a **non-line** group: P12's line
+///   renderer draws data labels, but the bar/area/pie/scatter renderers don't yet (their phases are
+///   P16+), so a shown label there still renders wrong.
+///
+/// Shown labels on a `lineChart` are Faithful (P12 renders them) — the accessor auto-drops the
+/// feature for the group that honors it, exactly like the P6 marker scoping. Same textual-classifier
+/// combo caveat as [`unsupported_marker`]: in a combo part holding a `lineChart` plus another group,
+/// a shown label on the non-line group is currently treated Faithful (revisit with real multi-group
+/// parsing).
+fn unsupported_data_labels(xml: &str) -> bool {
+    if contains_element(xml, "dLbl") {
+        return true;
+    }
+    if is_line_chart(xml) {
+        return false;
+    }
+    data_labels_shown(xml)
 }
 
 /// A `c:dLbls` that actually shows something — any `show*` toggle set true. An all-zero
@@ -557,19 +591,17 @@ mod tests {
                 "<c:catAx><c:scaling><c:orientation val=\"maxMin\"/></c:scaling></c:catAx>",
             ),
             (
-                "custom numFmt",
-                "<c:valAx><c:numFmt formatCode=\"0.00%\" sourceLinked=\"0\"/></c:valAx>",
-            ),
-            (
-                // A conditional format whose value contains an unescaped `>` — exercises the
-                // quote-aware tag scan (a naive `find('>')` would truncate the attribute and
-                // miss the custom format, falsely reporting Faithful).
+                // A conditional format whose value contains an unescaped `>` — a format we only
+                // approximate (the condition is dropped), and also exercises the quote-aware tag
+                // scan (a naive `find('>')` would truncate the attribute and miss the code).
                 "conditional numFmt with '>' in value",
                 "<c:valAx><c:numFmt formatCode=\"[Red][>1000]#,##0\" sourceLinked=\"0\"/></c:valAx>",
             ),
             (
-                "shown data label",
-                "<c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
+                // A per-point label override (idx-keyed) — degrades even on a line chart, since we
+                // draw uniform series labels, not per-point ones.
+                "per-point dLbl override",
+                "<c:ser><c:dLbls><c:dLbl><c:idx val=\"0\"/><c:showVal val=\"1\"/></c:dLbl></c:dLbls></c:ser>",
             ),
         ];
         for (label, xml) in cases {
@@ -578,6 +610,81 @@ mod tests {
                 source_fidelity(&framed),
                 Fidelity::Degraded,
                 "expected Degraded for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn shown_data_labels_are_line_scoped() {
+        // P12's LINE renderer draws data labels, so a shown `c:dLbls` on a `lineChart` is Faithful
+        // (the accessor auto-drops the feature for the group that honors it). The same shown label
+        // on a group whose renderer ignores labels (bar/area/pie/scatter, their phases are P16+)
+        // still renders wrong → Degraded.
+        let shown = "<c:dLbls><c:showVal val=\"1\"/><c:showPercent val=\"1\"/></c:dLbls>";
+        assert_eq!(
+            source_fidelity(&format!("<c:lineChart>{shown}</c:lineChart>")),
+            Fidelity::Faithful,
+            "line renders data labels → Faithful"
+        );
+        for group in ["barChart", "areaChart", "pieChart", "scatterChart"] {
+            assert_eq!(
+                source_fidelity(&format!("<c:{group}>{shown}</c:{group}>")),
+                Fidelity::Degraded,
+                "{group} ignores data labels → Degraded"
+            );
+        }
+    }
+
+    #[test]
+    fn per_point_label_override_degrades_everywhere_but_dlbls_container_does_not() {
+        // A singular `<c:dLbl>` (per-point) degrades on ANY group, including line.
+        let per_point = "<c:dLbls><c:dLbl><c:idx val=\"1\"/></c:dLbl></c:dLbls>";
+        for group in ["lineChart", "barChart"] {
+            assert_eq!(
+                source_fidelity(&format!("<c:{group}>{per_point}</c:{group}>")),
+                Fidelity::Degraded,
+                "{group} with a per-point dLbl → Degraded"
+            );
+        }
+        // The plural `<c:dLbls>` container (all-off) must NOT be mistaken for a per-point `<c:dLbl>`
+        // — boundary matching keeps them distinct.
+        let all_off = "<c:dLbls><c:showVal val=\"0\"/></c:dLbls>";
+        assert_eq!(
+            source_fidelity(&format!("<c:lineChart>{all_off}</c:lineChart>")),
+            Fidelity::Faithful,
+            "an all-off dLbls container is benign, not a per-point override"
+        );
+    }
+
+    #[test]
+    fn number_format_degrades_only_codes_we_approximate() {
+        // A code the applier renders exactly is Faithful (P6/P12 apply it to ticks + labels).
+        for code in ["General", "0%", "$#,##0", "#,##0.00"] {
+            let xml = format!(
+                "<c:lineChart><c:valAx><c:numFmt formatCode=\"{code}\" sourceLinked=\"0\"/></c:valAx></c:lineChart>"
+            );
+            assert_eq!(
+                source_fidelity(&xml),
+                Fidelity::Faithful,
+                "supported numFmt {code:?} → Faithful"
+            );
+        }
+        // A code we only approximate still warns — including a `#,##0,` scaling comma (÷1000),
+        // which parses but mis-renders (the Critical false-Faithful this guards against).
+        for code in [
+            "yyyy-mm-dd",
+            "0.00E+00",
+            "#,##0;(#,##0)",
+            "#,##0,",
+            "0.00_)",
+        ] {
+            let xml = format!(
+                "<c:lineChart><c:valAx><c:numFmt formatCode=\"{code}\" sourceLinked=\"0\"/></c:valAx></c:lineChart>"
+            );
+            assert_eq!(
+                source_fidelity(&xml),
+                Fidelity::Degraded,
+                "approximated numFmt {code:?} → Degraded"
             );
         }
     }

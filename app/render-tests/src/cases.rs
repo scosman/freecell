@@ -513,7 +513,10 @@ pub fn all() -> Vec<RenderCase> {
         RenderCase::new("grid_chart_line", chart_backing_scene(), CHART_GRID_VP)
             .charts(vec![in_grid_chart_spec("Regional Sales", "<c:lineChart/>")]),
         // A Degraded chart still renders as a line, plus the corner "⚠ May not display as intended"
-        // badge (`ui_design.md §2.2`) — here from a shown data label the renderer doesn't apply yet.
+        // badge (`ui_design.md §2.2`) — here from a 3-D group (`line3DChart`) rendered as its 2-D
+        // line. (A shown `c:dLbls` on a line is Faithful as of P12 — it renders — so the badge case
+        // uses the 3-D→2-D reduction, which keeps the same rendered line + badge, hence the baseline
+        // is unchanged.)
         RenderCase::new(
             "grid_chart_degraded_badge",
             chart_backing_scene(),
@@ -521,7 +524,7 @@ pub fn all() -> Vec<RenderCase> {
         )
         .charts(vec![in_grid_chart_spec(
             "Regional Sales",
-            "<c:lineChart><c:dLbls><c:showVal val=\"1\"/></c:dLbls></c:lineChart>",
+            "<c:line3DChart/>",
         )]),
         // An Unsupported group draws the placeholder box (title + "Unsupported chart type"),
         // occupying the chart's space (`ui_design.md §2.3`).

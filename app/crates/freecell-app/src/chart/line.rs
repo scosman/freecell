@@ -24,18 +24,22 @@ use gpui::{
     Point, SharedString, TextAlign, Window,
 };
 use gpui_component::plot::{
+    label::{measure_text_width, Text},
     origin_point,
     scale::{Scale, ScaleLinear, ScalePoint},
     shape::Line,
-    AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, StrokeStyle, AXIS_GAP,
+    AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, PlotLabel, StrokeStyle, AXIS_GAP,
 };
 
 use freecell_chart_model::{
-    apply_number_format, Chart, ChartKind, Marker, MarkerSymbol, SeriesData,
+    apply_number_format, Chart, ChartKind, DataLabelPosition, DataLabels, Marker, MarkerSymbol,
+    SeriesData,
 };
 
 use super::chrome::chart_frame;
-use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{
+    hsla, resolve_series_hsla, AXIS_STROKE, AXIS_TITLE_TEXT, GRID_STROKE, MUTED_TEXT,
+};
 use super::ticks::{format_tick, NiceScale};
 
 /// Pixels reserved at the left of the plot for value-axis tick labels.
@@ -58,14 +62,25 @@ const MARKER_STROKE_WIDTH: f32 = 1.6;
 /// The `dot` marker's radius as a fraction of the full marker radius — Excel's `dot` is a small
 /// filled dot, noticeably smaller than the `circle`/default marker.
 const DOT_MARKER_SCALE: f32 = 0.55;
+/// Data-label font size (matches the plot label primitive's default).
+const LABEL_FONT_SIZE: f32 = 10.0;
+/// Gap between a data label and its point (marker edge).
+const LABEL_GAP: f32 = 4.0;
+/// Legend-key swatch side length inside a data label.
+const LABEL_SWATCH: f32 = 8.0;
+/// Gap between the legend-key swatch and the label text.
+const LABEL_SWATCH_GAP: f32 = 3.0;
 
-/// One line: its per-category values, its resolved color, and its marker (already resolved from the
-/// series' explicit color/theme reference or the palette cycle, and its `c:marker`).
+/// One line: its per-category values, its resolved color, its marker (already resolved from the
+/// series' explicit color/theme reference or the palette cycle, and its `c:marker`), its data
+/// labels (`c:dLbls`, P12), and its name (for the series-name label part).
 #[derive(Clone)]
 struct LineSeries {
     values: Vec<f64>,
     color: Hsla,
     marker: Option<Marker>,
+    data_labels: Option<DataLabels>,
+    name: Option<String>,
 }
 
 /// A multi-series line plot over the raw `Line` primitive with ONE shared value scale
@@ -108,6 +123,8 @@ impl LinePlot {
                 values: values.clone(),
                 color: resolve_series_hsla(s.color, i),
                 marker: s.marker,
+                data_labels: s.data_labels.clone(),
+                name: s.name.clone(),
             });
         }
 
@@ -373,6 +390,131 @@ impl Plot for LinePlot {
                 }
             }
         }
+
+        // Data labels (P12), drawn last so they sit above the lines/markers.
+        self.paint_data_labels(&bounds, &xs, &value_scale, window, cx);
+    }
+}
+
+impl LinePlot {
+    /// Paint each series' data labels (`c:dLbls`, P12) at their points. For every series whose
+    /// labels are shown, at every finite point: compose the label text (value / percent / category
+    /// / series name — the value + percent formatted through the numFmt applier), place it per the
+    /// `c:dLblPos` position (default **above** for a line), and — when the legend key is shown —
+    /// draw a small series-color swatch to its left. Text is painted via the plot's [`PlotLabel`]
+    /// primitive; swatches via quads (both share the plot's coordinate origin).
+    fn paint_data_labels(
+        &self,
+        bounds: &Bounds<Pixels>,
+        xs: &[f32],
+        value_scale: &ScaleLinear<f64>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        let color = hsla(AXIS_TITLE_TEXT);
+        let mut texts: Vec<Text> = Vec::new();
+
+        for s in &self.series {
+            let Some(dl) = &s.data_labels else { continue };
+            if !dl.is_shown() {
+                continue;
+            }
+            // Percent (`c:showPercent`) is a point's share of the series total (finite points only).
+            let finite_total: f64 = s.values.iter().copied().filter(|v| v.is_finite()).sum();
+            let position = dl.position.unwrap_or(DataLabelPosition::Above);
+
+            for (i, &v) in s.values.iter().enumerate() {
+                if i >= xs.len() || !v.is_finite() {
+                    continue;
+                }
+                let Some(y) = value_scale.tick(&v) else {
+                    continue;
+                };
+                let category = self.categories.get(i).map(SharedString::as_ref);
+                let percent = (finite_total != 0.0).then_some(v / finite_total);
+                let text = dl.label_text(s.name.as_deref(), category, v, percent);
+                if text.is_empty() && !dl.show_legend_key {
+                    continue;
+                }
+
+                let text: SharedString = text.into();
+                let text_width = if text.is_empty() {
+                    0.0
+                } else {
+                    measure_text_width(&text, px(LABEL_FONT_SIZE), window)
+                };
+                let swatch = if dl.show_legend_key {
+                    LABEL_SWATCH
+                } else {
+                    0.0
+                };
+                let inner_gap = if swatch > 0.0 && !text.is_empty() {
+                    LABEL_SWATCH_GAP
+                } else {
+                    0.0
+                };
+                let block_width = swatch + inner_gap + text_width;
+
+                // Anchor the (swatch + text) block relative to the point, per `dLblPos`. The block's
+                // top-left is `(block_left, top)`, in plot-relative coordinates.
+                let half_marker = DOT_SIZE / 2.0;
+                let (block_left, top) = match position {
+                    DataLabelPosition::Above => (
+                        xs[i] - block_width / 2.0,
+                        y - half_marker - LABEL_GAP - LABEL_FONT_SIZE,
+                    ),
+                    DataLabelPosition::Below => {
+                        (xs[i] - block_width / 2.0, y + half_marker + LABEL_GAP)
+                    }
+                    DataLabelPosition::Center => {
+                        (xs[i] - block_width / 2.0, y - LABEL_FONT_SIZE / 2.0)
+                    }
+                    DataLabelPosition::Right => {
+                        (xs[i] + half_marker + LABEL_GAP, y - LABEL_FONT_SIZE / 2.0)
+                    }
+                    DataLabelPosition::Left => (
+                        xs[i] - half_marker - LABEL_GAP - block_width,
+                        y - LABEL_FONT_SIZE / 2.0,
+                    ),
+                };
+
+                // Clamp the block into the plot bounds so a label near an edge — an `Above` label on
+                // a near-max point, or a wide composed label at the last category — stays visible
+                // instead of overflowing with nothing clipping it (latent for real P14 data). A label
+                // already inside the bounds is unchanged; only an overflowing one is nudged in.
+                let plot_w = bounds.size.width.as_f32();
+                let plot_h = bounds.size.height.as_f32();
+                let block_left = block_left.clamp(0.0, (plot_w - block_width).max(0.0));
+                let top = top.clamp(0.0, (plot_h - LABEL_FONT_SIZE).max(0.0));
+
+                if dl.show_legend_key {
+                    // A filled series-color swatch at the block's left, vertically centered on the text.
+                    let swatch_top = top + (LABEL_FONT_SIZE - LABEL_SWATCH) / 2.0;
+                    let top_left = origin_point(px(block_left), px(swatch_top), bounds.origin);
+                    window.paint_quad(gpui::quad(
+                        gpui::bounds(top_left, size(px(LABEL_SWATCH), px(LABEL_SWATCH))),
+                        px(1.0),
+                        s.color,
+                        px(0.0),
+                        hsla(0xFFFFFF),
+                        BorderStyle::default(),
+                    ));
+                }
+
+                if !text.is_empty() {
+                    let text_left = block_left + swatch + inner_gap;
+                    texts.push(
+                        Text::new(text, point(px(text_left), px(top)), color)
+                            .font_size(px(LABEL_FONT_SIZE))
+                            .align(TextAlign::Left),
+                    );
+                }
+            }
+        }
+
+        if !texts.is_empty() {
+            PlotLabel::new(texts).paint(bounds, window, cx);
+        }
     }
 }
 
@@ -541,6 +683,23 @@ mod tests {
         );
         // A series with no marker leaves it None (the renderer draws its default dot).
         assert_eq!(plot.series[1].marker, None);
+    }
+
+    #[test]
+    fn series_data_labels_and_name_carry_into_the_plot() {
+        use freecell_chart_model::DataLabels;
+        let mut chart = three_series_line();
+        chart.series[0] = chart.series[0]
+            .clone()
+            .with_data_labels(DataLabels::new().value().with_number_format("$#,##0"));
+        let plot = LinePlot::multi_series(&chart).expect("plot");
+        // The labelled series carries its dLbls + name (for the series-name part) into LineSeries.
+        let dl = plot.series[0].data_labels.as_ref().expect("labels carried");
+        assert!(dl.show_value);
+        assert_eq!(dl.number_format.as_deref(), Some("$#,##0"));
+        assert_eq!(plot.series[0].name.as_deref(), Some("North"));
+        // A series with no labels stays None (nothing drawn).
+        assert!(plot.series[1].data_labels.is_none());
     }
 
     #[test]

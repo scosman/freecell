@@ -6,9 +6,12 @@ status: complete
 
 Rebuilt into **small, CR-sized phases** — each one coherent goal, one clean commit,
 reviewable in a sitting. Risk-ordered: **line chart proven *and hardened to production
-quality* before any other type**, with a **blocking human review/tuning checkpoint** after the
-line slice. Each new type then slots onto the hardened pipeline; v1 ships once all types pass a
-final cross-type gate. Authoring + editing follow as their own phases (v1 can ship first).
+quality*** first, with a **blocking human review/tuning checkpoint** after the line slice.
+**Then authoring + editing (insert / drag / resize / edit) land on the line chart — the *real
+minimal shipping version* — and v1 ships.** Only after that MVP is proven end-to-end do we go
+wide on breadth: each new chart type then slots onto the hardened, now-editable pipeline.
+(Rationale: no reason to invest in five more renderers before we know the authoring/editing path
+has no blockers.)
 
 Refs: `functional_spec.md`, `ui_design.md`, `architecture.md`. Reusable PoC assets:
 `SYNTHESIS.md §5`; fidelity targets: `ooxml-coverage-matrix.md`. Each phase's detail lives in
@@ -66,7 +69,7 @@ Human review of the whole line slice on real files (render vs Excel, in-grid beh
 live feel, badge/placeholder, save/restore in both apps, perf); budgeted **tuning** pass;
 GO/loop/re-plan decision. **No hardening or type phase starts until this passes.**
 
-## Harden the line chart to production quality  *(before any other type)*
+## Harden the line chart to production quality  *(before authoring)*
 Build the cross-cutting fidelity + robustness + CI machinery **proven on line first**; each is
 reusable infra the types then inherit. (Type-specific fills/labels land with each type.)
 
@@ -83,50 +86,59 @@ reusable infra the types then inherit. (Type-specific fills/labels land with eac
   perf. *Exit:* **a production-robust line chart** — the pipeline (render→fidelity→robust→CI) is
   proven end-to-end on one type.
 
-## New graph types — one phase each  *(each slots onto the hardened pipeline)*
-Each: renderer + type fidelity + reuse anchor/bind/save + its own regression baselines +
-round-trip. Ordered by prevalence/ROI.
+## Authoring — Stage A  *(the MVP: insert / drag / resize / edit the line chart)*
+The real minimal shipping version. Basic authoring + editing land **on the hardened line chart**
+before any breadth — a blocker here must surface before we've built five more renderers. The one
+genuinely new subsystem, the write path, is isolated to P16.
 
-- [ ] **P16 — Column & bar.** Both orientations; clustered/stacked/100%; `gapWidth`/`overlap`;
-  **Excel horizontal-bar category order**; per-type fills.
-- [ ] **P17 — Area.** Standard/stacked/100% (hand-rolled polygon fork); fills.
-- [ ] **P18 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;
-  rotation/explosion; on-slice % labels.
-- [ ] **P19 — Scatter.** Two numeric axes + dots; `scatterStyle`.
-- [ ] **P20 — Bubble.** Scatter + `bubbleSize`→radius (√-area + clamp).
-
-## v1 ship gate
-
-- [ ] **P21 — Cross-type sweep → v1 ships.** Full perceptual-diff + external round-trip suites
-  green across **all** types (+ badge/placeholder); mixed-type / many-charts / huge-sheet perf
-  re-measured. *Exit:* **v1 SHIPPABLE** (display + live + preserve, all in-scope types).
-
-## Authoring — Stage A  *(end-phase; v1 can ship first)*
-
-- [ ] **P22 — Write path (component design + impl).** Design doc for the write path + edit
+- [ ] **P16 — Write path (component design + impl).** Design doc for the write path + edit
   panel, then **write-from-model** (authored) + **source-patch** (edited). *Exit:* a
   model-built chart serializes to a valid `.xlsx` reopenable in Excel + LibreOffice; round-trip
   tests.
-- [ ] **P23 — Insert flow.** Action-bar chart-icon menu (type glyphs) → insert a near-empty
+- [ ] **P17 — Insert flow.** Action-bar chart-icon menu (type glyphs) → insert a near-empty
   chart of that type → it appears in the grid. *Exit:* insert a line chart via the UI; it
   renders + saves.
-- [ ] **P24 — Manipulate.** Select (outline + handles), move, resize, delete on the ChartLayer.
+- [ ] **P18 — Manipulate.** Select (outline + handles), move, resize, delete on the ChartLayer.
   *Exit:* manipulation persists to the anchor and round-trips.
-- [ ] **P25 — Edit panel + range/type.** Right-docked panel skeleton; set data **range** and
+- [ ] **P19 — Edit panel + range/type.** Right-docked panel skeleton; set data **range** and
   chart **type**. *Exit:* a near-empty inserted chart can be shaped into a real one.
 
-## Editing — Stage B  *(end-phase)*
+## Editing — Stage B  *(chrome editing — completes the MVP)*
 
-- [ ] **P26 — Chrome editing.** Title, legend on/off + position, axis titles, series colors,
+- [ ] **P20 — Chrome editing.** Title, legend on/off + position, axis titles, series colors,
   data-label toggles via the panel. *Exit:* chrome edits apply live + round-trip; the edit
   contract (patch preserves unmodeled styling) holds.
+
+## v1 MVP ship gate
+
+- [ ] **P21 — MVP sweep → v1 ships.** Full perceptual-diff + external round-trip suites green for
+  the **line chart** across display + live + preserve + **authoring/editing** (insert / move /
+  resize / delete / chrome edits) + badge/placeholder; many-charts / huge-sheet perf re-measured.
+  *Exit:* **v1 SHIPPABLE** — the line chart, fully authorable & editable. Breadth (other types)
+  follows in the next batch.
+
+## New graph types — one phase each  *(breadth, post-MVP — each slots onto the hardened, editable pipeline)*
+Each: renderer + type fidelity + reuse anchor/bind/save/**author/edit** + its own regression
+baselines + round-trip. Ordered by prevalence/ROI; the final type re-runs the full cross-type
+perceptual-diff + external round-trip sweep.
+
+- [ ] **P22 — Column & bar.** Both orientations; clustered/stacked/100%; `gapWidth`/`overlap`;
+  **Excel horizontal-bar category order**; per-type fills.
+- [ ] **P23 — Area.** Standard/stacked/100% (hand-rolled polygon fork); fills.
+- [ ] **P24 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;
+  rotation/explosion; on-slice % labels.
+- [ ] **P25 — Scatter.** Two numeric axes + dots; `scatterStyle`.
+- [ ] **P26 — Bubble.** Scatter + `bubbleSize`→radius (√-area + clamp); the final type re-runs
+  the full cross-type perceptual-diff + external round-trip sweep.
 
 ---
 
 ### Why this order
 Line chart goes **component → engine load → in-grid → live → save → perf → checkpoint → full
-hardening (fidelity + robustness + CI)** before any other type — so the *entire* production
-pipeline, not just rendering, is proven and reviewed on one type. Each new type (P16–20) is
-then a small CR that inherits that hardened machinery, and P21 confirms the suite across all of
-them. The one genuinely new subsystem — the write path — is isolated to P22, gating only
-authoring/editing.
+hardening (fidelity + robustness + CI)** before anything else — so the *entire* production
+pipeline, not just rendering, is proven and reviewed on one type. **Authoring + editing (P16–P20)
+then land on that hardened line chart — the write path (P16) is the one genuinely new subsystem —
+and P21 ships v1 as a fully authorable/editable line-chart product.** Only then do we go wide:
+each new type (P22–P26) is a small CR that inherits the hardened, editable machinery and re-runs
+its regression + round-trip suites. Deferring breadth until *after* the MVP means a blocker in the
+authoring/editing path surfaces before we've spent effort on five more renderers.

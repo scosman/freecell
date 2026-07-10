@@ -34,7 +34,7 @@ scrolled-clip case).
   for one; the placeholder **render** is built + validated here via a directly-constructed
   Unsupported spec, ready for the P14 load-path upgrade (retain-source + emit Unsupported spec).
   Degraded (3-D→2-D) charts *do* flow through the real load path and render + badge.
-- Interaction (select/move/resize) is authoring (P22+); charts here are read-only. The plain chart
+- Interaction (select/move/resize) is authoring (P16+; renumbered from P22+); charts here are read-only. The plain chart
   divs register no listeners, so the grid's coordinate-based hit-testing is unaffected.
 
 ## Steps

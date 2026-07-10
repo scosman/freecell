@@ -20,7 +20,7 @@ coverage on labels. Per the implementation plan (P12) and `functional_spec §4` 
 4. Reconciles the fidelity accessor: shown labels on a **line** now render → **Faithful**
    (scoped like markers were in P6); a **supported** `numFmt` no longer degrades (the applier
    renders it). Kept degrading (honest): shown labels on a **non-line** group (not rendered
-   yet — their phases are P16+), **per-point** `c:dLbl` overrides (custom per-point
+   yet — their phases are P22+; renumbered from P16+), **per-point** `c:dLbl` overrides (custom per-point
    text/position/deletion we don't render), and an **unsupported** `numFmt` code the applier
    falls back to general on (dates / scientific / fractions / multi-section / conditionals).
 

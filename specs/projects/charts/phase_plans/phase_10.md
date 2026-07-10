@@ -28,7 +28,7 @@ Plus the two multi-sheet items P9 explicitly deferred to P10, both **enabled by 
   worksheet** so the worker anchors each chart to the correct `SheetId` (P8/P9 anchored all charts
   to the first sheet for lack of this map).
 
-The authored / synthesize-from-template write mode is the **authoring phase (P22)**, explicitly
+The authored / synthesize-from-template write mode is the **authoring phase (P16; renumbered from P22)**, explicitly
 **out of scope** here. Rendering is untouched (engine-only phase; **no pixel suite** — the P10
 change moves no grid/cell/sheet/titlebar/chart-render baseline).
 

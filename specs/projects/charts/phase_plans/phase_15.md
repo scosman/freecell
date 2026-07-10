@@ -201,6 +201,34 @@ baselines during coding; the CI `render` gate (deliverable 1) is the full-suite 
 
 ## Measured p50/p99
 
-(Filled in after the bench runs — env-stamped, release, FORCE+ASSERTED; also written to
-`results/chart-perf.json` and echoed in the phase summary. Includes the existing three P11 ops
-plus the new many-line-charts + large-series ops, with the down-sample decision recorded.)
+Environment (stamped into `results/chart-perf.json`): x86_64 linux, **release**; headless — no
+GPU; all ops are CPU engine/render-path work. Bench: `render-tests/src/bin/chart_perf.rs`
+(FORCE+ASSERTED each op — a no-op would trip the asserts). Run FOREGROUND under `timeout`.
+
+| Op | p50 | p99 | max | Reference budget | Notes |
+|---|---|---|---|---|---|
+| first-paint (discover+parse+bind+snapshot, 1 line chart) | 248 µs | 428 µs | 461 µs | (off critical path) | P11 op; consistent with prior. |
+| edit-rerender (dirty-set → reresolve → snapshot) | 1.29 µs | 1.52 µs | 22.7 µs | (off critical path) | P11 op. |
+| scroll-with-K (K=1000, per-frame rect+cull scan) | 4.67 µs | 8.90 µs | 111 µs | 8.33 ms / 16.67 ms | P11 op; ~1800× under frame budget. |
+| **many-line-charts (open: discover+parse+bind 200 charts on one sheet)** | **7.61 ms** | **8.70 ms** | 8.76 ms | (lazy, off critical path) | ~38 µs/chart; a one-time per-sheet open (P11 lazy discovery), never per-frame. Comfortable. |
+| **large-series down-sample (N=100 000 → ≤ 2048 vertices)** | **241 µs** | **272 µs** | 279 µs | 8.33 ms / 16.67 ms | the decimation cost; ~3% of one frame, negligible vs a 100k-primitive paint. |
+| **large-series paint-prep, FULL N=100 000 (pre-hardening)** | **177 µs** | **221 µs** | 269 µs | 8.33 ms / 16.67 ms | per-frame point→pixel mapping at full resolution (proxy). |
+| **large-series paint-prep, DOWN-SAMPLED to 2048 (post-hardening)** | **4.14 µs** | **11.8 µs** | 23.6 µs | 8.33 ms / 16.67 ms | ~43× less prep; and the gpui side now draws **2048** markers + path vertices, not 100 000 (~49× fewer primitives — the dominant, un-measurable-headlessly win). |
+
+**Down-sample decision — ADOPTED.** The numbers motivate the large-series paint down-sample
+(architecture §5 challenge 5). The measurable proxy (per-frame point→pixel prep) drops **43×**
+(177 µs → 4.14 µs); the real, larger win is the **gpui primitive count**: a 100 000-point line
+would paint 100 000 marker discs + a 100 000-vertex tessellated stroke **per frame** (far over
+the 8.33 ms budget), which the decimation bounds to **2048** (~49× fewer) — shape-preserving
+(first/last + per-bucket min/max, so peaks survive). The decimation's own 241 µs is a rounding
+error against a 100k-primitive paint. Crucially it is **paint-only**: the retained `Chart`/source
+keeps all 100 000 points, so **save/live fidelity is untouched** (bench FORCE-ASSERTS the full N
+is retained). Gated at `MAX_PAINT_VERTICES = 2048`, far above every committed render scene
+(≤ ~12 points) → identity for them → **no baseline moves**.
+
+**Adversarial review.** None is a measured no-op: first-paint asserts the chart bound with the
+file's values; edit-rerender asserts the value changed + republished; scroll asserts all K
+scanned with only ~2 on-screen; many-line-charts asserts all 200 parsed as line charts with
+their cached values; large-series asserts the full 100 000-point series is retained while paint
+touches ≤ 2048. The many-line-charts open (7.6 ms/200 charts) is a lazy per-sheet open, never a
+per-frame cost, so it needs no further hardening.

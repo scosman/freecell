@@ -29,16 +29,22 @@ use std::time::Instant;
 
 use freecell_app::grid::chart_layer::{anchor_rect, ChartPlacement, GridGeometry};
 use freecell_chart_model::{
-    Anchor, AnchorCell, Axis, Category, Chart, ChartKind, ChartSpec, Grouping, Legend, Series,
-    SourceXml,
+    downsample_for_paint, Anchor, AnchorCell, Axis, Category, Chart, ChartKind, ChartSpec,
+    Grouping, Legend, Series, SourceXml, MAX_PAINT_VERTICES,
 };
 use freecell_core::perf::{fmt_ns, LatencyStats, FRAME_TARGET_NS, FRAME_WORST_NS};
 use freecell_core::{CellRange, CellRef, SheetId};
 use freecell_engine::chart::binding::{CellData, ChartBindings};
-use freecell_engine::chart::{authoring, discover_and_parse_for_sheet};
+use freecell_engine::chart::{authoring, discover_and_parse, discover_and_parse_for_sheet};
 
 /// Charts held on the stress sheet for the scroll-with-K measurement.
 const K: usize = 1000;
+
+/// Line charts on one sheet for the many-line-charts OPEN measurement (real zip + XML parse each).
+const MANY_K: usize = 200;
+
+/// Points in the large-series line for the paint-prep / down-sample measurement.
+const BIG_N: usize = 100_000;
 
 fn main() {
     let commit = std::env::var("FREECELL_COMMIT")
@@ -51,13 +57,23 @@ fn main() {
         std::env::temp_dir().join(format!("freecell_chart_perf_{}.xlsx", std::process::id()));
     authoring::write_line_fixture(&fixture).expect("write line fixture");
 
+    // The many-line-charts open fixture: K real line charts on one sheet, written once.
+    let many_fixture = std::env::temp_dir().join(format!(
+        "freecell_chart_perf_many_{}.xlsx",
+        std::process::id()
+    ));
+    authoring::write_many_line_charts_fixture(&many_fixture, MANY_K).expect("write many fixture");
+
     let first_paint = measure_first_paint(&fixture);
     let edit_rerender = measure_edit_rerender(&fixture);
     let scroll = measure_scroll_with_k();
+    let many = measure_many_line_charts(&many_fixture);
+    let large = measure_large_series();
 
     let _ = std::fs::remove_file(&fixture);
+    let _ = std::fs::remove_file(&many_fixture);
 
-    println!("=== P11 chart perf (headless, CPU render/engine path) ===");
+    println!("=== chart perf (headless, CPU render/engine path) ===");
     print_op(
         "first-paint (discover+parse+bind+snapshot, 1 line chart)",
         &first_paint,
@@ -77,8 +93,45 @@ fn main() {
         "  scroll: {} charts total, ~{} on-screen per frame (rest culled), {} distinct scroll positions",
         K, scroll.max_on_screen, scroll.distinct
     );
+    print_op(
+        &format!("many-line-charts (open: discover+parse+bind {MANY_K} line charts on one sheet)"),
+        &many,
+        None,
+    );
+    println!("  many-line-charts: {MANY_K} charts parsed per open (real zip + XML parse each)");
+    print_op(
+        &format!("large-series down-sample (N={BIG_N} -> <= {MAX_PAINT_VERTICES} vertices)"),
+        &large.downsample,
+        None,
+    );
+    print_op(
+        &format!("large-series paint-prep, FULL N={BIG_N} (pre-hardening per-frame CPU)"),
+        &large.prep_full,
+        Some((FRAME_TARGET_NS, FRAME_WORST_NS)),
+    );
+    print_op(
+        &format!(
+            "large-series paint-prep, DOWN-SAMPLED to {} (post-hardening per-frame CPU)",
+            large.kept
+        ),
+        &large.prep_downsampled,
+        Some((FRAME_TARGET_NS, FRAME_WORST_NS)),
+    );
+    println!(
+        "  large-series: {} points retained for save; {} vertices painted (down-sample ~{:.0}x fewer)",
+        large.n,
+        large.kept,
+        large.n as f64 / large.kept as f64,
+    );
 
-    if let Err(e) = write_json(&commit, &first_paint, &edit_rerender, &scroll) {
+    if let Err(e) = write_json(
+        &commit,
+        &first_paint,
+        &edit_rerender,
+        &scroll,
+        &many,
+        &large,
+    ) {
         eprintln!("chart_perf: failed to write results JSON: {e}");
     }
 }
@@ -285,6 +338,145 @@ fn measure_scroll_with_k() -> ScrollResult {
 }
 
 // ---------------------------------------------------------------------------------------------
+// many-line-charts (open at scale)
+// ---------------------------------------------------------------------------------------------
+
+/// The open cost for a sheet bearing K line charts: `discover_and_parse` walks the package and
+/// parses all K chart parts. Reports the whole-open latency, FORCE+ASSERTING all K were parsed as
+/// line charts with their cached values (a no-op parse would fail here).
+fn measure_many_line_charts(path: &Path) -> LatencyStats {
+    let mut samples = Vec::new();
+    for i in 0..120 {
+        let started = Instant::now();
+        let specs = discover_and_parse(path).expect("discover many line charts");
+        let elapsed = started.elapsed().as_nanos() as u64;
+
+        assert_eq!(specs.len(), MANY_K, "all K line charts are discovered");
+        assert!(
+            specs
+                .iter()
+                .all(|s| matches!(s.chart().map(|c| &c.kind), Some(ChartKind::Line { .. }))),
+            "every discovered chart is a line chart"
+        );
+        assert_eq!(
+            first_values(&specs[0]),
+            authoring::WIDGETS.to_vec(),
+            "each chart carries its cached values"
+        );
+        if i >= 10 {
+            samples.push(elapsed);
+        }
+    }
+    LatencyStats::from_samples(&samples)
+}
+
+// ---------------------------------------------------------------------------------------------
+// large-series (paint-prep + down-sample)
+// ---------------------------------------------------------------------------------------------
+
+struct LargeSeriesResult {
+    /// Cost of `downsample_for_paint(N points)`.
+    downsample: LatencyStats,
+    /// Per-frame paint-prep mapping ALL N points to pixels (pre-hardening).
+    prep_full: LatencyStats,
+    /// Per-frame paint-prep mapping only the down-sampled points (post-hardening).
+    prep_downsampled: LatencyStats,
+    /// Points retained (N — the full series kept for save).
+    n: usize,
+    /// Vertices painted after decimation.
+    kept: usize,
+}
+
+/// Large-series perf: a line with **N points**. Measures (1) the down-sample cost, (2) the
+/// per-frame point-mapping over ALL N (what the renderer did before the P15 hardening), and (3) the
+/// same mapping over the down-sampled vertices (what it does now). FORCE+ASSERTS that the full
+/// series (N points) is retained — the down-sample is paint-only, so save fidelity is untouched —
+/// while paint touches `<= MAX_PAINT_VERTICES`.
+fn measure_large_series() -> LargeSeriesResult {
+    // A dense sine wave so the shape (and its extrema) is non-trivial to preserve.
+    let values: Vec<f64> = (0..BIG_N)
+        .map(|i| ((i as f64) * 0.001).sin() * 100.0 + 100.0)
+        .collect();
+    // A representative linear value->pixel map (min..max -> plot_bottom..plot_top), the arithmetic
+    // the renderer's `ScaleLinear` does per point.
+    let (min, max) = (0.0_f64, 200.0_f64);
+    let (plot_bottom, plot_h) = (400.0_f32, 380.0_f32);
+    let y_px = |v: f64| -> f32 { plot_bottom - (((v - min) / (max - min)) as f32) * plot_h };
+
+    // 1. down-sample cost.
+    let mut ds = Vec::new();
+    let mut kept = 0usize;
+    for i in 0..300 {
+        let started = Instant::now();
+        let keep = downsample_for_paint(&values, MAX_PAINT_VERTICES);
+        let elapsed = started.elapsed().as_nanos() as u64;
+        kept = keep.len();
+        assert!(
+            keep.len() <= MAX_PAINT_VERTICES && *keep.last().unwrap() == BIG_N - 1,
+            "decimated to <= budget, keeping the last point"
+        );
+        std::hint::black_box(keep);
+        if i >= 20 {
+            ds.push(elapsed);
+        }
+    }
+
+    // 2. paint-prep over ALL N (pre-hardening).
+    let mut full = Vec::new();
+    for i in 0..300 {
+        let started = Instant::now();
+        let pts: Vec<f32> = (0..BIG_N)
+            .filter(|&j| values[j].is_finite())
+            .map(|j| y_px(values[j]))
+            .collect();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        assert_eq!(pts.len(), BIG_N, "full prep maps every point");
+        std::hint::black_box(pts);
+        if i >= 20 {
+            full.push(elapsed);
+        }
+    }
+
+    // 3. paint-prep over the down-sampled vertices (post-hardening).
+    let keep = downsample_for_paint(&values, MAX_PAINT_VERTICES);
+    let mut down = Vec::new();
+    for i in 0..300 {
+        let started = Instant::now();
+        let pts: Vec<f32> = keep
+            .iter()
+            .filter(|&&j| values[j].is_finite())
+            .map(|&j| y_px(values[j]))
+            .collect();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        assert_eq!(
+            pts.len(),
+            keep.len(),
+            "down-sampled prep maps the kept points"
+        );
+        std::hint::black_box(pts);
+        if i >= 20 {
+            down.push(elapsed);
+        }
+    }
+
+    // FORCE + ASSERT: the full series is retained for save (paint-only decimation).
+    assert_eq!(
+        values.len(),
+        BIG_N,
+        "the full N-point series is retained for save"
+    );
+    assert!(kept < BIG_N, "paint decimates below the full series");
+
+    LargeSeriesResult {
+        downsample: LatencyStats::from_samples(&ds),
+        prep_full: LatencyStats::from_samples(&full),
+        prep_downsampled: LatencyStats::from_samples(&down),
+        n: BIG_N,
+        kept,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------------------------
 
@@ -327,6 +519,8 @@ fn write_json(
     first_paint: &LatencyStats,
     edit_rerender: &LatencyStats,
     scroll: &ScrollResult,
+    many: &LatencyStats,
+    large: &LargeSeriesResult,
 ) -> std::io::Result<()> {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("results");
     std::fs::create_dir_all(&dir)?;
@@ -334,7 +528,7 @@ fn write_json(
     let json = serde_json::json!({
         "name": "freecell-chart-perf",
         "environment": render_tests::perf::environment_json(commit),
-        "note": "P11 chart perf: headless CPU render/engine path. Targets are ratified at the post-P11 human checkpoint; scroll is reported vs the repo's frame budgets for reference.",
+        "note": "chart perf: headless CPU render/engine path. P11 ops (first-paint/edit-rerender/scroll) + P15 many-line-charts (open at scale) and large-series (paint-prep + down-sample). Scroll/large-series prep are reported vs the repo's frame budgets for reference.",
         "ops": {
             "first_paint": stats_json(first_paint),
             "edit_rerender": stats_json(edit_rerender),
@@ -345,6 +539,20 @@ fn write_json(
                 "reference_frame_target_ns": FRAME_TARGET_NS,
                 "reference_frame_worst_ns": FRAME_WORST_NS,
                 "stats": stats_json(&scroll.stats),
+            },
+            "many_line_charts_open": {
+                "k": MANY_K,
+                "stats": stats_json(many),
+            },
+            "large_series": {
+                "n_points_retained_for_save": large.n,
+                "vertices_painted": large.kept,
+                "max_paint_vertices": MAX_PAINT_VERTICES,
+                "reference_frame_target_ns": FRAME_TARGET_NS,
+                "reference_frame_worst_ns": FRAME_WORST_NS,
+                "downsample": stats_json(&large.downsample),
+                "paint_prep_full_n": stats_json(&large.prep_full),
+                "paint_prep_downsampled": stats_json(&large.prep_downsampled),
             },
         },
     });

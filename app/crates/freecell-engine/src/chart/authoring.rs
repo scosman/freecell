@@ -1031,6 +1031,23 @@ pub fn write_charts_fixture(path: &Path, chart_xmls: &[String]) -> Result<()> {
     write_package(path, &parts)
 }
 
+/// Writes a single-sheet workbook carrying `k` **line** charts (each a Faithful single-series line
+/// over the shared `Data` grid), anchored down one drawing. Used by the P15 many-line-charts perf
+/// bench (K charts on a sheet) and a unit test; each chart discovers + parses independently, so the
+/// open cost scales with K.
+pub fn write_many_line_charts_fixture(path: &Path, k: usize) -> Result<()> {
+    let xmls: Vec<String> = (0..k)
+        .map(|i| {
+            catval_group_chart(
+                &format!("Line {}", i + 1),
+                "<c:lineChart><c:grouping val=\"standard\"/>",
+                "</c:lineChart>",
+            )
+        })
+        .collect();
+    write_charts_fixture(path, &xmls)
+}
+
 /// Writes a single-sheet workbook whose drawing references TWO charts (`rId1` line, `rId2` column)
 /// but whose drawing `_rels` maps ONLY `rId1` — a **dangling** `<c:chart r:id="rId2">`. `discover`
 /// must skip just that chart and still return the line chart (P14 per-chart-resilient walk).
@@ -1435,6 +1452,33 @@ mod tests {
         match &pie.series[0].data {
             SeriesData::CategoryValue { values, .. } => assert_eq!(values, &TOTALS.to_vec()),
             other => panic!("expected CategoryValue, got {other:?}"),
+        }
+    }
+
+    /// The many-line-charts fixture (P15 perf) writes K discoverable line charts on one sheet — the
+    /// open cost the many-line-charts bench measures. A small K here proves each parses as a line.
+    #[test]
+    fn many_line_charts_fixture_writes_k_line_charts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many_lines.xlsx");
+        let k = 12;
+        write_many_line_charts_fixture(&path, k).unwrap();
+
+        let charts = load_charts_from_xlsx(&path).unwrap();
+        assert_eq!(charts.len(), k, "K line charts are all discoverable");
+        for (i, chart) in charts.iter().enumerate() {
+            assert!(
+                matches!(chart.kind, ChartKind::Line { .. }),
+                "chart {i} is a line chart"
+            );
+            assert_eq!(
+                chart.title.as_deref(),
+                Some(format!("Line {}", i + 1).as_str())
+            );
+            match &chart.series[0].data {
+                SeriesData::CategoryValue { values, .. } => assert_eq!(values, &WIDGETS.to_vec()),
+                other => panic!("expected CategoryValue, got {other:?}"),
+            }
         }
     }
 

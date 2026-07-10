@@ -1,0 +1,76 @@
+# Linux `roundtrip` — external round-trip gate: a FreeCell-saved chart .xlsx must reopen in a
+# DIFFERENT real spreadsheet app. Excel can't run in CI, but LibreOffice can (`soffice
+# --headless`), so this proves a FreeCell-saved LINE chart survives being read + re-written by
+# LibreOffice (charts/architecture §7 real-file corpus, §8 risk 3; implementation_plan P15).
+#
+# The engine round-trip test (`charts_roundtrip_libreoffice`) is gpui-FREE — it exercises only
+# `freecell-engine` + `freecell-chart-model` — so this job needs NO X11/Vulkan/gpui stack (unlike
+# the pixel `render` gate), just the Rust toolchain + `libreoffice-calc`. It sets
+# `FREECELL_LIBREOFFICE=1`, which makes the test HARD-FAIL if `soffice` is missing (a required
+# external-round-trip gate must not silently skip — mirrors the render gate's `FREECELL_RENDER`).
+#
+# Runs on PRs that touch `app/**` (where the manager's CR happens) and on `main`; also manually
+# dispatchable once this file lands on the default branch. Kept separate from the fast `checks`
+# gate so the ~1-minute LibreOffice install never burdens every-push CI.
+#
+# The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
+
+name: roundtrip
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/roundtrip.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - '.github/workflows/roundtrip.yml'
+
+concurrency:
+  group: roundtrip-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same CI-only trims as checks.yml (keep target/ lean; file:line backtraces without heavy DWARF).
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  roundtrip:
+    name: external round-trip (LibreOffice headless)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # LibreOffice Calc supplies the xlsx import/export filters `soffice --convert-to` needs.
+      # `--no-install-recommends` keeps it lean (no Java/help packs). This is the ONLY system dep:
+      # the round-trip test is gpui-free, so no X11/Vulkan/font stack is required.
+      - name: Install LibreOffice Calc (headless)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-calc
+          soffice --version
+
+      # Installs the toolchain pinned by app/rust-toolchain.toml.
+      - name: Install pinned toolchain
+        working-directory: app
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+          cache-on-failure: true
+
+      # The external round-trip: FreeCell saves the real Excel line workbook, LibreOffice reopens +
+      # re-writes it, and our loader reparses the surviving line chart. FREECELL_LIBREOFFICE=1 makes
+      # a missing soffice a HARD failure (no silent skip on the required gate).
+      - name: Chart external round-trip (FreeCell save -> LibreOffice reopen)
+        working-directory: app
+        env:
+          FREECELL_LIBREOFFICE: "1"
+        run: cargo test -p freecell-engine --test charts_roundtrip_libreoffice -- --nocapture

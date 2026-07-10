@@ -32,8 +32,8 @@ use gpui_component::plot::{
 };
 
 use freecell_chart_model::{
-    apply_number_format, Chart, ChartKind, DataLabelPosition, DataLabels, Marker, MarkerSymbol,
-    SeriesData,
+    apply_number_format, downsample_for_paint, Chart, ChartKind, DataLabelPosition, DataLabels,
+    Marker, MarkerSymbol, SeriesData, MAX_PAINT_VERTICES,
 };
 
 use super::chrome::chart_frame;
@@ -411,22 +411,31 @@ impl Plot for LinePlot {
         // painted at each point. Per series (line then its markers) so ordering matches the primitive.
         let stroke_style = self.stroke_style();
         for s in &self.series {
+            let n = s.values.len().min(xs.len());
+            // Large-series down-sample FOR PAINT ONLY (architecture §5 challenge 5): decimate a huge
+            // series to <= MAX_PAINT_VERTICES shape-preserving vertices so the per-frame stroke +
+            // marker cost is bounded. The retained model/source is untouched (save keeps every
+            // point). A series within budget returns identity, so ordinary charts (every committed
+            // scene is <= ~12 points) paint byte-identically — no baseline moves.
+            let keep = downsample_for_paint(&s.values[..n], MAX_PAINT_VERTICES);
+
             let xs_for_line = xs.clone();
             let values = s.values.clone();
             let scale_for_line = value_scale.clone();
             let stroke: Background = s.color.into();
-            let n = values.len().min(xs.len());
+            let keep_x = keep.clone();
+            let keep_y = keep.clone();
 
             Line::new()
-                .data((0..n).collect::<Vec<usize>>())
-                .x(move |i: &usize| Some(xs_for_line[*i]))
+                .data((0..keep.len()).collect::<Vec<usize>>())
+                .x(move |j: &usize| Some(xs_for_line[keep_x[*j]]))
                 // Drop a non-finite value (NaN/Inf) rather than emit a bad point: the primitive
                 // omits a `None` point, connecting its finite neighbors with a straight segment
                 // (never panics). So an interior non-numeric cell bridges across, and a
                 // leading/trailing run leaves a visible break — "render what's valid, blank the
                 // rest" (functional_spec §7). A true per-cell break is a future-fidelity item.
-                .y(move |i: &usize| {
-                    let v = values[*i];
+                .y(move |j: &usize| {
+                    let v = values[keep_y[*j]];
                     v.is_finite().then(|| scale_for_line.tick(&v)).flatten()
                 })
                 .stroke(stroke)
@@ -434,9 +443,10 @@ impl Plot for LinePlot {
                 .stroke_style(stroke_style)
                 .paint(&bounds, window);
 
-            // Markers at each finite point (in absolute coordinates, like the primitive's dots).
-            // `zip` stops at the shorter of xs/values, matching the `n` the line used.
-            for (&x, &v) in xs.iter().zip(&s.values) {
+            // Markers at each kept finite point (in absolute coordinates, like the primitive's dots).
+            // Iterating `keep` matches the vertices the line drew (identity keep == every point).
+            for &i in &keep {
+                let (x, v) = (xs[i], s.values[i]);
                 if let Some(y) = v.is_finite().then(|| value_scale.tick(&v)).flatten() {
                     let center = origin_point(px(x), px(y), bounds.origin);
                     paint_marker(window, center, s.marker, s.color);

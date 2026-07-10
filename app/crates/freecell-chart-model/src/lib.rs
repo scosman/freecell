@@ -25,6 +25,7 @@
 //! additively with their phases (P6/P12/P13), and the unbounded DrawingML long tail is
 //! preserved via [`ChartSpec`]'s retained source rather than modeled.
 
+mod downsample;
 mod fidelity;
 mod label;
 mod marker;
@@ -33,6 +34,7 @@ mod spec;
 mod stroke;
 mod theme;
 
+pub use downsample::{downsample_for_paint, MAX_PAINT_VERTICES};
 pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
 pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};

@@ -8,27 +8,27 @@
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
     "renderer": "assumed Mesa lavapipe / software Vulkan (ICD presence enforced by perf.sh) — CPU render-build path measured; GPU present NOT measured",
     "profile": "release",
-    "commit": "a5cf260"
+    "commit": "6f0426e"
   },
-  "note": "P11 chart perf: headless CPU render/engine path. Targets are ratified at the post-P11 human checkpoint; scroll is reported vs the repo's frame budgets for reference.",
+  "note": "chart perf: headless CPU render/engine path. P11 ops (first-paint/edit-rerender/scroll) + P15 many-line-charts (open at scale) and large-series (paint-prep + down-sample). Scroll/large-series prep are reported vs the repo's frame budgets for reference.",
   "ops": {
     "first_paint": {
       "count": 280,
-      "p50_ns": 369149,
-      "p99_ns": 435108,
-      "max_ns": 454596,
-      "p50": "369.15 µs",
-      "p99": "435.11 µs",
-      "max": "454.60 µs"
+      "p50_ns": 247835,
+      "p99_ns": 427871,
+      "max_ns": 460497,
+      "p50": "247.84 µs",
+      "p99": "427.87 µs",
+      "max": "460.50 µs"
     },
     "edit_rerender": {
       "count": 2800,
-      "p50_ns": 1873,
-      "p99_ns": 2580,
-      "max_ns": 24811,
-      "p50": "1.87 µs",
-      "p99": "2.58 µs",
-      "max": "24.81 µs"
+      "p50_ns": 1291,
+      "p99_ns": 1522,
+      "max_ns": 22684,
+      "p50": "1.29 µs",
+      "p99": "1.52 µs",
+      "max": "22.68 µs"
     },
     "scroll_with_k": {
       "k": 1000,
@@ -38,12 +38,58 @@
       "reference_frame_worst_ns": 16666667,
       "stats": {
         "count": 4360,
-        "p50_ns": 6370,
-        "p99_ns": 14091,
-        "max_ns": 36686,
-        "p50": "6.37 µs",
-        "p99": "14.09 µs",
-        "max": "36.69 µs"
+        "p50_ns": 4674,
+        "p99_ns": 8905,
+        "max_ns": 110784,
+        "p50": "4.67 µs",
+        "p99": "8.90 µs",
+        "max": "110.78 µs"
+      }
+    },
+    "many_line_charts_open": {
+      "k": 200,
+      "stats": {
+        "count": 110,
+        "p50_ns": 7613299,
+        "p99_ns": 8697462,
+        "max_ns": 8763178,
+        "p50": "7.61 ms",
+        "p99": "8.70 ms",
+        "max": "8.76 ms"
+      }
+    },
+    "large_series": {
+      "n_points_retained_for_save": 100000,
+      "vertices_painted": 2048,
+      "max_paint_vertices": 2048,
+      "reference_frame_target_ns": 8333333,
+      "reference_frame_worst_ns": 16666667,
+      "downsample": {
+        "count": 280,
+        "p50_ns": 241108,
+        "p99_ns": 271518,
+        "max_ns": 279106,
+        "p50": "241.11 µs",
+        "p99": "271.52 µs",
+        "max": "279.11 µs"
+      },
+      "paint_prep_full_n": {
+        "count": 280,
+        "p50_ns": 177241,
+        "p99_ns": 221018,
+        "max_ns": 268921,
+        "p50": "177.24 µs",
+        "p99": "221.02 µs",
+        "max": "268.92 µs"
+      },
+      "paint_prep_downsampled": {
+        "count": 280,
+        "p50_ns": 4139,
+        "p99_ns": 11840,
+        "max_ns": 23633,
+        "p50": "4.14 µs",
+        "p99": "11.84 µs",
+        "max": "23.63 µs"
       }
     }
   }

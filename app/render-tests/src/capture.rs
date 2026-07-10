@@ -197,6 +197,14 @@ pub fn default_exit_after_ms() -> u64 {
 /// capture is non-blank. The reusable core of both the grid ([`render_all`]) and chart
 /// ([`render_charts`]) paths. `launch_cmd` must NOT background itself (`&`) — the script does.
 /// `label` names the fixture in error messages.
+///
+/// **Diagnosability (P15):** the happy path is unchanged, but a failure must reveal WHY. Two
+/// error sinks that used to be `/dev/null` are captured and surfaced: `xvfb-run` gets an explicit
+/// `-e <errfile>` (its default error file is `/dev/null`, so a **failure of Xvfb itself** to
+/// start otherwise vanishes), and the capture script redirects the **render binary's** stdout+
+/// stderr to a log it dumps on any failure (a Vulkan/lavapipe device-creation failure otherwise
+/// vanishes). On a non-zero exit the bail includes the exit code, the failing-command context,
+/// `xvfb-run`'s stdout + stderr, and the Xvfb error file — so a CI run names the real cause.
 fn capture_window(
     launch_cmd: &str,
     viewport: (u32, u32),
@@ -208,15 +216,37 @@ fn capture_window(
     let script = capture_script(launch_cmd, icd, viewport, out)?;
     let screen = format!("-screen 0 {}x{}x24", w + SCREEN_MARGIN, h + SCREEN_MARGIN);
 
+    // Give `xvfb-run` an explicit error file instead of its `/dev/null` default, so an Xvfb
+    // startup / xauth failure (which never reaches the wrapped script's stderr) is captured.
+    let xvfb_err = unique_diag_path(label, "xvfb-err");
+    let xvfb_err_arg = path_str(&xvfb_err)?.to_string();
+
     let output = Command::new("xvfb-run")
-        .args(["-a", "-s", &screen, "bash", "-c", &script])
+        .args([
+            "-a",
+            "-e",
+            &xvfb_err_arg,
+            "-s",
+            &screen,
+            "bash",
+            "-c",
+            &script,
+        ])
         .output()
         .context("spawning xvfb-run")?;
+
+    let xvfb_err_text = read_and_remove(&xvfb_err);
+
     if !output.status.success() {
         bail!(
-            "capture failed (exit {:?}):\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{}",
+            format_capture_failure(
+                label,
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                &xvfb_err_text,
+            )
         );
     }
 
@@ -231,15 +261,81 @@ fn capture_window(
     })?;
     if colors <= 1 {
         bail!(
-            "capture for {label} is blank ({colors} unique colour(s)); xvfb stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "capture for {label} is blank ({colors} unique colour(s)); xvfb stderr:\n{}\nxvfb error file:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            xvfb_err_text.trim(),
         );
     }
     Ok(())
 }
 
+/// Assemble the (diagnosable) capture-failure message from the pieces the harness collects: the
+/// `xvfb-run` exit code, its stdout + stderr (the wrapped script's own diagnostic block flows
+/// here), and the Xvfb error file. Factored out so the message contract is unit-testable without
+/// a display. Empty sections are labelled `<empty>` so a blank one is an explicit signal (not a
+/// gap that reads like the section is missing).
+fn format_capture_failure(
+    label: &str,
+    exit_code: Option<i32>,
+    xvfb_stdout: &str,
+    xvfb_stderr: &str,
+    xvfb_err_file: &str,
+) -> String {
+    let section = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            "<empty>".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    format!(
+        "capture failed for {label} (xvfb-run exit {exit_code:?}).\n\
+         --- xvfb-run stderr (includes the capture script's diagnostic block: render-binary log, \
+         xwininfo tree, which step failed) ---\n{stderr}\n\
+         --- xvfb-run stdout ---\n{stdout}\n\
+         --- Xvfb error file (-e; Xvfb/xauth startup errors, normally /dev/null) ---\n{errfile}",
+        stderr = section(xvfb_stderr),
+        stdout = section(xvfb_stdout),
+        errfile = section(xvfb_err_file),
+    )
+}
+
+/// A unique path in the temp dir for a per-capture diagnostic sink (`kind` disambiguates the
+/// Xvfb error file from any future sinks). Includes the pid so parallel captures never collide.
+fn unique_diag_path(label: &str, kind: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let safe: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    std::env::temp_dir().join(format!(
+        "freecell_render_{kind}_{safe}_{}_{nanos}.log",
+        std::process::id()
+    ))
+}
+
+/// Read a diagnostic file's text (empty string if unreadable/absent) and remove it. Used for the
+/// Xvfb `-e` error file, which we only need on a failure and never want to leave behind.
+fn read_and_remove(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
+    text
+}
+
 /// The per-case bash script run inside `xvfb-run`: launch the renderer, force presentation with
 /// `xrefresh`, find the render window by its size, and capture it by id.
+///
+/// **Diagnosability (P15):** the render binary's stdout+stderr goes to a script-local log
+/// (`APP_LOG`) instead of `/dev/null`, and any non-zero `rc` dumps a diagnostic block to stderr —
+/// which step failed, the resolved `DISPLAY`, whether the render process is still alive, the
+/// render binary's captured log (a Vulkan/lavapipe device failure lands here), `import`'s stderr,
+/// and the `xwininfo` window tree (so a "no window" failure shows what DID present). The happy
+/// path (rc=0) prints nothing extra and behaves exactly as before — the timing/capture is
+/// unchanged so committed baselines never move.
 fn capture_script(
     launch_cmd: &str,
     icd: &Path,
@@ -257,20 +353,37 @@ fn capture_script(
 export VK_ICD_FILENAMES={icd}
 export LIBGL_ALWAYS_SOFTWARE=1
 export ZED_ALLOW_EMULATED_GPU=1
-{launch_cmd} >/dev/null 2>&1 &
+APP_LOG=$(mktemp)
+IMPORT_LOG=$(mktemp)
+{launch_cmd} >"$APP_LOG" 2>&1 &
 APP=$!
 sleep {settle}
 xrefresh >/dev/null 2>&1 || true
 sleep {present}
 WID=$(xwininfo -root -tree 2>/dev/null | grep "{w}x{h}+" | grep -oE '0x[0-9a-f]+' | head -1)
 rc=0
+step=""
 if [ -z "$WID" ]; then
-  echo "no {w}x{h} render window found" >&2
+  step="find-window (no {w}x{h} window presented)"
   rc=3
 else
-  import -window "$WID" {out} || rc=$?
+  import -window "$WID" {out} 2>"$IMPORT_LOG" || rc=$?
+  [ "$rc" -ne 0 ] && step="import -window $WID"
+fi
+if [ "$rc" -ne 0 ]; then
+  {{
+    echo "capture step failed: $step (rc=$rc) on DISPLAY=${{DISPLAY:-<unset>}} screen {w}x{h}"
+    if kill -0 "$APP" 2>/dev/null; then echo "[render process $APP still alive]"; else echo "[render process $APP already exited]"; fi
+    echo "--- render binary log (stdout+stderr) ---"
+    cat "$APP_LOG" 2>/dev/null || echo "<no render log>"
+    echo "--- import stderr ---"
+    cat "$IMPORT_LOG" 2>/dev/null || echo "<none>"
+    echo "--- xwininfo -root -tree ---"
+    xwininfo -root -tree 2>&1 | head -n 40 || echo "<xwininfo failed>"
+  }} >&2
 fi
 kill -KILL $APP >/dev/null 2>&1 || true
+rm -f "$APP_LOG" "$IMPORT_LOG"
 exit $rc
 "#,
     ))
@@ -301,4 +414,51 @@ fn unique_colors(path: &Path) -> Result<usize> {
         }
     }
     Ok(seen.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The diagnosable failure message (P15) surfaces the exit code and every diagnostic section
+    /// so a CI run reveals the real cause of a capture failure — not the old blank
+    /// `capture failed (exit Some(1)):`. Pure string assembly, so it needs no display.
+    #[test]
+    fn failure_message_surfaces_exit_code_and_every_section() {
+        let msg = format_capture_failure(
+            "border_all_thin",
+            Some(1),
+            "",
+            "capture step failed: find-window (rc=3)\n--- render binary log (stdout+stderr) ---\nVulkan device creation failed",
+            "Fatal server error:\nCannot establish any listening sockets",
+        );
+        // Names the case + the real exit code (the old message stopped here with empty stderr).
+        assert!(msg.contains("border_all_thin"), "message: {msg}");
+        assert!(msg.contains("exit Some(1)"), "message: {msg}");
+        // Every source of truth is present and labelled.
+        assert!(msg.contains("xvfb-run stderr"), "message: {msg}");
+        assert!(msg.contains("xvfb-run stdout"), "message: {msg}");
+        assert!(msg.contains("Xvfb error file"), "message: {msg}");
+        // The swallowed subprocess detail now reaches the log.
+        assert!(
+            msg.contains("Vulkan device creation failed"),
+            "render-binary log must surface: {msg}"
+        );
+        assert!(
+            msg.contains("Cannot establish any listening sockets"),
+            "Xvfb error file must surface: {msg}"
+        );
+    }
+
+    /// An empty section is labelled `<empty>` (an explicit signal) rather than a blank that reads
+    /// like the section was omitted — the exact ambiguity the old one-line message had.
+    #[test]
+    fn empty_sections_are_labelled_not_blank() {
+        let msg = format_capture_failure("cell_plain", Some(1), "", "", "");
+        assert!(
+            msg.contains("<empty>"),
+            "empty sections must be explicit: {msg}"
+        );
+        assert!(msg.contains("exit Some(1)"), "message: {msg}");
+    }
 }

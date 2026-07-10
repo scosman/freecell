@@ -3397,7 +3397,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironcalc"
 version = "0.7.1"
-source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#98852453d7f39ad5781dc9236e871d52e56019a3"
+source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#7a1e62379511b69e61a42b715893cd296b147c01"
 dependencies = [
  "bitcode",
  "chrono",
@@ -3413,7 +3413,7 @@ dependencies = [
 [[package]]
 name = "ironcalc_base"
 version = "0.7.1"
-source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#98852453d7f39ad5781dc9236e871d52e56019a3"
+source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#7a1e62379511b69e61a42b715893cd296b147c01"
 dependencies = [
  "bitcode",
  "chrono",

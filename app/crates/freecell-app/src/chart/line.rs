@@ -8,27 +8,34 @@
 //! - **N lines over ONE shared value scale.** All series measure against a single
 //!   [`NiceScale`] computed over the union of every series' values, so their heights are
 //!   directly comparable (the exact thing overlaid `LineChart`s cannot do).
-//! - **Straight segments** ([`StrokeStyle::Linear`]) — Excel's default line, not the
-//!   primitive's `Natural` (curved) default.
+//! - **Straight or smooth segments** — Excel's straight ([`StrokeStyle::Linear`]) default, or the
+//!   curved `Natural` line when `c:smooth` is set (P6).
 //! - a **numeric value axis** with readable "nice" tick labels + gridlines (our
-//!   [`NiceScale`]; the linear scale ships no tick generator);
+//!   [`NiceScale`]; the linear scale ships no tick generator), formatted through the axis'
+//!   `numFmt` when it carries one (P6);
 //! - a **category axis** (via [`ScalePoint`], which — unlike `ScaleBand` — honors its range
 //!   start, so no gutter fix-up is needed);
-//! - the **multi-series color cycle** ([`series_color`]), matched swatch-for-swatch by the
-//!   legend the surrounding [`super::chrome`] frame draws.
+//! - the **multi-series color cycle** (resolving explicit sRGB / theme / palette colors, P6),
+//!   matched swatch-for-swatch by the legend the surrounding [`super::chrome`] frame draws;
+//! - **per-point markers** (`c:marker` shapes, P6) painted at each data point.
 
-use gpui::{px, Background, Bounds, Hsla, IntoElement, Pixels, SharedString, TextAlign, Window};
+use gpui::{
+    point, px, size, Background, BorderStyle, Bounds, Hsla, IntoElement, PathBuilder, Pixels,
+    Point, SharedString, TextAlign, Window,
+};
 use gpui_component::plot::{
+    origin_point,
     scale::{Scale, ScaleLinear, ScalePoint},
     shape::Line,
     AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, StrokeStyle, AXIS_GAP,
 };
 
-use freecell_chart_model::{Chart, ChartKind, SeriesData};
+use freecell_chart_model::{
+    apply_number_format, Chart, ChartKind, Marker, MarkerSymbol, SeriesData,
+};
 
 use super::chrome::chart_frame;
-use super::palette::series_color;
-use super::style::{hsla, model_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
 use super::ticks::{format_tick, NiceScale};
 
 /// Pixels reserved at the left of the plot for value-axis tick labels.
@@ -44,15 +51,21 @@ const POINT_INSET: f32 = 10.0;
 const TARGET_TICKS: usize = 5;
 /// Line stroke width.
 const LINE_WIDTH: f32 = 2.0;
-/// Marker (dot) diameter.
+/// Default marker diameter — also the round dot drawn when a series specifies no marker.
 const DOT_SIZE: f32 = 6.0;
+/// Stroke width for the open-shape markers (plus / x / dash).
+const MARKER_STROKE_WIDTH: f32 = 1.6;
+/// The `dot` marker's radius as a fraction of the full marker radius — Excel's `dot` is a small
+/// filled dot, noticeably smaller than the `circle`/default marker.
+const DOT_MARKER_SCALE: f32 = 0.55;
 
-/// One line: its per-category values and its color (already resolved from the series' explicit
-/// color or the palette cycle).
+/// One line: its per-category values, its resolved color, and its marker (already resolved from the
+/// series' explicit color/theme reference or the palette cycle, and its `c:marker`).
 #[derive(Clone)]
 struct LineSeries {
     values: Vec<f64>,
     color: Hsla,
+    marker: Option<Marker>,
 }
 
 /// A multi-series line plot over the raw `Line` primitive with ONE shared value scale
@@ -63,6 +76,10 @@ pub struct LinePlot {
     series: Vec<LineSeries>,
     /// The single value domain shared by every series (the union of all their values, nice-d).
     scale: NiceScale,
+    /// Whether to draw curved (`c:smooth`) rather than straight segments.
+    smooth: bool,
+    /// The value-axis `c:numFmt` format code, applied to tick labels when present.
+    value_format: Option<String>,
 }
 
 impl LinePlot {
@@ -70,9 +87,9 @@ impl LinePlot {
     /// every series contributes to the shared value domain. Returns `None` for a non-line
     /// chart or one with no category/value data.
     pub fn multi_series(chart: &Chart) -> Option<Self> {
-        if !matches!(chart.kind, ChartKind::Line { .. }) {
+        let ChartKind::Line { smooth, .. } = chart.kind else {
             return None;
-        }
+        };
 
         let mut categories: Option<Vec<SharedString>> = None;
         let mut series = Vec::new();
@@ -87,10 +104,10 @@ impl LinePlot {
             if categories.is_none() {
                 categories = Some(cats.iter().map(|c| c.label().into()).collect());
             }
-            let color = model_hsla(s.color.unwrap_or_else(|| series_color(i)));
             series.push(LineSeries {
                 values: values.clone(),
-                color,
+                color: resolve_series_hsla(s.color, i),
+                marker: s.marker,
             });
         }
 
@@ -110,7 +127,27 @@ impl LinePlot {
             categories,
             series,
             scale,
+            smooth,
+            value_format: chart.val_axis.number_format.clone(),
         })
+    }
+
+    /// The stroke style for the current `smooth` flag: curved (`Natural`) when smooth, else the
+    /// straight `Linear` segments Excel draws by default.
+    fn stroke_style(&self) -> StrokeStyle {
+        if self.smooth {
+            StrokeStyle::Natural
+        } else {
+            StrokeStyle::Linear
+        }
+    }
+
+    /// A value-axis tick label, formatted through the axis `numFmt` when it carries one.
+    fn tick_label(&self, tick: f64) -> String {
+        match &self.value_format {
+            Some(code) => apply_number_format(code, tick),
+            None => format_tick(tick),
+        }
     }
 
     /// The shared value domain (exposed for tests: it must cover every series' values).
@@ -118,6 +155,128 @@ impl LinePlot {
     fn shared_scale(&self) -> NiceScale {
         self.scale
     }
+}
+
+/// Paint one series' marker at `center` (absolute window coordinates). The default (`marker ==
+/// None`) is the P5 round dot — a filled circle at [`DOT_SIZE`] with a white edge — so a series
+/// that specifies no marker looks exactly as it did before P6. Filled shapes
+/// (circle/square/diamond/triangle/star/dot/auto) are painted as a filled path or quad; the open
+/// shapes (plus/x/dash) as a stroked path in the series color; `none` paints nothing.
+fn paint_marker(window: &mut Window, center: Point<Pixels>, marker: Option<Marker>, color: Hsla) {
+    // A series with no `c:marker` defaults to the round dot (the P5 default), so absence resolves to
+    // `Circle`; an explicit `none` paints nothing (handled in the match, no early return).
+    let symbol = marker.map(|m| m.symbol).unwrap_or(MarkerSymbol::Circle);
+    let diameter = marker.and_then(|m| m.size).unwrap_or(DOT_SIZE);
+    let r = px(diameter / 2.0);
+    let edge = hsla(0xFFFFFF);
+    let cx = center.x;
+    let cy = center.y;
+
+    // A white-edged filled disc of `radius`, centered — the circle/dot marker primitive.
+    let disc = |window: &mut Window, radius: Pixels, border: Pixels| {
+        let top_left = point(cx - radius, cy - radius);
+        window.paint_quad(gpui::quad(
+            gpui::bounds(top_left, size(radius * 2.0, radius * 2.0)),
+            radius,
+            color,
+            border,
+            edge,
+            BorderStyle::default(),
+        ));
+    };
+
+    // A closed filled polygon through `pts` (absolute coordinates), edged in white.
+    let filled_polygon = |window: &mut Window, pts: &[Point<Pixels>]| {
+        let mut b = PathBuilder::fill();
+        b.move_to(pts[0]);
+        for p in &pts[1..] {
+            b.line_to(*p);
+        }
+        b.close();
+        if let Ok(path) = b.build() {
+            window.paint_path(path, color);
+        }
+    };
+    // A stroked segment set (each pair is a move+line) in the series color.
+    let stroked = |window: &mut Window, segments: &[(Point<Pixels>, Point<Pixels>)]| {
+        let mut b = PathBuilder::stroke(px(MARKER_STROKE_WIDTH));
+        for (from, to) in segments {
+            b.move_to(*from);
+            b.line_to(*to);
+        }
+        if let Ok(path) = b.build() {
+            window.paint_path(path, color);
+        }
+    };
+
+    match symbol {
+        // Reachable: an explicit `<c:symbol val="none"/>` (the default-marker case resolves to
+        // `Circle` above, so this is only hit for an authored/parsed `none`).
+        MarkerSymbol::None => {}
+        // Circle / auto: a white-edged filled disc at the full radius (the P5 default dot).
+        MarkerSymbol::Circle | MarkerSymbol::Auto => disc(window, r, px(1.0)),
+        // Dot: a smaller, unbordered filled dot (Excel's `dot` is noticeably smaller).
+        MarkerSymbol::Dot => disc(window, r * DOT_MARKER_SCALE, px(0.0)),
+        MarkerSymbol::Square => {
+            let top_left = point(cx - r, cy - r);
+            window.paint_quad(gpui::quad(
+                gpui::bounds(top_left, size(r * 2.0, r * 2.0)),
+                px(0.0),
+                color,
+                px(1.0),
+                edge,
+                BorderStyle::default(),
+            ));
+        }
+        MarkerSymbol::Diamond => filled_polygon(
+            window,
+            &[
+                point(cx, cy - r),
+                point(cx + r, cy),
+                point(cx, cy + r),
+                point(cx - r, cy),
+            ],
+        ),
+        MarkerSymbol::Triangle => filled_polygon(
+            window,
+            &[
+                point(cx, cy - r),
+                point(cx + r, cy + r),
+                point(cx - r, cy + r),
+            ],
+        ),
+        MarkerSymbol::Star => filled_polygon(window, &star_points(cx, cy, r)),
+        MarkerSymbol::Plus => stroked(
+            window,
+            &[
+                (point(cx, cy - r), point(cx, cy + r)),
+                (point(cx - r, cy), point(cx + r, cy)),
+            ],
+        ),
+        MarkerSymbol::X => stroked(
+            window,
+            &[
+                (point(cx - r, cy - r), point(cx + r, cy + r)),
+                (point(cx - r, cy + r), point(cx + r, cy - r)),
+            ],
+        ),
+        MarkerSymbol::Dash => stroked(window, &[(point(cx - r, cy), point(cx + r, cy))]),
+    }
+}
+
+/// The ten vertices (alternating outer/inner radius) of a five-pointed star centered at
+/// `(cx, cy)`, outer radius `r`.
+fn star_points(cx: Pixels, cy: Pixels, r: Pixels) -> Vec<Point<Pixels>> {
+    let outer = r.as_f32();
+    let inner = outer * 0.4;
+    (0..10)
+        .map(|i| {
+            let radius = if i % 2 == 0 { outer } else { inner };
+            // Start at the top point (−90°) and step 36° per vertex.
+            let angle = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+            point(cx + px(radius * angle.cos()), cy + px(radius * angle.sin()))
+        })
+        .collect()
 }
 
 impl Plot for LinePlot {
@@ -158,10 +317,11 @@ impl Plot for LinePlot {
             .y(grid_ys)
             .paint(&bounds, window);
 
-        // Axes + labels: value labels left of the value axis, category labels below the baseline.
+        // Axes + labels: value labels left of the value axis (formatted through the axis numFmt
+        // when present), category labels below the baseline.
         let value_labels = ticks.iter().filter_map(|t| {
             value_scale.tick(t).map(|y| {
-                AxisText::new(format_tick(*t), px(y), hsla(MUTED_TEXT)).align(TextAlign::Right)
+                AxisText::new(self.tick_label(*t), px(y), hsla(MUTED_TEXT)).align(TextAlign::Right)
             })
         });
         let cat_labels = self.categories.iter().enumerate().map(|(i, c)| {
@@ -176,19 +336,20 @@ impl Plot for LinePlot {
             .stroke(hsla(AXIS_STROKE))
             .paint(&bounds, window, cx);
 
-        // One `Line` per series, all sharing `xs` (category positions) and `value_scale`
-        // (the shared value domain). Straight segments (Excel's default), with small dot
-        // markers to keep crossing lines readable.
+        // One `Line` per series, all sharing `xs` (category positions) and `value_scale` (the
+        // shared value domain). Straight or smooth segments per `c:smooth`, then the series' `c:marker`
+        // painted at each point. Per series (line then its markers) so ordering matches the primitive.
+        let stroke_style = self.stroke_style();
         for s in &self.series {
-            let xs = xs.clone();
+            let xs_for_line = xs.clone();
             let values = s.values.clone();
-            let value_scale = value_scale.clone();
+            let scale_for_line = value_scale.clone();
             let stroke: Background = s.color.into();
             let n = values.len().min(xs.len());
 
             Line::new()
                 .data((0..n).collect::<Vec<usize>>())
-                .x(move |i: &usize| Some(xs[*i]))
+                .x(move |i: &usize| Some(xs_for_line[*i]))
                 // Drop a non-finite value (NaN/Inf) rather than emit a bad point: the primitive
                 // omits a `None` point, connecting its finite neighbors with a straight segment
                 // (never panics). So an interior non-numeric cell bridges across, and a
@@ -196,16 +357,21 @@ impl Plot for LinePlot {
                 // rest" (functional_spec §7). A true per-cell break is a future-fidelity item.
                 .y(move |i: &usize| {
                     let v = values[*i];
-                    v.is_finite().then(|| value_scale.tick(&v)).flatten()
+                    v.is_finite().then(|| scale_for_line.tick(&v)).flatten()
                 })
                 .stroke(stroke)
                 .stroke_width(px(LINE_WIDTH))
-                .stroke_style(StrokeStyle::Linear)
-                .dot()
-                .dot_size(px(DOT_SIZE))
-                .dot_fill_color(s.color)
-                .dot_stroke_color(hsla(0xFFFFFF))
+                .stroke_style(stroke_style)
                 .paint(&bounds, window);
+
+            // Markers at each finite point (in absolute coordinates, like the primitive's dots).
+            // `zip` stops at the shorter of xs/values, matching the `n` the line used.
+            for (&x, &v) in xs.iter().zip(&s.values) {
+                if let Some(y) = v.is_finite().then(|| value_scale.tick(&v)).flatten() {
+                    let center = origin_point(px(x), px(y), bounds.origin);
+                    paint_marker(window, center, s.marker, s.color);
+                }
+            }
         }
     }
 }
@@ -343,5 +509,64 @@ mod tests {
         let mut empty = three_series_line();
         empty.series.clear();
         assert!(LinePlot::multi_series(&empty).is_none());
+    }
+
+    #[test]
+    fn smooth_flag_selects_stroke_style() {
+        // A non-smooth line draws straight (`Linear`) segments; a smooth one curves (`Natural`).
+        let straight = LinePlot::multi_series(&three_series_line()).expect("plot");
+        assert!(matches!(straight.stroke_style(), StrokeStyle::Linear));
+        assert!(!straight.smooth);
+
+        let mut curved = three_series_line();
+        curved.kind = ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: true,
+        };
+        let curved = LinePlot::multi_series(&curved).expect("plot");
+        assert!(curved.smooth);
+        assert!(matches!(curved.stroke_style(), StrokeStyle::Natural));
+    }
+
+    #[test]
+    fn series_marker_is_carried_into_the_plot() {
+        let mut chart = three_series_line();
+        chart.series[0] = chart.series[0]
+            .clone()
+            .with_marker(Marker::new(MarkerSymbol::Square));
+        let plot = LinePlot::multi_series(&chart).expect("plot");
+        assert_eq!(
+            plot.series[0].marker,
+            Some(Marker::new(MarkerSymbol::Square))
+        );
+        // A series with no marker leaves it None (the renderer draws its default dot).
+        assert_eq!(plot.series[1].marker, None);
+    }
+
+    #[test]
+    fn theme_color_series_resolves_to_office_accent() {
+        use freecell_chart_model::{ChartColor, ThemePalette, ThemeSlot};
+        let mut chart = three_series_line();
+        chart.series[0] = chart.series[0]
+            .clone()
+            .with_color(ChartColor::theme(ThemeSlot::Accent1));
+        let plot = LinePlot::multi_series(&chart).expect("plot");
+        let expected = super::super::style::model_hsla(ThemePalette::office_default().accent1);
+        assert_eq!(
+            plot.series[0].color, expected,
+            "a schemeClr=accent1 series must resolve to the Office accent1 color"
+        );
+    }
+
+    #[test]
+    fn value_axis_numfmt_formats_tick_labels() {
+        // With a percent numFmt the ticks read as percentages; without one they are plain numbers.
+        let mut chart = three_series_line();
+        chart.val_axis = Axis::titled("Share").with_number_format("0%");
+        let plot = LinePlot::multi_series(&chart).expect("plot");
+        assert_eq!(plot.tick_label(0.25), "25%");
+
+        let plain = LinePlot::multi_series(&three_series_line()).expect("plot");
+        assert_eq!(plain.tick_label(40.0), format_tick(40.0));
     }
 }

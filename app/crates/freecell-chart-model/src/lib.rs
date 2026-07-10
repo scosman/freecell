@@ -26,15 +26,22 @@
 //! preserved via [`ChartSpec`]'s retained source rather than modeled.
 
 mod fidelity;
+mod marker;
+mod numfmt;
 mod spec;
+mod theme;
 
 pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
+pub use marker::{Marker, MarkerSymbol};
+pub use numfmt::apply_number_format;
 pub use spec::{Anchor, AnchorCell, CfRange, ChartSpec, Origin, SourcePart, SourceXml};
+pub use theme::{ChartColor, ThemePalette, ThemeSlot};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
 ///
-/// The PoC only needs solid colors; the wider OOXML color model (theme refs, tints,
-/// alpha) is out of scope and would be added by the follow-on project.
+/// This is the concrete resolved color. Theme-slot references (`<a:schemeClr>`) and their
+/// `lumMod`/`lumOff` tints are modeled by [`ChartColor`] (P6), which resolves to a [`Color`]
+/// against a [`ThemePalette`]; alpha is still out of scope (P13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -144,13 +151,16 @@ pub enum SeriesData {
     Xy { x: Vec<f64>, y: Vec<f64> },
 }
 
-/// One data series — a `c:ser` element. `color` mirrors an explicit `c:spPr` solid
-/// fill; `None` means "let the renderer pick from the palette cycle".
+/// One data series — a `c:ser` element. `color` mirrors the series' `c:spPr` fill — an explicit
+/// sRGB color or a theme reference ([`ChartColor`], P6); `None` means "let the renderer pick from
+/// the palette cycle". `marker` mirrors `c:marker` (the point symbol for a line/scatter series,
+/// P6); `None` leaves the marker to the renderer's default.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Series {
     pub name: Option<String>,
     pub data: SeriesData,
-    pub color: Option<Color>,
+    pub color: Option<ChartColor>,
+    pub marker: Option<Marker>,
 }
 
 impl Series {
@@ -164,6 +174,7 @@ impl Series {
             name: name.map(Into::into),
             data: SeriesData::CategoryValue { categories, values },
             color: None,
+            marker: None,
         }
     }
 
@@ -173,12 +184,20 @@ impl Series {
             name: name.map(Into::into),
             data: SeriesData::Xy { x, y },
             color: None,
+            marker: None,
         }
     }
 
-    /// Set an explicit series color (builder style).
-    pub fn with_color(mut self, color: Color) -> Self {
-        self.color = Some(color);
+    /// Set an explicit series color (builder style) — an sRGB [`Color`] or a [`ChartColor`]
+    /// (theme reference); a plain `Color` converts via [`From<Color>`](ChartColor).
+    pub fn with_color(mut self, color: impl Into<ChartColor>) -> Self {
+        self.color = Some(color.into());
+        self
+    }
+
+    /// Set the series marker (builder style).
+    pub fn with_marker(mut self, marker: Marker) -> Self {
+        self.marker = Some(marker);
         self
     }
 
@@ -195,22 +214,36 @@ impl Series {
     }
 }
 
-/// An axis — for the PoC only its title matters (`c:valAx` / `c:catAx` `c:title`).
-/// Numeric formatting and scale are the renderer's business (functional_spec §2).
+/// An axis — its title (`c:valAx` / `c:catAx` `c:title`) and its number format (`c:numFmt`
+/// `formatCode`, applied to tick labels, P6). The scale/tick generation is the renderer's business
+/// (functional_spec §2); `number_format` only governs how each tick number is *rendered*
+/// ([`apply_number_format`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Axis {
     pub title: Option<String>,
+    /// The `c:numFmt` format code (e.g. `"0%"`, `"$#,##0"`); `None` = general number formatting.
+    pub number_format: Option<String>,
 }
 
 impl Axis {
     pub fn untitled() -> Self {
-        Self { title: None }
+        Self {
+            title: None,
+            number_format: None,
+        }
     }
 
     pub fn titled(title: impl Into<String>) -> Self {
         Self {
             title: Some(title.into()),
+            number_format: None,
         }
+    }
+
+    /// Set the axis tick number format (`c:numFmt` format code, builder style).
+    pub fn with_number_format(mut self, format_code: impl Into<String>) -> Self {
+        self.number_format = Some(format_code.into());
+        self
     }
 }
 
@@ -251,8 +284,9 @@ pub struct Chart {
 }
 
 /// Format a cached number for a label: integers print without a decimal point, other
-/// values keep up to a few significant fractional digits, trimmed of trailing zeros.
-fn format_number(n: f64) -> String {
+/// values keep up to a few significant fractional digits, trimmed of trailing zeros. Shared with
+/// [`numfmt`] as the `General` / fall-back formatting.
+pub(crate) fn format_number(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e15 {
         return format!("{}", n as i64);
     }
@@ -298,6 +332,39 @@ mod tests {
         assert!(xy.is_empty());
     }
 
+    #[test]
+    fn series_color_accepts_rgb_and_theme() {
+        let base = Series::category_value(Some("s"), vec![], vec![]);
+        assert_eq!(base.color, None, "constructors default color to None");
+        assert_eq!(base.marker, None, "constructors default marker to None");
+
+        // A plain `Color` converts to `ChartColor::Rgb` via `From`.
+        let explicit = base.clone().with_color(Color::from_hex(0x123456));
+        assert_eq!(
+            explicit.color,
+            Some(ChartColor::Rgb(Color::from_hex(0x123456)))
+        );
+
+        // A theme reference is stored as-is.
+        let themed = base
+            .clone()
+            .with_color(ChartColor::theme(ThemeSlot::Accent2));
+        assert_eq!(themed.color, Some(ChartColor::theme(ThemeSlot::Accent2)));
+
+        // Markers ride the same builder pattern.
+        let marked = base.with_marker(Marker::new(MarkerSymbol::Diamond));
+        assert_eq!(marked.marker, Some(Marker::new(MarkerSymbol::Diamond)));
+    }
+
+    #[test]
+    fn axis_number_format_builder() {
+        assert_eq!(Axis::untitled().number_format, None);
+        assert_eq!(Axis::titled("Units").number_format, None);
+        let ax = Axis::titled("Revenue").with_number_format("$#,##0");
+        assert_eq!(ax.title.as_deref(), Some("Revenue"));
+        assert_eq!(ax.number_format.as_deref(), Some("$#,##0"));
+    }
+
     /// The model "round-trips" in the sense that a chart built through the public API
     /// reads back exactly the values it was given (there is no serialization yet —
     /// that is Experiment 1's job; this guards the in-memory shape / seam).
@@ -335,7 +402,7 @@ mod tests {
         assert_eq!(chart.series.len(), 1);
         let s = &chart.series[0];
         assert_eq!(s.name.as_deref(), Some("2024"));
-        assert_eq!(s.color, Some(Color::rgb(0x1F, 0x77, 0xB4)));
+        assert_eq!(s.color, Some(ChartColor::Rgb(Color::rgb(0x1F, 0x77, 0xB4))));
         assert_eq!(s.len(), 3);
         match &s.data {
             SeriesData::CategoryValue { categories, values } => {

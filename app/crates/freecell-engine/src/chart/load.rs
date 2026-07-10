@@ -496,7 +496,9 @@ mod tests {
         assert_eq!(s.name.as_deref(), Some("Widgets"));
         assert_eq!(
             s.color,
-            Some(freecell_chart_model::Color::from_hex(0x4472C4))
+            Some(freecell_chart_model::ChartColor::Rgb(
+                freecell_chart_model::Color::from_hex(0x4472C4)
+            ))
         );
         match &s.data {
             SeriesData::CategoryValue { categories, values } => {

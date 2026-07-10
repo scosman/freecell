@@ -7,16 +7,16 @@
 //! every series/slice with the exact color that mark uses, so the series→color mapping the §6
 //! rubric checks is correct by construction — the plot and the legend read the same palette.
 //! For a **pie/doughnut** the "series" are the *categories* of the single series, so the legend
-//! keys off the categories + [`slice_color`]; for everything else it keys off the series +
-//! [`series_color`].
+//! keys off the categories + [`slice_color`]; for everything else it keys off the series color,
+//! resolved by [`resolve_series_color`] (explicit sRGB / theme reference, else the palette cycle).
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{div, px, rgb, FontWeight, IntoElement, ParentElement, SharedString, Styled};
 
 use freecell_chart_model::{BarDir, Chart, ChartKind, SeriesData};
 
-use super::palette::{series_color, slice_color};
-use super::style::{AXIS_TITLE_TEXT, BACKGROUND, TITLE_TEXT};
+use super::palette::slice_color;
+use super::style::{resolve_series_color, AXIS_TITLE_TEXT, BACKGROUND, TITLE_TEXT};
 
 /// One legend key: the swatch color (packed `0xRRGGBB`) and the label it sits beside. This is the
 /// load-bearing series↔swatch mapping (module docs) — a plain, gpui-free struct so the mapping is
@@ -50,7 +50,9 @@ pub(crate) fn legend_entries(chart: &Chart) -> Vec<LegendEntry> {
         .iter()
         .enumerate()
         .map(|(i, s)| LegendEntry {
-            color: s.color.unwrap_or_else(|| series_color(i)).to_hex(),
+            // Resolve the series' explicit sRGB / theme color (or the palette cycle) to the same
+            // color its mark uses, so swatch↔mark match by construction (P6 theme colors included).
+            color: resolve_series_color(s.color, i).to_hex(),
             name: s
                 .name
                 .clone()
@@ -94,10 +96,11 @@ fn legend(chart: &Chart) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// The two axis-title captions (above the plot, below the plot). For a **horizontal** bar chart
-/// the value axis is at the bottom and the category axis on the left, so the captions swap:
-/// value title goes below (under the bottom value axis), category title above. Every other kind
-/// keeps value-title-above / category-title-below.
+/// The two axis titles as `(vertical_title, horizontal_title)` — the title of the **vertical** axis
+/// (rendered rotated down the left, [`vertical_axis_title`]) and of the **horizontal** axis
+/// (rendered as the bottom caption). Normally the value axis is vertical and the category axis
+/// horizontal; a **horizontal** bar chart swaps them (its value axis runs along the bottom, its
+/// category axis down the left).
 fn captions(chart: &Chart) -> (String, String) {
     let value = chart.val_axis.title.clone().unwrap_or_default();
     let category = chart.cat_axis.title.clone().unwrap_or_default();
@@ -114,46 +117,53 @@ fn captions(chart: &Chart) -> (String, String) {
     }
 }
 
-/// Wrap a plot element in the full chart frame: chart title on top, one axis-title caption above
-/// the plot, the plot beside its legend, and the other axis-title caption centered below. Shared
-/// by every chart kind so the chrome is identical across them.
+/// The vertical-axis title: a rotated, bottom-of-left caption. gpui cannot rotate a text run at the
+/// pinned rev (only svg/img take a transform), so — matching Excel's placement within that
+/// constraint — the characters are **stacked** in a narrow column beside the value axis, vertically
+/// centered against the plot. (When gpui gains text rotation this becomes a true 90° label with no
+/// call-site change.)
+fn vertical_axis_title(text: String) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .w(px(16.))
+        .children(text.chars().map(|c| {
+            div()
+                .text_color(rgb(AXIS_TITLE_TEXT))
+                .text_size(px(11.))
+                .line_height(px(12.))
+                .child(SharedString::from(c.to_string()))
+        }))
+        .into_any_element()
+}
+
+/// Wrap a plot element in the full chart frame: chart title on top, the **vertical**-axis title
+/// rotated down the left of the plot, the plot beside its legend, and the **horizontal**-axis title
+/// centered below. Shared by every chart kind so the chrome is identical across them.
 ///
-/// The chrome is **driven by the model, not always-on**: the title row, each axis-title caption,
-/// and the legend column are each rendered only when the model carries them (a non-empty title /
-/// caption, `chart.legend.is_some()`). An untitled, legend-less chart is just its plot — no blank
-/// rows, no stray legend column.
+/// The chrome is **driven by the model, not always-on**: the title row, each axis title, and the
+/// legend column are each rendered only when the model carries them (a non-empty title / axis
+/// title, `chart.legend.is_some()`). An untitled, legend-less chart is just its plot — no blank
+/// rows/columns, no stray legend column.
 pub fn chart_frame(chart: &Chart, plot: gpui::AnyElement) -> gpui::AnyElement {
     let title = chart.title.clone().unwrap_or_default();
-    let (top_caption, bottom_caption) = captions(chart);
+    let (vertical_title, bottom_caption) = captions(chart);
     let has_legend = chart.legend.is_some();
 
     let body = div()
         .flex_1()
         .min_h(px(0.))
         .flex()
-        .flex_col()
-        // Top axis-title caption (compact caption above the plot) — only when there is one.
-        .when(!top_caption.is_empty(), |body| {
-            body.child(
-                div().pl(px(6.)).child(
-                    div()
-                        .text_color(rgb(AXIS_TITLE_TEXT))
-                        .text_size(px(11.))
-                        .child(SharedString::from(top_caption)),
-                ),
-            )
+        .flex_row()
+        // The vertical-axis title, rotated down the left of the value axis — only when there is one.
+        .when(!vertical_title.is_empty(), |body| {
+            body.child(vertical_axis_title(vertical_title))
         })
-        .child(
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .flex_row()
-                .child(div().flex_1().min_w(px(0.)).child(plot))
-                // The legend column only when the model has a legend; otherwise the plot fills
-                // the full width.
-                .when(has_legend, |row| row.child(legend(chart))),
-        );
+        .child(div().flex_1().min_w(px(0.)).child(plot))
+        // The legend column only when the model has a legend; otherwise the plot fills the width.
+        .when(has_legend, |row| row.child(legend(chart)));
 
     div()
         .size_full()
@@ -247,6 +257,21 @@ mod tests {
         assert_eq!(
             entries[0].color, 0x123456,
             "an explicit series color must win over the palette"
+        );
+    }
+
+    #[test]
+    fn legend_entry_resolves_theme_colored_series() {
+        use freecell_chart_model::{ChartColor, ThemePalette, ThemeSlot};
+        let mut chart = multi_series_line();
+        chart.series[0] = chart.series[0]
+            .clone()
+            .with_color(ChartColor::theme(ThemeSlot::Accent2));
+        let entries = legend_entries(&chart);
+        assert_eq!(
+            entries[0].color,
+            ThemePalette::office_default().accent2.to_hex(),
+            "a schemeClr swatch must resolve to the same Office accent color its mark uses"
         );
     }
 

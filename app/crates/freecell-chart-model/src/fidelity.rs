@@ -29,15 +29,22 @@
 //! Sourced from `experiments/chart-poc/ooxml-coverage-matrix.md`: the renderer's honored
 //! baseline (the matrix **OK** rows) is Faithful; a render-affecting feature the matrix marks as
 //! not-yet-supported degrades the chart. The set is deliberately curated to fire **only when a
-//! feature is actually active** — benign/default forms (a `General` number format,
-//! `smooth val="0"`, a `none`/`circle` marker symbol, a `minMax` orientation, an all-zero
-//! `dLbls`) must **not** raise a false warning (architecture §3.3). Excluded on the same
-//! grounds: the `scaling` wrapper
-//! (always present), gridline toggles (we draw gridlines anyway), `varyColors` (matches our
-//! palette), `gapWidth`/`overlap`/`firstSliceAng` (written at defaults on nearly every
-//! bar/pie), and `schemeClr` (pervasive across text/chrome — theme-fill fidelity is assessed
-//! by the parser where fill context is known, and lands with P6). Entries auto-drop as support
-//! arrives (P6/P12/P13).
+//! feature is actually active** — benign/default forms (a `General` number format, a `minMax`
+//! orientation, an all-zero `dLbls`) must **not** raise a false warning (architecture §3.3).
+//! Excluded on the same grounds: the `scaling` wrapper (always present), gridline toggles (we
+//! draw gridlines anyway), `varyColors` (matches our palette), `gapWidth`/`overlap`/`firstSliceAng`
+//! (written at defaults on nearly every bar/pie), and `schemeClr` (a theme reference we now
+//! resolve to a color, P6).
+//!
+//! **Auto-dropped / scoped as support arrives.** `smooth` (curved lines) **renders faithfully as
+//! of P6** (on `lineChart`, the only group that draws it), so it left this set. `c:marker` symbols
+//! are now **scoped to the renderer that honors them**: P6's line renderer paints every symbol, so
+//! a marker on a `lineChart` is Faithful — but the scatter/point renderers still draw a fixed
+//! circle and ignore `c:marker` (their marker support is a later phase), so a non-`circle`/non-`none`
+//! symbol on a **non-line** group still degrades (a wrong chart must keep its badge). `c:numFmt`
+//! remains — P6 applies a **bounded** subset to ticks, so a format code we don't parse must still
+//! warn; P12 completes numFmt and shrinks this further. Entries auto-drop / re-scope with no
+//! separate bookkeeping (architecture §3.3).
 
 /// How faithfully the renderer can draw a chart, derived from its model + retained source
 /// (charts/functional_spec §5, architecture §3.3). Consumed by the render/UI layer (P8):
@@ -100,8 +107,11 @@ const UNSUPPORTED_CHART_GROUPS: &[&str] = &[
 ///   *do* resolve to a color, so its presence is not by itself a fidelity loss.
 /// - `c:min` / `c:max` — explicit axis-scaling bounds (written only when set).
 ///
-/// The value-aware markers (`smooth`, `numFmt`, `orientation`, `dLbls` toggles, marker
-/// `symbol`) need their value inspected and are handled by dedicated detectors below.
+/// The value-aware features still tracked (`numFmt`, `orientation`, `dLbls` toggles, and the
+/// **line-scoped** marker check) need their value/context inspected and are handled by dedicated
+/// detectors below. `c:smooth` left the set entirely in P6 (rendered on line, and line is the only
+/// group that draws it); `c:marker` is now **scoped** — Faithful on a `lineChart` (P6 renders every
+/// symbol) but still degrading on a non-line group (see [`unsupported_marker`]).
 const RENDER_AFFECTING_PRESENCE_MARKERS: &[&str] = &["dPt", "gradFill", "pattFill", "min", "max"];
 
 /// Map a **3-D** chart-group element local-name to its **2-D** equivalent element local-name
@@ -167,11 +177,10 @@ fn has_render_affecting_unsupported_feature(xml: &str) -> bool {
     RENDER_AFFECTING_PRESENCE_MARKERS
         .iter()
         .any(|marker| contains_element(xml, marker))
-        || smooth_enabled(xml)
         || axis_reversed(xml)
         || custom_number_format(xml)
         || data_labels_shown(xml)
-        || markers_shown(xml)
+        || unsupported_marker(xml)
 }
 
 /// The `cx:` extended-chart family (sunburst, treemap, waterfall, histogram, box-&-whisker,
@@ -179,12 +188,6 @@ fn has_render_affecting_unsupported_feature(xml: &str) -> bool {
 /// part declares that namespace, so its URI fragment is a reliable marker.
 fn is_extended_chart(xml: &str) -> bool {
     xml.contains("chartex")
-}
-
-/// `c:smooth val="1"` — a curved line we don't yet draw (P6). `val="0"` (explicit straight) is
-/// benign and must not degrade.
-fn smooth_enabled(xml: &str) -> bool {
-    any_opening_tag(xml, "smooth", val_is_true)
 }
 
 /// `c:orientation val="maxMin"` — a reversed axis we don't honor. The default `minMax` is
@@ -222,18 +225,40 @@ fn data_labels_shown(xml: &str) -> bool {
         .any(|toggle| any_opening_tag(xml, toggle, val_is_true))
 }
 
-/// A `c:marker` with a `c:symbol` we cannot draw. Per the coverage matrix (section C `c:marker`:
-/// "Round dot markers exist; non-circle shapes … need custom marks"), the round **`circle`** dot
-/// *is* drawable and **`none`** means no marker — both are Faithful, and `circle` in particular
-/// is what real scatter series (a first-class supported type) carry, so flagging it would badge
-/// nearly every scatter chart (architecture §3.3 forbids that false warning). Only a non-circle
-/// shape (`square`/`diamond`/`triangle`/…) we don't yet render degrades.
-fn markers_shown(xml: &str) -> bool {
+/// A `c:marker` with a `c:symbol` shape only the **line** renderer draws. P6's line renderer paints
+/// every OOXML marker symbol, so a marker on a `lineChart` is Faithful; but the scatter/point
+/// renderers still draw a fixed `circle` and ignore `c:marker` (their marker support is a later
+/// phase), so a non-line chart-group carrying a non-`circle`/non-`none` symbol still renders wrong →
+/// Degraded. `circle`/`none` are exactly what the fixed renderer draws (or nothing), so they are
+/// Faithful anywhere. (A `line3DChart` is *not* a `lineChart` — it degrades as a 3-D group first,
+/// which takes precedence in [`source_fidelity`], so the scoping here only ever sees the 2-D line.)
+///
+/// **Caveat (combo parts):** this classifier is textual, not a DOM, so it can't bind a `<c:marker>`
+/// to its *enclosing* chart-group. In a **combo** part that holds both a `<c:lineChart>` and another
+/// group (e.g. `<c:scatterChart>`), [`is_line_chart`] is true, so a non-circle marker on the
+/// *non-line* series is currently classified Faithful (its advisory badge is dropped) — revisit when
+/// P7 lands real multi-group parsing that can associate a marker with its group.
+fn unsupported_marker(xml: &str) -> bool {
+    if is_line_chart(xml) {
+        return false;
+    }
     any_opening_tag(
         xml,
         "symbol",
         |attrs| matches!(attr_value(attrs, "val"), Some(val) if val != "none" && val != "circle"),
     )
+}
+
+/// Whether the source contains a 2-D `c:lineChart` group — the one group whose renderer honors the
+/// full `c:marker` symbol set (and `c:smooth`). Boundary-aware, so it does **not** match
+/// `line3DChart`.
+///
+/// Same textual-classifier caveat as [`unsupported_marker`]: in a combo part with a `lineChart`
+/// plus another group this returns true for the whole part. `c:smooth` is likewise unscoped (no
+/// per-group binding), but that is harmless today — the non-line renderers draw no connecting line
+/// for `smooth` to curve, so an unhonored `smooth` on a non-line series changes nothing.
+fn is_line_chart(xml: &str) -> bool {
+    contains_element(xml, "lineChart")
 }
 
 /// A truthy OOXML boolean `val` attribute (`1` or `true`).
@@ -531,7 +556,6 @@ mod tests {
                 "reversed axis",
                 "<c:catAx><c:scaling><c:orientation val=\"maxMin\"/></c:scaling></c:catAx>",
             ),
-            ("smooth line", "<c:ser><c:smooth val=\"1\"/></c:ser>"),
             (
                 "custom numFmt",
                 "<c:valAx><c:numFmt formatCode=\"0.00%\" sourceLinked=\"0\"/></c:valAx>",
@@ -547,11 +571,6 @@ mod tests {
                 "shown data label",
                 "<c:dLbls><c:showVal val=\"1\"/></c:dLbls>",
             ),
-            (
-                // A non-circle marker shape we cannot draw (circle/none are Faithful — see below).
-                "non-circle marker",
-                "<c:ser><c:marker><c:symbol val=\"diamond\"/></c:marker></c:ser>",
-            ),
         ];
         for (label, xml) in cases {
             let framed = format!("<c:lineChart>{xml}</c:lineChart>");
@@ -565,9 +584,8 @@ mod tests {
 
     #[test]
     fn benign_feature_forms_do_not_degrade() {
-        // The default/off form of each value-aware marker must NOT degrade.
+        // The default/off form of each still-tracked value-aware feature must NOT degrade.
         let cases = [
-            ("smooth off", "<c:ser><c:smooth val=\"0\"/></c:ser>"),
             (
                 "general numFmt",
                 "<c:valAx><c:numFmt formatCode=\"General\" sourceLinked=\"1\"/></c:valAx>",
@@ -575,15 +593,6 @@ mod tests {
             (
                 "minMax orientation",
                 "<c:catAx><c:scaling><c:orientation val=\"minMax\"/></c:scaling></c:catAx>",
-            ),
-            (
-                "no marker",
-                "<c:ser><c:marker><c:symbol val=\"none\"/></c:marker></c:ser>",
-            ),
-            (
-                // The round dot IS drawable (coverage matrix §C `c:marker`), so it stays Faithful.
-                "circle marker",
-                "<c:ser><c:marker><c:symbol val=\"circle\"/></c:marker></c:ser>",
             ),
             (
                 "all-off dLbls",
@@ -596,6 +605,72 @@ mod tests {
                 source_fidelity(&framed),
                 Fidelity::Faithful,
                 "expected Faithful for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn now_rendered_features_are_faithful() {
+        // P6's LINE renderer draws `c:smooth` (curved line) and every `c:marker` symbol, so on a
+        // `lineChart` their presence no longer degrades — the accessor auto-drops a feature once the
+        // renderer honors it (architecture §3.3). `val="0"`/`none` were always Faithful; the point
+        // here is that the *active* forms on a line chart are now Faithful too.
+        for (label, xml) in [
+            ("smooth on", "<c:ser><c:smooth val=\"1\"/></c:ser>"),
+            (
+                "square marker",
+                "<c:ser><c:marker><c:symbol val=\"square\"/></c:marker></c:ser>",
+            ),
+            (
+                "diamond marker",
+                "<c:ser><c:marker><c:symbol val=\"diamond\"/></c:marker></c:ser>",
+            ),
+            (
+                "star marker",
+                "<c:ser><c:marker><c:symbol val=\"star\"/></c:marker></c:ser>",
+            ),
+        ] {
+            let framed = format!("<c:lineChart>{xml}</c:lineChart>");
+            assert_eq!(
+                source_fidelity(&framed),
+                Fidelity::Faithful,
+                "expected Faithful for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_are_scoped_to_the_line_renderer() {
+        // The marker fidelity is SCOPED: only the line renderer paints the full symbol set. The
+        // scatter/point renderers still draw a fixed circle and ignore `c:marker`, so a non-circle
+        // marker on a non-line group must STILL degrade (no false-Faithful — the wrong chart keeps
+        // its badge), while the same marker on a line chart is Faithful.
+        let diamond = "<c:ser><c:marker><c:symbol val=\"diamond\"/></c:marker></c:ser>";
+
+        assert_eq!(
+            source_fidelity(&format!("<c:lineChart>{diamond}</c:lineChart>")),
+            Fidelity::Faithful,
+            "line chart renders the diamond marker → Faithful"
+        );
+        assert_eq!(
+            source_fidelity(&format!("<c:scatterChart>{diamond}</c:scatterChart>")),
+            Fidelity::Degraded,
+            "scatter ignores the marker (draws a circle) → Degraded"
+        );
+        assert_eq!(
+            source_fidelity(&format!("<c:barChart>{diamond}</c:barChart>")),
+            Fidelity::Degraded,
+            "a non-line group with a non-circle marker → Degraded"
+        );
+
+        // circle / none are what the fixed renderer draws (or nothing) → Faithful anywhere.
+        for symbol in ["circle", "none"] {
+            let marker =
+                format!("<c:ser><c:marker><c:symbol val=\"{symbol}\"/></c:marker></c:ser>");
+            assert_eq!(
+                source_fidelity(&format!("<c:scatterChart>{marker}</c:scatterChart>")),
+                Fidelity::Faithful,
+                "scatter + {symbol} marker → Faithful"
             );
         }
     }

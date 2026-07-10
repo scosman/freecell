@@ -36,7 +36,7 @@ those docs — this is the ordered checklist.
 - [x] **P5 — Line renderer.** Production line component from `chart-model` (chrome, nice-tick
   numeric axes, multi-series on one shared scale, legend, title, axis titles). *Exit:* unit
   tests + committed render-test baselines; runs in the test harness, not the app.
-- [ ] **P6 — Line P1 fidelity.** Theme colors (`schemeClr`), rotated vertical value-axis title,
+- [x] **P6 — Line P1 fidelity.** Theme colors (`schemeClr`), rotated vertical value-axis title,
   `numFmt` ticks, markers, `smooth`. *Exit:* updated render-test baselines; reviewer sees a
   *real* line chart.
 

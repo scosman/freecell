@@ -8,7 +8,9 @@
 
 use gpui::{rgb, Hsla};
 
-use freecell_chart_model::Color as ModelColor;
+use freecell_chart_model::{ChartColor, Color as ModelColor, ThemePalette};
+
+use super::palette::series_color;
 
 /// Chart background (behind the whole widget).
 pub const BACKGROUND: u32 = 0xFFFFFF;
@@ -31,4 +33,26 @@ pub fn hsla(hex: u32) -> Hsla {
 /// Convert a [`freecell_chart_model::Color`] to a gpui `Hsla`.
 pub fn model_hsla(color: ModelColor) -> Hsla {
     Hsla::from(rgb(color.to_hex()))
+}
+
+/// The theme palette a standalone chart resolves `schemeClr` references against. The isolated
+/// render component (P5/P6) has no workbook, so it uses the default **Office** theme — correct for
+/// the common default-theme file; P8 threads the actual workbook `clrScheme` when a chart is drawn
+/// in the grid.
+pub fn render_theme_palette() -> ThemePalette {
+    ThemePalette::office_default()
+}
+
+/// Resolve a series' optional model color ([`ChartColor`] — explicit sRGB or a theme reference) to
+/// a concrete [`ModelColor`], falling back to the categorical palette cycle at `index` when the
+/// series carries no explicit color (functional_spec §4 P1).
+pub fn resolve_series_color(color: Option<ChartColor>, index: usize) -> ModelColor {
+    color
+        .map(|c| c.resolve(&render_theme_palette()))
+        .unwrap_or_else(|| series_color(index))
+}
+
+/// [`resolve_series_color`] as a gpui `Hsla` — the form the plot primitives consume.
+pub fn resolve_series_hsla(color: Option<ChartColor>, index: usize) -> Hsla {
+    model_hsla(resolve_series_color(color, index))
 }

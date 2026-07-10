@@ -23,9 +23,8 @@ use gpui_component::plot::{
 use freecell_chart_model::{Chart, ChartKind, Grouping, SeriesData};
 
 use super::chrome::chart_frame;
-use super::palette::series_color;
 use super::stacking::{category_totals, percent_segments, stacked_segments, Segment};
-use super::style::{hsla, model_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
 use super::ticks::{format_tick, NiceScale};
 
 const VALUE_AXIS_GUTTER: f32 = 46.0;
@@ -76,7 +75,7 @@ impl AreaPlot {
             if categories.is_none() {
                 categories = Some(cats.iter().map(|c| c.label().into()).collect());
             }
-            colors.push(model_hsla(s.color.unwrap_or_else(|| series_color(i))));
+            colors.push(resolve_series_hsla(s.color, i));
             values.push(vals.clone());
         }
 

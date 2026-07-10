@@ -310,6 +310,9 @@ chart_render_cases! {
     // P5 — production line coverage: single-series, a zero-crossing nice-tick value axis,
     // legend-off (plot uses full width), and title/axis-title collapse (legend still shown).
     chart_line_single, chart_line_negative, chart_line_no_legend, chart_line_no_titles,
+    // P6 — line P1 fidelity: theme colors + per-series markers + currency numFmt ticks
+    // (chart_line_markers), and a smooth curve + percent numFmt ticks (chart_line_smooth).
+    chart_line_markers, chart_line_smooth,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

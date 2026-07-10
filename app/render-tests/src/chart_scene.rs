@@ -12,7 +12,10 @@
 //! with the one make-or-break scene (`chart_line_multi`); later phases add rows the same way the
 //! grid case table grows.
 
-use freecell_chart_model::{Axis, Category, Chart, ChartKind, Grouping, Legend, Series};
+use freecell_chart_model::{
+    Axis, Category, Chart, ChartColor, ChartKind, Grouping, Legend, Marker, MarkerSymbol, Series,
+    ThemeSlot,
+};
 
 /// One capturable chart fixture: a chart, and the (tight) capture viewport in device px. `name`
 /// is snake_case and IS the baseline PNG filename (`<name>.png`) and the `--chart` key, so a red
@@ -43,6 +46,8 @@ pub fn all() -> Vec<ChartScene> {
         chart_line_negative(),
         chart_line_no_legend(),
         chart_line_no_titles(),
+        chart_line_markers(),
+        chart_line_smooth(),
     ]
 }
 
@@ -230,6 +235,89 @@ fn chart_line_no_titles() -> ChartScene {
     }
 }
 
+/// The P6 fidelity showcase (markers + theme colors + numFmt): a three-region straight line where
+/// each series is an **Office theme color** (`schemeClr` accent1/2/3) carrying a distinct **marker**
+/// (circle / square / diamond), and the value axis uses a **currency `numFmt`** (`"$#,##0"`) so its
+/// ticks read `$0`, `$20,000`, …. Proves theme-color resolution, per-series marker shapes, numFmt
+/// ticks, and the rotated vertical value-axis title in one capture.
+fn chart_line_markers() -> ChartScene {
+    let chart = Chart {
+        title: Some("Regional Revenue".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(
+                Some("North"),
+                months(),
+                vec![18000.0, 24000.0, 30000.0, 41000.0, 52000.0, 63000.0],
+            )
+            .with_color(ChartColor::theme(ThemeSlot::Accent1))
+            .with_marker(Marker::new(MarkerSymbol::Circle)),
+            Series::category_value(
+                Some("South"),
+                months(),
+                vec![42000.0, 38000.0, 45000.0, 39000.0, 48000.0, 55000.0],
+            )
+            .with_color(ChartColor::theme(ThemeSlot::Accent2))
+            .with_marker(Marker::new(MarkerSymbol::Square)),
+            Series::category_value(
+                Some("West"),
+                months(),
+                vec![25000.0, 29000.0, 27000.0, 34000.0, 40000.0, 46000.0],
+            )
+            .with_color(ChartColor::theme(ThemeSlot::Accent3))
+            .with_marker(Marker::new(MarkerSymbol::Diamond)),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Revenue (USD)").with_number_format("$#,##0"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_markers",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The P6 `smooth` + percent-`numFmt` showcase: a two-series **smooth** (curved, `c:smooth`) line of
+/// conversion rates in **Office theme colors** (`schemeClr` accent5/accent6), with a **percent
+/// `numFmt`** (`"0%"`) value axis so its fractional values (0.12, 0.34, …) render as `12%`, `34%`.
+/// Proves the curved stroke and percent tick formatting (distinct from the straight, currency
+/// `chart_line_markers`).
+fn chart_line_smooth() -> ChartScene {
+    let chart = Chart {
+        title: Some("Conversion Rate".into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: true,
+        },
+        series: vec![
+            Series::category_value(
+                Some("Desktop"),
+                months(),
+                vec![0.12, 0.18, 0.22, 0.31, 0.4, 0.52],
+            )
+            .with_color(ChartColor::theme(ThemeSlot::Accent5)),
+            Series::category_value(
+                Some("Mobile"),
+                months(),
+                vec![0.08, 0.11, 0.19, 0.24, 0.29, 0.38],
+            )
+            .with_color(ChartColor::theme(ThemeSlot::Accent6)),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Rate").with_number_format("0%"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_line_smooth",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +404,55 @@ mod tests {
         assert!(bare.chart.val_axis.title.is_none(), "untitled value axis");
         // ...but a legend is still present (it should render even with titles gone).
         assert!(bare.chart.legend.is_some(), "legend still present");
+    }
+
+    #[test]
+    fn p6_scenes_carry_the_new_fidelity_features() {
+        // Markers scene: theme colors, distinct marker symbols, and a currency value-axis numFmt.
+        let markers = get("chart_line_markers").expect("chart_line_markers scene");
+        assert!(matches!(
+            markers.chart.kind,
+            ChartKind::Line { smooth: false, .. }
+        ));
+        assert_eq!(
+            markers.chart.val_axis.number_format.as_deref(),
+            Some("$#,##0"),
+            "markers scene must format ticks as currency"
+        );
+        let symbols: Vec<_> = markers
+            .chart
+            .series
+            .iter()
+            .map(|s| s.marker.map(|m| m.symbol))
+            .collect();
+        assert_eq!(
+            symbols,
+            vec![
+                Some(MarkerSymbol::Circle),
+                Some(MarkerSymbol::Square),
+                Some(MarkerSymbol::Diamond)
+            ],
+            "each series carries its own marker shape"
+        );
+        assert!(
+            markers
+                .chart
+                .series
+                .iter()
+                .all(|s| matches!(s.color, Some(ChartColor::Theme { .. }))),
+            "every markers-scene series is a theme color"
+        );
+
+        // Smooth scene: curved line and a percent value-axis numFmt.
+        let smooth = get("chart_line_smooth").expect("chart_line_smooth scene");
+        assert!(
+            matches!(smooth.chart.kind, ChartKind::Line { smooth: true, .. }),
+            "smooth scene must be a curved line"
+        );
+        assert_eq!(
+            smooth.chart.val_axis.number_format.as_deref(),
+            Some("0%"),
+            "smooth scene must format ticks as percentages"
+        );
     }
 }

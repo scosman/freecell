@@ -34,9 +34,8 @@ use gpui_component::plot::{
 use freecell_chart_model::{BarDir, Chart, ChartKind, Grouping, SeriesData};
 
 use super::chrome::chart_frame;
-use super::palette::series_color;
 use super::stacking::{category_totals, percent_segments, stacked_segments, Segment};
-use super::style::{hsla, model_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
 use super::ticks::{format_tick, NiceScale};
 
 /// Left gutter for the value-axis tick labels on a vertical column chart.
@@ -101,7 +100,7 @@ impl BarPlot {
             }
             series.push(BarSeries {
                 values: values.clone(),
-                color: model_hsla(s.color.unwrap_or_else(|| series_color(i))),
+                color: resolve_series_hsla(s.color, i),
             });
         }
 

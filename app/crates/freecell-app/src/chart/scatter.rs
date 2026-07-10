@@ -15,7 +15,8 @@
 //!   exactly the reuse Gate 1 made for the line value axis;
 //! - the title / both axis titles / legend from [`super::chrome`] (the Y-axis title lives in
 //!   `val_axis`, the X-axis title in `cat_axis`, so both numeric captions render unchanged);
-//! - the multi-series color cycle [`series_color`], matched swatch-for-dot-cloud by the legend.
+//! - the multi-series color cycle via [`resolve_series_color`](super::style::resolve_series_color),
+//!   matched swatch-for-dot-cloud by the legend.
 //!
 //! The only net-new drawing is the dot mark: gpui-component's `Line` primitive already paints
 //! its dots as a rounded quad whose corner radius = half its side (i.e. a filled circle,
@@ -33,8 +34,7 @@ use gpui_component::plot::{
 use freecell_chart_model::{Chart, ChartKind, SeriesData};
 
 use super::chrome::chart_frame;
-use super::palette::series_color;
-use super::style::{hsla, model_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
 use super::ticks::{format_tick, NiceScale};
 
 /// Pixels reserved at the left of the plot for value-axis (Y) tick labels.
@@ -82,7 +82,7 @@ impl ScatterPlot {
             let SeriesData::Xy { x, y } = &s.data else {
                 continue;
             };
-            let color = model_hsla(s.color.unwrap_or_else(|| series_color(i)));
+            let color = resolve_series_hsla(s.color, i);
             series.push(ScatterSeries {
                 xs: x.clone(),
                 ys: y.clone(),

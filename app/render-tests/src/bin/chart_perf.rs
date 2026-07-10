@@ -94,7 +94,7 @@ fn main() {
         K, scroll.max_on_screen, scroll.distinct
     );
     print_op(
-        &format!("many-line-charts (open: discover+parse+bind {MANY_K} line charts on one sheet)"),
+        &format!("many-line-charts (open: discover+parse {MANY_K} line charts on one sheet)"),
         &many,
         None,
     );

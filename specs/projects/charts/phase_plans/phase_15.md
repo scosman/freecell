@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 15: Regression + external round-trip CI + line perf hardening
@@ -131,10 +131,11 @@ Exit: **a production-robust line chart** — the pipeline proven end-to-end on o
 
 6. **Perf — extend `app/render-tests/src/bin/chart_perf.rs`** with two new FOREGROUND,
    FORCE+ASSERTED ops (release; p50/p99 env-stamped; written to `results/chart-perf.json`):
-   - **many-line-charts (first-paint at scale)** — discover+parse+bind+snapshot a workbook
-     bearing **K line charts** (generate via a new `authoring::write_many_line_charts_fixture(path,
-     k)`), asserting all K bound with their cached values. Reports the per-open cost for a
-     many-chart sheet (the "many-line-charts" perf the plan calls for).
+   - **many-line-charts (open at scale)** — `discover_and_parse` a workbook bearing **K line
+     charts** (generate via a new `authoring::write_many_line_charts_fixture(path, k)`), asserting
+     all K parsed as line charts with their cached values. Reports the per-open (walk + parse) cost
+     for a many-chart sheet (the "many-line-charts" perf the plan calls for). Binding/snapshot is
+     already covered by the `first-paint` op, so this op is discover+parse only.
    - **large-series** — build a line `Chart` with **N points** (e.g. N = 100 000) and measure
      the **paint-prep down-sample** (`chart::downsample_for_paint`, new — see step 7) plus the
      model clone the snapshot does; assert the down-sample keeps ≤ a bounded number of vertices
@@ -181,8 +182,8 @@ Exit: **a production-robust line chart** — the pipeline proven end-to-end on o
     `discover_and_parse` on the LibreOffice output finds a **line** chart (chart part survived
     the external round-trip). Self-skips (or hard-fails under `FREECELL_LIBREOFFICE=1`) when
     `soffice` is absent.
-- **chart_perf.rs** (bench asserts, not `#[test]`) — many-line-charts binds all K with cached
-  values; large-series retains N points for save while the paint vertex count is bounded.
+- **chart_perf.rs** (bench asserts, not `#[test]`) — many-line-charts parses all K as line charts
+  with cached values; large-series retains N points for save while the paint vertex count is bounded.
 - **authoring unit** — `write_many_line_charts_fixture` writes K discoverable line charts (a
   small K in a unit test; the bench uses a larger K).
 - **downsample unit** (if step 7 lands) — `downsample_for_paint` on a small series is identity
@@ -239,7 +240,7 @@ GPU; all ops are CPU engine/render-path work. Bench: `render-tests/src/bin/chart
 | first-paint (discover+parse+bind+snapshot, 1 line chart) | 248 µs | 428 µs | 461 µs | (off critical path) | P11 op; consistent with prior. |
 | edit-rerender (dirty-set → reresolve → snapshot) | 1.29 µs | 1.52 µs | 22.7 µs | (off critical path) | P11 op. |
 | scroll-with-K (K=1000, per-frame rect+cull scan) | 4.67 µs | 8.90 µs | 111 µs | 8.33 ms / 16.67 ms | P11 op; ~1800× under frame budget. |
-| **many-line-charts (open: discover+parse+bind 200 charts on one sheet)** | **7.61 ms** | **8.70 ms** | 8.76 ms | (lazy, off critical path) | ~38 µs/chart; a one-time per-sheet open (P11 lazy discovery), never per-frame. Comfortable. |
+| **many-line-charts (open: discover+parse 200 charts on one sheet)** | **7.61 ms** | **8.70 ms** | 8.76 ms | (lazy, off critical path) | ~38 µs/chart; a one-time per-sheet walk + parse (P11 lazy discovery), never per-frame. Comfortable. Binding/snapshot is covered by first-paint. |
 | **large-series down-sample (N=100 000 → ≤ 2048 vertices)** | **241 µs** | **272 µs** | 279 µs | 8.33 ms / 16.67 ms | the decimation cost; ~3% of one frame, negligible vs a 100k-primitive paint. |
 | **large-series paint-prep, FULL N=100 000 (pre-hardening)** | **177 µs** | **221 µs** | 269 µs | 8.33 ms / 16.67 ms | per-frame point→pixel mapping at full resolution (proxy). |
 | **large-series paint-prep, DOWN-SAMPLED to 2048 (post-hardening)** | **4.14 µs** | **11.8 µs** | 23.6 µs | 8.33 ms / 16.67 ms | ~43× less prep; and the gpui side now draws **2048** markers + path vertices, not 100 000 (~49× fewer primitives — the dominant, un-measurable-headlessly win). |

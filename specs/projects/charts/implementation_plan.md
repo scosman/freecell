@@ -78,7 +78,7 @@ reusable infra the types then inherit. (Type-specific fills/labels land with eac
   corpus loads without breakage; line charts render; every *other* type degrades to
   placeholder/warning cleanly; edge cases (unresolved `c:f`, empty ranges, row/col shifts).
   *Exit:* corpus green; workbook open never breaks.
-- [ ] **P15 — Regression + external round-trip CI + line perf hardening.** Perceptual-diff suite
+- [x] **P15 — Regression + external round-trip CI + line perf hardening.** Perceptual-diff suite
   + save→reopen (Excel + LibreOffice) wired into CI for line; many-line-charts/large-series
   perf. *Exit:* **a production-robust line chart** — the pipeline (render→fidelity→robust→CI) is
   proven end-to-end on one type.

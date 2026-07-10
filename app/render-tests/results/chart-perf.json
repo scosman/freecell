@@ -8,7 +8,7 @@
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
     "renderer": "assumed Mesa lavapipe / software Vulkan (ICD presence enforced by perf.sh) — CPU render-build path measured; GPU present NOT measured",
     "profile": "release",
-    "commit": "6f0426e"
+    "commit": "93041ab"
   },
   "note": "chart perf: headless CPU render/engine path. P11 ops (first-paint/edit-rerender/scroll) + P15 many-line-charts (open at scale) and large-series (paint-prep + down-sample). Scroll/large-series prep are reported vs the repo's frame budgets for reference.",
   "ops": {

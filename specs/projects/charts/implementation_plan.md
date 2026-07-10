@@ -42,7 +42,7 @@ those docs — this is the ordered checklist.
 
 ## Engine — load
 
-- [ ] **P7 — Chart load.** `freecell-engine` `discover_and_parse` walks sheet→drawing→chart,
+- [x] **P7 — Chart load.** `freecell-engine` `discover_and_parse` walks sheet→drawing→chart,
   parses `chartN.xml` → `ChartSpec` (line fixtures) into the P2 model + retained source.
   *Exit:* headless unit tests parse a real line-chart `.xlsx`; no UI.
 

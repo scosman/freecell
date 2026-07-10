@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use freecell_chart_model::{Anchor, AnchorCell};
 
 /// The four category labels shared by all three charts (`Data!$A$2:$A$5`).
 pub const CATEGORIES: [&str; 4] = ["Q1", "Q2", "Q3", "Q4"];
@@ -407,6 +408,261 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+// ---------------------------------------------------------------------------------------------
+// Single line-chart fixture (P7 — the real `.xlsx` the load path parses end-to-end)
+// ---------------------------------------------------------------------------------------------
+
+/// The single chart part in the line fixture.
+pub const LINE_CHART_PART: &str = "xl/charts/chart1.xml";
+/// The line fixture chart's title.
+pub const LINE_CHART_TITLE: &str = "Sales Trend";
+/// The line fixture chart's `twoCellAnchor` placement — the single source of truth shared by the
+/// generated drawing XML ([`write_line_fixture`]) and the load-path assertions. Carries non-zero
+/// EMU offsets so the offset fields are exercised, not just the cell indices.
+pub const LINE_ANCHOR: Anchor = Anchor::new(
+    AnchorCell::with_offsets(1, 12_700, 6, 0),
+    AnchorCell::with_offsets(9, 0, 22, 6_350),
+);
+
+/// Writes a **single line-chart** `.xlsx` to `path` (creating parent dirs): a straight
+/// (non-smooth) two-series line over the shared `Data` grid, anchored at [`LINE_ANCHOR`], whose
+/// chart part additionally carries a `_rels` → `colors1.xml` + `style1.xml` aux chain — so the
+/// load path's related-part retention (charts/architecture §3.2) is exercised end-to-end. Like
+/// [`write_fixture`], it is a valid OPC package IronCalc accepts (asserted in tests).
+pub fn write_line_fixture(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut zw = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let parts: &[(&str, String)] = &[
+        ("[Content_Types].xml", line_content_types()),
+        ("_rels/.rels", root_rels()),
+        ("xl/workbook.xml", workbook()),
+        ("xl/_rels/workbook.xml.rels", workbook_rels()),
+        ("xl/styles.xml", styles()),
+        ("xl/sharedStrings.xml", shared_strings()),
+        ("xl/worksheets/sheet1.xml", worksheet()),
+        ("xl/worksheets/_rels/sheet1.xml.rels", worksheet_rels()),
+        ("xl/drawings/drawing1.xml", line_drawing()),
+        ("xl/drawings/_rels/drawing1.xml.rels", line_drawing_rels()),
+        ("xl/charts/chart1.xml", line_fixture_chart()),
+        ("xl/charts/_rels/chart1.xml.rels", line_chart_rels()),
+        ("xl/charts/colors1.xml", chart_colors()),
+        ("xl/charts/style1.xml", chart_style()),
+    ];
+    for (name, body) in parts {
+        zw.start_file(*name, opts)
+            .with_context(|| format!("starting zip entry {name}"))?;
+        zw.write_all(body.as_bytes())
+            .with_context(|| format!("writing zip entry {name}"))?;
+    }
+    zw.finish().context("finishing line fixture zip")?;
+    Ok(())
+}
+
+/// Content types for the line fixture — the base workbook parts plus the chart, chart-colors,
+/// and chart-style part overrides (real Excel declares each; IronCalc ignores the chart parts).
+fn line_content_types() -> String {
+    format!(
+        r#"{DECL}
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="xml" ContentType="application/xml"/>
+ <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+ <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+ <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+ <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+ <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+ <Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+ <Override PartName="/xl/charts/colors1.xml" ContentType="application/vnd.ms-office.chartcolorstyle+xml"/>
+ <Override PartName="/xl/charts/style1.xml" ContentType="application/vnd.ms-office.chartstyle+xml"/>
+</Types>"#
+    )
+}
+
+/// The line fixture's drawing: one `twoCellAnchor` graphic frame (at [`LINE_ANCHOR`]) referencing
+/// `chart1.xml` via `r:id="rId1"`. Built from [`LINE_ANCHOR`] so the XML and the assertions
+/// cannot drift.
+fn line_drawing() -> String {
+    let (f, t) = (LINE_ANCHOR.from, LINE_ANCHOR.to);
+    format!(
+        r#"{DECL}
+<xdr:wsDr xmlns:xdr="{NS_XDR}" xmlns:a="{NS_A}">
+ <xdr:twoCellAnchor>
+  <xdr:from><xdr:col>{fc}</xdr:col><xdr:colOff>{fco}</xdr:colOff><xdr:row>{fr}</xdr:row><xdr:rowOff>{fro}</xdr:rowOff></xdr:from>
+  <xdr:to><xdr:col>{tc}</xdr:col><xdr:colOff>{tco}</xdr:colOff><xdr:row>{tr}</xdr:row><xdr:rowOff>{tro}</xdr:rowOff></xdr:to>
+  <xdr:graphicFrame macro="">
+   <xdr:nvGraphicFramePr>
+    <xdr:cNvPr id="2" name="Line Chart 1"/>
+    <xdr:cNvGraphicFramePr/>
+   </xdr:nvGraphicFramePr>
+   <xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>
+   <a:graphic><a:graphicData uri="{NS_CHART}">
+     <c:chart xmlns:c="{NS_CHART}" xmlns:r="{NS_REL}" r:id="rId1"/>
+   </a:graphicData></a:graphic>
+  </xdr:graphicFrame>
+  <xdr:clientData/>
+ </xdr:twoCellAnchor>
+</xdr:wsDr>"#,
+        fc = f.col,
+        fco = f.col_off_emu,
+        fr = f.row,
+        fro = f.row_off_emu,
+        tc = t.col,
+        tco = t.col_off_emu,
+        tr = t.row,
+        tro = t.row_off_emu,
+    )
+}
+
+fn line_drawing_rels() -> String {
+    format!(
+        r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="{NS_REL}/chart" Target="../charts/chart1.xml"/></Relationships>"#
+    )
+}
+
+/// The line chart part: a straight (non-smooth) two-series line over the `Data` grid.
+fn line_fixture_chart() -> String {
+    let group = format!(
+        r#"<c:lineChart>
+   <c:grouping val="standard"/><c:varyColors val="0"/>
+   {w}{g}
+   <c:marker val="1"/>
+   <c:axId val="111111111"/><c:axId val="222222222"/>
+  </c:lineChart>
+  {cat_ax}
+  {val_ax}"#,
+        w = catval_series(0, "Widgets", WIDGETS_COLOR, "$B$1", "$B$2:$B$5", &WIDGETS),
+        g = catval_series(1, "Gadgets", GADGETS_COLOR, "$C$1", "$C$2:$C$5", &GADGETS),
+        cat_ax = cat_axis("Quarter"),
+        val_ax = val_axis("Units (thousands)"),
+    );
+    chart_space(LINE_CHART_TITLE, &group, true)
+}
+
+/// The chart part's `_rels` — the `chartStyle`/`chartColorStyle` aux parts every modern Excel
+/// chart carries (retained byte-for-byte by the load path, never parsed by us).
+fn line_chart_rels() -> String {
+    format!(
+        r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#
+    )
+}
+
+/// A minimal `colorsN.xml` chart-color-style part (its `colorStyle` root is asserted in tests).
+fn chart_colors() -> String {
+    format!(
+        r#"{DECL}<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="{NS_A}" meth="cycle" id="10"><a:schemeClr val="accent1"/><a:schemeClr val="accent2"/><a:schemeClr val="accent3"/><cs:variation/></cs:colorStyle>"#
+    )
+}
+
+/// A minimal `styleN.xml` chart-style part (a stub — we never parse it, only byte-preserve it).
+fn chart_style() -> String {
+    format!(
+        r#"{DECL}<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle" xmlns:a="{NS_A}" id="201"/>"#
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Line + unsupported-group fixture (P7 — the load layer must never break on one bad chart)
+// ---------------------------------------------------------------------------------------------
+
+/// The two chart parts in the mixed fixture, in drawing order: a parseable line, then a
+/// `c:surfaceChart` our `parse_chart_xml` does not recognize.
+pub const MIXED_CHART_PARTS: [&str; 2] = ["xl/charts/chart1.xml", "xl/charts/chart2.xml"];
+
+/// Writes a single-sheet `.xlsx` with **two** charts — a parseable line (`chart1`) and an
+/// **unparseable** `c:surfaceChart` (`chart2`) — to prove the load walk is per-chart non-fatal:
+/// `discover_and_parse` skips the surface chart (logging it) and still returns the line chart,
+/// rather than aborting the whole load (charts/architecture §6).
+pub fn write_line_plus_unsupported_fixture(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut zw = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let parts: &[(&str, String)] = &[
+        ("[Content_Types].xml", mixed_content_types()),
+        ("_rels/.rels", root_rels()),
+        ("xl/workbook.xml", workbook()),
+        ("xl/_rels/workbook.xml.rels", workbook_rels()),
+        ("xl/styles.xml", styles()),
+        ("xl/sharedStrings.xml", shared_strings()),
+        ("xl/worksheets/sheet1.xml", worksheet()),
+        ("xl/worksheets/_rels/sheet1.xml.rels", worksheet_rels()),
+        ("xl/drawings/drawing1.xml", mixed_drawing()),
+        ("xl/drawings/_rels/drawing1.xml.rels", mixed_drawing_rels()),
+        ("xl/charts/chart1.xml", line_fixture_chart()),
+        ("xl/charts/chart2.xml", unsupported_surface_chart()),
+    ];
+    for (name, body) in parts {
+        zw.start_file(*name, opts)
+            .with_context(|| format!("starting zip entry {name}"))?;
+        zw.write_all(body.as_bytes())
+            .with_context(|| format!("writing zip entry {name}"))?;
+    }
+    zw.finish().context("finishing mixed fixture zip")?;
+    Ok(())
+}
+
+fn mixed_content_types() -> String {
+    format!(
+        r#"{DECL}
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="xml" ContentType="application/xml"/>
+ <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+ <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+ <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+ <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+ <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+ <Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+ <Override PartName="/xl/charts/chart2.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+</Types>"#
+    )
+}
+
+/// Two `twoCellAnchor` frames referencing `chart1`/`chart2` (reuses [`anchor`], as the 3-chart
+/// fixture drawing does).
+fn mixed_drawing() -> String {
+    format!(
+        r#"{DECL}
+<xdr:wsDr xmlns:xdr="{NS_XDR}" xmlns:a="{NS_A}">
+ {a1}
+ {a2}
+</xdr:wsDr>"#,
+        a1 = anchor(1, 1, 5, 10, 14),
+        a2 = anchor(2, 12, 5, 21, 14),
+    )
+}
+
+fn mixed_drawing_rels() -> String {
+    format!(
+        r#"{DECL}<Relationships xmlns="{NS_PKG_REL}"><Relationship Id="rId1" Type="{NS_REL}/chart" Target="../charts/chart1.xml"/><Relationship Id="rId2" Type="{NS_REL}/chart" Target="../charts/chart2.xml"/></Relationships>"#
+    )
+}
+
+/// A `c:surfaceChart` — a group our `parse_chart_xml` does not recognize, so parsing it fails
+/// (and the load must skip it, not abort). Structurally a valid `c:chartSpace` otherwise.
+fn unsupported_surface_chart() -> String {
+    let group = format!(
+        r#"<c:surfaceChart>
+   <c:ser><c:idx val="0"/><c:order val="0"/><c:val>{val}</c:val></c:ser>
+   <c:axId val="111111111"/><c:axId val="222222222"/><c:axId val="333333333"/>
+  </c:surfaceChart>"#,
+        val = num_ref("$B$2:$B$5", &WIDGETS),
+    );
+    chart_space("Terrain", &group, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +749,20 @@ mod tests {
             .expect("IronCalc opens the authored fixture");
         // Sanity: the single "Data" worksheet came through (chart parts are, as expected,
         // invisible to IronCalc — it has no chart model).
+        assert_eq!(model.workbook.worksheets.len(), 1);
+        assert_eq!(model.workbook.worksheets[0].name, "Data");
+    }
+
+    /// The line fixture (with its chart `_rels` + colors/style aux parts) is also a valid
+    /// workbook IronCalc opens — the extra chart machinery does not break the package.
+    #[test]
+    fn line_fixture_loads_in_ironcalc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("line_chart.xlsx");
+        write_line_fixture(&path).unwrap();
+        let path_str = path.to_str().unwrap();
+        let model = ironcalc::import::load_from_xlsx(path_str, "en", "UTC", "en")
+            .expect("IronCalc opens the line fixture");
         assert_eq!(model.workbook.worksheets.len(), 1);
         assert_eq!(model.workbook.worksheets[0].name, "Data");
     }

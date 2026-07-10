@@ -159,7 +159,7 @@ pub fn reinject(
 
     let cursor = zw.finish().context("finishing re-injected zip")?;
     let report = SaveReport {
-        charts_preserved: sheets.iter().map(|s| s.chart_parts.len()).sum(),
+        charts_preserved: sheets.iter().map(|s| s.charts.len()).sum(),
         patched_sheets: plan.iter().map(|p| p.sheet_part.clone()).collect(),
         carried_parts: carry_names,
     };
@@ -422,7 +422,7 @@ mod tests {
         // (a) Our own loader re-finds all three charts, same cached values.
         let sheets = discover(&out).unwrap();
         assert_eq!(sheets.len(), 1);
-        assert_eq!(sheets[0].chart_parts.len(), 3);
+        assert_eq!(sheets[0].charts.len(), 3);
         let after = load_charts_from_xlsx(&out).unwrap();
         assert_eq!(after, before, "charts survive the round-trip unchanged");
 

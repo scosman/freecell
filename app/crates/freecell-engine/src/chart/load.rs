@@ -12,13 +12,27 @@ use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
 use freecell_chart_model::{
-    Axis, BarDir, Category, Chart, ChartKind, Grouping, Legend, LegendPosition, Series,
+    Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart, ChartKind, ChartSpec, Grouping,
+    Legend, LegendPosition, Series, SourcePart, SourceXml,
 };
 
 use super::xlsx::{self, attr};
 
-/// The chart part names carried by one worksheet's single `<drawing>`, plus everything the
-/// save re-injection needs to patch that worksheet. Discovered by [`discover`].
+/// One chart discovered under a worksheet's `<drawing>`: its package part name plus the
+/// [`Anchor`] parsed from the `xdr:*Anchor` graphic frame that references it. Produced in
+/// document order by [`discover`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredChart {
+    /// The chart part name, e.g. `xl/charts/chart1.xml`.
+    pub part: String,
+    /// The chart's in-grid placement (`xdr:twoCellAnchor` from/to). Best-effort: a chart
+    /// whose graphic frame carries no resolvable anchor gets a zero anchor at `A1` (P8 maps
+    /// this to pixels; a malformed anchor never fails the load).
+    pub anchor: Anchor,
+}
+
+/// The charts carried by one worksheet's single `<drawing>`, plus everything the save
+/// re-injection needs to patch that worksheet. Discovered by [`discover`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SheetDrawing {
     /// e.g. `xl/worksheets/sheet1.xml`.
@@ -29,9 +43,9 @@ pub struct SheetDrawing {
     pub drawing_rel_id: String,
     /// The relationship `Type` URI for that worksheet → drawing relationship.
     pub drawing_rel_type: String,
-    /// The chart part names this drawing's graphic frames reference, in document order —
-    /// e.g. `["xl/charts/chart1.xml", "xl/charts/chart2.xml"]`.
-    pub chart_parts: Vec<String>,
+    /// The charts this drawing's graphic frames reference (part name + anchor), in document
+    /// order.
+    pub charts: Vec<DiscoveredChart>,
 }
 
 /// Walks every worksheet in the package and returns the `<drawing>`-bearing ones with their
@@ -59,8 +73,8 @@ pub fn discover(path: &Path) -> Result<Vec<SheetDrawing>> {
             continue;
         };
         let drawing_xml = xlsx::read_entry_from(&mut archive, &drawing_part)?;
-        let chart_parts = drawing_chart_parts(&drawing_xml, &drawing_part, &mut archive)?;
-        if chart_parts.is_empty() {
+        let charts = drawing_charts(&drawing_xml, &drawing_part, &mut archive)?;
+        if charts.is_empty() {
             continue;
         }
         out.push(SheetDrawing {
@@ -68,7 +82,7 @@ pub fn discover(path: &Path) -> Result<Vec<SheetDrawing>> {
             drawing_part,
             drawing_rel_id: rel_id,
             drawing_rel_type: rel_type,
-            chart_parts,
+            charts,
         });
     }
     // Deterministic order (zip index order is not guaranteed sorted).
@@ -103,21 +117,23 @@ fn worksheet_drawing<R: std::io::Read + std::io::Seek>(
     Ok(Some((rel_id, drawing_part, rel.rel_type.clone())))
 }
 
-/// Collects the chart part names referenced by a drawing's `<c:chart r:id>` graphic frames,
-/// in document order, resolving each `r:id` through the drawing's `_rels`.
-fn drawing_chart_parts<R: std::io::Read + std::io::Seek>(
+/// Collects the charts referenced by a drawing's `<c:chart r:id>` graphic frames, in document
+/// order, resolving each `r:id` through the drawing's `_rels` (part name) and reading each
+/// frame's enclosing `xdr:*Anchor` (placement).
+fn drawing_charts<R: std::io::Read + std::io::Seek>(
     drawing_xml: &str,
     drawing_part: &str,
     archive: &mut zip::ZipArchive<R>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<DiscoveredChart>> {
     let doc = Document::parse(drawing_xml).context("parsing drawing XML")?;
-    // `<c:chart r:id="...">` frames — one per embedded chart.
-    let chart_rel_ids: Vec<String> = doc
+    // `<c:chart r:id="...">` frames — one per embedded chart — each paired with the anchor of
+    // the graphic frame that holds it.
+    let referenced: Vec<(String, Anchor)> = doc
         .descendants()
         .filter(|n| n.tag_name().name() == "chart")
-        .filter_map(|n| attr(&n, "id").map(str::to_string))
+        .filter_map(|n| attr(&n, "id").map(|id| (id.to_string(), enclosing_anchor(&n))))
         .collect();
-    if chart_rel_ids.is_empty() {
+    if referenced.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -127,31 +143,204 @@ fn drawing_chart_parts<R: std::io::Read + std::io::Seek>(
     })?;
     let rels = xlsx::parse_rels(&rels_xml)?;
 
-    let mut parts = Vec::new();
-    for rel_id in chart_rel_ids {
+    let mut charts = Vec::new();
+    for (rel_id, anchor) in referenced {
         let rel = rels
             .get(&rel_id)
             .ok_or_else(|| anyhow!("{rels_part} has no relationship {rel_id}"))?;
-        parts.push(xlsx::resolve_target(drawing_part, &rel.target));
+        charts.push(DiscoveredChart {
+            part: xlsx::resolve_target(drawing_part, &rel.target),
+            anchor,
+        });
     }
-    Ok(parts)
+    Ok(charts)
+}
+
+/// The [`Anchor`] of the `xdr:*Anchor` element enclosing a `<c:chart>` graphic frame. Walks up
+/// to the first `twoCellAnchor`/`oneCellAnchor`/`absoluteAnchor` ancestor; a chart with no
+/// anchor ancestor (unexpected) gets a zero anchor at `A1` so the load never fails on it.
+fn enclosing_anchor(chart_node: &Node) -> Anchor {
+    chart_node
+        .ancestors()
+        .find(|n| is_anchor_element(n))
+        .map(|el| parse_anchor(&el))
+        .unwrap_or_else(|| Anchor::new(AnchorCell::new(0, 0), AnchorCell::new(0, 0)))
+}
+
+/// Whether a node is a spreadsheet-drawing anchor element (the three `xdr:` anchor kinds).
+fn is_anchor_element(node: &Node) -> bool {
+    matches!(
+        node.tag_name().name(),
+        "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor"
+    )
+}
+
+/// Parses an anchor element's `<xdr:from>`/`<xdr:to>` cell corners into an [`Anchor`]. A
+/// `oneCellAnchor`/`absoluteAnchor` (which carries `<xdr:ext>` instead of `<xdr:to>`) has no
+/// `to` corner, so it falls back to `to = from` — a degenerate rectangle P8 can still place.
+fn parse_anchor(anchor_el: &Node) -> Anchor {
+    let from = child(anchor_el, "from")
+        .map(|n| anchor_cell(&n))
+        .unwrap_or_else(|| AnchorCell::new(0, 0));
+    let to = child(anchor_el, "to")
+        .map(|n| anchor_cell(&n))
+        .unwrap_or(from);
+    Anchor::new(from, to)
+}
+
+/// Reads an `<xdr:from>`/`<xdr:to>` corner: its `<xdr:col>`/`<xdr:colOff>`/`<xdr:row>`/
+/// `<xdr:rowOff>` children (a missing/unparseable child reads as `0`).
+fn anchor_cell(cell: &Node) -> AnchorCell {
+    AnchorCell::with_offsets(
+        child_number(cell, "col"),
+        child_number(cell, "colOff"),
+        child_number(cell, "row"),
+        child_number(cell, "rowOff"),
+    )
+}
+
+/// The integer text of a named child element (`0` when absent or unparseable).
+fn child_number<T: std::str::FromStr + Default>(node: &Node, name: &str) -> T {
+    child(node, name)
+        .and_then(|n| n.text())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_default()
 }
 
 /// Loads every embedded chart in the workbook into [`freecell_chart_model::Chart`], in
-/// (worksheet, document) order. The seam this whole experiment exists to prove: file → model.
+/// (worksheet, document) order — the bare render pictures, without the production envelope.
+/// [`discover_and_parse`] is the full-envelope path (source, ranges, anchor, origin).
 pub fn load_charts_from_xlsx(path: &Path) -> Result<Vec<Chart>> {
     let sheets = discover(path)?;
     let mut charts = Vec::new();
     for sheet in &sheets {
-        for chart_part in &sheet.chart_parts {
-            let xml = xlsx::read_entry(path, chart_part)
-                .with_context(|| format!("reading chart part {chart_part}"))?;
-            let chart = parse_chart_xml(&xml)
-                .with_context(|| format!("parsing chart part {chart_part}"))?;
+        for dc in &sheet.charts {
+            let xml = xlsx::read_entry(path, &dc.part)
+                .with_context(|| format!("reading chart part {}", dc.part))?;
+            let chart =
+                parse_chart_xml(&xml).with_context(|| format!("parsing chart part {}", dc.part))?;
             charts.push(chart);
         }
     }
     Ok(charts)
+}
+
+/// Discovers every embedded chart and parses it into a full [`freecell_chart_model::ChartSpec`]
+/// — the production envelope (charts/architecture §3.2, §4.1): the render [`Chart`] wrapped with
+/// its retained **source** (the `chartN.xml` verbatim + its related parts), its `c:f`
+/// **source ranges** (live binding, P9), and its `twoCellAnchor` **anchor** (in-grid placement,
+/// P8), with [`Origin::Loaded`](freecell_chart_model::Origin::Loaded). Charts come back in
+/// (worksheet, document) order.
+///
+/// This is the read side the whole chart pipeline hangs off: the engine produces `ChartSpec`s,
+/// the app consumes them. It reads **cached** values only (no IronCalc eval); live resolution of
+/// the retained `source_ranges` is P9.
+///
+/// **A bad chart is per-chart non-fatal, never fatal to the load** (charts/architecture §6,
+/// functional_spec §1): a chart whose part can't be read or parsed — an unsupported group our
+/// `parse_chart_xml` doesn't recognize (surface / radar / stock / 3-D / bubble), or a malformed
+/// part — is **skipped and logged**, and the walk continues, returning the charts that did
+/// parse. Opening a workbook must never break on one broken chart.
+///
+/// NOTE (P8 / P14): this phase **drops** an unparseable chart entirely. The fuller handling —
+/// retaining its source so it still byte-preserves on save, and rendering an actual placeholder
+/// for it (charts/functional_spec §5 "Unsupported → placeholder") — is deferred to **P8**
+/// (placeholder render) and **P14** (cross-type graceful-degrade / real-file corpus), per the
+/// plan's risk ordering (line end-to-end first, cross-type robustness at P14). Skip-and-log is
+/// sufficient for the line-only slice while honoring the never-breaks invariant.
+///
+/// This resilience covers a chart the walk *reaches* but can't parse. It does **not** yet cover
+/// a corrupt **drawing relationship** in the shared [`discover`] walk — a missing drawing `_rels`
+/// part, or a `<c:chart r:id>` whose `rId` is absent from it — which still `?`-aborts the whole
+/// load (a package-corruption path, distinct from an unsupported chart). Making that dangling-rel
+/// case per-chart-resilient is **P14** robustness work; tracked in `phase_plans/phase_7.md`.
+pub fn discover_and_parse(path: &Path) -> Result<Vec<ChartSpec>> {
+    let sheets = discover(path)?;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading {} as a zip", path.display()))?;
+
+    let mut specs = Vec::new();
+    for sheet in &sheets {
+        for dc in &sheet.charts {
+            match parse_discovered_chart(&mut archive, dc) {
+                Ok(spec) => specs.push(spec),
+                // Skip + log; the walk continues. (P8/P14 upgrade skip → retain-source +
+                // placeholder — see the fn docs.)
+                Err(err) => {
+                    tracing::warn!(chart_part = %dc.part, "skipping unparseable chart: {err:#}");
+                }
+            }
+        }
+    }
+    Ok(specs)
+}
+
+/// Parses one discovered chart into a [`ChartSpec`] — read the part, map it to a [`Chart`], and
+/// gather its `c:f` ranges + retained source (XML + related parts). Fallible so
+/// [`discover_and_parse`] can treat a failure as per-chart non-fatal (skip + log).
+fn parse_discovered_chart<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    dc: &DiscoveredChart,
+) -> Result<ChartSpec> {
+    let chart_xml = xlsx::read_entry_from(archive, &dc.part)
+        .with_context(|| format!("reading chart part {}", dc.part))?;
+    let chart =
+        parse_chart_xml(&chart_xml).with_context(|| format!("parsing chart part {}", dc.part))?;
+    let source_ranges = parse_cf_ranges(&chart_xml);
+    let related_parts = read_related_parts(archive, &dc.part)?;
+    let source = SourceXml::new(chart_xml).with_related_parts(related_parts);
+    Ok(ChartSpec::loaded(chart, source, source_ranges, dc.anchor))
+}
+
+/// Collects every `<c:f>` data-reference formula in a chart part, as written, in document order
+/// — a [`CfRange`] per `<c:f>` whose parent is a `*Ref` (`numRef`/`strRef`/`multiLvlStrRef`).
+/// These are retained raw for live binding (P9); structured sheet/range decomposition + index
+/// resolution is P9's job. Whitespace-only / empty formulas are skipped.
+fn parse_cf_ranges(chart_xml: &str) -> Vec<CfRange> {
+    let Ok(doc) = Document::parse(chart_xml) else {
+        return Vec::new();
+    };
+    doc.descendants()
+        .filter(|n| n.tag_name().name() == "f")
+        .filter(|n| {
+            n.parent()
+                .is_some_and(|p| p.tag_name().name().ends_with("Ref"))
+        })
+        .filter_map(|n| n.text())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(CfRange::new)
+        .collect()
+}
+
+/// Retains a chart part's own related parts as raw bytes (charts/architecture §3.2) — its
+/// `_rels` (`xl/charts/_rels/chartN.xml.rels`) plus every non-external part that `_rels`
+/// references (`colorsN.xml`, `styleN.xml`, embeddings) that exists in the package. A chart
+/// with no `_rels` retains nothing. A missing referenced target is skipped (never a hard
+/// error); a malformed `_rels` is a hard error (the package is broken).
+fn read_related_parts<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    chart_part: &str,
+) -> Result<Vec<SourcePart>> {
+    let rels_part = xlsx::rels_part_for(chart_part);
+    if !xlsx::has_entry(archive, &rels_part) {
+        return Ok(Vec::new());
+    }
+    let rels_bytes = xlsx::read_entry_bytes_from(archive, &rels_part)?;
+    let rels = xlsx::parse_rels(
+        std::str::from_utf8(&rels_bytes).with_context(|| format!("{rels_part} is not UTF-8"))?,
+    )?;
+
+    let mut parts = vec![SourcePart::new(rels_part, rels_bytes)];
+    for rel in rels.values() {
+        let target = xlsx::resolve_target(chart_part, &rel.target);
+        if xlsx::has_entry(archive, &target) {
+            let bytes = xlsx::read_entry_bytes_from(archive, &target)?;
+            parts.push(SourcePart::new(target, bytes));
+        }
+    }
+    Ok(parts)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -439,7 +628,8 @@ fn child_val(node: &Node, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freecell_chart_model::SeriesData;
+    use crate::chart::authoring;
+    use freecell_chart_model::{Fidelity, SeriesData};
 
     const COLUMN_CHART: &str = r#"<?xml version="1.0"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
@@ -562,5 +752,220 @@ mod tests {
     fn missing_chart_group_is_an_error() {
         let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea/></c:chart></c:chartSpace>"#;
         assert!(parse_chart_xml(xml).is_err());
+    }
+
+    // --- P7: discover_and_parse → ChartSpec envelope --------------------------------------
+
+    /// The exit-criterion test: a **real** line-chart `.xlsx` (a real OPC zip with the full
+    /// worksheet→drawing→chart chain) parses end-to-end into a `ChartSpec` — chart model,
+    /// anchor, `c:f` source ranges, retained source XML + related parts, and Faithful fidelity.
+    #[test]
+    fn discover_and_parse_reads_line_fixture_end_to_end() {
+        use authoring::{
+            CATEGORIES, GADGETS, LINE_ANCHOR, LINE_CHART_PART, LINE_CHART_TITLE, WIDGETS,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("line_chart.xlsx");
+        authoring::write_line_fixture(&path).unwrap();
+
+        let specs = discover_and_parse(&path).unwrap();
+        assert_eq!(specs.len(), 1, "one embedded line chart");
+        let spec = &specs[0];
+
+        // Chart model (the render seam): a straight two-series line with cached values.
+        assert!(matches!(
+            spec.chart.kind,
+            ChartKind::Line { smooth: false, .. }
+        ));
+        assert_eq!(spec.chart.title.as_deref(), Some(LINE_CHART_TITLE));
+        assert_eq!(spec.chart.series.len(), 2);
+        assert_eq!(spec.chart.series[0].name.as_deref(), Some("Widgets"));
+        assert_eq!(spec.chart.series[1].name.as_deref(), Some("Gadgets"));
+        match &spec.chart.series[0].data {
+            SeriesData::CategoryValue { categories, values } => {
+                let cats: Vec<String> = categories.iter().map(Category::label).collect();
+                assert_eq!(cats, CATEGORIES);
+                assert_eq!(values, &WIDGETS.to_vec());
+            }
+            other => panic!("expected CategoryValue, got {other:?}"),
+        }
+        match &spec.chart.series[1].data {
+            SeriesData::CategoryValue { values, .. } => assert_eq!(values, &GADGETS.to_vec()),
+            other => panic!("expected CategoryValue, got {other:?}"),
+        }
+
+        // Anchor: the twoCellAnchor from/to cells, including EMU offsets.
+        assert_eq!(spec.anchor, LINE_ANCHOR);
+
+        // source_ranges: every c:f (tx/cat/val per series) retained as-written, in doc order.
+        let ranges: Vec<&str> = spec.source_ranges.iter().map(CfRange::as_str).collect();
+        assert_eq!(
+            ranges,
+            vec![
+                "Data!$B$1",
+                "Data!$A$2:$A$5",
+                "Data!$B$2:$B$5",
+                "Data!$C$1",
+                "Data!$A$2:$A$5",
+                "Data!$C$2:$C$5",
+            ]
+        );
+
+        // Retained source: chart XML byte-identical to the part, plus its related parts.
+        assert!(spec.is_loaded());
+        let source = spec.source().expect("loaded chart retains source");
+        let part_xml = xlsx::read_entry(&path, LINE_CHART_PART).unwrap();
+        assert_eq!(source.chart_xml, part_xml, "chart XML retained verbatim");
+        assert!(source.chart_xml.contains("<c:lineChart"));
+
+        let related: Vec<&str> = source
+            .related_parts
+            .iter()
+            .map(|p| p.part_name.as_str())
+            .collect();
+        assert!(related.contains(&"xl/charts/_rels/chart1.xml.rels"));
+        assert!(related.contains(&"xl/charts/colors1.xml"));
+        assert!(related.contains(&"xl/charts/style1.xml"));
+        let colors = source
+            .related_parts
+            .iter()
+            .find(|p| p.part_name == "xl/charts/colors1.xml")
+            .expect("colors part retained");
+        assert!(std::str::from_utf8(&colors.bytes)
+            .unwrap()
+            .contains("colorStyle"));
+
+        // Fidelity: a plain supported line renders faithfully (no badge).
+        assert_eq!(spec.display_fidelity(), Fidelity::Faithful);
+    }
+
+    /// The walk visits every chart in a multi-chart workbook in document order and associates
+    /// each with its *own* anchor (not just the first). Charts without a `_rels` retain no
+    /// related parts.
+    #[test]
+    fn discover_and_parse_walks_multiple_charts_in_document_order() {
+        use authoring::CHART_TITLES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("charts_basic.xlsx");
+        authoring::write_fixture(&path).unwrap();
+
+        let specs = discover_and_parse(&path).unwrap();
+        assert_eq!(specs.len(), 3);
+
+        // Kinds in drawing order: column, line, pie.
+        assert!(matches!(specs[0].chart.kind, ChartKind::Bar { .. }));
+        assert!(matches!(specs[1].chart.kind, ChartKind::Line { .. }));
+        assert_eq!(
+            specs[2].chart.kind,
+            ChartKind::Pie {
+                doughnut_hole: None
+            }
+        );
+        assert_eq!(specs[1].chart.title.as_deref(), Some(CHART_TITLES[1]));
+
+        // The LINE chart carries the drawing's SECOND anchor — per-chart association, not the
+        // first. The fixture's second frame is from(col=11,row=5) to(col=21,row=15).
+        assert_eq!(specs[1].anchor.from, AnchorCell::new(11, 5));
+        assert_eq!(specs[1].anchor.to, AnchorCell::new(21, 15));
+
+        // Every spec is Loaded, retains its chart XML, and (no chart _rels) has no related parts.
+        for spec in &specs {
+            assert!(spec.is_loaded());
+            let source = spec.source().unwrap();
+            assert!(source.chart_xml.contains("<c:chartSpace"));
+            assert!(source.related_parts.is_empty());
+        }
+
+        // The line chart's c:f refs are retained (tx/cat/val × 2 series = 6).
+        assert_eq!(specs[1].source_ranges.len(), 6);
+    }
+
+    /// One unparseable chart (an unsupported `c:surfaceChart`) must NOT abort the load or drop
+    /// the other charts: `discover_and_parse` succeeds, skips the bad chart, and returns the
+    /// parseable line chart (charts/architecture §6, functional_spec §1).
+    #[test]
+    fn discover_and_parse_skips_unparseable_charts_without_failing_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("line_plus_unsupported.xlsx");
+        authoring::write_line_plus_unsupported_fixture(&path).unwrap();
+
+        // The load SUCCEEDS (no Err) despite the surface chart being unparseable.
+        let specs = discover_and_parse(&path).expect("load succeeds despite an unparseable chart");
+
+        // Only the parseable line chart comes through; the surface chart is skipped, not
+        // returned (and did not crash the walk).
+        assert_eq!(specs.len(), 1);
+        assert!(matches!(specs[0].chart.kind, ChartKind::Line { .. }));
+        assert_eq!(specs[0].display_fidelity(), Fidelity::Faithful);
+    }
+
+    #[test]
+    fn parse_cf_ranges_collects_ref_formulas_in_document_order() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart><c:plotArea><c:lineChart>
+            <c:ser>
+              <c:tx><c:strRef><c:f>Sheet1!$B$1</c:f></c:strRef></c:tx>
+              <c:cat><c:strRef><c:f>Sheet1!$A$2:$A$4</c:f></c:strRef></c:cat>
+              <c:val><c:numRef><c:f>Sheet1!$B$2:$B$4</c:f></c:numRef></c:val>
+            </c:ser>
+          </c:lineChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let ranges = parse_cf_ranges(xml);
+        let formulas: Vec<&str> = ranges.iter().map(CfRange::as_str).collect();
+        assert_eq!(
+            formulas,
+            vec!["Sheet1!$B$1", "Sheet1!$A$2:$A$4", "Sheet1!$B$2:$B$4"]
+        );
+
+        // A bare <c:f> not under a *Ref is ignored; a whitespace-only ref is skipped.
+        let stray = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:f>Bare!$A$1</c:f><c:numRef><c:f>  </c:f></c:numRef><c:strRef><c:f>Kept!$A$1</c:f></c:strRef></c:chartSpace>"#;
+        let kept: Vec<String> = parse_cf_ranges(stray)
+            .into_iter()
+            .map(|r| r.formula)
+            .collect();
+        assert_eq!(kept, vec!["Kept!$A$1"]);
+
+        // multiLvlStrRef (hierarchical categories) is a `*Ref` too → its c:f is collected.
+        let multi = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:cat><c:multiLvlStrRef><c:f>Data!$A$2:$B$5</c:f></c:multiLvlStrRef></c:cat></c:chartSpace>"#;
+        let hier: Vec<String> = parse_cf_ranges(multi)
+            .into_iter()
+            .map(|r| r.formula)
+            .collect();
+        assert_eq!(hier, vec!["Data!$A$2:$B$5"]);
+    }
+
+    #[test]
+    fn anchor_parsing_reads_two_cell_anchor() {
+        let two = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing">
+          <xdr:twoCellAnchor>
+            <xdr:from><xdr:col>2</xdr:col><xdr:colOff>19050</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>9525</xdr:rowOff></xdr:from>
+            <xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>18</xdr:row><xdr:rowOff>4762</xdr:rowOff></xdr:to>
+          </xdr:twoCellAnchor>
+        </xdr:wsDr>"#;
+        let doc = Document::parse(two).unwrap();
+        let el = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "twoCellAnchor")
+            .unwrap();
+        let anchor = parse_anchor(&el);
+        assert_eq!(anchor.from, AnchorCell::with_offsets(2, 19050, 3, 9525));
+        assert_eq!(anchor.to, AnchorCell::with_offsets(8, 0, 18, 4762));
+
+        // A oneCellAnchor (no <xdr:to>, carries <xdr:ext>) falls back to `to = from`.
+        let one = r#"<xdr:wsDr xmlns:xdr="http://x">
+          <xdr:oneCellAnchor>
+            <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+            <xdr:ext cx="100" cy="200"/>
+          </xdr:oneCellAnchor>
+        </xdr:wsDr>"#;
+        let doc = Document::parse(one).unwrap();
+        let el = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "oneCellAnchor")
+            .unwrap();
+        let anchor = parse_anchor(&el);
+        assert_eq!(anchor.from, AnchorCell::new(1, 1));
+        assert_eq!(anchor.to, anchor.from);
     }
 }

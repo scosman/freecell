@@ -18,5 +18,8 @@ pub mod load;
 pub mod save;
 pub mod xlsx;
 
-pub use load::{discover, load_charts_from_xlsx, parse_chart_xml, SheetDrawing};
+pub use load::{
+    discover, discover_and_parse, load_charts_from_xlsx, parse_chart_xml, DiscoveredChart,
+    SheetDrawing,
+};
 pub use save::{reinject, save_with_charts, SaveReport};

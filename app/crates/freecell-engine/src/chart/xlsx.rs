@@ -34,6 +34,24 @@ pub fn read_entry_from<R: Read + std::io::Seek>(
     Ok(buf)
 }
 
+/// Reads one entry from an already-open archive into raw bytes — the `Vec<u8>` twin of
+/// [`read_entry_from`]. Retained related parts (chart `_rels`, `colorsN`/`styleN`,
+/// embeddings) are captured **byte-for-byte** through this, so save can carry them through
+/// unchanged rather than re-encoding them via `String`.
+pub fn read_entry_bytes_from<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let mut entry = archive
+        .by_name(name)
+        .with_context(|| format!("zip entry {name} not found"))?;
+    let mut buf = Vec::new();
+    entry
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading zip entry {name}"))?;
+    Ok(buf)
+}
+
 /// Returns `true` if the archive contains an entry with this exact name.
 pub fn has_entry<R: Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>, name: &str) -> bool {
     archive.by_name(name).is_ok()

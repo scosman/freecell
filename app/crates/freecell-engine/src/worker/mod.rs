@@ -9,7 +9,7 @@
 //!
 //! - [`protocol`] — the engine-free `Command` / `WorkerEvent` contract.
 //! - [`client`] — [`DocumentClient`] + the shared read-surfaces + [`WorkerEventReceiver`].
-//! - [`run`] — the worker's loop (coalescing, publish-then-bump, catch_unwind + degraded
+//! - `run` — the worker's loop (coalescing, publish-then-bump, catch_unwind + degraded
 //!   policy, dirty-op accounting).
 //!
 //! [`WorkbookDocument`]: crate::WorkbookDocument

@@ -15,7 +15,7 @@
 //! the worker-side input-cap re-check, `catch_unwind` + degraded policy, and dirty-op
 //! accounting.
 //!
-//! Phase 5 adds the **style & geometry cache** ([`cache`]): the IronCalc-facing builder/mutator
+//! Phase 5 adds the **style & geometry cache** (the `cache` module): the IronCalc-facing builder/mutator
 //! that converts engine geometry + `Style` into the engine-free
 //! [`SheetCache`](freecell_core::SheetCache) read model (resolved `RenderStyle`s + px geometry).
 //! The worker builds it on sheet activation and mirrors each issued edit into it (re-reading the

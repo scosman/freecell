@@ -199,6 +199,35 @@ scenes are ≤ a dozen points). The **new** `chart_line_dense` scene (if added) 
 eyeballed baseline. Subset runs (`render_tests.sh test chart_line`) guard the existing chart
 baselines during coding; the CI `render` gate (deliverable 1) is the full-suite truth.
 
+## CI render gate — root cause & outcome (deliverable 1)
+
+The improved diagnostics did their job: they turned the opaque `capture failed (exit Some(1))`
+into the real cause. The failure is **intermittent flaky software rendering**, not a
+deterministic bug:
+
+- Run on `6f0426e` (diagnostics commit): **full green** — `102 passed; 0 failed` in 471 s (all
+  ~88 grid + 15 chart cases rendered + diffed).
+- Re-dispatch on the **render-identical** `93041ab`: aborted at ~10 s. The now-visible cause
+  (from the added Xvfb `-e` error file + blank-guard message):
+  `capture for border_all_thin is blank (1 unique colour(s))` — the **first, coldest** lavapipe
+  render presented a **blank frame** within the fixed settle window (the Xvfb error file held
+  only benign `xkbcomp` keysym warnings, "not fatal to the X server"). P11's earlier
+  `exit Some(1)` was a **different** transient mode of the same flakiness. One flaky case aborts
+  the whole *shared* render-all on the first case.
+
+**Fix (gate-preserving, `bf4978b`)** — a retry, not a weakening: `capture_window` now retries
+each case's capture up to `RENDER_TESTS_CAPTURE_ATTEMPTS` (default 3; CI 4) fully-independent
+`xvfb-run` attempts, so a transient cold-start blank / `xvfb` failure clears on a fresh attempt
+(the failed attempt also warms Mesa's on-disk shader cache for the retry). A retry still must
+produce a **non-blank frame that diffs against the committed baseline** — nothing is skipped or
+softened. `render.yml` also gives the cold first frame more margin
+(`RENDER_TESTS_SETTLE_S=6.0`, `PRESENT_S=2.0`) — these change only *when* a frame is captured
+(after it has painted), never *what*, so baselines are unaffected. Happy path is unchanged
+(succeeds on attempt 1; verified locally). The confirming full CI render run on `bf4978b` is
+dispatched; a green run there closes the exit criterion (hand final green confirmation to the
+manager if it is still rendering at hand-off — the fix is validated locally and the mechanism is
+sound).
+
 ## Measured p50/p99
 
 Environment (stamped into `results/chart-perf.json`): x86_64 linux, **release**; headless — no

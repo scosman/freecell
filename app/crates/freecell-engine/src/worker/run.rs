@@ -31,7 +31,7 @@ use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
-use freecell_chart_model::{Anchor, ChartInsertKind, ChartSpec};
+use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, ChartSpec};
 
 use crate::cache;
 use crate::chart::binding::{CellData, ChartBindings};
@@ -113,6 +113,9 @@ struct AuthoredEntry {
     /// The worksheet the chart is anchored on (keys the published snapshot; resolved to the current
     /// worksheet name at save time, so an in-session rename follows and a deleted host drops it).
     anchor_sheet: SheetId,
+    /// The stable manipulation handle (P18) the worker stamps onto the published spec, so the app
+    /// can name this authored chart back for move/resize/delete.
+    id: ChartId,
     /// The authored render envelope (a `ChartSpec::authored`, no retained source).
     spec: ChartSpec,
 }
@@ -179,6 +182,18 @@ pub(super) struct Worker {
     /// loaded [`charts`](Self::charts): they ride the published snapshot but are never re-resolved
     /// (no binding yet) and are saved via the write-from-model path, not the loaded re-inject.
     authored_charts: Vec<AuthoredEntry>,
+    /// Monotonic source of stable [`ChartId`]s (P18), shared across loaded + authored charts so a
+    /// manipulation id names exactly one chart. Starts at 1 ([`ChartId::NONE`] = 0 is unassigned).
+    next_chart_id: u64,
+    /// Loaded charts moved/resized in-session (P18): `chart_part → new twoCellAnchor`, accumulated
+    /// **relative to the current [`chart_source_path`](Self::chart_source_path)**. The save patches
+    /// each into the retained drawing part; a save that advances the source (bakes them in) clears
+    /// this. An authored-charts-present save keeps the source (and this map) put.
+    loaded_anchor_edits: HashMap<String, Anchor>,
+    /// Loaded charts deleted in-session (P18): the `chart_part`s the save must drop from the
+    /// package (their `twoCellAnchor` + part chain), also relative to `chart_source_path`. Deleted
+    /// parts are additionally skipped by the save-time discovery sweep so they can't be re-bound.
+    loaded_deletes: HashSet<String>,
     /// The published [`ChartSnapshot`] version — bumped on load (when charts exist) and on each
     /// dirty re-resolve, so the UI installs charts only when they actually change.
     chart_version: u64,
@@ -249,6 +264,9 @@ impl Worker {
             clipboard: None,
             charts: ChartBindings::default(),
             authored_charts: Vec::new(),
+            next_chart_id: 1,
+            loaded_anchor_edits: HashMap::new(),
+            loaded_deletes: HashSet::new(),
             chart_version: 0,
             chart_source_path: match &source {
                 DocumentSource::OpenFile(path) => Some(path.clone()),
@@ -323,9 +341,10 @@ impl Worker {
         // diff-lists (one style paste + K row-height runs), so the touch-set must stay 1:1 with
         // the undo stack — they can't ride the generic coalesced edit path.
         let mut font_ops: Vec<Command> = Vec::new();
-        // Chart inserts (`InsertChart`) also run one-by-one after the edit batch: each mutates the
-        // authored-chart set + republishes the chart snapshot (P17); it is not an IronCalc edit.
-        let mut insert_chart_ops: Vec<Command> = Vec::new();
+        // Chart ops (`InsertChart` / `SetChartAnchor` / `DeleteChart`) also run one-by-one after the
+        // edit batch: each mutates the authored/loaded chart set + republishes the chart snapshot
+        // (P17/P18); none is an IronCalc edit, so none rides the undo/touch stacks.
+        let mut chart_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
         // Every sheet activated in this drained batch (in order), so lazy chart discovery walks
         // EACH one — not just the batch's final active sheet (a batch that activates A then B must
@@ -357,7 +376,9 @@ impl Worker {
                 | Command::PasteInternal { .. }
                 | Command::PasteTsv { .. }) => clipboard_ops.push(clip),
                 font @ Command::SetFont { .. } => font_ops.push(font),
-                insert @ Command::InsertChart { .. } => insert_chart_ops.push(insert),
+                chart @ (Command::InsertChart { .. }
+                | Command::SetChartAnchor { .. }
+                | Command::DeleteChart { .. }) => chart_ops.push(chart),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
@@ -423,16 +444,21 @@ impl Worker {
             }
         }
 
-        // Chart inserts after the edit batch (each is standalone: it pushes an authored chart +
-        // republishes the chart snapshot; not an IronCalc edit, so it rides no undo/touch entry).
-        for insert in insert_chart_ops {
-            if let Command::InsertChart {
-                sheet,
-                kind,
-                anchor,
-            } = insert
-            {
-                self.insert_authored_chart(sheet, kind, anchor);
+        // Chart ops after the edit batch (each is standalone: it mutates the authored/loaded chart
+        // set + republishes the chart snapshot; not an IronCalc edit, so it rides no undo/touch
+        // entry — see the P18 undo note on `insert_authored_chart`).
+        for op in chart_ops {
+            match op {
+                Command::InsertChart {
+                    sheet,
+                    kind,
+                    anchor,
+                } => self.insert_authored_chart(sheet, kind, anchor),
+                Command::SetChartAnchor { sheet, id, anchor } => {
+                    self.set_chart_anchor(sheet, id, anchor)
+                }
+                Command::DeleteChart { sheet, id } => self.delete_chart(sheet, id),
+                _ => unreachable!("only chart ops are bucketed here"),
             }
         }
 
@@ -1370,13 +1396,29 @@ impl Worker {
         };
         match crate::chart::discover_and_parse_for_part(&path, &part) {
             Ok(specs) => {
-                if self.charts.add_missing(vec![(sheet, specs)]) {
+                if self.bind_discovered(sheet, specs) {
                     self.chart_version += 1;
                     self.store_chart_snapshot();
                     self.emit(WorkerEvent::Published);
                 }
             }
             Err(err) => tracing::warn!(%part, "lazy chart discovery failed: {err:#}"),
+        }
+    }
+
+    /// Bind the charts `specs` discovered on `sheet`, skipping any deleted in-session (P18 — so a
+    /// save-time full sweep can't resurrect a deleted loaded chart), and — when new charts were
+    /// bound — stamp their stable [`ChartId`]s. Returns whether anything was added.
+    fn bind_discovered(&mut self, sheet: SheetId, specs: crate::chart::load::SheetCharts) -> bool {
+        let specs: crate::chart::load::SheetCharts = specs
+            .into_iter()
+            .filter(|(part, _)| !self.loaded_deletes.contains(part))
+            .collect();
+        if self.charts.add_missing(vec![(sheet, specs)]) {
+            self.charts.assign_missing_ids(&mut self.next_chart_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -1410,7 +1452,7 @@ impl Worker {
             self.discovered_chart_sheets.insert(sheet);
             match crate::chart::discover_and_parse_for_part(&path, &part) {
                 Ok(specs) if !specs.is_empty() => {
-                    if self.charts.add_missing(vec![(sheet, specs)]) {
+                    if self.bind_discovered(sheet, specs) {
                         added = true;
                     }
                 }
@@ -1471,8 +1513,16 @@ impl Worker {
         // through its stable anchor `SheetId` → CURRENT name (rename-safe; a deleted host drops).
         if let Some(original) = &reinject_source {
             let live = self.charts.live_charts(|id| self.sheet_name_of(id));
-            let (reinjected, _report) = crate::chart::reinject_live_charts(original, &bytes, &live)
-                .map_err(|e| SaveError::Serialize(format!("charts couldn't be saved: {e:#}")))?;
+            // P18: moved/resized loaded charts patch their retained `twoCellAnchor`; deleted loaded
+            // charts drop from the package. Both are keyed by `chart_part`, relative to `original`.
+            let (reinjected, _report) = crate::chart::reinject_live_charts(
+                original,
+                &bytes,
+                &live,
+                &self.loaded_anchor_edits,
+                &self.loaded_deletes,
+            )
+            .map_err(|e| SaveError::Serialize(format!("charts couldn't be saved: {e:#}")))?;
             bytes = reinjected;
         }
 
@@ -1505,6 +1555,11 @@ impl Worker {
         // each save re-synthesizes them fresh from `authored_charts`.
         if !has_authored {
             self.chart_source_path = Some(path.to_path_buf());
+            // The just-saved file now bakes in the loaded moves/deletes (they became part of the new
+            // source), so the accumulated diffs vs. the old source are spent — clear them (P18). With
+            // authored charts present the source stays put, so the diffs must persist to re-apply.
+            self.loaded_anchor_edits.clear();
+            self.loaded_deletes.clear();
         }
         Ok(())
     }
@@ -1555,19 +1610,85 @@ impl Worker {
             tracing::warn!(sheet = sheet.0, "InsertChart onto a missing sheet ignored");
             return;
         }
+        let id = ChartId(self.next_chart_id);
+        self.next_chart_id += 1;
         self.authored_charts.push(AuthoredEntry {
             anchor_sheet: sheet,
+            id,
             spec: ChartSpec::authored(kind.near_empty_chart(), anchor),
         });
-        // Mark the document dirty so the unsaved chart can be saved. An insert is NOT an
-        // IronCalc-undoable op — it pushes no undo/touch entry (undo/delete of a chart is P18), so
-        // it never desyncs the undo/touch stacks; `ops_seen` is a monotonic committed-op counter
-        // consumed only by the dirty flag + the `Saved` ack.
+        // Mark the document dirty so the unsaved chart can be saved. A chart op is NOT an
+        // IronCalc-undoable op — it pushes no undo/touch entry, so it never desyncs the undo/touch
+        // stacks; `ops_seen` is a monotonic committed-op counter consumed only by the dirty flag +
+        // the `Saved` ack. **P18 undo decision:** chart insert/move/resize/delete are worker-side
+        // state with no IronCalc undo hook; interleaving a chart-undo history with IronCalc's stacks
+        // is a large, desync-prone subsystem the interaction spec doesn't call for, so chart ops are
+        // deliberately immediate and off the Ctrl+Z stack (cell undo/redo stays correct alongside).
         self.ops_seen += 1;
         self.shared
             .committed_ops
             .store(self.ops_seen, Ordering::Release);
         // Publish the new chart on the same seam the loaded charts ride, so the window installs it.
+        self.chart_version += 1;
+        self.store_chart_snapshot();
+        self.emit(WorkerEvent::Published);
+    }
+
+    /// Move/resize a chart (P18, `Command::SetChartAnchor`): set the chart named by `id` to `anchor`.
+    /// Degraded-guarded like every mutating op. An **authored** chart's model anchor is rewritten
+    /// (the write-from-model save re-synthesizes its drawing there); a **loaded** chart's render
+    /// anchor is updated AND recorded in `loaded_anchor_edits` so the source-first save patches its
+    /// retained `twoCellAnchor`. Republishes the chart snapshot so the grid repaints at the new rect.
+    fn set_chart_anchor(&mut self, _sheet: SheetId, id: ChartId, anchor: Anchor) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        // Authored first (its ids never collide with loaded ones — one shared counter).
+        if let Some(entry) = self.authored_charts.iter_mut().find(|e| e.id == id) {
+            entry.spec.anchor = anchor;
+        } else if let Some(chart_part) = self.charts.set_anchor_by_id(id, anchor) {
+            self.loaded_anchor_edits.insert(chart_part, anchor);
+        } else {
+            tracing::warn!(id = id.0, "SetChartAnchor for an unknown chart id ignored");
+            return;
+        }
+        self.ops_seen += 1;
+        self.shared
+            .committed_ops
+            .store(self.ops_seen, Ordering::Release);
+        self.chart_version += 1;
+        self.store_chart_snapshot();
+        self.emit(WorkerEvent::Published);
+    }
+
+    /// Delete a chart (P18, `Command::DeleteChart`): drop the chart named by `id`. Degraded-guarded.
+    /// An **authored** chart is removed from the authored set; a **loaded** chart is unbound and its
+    /// `chart_part` recorded in `loaded_deletes` so the source-first save drops it from the package
+    /// (its `twoCellAnchor` + part chain) — and the save-time discovery sweep skips it so it can't be
+    /// re-bound. Republishes so the grid drops it.
+    fn delete_chart(&mut self, _sheet: SheetId, id: ChartId) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        if let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) {
+            self.authored_charts.remove(pos);
+        } else if let Some(chart_part) = self.charts.remove_by_id(id) {
+            self.loaded_anchor_edits.remove(&chart_part);
+            self.loaded_deletes.insert(chart_part);
+        } else {
+            tracing::warn!(id = id.0, "DeleteChart for an unknown chart id ignored");
+            return;
+        }
+        self.ops_seen += 1;
+        self.shared
+            .committed_ops
+            .store(self.ops_seen, Ordering::Release);
         self.chart_version += 1;
         self.store_chart_snapshot();
         self.emit(WorkerEvent::Published);
@@ -1601,9 +1722,11 @@ impl Worker {
             .map(|(sheet, specs)| (sheet, specs.to_vec()))
             .collect();
         for entry in &self.authored_charts {
+            // Stamp the authored chart's stable id (P18) so the app can manipulate it.
+            let spec = entry.spec.clone().with_id(entry.id);
             match groups.iter_mut().find(|(s, _)| *s == entry.anchor_sheet) {
-                Some((_, specs)) => specs.push(entry.spec.clone()),
-                None => groups.push((entry.anchor_sheet, vec![entry.spec.clone()])),
+                Some((_, specs)) => specs.push(spec),
+                None => groups.push((entry.anchor_sheet, vec![spec])),
             }
         }
         groups
@@ -2075,6 +2198,9 @@ mod tests {
             clipboard: None,
             charts: ChartBindings::default(),
             authored_charts: Vec::new(),
+            next_chart_id: 1,
+            loaded_anchor_edits: HashMap::new(),
+            loaded_deletes: HashSet::new(),
             chart_version: 0,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),
@@ -3224,6 +3350,129 @@ mod tests {
         );
     }
 
+    /// P18: `SetChartAnchor` moves/resizes an authored chart's model anchor + bumps the version.
+    #[test]
+    fn set_chart_anchor_updates_authored_chart() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        let version_before = worker.chart_version;
+        let moved = Anchor::new(
+            freecell_chart_model::AnchorCell::new(3, 3),
+            freecell_chart_model::AnchorCell::new(11, 18),
+        );
+        worker.process_batch(vec![Command::SetChartAnchor {
+            sheet,
+            id,
+            anchor: moved,
+        }]);
+        assert_eq!(worker.authored_charts[0].spec.anchor, moved);
+        assert!(worker.chart_version > version_before, "a move republishes");
+    }
+
+    /// P18: `DeleteChart` removes the named authored chart (leaving the rest).
+    #[test]
+    fn delete_chart_removes_authored_chart() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::InsertChart {
+                sheet,
+                kind: ChartInsertKind::Line,
+                anchor: test_anchor(),
+            },
+            Command::InsertChart {
+                sheet,
+                kind: ChartInsertKind::Bar,
+                anchor: test_anchor(),
+            },
+        ]);
+        assert_eq!(worker.authored_charts.len(), 2);
+        let first = worker.authored_charts[0].id;
+        worker.process_batch(vec![Command::DeleteChart { sheet, id: first }]);
+        assert_eq!(worker.authored_charts.len(), 1);
+        assert_ne!(
+            worker.authored_charts[0].id, first,
+            "the other chart survives"
+        );
+    }
+
+    /// P18 degraded guard: a degraded worker rejects `SetChartAnchor` + `DeleteChart` (like insert).
+    #[test]
+    fn set_anchor_and_delete_rejected_when_degraded() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Insert a chart BEFORE degrading (so there's an id), then degrade.
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::TestPanic]);
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(worker.degraded);
+        drain_events(&rx);
+
+        worker.process_batch(vec![
+            Command::SetChartAnchor {
+                sheet,
+                id,
+                anchor: test_anchor(),
+            },
+            Command::DeleteChart { sheet, id },
+        ]);
+        let rejects = drain_events(&rx)
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkerEvent::EditRejected {
+                        reason: EditRejectedReason::Degraded
+                    }
+                )
+            })
+            .count();
+        assert_eq!(rejects, 2, "both chart ops are rejected when degraded");
+        // The chart is untouched (still present).
+        assert_eq!(worker.authored_charts.len(), 1);
+    }
+
+    /// P18 undo decision (documented): chart ops are OFF the IronCalc undo stack, and a cell
+    /// undo/redo stays correct while an authored chart rides the snapshot (charts are independent
+    /// of IronCalc's undo/touch stacks). This guards that a chart's presence never breaks cell undo.
+    #[test]
+    fn cell_undo_redo_correct_with_authored_chart_present() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let cell00 = |w: &Worker| w.doc.formatted_value(0, CellRef::new(0, 0)).unwrap();
+        worker.process_batch(vec![set_input(sheet, 0, 0, "hello")]);
+        assert_eq!(cell00(&worker), "hello");
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(cell00(&worker), "", "cell undo works with a chart present");
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(cell00(&worker), "hello", "cell redo works too");
+        // The authored chart is untouched by the cell undo/redo.
+        assert_eq!(worker.authored_charts.len(), 1);
+    }
+
     #[test]
     fn undo_redo_agreement_walk() {
         // A scripted edit/undo/redo walk: the cache must agree with the engine after EVERY step.
@@ -4191,6 +4440,9 @@ mod tests {
             clipboard: None,
             charts: ChartBindings::default(),
             authored_charts: Vec::new(),
+            next_chart_id: 1,
+            loaded_anchor_edits: HashMap::new(),
+            loaded_deletes: HashSet::new(),
             chart_version: 0,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),

@@ -50,6 +50,21 @@ impl AnchorCell {
     }
 }
 
+/// A **stable per-chart handle** used to reference a chart across the app↔engine seam during
+/// manipulation (P18: select / move / resize / delete). The engine assigns one to every chart it
+/// owns — loaded charts at bind time, authored charts at insert time, from a single monotonic
+/// counter — and **stamps it onto each published [`ChartSpec`]**, so the app can name a specific
+/// chart back to the worker (which resolves it to a loaded `chart_part` or an authored entry)
+/// without depending on a fragile snapshot index. [`NONE`](ChartId::NONE) is the unassigned value a
+/// freshly-constructed spec carries before the worker stamps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChartId(pub u64);
+
+impl ChartId {
+    /// The unassigned id a freshly-constructed [`ChartSpec`] carries until the worker stamps it.
+    pub const NONE: ChartId = ChartId(0);
+}
+
 /// A chart's placement in the sheet — an `xdr:twoCellAnchor`'s from/to corners. The chart
 /// occupies the rectangle spanning `from`..`to`, so it scrolls and zooms with the sheet
 /// (the anchor is in sheet coordinates, not screen coordinates).
@@ -211,6 +226,9 @@ pub struct ChartSpec {
     pub anchor: Anchor,
     /// Where the chart came from (and, for a loaded chart, its retained source).
     pub origin: Origin,
+    /// The stable handle the engine stamps for manipulation (P18). [`NONE`](ChartId::NONE) on a
+    /// freshly-constructed spec; the worker assigns + stamps a real id on the published snapshot.
+    pub id: ChartId,
 }
 
 impl ChartSpec {
@@ -229,6 +247,7 @@ impl ChartSpec {
             origin: Origin::Loaded {
                 source: Arc::new(source),
             },
+            id: ChartId::NONE,
         }
     }
 
@@ -250,6 +269,7 @@ impl ChartSpec {
             origin: Origin::Loaded {
                 source: Arc::new(source),
             },
+            id: ChartId::NONE,
         }
     }
 
@@ -261,7 +281,15 @@ impl ChartSpec {
             source_ranges: Vec::new(),
             anchor,
             origin: Origin::Authored,
+            id: ChartId::NONE,
         }
+    }
+
+    /// Stamp this spec's stable [`ChartId`] (builder) — the worker assigns it when publishing the
+    /// snapshot so the app can reference this exact chart back for manipulation (P18).
+    pub fn with_id(mut self, id: ChartId) -> Self {
+        self.id = id;
+        self
     }
 
     /// The typed render [`Chart`], or `None` for an [`Unsupported`](ChartBody::Unsupported) chart

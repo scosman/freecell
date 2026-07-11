@@ -1307,6 +1307,18 @@ fn make_grid_sink(
             col: *at,
             count: *count,
         }),
+        // Chart manipulation (P18): move/resize (a new anchor) + delete route straight to the worker,
+        // like the other grid-initiated structure ops. The worker resolves the `ChartId` to the
+        // authored set or a loaded binding and republishes the chart snapshot.
+        GridEvent::ChartAnchorChanged { id, anchor } => client.send(Command::SetChartAnchor {
+            sheet: shared.active_sheet.get(),
+            id: *id,
+            anchor: *anchor,
+        }),
+        GridEvent::ChartDeleted { id } => client.send(Command::DeleteChart {
+            sheet: shared.active_sheet.get(),
+            id: *id,
+        }),
     })
 }
 

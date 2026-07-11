@@ -98,7 +98,7 @@ genuinely new subsystem, the write path, is isolated to P16.
 - [x] **P17 — Insert flow.** Action-bar chart-icon menu (type glyphs) → insert a near-empty
   chart of that type → it appears in the grid. *Exit:* insert a line chart via the UI; it
   renders + saves.
-- [ ] **P18 — Manipulate.** Select (outline + handles), move, resize, delete on the ChartLayer.
+- [x] **P18 — Manipulate.** Select (outline + handles), move, resize, delete on the ChartLayer.
   *Exit:* manipulation persists to the anchor and round-trips.
 - [ ] **P19 — Edit panel + range/type.** Right-docked panel skeleton; set data **range** and
   chart **type**. *Exit:* a near-empty inserted chart can be shaped into a real one.

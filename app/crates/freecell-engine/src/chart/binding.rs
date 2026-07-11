@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use roxmltree::{Document, Node};
 
-use freecell_chart_model::{Category, Chart, ChartSpec, Series, SeriesData};
+use freecell_chart_model::{Anchor, Category, Chart, ChartId, ChartSpec, Series, SeriesData};
 use freecell_core::{CellRange, CellRef, SheetId};
 
 use super::load::is_chart_group;
@@ -382,6 +382,10 @@ struct BoundChart {
     /// reflows on (P10). Set at discovery; empty only for the single-sheet `from_specs` convenience
     /// (never used by the save path).
     chart_part: String,
+    /// The stable manipulation handle the worker stamps (P18) — assigned by
+    /// [`ChartBindings::assign_missing_ids`] and stamped onto the published spec so the app can name
+    /// this chart back for move/resize/delete. [`ChartId::NONE`] until assigned.
+    id: ChartId,
     spec: ChartSpec,
     binding: ChartBinding,
 }
@@ -461,6 +465,7 @@ impl ChartBindings {
                     BoundChart {
                         anchor_sheet,
                         chart_part,
+                        id: ChartId::NONE,
                         spec,
                         binding,
                     }
@@ -472,6 +477,37 @@ impl ChartBindings {
 
     pub fn is_empty(&self) -> bool {
         self.charts.is_empty()
+    }
+
+    /// Assign a stable [`ChartId`] to every bound chart that doesn't have one yet (P18), drawing
+    /// from the worker's monotonic `next` counter (shared with authored charts so ids are globally
+    /// unique). Called after each [`add_missing`](Self::add_missing) so a lazily-discovered chart
+    /// gets an id the moment it is bound.
+    pub fn assign_missing_ids(&mut self, next: &mut u64) {
+        for bc in &mut self.charts {
+            if bc.id == ChartId::NONE {
+                bc.id = ChartId(*next);
+                *next += 1;
+            }
+        }
+    }
+
+    /// Move/resize a bound chart (P18): set the chart with stable id `id` to `anchor` (updating its
+    /// render spec so the republished snapshot places it there) and return its `chart_part` so the
+    /// caller can record the drawing-anchor patch the save applies. `None` if no bound chart has
+    /// that id (it was authored, or already deleted).
+    pub fn set_anchor_by_id(&mut self, id: ChartId, anchor: Anchor) -> Option<String> {
+        let bc = self.charts.iter_mut().find(|bc| bc.id == id)?;
+        bc.spec.anchor = anchor;
+        Some(bc.chart_part.clone())
+    }
+
+    /// Delete a bound chart (P18): remove the chart with stable id `id` and return its `chart_part`
+    /// so the caller can record it for the save to drop from the package. `None` if no bound chart
+    /// has that id.
+    pub fn remove_by_id(&mut self, id: ChartId) -> Option<String> {
+        let pos = self.charts.iter().position(|bc| bc.id == id)?;
+        Some(self.charts.remove(pos).chart_part)
     }
 
     /// Append the charts in `groups` that aren't **already bound**, anchoring each to its group's
@@ -499,6 +535,7 @@ impl ChartBindings {
                 self.charts.push(BoundChart {
                     anchor_sheet,
                     chart_part,
+                    id: ChartId::NONE,
                     spec,
                     binding,
                 });
@@ -598,9 +635,12 @@ impl ChartBindings {
     pub fn specs_by_sheet(&self) -> Vec<(SheetId, Arc<[ChartSpec]>)> {
         let mut out: Vec<(SheetId, Vec<ChartSpec>)> = Vec::new();
         for bc in &self.charts {
+            // Stamp the stable manipulation id onto the published spec (P18) so the app can name
+            // this exact chart back for move/resize/delete.
+            let spec = bc.spec.clone().with_id(bc.id);
             match out.iter_mut().find(|(s, _)| *s == bc.anchor_sheet) {
-                Some((_, specs)) => specs.push(bc.spec.clone()),
-                None => out.push((bc.anchor_sheet, vec![bc.spec.clone()])),
+                Some((_, specs)) => specs.push(spec),
+                None => out.push((bc.anchor_sheet, vec![spec])),
             }
         }
         out.into_iter()
@@ -814,6 +854,7 @@ mod tests {
                 BoundChart {
                     anchor_sheet: SheetId(0),
                     chart_part: "xl/charts/chart1.xml".into(),
+                    id: ChartId::NONE,
                     spec: spec_for("<c:lineChart/>"),
                     binding: ChartBinding {
                         series: vec![SeriesBinding {
@@ -826,6 +867,7 @@ mod tests {
                 BoundChart {
                     anchor_sheet: SheetId(0),
                     chart_part: "xl/charts/chart2.xml".into(),
+                    id: ChartId::NONE,
                     spec: spec_for("<c:lineChart/>"),
                     binding: ChartBinding {
                         series: vec![SeriesBinding {
@@ -973,12 +1015,14 @@ mod tests {
                 BoundChart {
                     anchor_sheet: SheetId(0),
                     chart_part: "xl/charts/chart1.xml".into(),
+                    id: ChartId::NONE,
                     spec: spec_for("<c:lineChart/>"),
                     binding: bind("Data!$B$2:$B$3"),
                 },
                 BoundChart {
                     anchor_sheet: SheetId(0),
                     chart_part: "xl/charts/chart2.xml".into(),
+                    id: ChartId::NONE,
                     spec: spec_for("<c:lineChart/>"),
                     binding: bind("Data!$D$2:$D$3"),
                 },

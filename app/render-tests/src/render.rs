@@ -67,6 +67,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let in_cell = case.in_cell;
     let titlebar = case.titlebar;
     let charts = case.charts;
+    let selected_chart = case.selected_chart;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
@@ -111,6 +112,10 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     // grid paints them over the cells at each chart's anchor rect.
                     if !charts.is_empty() {
                         view.set_sheet_charts(sheet, std::sync::Arc::from(charts), cx);
+                    }
+                    // A selected chart (P18) draws the selection outline + resize handles.
+                    if let Some(id) = selected_chart {
+                        view.set_selected_chart(Some(id), cx);
                     }
                     // Editing-feel overlays (Phase 2): a live mirror and/or an open in-cell editor.
                     if let Some((row, col, text)) = mirror {

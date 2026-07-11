@@ -35,7 +35,7 @@ pub use document::{
 };
 pub use instrument::{engine_call_count, reset_engine_call_count};
 pub use worker::{
-    BorderLine, BorderPreset, ChartInsertKind, ChartSnapshot, Command, DocumentClient,
+    BorderLine, BorderPreset, ChartId, ChartInsertKind, ChartSnapshot, Command, DocumentClient,
     EditRejectedReason, PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent,
     WorkerEventReceiver, WORKER_STACK_SIZE,
 };

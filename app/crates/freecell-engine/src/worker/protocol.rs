@@ -11,7 +11,7 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use freecell_chart_model::{Anchor, ChartInsertKind};
+use freecell_chart_model::{Anchor, ChartId, ChartInsertKind};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
 use freecell_core::{CellRange, CellRef, Rgb, SheetId};
@@ -313,6 +313,21 @@ pub enum Command {
         kind: ChartInsertKind,
         anchor: Anchor,
     },
+    /// **Move or resize** a chart on `sheet` (P18, `ui_design §3.2`): set the chart named by its
+    /// stable [`ChartId`] to a new [`Anchor`] (both move and resize produce one). For an **authored**
+    /// chart the worker rewrites the model anchor; for a **loaded** chart it updates the render
+    /// anchor and records a drawing-anchor patch the source-first save applies to the retained
+    /// `twoCellAnchor`. Degraded-guarded like every mutating op.
+    SetChartAnchor {
+        sheet: SheetId,
+        id: ChartId,
+        anchor: Anchor,
+    },
+    /// **Delete** a chart on `sheet` (P18, Delete/Backspace or the chart context menu): drop the
+    /// chart named by its [`ChartId`]. An **authored** chart is removed from the authored set; a
+    /// **loaded** chart is unbound and recorded so the save drops it from the package (its
+    /// `twoCellAnchor` + part chain) without corrupting the rest. Degraded-guarded.
+    DeleteChart { sheet: SheetId, id: ChartId },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },
     /// Drop the model and exit the loop.

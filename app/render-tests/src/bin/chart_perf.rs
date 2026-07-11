@@ -247,6 +247,12 @@ impl GridGeometry for UniformGeom {
     fn row_start(&self, row: u32) -> f64 {
         row as f64 * 20.0
     }
+    fn col_at(&self, x: f64) -> u32 {
+        (x.max(0.0) / 80.0).floor() as u32
+    }
+    fn row_at(&self, y: f64) -> u32 {
+        (y.max(0.0) / 20.0).floor() as u32
+    }
 }
 
 struct ScrollResult {

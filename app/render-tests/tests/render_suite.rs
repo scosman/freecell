@@ -259,6 +259,8 @@ render_cases! {
     // corner badge, the Unsupported placeholder, and a scrolled/clipped chart.
     grid_chart_line, grid_chart_degraded_badge, grid_chart_unsupported_placeholder,
     grid_chart_scrolled_clipped,
+    // Manipulate (P18): a selected chart with its selection outline + resize handles.
+    grid_chart_selected,
     // Editing feel (Phase 2): live mirror + in-cell editor overlay
     cell_mirror_typing, incell_editor_open,
     // Fonts (Phase 5): family + size + row auto-grow

@@ -22,6 +22,7 @@ use std::ops::Range;
 
 use gpui::{App, Window};
 
+use freecell_chart_model::{Anchor, ChartId};
 use freecell_core::selection::Direction;
 use freecell_core::{CellRange, CellRef, SelectionModel};
 
@@ -143,6 +144,12 @@ pub enum GridEvent {
     DeleteRows { at: u32, count: u32 },
     /// Delete `count` columns starting at 0-based `at`.
     DeleteColumns { at: u32, count: u32 },
+    /// A chart was **moved or resized** on the ChartLayer (P18, `ui_design §3.2`) — both produce a
+    /// new [`Anchor`]. The window forwards it as `Command::SetChartAnchor` for the active sheet.
+    ChartAnchorChanged { id: ChartId, anchor: Anchor },
+    /// A selected chart was **deleted** (Delete/Backspace or the chart context menu, P18). The
+    /// window forwards it as `Command::DeleteChart` for the active sheet.
+    ChartDeleted { id: ChartId },
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

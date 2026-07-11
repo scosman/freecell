@@ -182,6 +182,14 @@ axis title, font/line-weight tuning). Not defects — recorded so they aren't re
 | C-P13-4 | **Minor gridlines are not rendered — but now correctly DEGRADE.** The line renderer draws only **major** gridlines; an authored `c:minorGridlines` renders without its lines. | Excel draws minor gridlines when set. | `fidelity::unsupported_minor_gridlines` classifies a line chart carrying `c:minorGridlines` as **[`Degraded`]** (honest badge). Major-gridline on/off stays Faithful (honored). No committed baseline uses minor gridlines. | Draw minor gridlines (sub-ticks off the value axis) in a later pass, then drop from the degrade set. |
 | C-P13-5 | **Legend swatch ignores `a:ln` alpha (cosmetic).** The legend color chip is a solid `div` fill, so a semi-transparent series (e.g. the 40%-alpha "Light / 40%" series in `chart_line_styled.png`) shows an **opaque** swatch even though its line is faded. | Excel's legend key mirrors the series line's opacity. | Pre-existing solid-chip legend design (the chip is `bg(rgb(color))` with no alpha channel). The *line* itself renders the alpha correctly; only the tiny legend chip doesn't. Tracked, not fixed. | Apply the resolved `Hsla` (incl. alpha) to the legend chip if legend↔line opacity parity is wanted. |
 
+### Charts — manipulate (Charts P18, 2026-07-11)
+
+Non-blocking forward-looking note from the P18 (select/move/resize/delete) review. Not a defect — recorded so it isn't re-litigated.
+
+| # | Item | Vs. Excel | Root cause / current behavior | Follow-up if needed |
+|---|---|---|---|---|
+| C-P18-1 | **Moving/resizing a LOADED chart whose drawing anchor is a `oneCellAnchor` or `absoluteAnchor` moves its position but keeps its original size (cosmetic).** The overwhelmingly-common `twoCellAnchor` (used by real files, our loader, and the authored writer) is fully rewritten; the two rarer anchor kinds carry an `<xdr:ext>` (size) instead of `<xdr:to>`. | Excel moves + resizes any anchor kind. | `chart::save::patch_drawing_xml` rewrites `<xdr:from>`/`<xdr:to>` for the target anchor; a `oneCellAnchor`/`absoluteAnchor` has no `<xdr:to>`, so its `<xdr:from>` corner is updated (position moves) but its `<xdr:ext>` is left untouched (size preserved). **No corruption** — the patched drawing stays valid and reopens; only the size edit is dropped. | Extend the P18 edit path to rewrite `<xdr:ext>` (and, for a resize, convert to `twoCellAnchor` if needed) when the target anchor is not a `twoCellAnchor`. Small once a real file needs it. |
+
 ### `mvp-gaps` UI review — accepted limitations (owner-approved 2026-07-06)
 
 Two judgment calls from the post-Phase-8 **UI-review bug-fix round**, reviewed and accepted by

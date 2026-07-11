@@ -10,7 +10,7 @@
 //! content-local px — the same `offset − scroll` mapping cells use, so scroll and variable-geometry
 //! ("zoom") are free.
 
-use freecell_chart_model::{Anchor, ChartSpec, Fidelity};
+use freecell_chart_model::{Anchor, AnchorCell, ChartSpec, Fidelity};
 
 /// EMU (English Metric Units) per CSS pixel at Excel's 96-DPI screen basis: 914 400 EMU/inch ÷
 /// 96 px/inch. An `xdr:*Anchor`'s intra-cell `colOff`/`rowOff` are in EMUs; this converts them to
@@ -30,6 +30,182 @@ pub trait GridGeometry {
     fn col_start(&self, col: u32) -> f64;
     /// The content-space y offset (px, pre-scroll) of row `row`'s top edge.
     fn row_start(&self, row: u32) -> f64;
+    /// The column whose span contains content-space x offset `x` (px, pre-scroll) — the inverse of
+    /// [`col_start`](Self::col_start), used by [`rect_to_anchor`] to turn a dragged pixel rect back
+    /// into a cell anchor (P18).
+    fn col_at(&self, x: f64) -> u32;
+    /// The row whose span contains content-space y offset `y` (px, pre-scroll).
+    fn row_at(&self, y: f64) -> u32;
+}
+
+/// The visual size (px) of a selection resize handle square drawn at a selected chart's corners +
+/// edge midpoints (P18, `ui_design §3.2`).
+pub const HANDLE_PX: f32 = 8.0;
+/// The half-extent (px) of a handle's **hit** zone — a little larger than the visual square so a
+/// handle is easy to grab.
+pub const HANDLE_HIT_HALF: f32 = 7.0;
+/// The minimum width/height (px) a chart resize clamps to, so a drag can't invert or collapse it.
+pub const MIN_CHART_PX: f32 = 40.0;
+
+/// Map a chart's content-local pixel `rect` (as produced by a move/resize drag, current scroll
+/// applied) **back** to an [`Anchor`] — the inverse of [`anchor_rect`] (P18). Each corner resolves
+/// to the cell whose span contains it plus the intra-cell EMU offset, so a moved/resized chart
+/// persists to a `twoCellAnchor` that reproduces the same rect. Offsets are clamped ≥ 0.
+pub fn rect_to_anchor(
+    rect: ChartRect,
+    geom: &impl GridGeometry,
+    scroll_x: f64,
+    scroll_y: f64,
+) -> Anchor {
+    let x0 = rect.x as f64 + scroll_x;
+    let x1 = (rect.x + rect.w) as f64 + scroll_x;
+    let y0 = rect.y as f64 + scroll_y;
+    let y1 = (rect.y + rect.h) as f64 + scroll_y;
+    Anchor::new(anchor_cell_at(geom, x0, y0), anchor_cell_at(geom, x1, y1))
+}
+
+/// The [`AnchorCell`] for a content-space point `(x, y)` (pre-scroll px): the containing cell + the
+/// intra-cell EMU offset from that cell's top-left.
+fn anchor_cell_at(geom: &impl GridGeometry, x: f64, y: f64) -> AnchorCell {
+    let col = geom.col_at(x);
+    let row = geom.row_at(y);
+    let col_off = ((x - geom.col_start(col)).max(0.0) * EMU_PER_PX).round() as i64;
+    let row_off = ((y - geom.row_start(row)).max(0.0) * EMU_PER_PX).round() as i64;
+    AnchorCell::with_offsets(col, col_off, row, row_off)
+}
+
+/// One of the eight selection resize handles around a chart's rect — four corners + four edge
+/// midpoints (P18). Each names the edge(s) a drag on it moves ([`Handle::moves`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
+
+/// Which edges a drag on this handle moves: `(left, right, top, bottom)`.
+struct MovedEdges {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+impl Handle {
+    /// All eight handles, in a stable order.
+    pub const ALL: [Handle; 8] = [
+        Handle::TopLeft,
+        Handle::Top,
+        Handle::TopRight,
+        Handle::Right,
+        Handle::BottomRight,
+        Handle::Bottom,
+        Handle::BottomLeft,
+        Handle::Left,
+    ];
+
+    /// The handle's center point on `rect` (the point the small square is drawn around).
+    pub fn center(self, rect: ChartRect) -> (f32, f32) {
+        let (l, r) = (rect.x, rect.x + rect.w);
+        let (t, b) = (rect.y, rect.y + rect.h);
+        let (cx, cy) = ((l + r) / 2.0, (t + b) / 2.0);
+        match self {
+            Handle::TopLeft => (l, t),
+            Handle::Top => (cx, t),
+            Handle::TopRight => (r, t),
+            Handle::Right => (r, cy),
+            Handle::BottomRight => (r, b),
+            Handle::Bottom => (cx, b),
+            Handle::BottomLeft => (l, b),
+            Handle::Left => (l, cy),
+        }
+    }
+
+    /// The `HANDLE_PX`-sized square rect drawn for this handle (centered on [`center`](Self::center)).
+    pub fn square(self, rect: ChartRect) -> ChartRect {
+        let (cx, cy) = self.center(rect);
+        ChartRect {
+            x: cx - HANDLE_PX / 2.0,
+            y: cy - HANDLE_PX / 2.0,
+            w: HANDLE_PX,
+            h: HANDLE_PX,
+        }
+    }
+
+    fn moves(self) -> MovedEdges {
+        let (mut left, mut right, mut top, mut bottom) = (false, false, false, false);
+        match self {
+            Handle::TopLeft => (left, top) = (true, true),
+            Handle::Top => top = true,
+            Handle::TopRight => (right, top) = (true, true),
+            Handle::Right => right = true,
+            Handle::BottomRight => (right, bottom) = (true, true),
+            Handle::Bottom => bottom = true,
+            Handle::BottomLeft => (left, bottom) = (true, true),
+            Handle::Left => left = true,
+        }
+        MovedEdges {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
+}
+
+/// The handle of `rect` a content-local point `(x, y)` grabs, if any (within [`HANDLE_HIT_HALF`]).
+/// Corners win over edges when the zones overlap (their order in [`Handle::ALL`] puts corners
+/// first at each end). Only the **selected** chart's handles are hit-tested by the caller.
+pub fn handle_at(rect: ChartRect, x: f32, y: f32) -> Option<Handle> {
+    Handle::ALL.into_iter().find(|h| {
+        let (cx, cy) = h.center(rect);
+        (x - cx).abs() <= HANDLE_HIT_HALF && (y - cy).abs() <= HANDLE_HIT_HALF
+    })
+}
+
+/// Apply a drag delta `(dx, dy)` (content px, from the grab point) to `start` by moving the edges
+/// [`handle`](Handle) controls, clamped so width/height stay ≥ [`MIN_CHART_PX`] (P18). A corner
+/// moves two edges; an edge midpoint moves one. The opposite (fixed) edges never move, so the
+/// resize pins the chart's far side.
+pub fn resize_rect(start: ChartRect, handle: Handle, dx: f32, dy: f32) -> ChartRect {
+    let m = handle.moves();
+    let mut left = start.x;
+    let mut right = start.x + start.w;
+    let mut top = start.y;
+    let mut bottom = start.y + start.h;
+    if m.left {
+        left = (left + dx).min(right - MIN_CHART_PX);
+    }
+    if m.right {
+        right = (right + dx).max(left + MIN_CHART_PX);
+    }
+    if m.top {
+        top = (top + dy).min(bottom - MIN_CHART_PX);
+    }
+    if m.bottom {
+        bottom = (bottom + dy).max(top + MIN_CHART_PX);
+    }
+    ChartRect {
+        x: left,
+        y: top,
+        w: right - left,
+        h: bottom - top,
+    }
+}
+
+/// Translate `rect` by a move drag delta `(dx, dy)` (content px) — the whole chart follows the
+/// pointer (P18). Size is unchanged.
+pub fn move_rect(rect: ChartRect, dx: f32, dy: f32) -> ChartRect {
+    ChartRect {
+        x: rect.x + dx,
+        y: rect.y + dy,
+        ..rect
+    }
 }
 
 /// A chart's **content-local** pixel rectangle (origin at the content area's top-left, current
@@ -124,6 +300,12 @@ mod tests {
         }
         fn row_start(&self, row: u32) -> f64 {
             row as f64 * self.row_h
+        }
+        fn col_at(&self, x: f64) -> u32 {
+            (x.max(0.0) / self.col_w).floor() as u32
+        }
+        fn row_at(&self, y: f64) -> u32 {
+            (y.max(0.0) / self.row_h).floor() as u32
         }
     }
 
@@ -252,6 +434,75 @@ mod tests {
             h: 80.0,
         }
         .is_offscreen(cw, ch));
+    }
+
+    #[test]
+    fn rect_to_anchor_inverts_anchor_rect() {
+        let geom = Uniform {
+            col_w: 100.0,
+            row_h: 24.0,
+        };
+        // A twoCellAnchor with intra-cell offsets → rect → back to the same anchor.
+        let anchor = Anchor::new(
+            AnchorCell::with_offsets(1, 9525, 2, 19_050),
+            AnchorCell::with_offsets(6, 4762, 14, 4762),
+        );
+        for (sx, sy) in [(0.0, 0.0), (40.0, 10.0), (250.0, 120.0)] {
+            let rect = anchor_rect(&anchor, &geom, sx, sy);
+            let back = rect_to_anchor(rect, &geom, sx, sy);
+            assert_eq!(
+                back.from.col, anchor.from.col,
+                "from.col at scroll {sx},{sy}"
+            );
+            assert_eq!(back.from.row, anchor.from.row);
+            assert_eq!(back.to.col, anchor.to.col);
+            assert_eq!(back.to.row, anchor.to.row);
+            // Offsets round-trip within a rounding EMU (pixel → EMU → pixel).
+            assert!((back.from.col_off_emu - anchor.from.col_off_emu).abs() <= EMU_PER_PX as i64);
+            assert!((back.to.row_off_emu - anchor.to.row_off_emu).abs() <= EMU_PER_PX as i64);
+        }
+    }
+
+    #[test]
+    fn handle_at_hits_each_handle_and_misses_the_interior() {
+        let rect = ChartRect {
+            x: 100.0,
+            y: 50.0,
+            w: 200.0,
+            h: 120.0,
+        };
+        // Each handle's center is grabbed.
+        for h in Handle::ALL {
+            let (cx, cy) = h.center(rect);
+            assert_eq!(handle_at(rect, cx, cy), Some(h), "grab {h:?}");
+        }
+        // The interior (well inside every handle zone) grabs nothing.
+        assert_eq!(handle_at(rect, 200.0, 110.0), None);
+    }
+
+    #[test]
+    fn resize_rect_moves_the_dragged_edges_and_clamps_min() {
+        let start = ChartRect {
+            x: 100.0,
+            y: 50.0,
+            w: 200.0,
+            h: 120.0,
+        };
+        // Dragging the bottom-right corner grows width + height; the top-left stays pinned.
+        let r = resize_rect(start, Handle::BottomRight, 30.0, 40.0);
+        assert_eq!((r.x, r.y), (100.0, 50.0));
+        assert_eq!((r.w, r.h), (230.0, 160.0));
+
+        // Dragging the left edge inward moves x + shrinks width; the right edge stays pinned.
+        let r = resize_rect(start, Handle::Left, 50.0, 0.0);
+        assert_eq!(r.x, 150.0);
+        assert_eq!(r.w, 150.0);
+        assert_eq!(r.x + r.w, 300.0, "right edge pinned");
+
+        // An extreme inward left drag clamps to MIN_CHART_PX (never inverts).
+        let r = resize_rect(start, Handle::Left, 500.0, 0.0);
+        assert_eq!(r.w, MIN_CHART_PX);
+        assert_eq!(r.x + r.w, 300.0, "right edge still pinned");
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! baseline filename, so a red CI line names the exact broken feature.
 
 use freecell_chart_model::{
-    Anchor, AnchorCell, Axis, Category, Chart, ChartColor, ChartKind, ChartSpec, Grouping, Legend,
-    Series, SourceXml, ThemeSlot,
+    Anchor, AnchorCell, Axis, Category, Chart, ChartColor, ChartId, ChartKind, ChartSpec, Grouping,
+    Legend, Series, SourceXml, ThemeSlot,
 };
 use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
 
@@ -76,6 +76,9 @@ pub struct RenderCase {
     /// §4.2`) — the harness hands them to `GridView::set_sheet_charts` for the active sheet. Empty
     /// for every non-chart case (no ChartLayer painted → no baseline change).
     pub charts: Vec<ChartSpec>,
+    /// A selected chart (P18) — its stable [`ChartId`], drawn with the selection outline + resize
+    /// handles. `None` (the default) draws no selection chrome, so no existing baseline moves.
+    pub selected_chart: Option<ChartId>,
 }
 
 impl RenderCase {
@@ -92,6 +95,7 @@ impl RenderCase {
             in_cell: None,
             titlebar: None,
             charts: Vec::new(),
+            selected_chart: None,
         }
     }
 
@@ -103,6 +107,12 @@ impl RenderCase {
     /// Installs charts on the case's ChartLayer (P8).
     fn charts(mut self, charts: Vec<ChartSpec>) -> Self {
         self.charts = charts;
+        self
+    }
+
+    /// Selects the chart with this [`ChartId`] (P18) — draws the selection outline + resize handles.
+    fn selected_chart(mut self, id: ChartId) -> Self {
+        self.selected_chart = Some(id);
         self
     }
 
@@ -543,6 +553,14 @@ pub fn all() -> Vec<RenderCase> {
         )
         .charts(vec![in_grid_chart_spec("Regional Sales", "<c:lineChart/>")])
         .reveal(22, 8),
+        // A SELECTED chart (P18): the same Faithful line chart with the selection outline + eight
+        // resize handles drawn over its rect (`ui_design.md §3.2`). New ChartLayer chrome — its own
+        // baseline, so no existing `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_selected", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![
+                in_grid_chart_spec("Regional Sales", "<c:lineChart/>").with_id(ChartId(1))
+            ])
+            .selected_chart(ChartId(1)),
         // ---- Editing feel (Phase 2): live mirror + in-cell editor overlay --------------
         RenderCase::new(
             // The active cell shows the raw text being typed (default style, left-aligned)

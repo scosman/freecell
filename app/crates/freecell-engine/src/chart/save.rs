@@ -21,7 +21,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
-use freecell_chart_model::{Category, Chart, SeriesData};
+use freecell_chart_model::{Anchor, AnchorCell, Category, Chart, SeriesData};
 
 use super::load::{self, parse_chart_xml, SheetDrawing};
 use super::xlsx;
@@ -89,6 +89,8 @@ pub fn save_with_charts(original: &Path, out: &Path) -> Result<SaveReport> {
         &sheets,
         &targets,
         &BTreeMap::new(),
+        &HashMap::new(),
+        &HashSet::new(),
     )?;
     std::fs::write(out, &final_bytes).with_context(|| format!("writing {}", out.display()))?;
     Ok(report)
@@ -130,11 +132,21 @@ pub fn reinject_live_charts(
     original: &Path,
     model_bytes: &[u8],
     live: &[LiveChart],
+    anchor_edits: &HashMap<String, Anchor>,
+    deletes: &HashSet<String>,
 ) -> Result<(Vec<u8>, SaveReport)> {
     let sheets = load::discover(original)?;
     let patches = build_live_patches(original, live)?;
     let targets = live_sheet_targets(original, model_bytes, &sheets, live)?;
-    reinject(original, model_bytes, &sheets, &targets, &patches)
+    reinject(
+        original,
+        model_bytes,
+        &sheets,
+        &targets,
+        &patches,
+        anchor_edits,
+        deletes,
+    )
 }
 
 /// The edited-loaded patch map for [`reinject_live_charts`], keyed by each live chart's **own**
@@ -274,6 +286,8 @@ pub fn reinject(
     sheets: &[SheetDrawing],
     targets: &[Option<String>],
     patches: &BTreeMap<String, String>,
+    anchor_edits: &HashMap<String, Anchor>,
+    deletes: &HashSet<String>,
 ) -> Result<(Vec<u8>, SaveReport)> {
     debug_assert_eq!(
         sheets.len(),
@@ -287,13 +301,78 @@ pub fn reinject(
     let mut orig = zip::ZipArchive::new(orig_file)
         .with_context(|| format!("reading {} as a zip", original.display()))?;
 
+    // P18: a drawing whose charts are ALL deleted **and which holds nothing else** is dropped whole
+    // (reuses the deleted-host path); one with only SOME charts deleted, a moved/resized chart, or
+    // **co-located non-chart anchors** (shapes / textboxes live in the SAME `drawingN.xml` as chart
+    // anchors) survives with a **patched** drawing XML (+ `_rels`) so those shapes are never silently
+    // dropped (functional_spec §7 / architecture §6 — "never silently drop"). `SheetDrawing.charts`
+    // tracks only the chart anchors, so we compare it against the drawing's TOTAL anchor count.
+    // `eff_targets` folds the wholly-dropped override into the caller's targets so the plan,
+    // content-types, and report all agree.
+    let mut eff_targets: Vec<Option<String>> = targets.to_vec();
+    for (k, sheet) in sheets.iter().enumerate() {
+        let all_charts_deleted =
+            !sheet.charts.is_empty() && sheet.charts.iter().all(|dc| deletes.contains(&dc.part));
+        if all_charts_deleted
+            && drawing_anchor_count(&mut orig, &sheet.drawing_part)? <= sheet.charts.len()
+        {
+            eff_targets[k] = None;
+        }
+    }
+
     // The whole part chain of every DROPPED drawing — excluded from carry + content-types so no
     // orphaned chart/drawing parts leak into the output.
     let mut dropped_parts: HashSet<String> = HashSet::new();
-    for (sheet, target) in sheets.iter().zip(targets) {
+    for (sheet, target) in sheets.iter().zip(&eff_targets) {
         if target.is_none() {
             for part in drawing_chain_parts(&mut orig, sheet)? {
                 dropped_parts.insert(part);
+            }
+        }
+    }
+
+    // Patched drawing parts (moved/resized anchors, individually-removed deleted anchors) — a
+    // `drawing_part → patched XML` / `drawing_rels_part → patched rels` substitution applied in the
+    // carry loop. A surviving drawing's individually-deleted charts have their part chains dropped.
+    let mut drawing_subs: HashMap<String, String> = HashMap::new();
+    let mut drawing_rels_subs: HashMap<String, String> = HashMap::new();
+    for (sheet, target) in sheets.iter().zip(&eff_targets) {
+        if target.is_none() {
+            continue; // wholly dropped — no per-anchor patch
+        }
+        let touched = sheet
+            .charts
+            .iter()
+            .any(|dc| deletes.contains(&dc.part) || anchor_edits.contains_key(&dc.part));
+        if !touched {
+            continue; // this drawing's charts are all untouched → byte-preserve verbatim
+        }
+        let part_by_rel = drawing_part_by_rel(&mut orig, sheet)?;
+        let drawing_xml = xlsx::read_entry_from(&mut orig, &sheet.drawing_part)
+            .with_context(|| format!("reading drawing part {}", sheet.drawing_part))?;
+        let (patched_xml, _remaining) =
+            patch_drawing_xml(&drawing_xml, &part_by_rel, anchor_edits, deletes)?;
+        drawing_subs.insert(sheet.drawing_part.clone(), patched_xml);
+        // Remove each individually-deleted chart's rel from the drawing `_rels` + drop its part
+        // chain, so no dangling relationship or orphaned chart part survives.
+        let deleted_rel_ids: Vec<String> = part_by_rel
+            .iter()
+            .filter(|(_, part)| deletes.contains(*part))
+            .map(|(rel_id, _)| rel_id.clone())
+            .collect();
+        if !deleted_rel_ids.is_empty() {
+            let rels_part = xlsx::rels_part_for(&sheet.drawing_part);
+            if xlsx::has_entry(&mut orig, &rels_part) {
+                let rels_xml = xlsx::read_entry_from(&mut orig, &rels_part)?;
+                drawing_rels_subs
+                    .insert(rels_part, patch_drawing_rels(&rels_xml, &deleted_rel_ids)?);
+            }
+        }
+        for dc in &sheet.charts {
+            if deletes.contains(&dc.part) {
+                for part in chart_chain_parts(&mut orig, &dc.part)? {
+                    dropped_parts.insert(part);
+                }
             }
         }
     }
@@ -320,7 +399,7 @@ pub fn reinject(
     // drops that drawing (deleted host sheet / unparseable charts). A distinctive relationship Id
     // per patched sheet, chosen to never collide with the rId1/rId2… IronCalc emits.
     let mut plan: Vec<SheetPatch> = Vec::new();
-    for (k, (sheet, target)) in sheets.iter().zip(targets).enumerate() {
+    for (k, (sheet, target)) in sheets.iter().zip(&eff_targets).enumerate() {
         let Some(out_part) = target else {
             continue; // dropped drawing (not re-injected into any worksheet)
         };
@@ -381,27 +460,36 @@ pub fn reinject(
         write_part(&mut zw, opts, &p.rels_part, rels.as_bytes())?;
     }
 
-    // Carry the original chart + drawing parts. A chart part with an edited-loaded patch is
-    // written patched (its reflowed caches); every other part goes byte-for-byte (bit-stable).
+    // Carry the original chart + drawing parts. A chart part with an edited-loaded patch is written
+    // patched (its reflowed caches); a moved/resized or partially-deleted drawing (+ its `_rels`) is
+    // written with its P18-patched XML; every other part goes byte-for-byte (bit-stable).
     let mut patched_charts: Vec<String> = Vec::new();
     for (name, bytes) in &carry {
-        match patches.get(name) {
-            Some(patched_xml) => {
-                write_part(&mut zw, opts, name, patched_xml.as_bytes())?;
-                patched_charts.push(name.clone());
-            }
-            None => write_part(&mut zw, opts, name, bytes)?,
+        if let Some(patched_xml) = patches.get(name) {
+            write_part(&mut zw, opts, name, patched_xml.as_bytes())?;
+            patched_charts.push(name.clone());
+        } else if let Some(patched_xml) = drawing_subs.get(name) {
+            write_part(&mut zw, opts, name, patched_xml.as_bytes())?;
+        } else if let Some(patched_rels) = drawing_rels_subs.get(name) {
+            write_part(&mut zw, opts, name, patched_rels.as_bytes())?;
+        } else {
+            write_part(&mut zw, opts, name, bytes)?;
         }
     }
 
     let cursor = zw.finish().context("finishing re-injected zip")?;
     let report = SaveReport {
-        // Charts on re-injected (non-dropped) sheets — a dropped drawing's charts aren't preserved.
+        // Charts on re-injected (non-dropped) sheets, minus any individually deleted (P18).
         charts_preserved: sheets
             .iter()
-            .zip(targets)
+            .zip(&eff_targets)
             .filter(|(_, t)| t.is_some())
-            .map(|(s, _)| s.charts.len())
+            .map(|(s, _)| {
+                s.charts
+                    .iter()
+                    .filter(|dc| !deletes.contains(&dc.part))
+                    .count()
+            })
             .sum(),
         patched_sheets: plan.iter().map(|p| p.sheet_part.clone()).collect(),
         carried_parts: carry_names,
@@ -453,6 +541,175 @@ fn drawing_chain_parts<R: Read + std::io::Seek>(
         }
     }
     Ok(parts)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drawing-anchor patching (P18: move/resize/delete a loaded chart in the retained drawing part)
+// ---------------------------------------------------------------------------------------------
+
+/// The `relationship id → target chart part` map of one drawing's `_rels` (resolved against the
+/// drawing part), so a `<c:chart r:id=…>` in the drawing XML resolves to its `xl/charts/chartN.xml`.
+/// Empty when the drawing has no `_rels` (a chartless drawing never reaches the P18 patch path).
+fn drawing_part_by_rel<R: Read + std::io::Seek>(
+    orig: &mut zip::ZipArchive<R>,
+    sheet: &SheetDrawing,
+) -> Result<HashMap<String, String>> {
+    let rels_part = xlsx::rels_part_for(&sheet.drawing_part);
+    if !xlsx::has_entry(orig, &rels_part) {
+        return Ok(HashMap::new());
+    }
+    let rels_xml = xlsx::read_entry_from(orig, &rels_part)?;
+    Ok(xlsx::parse_rels(&rels_xml)?
+        .into_iter()
+        .map(|(rel_id, rel)| {
+            (
+                rel_id,
+                xlsx::resolve_target(&sheet.drawing_part, &rel.target),
+            )
+        })
+        .collect())
+}
+
+/// The chart part + its `_rels` + non-external aux targets (`colorsN`/`styleN`/embeddings) — one
+/// deleted chart's whole package chain, dropped from carry + content-types so no orphan survives
+/// when a chart is individually removed from a *surviving* drawing (P18). Mirrors the chart portion
+/// of [`drawing_chain_parts`].
+fn chart_chain_parts<R: Read + std::io::Seek>(
+    orig: &mut zip::ZipArchive<R>,
+    chart_part: &str,
+) -> Result<Vec<String>> {
+    let mut parts = vec![chart_part.to_string()];
+    let chart_rels = xlsx::rels_part_for(chart_part);
+    if xlsx::has_entry(orig, &chart_rels) {
+        let rels_xml = xlsx::read_entry_from(orig, &chart_rels)?;
+        parts.push(chart_rels);
+        for rel in xlsx::parse_rels(&rels_xml)?.values() {
+            let target = xlsx::resolve_target(chart_part, &rel.target);
+            if xlsx::has_entry(orig, &target) {
+                parts.push(target);
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// Whether a local element name is one of the three spreadsheet-drawing anchor kinds.
+fn is_anchor_element_name(name: &str) -> bool {
+    matches!(name, "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor")
+}
+
+/// The total number of `<xdr:*Anchor>` elements in a drawing part — chart frames **and** any
+/// co-located shapes/textboxes/images. Compared against the chart-anchor count (`SheetDrawing.charts`)
+/// to decide whether a fully-chart-deleted drawing can be dropped whole (only when it holds nothing
+/// but those charts) or must be patched to preserve its non-chart anchors (P18).
+fn drawing_anchor_count<R: Read + std::io::Seek>(
+    orig: &mut zip::ZipArchive<R>,
+    drawing_part: &str,
+) -> Result<usize> {
+    let xml = xlsx::read_entry_from(orig, drawing_part)
+        .with_context(|| format!("reading drawing part {drawing_part}"))?;
+    let doc = Document::parse(&xml)
+        .with_context(|| format!("parsing drawing part {drawing_part} to count anchors"))?;
+    Ok(doc
+        .descendants()
+        .filter(|n| n.is_element() && is_anchor_element_name(n.tag_name().name()))
+        .count())
+}
+
+/// Patch a worksheet drawing part's `twoCellAnchor`s for P18 move/resize/delete: for each anchor
+/// element, resolve the chart it frames (via its `<c:chart r:id>` → `part_by_rel`) and either
+/// **remove** the whole anchor (the chart is in `deletes`) or **rewrite** its `<xdr:from>`/`<xdr:to>`
+/// (the chart has an entry in `anchor_edits`). Untouched anchors — and all non-anchor bytes,
+/// namespaces, and shape ids — are preserved **byte-for-byte** (the same targeted-splice pattern as
+/// [`patch_chart_source`]). Returns the patched XML + the count of anchors that remain.
+fn patch_drawing_xml(
+    drawing_xml: &str,
+    part_by_rel: &HashMap<String, String>,
+    anchor_edits: &HashMap<String, Anchor>,
+    deletes: &HashSet<String>,
+) -> Result<(String, usize)> {
+    let doc = Document::parse(drawing_xml).context("parsing drawing XML to patch")?;
+    // (byte_range, replacement) edits, applied descending so earlier offsets stay valid.
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    let mut remaining = 0usize;
+    for anchor in doc
+        .descendants()
+        .filter(|n| n.is_element() && is_anchor_element_name(n.tag_name().name()))
+    {
+        // The chart part this anchor frames, via its `<c:chart r:id>` (if any).
+        let chart_part = anchor
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "chart")
+            .and_then(|c| xlsx::attr(&c, "id"))
+            .and_then(|rel_id| part_by_rel.get(rel_id));
+        match chart_part {
+            Some(part) if deletes.contains(part) => {
+                edits.push((anchor.range(), String::new())); // remove the whole anchor
+            }
+            Some(part) if anchor_edits.contains_key(part) => {
+                remaining += 1;
+                let new = &anchor_edits[part];
+                if let Some(from) = child(&anchor, "from") {
+                    let prefix = element_prefix(drawing_xml, &from);
+                    edits.push((
+                        from.range(),
+                        serialize_anchor_corner(prefix, "from", &new.from),
+                    ));
+                }
+                if let Some(to) = child(&anchor, "to") {
+                    let prefix = element_prefix(drawing_xml, &to);
+                    edits.push((to.range(), serialize_anchor_corner(prefix, "to", &new.to)));
+                }
+            }
+            _ => remaining += 1, // untouched (or a non-chart anchor — image/shape) → keep verbatim
+        }
+    }
+
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut patched = drawing_xml.to_string();
+    let mut prev_start = patched.len();
+    for (range, replacement) in edits {
+        debug_assert!(
+            range.end <= prev_start,
+            "drawing edit ranges must be disjoint"
+        );
+        prev_start = range.start;
+        patched.replace_range(range, &replacement);
+    }
+    Ok((patched, remaining))
+}
+
+/// One `<xdr:from>`/`<xdr:to>` corner element, rebuilt with the source's namespace `prefix` (e.g.
+/// `xdr:`) so the patched drawing keeps the file's exact prefixes.
+fn serialize_anchor_corner(prefix: &str, tag: &str, cell: &AnchorCell) -> String {
+    format!(
+        "<{p}{tag}><{p}col>{c}</{p}col><{p}colOff>{co}</{p}colOff>\
+         <{p}row>{r}</{p}row><{p}rowOff>{ro}</{p}rowOff></{p}{tag}>",
+        p = prefix,
+        tag = tag,
+        c = cell.col,
+        co = cell.col_off_emu,
+        r = cell.row,
+        ro = cell.row_off_emu,
+    )
+}
+
+/// Remove the `<Relationship>` entries whose `Id` is in `deleted_rel_ids` from a drawing `_rels`
+/// part (P18 delete) — so a deleted chart leaves no dangling relationship to a dropped chart part.
+fn patch_drawing_rels(rels_xml: &str, deleted_rel_ids: &[String]) -> Result<String> {
+    let doc = Document::parse(rels_xml).context("parsing drawing _rels to patch")?;
+    let mut ranges: Vec<Range<usize>> = doc
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "Relationship")
+        .filter(|n| xlsx::attr(n, "Id").is_some_and(|id| deleted_rel_ids.iter().any(|d| d == id)))
+        .map(|n| n.range())
+        .collect();
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
+    let mut patched = rels_xml.to_string();
+    for range in ranges {
+        patched.replace_range(range, "");
+    }
+    Ok(patched)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -888,6 +1145,154 @@ mod tests {
     use crate::document::WorkbookDocument;
     use freecell_core::{CellRef, SheetId};
 
+    // ---- P18 drawing-anchor patching (move/resize/delete a loaded chart) --------------------
+
+    /// A minimal two-anchor drawing (two charts) with declared namespaces, in the `xdr:`-prefixed
+    /// shape real files (and our authored writer) use.
+    fn two_chart_drawing() -> &'static str {
+        r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>14</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor><xdr:twoCellAnchor><xdr:from><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>14</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>18</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#
+    }
+
+    fn part_by_rel() -> HashMap<String, String> {
+        HashMap::from([
+            ("rId1".to_string(), "xl/charts/chart1.xml".to_string()),
+            ("rId2".to_string(), "xl/charts/chart2.xml".to_string()),
+        ])
+    }
+
+    #[test]
+    fn patch_drawing_xml_rewrites_a_moved_charts_from_to() {
+        let new = Anchor::new(
+            AnchorCell::with_offsets(3, 9525, 5, 19050),
+            AnchorCell::with_offsets(9, 4762, 17, 4762),
+        );
+        let edits = HashMap::from([("xl/charts/chart1.xml".to_string(), new)]);
+        let (patched, remaining) =
+            patch_drawing_xml(two_chart_drawing(), &part_by_rel(), &edits, &HashSet::new())
+                .unwrap();
+        assert_eq!(
+            remaining, 2,
+            "both anchors remain (one moved, one untouched)"
+        );
+        // chart1's from/to were rewritten to the new cells + EMU offsets (prefix preserved).
+        assert!(patched.contains("<xdr:from><xdr:col>3</xdr:col><xdr:colOff>9525</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>19050</xdr:rowOff></xdr:from>"));
+        assert!(patched.contains("<xdr:to><xdr:col>9</xdr:col><xdr:colOff>4762</xdr:colOff><xdr:row>17</xdr:row><xdr:rowOff>4762</xdr:rowOff></xdr:to>"));
+        // The graphic frame (chart ref) is untouched, and chart2's anchor is byte-identical.
+        assert!(patched.contains(r#"<c:chart r:id="rId1"/>"#));
+        assert!(patched.contains("<xdr:from><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"));
+        // The patched drawing still parses.
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    #[test]
+    fn patch_drawing_xml_removes_a_deleted_charts_anchor() {
+        let deletes = HashSet::from(["xl/charts/chart1.xml".to_string()]);
+        let (patched, remaining) = patch_drawing_xml(
+            two_chart_drawing(),
+            &part_by_rel(),
+            &HashMap::new(),
+            &deletes,
+        )
+        .unwrap();
+        assert_eq!(remaining, 1, "only chart2's anchor remains");
+        assert!(
+            !patched.contains(r#"r:id="rId1""#),
+            "chart1's frame is gone"
+        );
+        assert!(
+            patched.contains(r#"r:id="rId2""#),
+            "chart2's frame survives"
+        );
+        // Exactly one twoCellAnchor left.
+        assert_eq!(patched.matches("<xdr:twoCellAnchor>").count(), 1);
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    #[test]
+    fn patch_drawing_rels_drops_deleted_relationships() {
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart2.xml"/></Relationships>"#;
+        let patched = patch_drawing_rels(rels, &["rId1".to_string()]).unwrap();
+        assert!(!patched.contains(r#"Id="rId1""#), "the deleted rel is gone");
+        assert!(
+            patched.contains(r#"Id="rId2""#),
+            "the surviving rel is kept"
+        );
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    /// Overwrite one entry of a zip on disk (test helper for crafting a fixture).
+    fn rewrite_zip_entry(path: &Path, entry: &str, new_content: &str) {
+        let bytes = std::fs::read(path).unwrap();
+        let mut zin = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).unwrap();
+            let name = f.name().to_string();
+            zw.start_file(&name, opts).unwrap();
+            if name == entry {
+                zw.write_all(new_content.as_bytes()).unwrap();
+            } else {
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf).unwrap();
+                zw.write_all(&buf).unwrap();
+            }
+        }
+        std::fs::write(path, zw.finish().unwrap().into_inner()).unwrap();
+    }
+
+    /// Read a package part out of in-memory `.xlsx` bytes.
+    fn entry_from_bytes(bytes: &[u8], name: &str) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).unwrap();
+        let mut f = z.by_name(name).unwrap();
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    /// Moderate CR: deleting the only chart in a drawing that ALSO holds a non-chart anchor (a
+    /// textbox) must preserve that co-located anchor — the whole-drawing-drop shortcut only applies
+    /// when the drawing holds nothing but the deleted charts (never silently drop shapes/textboxes).
+    #[test]
+    fn deleting_a_chart_preserves_a_co_located_textbox_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("book.xlsx");
+        authoring::write_line_fixture(&original).unwrap();
+
+        // Splice a textbox `<xdr:sp>` anchor into the SAME drawing as the chart.
+        let sheets = discover(&original).unwrap();
+        let drawing_part = sheets[0].drawing_part.clone();
+        let chart_part = sheets[0].charts[0].part.clone();
+        let drawing_xml = xlsx::read_entry(&original, &drawing_part).unwrap();
+        let textbox = r#"<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>20</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>24</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="99" name="TextBox 99"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr><xdr:spPr/><xdr:txBody><a:bodyPr/><a:p><a:r><a:t>ANNOTATION_MARKER</a:t></a:r></a:p></xdr:txBody></xdr:sp><xdr:clientData/></xdr:twoCellAnchor>"#;
+        let with_textbox = drawing_xml.replace("</xdr:wsDr>", &format!("{textbox}</xdr:wsDr>"));
+        assert!(with_textbox.contains("ANNOTATION_MARKER"));
+        rewrite_zip_entry(&original, &drawing_part, &with_textbox);
+
+        // The chart is deleted (removed from bindings → `live` empty), recorded in `deletes`.
+        let model_bytes = ironcalc_bytes(&original);
+        let deletes = HashSet::from([chart_part.clone()]);
+        let (out, _report) =
+            reinject_live_charts(&original, &model_bytes, &[], &HashMap::new(), &deletes).unwrap();
+
+        // The drawing survives with its textbox anchor; the chart frame is gone.
+        let out_drawing = entry_from_bytes(&out, &drawing_part);
+        assert!(
+            out_drawing.contains("ANNOTATION_MARKER"),
+            "the co-located textbox anchor must survive the chart delete"
+        );
+        assert!(
+            !out_drawing.contains("<c:chart") && !out_drawing.contains("r:id="),
+            "the deleted chart's anchor is removed from the drawing"
+        );
+        // The chart part is dropped, and the package still opens with zero charts.
+        let out_path = dir.path().join("out.xlsx");
+        std::fs::write(&out_path, &out).unwrap();
+        crate::document::WorkbookDocument::open(&out_path).expect("reopens");
+        assert_eq!(discover_and_parse(&out_path).unwrap().len(), 0);
+    }
+
     /// The first series' first value of a parsed `CategoryValue` chart (a common patch assertion).
     fn first_value(chart: &Chart) -> f64 {
         match &chart.series[0].data {
@@ -1150,8 +1555,16 @@ mod tests {
         patches.insert("xl/charts/chart1.xml".to_string(), patched);
         let model_bytes = std::fs::read(&nochart).unwrap();
         let targets = name_targets(&original, &model_bytes, &sheets);
-        let (bytes, report) =
-            reinject(&original, &model_bytes, &sheets, &targets, &patches).unwrap();
+        let (bytes, report) = reinject(
+            &original,
+            &model_bytes,
+            &sheets,
+            &targets,
+            &patches,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let out = dir.path().join("out.xlsx");
         std::fs::write(&out, &bytes).unwrap();
         assert_eq!(report.charts_preserved, 1);
@@ -1204,8 +1617,16 @@ mod tests {
 
         let model_bytes = ironcalc_bytes(&original);
         let targets = name_targets(&original, &model_bytes, &sheets);
-        let (bytes, report) =
-            reinject(&original, &model_bytes, &sheets, &targets, &patches).unwrap();
+        let (bytes, report) = reinject(
+            &original,
+            &model_bytes,
+            &sheets,
+            &targets,
+            &patches,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let out = dir.path().join("out.xlsx");
         std::fs::write(&out, &bytes).unwrap();
         assert_eq!(report.patched_charts, vec!["xl/charts/chart2.xml"]);
@@ -1284,7 +1705,14 @@ mod tests {
         let chart =
             parse_chart_xml(&xlsx::read_entry(&original, "xl/charts/chart1.xml").unwrap()).unwrap();
         let live = vec![live_on("Ghost", "xl/charts/chart1.xml", chart)];
-        let err = reinject_live_charts(&original, &ironcalc_bytes(&original), &live).unwrap_err();
+        let err = reinject_live_charts(
+            &original,
+            &ironcalc_bytes(&original),
+            &live,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Ghost"),
@@ -1313,8 +1741,14 @@ mod tests {
                 ),
             },
         ];
-        let (bytes, report) =
-            reinject_live_charts(&original, &ironcalc_bytes(&original), &live).unwrap();
+        let (bytes, report) = reinject_live_charts(
+            &original,
+            &ironcalc_bytes(&original),
+            &live,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let out = dir.path().join("out.xlsx");
         std::fs::write(&out, &bytes).unwrap();
 
@@ -1354,8 +1788,14 @@ mod tests {
         }
         let live = vec![live_on("Data", "xl/charts/chart1.xml", supported)];
 
-        let (bytes, report) =
-            reinject_live_charts(&original, &ironcalc_bytes(&original), &live).unwrap();
+        let (bytes, report) = reinject_live_charts(
+            &original,
+            &ironcalc_bytes(&original),
+            &live,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let out = dir.path().join("out.xlsx");
         std::fs::write(&out, &bytes).unwrap();
 
@@ -1405,8 +1845,14 @@ mod tests {
             },
         ];
 
-        let (bytes, report) =
-            reinject_live_charts(&original, &ironcalc_bytes(&original), &live).unwrap();
+        let (bytes, report) = reinject_live_charts(
+            &original,
+            &ironcalc_bytes(&original),
+            &live,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let out = dir.path().join("out.xlsx");
         std::fs::write(&out, &bytes).unwrap();
 
@@ -1450,8 +1896,14 @@ mod tests {
             live_on("Data", "xl/charts/chart1.xml", with_value(111.0)),
             live_on("Summary", "xl/charts/chart2.xml", with_value(222.0)),
         ];
-        let (bytes, _report) =
-            reinject_live_charts(&original, &ironcalc_bytes(&original), &live).unwrap();
+        let (bytes, _report) = reinject_live_charts(
+            &original,
+            &ironcalc_bytes(&original),
+            &live,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let out = dir.path().join("out.xlsx");
         std::fs::write(&out, &bytes).unwrap();
 
@@ -1494,8 +1946,14 @@ mod tests {
             values[0] = 555.0;
         }
 
-        let (bytes, report) =
-            reinject_live_charts(&original, &ironcalc_bytes(&original), &live).unwrap();
+        let (bytes, report) = reinject_live_charts(
+            &original,
+            &ironcalc_bytes(&original),
+            &live,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         let out = dir.path().join("out.xlsx");
         std::fs::write(&out, &bytes).unwrap();
 

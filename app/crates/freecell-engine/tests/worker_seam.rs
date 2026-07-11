@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use freecell_chart_model::{Anchor, AnchorCell, SeriesData};
+use freecell_chart_model::{Anchor, AnchorCell, ChartId, SeriesData};
 use freecell_core::{CellRange, CellRef, SheetId};
 use freecell_engine::{
     fixtures, ChartInsertKind, ChartSnapshot, Command, DocumentClient, DocumentSource,
@@ -1497,4 +1497,354 @@ fn authored_chart_on_a_loaded_charts_sheet_fails_loudly() {
     );
     // The atomic save wrote nothing (no partial/corrupt output at the target).
     assert!(!out.exists(), "a failed save leaves no output file");
+}
+
+// ---------------------------------------------------------------------------------------------
+// P18 — manipulate: move / resize / delete persist to the anchor and round-trip
+// (charts/functional_spec §6.A, ui_design §3.2). LibreOffice is env-broken here, so persistence is
+// proven via the IronCalc `discover_and_parse` reopen path (open → manipulate → save → reopen).
+// ---------------------------------------------------------------------------------------------
+
+/// The stable [`ChartId`] of the first chart published on `sheet` (loaded or authored), if any.
+fn first_chart_id(client: &DocumentClient, sheet: SheetId) -> Option<ChartId> {
+    client
+        .chart_snapshot()
+        .sheets
+        .iter()
+        .find(|(s, _)| *s == sheet)
+        .and_then(|(_, specs)| specs.first().map(|sp| sp.id))
+}
+
+/// The published anchor of chart `id` on `sheet`, if present.
+fn snapshot_anchor(client: &DocumentClient, sheet: SheetId, id: ChartId) -> Option<Anchor> {
+    client
+        .chart_snapshot()
+        .sheets
+        .iter()
+        .find(|(s, _)| *s == sheet)
+        .and_then(|(_, specs)| specs.iter().find(|sp| sp.id == id).map(|sp| sp.anchor))
+}
+
+/// The number of charts published on `sheet`.
+fn chart_count_on(client: &DocumentClient, sheet: SheetId) -> usize {
+    client
+        .chart_snapshot()
+        .sheets
+        .iter()
+        .find(|(s, _)| *s == sheet)
+        .map_or(0, |(_, specs)| specs.len())
+}
+
+/// The anchors of every chart parsed back from a saved workbook.
+fn reopened_anchors(path: &std::path::Path) -> Vec<Anchor> {
+    freecell_engine::chart::discover_and_parse(path)
+        .unwrap()
+        .iter()
+        .map(|s| s.anchor)
+        .collect()
+}
+
+/// P18 (authored): move/resize an authored chart → its model anchor persists and round-trips.
+#[test]
+fn move_authored_chart_roundtrips() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(Command::InsertChart {
+        sheet,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(0, 0),
+    });
+    poll_until(
+        || first_chart_id(&client, sheet).is_some(),
+        "the authored chart is published",
+    );
+    let id = first_chart_id(&client, sheet).unwrap();
+
+    let moved = Anchor::new(AnchorCell::new(5, 10), AnchorCell::new(13, 25));
+    client.send(Command::SetChartAnchor {
+        sheet,
+        id,
+        anchor: moved,
+    });
+    poll_until(
+        || snapshot_anchor(&client, sheet, id) == Some(moved),
+        "the moved anchor is republished",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("moved.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 80,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 80, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+    assert_eq!(
+        reopened_anchors(&out),
+        vec![moved],
+        "the authored chart's moved anchor round-trips"
+    );
+}
+
+/// P18 (authored): delete one of two authored charts → it is gone from the saved package.
+#[test]
+fn delete_authored_chart_roundtrips() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(Command::InsertChart {
+        sheet,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(0, 0),
+    });
+    client.send(Command::InsertChart {
+        sheet,
+        kind: ChartInsertKind::Bar,
+        anchor: chart_anchor(10, 0),
+    });
+    poll_until(
+        || chart_count_on(&client, sheet) == 2,
+        "both authored charts are published",
+    );
+    let first = first_chart_id(&client, sheet).unwrap();
+    client.send(Command::DeleteChart { sheet, id: first });
+    poll_until(
+        || chart_count_on(&client, sheet) == 1,
+        "one authored chart remains after delete",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("deleted.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 81,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 81, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+    assert_eq!(
+        freecell_engine::chart::discover_and_parse(&out)
+            .unwrap()
+            .len(),
+        1,
+        "exactly one authored chart survives the delete"
+    );
+}
+
+/// P18 (loaded): move a loaded chart → its retained drawing `twoCellAnchor` is patched and the new
+/// anchor round-trips (the source-first save contract for a manipulated loaded chart).
+#[test]
+fn move_loaded_chart_patches_drawing_and_roundtrips() {
+    let (client, rx, sheets, _dir) = spawn_over_chart_file(|p| {
+        freecell_engine::chart::authoring::write_line_fixture(p).unwrap()
+    });
+    let data = sheets[0].id;
+    poll_until(
+        || first_chart_id(&client, data).is_some(),
+        "the loaded line chart is discovered",
+    );
+    let id = first_chart_id(&client, data).unwrap();
+    let original = snapshot_anchor(&client, data, id).unwrap();
+
+    let moved = Anchor::new(AnchorCell::new(3, 3), AnchorCell::new(11, 20));
+    assert_ne!(original, moved, "the test moves the chart to a new anchor");
+    client.send(Command::SetChartAnchor {
+        sheet: data,
+        id,
+        anchor: moved,
+    });
+    poll_until(
+        || snapshot_anchor(&client, data, id) == Some(moved),
+        "the moved loaded chart is republished",
+    );
+
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("loaded_moved.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 82,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 82, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out_path).expect("reopens");
+    assert_eq!(
+        reopened_anchors(&out_path),
+        vec![moved],
+        "the loaded chart's drawing anchor was patched and round-trips"
+    );
+}
+
+/// P18 (loaded): delete a loaded chart → it is dropped from the saved package (the workbook still
+/// opens; no chart comes back).
+#[test]
+fn delete_loaded_chart_drops_it_from_the_package() {
+    let (client, rx, sheets, _dir) = spawn_over_chart_file(|p| {
+        freecell_engine::chart::authoring::write_line_fixture(p).unwrap()
+    });
+    let data = sheets[0].id;
+    poll_until(
+        || first_chart_id(&client, data).is_some(),
+        "the loaded line chart is discovered",
+    );
+    let id = first_chart_id(&client, data).unwrap();
+    client.send(Command::DeleteChart { sheet: data, id });
+    poll_until(
+        || chart_count_on(&client, data) == 0,
+        "the loaded chart is removed from the snapshot",
+    );
+
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("loaded_deleted.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 83,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 83, .. })).is_some());
+    // The workbook still opens, and the deleted chart does not come back.
+    freecell_engine::WorkbookDocument::open(&out_path).expect("reopens after a chart delete");
+    assert_eq!(
+        freecell_engine::chart::discover_and_parse(&out_path)
+            .unwrap()
+            .len(),
+        0,
+        "the deleted loaded chart is gone from the saved package"
+    );
+}
+
+/// P18 (loaded, no-drift): the loaded anchor edit is an ABSOLUTE anchor re-applied against the
+/// current source each save and cleared once the source advances — so a re-save doesn't drift the
+/// anchor, and a second move is applied absolutely (not stacked on the first). No-authored case
+/// (the source advances after each save).
+#[test]
+fn moved_loaded_chart_resave_is_stable_and_reflects_latest_move() {
+    let (client, rx, sheets, _dir) = spawn_over_chart_file(|p| {
+        freecell_engine::chart::authoring::write_line_fixture(p).unwrap()
+    });
+    let data = sheets[0].id;
+    poll_until(
+        || first_chart_id(&client, data).is_some(),
+        "the loaded line chart is discovered",
+    );
+    let id = first_chart_id(&client, data).unwrap();
+
+    let moved = Anchor::new(AnchorCell::new(3, 3), AnchorCell::new(11, 20));
+    client.send(Command::SetChartAnchor {
+        sheet: data,
+        id,
+        anchor: moved,
+    });
+    poll_until(
+        || snapshot_anchor(&client, data, id) == Some(moved),
+        "the move is published",
+    );
+
+    let out = tempdir().unwrap();
+    let p1 = out.path().join("save1.xlsx");
+    client.send(Command::Save {
+        path: p1.clone(),
+        req_id: 84,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 84, .. })).is_some());
+    assert_eq!(reopened_anchors(&p1), vec![moved]);
+
+    // (a) Re-save with NO further move → the anchor is stable (source advanced, edit spent; the
+    // just-saved file is byte-preserved — no drift, no double-apply).
+    let p2 = out.path().join("save2.xlsx");
+    client.send(Command::Save {
+        path: p2.clone(),
+        req_id: 85,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 85, .. })).is_some());
+    assert_eq!(
+        reopened_anchors(&p2),
+        vec![moved],
+        "a plain re-save does not drift the moved anchor"
+    );
+
+    // (b) Move AGAIN → save → the latest anchor wins (absolute, not additive).
+    let moved2 = Anchor::new(AnchorCell::new(6, 7), AnchorCell::new(14, 24));
+    client.send(Command::SetChartAnchor {
+        sheet: data,
+        id,
+        anchor: moved2,
+    });
+    poll_until(
+        || snapshot_anchor(&client, data, id) == Some(moved2),
+        "the second move is published",
+    );
+    let p3 = out.path().join("save3.xlsx");
+    client.send(Command::Save {
+        path: p3.clone(),
+        req_id: 86,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 86, .. })).is_some());
+    assert_eq!(
+        reopened_anchors(&p3),
+        vec![moved2],
+        "the second move is applied absolutely (no double-apply)"
+    );
+}
+
+/// P18 (loaded, authored-present no-drift): with an authored chart present the reinject source
+/// **stays** the original and `loaded_anchor_edits` persist across saves — re-applying the ABSOLUTE
+/// anchor each time, so a re-save keeps the loaded chart's moved anchor stable (no drift, no double
+/// apply).
+#[test]
+fn moved_loaded_chart_with_authored_present_resave_is_stable() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("line.xlsx");
+    freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
+    let data = sheets[0].id;
+    client.send(full_viewport(data));
+    poll_until(
+        || first_chart_id(&client, data).is_some(),
+        "the loaded line chart is discovered",
+    );
+    let id = first_chart_id(&client, data).unwrap();
+
+    // An authored chart on a SECOND sheet keeps the reinject source pinned to the original.
+    let other = add_sheet_and_id(&client, &rx, data);
+    client.send(Command::InsertChart {
+        sheet: other,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(1, 1),
+    });
+    poll_until(
+        || chart_count_on(&client, other) == 1,
+        "the authored chart is published",
+    );
+
+    let moved = Anchor::new(AnchorCell::new(3, 3), AnchorCell::new(11, 20));
+    client.send(Command::SetChartAnchor {
+        sheet: data,
+        id,
+        anchor: moved,
+    });
+    poll_until(
+        || snapshot_anchor(&client, data, id) == Some(moved),
+        "the loaded chart move is published",
+    );
+
+    // Save twice — the loaded chart keeps its moved anchor across both saves (exactly once each).
+    let moved_once =
+        |p: &std::path::Path| reopened_anchors(p).iter().filter(|a| **a == moved).count();
+    let out1 = dir.path().join("out1.xlsx");
+    client.send(Command::Save {
+        path: out1.clone(),
+        req_id: 87,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 87, .. })).is_some());
+    assert_eq!(
+        moved_once(&out1),
+        1,
+        "first save places the loaded chart at `moved`"
+    );
+
+    let out2 = dir.path().join("out2.xlsx");
+    client.send(Command::Save {
+        path: out2.clone(),
+        req_id: 88,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 88, .. })).is_some());
+    assert_eq!(
+        moved_once(&out2),
+        1,
+        "the re-save (authored present, source pinned) keeps the moved anchor — no drift/double-apply"
+    );
 }

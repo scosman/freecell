@@ -1,7 +1,10 @@
 //! The FreeCell-owned **bar / column** widget family, built over gpui-component's `plot/`
-//! **primitives** (`Bar` + `ScaleLinear` + `PlotAxis` + `Grid`) rather than the stock chart
-//! structs — which do only single-series and expose no numeric value axis, no legend, no title
-//! (`research/compare-bar-column.md`). One `BarPlot` renders every in-scope bar variant:
+//! **primitives** (`Bar` + `ScaleLinear` + `PlotAxis` for the tick labels) rather than the stock
+//! chart structs — which do only single-series and expose no numeric value axis, no legend, no
+//! title (`research/compare-bar-column.md`). The gridlines + axis LINES come from the shared
+//! [`super::cartesian`] chrome (bounded to the plot rect), not gpui-component's `Grid`/`PlotAxis`
+//! axis line, which drew full-`bounds` lines that overran into the tick-label gutter. One `BarPlot`
+//! renders every in-scope bar variant:
 //!
 //! - **Direction** ([`BarDir`]): vertical **columns** (`Col`) or horizontal **bars** (`Bar`,
 //!   axes swapped — category on Y, value on X).
@@ -28,14 +31,15 @@ use gpui::{
 use gpui_component::plot::{
     scale::{Scale, ScaleLinear},
     shape::{Bar, BarAlignment},
-    AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, AXIS_GAP,
+    AxisLabelSide, AxisText, IntoPlot, Plot, PlotAxis, AXIS_GAP,
 };
 
 use freecell_chart_model::{BarDir, Chart, ChartKind, Grouping, SeriesData};
 
+use super::cartesian::PlotRect;
 use super::chrome::chart_frame;
 use super::stacking::{category_totals, percent_segments, stacked_segments, Segment};
-use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, MUTED_TEXT};
 use super::ticks::{format_tick, NiceScale};
 
 /// Left gutter for the value-axis tick labels on a vertical column chart.
@@ -236,6 +240,14 @@ impl Plot for BarPlot {
         let plot_top = PLOT_TOP_GAP;
         let plot_bottom = (h - AXIS_GAP).max(plot_top + 1.0);
 
+        // The plot rect the gridlines + axis lines are clipped to (the shared cartesian chrome).
+        let rect = PlotRect {
+            left: plot_left,
+            right: plot_right,
+            top: plot_top,
+            bottom: plot_bottom,
+        };
+
         let n = self.categories.len().max(1);
         let ticks = self.scale.ticks();
 
@@ -273,16 +285,7 @@ impl Plot for BarPlot {
         };
 
         // Gridlines + axes + labels (orientation-aware).
-        self.paint_chrome(
-            &bounds,
-            window,
-            cx,
-            horizontal,
-            plot_left,
-            plot_bottom,
-            &geo,
-            &ticks,
-        );
+        self.paint_chrome(&bounds, window, cx, horizontal, &rect, &geo, &ticks);
 
         // Bars. `cross` = category-axis position, `value` = value-axis position; the alignment
         // tells the primitive which screen axis each maps to.
@@ -308,8 +311,7 @@ impl BarPlot {
         window: &mut Window,
         cx: &mut gpui::App,
         horizontal: bool,
-        plot_left: f32,
-        plot_bottom: f32,
+        rect: &PlotRect,
         geo: &Geometry,
         ticks: &[f64],
     ) {
@@ -327,12 +329,10 @@ impl BarPlot {
         });
 
         if horizontal {
-            // Value axis on the bottom (vertical gridlines); category axis on the left.
-            Grid::new()
-                .stroke(hsla(GRID_STROKE))
-                .dash_array(&[px(4.), px(2.)])
-                .x(value_pixels.iter().map(|x| px(*x)).collect())
-                .paint(bounds, window);
+            // Value axis on the bottom (vertical gridlines); category axis on the left. Gridlines +
+            // both axis lines bounded to the plot rect.
+            rect.paint_vertical_gridlines(bounds, &value_pixels, window);
+            rect.paint_axes(bounds, window);
             let value_axis_labels = value_labels.map(|(text, x)| {
                 AxisText::new(text, px(x), hsla(MUTED_TEXT)).align(TextAlign::Center)
             });
@@ -341,20 +341,19 @@ impl BarPlot {
                     .align(TextAlign::Right)
             });
             PlotAxis::new()
-                .x(px(plot_bottom))
+                .x(px(rect.bottom))
+                .x_axis(false)
                 .x_label(value_axis_labels)
-                .y(px(plot_left))
+                .y(px(rect.left))
                 .y_label_side(AxisLabelSide::Start)
                 .y_label(cat_labels)
                 .stroke(hsla(AXIS_STROKE))
                 .paint(bounds, window, cx);
         } else {
-            // Value axis on the left (horizontal gridlines); category axis on the bottom.
-            Grid::new()
-                .stroke(hsla(GRID_STROKE))
-                .dash_array(&[px(4.), px(2.)])
-                .y(value_pixels.iter().map(|y| px(*y)).collect())
-                .paint(bounds, window);
+            // Value axis on the left (horizontal gridlines); category axis on the bottom. Gridlines +
+            // both axis lines bounded to the plot rect.
+            rect.paint_horizontal_gridlines(bounds, &value_pixels, window);
+            rect.paint_axes(bounds, window);
             let value_axis_labels = value_labels.map(|(text, y)| {
                 AxisText::new(text, px(y), hsla(MUTED_TEXT)).align(TextAlign::Right)
             });
@@ -363,9 +362,10 @@ impl BarPlot {
                     .align(TextAlign::Center)
             });
             PlotAxis::new()
-                .x(px(plot_bottom))
+                .x(px(rect.bottom))
+                .x_axis(false)
                 .x_label(cat_labels)
-                .y(px(plot_left))
+                .y(px(rect.left))
                 .y_label_side(AxisLabelSide::Start)
                 .y_label(value_axis_labels)
                 .stroke(hsla(AXIS_STROKE))

@@ -28,7 +28,7 @@ use gpui_component::plot::{
     origin_point,
     scale::{Scale, ScaleLinear, ScalePoint},
     shape::Line,
-    AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, PlotLabel, StrokeStyle, AXIS_GAP,
+    AxisLabelSide, AxisText, IntoPlot, Plot, PlotAxis, PlotLabel, StrokeStyle, AXIS_GAP,
 };
 
 use freecell_chart_model::{
@@ -36,9 +36,10 @@ use freecell_chart_model::{
     Marker, MarkerSymbol, SeriesData, MAX_PAINT_VERTICES,
 };
 
+use super::cartesian::PlotRect;
 use super::chrome::chart_frame;
 use super::style::{
-    hsla, resolve_series_hsla, with_alpha, AXIS_STROKE, AXIS_TITLE_TEXT, GRID_STROKE, MUTED_TEXT,
+    hsla, resolve_series_hsla, with_alpha, AXIS_STROKE, AXIS_TITLE_TEXT, MUTED_TEXT,
 };
 use super::ticks::{format_tick, NiceScale};
 
@@ -64,6 +65,12 @@ const MIN_LINE_PX: f32 = 1.0;
 const MAX_LINE_PX: f32 = 8.0;
 /// Default marker diameter — also the round dot drawn when a series specifies no marker.
 const DOT_SIZE: f32 = 6.0;
+/// A point marker's diameter must be at least this many times the series line width, so the marker
+/// always reads as a clearly larger dot sitting on the line rather than a bump ~= the line width.
+const MARKER_MIN_LINE_MULT: f32 = 2.0;
+/// Absolute minimum marker diameter (px), regardless of line width — so a thin-line series still gets
+/// a visible dot.
+const MARKER_MIN_DIAMETER: f32 = 6.0;
 /// Stroke width for the open-shape markers (plus / x / dash).
 const MARKER_STROKE_WIDTH: f32 = 1.6;
 /// The `dot` marker's radius as a fraction of the full marker radius — Excel's `dot` is a small
@@ -219,16 +226,26 @@ impl LinePlot {
 /// shapes (plus/x/dash) as a stroked path in the series color; `none` paints nothing.
 ///
 /// Shared with the scatter renderer ([`super::scatter`]), whose dots are the same marker mark (P25).
+/// `line_width` is the series' resolved stroke width (px): the marker diameter is floored at
+/// `2 ×` it (and at [`MARKER_MIN_DIAMETER`]), so a marker is always a clearly larger dot than the
+/// line it sits on, never a barely-visible bump ~= the line width.
 pub(super) fn paint_marker(
     window: &mut Window,
     center: Point<Pixels>,
     marker: Option<Marker>,
     color: Hsla,
+    line_width: f32,
 ) {
     // A series with no `c:marker` defaults to the round dot (the P5 default), so absence resolves to
     // `Circle`; an explicit `none` paints nothing (handled in the match, no early return).
     let symbol = marker.map(|m| m.symbol).unwrap_or(MarkerSymbol::Circle);
-    let diameter = marker.and_then(|m| m.size).unwrap_or(DOT_SIZE);
+    // The requested size (explicit `c:marker` size, else the default dot), floored so the marker is
+    // at least ~2× the line width and never below the absolute minimum.
+    let diameter = marker
+        .and_then(|m| m.size)
+        .unwrap_or(DOT_SIZE)
+        .max(line_width * MARKER_MIN_LINE_MULT)
+        .max(MARKER_MIN_DIAMETER);
     let r = px(diameter / 2.0);
     let edge = hsla(0xFFFFFF);
     let cx = center.x;
@@ -384,19 +401,27 @@ impl Plot for LinePlot {
         let value_scale = ScaleLinear::new(vec![self.scale.min, self.scale.max], value_range);
         let ticks = self.scale.ticks();
 
+        // The plot rect the gridlines + axis lines are clipped to (never bleeding into the axis-label
+        // gutters or past the plot edge — the shared cartesian chrome).
+        let rect = PlotRect {
+            left: plot_left,
+            right: plot_right,
+            top: plot_top,
+            bottom: plot_bottom,
+        };
+
         // Gridlines at each nice tick (horizontal, for the value axis) — only when the value axis
-        // carries `c:majorGridlines` (P13; Excel's default line chart does).
+        // carries `c:majorGridlines` (P13; Excel's default line chart does), bounded to the plot rect.
         if self.major_gridlines {
             let grid_ys: Vec<f32> = ticks.iter().filter_map(|t| value_scale.tick(t)).collect();
-            Grid::new()
-                .stroke(hsla(GRID_STROKE))
-                .dash_array(&[px(4.), px(2.)])
-                .y(grid_ys)
-                .paint(&bounds, window);
+            rect.paint_horizontal_gridlines(&bounds, &grid_ys, window);
         }
+        // The solid category (X) + value (Y) axis lines at the plot's bottom/left boundaries.
+        rect.paint_axes(&bounds, window);
 
-        // Axes + labels: value labels left of the value axis (formatted through the axis numFmt
-        // when present), category labels below the baseline.
+        // Labels: value labels left of the value axis (formatted through the axis numFmt when
+        // present), category labels below the baseline. The axis LINES are drawn above (bounded), so
+        // `PlotAxis` here only paints the tick labels (`x_axis(false)`).
         let value_labels = ticks.iter().filter_map(|t| {
             value_scale.tick(t).map(|y| {
                 AxisText::new(self.tick_label(*t), px(y), hsla(MUTED_TEXT)).align(TextAlign::Right)
@@ -407,6 +432,7 @@ impl Plot for LinePlot {
         });
         PlotAxis::new()
             .x(px(plot_bottom))
+            .x_axis(false)
             .x_label(cat_labels)
             .y(px(plot_left))
             .y_label_side(AxisLabelSide::Start)
@@ -457,7 +483,7 @@ impl Plot for LinePlot {
                 let (x, v) = (xs[i], s.values[i]);
                 if let Some(y) = v.is_finite().then(|| value_scale.tick(&v)).flatten() {
                     let center = origin_point(px(x), px(y), bounds.origin);
-                    paint_marker(window, center, s.marker, s.color);
+                    paint_marker(window, center, s.marker, s.color, s.width_px);
                 }
             }
         }

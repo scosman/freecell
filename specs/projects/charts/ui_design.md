@@ -21,9 +21,12 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
 ## 2. v1-core display UI (read-only)
 
 ### 2.1 A rendered chart
-- Drawn at its anchor rect (`twoCellAnchor` from/to → pixels); the PoC renderer paints title,
-  plot, axes, legend. No border/handles in v1 core (read-only). Off-screen charts aren't
-  drawn; partially-scrolled charts are clipped.
+- Drawn at its anchor rect (`twoCellAnchor` from/to → pixels); the renderer paints title,
+  plot, axes (a solid category **and** value axis line at the plot boundaries, with gridlines
+  clipped to the plot rect — not run through the tick-label gutters), legend, framed by a
+  subtle ~1px light-grey outline around the chart's outer edge (every chart type, pie/doughnut
+  included). No **selection** border / resize handles in v1 core (read-only). Off-screen charts
+  aren't drawn; partially-scrolled charts are clipped.
 
 ### 2.2 Compatibility warning (functional_spec §5)
 - When a chart's `compatibility_warning` flag is set, show a small **inline** label in the

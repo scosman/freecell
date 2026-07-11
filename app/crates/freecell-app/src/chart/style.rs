@@ -24,6 +24,8 @@ pub const MUTED_TEXT: u32 = 0x6B7280;
 pub const AXIS_STROKE: u32 = 0x9CA3AF;
 /// Gridline stroke.
 pub const GRID_STROKE: u32 = 0xE5E7EB;
+/// Subtle light-grey outline drawn around the whole chart's outer edge (every chart type).
+pub const CHART_OUTLINE: u32 = 0xD1D5DB;
 
 // Font sizes/weights tuned toward Excel's chart proportions (P13, observation B). Excel's default
 // line chart draws the TITLE bold + noticeably larger than the axis titles, axis titles **bold** at

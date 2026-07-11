@@ -17,14 +17,15 @@ use gpui::{
 };
 use gpui_component::plot::{
     scale::{Scale, ScaleLinear, ScalePoint},
-    AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, AXIS_GAP,
+    AxisLabelSide, AxisText, IntoPlot, Plot, PlotAxis, AXIS_GAP,
 };
 
 use freecell_chart_model::{Chart, ChartKind, Grouping, SeriesData};
 
+use super::cartesian::PlotRect;
 use super::chrome::chart_frame;
 use super::stacking::{category_totals, percent_segments, stacked_segments, Segment};
-use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{hsla, resolve_series_hsla, AXIS_STROKE, MUTED_TEXT};
 use super::ticks::{format_tick, NiceScale};
 
 const VALUE_AXIS_GUTTER: f32 = 46.0;
@@ -159,18 +160,21 @@ impl Plot for AreaPlot {
         );
         let ticks = self.scale.ticks();
 
-        // Gridlines at each nice tick (horizontal).
-        let grid_ys: Vec<Pixels> = ticks
-            .iter()
-            .filter_map(|t| value_scale.tick(t).map(px))
-            .collect();
-        Grid::new()
-            .stroke(hsla(GRID_STROKE))
-            .dash_array(&[px(4.), px(2.)])
-            .y(grid_ys)
-            .paint(&bounds, window);
+        // The plot rect the gridlines + axis lines are clipped to (the shared cartesian chrome).
+        let rect = PlotRect {
+            left: plot_left,
+            right: plot_right,
+            top: plot_top,
+            bottom: plot_bottom,
+        };
 
-        // Axes + labels.
+        // Gridlines at each nice tick (horizontal), bounded to the plot rect.
+        let grid_ys: Vec<f32> = ticks.iter().filter_map(|t| value_scale.tick(t)).collect();
+        rect.paint_horizontal_gridlines(&bounds, &grid_ys, window);
+        // The solid category (X) + value (Y) axis lines at the plot's bottom/left boundaries.
+        rect.paint_axes(&bounds, window);
+
+        // Labels (the axis LINES are drawn above, bounded, so `PlotAxis` only paints labels here).
         let value_labels = ticks.iter().filter_map(|t| {
             value_scale.tick(t).map(|y| {
                 let text = if self.percent {
@@ -186,6 +190,7 @@ impl Plot for AreaPlot {
         });
         PlotAxis::new()
             .x(px(plot_bottom))
+            .x_axis(false)
             .x_label(cat_labels)
             .y(px(plot_left))
             .y_label_side(AxisLabelSide::Start)

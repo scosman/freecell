@@ -22,7 +22,7 @@ use freecell_chart_model::{BarDir, Chart, ChartKind, LegendPosition, SeriesData}
 
 use super::style::{
     hsla, resolve_series_color, resolve_slice_color, AXIS_TITLE_FONT_SIZE, AXIS_TITLE_TEXT,
-    BACKGROUND, LEGEND_FONT_SIZE, TITLE_FONT_SIZE, TITLE_TEXT,
+    BACKGROUND, CHART_OUTLINE, LEGEND_FONT_SIZE, TITLE_FONT_SIZE, TITLE_TEXT,
 };
 
 /// Width (px) of the rotated value-axis title column. Also the SVG viewBox width, so the rotated
@@ -307,6 +307,10 @@ pub fn chart_frame(chart: &Chart, plot: gpui::AnyElement) -> gpui::AnyElement {
         .flex()
         .flex_col()
         .bg(rgb(BACKGROUND))
+        // A subtle ~1px light-grey outline around the whole chart's outer edge (every chart type,
+        // including pie/doughnut, which share this frame).
+        .border_1()
+        .border_color(rgb(CHART_OUTLINE))
         .p_3()
         .gap_1()
         // Chart title — only when there is one. Bold + the largest chart text (Excel proportions).

@@ -23,15 +23,16 @@ use gpui::{px, size, BorderStyle, Bounds, Hsla, IntoElement, Pixels, TextAlign, 
 use gpui_component::plot::{
     origin_point,
     scale::{Scale, ScaleLinear},
-    AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, AXIS_GAP,
+    AxisLabelSide, AxisText, IntoPlot, Plot, PlotAxis, AXIS_GAP,
 };
 
 use freecell_chart_model::{
     cap_markers_for_paint, Chart, ChartKind, SeriesData, SizeRepresentation, MAX_PAINT_MARKERS,
 };
 
+use super::cartesian::PlotRect;
 use super::chrome::chart_frame;
-use super::style::{hsla, resolve_series_hsla, with_alpha, AXIS_STROKE, GRID_STROKE, MUTED_TEXT};
+use super::style::{hsla, resolve_series_hsla, with_alpha, AXIS_STROKE, MUTED_TEXT};
 use super::ticks::{format_tick, NiceScale};
 
 /// Pixels reserved at the left of the plot for value-axis (Y) tick labels.
@@ -199,23 +200,25 @@ impl Plot for BubblePlot {
         let x_ticks = self.x_scale.ticks();
         let y_ticks = self.y_scale.ticks();
 
-        // Grid: vertical lines at each X tick, horizontal at each Y tick.
-        let grid_xs: Vec<Pixels> = x_ticks
-            .iter()
-            .filter_map(|t| x_axis.tick(t).map(px))
-            .collect();
-        let grid_ys: Vec<Pixels> = y_ticks
-            .iter()
-            .filter_map(|t| y_axis.tick(t).map(px))
-            .collect();
-        Grid::new()
-            .stroke(hsla(GRID_STROKE))
-            .dash_array(&[px(4.), px(2.)])
-            .x(grid_xs)
-            .y(grid_ys)
-            .paint(&bounds, window);
+        // The plot rect the gridlines + axis lines are clipped to (the shared cartesian chrome).
+        let rect = PlotRect {
+            left: plot_left,
+            right: plot_right,
+            top: plot_top,
+            bottom: plot_bottom,
+        };
 
-        // Axes + numeric tick labels (same layout as scatter).
+        // Grid: vertical lines at each X tick, horizontal at each Y tick — both bounded to the plot
+        // rect.
+        let grid_xs: Vec<f32> = x_ticks.iter().filter_map(|t| x_axis.tick(t)).collect();
+        let grid_ys: Vec<f32> = y_ticks.iter().filter_map(|t| y_axis.tick(t)).collect();
+        rect.paint_vertical_gridlines(&bounds, &grid_xs, window);
+        rect.paint_horizontal_gridlines(&bounds, &grid_ys, window);
+        // The solid category (X) + value (Y) axis lines at the plot's bottom/left boundaries.
+        rect.paint_axes(&bounds, window);
+
+        // Numeric tick labels (same layout as scatter); the axis LINES are drawn above (bounded), so
+        // `PlotAxis` only paints labels here.
         let value_labels = y_ticks.iter().filter_map(|t| {
             y_axis.tick(t).map(|y| {
                 AxisText::new(format_tick(*t), px(y), hsla(MUTED_TEXT)).align(TextAlign::Right)
@@ -228,6 +231,7 @@ impl Plot for BubblePlot {
         });
         PlotAxis::new()
             .x(px(plot_bottom))
+            .x_axis(false)
             .x_label(x_labels)
             .y(px(plot_left))
             .y_label_side(AxisLabelSide::Start)

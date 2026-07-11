@@ -21,6 +21,7 @@ pub mod ticks;
 pub mod area;
 pub mod bar;
 pub mod bubble;
+mod cartesian;
 pub mod chrome;
 pub mod in_grid;
 pub mod line;

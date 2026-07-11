@@ -557,6 +557,29 @@ impl ChartBindings {
         Some(bc.chart_part.clone())
     }
 
+    /// Edit a bound **loaded** chart's chrome (P20): mutate the render [`Chart`] of the chart with
+    /// stable id `id` in place — the panel's title / legend / axis-title / series-color /
+    /// data-label edit. Returns whether a chart was found **and** mutated. An
+    /// [`Unsupported`](freecell_chart_model::ChartBody::Unsupported) chart has no render picture
+    /// (thus no chrome to edit), so it is left untouched and returns `false`.
+    ///
+    /// The chart's [`ChartBinding`] is deliberately **not** touched — a chrome edit changes only the
+    /// render picture, not the data references — so the chart still live-re-resolves against the same
+    /// cells, and the source-first save patches its retained `chartN.xml` (the changed chrome
+    /// sub-element only, `super::save::patch_chart_source`).
+    pub fn edit_chart_by_id(&mut self, id: ChartId, edit: impl FnOnce(&mut Chart)) -> bool {
+        let Some(bc) = self.charts.iter_mut().find(|bc| bc.id == id) else {
+            return false;
+        };
+        match bc.spec.chart_mut() {
+            Some(chart) => {
+                edit(chart);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Delete a bound chart (P18): remove the chart with stable id `id` and return its `chart_part`
     /// so the caller can record it for the save to drop from the package. `None` if no bound chart
     /// has that id.

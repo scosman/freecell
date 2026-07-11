@@ -105,7 +105,7 @@ genuinely new subsystem, the write path, is isolated to P16.
 
 ## Editing — Stage B  *(chrome editing — completes the MVP)*
 
-- [ ] **P20 — Chrome editing.** Title, legend on/off + position, axis titles, series colors,
+- [x] **P20 — Chrome editing.** Title, legend on/off + position, axis titles, series colors,
   data-label toggles via the panel. *Exit:* chrome edits apply live + round-trip; the edit
   contract (patch preserves unmodeled styling) holds.
 

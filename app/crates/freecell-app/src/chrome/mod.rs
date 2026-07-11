@@ -25,7 +25,7 @@ use gpui::{App, SharedString, Window};
 
 pub use client::{ChromeClient, RecordingClient};
 pub use edit::{EditController, EditOrigin};
-pub use view::ChromeView;
+pub use view::{ChartPanel, ChartPanelSeries, ChromeView};
 
 /// One sheet as the tab bar mirrors it. The chrome's own view-model of the worker's
 /// `SheetMeta`, extended with `has_content` (which the worker's `SheetMeta` does not carry

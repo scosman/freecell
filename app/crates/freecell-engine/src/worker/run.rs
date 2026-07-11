@@ -31,7 +31,9 @@ use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
-use freecell_chart_model::{Anchor, CfRange, Chart, ChartId, ChartInsertKind, ChartSpec};
+use freecell_chart_model::{
+    Anchor, CfRange, Chart, ChartColor, ChartId, ChartInsertKind, ChartSpec, Color, Legend,
+};
 
 use crate::cache;
 use crate::chart::binding::{
@@ -44,7 +46,10 @@ use std::path::Path;
 
 use super::charts::ChartSnapshot;
 use super::client::Shared;
-use super::protocol::{Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr, WorkerEvent};
+use super::protocol::{
+    ChartAxisKind, ChartChromeEdit, Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
+    WorkerEvent,
+};
 
 /// Whether the loop should keep running after a batch.
 #[derive(Debug, PartialEq, Eq)]
@@ -390,7 +395,8 @@ impl Worker {
                 | Command::SetChartAnchor { .. }
                 | Command::DeleteChart { .. }
                 | Command::SetChartRange { .. }
-                | Command::SetChartType { .. }) => chart_ops.push(chart),
+                | Command::SetChartType { .. }
+                | Command::SetChartChrome { .. }) => chart_ops.push(chart),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
@@ -472,6 +478,9 @@ impl Worker {
                 Command::DeleteChart { sheet, id } => self.delete_chart(sheet, id),
                 Command::SetChartRange { sheet, id, data } => self.set_chart_range(sheet, id, data),
                 Command::SetChartType { sheet, id, kind } => self.set_chart_type(sheet, id, kind),
+                Command::SetChartChrome { sheet, id, edit } => {
+                    self.set_chart_chrome(sheet, id, edit)
+                }
                 _ => unreachable!("only chart ops are bucketed here"),
             }
         }
@@ -1832,6 +1841,42 @@ impl Worker {
         self.commit_chart_op();
     }
 
+    /// Edit a chart's **chrome** (P20, `Command::SetChartChrome`): apply one chrome attribute change
+    /// — title / legend / axis title / series color / data-label toggles — to the chart named by `id`,
+    /// on **either** provenance. An **authored** chart's model is mutated (re-serialized on save); a
+    /// **loaded** chart's retained render model is mutated (so it re-renders live) and its retained
+    /// `chartN.xml` is source-patched on save (only the changed sub-element, preserving unmodeled
+    /// styling — the edit contract). Degraded-guarded; an unknown/Unsupported id is ignored.
+    fn set_chart_chrome(&mut self, _sheet: SheetId, id: ChartId, edit: ChartChromeEdit) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        // Authored first (its ids never collide with loaded ones — one shared counter).
+        if let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) {
+            if let Some(chart) = self.authored_charts[pos].spec.chart_mut() {
+                apply_chrome_edit(chart, &edit);
+                self.commit_chart_op();
+            }
+            return;
+        }
+        // Loaded: mutate the bound chart's render model in place (its binding is untouched, so it
+        // still live-re-resolves; the save patches its retained source).
+        if self
+            .charts
+            .edit_chart_by_id(id, |chart| apply_chrome_edit(chart, &edit))
+        {
+            self.commit_chart_op();
+            return;
+        }
+        tracing::warn!(
+            id = id.0,
+            "SetChartChrome for an unknown/unsupported chart id ignored"
+        );
+    }
+
     /// Resolve an authored chart's series values from the **current** cells, given a `template` whose
     /// series shells are already in the right data shape and its `binding` (P19). A `&self` mirror of
     /// the [`reresolve_charts`](Self::reresolve_charts) closure setup, used by the range/type handlers
@@ -2043,6 +2088,41 @@ impl Worker {
     /// only at teardown).
     fn emit(&self, event: WorkerEvent) {
         let _ = self.event_tx.try_send(event);
+    }
+}
+
+/// Apply one chrome edit to a render [`Chart`] (P20) — the pure mutation shared by the authored and
+/// loaded chrome-edit paths (`set_chart_chrome`). A [`DataLabels`](ChartChromeEdit::DataLabels) edit
+/// applies the show toggles across **every** series, preserving each series' existing label
+/// number-format / separator / position (and any legend-key / series-name already shown), and clears
+/// a series' labels to `None` only when nothing at all would show.
+fn apply_chrome_edit(chart: &mut Chart, edit: &ChartChromeEdit) {
+    match edit {
+        ChartChromeEdit::Title(title) => chart.title = title.clone(),
+        ChartChromeEdit::Legend(position) => {
+            chart.legend = position.map(|position| Legend { position })
+        }
+        ChartChromeEdit::AxisTitle { axis, title } => {
+            let ax = match axis {
+                ChartAxisKind::Category => &mut chart.cat_axis,
+                ChartAxisKind::Value => &mut chart.val_axis,
+            };
+            ax.title = title.clone();
+        }
+        ChartChromeEdit::SeriesColor { series, color } => {
+            if let Some(s) = chart.series.get_mut(*series) {
+                s.color = color.map(|rgb| ChartColor::Rgb(Color::from_hex(rgb.to_hex())));
+            }
+        }
+        ChartChromeEdit::DataLabels(toggles) => {
+            for s in &mut chart.series {
+                let mut labels = s.data_labels.clone().unwrap_or_default();
+                labels.show_value = toggles.show_value;
+                labels.show_category_name = toggles.show_category_name;
+                labels.show_percent = toggles.show_percent;
+                s.data_labels = labels.is_shown().then_some(labels);
+            }
+        }
     }
 }
 
@@ -3972,6 +4052,148 @@ mod tests {
             worker.authored_charts[0].spec.chart().unwrap().kind,
             freecell_chart_model::ChartKind::Line { .. }
         ));
+    }
+
+    // --- P20: chrome editing ----------------------------------------------------------------
+
+    /// The published authored chart's typed [`Chart`] (for chrome assertions).
+    fn authored_chart(worker: &Worker, idx: usize) -> Chart {
+        worker.authored_charts[idx].spec.chart().unwrap().clone()
+    }
+
+    fn chrome(sheet: SheetId, id: ChartId, edit: ChartChromeEdit) -> Command {
+        Command::SetChartChrome { sheet, id, edit }
+    }
+
+    /// P20: each chrome edit mutates an **authored** chart's model + republishes.
+    #[test]
+    fn set_chart_chrome_edits_an_authored_chart() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+
+        // Title.
+        let v0 = worker.chart_version;
+        worker.process_batch(vec![chrome(
+            sheet,
+            id,
+            ChartChromeEdit::Title(Some("Sales".into())),
+        )]);
+        assert_eq!(authored_chart(&worker, 0).title.as_deref(), Some("Sales"));
+        assert!(worker.chart_version > v0, "a chrome edit republishes");
+
+        // Legend off, then on-at-bottom.
+        worker.process_batch(vec![chrome(sheet, id, ChartChromeEdit::Legend(None))]);
+        assert_eq!(authored_chart(&worker, 0).legend, None);
+        worker.process_batch(vec![chrome(
+            sheet,
+            id,
+            ChartChromeEdit::Legend(Some(freecell_chart_model::LegendPosition::Bottom)),
+        )]);
+        assert_eq!(
+            authored_chart(&worker, 0).legend.map(|l| l.position),
+            Some(freecell_chart_model::LegendPosition::Bottom)
+        );
+
+        // Axis titles.
+        worker.process_batch(vec![chrome(
+            sheet,
+            id,
+            ChartChromeEdit::AxisTitle {
+                axis: ChartAxisKind::Category,
+                title: Some("Quarter".into()),
+            },
+        )]);
+        assert_eq!(
+            authored_chart(&worker, 0).cat_axis.title.as_deref(),
+            Some("Quarter")
+        );
+
+        // Series color.
+        worker.process_batch(vec![chrome(
+            sheet,
+            id,
+            ChartChromeEdit::SeriesColor {
+                series: 0,
+                color: Some(Rgb::from_hex(0x70AD47)),
+            },
+        )]);
+        assert_eq!(
+            authored_chart(&worker, 0).series[0].color,
+            Some(freecell_chart_model::ChartColor::Rgb(
+                freecell_chart_model::Color::from_hex(0x70AD47)
+            )),
+        );
+
+        // Data-label toggles apply to every series; clearing all turns labels off.
+        worker.process_batch(vec![chrome(
+            sheet,
+            id,
+            ChartChromeEdit::DataLabels(crate::worker::protocol::DataLabelToggles {
+                show_value: true,
+                show_category_name: false,
+                show_percent: true,
+            }),
+        )]);
+        let dl = authored_chart(&worker, 0).series[0]
+            .data_labels
+            .clone()
+            .expect("labels set");
+        assert!(dl.show_value && dl.show_percent && !dl.show_category_name);
+        worker.process_batch(vec![chrome(
+            sheet,
+            id,
+            ChartChromeEdit::DataLabels(crate::worker::protocol::DataLabelToggles::default()),
+        )]);
+        assert!(
+            authored_chart(&worker, 0).series[0].data_labels.is_none(),
+            "clearing every toggle removes the labels"
+        );
+    }
+
+    /// P20 degraded guard: a degraded worker rejects `SetChartChrome`, leaving the chart untouched.
+    #[test]
+    fn set_chart_chrome_rejected_when_degraded() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        let title_before = authored_chart(&worker, 0).title;
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::TestPanic]);
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(worker.degraded);
+        drain_events(&rx);
+
+        worker.process_batch(vec![chrome(
+            sheet,
+            id,
+            ChartChromeEdit::Title(Some("nope".into())),
+        )]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Degraded
+                }
+            )),
+            "a degraded worker rejects SetChartChrome"
+        );
+        assert_eq!(
+            authored_chart(&worker, 0).title,
+            title_before,
+            "the chart is untouched when degraded"
+        );
     }
 
     #[test]

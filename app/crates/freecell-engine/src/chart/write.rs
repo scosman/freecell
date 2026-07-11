@@ -184,6 +184,13 @@ fn series_element(idx: usize, series: &Series, refs: Option<&SeriesRefs>) -> Str
         .map(|n| tx_element(n, name_f))
         .unwrap_or_default();
     let sp = sppr_element(series.color.as_ref());
+    // Data labels (`c:dLbls`, P20) sit after `spPr` and before the data roles — schema-valid in
+    // every `CT_*Ser`. Shared with the loaded chrome patch via `chrome::dlbls_element`.
+    let dlbls = series
+        .data_labels
+        .as_ref()
+        .map(|l| super::chrome::dlbls_element("c:", l))
+        .unwrap_or_default();
     let data = match &series.data {
         SeriesData::CategoryValue { categories, values } => {
             format!(
@@ -200,7 +207,7 @@ fn series_element(idx: usize, series: &Series, refs: Option<&SeriesRefs>) -> Str
             )
         }
     };
-    format!(r#"<c:ser><c:idx val="{idx}"/><c:order val="{idx}"/>{tx}{sp}{data}</c:ser>"#)
+    format!(r#"<c:ser><c:idx val="{idx}"/><c:order val="{idx}"/>{tx}{sp}{dlbls}{data}</c:ser>"#)
 }
 
 /// A `<c:tx>` series-name element — a `strRef` (with cache) when a name ref is given, else a plain
@@ -865,6 +872,33 @@ mod tests {
             };
             assert_roundtrip(chart, &sheet1_refs());
         }
+    }
+
+    /// P20: an authored series carrying **data labels** serializes a `c:dLbls` (between `spPr` and
+    /// the data roles) that round-trips through the loader — the authored twin of the loaded chrome
+    /// patch.
+    #[test]
+    fn serialize_roundtrips_series_data_labels() {
+        use freecell_chart_model::{DataLabelPosition, DataLabels};
+        let labels = DataLabels::new()
+            .value()
+            .category_name()
+            .with_number_format("#,##0")
+            .at(DataLabelPosition::Above);
+        let chart = Chart {
+            title: Some("Labeled".into()),
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![sales_series().with_data_labels(labels.clone())],
+            cat_axis: Axis::titled("Quarter"),
+            val_axis: Axis::default(),
+            legend: Some(Legend::default()),
+        };
+        let xml = serialize_chart_xml(&chart, &sheet1_refs());
+        assert!(xml.contains("<c:dLbls>"), "data labels emitted");
+        assert_roundtrip(chart, &sheet1_refs());
     }
 
     #[test]

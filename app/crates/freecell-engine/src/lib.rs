@@ -35,9 +35,9 @@ pub use document::{
 };
 pub use instrument::{engine_call_count, reset_engine_call_count};
 pub use worker::{
-    BorderLine, BorderPreset, ChartId, ChartInsertKind, ChartSnapshot, Command, DocumentClient,
-    EditRejectedReason, PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent,
-    WorkerEventReceiver, WORKER_STACK_SIZE,
+    BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, ChartId, ChartInsertKind,
+    ChartSnapshot, Command, DataLabelToggles, DocumentClient, EditRejectedReason, PasteError,
+    SheetMeta, StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver, WORKER_STACK_SIZE,
 };
 
 /// Re-export of the pinned IronCalc workbook type the worker will own. `pub(crate)` — the

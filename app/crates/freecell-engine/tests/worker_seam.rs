@@ -15,8 +15,9 @@ use std::time::Duration;
 use freecell_chart_model::{Anchor, AnchorCell, ChartId, SeriesData};
 use freecell_core::{CellRange, CellRef, SheetId};
 use freecell_engine::{
-    fixtures, ChartInsertKind, ChartSnapshot, Command, DocumentClient, DocumentSource,
-    EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
+    fixtures, ChartAxisKind, ChartChromeEdit, ChartInsertKind, ChartSnapshot, Command,
+    DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, SheetMeta, StyleAttr,
+    WorkerEvent, WorkerEventReceiver,
 };
 use tempfile::tempdir;
 
@@ -2099,4 +2100,261 @@ fn combined_save_mixes_loaded_bound_and_unbound_authored_charts() {
         )),
         "all three reopen as line charts",
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P20 — chrome editing: title / legend / axis title / series color / data labels apply LIVE and
+// round-trip; the loaded edit-contract holds (patch preserves unmodeled styling byte-for-byte).
+// LibreOffice is env-broken here, so round-trip is proven via the `discover_and_parse` reopen path.
+// ---------------------------------------------------------------------------------------------
+
+/// The published title of the first chart anchored on `sheet`, if any.
+fn snapshot_chart_title(client: &DocumentClient, sheet: SheetId) -> Option<String> {
+    client
+        .chart_snapshot()
+        .sheets
+        .iter()
+        .find(|(s, _)| *s == sheet)
+        .and_then(|(_, specs)| specs.first())
+        .and_then(|sp| sp.chart())
+        .and_then(|c| c.title.clone())
+}
+
+/// Rewrite one zip entry of an `.xlsx` on disk (test helper for injecting a fixture sentinel).
+fn rewrite_zip_entry(path: &std::path::Path, entry: &str, edit: impl Fn(&str) -> String) {
+    use std::io::{Read, Write};
+    let bytes = std::fs::read(path).unwrap();
+    let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::<u8>::new()));
+    let opts =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for i in 0..zin.len() {
+        let mut f = zin.by_index(i).unwrap();
+        let name = f.name().to_string();
+        zw.start_file(&name, opts).unwrap();
+        if name == entry {
+            let mut s = String::new();
+            f.read_to_string(&mut s).unwrap();
+            zw.write_all(edit(&s).as_bytes()).unwrap();
+        } else {
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            zw.write_all(&buf).unwrap();
+        }
+    }
+    std::fs::write(path, zw.finish().unwrap().into_inner()).unwrap();
+}
+
+/// A line-chart fixture whose `chart1.xml` carries an **unmodeled** `<c:roundedCorners>` element —
+/// the sentinel the loaded edit contract must preserve byte-for-byte across a chrome edit + save.
+fn write_line_fixture_with_sentinel(path: &std::path::Path) {
+    freecell_engine::chart::authoring::write_line_fixture(path).unwrap();
+    rewrite_zip_entry(path, "xl/charts/chart1.xml", |xml| {
+        xml.replace("<c:chart>", "<c:roundedCorners val=\"1\"/><c:chart>")
+    });
+}
+
+/// **The headline exit proof (loaded chart).** Open a loaded line chart carrying an unmodeled
+/// styling element, edit its title through the panel command, save, reopen: (a) the title changed,
+/// (b) the unmodeled element is byte-identical in the saved chart part (the edit contract), and the
+/// edit was LIVE (the published chart re-rendered before the save).
+#[test]
+fn loaded_chart_title_edit_is_live_and_preserves_unmodeled_styling() {
+    let (client, rx, sheets, fixture_dir) = spawn_over_chart_file(write_line_fixture_with_sentinel);
+    let original = fixture_dir.path().join("book.xlsx");
+    let sheet = sheets[0].id;
+
+    // The sentinel is present in the loaded chart part before any edit.
+    let before =
+        freecell_engine::chart::xlsx::read_entry(&original, "xl/charts/chart1.xml").unwrap();
+    assert!(
+        before.contains("<c:roundedCorners val=\"1\"/>"),
+        "sentinel present pre-edit"
+    );
+
+    let id = first_chart_id(&client, sheet).expect("the loaded line chart is discovered");
+
+    // Edit the title through the panel command; it applies LIVE to the published snapshot.
+    client.send(Command::SetChartChrome {
+        sheet,
+        id,
+        edit: ChartChromeEdit::Title(Some("Reviewed Q Report".into())),
+    });
+    poll_until(
+        || snapshot_chart_title(&client, sheet).as_deref() == Some("Reviewed Q Report"),
+        "the loaded chart's title re-renders live on the snapshot",
+    );
+
+    // Save + reopen.
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("edited.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 101,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 101, .. })).is_some());
+
+    // (a) The edited title round-trips.
+    freecell_engine::WorkbookDocument::open(&out_path).expect("edited workbook reopens");
+    let specs = freecell_engine::chart::discover_and_parse(&out_path).unwrap();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(
+        specs[0].chart().unwrap().title.as_deref(),
+        Some("Reviewed Q Report"),
+        "the title edit round-trips",
+    );
+
+    // (b) The unmodeled styling element is byte-identical in the saved chart part (edit contract).
+    let saved =
+        freecell_engine::chart::xlsx::read_entry(&out_path, "xl/charts/chart1.xml").unwrap();
+    assert!(
+        saved.contains("<c:roundedCorners val=\"1\"/>"),
+        "the unmodeled OOXML element survives the edit + save byte-for-byte",
+    );
+    // The chart's c:f binding + its series' colors were untouched (only the title was patched).
+    assert!(saved.contains("<c:f>Data!$B$2:$B$5</c:f>"), "c:f preserved");
+    assert!(
+        saved.contains(r#"<a:srgbClr val="4472C4"/>"#),
+        "series color preserved"
+    );
+}
+
+/// P20: a **loaded** chart's legend / series color / data-label edits also round-trip through the
+/// source patch (each splices only its own sub-element).
+#[test]
+fn loaded_chart_legend_color_and_labels_roundtrip() {
+    let (client, rx, sheets, _dir) = spawn_over_chart_file(write_line_fixture_with_sentinel);
+    let sheet = sheets[0].id;
+    let id = first_chart_id(&client, sheet).expect("chart discovered");
+
+    client.send(Command::SetChartChrome {
+        sheet,
+        id,
+        edit: ChartChromeEdit::Legend(Some(freecell_chart_model::LegendPosition::Bottom)),
+    });
+    client.send(Command::SetChartChrome {
+        sheet,
+        id,
+        edit: ChartChromeEdit::SeriesColor {
+            series: 0,
+            color: Some(freecell_core::Rgb::from_hex(0x70AD47)),
+        },
+    });
+    client.send(Command::SetChartChrome {
+        sheet,
+        id,
+        edit: ChartChromeEdit::DataLabels(DataLabelToggles {
+            show_value: true,
+            show_category_name: false,
+            show_percent: false,
+        }),
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .find(|(s, _)| *s == sheet)
+                .and_then(|(_, specs)| specs.first())
+                .and_then(|sp| sp.chart())
+                .map(|c| c.series[0].data_labels.is_some())
+                == Some(true)
+        },
+        "the loaded chart's chrome edits apply live",
+    );
+
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("chrome.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 102,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 102, .. })).is_some());
+
+    freecell_engine::WorkbookDocument::open(&out_path).expect("reopens");
+    let specs = freecell_engine::chart::discover_and_parse(&out_path).unwrap();
+    let chart = specs[0].chart().unwrap();
+    assert_eq!(
+        chart.legend.map(|l| l.position),
+        Some(freecell_chart_model::LegendPosition::Bottom),
+    );
+    assert_eq!(
+        chart.series[0].color,
+        Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0x70AD47)
+        )),
+    );
+    assert!(chart.series[0].data_labels.as_ref().unwrap().show_value);
+    // The unmodeled sentinel still survives across the multi-field chrome edit.
+    let saved =
+        freecell_engine::chart::xlsx::read_entry(&out_path, "xl/charts/chart1.xml").unwrap();
+    assert!(saved.contains("<c:roundedCorners val=\"1\"/>"));
+}
+
+/// P20 (authored): an authored chart's chrome edits (title / legend / axis title / series color /
+/// data labels) survive the write-from-model save + reopen.
+#[test]
+fn authored_chart_chrome_edits_roundtrip() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(Command::InsertChart {
+        sheet,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(0, 0),
+    });
+    poll_until(
+        || first_chart_id(&client, sheet).is_some(),
+        "the authored chart is published",
+    );
+    let id = first_chart_id(&client, sheet).unwrap();
+
+    for edit in [
+        ChartChromeEdit::Title(Some("Authored & Edited".into())),
+        ChartChromeEdit::Legend(Some(freecell_chart_model::LegendPosition::Top)),
+        ChartChromeEdit::AxisTitle {
+            axis: ChartAxisKind::Value,
+            title: Some("Units".into()),
+        },
+        ChartChromeEdit::SeriesColor {
+            series: 0,
+            color: Some(freecell_core::Rgb::from_hex(0xED7D31)),
+        },
+        ChartChromeEdit::DataLabels(DataLabelToggles {
+            show_value: true,
+            show_category_name: true,
+            show_percent: false,
+        }),
+    ] {
+        client.send(Command::SetChartChrome { sheet, id, edit });
+    }
+    poll_until(
+        || snapshot_chart_title(&client, sheet).as_deref() == Some("Authored & Edited"),
+        "the authored chart's chrome edits apply",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("authored_chrome.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 103,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 103, .. })).is_some());
+
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    let chart = specs[0].chart().unwrap();
+    assert_eq!(chart.title.as_deref(), Some("Authored & Edited"));
+    assert_eq!(
+        chart.legend.map(|l| l.position),
+        Some(freecell_chart_model::LegendPosition::Top)
+    );
+    assert_eq!(chart.val_axis.title.as_deref(), Some("Units"));
+    assert_eq!(
+        chart.series[0].color,
+        Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0xED7D31)
+        )),
+    );
+    let dl = chart.series[0].data_labels.clone().expect("labels present");
+    assert!(dl.show_value && dl.show_category_name);
 }

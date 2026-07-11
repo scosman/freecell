@@ -11,7 +11,7 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use freecell_chart_model::{Anchor, ChartId, ChartInsertKind};
+use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
 use freecell_core::{CellRange, CellRef, Rgb, SheetId};
@@ -144,6 +144,47 @@ impl BorderPreset {
             BorderPreset::None => "None",
         }
     }
+}
+
+/// Which axis a [`ChartChromeEdit::AxisTitle`] targets — the category (`c:catAx`, or scatter's X
+/// `c:valAx`) or the value (`c:valAx`, or scatter's Y) axis, matching the model's
+/// `Chart::cat_axis` / `Chart::val_axis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartAxisKind {
+    Category,
+    Value,
+}
+
+/// The data-label **show** toggles a [`ChartChromeEdit::DataLabels`] applies across every series of a
+/// chart (`c:dLbls` `showVal` / `showCatName` / `showPercent`, functional_spec §6.B). Each series'
+/// existing label number-format / separator / position (and any legend-key / series-name already on)
+/// is preserved; only these three flags are set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DataLabelToggles {
+    pub show_value: bool,
+    pub show_category_name: bool,
+    pub show_percent: bool,
+}
+
+/// One chrome attribute change carried by [`Command::SetChartChrome`] (P20, functional_spec §6.B).
+/// Each variant names exactly one field of the render [`Chart`](freecell_chart_model::Chart) — so the
+/// loaded-chart source patch can splice **only** that sub-element and leave everything else
+/// byte-stable (the edit contract).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChartChromeEdit {
+    /// Set (or clear, `None`) the chart title.
+    Title(Option<String>),
+    /// Turn the legend on at a position, or off (`None`).
+    Legend(Option<LegendPosition>),
+    /// Set (or clear, `None`) an axis title.
+    AxisTitle {
+        axis: ChartAxisKind,
+        title: Option<String>,
+    },
+    /// Set (or clear back to the palette, `None`) one series' color, by 0-based series index.
+    SeriesColor { series: usize, color: Option<Rgb> },
+    /// Apply the data-label toggles across every series.
+    DataLabels(DataLabelToggles),
 }
 
 /// A command the UI hands the worker over the (unbounded, non-blocking) command channel.
@@ -350,6 +391,19 @@ pub enum Command {
         sheet: SheetId,
         id: ChartId,
         kind: ChartInsertKind,
+    },
+    /// **Edit a chart's chrome** (P20, the edit panel): change one chrome attribute — title, legend,
+    /// axis title, series color, or data-label toggles — of the chart named by its [`ChartId`]. Unlike
+    /// range/type, this applies to **both** provenances: an **authored** chart's model is mutated and
+    /// re-serialized on save (write-from-model); a **loaded** chart's retained render model is mutated
+    /// (so it re-renders live) and its retained `chartN.xml` is **source-patched** on save — only the
+    /// changed sub-element is spliced, so unmodeled OOXML styling is preserved byte-for-byte (the edit
+    /// contract, functional_spec §6). `sheet` is advisory (the panel's host sheet); the chart is found
+    /// by `id`. Degraded-guarded; an unknown id is ignored.
+    SetChartChrome {
+        sheet: SheetId,
+        id: ChartId,
+        edit: ChartChromeEdit,
     },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },

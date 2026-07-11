@@ -28,6 +28,7 @@
 
 pub mod authoring;
 pub mod binding;
+pub mod chrome;
 pub mod load;
 pub mod range;
 pub mod save;

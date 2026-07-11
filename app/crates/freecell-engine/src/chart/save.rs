@@ -21,10 +21,16 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
-use freecell_chart_model::{Anchor, AnchorCell, Category, Chart, SeriesData};
+use freecell_chart_model::{
+    Anchor, AnchorCell, Category, Chart, ChartColor, ChartKind, Color, SeriesData, ThemePalette,
+};
 
 use super::load::{self, parse_chart_xml, SheetDrawing};
-use super::xlsx;
+use super::{chrome, xlsx};
+
+/// The drawingml-main namespace URI — the `a:` prefix the chrome patcher resolves against the file's
+/// own namespace declarations (so an inserted title / fill keeps the file's exact `a:` spelling).
+const NS_DRAWINGML_MAIN: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 
 /// A summary of what a save re-injection preserved — for the round-trip report + tests.
 #[derive(Clone, Debug)]
@@ -957,6 +963,15 @@ pub fn patch_chart_source(chart_xml: &str, chart: &Chart) -> Result<String> {
         }
     }
 
+    // --- Chrome edits (P20 edit contract, functional_spec §6) ------------------------------
+    // Splice ONLY the chrome fields that DIFFER from the file XML — title, legend, axis titles,
+    // series colors, data labels — so an unmodeled DrawingML element (a gradient, a theme effect,
+    // rounded corners) stays byte-for-byte. The file XML is re-parsed to diff against the target
+    // model; a chart whose chrome is untouched adds no chrome edit at all.
+    if let (Ok(cached), Some(chart_node)) = (parse_chart_xml(chart_xml), child(&root, "chart")) {
+        collect_chrome_edits(chart_xml, &root, &chart_node, chart, &cached, &mut edits);
+    }
+
     // Descending start order → each splice leaves the unprocessed prefix (and its offsets) intact.
     edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     let mut patched = chart_xml.to_string();
@@ -971,6 +986,479 @@ pub fn patch_chart_source(chart_xml: &str, chart: &Chart) -> Result<String> {
         patched.replace_range(range, &replacement);
     }
     Ok(patched)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chrome patcher (P20): splice only the changed title / legend / axis-title / series-color /
+// data-label sub-elements into a loaded chart's retained source, preserving everything else.
+// ---------------------------------------------------------------------------------------------
+
+// Per-parent schema orders: the local names that come strictly AFTER an upserted child. A fresh
+// insert lands before the first present following sibling (else before the parent's close tag), so
+// it is always schema-valid. Deliberately broad (naming later siblings we don't emit) so an
+// unmodeled later element still anchors the insert correctly.
+
+/// After `c:chart/c:title`.
+const TITLE_FOLLOWING: &[&str] = &[
+    "autoTitleDeleted",
+    "pivotFmts",
+    "view3D",
+    "floor",
+    "sideWall",
+    "backWall",
+    "plotArea",
+    "legend",
+    "plotVisOnly",
+    "dispBlanksAs",
+    "showDLblsOverMax",
+    "extLst",
+];
+/// After `c:chart/c:autoTitleDeleted`.
+const AUTO_TITLE_FOLLOWING: &[&str] = &[
+    "pivotFmts",
+    "view3D",
+    "floor",
+    "sideWall",
+    "backWall",
+    "plotArea",
+    "legend",
+    "plotVisOnly",
+    "dispBlanksAs",
+    "showDLblsOverMax",
+    "extLst",
+];
+/// After `c:chart/c:legend`.
+const LEGEND_FOLLOWING: &[&str] = &["plotVisOnly", "dispBlanksAs", "showDLblsOverMax", "extLst"];
+/// After a `c:catAx`/`c:valAx` `c:title`.
+const AXIS_TITLE_FOLLOWING: &[&str] = &[
+    "numFmt",
+    "majorTickMark",
+    "minorTickMark",
+    "tickLblPos",
+    "spPr",
+    "txPr",
+    "crossAx",
+    "crosses",
+    "crossesAt",
+    "auto",
+    "lblAlgn",
+    "lblOffset",
+    "tickLblSkip",
+    "tickMarkSkip",
+    "noMultiLvlLbl",
+    "dispUnits",
+    "crossBetween",
+    "majorUnit",
+    "minorUnit",
+    "extLst",
+];
+/// After a `c:ser` `c:spPr` (whole-element insert when the series has none).
+const SER_SPPR_FOLLOWING: &[&str] = &[
+    "marker",
+    "invertIfNegative",
+    "pictureOptions",
+    "explosion",
+    "dPt",
+    "dLbls",
+    "trendline",
+    "errBars",
+    "cat",
+    "val",
+    "xVal",
+    "yVal",
+    "smooth",
+    "bubble3D",
+    "bubbleSize",
+    "shape",
+    "extLst",
+];
+/// After a `c:ser` `c:dLbls`.
+const SER_DLBLS_FOLLOWING: &[&str] = &[
+    "trendline",
+    "errBars",
+    "cat",
+    "val",
+    "xVal",
+    "yVal",
+    "smooth",
+    "bubble3D",
+    "bubbleSize",
+    "shape",
+    "extLst",
+];
+/// After a `c:spPr` fill (a solid/gradient/… fill), i.e. inside `spPr` before the line stroke.
+const SPPR_FILL_FOLLOWING: &[&str] = &["ln", "effectLst", "effectDag", "scene3d", "sp3d", "extLst"];
+/// The DrawingML fill variants a series `spPr` fill upsert replaces (only one may be present).
+const FILL_VARIANTS: &[&str] = &[
+    "noFill",
+    "solidFill",
+    "gradFill",
+    "blipFill",
+    "pattFill",
+    "grpFill",
+];
+
+/// The `a:` (drawingml-main) prefix (incl. the trailing `:`, or `""` for a default namespace) the
+/// chart part declares — so an inserted title / fill keeps the file's exact spelling. Real chart
+/// parts always declare this namespace; the `"a:"` fallback only fires for a (non-conformant) part
+/// that uses no drawingml at all.
+fn drawingml_prefix(root: &Node) -> String {
+    if let Some(p) = root.lookup_prefix(NS_DRAWINGML_MAIN) {
+        return format!("{p}:");
+    }
+    if root.default_namespace() == Some(NS_DRAWINGML_MAIN) {
+        return String::new();
+    }
+    "a:".to_string()
+}
+
+/// The `RRGGBB` [`Color`] for a [`ChartColor`] (a theme reference resolves to its office-default RGB,
+/// as the loaded-edit path only ever sets a concrete sRGB).
+fn chart_color_srgb(c: &ChartColor) -> Color {
+    match c {
+        ChartColor::Rgb(color) => *color,
+        ChartColor::Theme { slot, .. } => ThemePalette::office_default().color(*slot),
+    }
+}
+
+/// Whether `node` is a **self-closing** element (`<x/>`) — which has no content region to splice a
+/// child into, so a would-be child insert must instead replace the whole element (the caller rebuilds
+/// it in open/close form). `<x></x>` (empty with a close tag) is **not** self-closing (its close tag
+/// is a valid insert anchor).
+fn is_self_closing(src: &str, node: &Node) -> bool {
+    let range = node.range();
+    src[range.start..range.end].trim_end().ends_with("/>")
+}
+
+/// The byte offset at which to insert a fresh child of `parent`: before the first present sibling in
+/// `following` (schema order), else just before the parent's closing tag.
+///
+/// Precondition: `parent` is **not** self-closing — a `<x/>` element has no content region, so its
+/// `rfind('<')` would return the element's own opening `<` and splice the child *before* the parent.
+/// The only realistic self-closing chrome parent is a series `<c:spPr/>`, which
+/// [`patch_series_color`] special-cases (whole-element replace) before ever reaching here.
+fn insertion_offset(src: &str, parent: &Node, following: &[&str]) -> usize {
+    debug_assert!(
+        !is_self_closing(src, parent),
+        "insertion_offset called on a self-closing parent — cannot insert a child into it",
+    );
+    if let Some(n) = parent
+        .children()
+        .find(|n| n.is_element() && following.contains(&n.tag_name().name()))
+    {
+        return n.range().start;
+    }
+    let range = parent.range();
+    range.start
+        + src[range.start..range.end]
+            .rfind('<')
+            .expect("an element node has a closing tag")
+}
+
+/// Upsert `parent`'s child into the replace / insert buckets. `replace_names` are the local names
+/// that count as the existing element (usually `[local]`; a series fill counts every fill variant).
+/// `new_xml` = `Some(_)` to set (replace-or-insert), `None` to remove. A fresh insert lands before
+/// the first `following` sibling; `seq` orders inserts that share an offset (a series' new
+/// `spPr` + `dLbls`).
+#[allow(clippy::too_many_arguments)]
+fn upsert_child(
+    src: &str,
+    parent: &Node,
+    replace_names: &[&str],
+    new_xml: Option<String>,
+    following: &[&str],
+    seq: usize,
+    replaces: &mut Vec<(Range<usize>, String)>,
+    inserts: &mut Vec<(usize, usize, String)>,
+) {
+    let existing = parent
+        .children()
+        .find(|n| n.is_element() && replace_names.contains(&n.tag_name().name()));
+    match (existing, new_xml) {
+        (Some(node), Some(xml)) => replaces.push((node.range(), xml)),
+        (Some(node), None) => replaces.push((node.range(), String::new())),
+        (None, Some(xml)) => inserts.push((insertion_offset(src, parent, following), seq, xml)),
+        (None, None) => {}
+    }
+}
+
+/// Collect the targeted splices for every chrome field that differs between the target `chart` and
+/// the file-parsed `cached`, appending them to `edits` (charts/functional_spec §6 edit contract).
+/// Only changed fields are touched.
+fn collect_chrome_edits(
+    src: &str,
+    root: &Node,
+    chart_node: &Node,
+    chart: &Chart,
+    cached: &Chart,
+    edits: &mut Vec<(Range<usize>, String)>,
+) {
+    let c = element_prefix(src, chart_node);
+    let a = drawingml_prefix(root);
+    let mut replaces: Vec<(Range<usize>, String)> = Vec::new();
+    let mut inserts: Vec<(usize, usize, String)> = Vec::new();
+
+    // --- Title -------------------------------------------------------------------------------
+    if chart.title != cached.title {
+        patch_title(
+            src,
+            chart_node,
+            c,
+            &a,
+            chart.title.as_deref(),
+            &mut replaces,
+            &mut inserts,
+        );
+    }
+
+    // --- Legend ------------------------------------------------------------------------------
+    if chart.legend != cached.legend {
+        let new = chart.legend.map(|l| chrome::legend_element(c, l.position));
+        upsert_child(
+            src,
+            chart_node,
+            &["legend"],
+            new,
+            LEGEND_FOLLOWING,
+            0,
+            &mut replaces,
+            &mut inserts,
+        );
+    }
+
+    // --- Axis titles -------------------------------------------------------------------------
+    if let Some(plot_area) = child(chart_node, "plotArea") {
+        let is_scatter = matches!(chart.kind, ChartKind::Scatter);
+        let axis_nodes = axis_nodes(&plot_area, is_scatter);
+        if chart.cat_axis.title != cached.cat_axis.title {
+            if let Some(ax) = axis_nodes.0 {
+                let new = chart
+                    .cat_axis
+                    .title
+                    .as_deref()
+                    .map(|t| chrome::title_element(c, &a, t));
+                upsert_child(
+                    src,
+                    &ax,
+                    &["title"],
+                    new,
+                    AXIS_TITLE_FOLLOWING,
+                    0,
+                    &mut replaces,
+                    &mut inserts,
+                );
+            }
+        }
+        if chart.val_axis.title != cached.val_axis.title {
+            if let Some(ax) = axis_nodes.1 {
+                let new = chart
+                    .val_axis
+                    .title
+                    .as_deref()
+                    .map(|t| chrome::title_element(c, &a, t));
+                upsert_child(
+                    src,
+                    &ax,
+                    &["title"],
+                    new,
+                    AXIS_TITLE_FOLLOWING,
+                    0,
+                    &mut replaces,
+                    &mut inserts,
+                );
+            }
+        }
+    }
+
+    // --- Series colors + data labels ---------------------------------------------------------
+    let group = child(chart_node, "plotArea").and_then(|plot| {
+        plot.children()
+            .find(|n| n.is_element() && load::is_chart_group(n.tag_name().name()))
+    });
+    if let Some(group) = group {
+        let sers: Vec<Node> = group
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "ser")
+            .collect();
+        for (i, ser) in sers.iter().enumerate() {
+            let (Some(series), Some(cached_series)) = (chart.series.get(i), cached.series.get(i))
+            else {
+                continue;
+            };
+            // Series color → the `solidFill` inside `spPr` (a co-located `a:ln` stroke survives).
+            if series.color != cached_series.color {
+                patch_series_color(
+                    src,
+                    ser,
+                    c,
+                    &a,
+                    series.color.as_ref(),
+                    &mut replaces,
+                    &mut inserts,
+                );
+            }
+            // Data labels → the series' `c:dLbls` (schema-ordered before the data roles).
+            if series.data_labels != cached_series.data_labels {
+                let new = series
+                    .data_labels
+                    .as_ref()
+                    .map(|l| chrome::dlbls_element(c, l));
+                upsert_child(
+                    src,
+                    ser,
+                    &["dLbls"],
+                    new,
+                    SER_DLBLS_FOLLOWING,
+                    1, // after a same-anchor new spPr (seq 0)
+                    &mut replaces,
+                    &mut inserts,
+                );
+            }
+        }
+    }
+
+    // Merge inserts sharing an offset (a series' new spPr + dLbls) in schema (seq) order, so an
+    // inserted spPr always precedes an inserted dLbls at the same anchor.
+    inserts.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+    let mut merged: Vec<(Range<usize>, String)> = Vec::new();
+    for (off, _seq, xml) in inserts {
+        match merged.last_mut() {
+            Some((r, s)) if r.start == off => s.push_str(&xml),
+            _ => merged.push((off..off, xml)),
+        }
+    }
+    edits.extend(replaces);
+    edits.extend(merged);
+}
+
+/// The `(category, value)` axis nodes to patch an axis title into: for scatter the two `c:valAx`
+/// (first = X = category, second = Y = value); otherwise `c:catAx` + `c:valAx` — mirroring
+/// [`load::parse_axes`].
+fn axis_nodes<'a>(
+    plot_area: &Node<'a, '_>,
+    is_scatter: bool,
+) -> (Option<Node<'a, 'a>>, Option<Node<'a, 'a>>) {
+    if is_scatter {
+        let mut vals = plot_area
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "valAx");
+        (vals.next(), vals.next())
+    } else {
+        (child(plot_area, "catAx"), child(plot_area, "valAx"))
+    }
+}
+
+/// Splice a chart title change: replace an existing title's text holder (`c:tx`) to keep its own
+/// styling, insert a fresh `c:title` when there was none (clearing `autoTitleDeleted`), or remove it
+/// (setting `autoTitleDeleted=1`) when cleared.
+fn patch_title(
+    src: &str,
+    chart_node: &Node,
+    c: &str,
+    a: &str,
+    new_title: Option<&str>,
+    replaces: &mut Vec<(Range<usize>, String)>,
+    inserts: &mut Vec<(usize, usize, String)>,
+) {
+    let existing_title = child(chart_node, "title");
+    match (existing_title, new_title) {
+        (Some(title), Some(text)) => match child(&title, "tx") {
+            // Replace only the text holder → preserve the title's own spPr/txPr/overlay/layout.
+            Some(tx) => replaces.push((tx.range(), chrome::title_tx(c, a, text))),
+            None => replaces.push((title.range(), chrome::title_element(c, a, text))),
+        },
+        (None, Some(text)) => {
+            inserts.push((
+                insertion_offset(src, chart_node, TITLE_FOLLOWING),
+                0,
+                chrome::title_element(c, a, text),
+            ));
+            // A title that was auto-deleted must be un-deleted so the new title shows.
+            set_auto_title_deleted(src, chart_node, c, false, replaces, inserts);
+        }
+        (Some(title), None) => {
+            replaces.push((title.range(), String::new()));
+            set_auto_title_deleted(src, chart_node, c, true, replaces, inserts);
+        }
+        (None, None) => {}
+    }
+}
+
+/// Set `c:autoTitleDeleted` to `deleted` (`val="1"`/`"0"`): replace an existing one, or (only when
+/// `deleted`, i.e. removing a title) insert one where the title was.
+fn set_auto_title_deleted(
+    src: &str,
+    chart_node: &Node,
+    c: &str,
+    deleted: bool,
+    replaces: &mut Vec<(Range<usize>, String)>,
+    inserts: &mut Vec<(usize, usize, String)>,
+) {
+    let val = if deleted { "1" } else { "0" };
+    let element = format!("<{c}autoTitleDeleted val=\"{val}\"/>");
+    match child(chart_node, "autoTitleDeleted") {
+        Some(node) => replaces.push((node.range(), element)),
+        None if deleted => inserts.push((
+            insertion_offset(src, chart_node, AUTO_TITLE_FOLLOWING),
+            0,
+            element,
+        )),
+        None => {} // adding a title with no autoTitleDeleted present: absence already means "show"
+    }
+}
+
+/// Splice a series color change into its `c:spPr` (upsert the `solidFill` inside an existing `spPr`
+/// so a co-located `a:ln` stroke survives; insert a whole `spPr` when the series has none; remove the
+/// `solidFill` when cleared).
+fn patch_series_color(
+    src: &str,
+    ser: &Node,
+    c: &str,
+    a: &str,
+    new_color: Option<&ChartColor>,
+    replaces: &mut Vec<(Range<usize>, String)>,
+    inserts: &mut Vec<(usize, usize, String)>,
+) {
+    let new_srgb = new_color.map(chart_color_srgb);
+    match child(ser, "spPr") {
+        // A self-closing `<c:spPr/>` has no content region to splice a fill into (inserting inside it
+        // would land the fill *outside* the spPr, as an invalid direct child of `<c:ser>` — silent
+        // color loss on reopen). Setting a color replaces the whole (empty) element with a full spPr
+        // carrying the fill (lossless: a self-closing spPr held nothing else). Clearing is a no-op.
+        Some(sp_pr) if is_self_closing(src, &sp_pr) => {
+            if let Some(color) = new_srgb {
+                replaces.push((sp_pr.range(), chrome::series_sppr_element(c, a, color)));
+            }
+        }
+        Some(sp_pr) => {
+            let new_fill = new_srgb.map(|color| chrome::sppr_solid_fill(a, color));
+            // Set → replace/insert the fill inside spPr; clear → remove only a `solidFill`.
+            let replace_names: &[&str] = if new_fill.is_some() {
+                FILL_VARIANTS
+            } else {
+                &["solidFill"]
+            };
+            upsert_child(
+                src,
+                &sp_pr,
+                replace_names,
+                new_fill,
+                SPPR_FILL_FOLLOWING,
+                0,
+                replaces,
+                inserts,
+            );
+        }
+        None => {
+            if let Some(color) = new_srgb {
+                inserts.push((
+                    insertion_offset(src, ser, SER_SPPR_FOLLOWING),
+                    0, // a new spPr precedes a same-anchor new dLbls (seq 1)
+                    chrome::series_sppr_element(c, a, color),
+                ));
+            }
+        }
+    }
 }
 
 /// Reflow a numeric value cache (`c:val` / `c:yVal` / `c:xVal` → `numCache`) to `values`.
@@ -1494,6 +1982,312 @@ mod tests {
         );
         // The value cache's formatCode survived the reflow.
         assert!(patched.contains("<c:formatCode>General</c:formatCode>"));
+    }
+
+    // --- P20: chrome patcher (title / legend / axis title / series color / data labels) ------
+
+    /// The line fixture with an **unmodeled** `<c:roundedCorners>` (our parser ignores it) spliced
+    /// into the chartSpace — the sentinel the edit contract must preserve byte-for-byte.
+    fn line_fixture_with_unmodeled() -> String {
+        let xml = authoring::line_chart_xml_for_test()
+            .replace("<c:chart>", "<c:roundedCorners val=\"1\"/><c:chart>");
+        assert!(
+            xml.contains("<c:roundedCorners val=\"1\"/>"),
+            "sentinel spliced"
+        );
+        xml
+    }
+
+    /// **The headline edit-contract test.** Editing the title of a loaded chart patches ONLY the
+    /// title's text holder: the edited title re-parses to the new text, while an unmodeled element
+    /// AND every unchanged chrome field (legend, axis titles, both series' colors) stay byte-stable.
+    #[test]
+    fn patch_edits_title_and_preserves_unmodeled_and_unchanged_chrome() {
+        let xml = line_fixture_with_unmodeled();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        chart.title = Some("Edited & Renamed".into());
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+
+        // (a) The title changed on re-parse.
+        let reparsed = parse_chart_xml(&patched).unwrap();
+        assert_eq!(reparsed.title.as_deref(), Some("Edited & Renamed"));
+
+        // (b) The unmodeled element survives byte-identically (the preserve-unmodeled guarantee).
+        assert!(
+            patched.contains("<c:roundedCorners val=\"1\"/>"),
+            "an unmodeled OOXML element must survive a title edit byte-for-byte",
+        );
+
+        // (c) Every OTHER chrome field is untouched — legend, both series colors, axis titles.
+        assert!(
+            patched.contains(r#"<c:legend><c:legendPos val="r"/><c:overlay val="0"/></c:legend>"#),
+            "the unchanged legend is byte-stable",
+        );
+        assert!(
+            patched.contains(r#"<a:srgbClr val="4472C4"/>"#),
+            "Widgets color kept"
+        );
+        assert!(
+            patched.contains(r#"<a:srgbClr val="ED7D31"/>"#),
+            "Gadgets color kept"
+        );
+        assert_eq!(reparsed.cat_axis.title.as_deref(), Some("Quarter"));
+        assert_eq!(
+            reparsed.val_axis.title.as_deref(),
+            Some("Units (thousands)")
+        );
+        // The title's own `<c:overlay>` wrapper survived (only the tx text holder was spliced).
+        assert!(patched.contains(r#"<c:overlay val="0"/></c:title>"#));
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    #[test]
+    fn patch_toggles_legend_off_then_a_new_one_on() {
+        let xml = line_fixture_with_unmodeled();
+
+        // Off: clear the legend → the element is gone, everything else byte-stable.
+        let mut off = parse_chart_xml(&xml).unwrap();
+        off.legend = None;
+        let patched_off = patch_chart_source(&xml, &off).unwrap();
+        assert!(!patched_off.contains("<c:legend>"), "the legend is removed");
+        assert!(patched_off.contains("<c:roundedCorners val=\"1\"/>"));
+        assert_eq!(parse_chart_xml(&patched_off).unwrap().legend, None);
+
+        // On (position change): right → bottom.
+        let mut moved = parse_chart_xml(&xml).unwrap();
+        moved.legend = Some(freecell_chart_model::Legend {
+            position: freecell_chart_model::LegendPosition::Bottom,
+        });
+        let patched_on = patch_chart_source(&xml, &moved).unwrap();
+        assert_eq!(
+            parse_chart_xml(&patched_on).unwrap().legend,
+            Some(freecell_chart_model::Legend {
+                position: freecell_chart_model::LegendPosition::Bottom
+            }),
+        );
+        assert!(roxmltree::Document::parse(&patched_on).is_ok());
+    }
+
+    #[test]
+    fn patch_sets_a_legend_on_a_chart_that_had_none() {
+        // Strip the legend from the fixture, then add one back via a patch (insert path).
+        let xml = authoring::line_chart_xml_for_test().replace(
+            r#"<c:legend><c:legendPos val="r"/><c:overlay val="0"/></c:legend>"#,
+            "",
+        );
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        assert_eq!(chart.legend, None, "the stripped fixture has no legend");
+        chart.legend = Some(freecell_chart_model::Legend {
+            position: freecell_chart_model::LegendPosition::Top,
+        });
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        // The inserted legend lands before plotVisOnly (schema order) and re-parses.
+        assert!(patched.contains(r#"<c:legendPos val="t"/>"#));
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+        assert_eq!(
+            parse_chart_xml(&patched).unwrap().legend,
+            Some(freecell_chart_model::Legend {
+                position: freecell_chart_model::LegendPosition::Top
+            }),
+        );
+    }
+
+    #[test]
+    fn patch_sets_axis_titles() {
+        let xml = line_fixture_with_unmodeled();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        chart.cat_axis.title = Some("Period".into());
+        chart.val_axis.title = None; // clear the value-axis title
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        let reparsed = parse_chart_xml(&patched).unwrap();
+        assert_eq!(reparsed.cat_axis.title.as_deref(), Some("Period"));
+        assert_eq!(reparsed.val_axis.title, None);
+        assert!(patched.contains("<c:roundedCorners val=\"1\"/>"));
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    #[test]
+    fn patch_series_color_preserves_a_co_located_line_stroke() {
+        // Give the Widgets series a line stroke alongside its shape fill — a color edit must splice
+        // only the shape solidFill and leave the `a:ln` (the visible line styling) byte-identical.
+        let ln = r#"<a:ln w="19050"><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:ln>"#;
+        let xml = authoring::line_chart_xml_for_test().replacen(
+            r#"<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>"#,
+            &format!(r#"<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>{ln}</c:spPr>"#),
+            1,
+        );
+        assert!(xml.contains(ln), "the a:ln was injected");
+
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        chart.series[0].color = Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0x70AD47),
+        ));
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+
+        // The shape fill is the new color; the co-located line stroke is untouched.
+        assert!(
+            patched.contains(r#"<a:srgbClr val="70AD47"/>"#),
+            "new shape fill"
+        );
+        assert!(
+            patched.contains(ln),
+            "the a:ln stroke survives the color edit byte-for-byte"
+        );
+        assert!(
+            !patched.contains(r#"<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>"#)
+                || patched.matches(r#"<a:srgbClr val="4472C4"/>"#).count() == 0,
+            "the old shape fill color is replaced"
+        );
+        assert_eq!(
+            parse_chart_xml(&patched).unwrap().series[0].color,
+            Some(freecell_chart_model::ChartColor::Rgb(
+                freecell_chart_model::Color::from_hex(0x70AD47)
+            )),
+        );
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    /// CR regression: a series whose `spPr` is a **self-closing** `<c:spPr/>` (no fill) must get its
+    /// color spliced INSIDE the spPr, not as an invalid direct child of `<c:ser>`. The pre-fix bug
+    /// inserted the fill before the spPr → schema-invalid XML that reads the color back as `None`
+    /// (silent color loss on reopen). The color must survive on re-parse.
+    #[test]
+    fn patch_series_color_into_a_self_closing_sppr() {
+        // Replace the Widgets series' full spPr with a self-closing one (a color-less series).
+        let xml = authoring::line_chart_xml_for_test().replacen(
+            r#"<c:spPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>"#,
+            "<c:spPr/>",
+            1,
+        );
+        assert!(
+            xml.contains("<c:spPr/>"),
+            "the self-closing spPr was injected"
+        );
+
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        assert_eq!(
+            chart.series[0].color, None,
+            "the self-closing spPr carries no color"
+        );
+        chart.series[0].color = Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0x5B9BD5),
+        ));
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+
+        // The fill is INSIDE the spPr (a well-formed, schema-valid element), and re-parses to the color.
+        assert!(
+            patched.contains(
+                r#"<c:spPr><a:solidFill><a:srgbClr val="5B9BD5"/></a:solidFill></c:spPr>"#
+            ),
+            "the fill is spliced inside a rebuilt spPr, not before it:\n{patched}",
+        );
+        assert!(
+            !patched.contains("<c:spPr/>"),
+            "the self-closing spPr was replaced"
+        );
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+        assert_eq!(
+            parse_chart_xml(&patched).unwrap().series[0].color,
+            Some(freecell_chart_model::ChartColor::Rgb(
+                freecell_chart_model::Color::from_hex(0x5B9BD5)
+            )),
+            "the color reads back on reopen (no silent loss)",
+        );
+    }
+
+    /// CR: a color edit on an **empty-but-closed** `<c:spPr></c:spPr>` inserts the fill before the
+    /// close tag (the non-self-closing path) and round-trips — locking that only the `/>` form takes
+    /// the whole-element-replace branch.
+    #[test]
+    fn patch_series_color_into_an_empty_closed_sppr() {
+        let xml = authoring::line_chart_xml_for_test().replacen(
+            r#"<c:spPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>"#,
+            "<c:spPr></c:spPr>",
+            1,
+        );
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        chart.series[0].color = Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0x5B9BD5),
+        ));
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+        assert_eq!(
+            parse_chart_xml(&patched).unwrap().series[0].color,
+            Some(freecell_chart_model::ChartColor::Rgb(
+                freecell_chart_model::Color::from_hex(0x5B9BD5)
+            )),
+        );
+    }
+
+    /// CR (phase-20 Tests list): a loaded chart with an unmodeled element and **no** chrome (or value)
+    /// change re-patches **byte-for-byte** — collect_chrome_edits adds nothing when every field
+    /// matches, so the whole patch is a no-op that preserves the unmodeled element exactly.
+    #[test]
+    fn patch_with_no_chrome_change_is_byte_identical() {
+        let xml = line_fixture_with_unmodeled();
+        let chart = parse_chart_xml(&xml).unwrap();
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        assert_eq!(
+            patched, xml,
+            "an unchanged loaded chart (chrome + values) re-patches byte-for-byte",
+        );
+        assert!(patched.contains("<c:roundedCorners val=\"1\"/>"));
+    }
+
+    #[test]
+    fn patch_adds_data_labels_to_a_series() {
+        let xml = line_fixture_with_unmodeled();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        assert!(
+            chart.series[0].data_labels.is_none(),
+            "no labels in the fixture"
+        );
+        chart.series[0].data_labels =
+            Some(freecell_chart_model::DataLabels::new().value().percent());
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        assert!(patched.contains("<c:dLbls>"), "a dLbls was inserted");
+        assert!(patched.contains("<c:roundedCorners val=\"1\"/>"));
+        let reparsed = parse_chart_xml(&patched).unwrap();
+        let dl = reparsed.series[0]
+            .data_labels
+            .clone()
+            .expect("labels present on reopen");
+        assert!(dl.show_value && dl.show_percent && !dl.show_category_name);
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    /// A combined chrome edit (title + legend + a series color + labels) on a chart with an
+    /// unmodeled element: all edits land and the sentinel is byte-stable — the whole panel's worth
+    /// of edits patched in one save.
+    #[test]
+    fn patch_applies_multiple_chrome_edits_together() {
+        let xml = line_fixture_with_unmodeled();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        chart.title = Some("Q Report".into());
+        chart.legend = Some(freecell_chart_model::Legend {
+            position: freecell_chart_model::LegendPosition::Bottom,
+        });
+        chart.series[1].color = Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0x5B9BD5),
+        ));
+        chart.series[0].data_labels = Some(freecell_chart_model::DataLabels::new().value());
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+
+        let reparsed = parse_chart_xml(&patched).unwrap();
+        assert_eq!(reparsed.title.as_deref(), Some("Q Report"));
+        assert_eq!(
+            reparsed.legend.map(|l| l.position),
+            Some(freecell_chart_model::LegendPosition::Bottom)
+        );
+        assert_eq!(
+            reparsed.series[1].color,
+            Some(freecell_chart_model::ChartColor::Rgb(
+                freecell_chart_model::Color::from_hex(0x5B9BD5)
+            )),
+        );
+        assert!(reparsed.series[0].data_labels.as_ref().unwrap().show_value);
+        assert!(patched.contains("<c:roundedCorners val=\"1\"/>"));
+        assert!(roxmltree::Document::parse(&patched).is_ok());
     }
 
     #[test]

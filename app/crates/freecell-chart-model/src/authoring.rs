@@ -71,6 +71,37 @@ impl ChartInsertKind {
         }
     }
 
+    /// The [`ChartInsertKind`] a fully-specified [`ChartKind`] came from — the inverse of
+    /// [`chart_kind`](Self::chart_kind). Used by the edit panel (P19) to show a chart's **current**
+    /// type and by the worker to map a spec back to a menu kind for a type switch. `None` only for a
+    /// [`ChartKind`] no menu entry authors (there is none today — every variant maps back).
+    pub fn from_chart_kind(kind: &ChartKind) -> Option<Self> {
+        Some(match kind {
+            ChartKind::Line { .. } => ChartInsertKind::Line,
+            ChartKind::Bar {
+                dir: BarDir::Col, ..
+            } => ChartInsertKind::Column,
+            ChartKind::Bar {
+                dir: BarDir::Bar, ..
+            } => ChartInsertKind::Bar,
+            ChartKind::Area { .. } => ChartInsertKind::Area,
+            ChartKind::Pie {
+                doughnut_hole: None,
+            } => ChartInsertKind::Pie,
+            ChartKind::Pie {
+                doughnut_hole: Some(_),
+            } => ChartInsertKind::Doughnut,
+            ChartKind::Scatter => ChartInsertKind::Scatter,
+        })
+    }
+
+    /// Whether an authored chart of this type carries **xy** series ([`SeriesData::Xy`]) rather than
+    /// category/value — `true` only for [`Scatter`](ChartInsertKind::Scatter). Drives the data-shape a
+    /// re-range / type-switch builds its series in (P19).
+    pub fn is_xy(self) -> bool {
+        matches!(self, ChartInsertKind::Scatter)
+    }
+
     /// A **near-empty** authored [`Chart`] of this type: one placeholder series over a small sample
     /// grid, a generic title, default axes, and a right legend. It carries no data references —
     /// live binding is set later when the chart is re-ranged (P19). Because bar/area/pie render the
@@ -201,6 +232,18 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn from_chart_kind_inverts_chart_kind() {
+        for kind in ALL {
+            let round = ChartInsertKind::from_chart_kind(&kind.chart_kind());
+            assert_eq!(round, Some(kind), "{kind:?} must round-trip its ChartKind");
+        }
+        // `is_xy` is true only for scatter (the one xy-series menu type).
+        assert!(ChartInsertKind::Scatter.is_xy());
+        assert!(!ChartInsertKind::Line.is_xy());
+        assert!(!ChartInsertKind::Pie.is_xy());
     }
 
     #[test]

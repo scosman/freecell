@@ -17,6 +17,8 @@
 //! - [`write`] is the **write-from-model** path (P16): it *synthesizes* chart XML (+ drawing / rels /
 //!   content-types) from an **authored** [`freecell_chart_model::Chart`] into a workbook — the inverse
 //!   of [`load`], and the third save write-mode beside [`save`]'s byte-preserve + edit-patch.
+//! - [`range`] (P19) turns a picked data-range block into the per-series `c:f` refs an authored
+//!   chart binds against — the structural half of shaping a near-empty chart into a real one.
 //! - [`authoring`] programmatically writes example `.xlsx` fixtures (used by the tests).
 //! - [`xlsx`] holds the shared zip + OPC-relationship helpers.
 //!
@@ -27,6 +29,7 @@
 pub mod authoring;
 pub mod binding;
 pub mod load;
+pub mod range;
 pub mod save;
 pub mod write;
 pub mod xlsx;
@@ -37,6 +40,7 @@ pub use load::{
     discover_and_parse_for_sheet, load_charts_from_xlsx, parse_chart_xml, workbook_sheet_parts,
     DiscoveredChart, SheetDrawing,
 };
+pub use range::series_refs_from_block;
 pub use save::{
     patch_chart_source, reinject, reinject_live_charts, save_with_charts, LiveChart, SaveReport,
 };

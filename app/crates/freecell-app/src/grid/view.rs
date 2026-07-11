@@ -1083,7 +1083,13 @@ impl GridView {
         // A chart under the pointer wins over the cell beneath it (this is the left-button handler:
         // a chart click = select + begin a move/resize drag).
         if let Some(chart_hit) = chart_hit {
+            let id = match chart_hit {
+                ChartHit::Handle { id, .. } | ChartHit::Body { id, .. } => id,
+            };
             self.begin_chart_interaction(chart_hit, (local_x, local_y), cx);
+            // Tell the owner a chart was selected (P19) so it opens the edit panel. A programmatic
+            // `set_selected_chart` stays silent; only a user click emits this.
+            self.events.emit(&GridEvent::ChartSelected(id), window, cx);
             return;
         }
         // A click that missed every chart deselects the current chart.
@@ -3888,6 +3894,13 @@ mod tests {
                     let before_sel = *grid.selection();
                     grid.handle_mouse_down(&mouse_ev(MouseButton::Left, 400.0, 200.0), window, cx);
                     assert_eq!(grid.selected_chart, Some(ChartId(7)), "chart selected");
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::ChartSelected(ChartId(7)))),
+                        "a chart click emits ChartSelected so the window opens the edit panel (P19)"
+                    );
                     assert!(
                         matches!(
                             grid.chart_drag,

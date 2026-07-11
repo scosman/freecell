@@ -14,6 +14,7 @@
 //! windows + panels + dialogs, and mediates the grid/chrome/worker seams.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -23,6 +24,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 
+use freecell_chart_model::{ChartId, ChartInsertKind};
 use freecell_core::{limits, SelectionModel, SheetId};
 use freecell_engine::{
     Command, DocumentClient, DocumentSource, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
@@ -134,6 +136,11 @@ pub struct WorkbookWindow {
     /// The sheets that currently have charts installed — so a snapshot that drops a sheet's charts
     /// can clear them.
     installed_chart_sheets: Vec<SheetId>,
+    /// The **authored** chart ids seen in the installed snapshot (P19). A newly-appeared authored id
+    /// means the user just inserted a chart, so its edit panel auto-opens (the insert→shape flow,
+    /// `ui_design §3.1`); loaded charts are never tracked here, so opening a file never auto-opens a
+    /// panel.
+    known_authored_charts: HashSet<ChartId>,
 
     /// Keeps the worker→UI event task alive for the window's lifetime.
     _event_task: gpui::Task<()>,
@@ -279,6 +286,7 @@ impl WorkbookWindow {
             next_req_id: 0,
             installed_chart_version: 0,
             installed_chart_sheets: Vec::new(),
+            known_authored_charts: HashSet::new(),
             _event_task: event_task,
         }
     }
@@ -340,6 +348,61 @@ impl WorkbookWindow {
         });
         self.installed_chart_sheets = present;
         self.installed_chart_version = snapshot.version;
+
+        // Drive the chart edit panel off the fresh snapshot (P19): auto-open a just-inserted authored
+        // chart, or reconcile an already-open panel's shown type/range (or close it if its chart is
+        // gone).
+        self.refresh_chart_panel(cx);
+    }
+
+    /// Reconcile the right-docked chart **edit panel** with the current snapshot (P19): a
+    /// newly-appeared **authored** chart (the user just inserted one) auto-opens its panel — the
+    /// insert→shape flow (`ui_design §3.1`); otherwise an already-open panel is refreshed to the
+    /// chart's current type/range (or closed if the chart was deleted). Loaded charts never
+    /// auto-open (they aren't tracked), so opening a file never pops the panel.
+    fn refresh_chart_panel(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.client.chart_snapshot();
+        let authored_now: HashSet<ChartId> = snapshot
+            .sheets
+            .iter()
+            .flat_map(|(_, specs)| specs.iter())
+            .filter(|s| s.is_authored())
+            .map(|s| s.id)
+            .collect();
+        let newly_inserted = authored_now
+            .iter()
+            .find(|id| !self.known_authored_charts.contains(id))
+            .copied();
+        self.known_authored_charts = authored_now;
+
+        if let Some(id) = newly_inserted {
+            self.open_chart_panel_for(id, cx);
+            return;
+        }
+        // Reconcile an already-open panel.
+        let Some(target) = self.chrome.read(cx).chart_panel_target() else {
+            return;
+        };
+        match authored_chart_panel_info(&self.client, target) {
+            Some(info) => self.chrome.update(cx, |c, cx| {
+                c.open_chart_panel(info.sheet, target, info.kind, info.ranges, cx)
+            }),
+            None => self.chrome.update(cx, |c, cx| c.close_chart_panel(cx)),
+        }
+    }
+
+    /// Open the edit panel for authored chart `id` + outline it in the grid (P19). Used on
+    /// insert-auto-open (a user click already outlined the chart, so the grid select there is a
+    /// harmless re-set).
+    fn open_chart_panel_for(&mut self, id: ChartId, cx: &mut Context<Self>) {
+        let Some(info) = authored_chart_panel_info(&self.client, id) else {
+            return;
+        };
+        self.grid
+            .update(cx, |g, cx| g.set_selected_chart(Some(id), cx));
+        self.chrome.update(cx, |c, cx| {
+            c.open_chart_panel(info.sheet, id, info.kind, info.ranges, cx)
+        });
     }
 
     /// Folds a worker event (`components/engine_worker.md`), routing each to the window's
@@ -1181,6 +1244,43 @@ fn route_selection_changed(
 /// Builds the grid's [`GridEventSink`] — routes grid events to the sibling chrome + the worker
 /// **without touching the `WorkbookWindow` entity** (the sink fires from inside the grid's own
 /// `update`). Cyclic follow-ups (the cap-reject selection revert) are deferred.
+/// What the chart edit panel needs about an authored chart, resolved from the published snapshot
+/// (P19): its host sheet, its current type (for the highlighted glyph), and a short summary of its
+/// bound data range(s).
+struct ChartPanelInfo {
+    sheet: SheetId,
+    kind: ChartInsertKind,
+    ranges: Option<String>,
+}
+
+/// Resolve the edit-panel info for an **authored** chart by [`ChartId`] from the worker's current
+/// chart snapshot (P19). `None` if no such chart is published, or it is a **loaded** chart (whose
+/// editing is P20's source-patch territory — the panel is authored-only for now).
+fn authored_chart_panel_info(client: &DocumentClient, id: ChartId) -> Option<ChartPanelInfo> {
+    let snapshot = client.chart_snapshot();
+    for (sheet, specs) in &snapshot.sheets {
+        for spec in specs.iter() {
+            if spec.id == id && spec.is_authored() {
+                let chart = spec.chart()?;
+                let kind = ChartInsertKind::from_chart_kind(&chart.kind)?;
+                let ranges = (!spec.source_ranges.is_empty()).then(|| {
+                    spec.source_ranges
+                        .iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+                return Some(ChartPanelInfo {
+                    sheet: *sheet,
+                    kind,
+                    ranges,
+                });
+            }
+        }
+    }
+    None
+}
+
 fn make_grid_sink(
     chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>>,
     grid_slot: Rc<OnceCell<WeakEntity<GridView>>>,
@@ -1315,10 +1415,34 @@ fn make_grid_sink(
             id: *id,
             anchor: *anchor,
         }),
-        GridEvent::ChartDeleted { id } => client.send(Command::DeleteChart {
-            sheet: shared.active_sheet.get(),
-            id: *id,
-        }),
+        GridEvent::ChartDeleted { id } => {
+            client.send(Command::DeleteChart {
+                sheet: shared.active_sheet.get(),
+                id: *id,
+            });
+            // Close the edit panel eagerly if it was shaping the just-deleted chart (the next sync
+            // would close it anyway once the chart drops from the snapshot).
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let id = *id;
+                chrome.update(cx, |c, cx| {
+                    if c.chart_panel_target() == Some(id) {
+                        c.close_chart_panel(cx);
+                    }
+                });
+            }
+        }
+        // A chart was clicked (P19): open the right-docked edit panel for it (authored charts only —
+        // the grid already outlined it in `begin_chart_interaction`).
+        GridEvent::ChartSelected(id) => {
+            if let Some(info) = authored_chart_panel_info(&client, *id) {
+                if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                    let id = *id;
+                    chrome.update(cx, |c, cx| {
+                        c.open_chart_panel(info.sheet, id, info.kind, info.ranges, cx)
+                    });
+                }
+            }
+        }
     })
 }
 

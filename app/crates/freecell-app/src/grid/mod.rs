@@ -150,6 +150,11 @@ pub enum GridEvent {
     /// A selected chart was **deleted** (Delete/Backspace or the chart context menu, P18). The
     /// window forwards it as `Command::DeleteChart` for the active sheet.
     ChartDeleted { id: ChartId },
+    /// A chart became **selected** by a user interaction (a click on its body/handle, P19). The
+    /// window opens the right-docked **edit panel** for it (an authored chart is shapeable — set its
+    /// range + type); a programmatic `set_selected_chart` does NOT emit this. Fires on every chart
+    /// mouse-down (the window dedupes by id), so re-clicking the editing chart is a harmless no-op.
+    ChartSelected(ChartId),
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

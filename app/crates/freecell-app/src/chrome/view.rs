@@ -42,7 +42,7 @@ use freecell_core::{
     limits, Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign,
 };
 
-use freecell_chart_model::{Anchor as ChartAnchor, AnchorCell};
+use freecell_chart_model::{Anchor as ChartAnchor, AnchorCell, ChartId};
 
 use freecell_engine::{
     BorderLine, BorderPreset, ChartInsertKind, Command, EditRejectedReason, StyleAttr, StylePath,
@@ -79,6 +79,10 @@ const TARGET_ICON_GREY: u32 = 0xC8C8C8;
 const TARGET_ICON_DARK: u32 = 0x1F1F1F;
 
 const ACTION_ROW_H: f32 = 36.0;
+
+/// The right-docked chart edit-panel width (P19, `ui_design §4`) — a compact side panel over the
+/// grid's right edge, wide enough for the type glyph row + the range status/apply button.
+const CHART_PANEL_W: f32 = 268.0;
 
 /// The default footprint (in cells) of a chart inserted from the action bar — a typical Excel
 /// default chart size (~8 columns × 15 rows), anchored at the active cell (`ui_design §3.1`).
@@ -156,6 +160,22 @@ const REF_BOX_W: f32 = 72.0;
 /// gap (`render_data_row` layout); the cap-error popover anchors here.
 const DATA_ROW_CONTENT_LEFT: f32 = 8.0 + REF_BOX_W + 8.0 + 1.0 + 8.0;
 
+/// The right-docked chart **edit panel**'s state (P19) — the authored chart it is shaping. Its
+/// `kind` drives the type row's highlight (updated optimistically on a pick, then reconciled by the
+/// window from the republished snapshot); `ranges` is a short human summary of the chart's current
+/// `c:f` data range(s), or `None` when it is still a near-empty placeholder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChartPanel {
+    /// The chart's host sheet (the `SetChartType`/`SetChartRange` target).
+    pub sheet: SheetId,
+    /// The chart's stable id.
+    pub id: ChartId,
+    /// The chart's current type (for the highlighted type glyph).
+    pub kind: ChartInsertKind,
+    /// A short summary of the current bound data range(s), `None` if unset.
+    pub ranges: Option<String>,
+}
+
 /// The chrome around the grid: action row + data row + sheet tab bar.
 pub struct ChromeView {
     client: Rc<dyn ChromeClient>,
@@ -231,6 +251,12 @@ pub struct ChromeView {
     /// The chart-insert menu's open state (the action-bar chart-type glyph menu, P17). Like the
     /// other formatting popovers it closes on click-away / a type pick / degrade.
     chart_menu_open: bool,
+    /// The right-docked **chart edit panel** (P19, `ui_design §4`), open while an **authored** chart
+    /// is being shaped. Unlike the action-bar popovers it is not click-away dismissed (the user picks
+    /// data cells in the grid with it open) — it closes on its × button, on the chart's deletion, or
+    /// on degrade. The window drives open/close/refresh (`shell::window`); the panel's controls send
+    /// `SetChartType` / `SetChartRange` for its `(sheet, id)`.
+    chart_panel: Option<ChartPanel>,
     /// The installed font-family names for the family dropdown, fetched once at build
     /// (`cx.text_system().all_font_names()`), sorted-unique with "Default (Inter)" prepended
     /// (`components/action_bar.md`). `Rc` so the render closure can clone it cheaply.
@@ -350,6 +376,7 @@ impl ChromeView {
             text_color_picker,
             num_fmt_open: false,
             chart_menu_open: false,
+            chart_panel: None,
             anchor_x: [0.0; ANCHOR_COUNT],
             font_names,
             font_family_open: false,
@@ -1142,6 +1169,100 @@ impl ChromeView {
         self.chart_menu_open
     }
 
+    // ---- Chart edit panel (P19) -----------------------------------------------------------
+
+    /// Open (or re-point) the right-docked chart **edit panel** on the authored chart `id`
+    /// (`ui_design §4`). The window calls this when a chart is selected or freshly inserted, and again
+    /// on each republish to reconcile the shown `kind`/`ranges` with the worker's snapshot.
+    pub fn open_chart_panel(
+        &mut self,
+        sheet: SheetId,
+        id: ChartId,
+        kind: ChartInsertKind,
+        ranges: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.chart_panel = Some(ChartPanel {
+            sheet,
+            id,
+            kind,
+            ranges,
+        });
+        cx.notify();
+    }
+
+    /// Close the chart edit panel (its × button, the chart's deletion, or a degrade).
+    pub fn close_chart_panel(&mut self, cx: &mut Context<Self>) {
+        if self.chart_panel.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The chart the edit panel is currently shaping, if any (window introspection: refresh / close).
+    pub fn chart_panel_target(&self) -> Option<ChartId> {
+        self.chart_panel.as_ref().map(|p| p.id)
+    }
+
+    /// Switch the panel's chart to `kind` (P19). A mutating chart control — like `insert_chart` it
+    /// commits any pending in-cell edit first (bailing if blocked) and degrade-guards. Updates the
+    /// panel's shown `kind` optimistically; the worker republishes the reshaped chart and the window
+    /// reconciles.
+    pub fn set_chart_type_from_panel(
+        &mut self,
+        kind: ChartInsertKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.chart_panel.as_ref() else {
+            return;
+        };
+        let (sheet, id) = (panel.sheet, panel.id);
+        if self.degraded {
+            return;
+        }
+        if !self.commit_pending_edit(window, cx) {
+            return;
+        }
+        self.client.send(Command::SetChartType { sheet, id, kind });
+        if let Some(panel) = self.chart_panel.as_mut() {
+            panel.kind = kind;
+        }
+        cx.notify();
+    }
+
+    /// Bind the panel's chart to the **current grid selection** as its data range (P19). The skeleton
+    /// range-picker: the user selects the data block in the grid, then applies it here. Commits any
+    /// pending edit first + degrade-guards, then sends `SetChartRange` for the current selection
+    /// rectangle; the worker re-resolves the chart live + republishes.
+    ///
+    /// The command's `sheet` is the **active** sheet — the one the selection's coordinates live in —
+    /// **not** the chart's host sheet: the worker finds the chart by `id` and qualifies the emitted
+    /// `c:f` with `sheet`, so pairing the selection with its own sheet is what keeps the binding
+    /// honest (and enables valid cross-sheet data, e.g. a chart on Sheet1 bound to Sheet2's cells).
+    /// Every other range command in the chrome pairs `self.selection.range()` with `self.active_sheet`.
+    pub fn apply_chart_range_from_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.chart_panel.as_ref() else {
+            return;
+        };
+        let id = panel.id;
+        if self.degraded {
+            return;
+        }
+        if !self.commit_pending_edit(window, cx) {
+            return;
+        }
+        self.client.send(Command::SetChartRange {
+            sheet: self.active_sheet,
+            id,
+            data: self.selection.range(),
+        });
+        cx.notify();
+    }
+
     // ---- Action row: SetFont (family + size) ----------------------------------------------
 
     /// Sends one `SetFont` over the selection after committing any pending edit (fire-and-forget,
@@ -1377,6 +1498,7 @@ impl ChromeView {
                 self.font_size_open = false;
                 self.borders_open = false;
                 self.chart_menu_open = false;
+                self.chart_panel = None;
             }
             cx.notify();
         }
@@ -2487,6 +2609,9 @@ impl ChromeView {
         if let Some(id) = self.confirm_delete {
             overlays.push(self.render_delete_confirm(id, cx));
         }
+        if self.chart_panel.is_some() {
+            overlays.push(self.render_chart_panel(cx));
+        }
         overlays
     }
 
@@ -2827,6 +2952,127 @@ impl ChromeView {
                     .rounded_md()
                     .shadow_md()
                     .child(menu),
+            )
+            .into_any_element()
+    }
+
+    /// The right-docked chart **edit panel** (P19, `ui_design §4`): a floating card on the right side
+    /// of the sheet with a **Type** row (the `CHART_MENU` glyphs, current kind highlighted) and a
+    /// **Data range** section ("use the current selection" applies it as the chart's range). It is a
+    /// chrome overlay (no pixel baseline), not a popover on the chart, and — unlike the action-bar
+    /// popovers — it has **no click-away backdrop**, so the user can click data cells in the grid
+    /// while it stays open. Closed by its × button, the chart's deletion, or a degrade.
+    fn render_chart_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let panel = self
+            .chart_panel
+            .as_ref()
+            .expect("render_chart_panel only runs while the panel is open");
+        let current = panel.kind;
+
+        // Type row: one glyph button per authorable kind, the current one selected.
+        let mut type_row = div().flex().flex_wrap().gap(px(2.0));
+        for (kind, icon_path, label) in CHART_MENU {
+            type_row = type_row.child(
+                Button::new(gpui::ElementId::Name(
+                    format!("chart-panel-type-{label}").into(),
+                ))
+                .icon(Icon::empty().path(icon_path))
+                .tooltip(label)
+                .debug_selector(move || format!("chart-panel-type-{label}"))
+                .ghost()
+                .small()
+                .selected(kind == current)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.set_chart_type_from_panel(kind, window, cx);
+                })),
+            );
+        }
+
+        // The status shows the raw `c:f` formula strings (dev-facing) for now; P20 (chrome editing,
+        // which fleshes out this panel) replaces it with a user-friendly bounding-range summary.
+        let range_status = match &panel.ranges {
+            Some(r) => r.clone(),
+            None => "No data range set".to_string(),
+        };
+        let selection_a1 = self.selection.range().to_a1();
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("Edit chart"),
+            )
+            .child(
+                Button::new("chart-panel-close")
+                    .label("×")
+                    .debug_selector(|| "chart-panel-close".into())
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.close_chart_panel(cx);
+                    })),
+            );
+
+        let section_label = |text: &'static str| {
+            div()
+                .text_size(px(10.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(MUTED_TEXT))
+                .child(text)
+        };
+
+        div()
+            .absolute()
+            .top(px(ACTION_ROW_H + DATA_ROW_H))
+            .right_0()
+            .bottom(px(TAB_BAR_H))
+            .w(px(CHART_PANEL_W))
+            .occlude()
+            .debug_selector(|| "chart-panel-card".into())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3()
+            .bg(rgb(ACTIVE_TAB_BG))
+            .border_l_1()
+            .border_color(rgb(HAIRLINE))
+            .shadow_md()
+            .child(header)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(section_label("Type"))
+                    .child(type_row),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(section_label("Data range"))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgb(TEXT))
+                            .debug_selector(|| "chart-panel-range-status".into())
+                            .child(range_status),
+                    )
+                    .child(
+                        Button::new("chart-panel-apply-range")
+                            .label(format!("Use selection ({selection_a1})"))
+                            .debug_selector(|| "chart-panel-apply-range".into())
+                            .small()
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.apply_chart_range_from_selection(window, cx);
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -3996,6 +4242,147 @@ mod tests {
             "degrading closes the open chart menu"
         );
         assert!(upd(&h, cx, |c, _w, _cx| c.is_degraded()));
+    }
+
+    // ---- Chart edit panel (P19) -----------------------------------------------------------
+
+    #[gpui::test]
+    fn chart_panel_opens_and_closes(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.chart_panel_target()), None);
+        upd(&h, cx, |c, _w, cx| {
+            c.open_chart_panel(SheetId(0), ChartId(7), ChartInsertKind::Line, None, cx)
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target()),
+            Some(ChartId(7)),
+            "the panel opens on the given chart"
+        );
+        upd(&h, cx, |c, _w, cx| c.close_chart_panel(cx));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.chart_panel_target()), None);
+    }
+
+    /// A type glyph in the panel sends `SetChartType` for the panel's chart and updates the shown
+    /// kind optimistically.
+    #[gpui::test]
+    fn chart_panel_type_glyph_sends_set_chart_type(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.open_chart_panel(SheetId(0), ChartId(7), ChartInsertKind::Line, None, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.set_chart_type_from_panel(ChartInsertKind::Column, window, cx)
+        });
+        assert!(matches!(
+            h.client.take_commands().as_slice(),
+            [Command::SetChartType {
+                id: ChartId(7),
+                kind: ChartInsertKind::Column,
+                ..
+            }]
+        ));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel.as_ref().map(|p| p.kind)),
+            Some(ChartInsertKind::Column),
+            "the shown type updates optimistically"
+        );
+    }
+
+    /// The "use selection" button binds the chart to the current grid selection as its data range.
+    #[gpui::test]
+    fn chart_panel_apply_range_uses_current_selection(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(
+                SelectionModel {
+                    anchor: cell(0, 0),
+                    active: cell(4, 3),
+                },
+                window,
+                cx,
+            )
+        });
+        upd(&h, cx, |c, _w, cx| {
+            c.open_chart_panel(SheetId(0), ChartId(7), ChartInsertKind::Line, None, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.apply_chart_range_from_selection(window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetChartRange { id: ChartId(7), data, .. }]
+                    if *data == freecell_core::CellRange::new(cell(0, 0), cell(4, 3))
+            ),
+            "the current selection is applied as the chart's range, got {cmds:?}"
+        );
+    }
+
+    /// Moderate-fix regression: "Use selection" binds to the sheet the SELECTION is on (the active
+    /// sheet), not the chart's host sheet — so a chart hosted on one sheet can be bound to another
+    /// sheet's data (valid cross-sheet), and a stale host sheet never silently mis-qualifies the c:f.
+    #[gpui::test]
+    fn chart_panel_apply_range_binds_the_active_sheet_not_the_host(cx: &mut TestAppContext) {
+        // The user is on sheet 1 ("Data"); the panel edits a chart HOSTED on sheet 0 ("Host").
+        let h = build(
+            cx,
+            vec![
+                SheetTab::new(SheetId(0), "Host"),
+                SheetTab::new(SheetId(1), "Data"),
+            ],
+            SheetId(1),
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(
+                SelectionModel {
+                    anchor: cell(0, 0),
+                    active: cell(4, 1),
+                },
+                window,
+                cx,
+            )
+        });
+        upd(&h, cx, |c, _w, cx| {
+            c.open_chart_panel(SheetId(0), ChartId(7), ChartInsertKind::Line, None, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.apply_chart_range_from_selection(window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetChartRange { sheet: SheetId(1), id: ChartId(7), data }]
+                    if *data == freecell_core::CellRange::new(cell(0, 0), cell(4, 1))
+            ),
+            "the range binds the active/data sheet (1), not the chart's host sheet (0): {cmds:?}"
+        );
+    }
+
+    /// Degrading closes the panel and makes its controls inert (like the action-bar popovers).
+    #[gpui::test]
+    fn degrade_closes_chart_panel(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.open_chart_panel(SheetId(0), ChartId(7), ChartInsertKind::Line, None, cx)
+        });
+        assert!(upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_some()));
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_none()),
+            "degrading closes the edit panel"
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.set_chart_type_from_panel(ChartInsertKind::Bar, window, cx)
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a closed/degraded panel sends no command"
+        );
     }
 
     // ---- Action row: SetStylePath (text color, alignment, number format) ------------------

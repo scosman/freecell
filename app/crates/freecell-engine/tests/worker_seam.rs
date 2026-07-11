@@ -1848,3 +1848,255 @@ fn moved_loaded_chart_with_authored_present_resave_is_stable() {
         "the re-save (authored present, source pinned) keeps the moved anchor — no drift/double-apply"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// P19 — edit panel range/type: a ranged authored chart binds + saves with `c:f` (not literals), and
+// a retype round-trips as the new kind (charts/implementation_plan P19). LibreOffice is env-broken,
+// so the reopen proof is the IronCalc `discover_and_parse` path (insert → range/type → save → reopen).
+// ---------------------------------------------------------------------------------------------
+
+/// A `spawn_new` workbook seeded with a small data grid (B1 header, A2:A3 categories, B2:B3 values)
+/// plus a fresh line chart; returns the sheet + the authored chart id, ready for a range set.
+fn spawn_new_with_chart_data() -> (DocumentClient, WorkerEventReceiver, SheetId, ChartId) {
+    let (client, rx, sheet) = spawn_new();
+    for cmd in [
+        set_input(sheet, 0, 1, "Widgets"), // B1 (series name)
+        set_input(sheet, 1, 0, "Q1"),      // A2 (category)
+        set_input(sheet, 2, 0, "Q2"),      // A3
+        set_input(sheet, 1, 1, "10"),      // B2 (value)
+        set_input(sheet, 2, 1, "20"),      // B3
+    ] {
+        client.send(cmd);
+    }
+    client.send(Command::InsertChart {
+        sheet,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(4, 0),
+    });
+    poll_until(
+        || first_chart_id(&client, sheet).is_some(),
+        "the authored chart is published",
+    );
+    let id = first_chart_id(&client, sheet).unwrap();
+    (client, rx, sheet, id)
+}
+
+/// Exit proof: setting a range binds the authored chart to real cells, and on save it round-trips as
+/// a **live-bound** Loaded chart (its `c:f` + cached cell values survive `discover_and_parse`), not
+/// as literal placeholder data.
+#[test]
+fn ranged_authored_chart_saves_cf_and_roundtrips() {
+    let (client, rx, sheet, id) = spawn_new_with_chart_data();
+    client.send(Command::SetChartRange {
+        sheet,
+        id,
+        data: CellRange::from_a1("A1:B3").unwrap(),
+    });
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0) == vec![10.0, 20.0],
+        "the ranged chart re-resolves to the cell values on the seam",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("ranged.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 90,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 90, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(specs.len(), 1);
+    let spec = &specs[0];
+    assert!(
+        spec.is_loaded(),
+        "the reopened authored chart is a Loaded spec"
+    );
+    let ranges: Vec<&str> = spec.source_ranges.iter().map(|r| r.as_str()).collect();
+    assert!(
+        ranges.iter().any(|r| r.ends_with("$B$2:$B$3")),
+        "the value c:f round-tripped (LIVE binding, not literals): {ranges:?}"
+    );
+    match &spec.chart().unwrap().series[0].data {
+        SeriesData::CategoryValue { values, .. } => assert_eq!(values, &vec![10.0, 20.0]),
+        other => panic!("expected CategoryValue, got {other:?}"),
+    }
+    assert!(matches!(
+        spec.chart().unwrap().kind,
+        freecell_chart_model::ChartKind::Line { .. }
+    ));
+}
+
+/// Exit proof: switching a ranged chart's type round-trips as the new kind, keeping the `c:f` binding.
+#[test]
+fn retyped_authored_chart_roundtrips() {
+    let (client, rx, sheet, id) = spawn_new_with_chart_data();
+    client.send(Command::SetChartRange {
+        sheet,
+        id,
+        data: CellRange::from_a1("A1:B3").unwrap(),
+    });
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0) == vec![10.0, 20.0],
+        "the chart is ranged",
+    );
+    client.send(Command::SetChartType {
+        sheet,
+        id,
+        kind: ChartInsertKind::Column,
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .find(|(s, _)| *s == sheet)
+                .and_then(|(_, specs)| specs.first())
+                .is_some_and(|sp| {
+                    matches!(
+                        sp.chart().unwrap().kind,
+                        freecell_chart_model::ChartKind::Bar { .. }
+                    )
+                })
+        },
+        "the retype republishes a column chart",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("retyped.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 91,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 91, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(specs.len(), 1);
+    assert!(
+        matches!(
+            specs[0].chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Bar {
+                dir: freecell_chart_model::BarDir::Col,
+                ..
+            }
+        ),
+        "the reopened chart is a column (bar/col) chart"
+    );
+    let ranges: Vec<&str> = specs[0].source_ranges.iter().map(|r| r.as_str()).collect();
+    assert!(
+        ranges.iter().any(|r| r.ends_with("$B$2:$B$3")),
+        "the range binding survived the retype: {ranges:?}"
+    );
+}
+
+/// Phase-plan item 4 (three-way honesty): one save carrying a LOADED chart + a BOUND (ranged)
+/// authored chart + an UNBOUND authored chart keeps all three straight — loaded byte-preserved,
+/// bound-authored written with `c:f`, unbound-authored written as literals — and all three reopen.
+#[test]
+fn combined_save_mixes_loaded_bound_and_unbound_authored_charts() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("line.xlsx");
+    freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
+    let data_sheet = sheets[0].id;
+
+    // Discover the loaded line chart on Data (lazy, on first paint).
+    client.send(full_viewport(data_sheet));
+    poll_until(
+        || client.chart_snapshot().version >= 1,
+        "the loaded line chart is discovered on first paint",
+    );
+
+    // A SECOND sheet with its own data grid, carrying the two authored charts (a separate drawing
+    // from the loaded chart's, so the combined save doesn't hit the same-sheet fail-loud precondition).
+    let sheet2 = add_sheet_and_id(&client, &rx, data_sheet);
+    for cmd in [
+        set_input(sheet2, 0, 1, "S"),  // B1 (series name)
+        set_input(sheet2, 1, 0, "Q1"), // A2 (category)
+        set_input(sheet2, 2, 0, "Q2"), // A3
+        set_input(sheet2, 1, 1, "10"), // B2 (value)
+        set_input(sheet2, 2, 1, "20"), // B3
+    ] {
+        client.send(cmd);
+    }
+
+    // Chart A: insert + range it (BOUND — saves with c:f).
+    client.send(Command::InsertChart {
+        sheet: sheet2,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(4, 0),
+    });
+    poll_until(
+        || chart_count_on(&client, sheet2) == 1,
+        "the first authored chart is published",
+    );
+    let bound_id = first_chart_id(&client, sheet2).unwrap();
+    client.send(Command::SetChartRange {
+        sheet: sheet2,
+        id: bound_id,
+        data: CellRange::from_a1("A1:B3").unwrap(),
+    });
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet2, 0, 0) == vec![10.0, 20.0],
+        "chart A binds to Sheet2's cells",
+    );
+
+    // Chart B: insert but never range it (UNBOUND — saves as literals).
+    client.send(Command::InsertChart {
+        sheet: sheet2,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(14, 0),
+    });
+    poll_until(
+        || chart_count_on(&client, sheet2) == 2,
+        "both authored charts are published on Sheet2",
+    );
+
+    // The combined save runs loaded re-inject (Data) + authored write-from-model (Sheet2: one bound,
+    // one unbound) in one pass.
+    let out = dir.path().join("mixed.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 92,
+    });
+    assert!(
+        wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 92, .. })).is_some(),
+        "the three-way combined save succeeds"
+    );
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(
+        specs.len(),
+        3,
+        "loaded + bound-authored + unbound-authored all saved"
+    );
+    // Exactly one chart has no c:f — the unbound authored one (its literals aren't read back as refs).
+    assert_eq!(
+        specs.iter().filter(|s| s.source_ranges.is_empty()).count(),
+        1,
+        "one unbound (literal-only) authored chart"
+    );
+    let ranges: Vec<String> = specs
+        .iter()
+        .flat_map(|s| s.source_ranges.iter().map(|r| r.as_str().to_string()))
+        .collect();
+    assert!(
+        ranges.iter().any(|r| r.ends_with("$B$2:$B$5")),
+        "the loaded chart's c:f is preserved: {ranges:?}"
+    );
+    assert!(
+        ranges.iter().any(|r| r.ends_with("$B$2:$B$3")),
+        "the bound authored chart's c:f survived: {ranges:?}"
+    );
+    assert!(
+        specs.iter().all(|s| matches!(
+            s.chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Line { .. }
+        )),
+        "all three reopen as line charts",
+    );
+}

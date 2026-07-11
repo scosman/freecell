@@ -328,6 +328,29 @@ pub enum Command {
     /// **loaded** chart is unbound and recorded so the save drops it from the package (its
     /// `twoCellAnchor` + part chain) without corrupting the rest. Degraded-guarded.
     DeleteChart { sheet: SheetId, id: ChartId },
+    /// **Set an authored chart's data range** (P19, the edit panel): bind the chart named by its
+    /// [`ChartId`] to the rectangular `data` block on `sheet`. The chart is resolved by **`id`** (not
+    /// `sheet`), so `sheet` names the worksheet the **data** lives on — the worker qualifies the
+    /// emitted `c:f` with it and reads the values there; it may differ from the chart's host/anchor
+    /// sheet (valid cross-sheet chart data). The worker interprets the block (first row = series
+    /// names, first column = categories/x, each remaining column a series), gives the chart real `c:f`
+    /// refs, and re-resolves its values from the current cells — so it transitions from P17's
+    /// snapshot-but-not-live placeholder to a **LIVE** chart that re-renders on edit and saves with
+    /// `c:f` + caches (write-from-model). Degraded-guarded; a loaded/unknown id is ignored (loaded
+    /// re-range is P20).
+    SetChartRange {
+        sheet: SheetId,
+        id: ChartId,
+        data: CellRange,
+    },
+    /// **Switch an authored chart's type** (P19, the edit panel): rebuild the chart named by its
+    /// [`ChartId`] to `kind`, preserving its data-range binding + title where sensible, so it renders
+    /// as the new kind and round-trips. Degraded-guarded; a loaded/unknown id is ignored.
+    SetChartType {
+        sheet: SheetId,
+        id: ChartId,
+        kind: ChartInsertKind,
+    },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },
     /// Drop the model and exit the loop.

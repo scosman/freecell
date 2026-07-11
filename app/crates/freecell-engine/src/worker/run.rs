@@ -31,11 +31,14 @@ use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
-use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, ChartSpec};
+use freecell_chart_model::{Anchor, CfRange, Chart, ChartId, ChartInsertKind, ChartSpec};
 
 use crate::cache;
-use crate::chart::binding::{CellData, ChartBindings};
-use crate::chart::write::AuthoredChart;
+use crate::chart::binding::{
+    binding_from_refs, binding_is_dirty, build_series_shells, resolve_chart, CellData,
+    ChartBindings, SheetResolver,
+};
+use crate::chart::write::{AuthoredChart, SeriesRefs};
 use crate::document::{DocumentSource, FontFlag, SaveError, WorkbookDocument};
 use std::path::Path;
 
@@ -118,6 +121,13 @@ struct AuthoredEntry {
     id: ChartId,
     /// The authored render envelope (a `ChartSpec::authored`, no retained source).
     spec: ChartSpec,
+    /// The per-series `c:f` references once a **data range** is set (P19) — **empty** for a still
+    /// near-empty placeholder. This is the source of truth for a bound authored chart: its live
+    /// re-resolve derives a `ChartBinding` from it ([`binding_from_refs`]), and the write path
+    /// consumes it directly so the saved chart carries `c:f` + caches (not literals). Setting a range
+    /// (or switching type on a bound chart) rebuilds these; the chart becomes LIVE the moment it is
+    /// non-empty.
+    refs: Vec<SeriesRefs>,
 }
 
 /// The outcome of a guarded paste (`run_guarded_paste`): applied (with the pasted 0-based
@@ -378,7 +388,9 @@ impl Worker {
                 font @ Command::SetFont { .. } => font_ops.push(font),
                 chart @ (Command::InsertChart { .. }
                 | Command::SetChartAnchor { .. }
-                | Command::DeleteChart { .. }) => chart_ops.push(chart),
+                | Command::DeleteChart { .. }
+                | Command::SetChartRange { .. }
+                | Command::SetChartType { .. }) => chart_ops.push(chart),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
@@ -458,6 +470,8 @@ impl Worker {
                     self.set_chart_anchor(sheet, id, anchor)
                 }
                 Command::DeleteChart { sheet, id } => self.delete_chart(sheet, id),
+                Command::SetChartRange { sheet, id, data } => self.set_chart_range(sheet, id, data),
+                Command::SetChartType { sheet, id, kind } => self.set_chart_type(sheet, id, kind),
                 _ => unreachable!("only chart ops are bucketed here"),
             }
         }
@@ -1312,11 +1326,15 @@ impl Worker {
     /// bump so the fresh charts ride the same event that repaints the cells. Cheap when nothing
     /// intersects — a disjoint edit does no reads and leaves the snapshot untouched.
     fn reresolve_charts(&mut self, refresh: &[(SheetId, CellRange)], rebuilt: &[SheetId]) {
-        if self.charts.is_empty() {
+        // A bound authored chart (P19) rides the SAME dirty-set/re-resolve path as a loaded one, so
+        // an edit re-renders it too — even in a workbook that has *only* authored charts (no loaded
+        // set). Bail only when there is nothing bound to re-resolve.
+        let any_authored_bound = self.authored_charts.iter().any(|e| !e.refs.is_empty());
+        if self.charts.is_empty() && !any_authored_bound {
             return;
         }
         // A `c:f` sheet name → stable id against the current model. Owned (`move`), so it never
-        // borrows `self` while `self.charts` is mutated below.
+        // borrows `self` while the chart sets are mutated below.
         let props = self.doc.sheet_properties();
         let resolve_sheet = move |name: &str| -> Option<SheetId> {
             props
@@ -1324,19 +1342,33 @@ impl Worker {
                 .find(|(_, n)| n == name)
                 .map(|(id, _)| SheetId(*id))
         };
-        let indices = self.charts.dirty_indices(refresh, rebuilt, &resolve_sheet);
-        if indices.is_empty() {
-            return; // disjoint edit — nothing recomputes (charts/functional_spec §2)
-        }
-        // Live cell reader over the doc — a disjoint field borrow from `self.charts` below.
-        let doc = &self.doc;
-        let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
-            match resolve_idx(doc, sheet) {
-                Ok(idx) => doc.cell_value(idx, cell),
-                Err(_) => CellData::Empty,
+        let mut changed = false;
+
+        // Loaded charts (P9): intersect the range→chart index, re-resolve only the dirty ones.
+        if !self.charts.is_empty() {
+            let indices = self.charts.dirty_indices(refresh, rebuilt, &resolve_sheet);
+            if !indices.is_empty() {
+                // Live cell reader over the doc — a disjoint field borrow from `self.charts` below.
+                let doc = &self.doc;
+                let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
+                    match resolve_idx(doc, sheet) {
+                        Ok(idx) => doc.cell_value(idx, cell),
+                        Err(_) => CellData::Empty,
+                    }
+                };
+                if self.charts.reresolve(&indices, &resolve_sheet, &read_cell) {
+                    changed = true;
+                }
             }
-        };
-        if self.charts.reresolve(&indices, &resolve_sheet, &read_cell) {
+        }
+
+        // Authored charts (P19): re-resolve any bound authored chart the edit touched, so a range set
+        // in the panel behaves exactly like a loaded chart's live binding.
+        if any_authored_bound {
+            changed |= self.reresolve_authored(refresh, rebuilt, &resolve_sheet);
+        }
+
+        if changed {
             self.chart_version += 1;
             self.store_chart_snapshot();
         }
@@ -1568,8 +1600,10 @@ impl Worker {
     /// host worksheet name (dropping a chart whose host sheet was deleted in-session, like a loaded
     /// chart) and assigning it a **free** `xl/charts/chartN.xml` part — one that collides with
     /// neither an existing part in `package_bytes` (loaded charts already re-injected) nor another
-    /// authored chart. The chart carries no `c:f` refs yet (ranges arrive in P19), so `refs` is
-    /// empty and the serializer emits schema-valid literals.
+    /// authored chart. A **ranged** chart (P19) carries its per-series `c:f`
+    /// [`refs`](AuthoredEntry::refs), so the serializer emits `numRef`/`strRef` + caches (fully
+    /// cell-bound, live-binds like a loaded chart on reopen); a still near-empty placeholder carries
+    /// empty `refs`, so the serializer emits schema-valid literals.
     fn authored_write_list(&self, package_bytes: &[u8]) -> Vec<AuthoredChart> {
         let mut used = existing_chart_parts(package_bytes);
         let mut out = Vec::new();
@@ -1586,7 +1620,7 @@ impl Worker {
                 chart_part: next_chart_part(&mut used),
                 chart,
                 anchor: entry.spec.anchor,
-                refs: Vec::new(),
+                refs: entry.refs.clone(),
             });
         }
         out
@@ -1616,6 +1650,9 @@ impl Worker {
             anchor_sheet: sheet,
             id,
             spec: ChartSpec::authored(kind.near_empty_chart(), anchor),
+            // A freshly inserted chart carries placeholder literals — no `c:f` binding until a range
+            // is set (P19). Empty `refs` keeps it snapshot-but-not-live, saved as literals.
+            refs: Vec::new(),
         });
         // Mark the document dirty so the unsaved chart can be saved. A chart op is NOT an
         // IronCalc-undoable op — it pushes no undo/touch entry, so it never desyncs the undo/touch
@@ -1685,6 +1722,190 @@ impl Worker {
             tracing::warn!(id = id.0, "DeleteChart for an unknown chart id ignored");
             return;
         }
+        self.ops_seen += 1;
+        self.shared
+            .committed_ops
+            .store(self.ops_seen, Ordering::Release);
+        self.chart_version += 1;
+        self.store_chart_snapshot();
+        self.emit(WorkerEvent::Published);
+    }
+
+    /// Set an **authored** chart's data range (P19, `Command::SetChartRange`): give the chart named by
+    /// `id` real `c:f` refs derived from the `data` block on `sheet` (the sheet the data lives on —
+    /// not necessarily the chart's host sheet; the chart is found by `id`), rebuild its series in the
+    /// kind's data shape, and re-resolve their values from the current cells — so it transitions from
+    /// P17's snapshot-but-not-live placeholder to a **LIVE** chart (re-renders on edit,
+    /// `reresolve_authored`; saves with `c:f` + caches, `authored_write_list`). Degraded-guarded; a
+    /// loaded/unknown id is ignored (loaded re-range is P20's source-patch territory).
+    fn set_chart_range(&mut self, sheet: SheetId, id: ChartId, data: CellRange) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(data_sheet_name) = self.sheet_name_of(sheet) else {
+            tracing::warn!(
+                sheet = sheet.0,
+                "SetChartRange onto a missing sheet ignored"
+            );
+            return;
+        };
+        let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) else {
+            tracing::warn!(
+                id = id.0,
+                "SetChartRange for a non-authored/unknown chart ignored (loaded re-range is P20)"
+            );
+            return;
+        };
+        let Some(mut template) = self.authored_charts[pos].spec.chart().cloned() else {
+            return; // an authored chart always has a typed Chart; defensive
+        };
+        let refs = crate::chart::series_refs_from_block(&data_sheet_name, data);
+        let binding = binding_from_refs(&refs);
+        // The range keeps the current type, so the series data shape is unchanged — decide xy the same
+        // way `set_chart_type` does (`ChartInsertKind::is_xy`), not with an ad-hoc `matches!`.
+        let xy = ChartInsertKind::from_chart_kind(&template.kind).is_some_and(|k| k.is_xy());
+        template.series = build_series_shells(refs.len(), xy);
+        let resolved = self.resolve_authored_chart(sheet, &template, &binding);
+        let source_ranges = source_ranges_from_refs(&refs);
+
+        let entry = &mut self.authored_charts[pos];
+        if let Some(slot) = entry.spec.chart_mut() {
+            *slot = resolved;
+        }
+        entry.spec.source_ranges = source_ranges;
+        entry.refs = refs;
+        self.commit_chart_op();
+    }
+
+    /// Switch an **authored** chart's type (P19, `Command::SetChartType`): rebuild the chart named by
+    /// `id` to `kind`, preserving its title and — if it is already **bound** to a data range — its
+    /// `c:f` refs (rebuilding the series in the new kind's data shape and re-resolving live). An
+    /// unbound (still near-empty) chart is swapped to that kind's placeholder template, keeping the
+    /// title. Degraded-guarded; a loaded/unknown id is ignored.
+    fn set_chart_type(&mut self, sheet: SheetId, id: ChartId, kind: ChartInsertKind) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) else {
+            tracing::warn!(
+                id = id.0,
+                "SetChartType for a non-authored/unknown chart ignored"
+            );
+            return;
+        };
+        let title = self.authored_charts[pos]
+            .spec
+            .chart()
+            .and_then(|c| c.title.clone());
+        let refs = self.authored_charts[pos].refs.clone();
+
+        if refs.is_empty() {
+            // Unbound placeholder: swap to the new kind's near-empty template, keeping the title so a
+            // pre-range retype doesn't reset the (only) field the user has set.
+            let mut chart = kind.near_empty_chart();
+            chart.title = title;
+            if let Some(slot) = self.authored_charts[pos].spec.chart_mut() {
+                *slot = chart;
+            }
+        } else {
+            // Bound: keep the range refs + title/axes/legend, rebuild the series in the new kind's
+            // data shape, and re-resolve their values from the current cells.
+            let mut template = self.authored_charts[pos]
+                .spec
+                .chart()
+                .cloned()
+                .expect("authored chart has a typed Chart");
+            template.kind = kind.chart_kind();
+            template.series = build_series_shells(refs.len(), kind.is_xy());
+            let binding = binding_from_refs(&refs);
+            let resolved = self.resolve_authored_chart(sheet, &template, &binding);
+            if let Some(slot) = self.authored_charts[pos].spec.chart_mut() {
+                *slot = resolved;
+            }
+        }
+        self.commit_chart_op();
+    }
+
+    /// Resolve an authored chart's series values from the **current** cells, given a `template` whose
+    /// series shells are already in the right data shape and its `binding` (P19). A `&self` mirror of
+    /// the [`reresolve_charts`](Self::reresolve_charts) closure setup, used by the range/type handlers
+    /// to fill a freshly-rebuilt chart before it is published.
+    fn resolve_authored_chart(
+        &self,
+        anchor_sheet: SheetId,
+        template: &Chart,
+        binding: &crate::chart::ChartBinding,
+    ) -> Chart {
+        let props = self.doc.sheet_properties();
+        let resolve_sheet = move |name: &str| -> Option<SheetId> {
+            props
+                .iter()
+                .find(|(_, n)| n == name)
+                .map(|(id, _)| SheetId(*id))
+        };
+        let doc = &self.doc;
+        let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
+            match resolve_idx(doc, sheet) {
+                Ok(idx) => doc.cell_value(idx, cell),
+                Err(_) => CellData::Empty,
+            }
+        };
+        resolve_chart(template, binding, anchor_sheet, &resolve_sheet, &read_cell)
+    }
+
+    /// Re-resolve every **bound** authored chart the edit touched (P19), in place — returns whether
+    /// any authored chart's picture changed. Mirrors [`ChartBindings::reresolve`] for the authored
+    /// set: an authored chart's `ChartBinding` is derived from its `refs` on demand (their single
+    /// source of truth), so a dirty chart refreshes from the current cells through the shared
+    /// [`resolve_chart`].
+    fn reresolve_authored(
+        &mut self,
+        refresh: &[(SheetId, CellRange)],
+        rebuilt: &[SheetId],
+        resolve_sheet: &SheetResolver<'_>,
+    ) -> bool {
+        let doc = &self.doc;
+        let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
+            match resolve_idx(doc, sheet) {
+                Ok(idx) => doc.cell_value(idx, cell),
+                Err(_) => CellData::Empty,
+            }
+        };
+        let mut changed = false;
+        for entry in &mut self.authored_charts {
+            if entry.refs.is_empty() {
+                continue; // a still near-empty placeholder has no binding to re-resolve
+            }
+            let binding = binding_from_refs(&entry.refs);
+            let anchor_sheet = entry.anchor_sheet;
+            if !binding_is_dirty(&binding, anchor_sheet, refresh, rebuilt, resolve_sheet) {
+                continue;
+            }
+            let Some(template) = entry.spec.chart() else {
+                continue;
+            };
+            let resolved =
+                resolve_chart(template, &binding, anchor_sheet, resolve_sheet, &read_cell);
+            if entry.spec.chart() != Some(&resolved) {
+                if let Some(slot) = entry.spec.chart_mut() {
+                    *slot = resolved;
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Shared post-mutation bookkeeping for a chart op (P19): count the committed op (dirty +
+    /// savable), bump the chart version, re-store the snapshot, and publish. Chart ops are OFF the
+    /// IronCalc undo stack (the P18 decision), so this pushes no undo/touch entry.
+    fn commit_chart_op(&mut self) {
         self.ops_seen += 1;
         self.shared
             .committed_ops
@@ -2005,6 +2226,24 @@ fn existing_chart_parts(package_bytes: &[u8]) -> HashSet<String> {
         .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
         .filter(|n| n.starts_with("xl/charts/") && n.ends_with(".xml") && !n.contains("/_rels/"))
         .collect()
+}
+
+/// The distinct `c:f` formulas of a ranged authored chart's [`SeriesRefs`] as [`CfRange`]s, in
+/// first-seen order (name / categories / values across the series), for the published spec's
+/// `source_ranges` (P19). Deduped so a shared category column isn't listed once per series — the
+/// value the edit panel reads back to show the chart's current data range.
+fn source_ranges_from_refs(refs: &[SeriesRefs]) -> Vec<CfRange> {
+    let mut out: Vec<CfRange> = Vec::new();
+    for formula in refs
+        .iter()
+        .flat_map(|r| [&r.name, &r.categories, &r.values])
+        .flatten()
+    {
+        if !out.iter().any(|r| r.as_str() == formula) {
+            out.push(CfRange::new(formula.clone()));
+        }
+    }
+    out
 }
 
 /// The next free `xl/charts/chartN.xml` part, marking it used (mirrors `write::next_drawing_part`).
@@ -3471,6 +3710,268 @@ mod tests {
         assert_eq!(cell00(&worker), "hello", "cell redo works too");
         // The authored chart is untouched by the cell undo/redo.
         assert_eq!(worker.authored_charts.len(), 1);
+    }
+
+    // --- P19: edit panel range/type ---------------------------------------------------------
+
+    /// A small data grid an authored chart can bind to: B1 header, A2:A3 categories, B2:B3 values.
+    fn seed_chart_data(worker: &mut Worker, sheet: SheetId) {
+        worker.process_batch(vec![
+            set_input(sheet, 0, 1, "Widgets"), // B1 (series name)
+            set_input(sheet, 1, 0, "Q1"),      // A2 (category)
+            set_input(sheet, 2, 0, "Q2"),      // A3
+            set_input(sheet, 1, 1, "10"),      // B2 (value)
+            set_input(sheet, 2, 1, "20"),      // B3
+        ]);
+    }
+
+    fn first_series_values(worker: &Worker, chart_idx: usize) -> Vec<f64> {
+        match &worker.authored_charts[chart_idx]
+            .spec
+            .chart()
+            .unwrap()
+            .series[0]
+            .data
+        {
+            freecell_chart_model::SeriesData::CategoryValue { values, .. } => values.clone(),
+            freecell_chart_model::SeriesData::Xy { y, .. } => y.clone(),
+        }
+    }
+
+    /// P19: setting a data range binds an authored chart to real cells — its published spec gains
+    /// `source_ranges` (`c:f`) AND its values re-resolve LIVE from the current cells (not the
+    /// placeholder literals).
+    #[test]
+    fn set_chart_range_binds_authored_chart() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        seed_chart_data(&mut worker, sheet);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        let version_before = worker.chart_version;
+        worker.process_batch(vec![Command::SetChartRange {
+            sheet,
+            id,
+            data: CellRange::from_a1("A1:B3").unwrap(),
+        }]);
+
+        let entry = &worker.authored_charts[0];
+        assert!(!entry.refs.is_empty(), "the range binds `c:f` refs");
+        assert!(
+            entry
+                .spec
+                .source_ranges
+                .iter()
+                .any(|r| r.as_str().contains("$B$2:$B$3")),
+            "the value range is published on the spec"
+        );
+        // The first series re-resolved from B2:B3 (10, 20), replacing the (4,6,5,8) placeholder.
+        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
+        // And its category + name came from the cells.
+        match &entry.spec.chart().unwrap().series[0].data {
+            freecell_chart_model::SeriesData::CategoryValue { categories, .. } => {
+                assert_eq!(
+                    categories[0],
+                    freecell_chart_model::Category::Text("Q1".into())
+                );
+            }
+            other => panic!("expected CategoryValue, got {other:?}"),
+        }
+        assert_eq!(
+            worker.authored_charts[0].spec.chart().unwrap().series[0]
+                .name
+                .as_deref(),
+            Some("Widgets"),
+        );
+        assert!(
+            worker.chart_version > version_before,
+            "the range republishes"
+        );
+    }
+
+    /// P19: once ranged, an authored chart re-resolves on a source-cell edit — it rides the SAME
+    /// dirty-set/publish path as a loaded chart, even though the workbook has no loaded charts.
+    #[test]
+    fn edit_reresolves_ranged_authored_chart() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        seed_chart_data(&mut worker, sheet);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        worker.process_batch(vec![Command::SetChartRange {
+            sheet,
+            id,
+            data: CellRange::from_a1("A1:B3").unwrap(),
+        }]);
+        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
+
+        let version_before = worker.chart_version;
+        worker.process_batch(vec![set_input(sheet, 1, 1, "999")]); // edit B2
+        assert_eq!(
+            first_series_values(&worker, 0),
+            vec![999.0, 20.0],
+            "editing a bound cell re-resolves the authored chart"
+        );
+        assert!(
+            worker.chart_version > version_before,
+            "the live re-resolve bumped the chart version"
+        );
+    }
+
+    /// A disjoint edit (outside every bound authored range) does NOT re-resolve the chart — the
+    /// authored dirty-set intersection is honored just like the loaded one.
+    #[test]
+    fn disjoint_edit_leaves_ranged_authored_chart_untouched() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        seed_chart_data(&mut worker, sheet);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        worker.process_batch(vec![Command::SetChartRange {
+            sheet,
+            id,
+            data: CellRange::from_a1("A1:B3").unwrap(),
+        }]);
+        let version_before = worker.chart_version;
+        worker.process_batch(vec![set_input(sheet, 20, 20, "42")]); // far outside A1:B3
+        assert_eq!(
+            worker.chart_version, version_before,
+            "a disjoint edit re-resolves nothing"
+        );
+    }
+
+    /// P19: switching an authored chart's type rebuilds it to the new kind, preserving the title.
+    #[test]
+    fn set_chart_type_switches_kind_and_preserves_title() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        let version_before = worker.chart_version;
+        worker.process_batch(vec![Command::SetChartType {
+            sheet,
+            id,
+            kind: ChartInsertKind::Column,
+        }]);
+        let chart = worker.authored_charts[0].spec.chart().unwrap();
+        assert!(
+            matches!(
+                chart.kind,
+                freecell_chart_model::ChartKind::Bar {
+                    dir: freecell_chart_model::BarDir::Col,
+                    ..
+                }
+            ),
+            "the chart is now a column chart"
+        );
+        assert_eq!(
+            chart.title.as_deref(),
+            Some("Chart"),
+            "the title is preserved across a retype"
+        );
+        assert!(
+            worker.chart_version > version_before,
+            "a retype republishes"
+        );
+    }
+
+    /// P19: retyping a chart that already has a data range keeps the range binding (its `c:f` refs +
+    /// live values) — only the kind changes.
+    #[test]
+    fn set_chart_type_preserves_the_range_binding() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        seed_chart_data(&mut worker, sheet);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        worker.process_batch(vec![Command::SetChartRange {
+            sheet,
+            id,
+            data: CellRange::from_a1("A1:B3").unwrap(),
+        }]);
+        worker.process_batch(vec![Command::SetChartType {
+            sheet,
+            id,
+            kind: ChartInsertKind::Column,
+        }]);
+        // Still bound to the same cells → still the live values, now on a column chart.
+        assert!(!worker.authored_charts[0].refs.is_empty(), "refs preserved");
+        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
+        assert!(matches!(
+            worker.authored_charts[0].spec.chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Bar { .. }
+        ));
+    }
+
+    /// P19 degraded guard: a degraded worker rejects `SetChartRange` + `SetChartType` (like every
+    /// mutating op), leaving the chart untouched.
+    #[test]
+    fn set_chart_range_and_type_rejected_when_degraded() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+        let id = worker.authored_charts[0].id;
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::TestPanic]);
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(worker.degraded);
+        drain_events(&rx);
+
+        worker.process_batch(vec![
+            Command::SetChartRange {
+                sheet,
+                id,
+                data: CellRange::from_a1("A1:B3").unwrap(),
+            },
+            Command::SetChartType {
+                sheet,
+                id,
+                kind: ChartInsertKind::Bar,
+            },
+        ]);
+        let rejects = drain_events(&rx)
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    WorkerEvent::EditRejected {
+                        reason: EditRejectedReason::Degraded
+                    }
+                )
+            })
+            .count();
+        assert_eq!(rejects, 2, "both chart edits are rejected when degraded");
+        // Untouched: still an unbound line chart.
+        assert!(worker.authored_charts[0].refs.is_empty());
+        assert!(matches!(
+            worker.authored_charts[0].spec.chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Line { .. }
+        ));
     }
 
     #[test]

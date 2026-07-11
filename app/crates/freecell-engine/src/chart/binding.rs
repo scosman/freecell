@@ -371,6 +371,77 @@ pub fn resolve_chart(
     chart
 }
 
+/// Build a [`ChartBinding`] from a set of [`SeriesRefs`](super::write::SeriesRefs) — the `c:f`
+/// formula strings a data-range pick produces (P19, `super::range`). Each role's formula is parsed
+/// via [`parse_cf`] into a structured [`CfRef`]; a `None` (or unparseable) role yields a `None`
+/// binding, which the resolver keeps at its template value. The inverse direction of
+/// [`parse_chart_binding`] (which reads a chart part's XML): here the refs come from an authored
+/// chart's range, not from retained source, but they re-resolve through the **same** [`resolve_chart`].
+pub fn binding_from_refs(refs: &[super::write::SeriesRefs]) -> ChartBinding {
+    ChartBinding {
+        series: refs
+            .iter()
+            .map(|r| SeriesBinding {
+                name: r.name.as_deref().and_then(parse_cf),
+                cat: r.categories.as_deref().and_then(parse_cf),
+                val: r.values.as_deref().and_then(parse_cf),
+            })
+            .collect(),
+    }
+}
+
+/// Empty render [`Series`] shells (one per ref) in the kind's data shape (`xy` for scatter, else
+/// category/value), for [`resolve_chart`] to fill from live cells. Names start `None`; the resolver
+/// sets each from its `c:tx` cell. Used when a re-range / type-switch rebuilds an authored chart's
+/// series to match its new [`SeriesRefs`](super::write::SeriesRefs) (P19).
+pub fn build_series_shells(count: usize, xy: bool) -> Vec<Series> {
+    (0..count)
+        .map(|_| {
+            if xy {
+                Series::xy(None::<String>, Vec::new(), Vec::new())
+            } else {
+                Series::category_value(None::<String>, Vec::new(), Vec::new())
+            }
+        })
+        .collect()
+}
+
+/// Does any of `binding`'s references overlap an edited range (on its resolved sheet), or resolve to
+/// a structurally-rebuilt sheet? The pure dirty test shared by loaded charts
+/// ([`BoundChart::is_dirty`]) and the authored re-resolve (P19) — an unqualified reference reads
+/// `anchor_sheet`, an unresolvable sheet name is skipped (its cache value is kept).
+pub fn binding_is_dirty(
+    binding: &ChartBinding,
+    anchor_sheet: SheetId,
+    edited: &[(SheetId, CellRange)],
+    rebuilt_sheets: &[SheetId],
+    resolve_sheet: &SheetResolver<'_>,
+) -> bool {
+    for sb in &binding.series {
+        for cf in [&sb.name, &sb.cat, &sb.val].into_iter().flatten() {
+            for area in &cf.areas {
+                let sheet = match &area.sheet {
+                    Some(name) => match resolve_sheet(name) {
+                        Some(s) => s,
+                        None => continue,
+                    },
+                    None => anchor_sheet,
+                };
+                if rebuilt_sheets.contains(&sheet) {
+                    return true;
+                }
+                if edited
+                    .iter()
+                    .any(|(es, er)| *es == sheet && ranges_intersect(&area.range, er))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// One chart the worker owns for live binding: its render/save envelope (whose `chart` field holds
 /// the current, live-resolved values), its structured per-series binding, and the sheet it is
 /// anchored on (which keys the published snapshot). Data sheets are resolved by name per reference,
@@ -400,29 +471,13 @@ impl BoundChart {
         rebuilt_sheets: &[SheetId],
         resolve_sheet: &SheetResolver<'_>,
     ) -> bool {
-        for sb in &self.binding.series {
-            for cf in [&sb.name, &sb.cat, &sb.val].into_iter().flatten() {
-                for area in &cf.areas {
-                    let sheet = match &area.sheet {
-                        Some(name) => match resolve_sheet(name) {
-                            Some(s) => s,
-                            None => continue,
-                        },
-                        None => self.anchor_sheet,
-                    };
-                    if rebuilt_sheets.contains(&sheet) {
-                        return true;
-                    }
-                    if edited
-                        .iter()
-                        .any(|(es, er)| *es == sheet && ranges_intersect(&area.range, er))
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        binding_is_dirty(
+            &self.binding,
+            self.anchor_sheet,
+            edited,
+            rebuilt_sheets,
+            resolve_sheet,
+        )
     }
 }
 

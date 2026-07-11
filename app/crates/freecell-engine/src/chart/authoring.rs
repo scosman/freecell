@@ -1487,12 +1487,13 @@ mod tests {
             parse_chart_xml(&line_chart()).unwrap().kind,
             ChartKind::Line { .. }
         ));
-        assert_eq!(
+        assert!(matches!(
             parse_chart_xml(&pie_chart()).unwrap().kind,
             ChartKind::Pie {
-                doughnut_hole: None
+                doughnut_hole: None,
+                ..
             }
-        );
+        ));
     }
 
     #[test]
@@ -1521,12 +1522,13 @@ mod tests {
 
         // Pie chart: single series over the totals.
         let pie = &charts[2];
-        assert_eq!(
+        assert!(matches!(
             pie.kind,
             ChartKind::Pie {
-                doughnut_hole: None
+                doughnut_hole: None,
+                ..
             }
-        );
+        ));
         assert_eq!(pie.series.len(), 1);
         match &pie.series[0].data {
             SeriesData::CategoryValue { values, .. } => assert_eq!(values, &TOTALS.to_vec()),

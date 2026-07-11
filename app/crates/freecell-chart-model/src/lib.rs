@@ -156,9 +156,20 @@ pub enum ChartKind {
     Line { grouping: Grouping, smooth: bool },
     /// `c:areaChart`.
     Area { grouping: Grouping },
-    /// `c:pieChart` / `c:doughnutChart`. `doughnut_hole` is the hole radius as a
-    /// fraction of the outer radius (`None` = solid pie).
-    Pie { doughnut_hole: Option<f32> },
+    /// `c:pieChart` / `c:doughnutChart`. A pie is single-series — its **slices** are the categories
+    /// of that one series (P24).
+    Pie {
+        /// The hole radius as a fraction of the outer radius (`c:holeSize`, doughnut); `None` = a
+        /// solid pie.
+        doughnut_hole: Option<f32>,
+        /// `c:firstSliceAng` — the rotation of the whole pie, in **degrees clockwise from 12
+        /// o'clock** (0..=360; Excel default 0). The first slice's leading edge starts here.
+        first_slice_ang: u16,
+        /// `c:varyColors` — color each slice from the palette by slice index (`true`, the pie
+        /// default) vs paint every slice the single series fill (`false`). A `c:dPt` per-slice
+        /// override ([`Series::data_points`]) wins over either.
+        vary_colors: bool,
+    },
     /// `c:scatterChart` — uses [`SeriesData::Xy`] series.
     Scatter,
 }
@@ -201,13 +212,29 @@ pub enum SeriesData {
     Xy { x: Vec<f64>, y: Vec<f64> },
 }
 
+/// A `c:dPt` **per-slice / per-point override** on a series (P24, used by pie/doughnut). A pie's
+/// slices are its categories, and a `c:dPt` can re-color or explode an individual slice; mirrors
+/// `<c:dPt>` (a child of `c:ser`), which carries a `c:idx` plus an optional `c:spPr` fill and a
+/// `c:explosion`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DataPoint {
+    /// `c:idx` — the 0-based index of the slice/point this override applies to.
+    pub index: u32,
+    /// `c:spPr` solid-fill override for this slice; `None` = use the varied palette / series color.
+    pub color: Option<ChartColor>,
+    /// `c:explosion@val` — how far the slice is pulled out from the center, as a percent of the
+    /// radius; `None`/0 = flush.
+    pub explosion: Option<u16>,
+}
+
 /// One data series — a `c:ser` element. `color` mirrors the series' `c:spPr` fill — an explicit
 /// sRGB color or a theme reference ([`ChartColor`], P6); `None` means "let the renderer pick from
 /// the palette cycle". `marker` mirrors `c:marker` (the point symbol for a line/scatter series,
 /// P6); `None` leaves the marker to the renderer's default. `data_labels` mirrors `c:dLbls` (the
 /// point labels — value / percent / names / legend key, P12); `None` means no labels. The
 /// chart-group-level `c:dLbls` default is resolved into each series here at parse time
-/// ([`DataLabels`] docs), so there is no chart-level label lookup.
+/// ([`DataLabels`] docs), so there is no chart-level label lookup. `data_points` mirrors the series'
+/// `c:dPt` per-slice overrides (color / explosion — pie/doughnut, P24); empty means no overrides.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Series {
     pub name: Option<String>,
@@ -218,6 +245,8 @@ pub struct Series {
     /// `c:spPr/a:ln` — the series line's stroke (width / color / alpha, P13); `None` leaves the
     /// renderer's Excel-like default weight in the series/palette color.
     pub stroke: Option<LineStroke>,
+    /// `c:dPt` per-slice overrides (pie/doughnut, P24); empty = none.
+    pub data_points: Vec<DataPoint>,
 }
 
 impl Series {
@@ -234,6 +263,7 @@ impl Series {
             marker: None,
             data_labels: None,
             stroke: None,
+            data_points: Vec::new(),
         }
     }
 
@@ -246,6 +276,7 @@ impl Series {
             marker: None,
             data_labels: None,
             stroke: None,
+            data_points: Vec::new(),
         }
     }
 
@@ -271,6 +302,12 @@ impl Series {
     /// Set the series' line stroke (`c:spPr/a:ln`, builder style).
     pub fn with_stroke(mut self, stroke: LineStroke) -> Self {
         self.stroke = Some(stroke);
+        self
+    }
+
+    /// Set the series' `c:dPt` per-slice overrides (pie/doughnut, builder style).
+    pub fn with_data_points(mut self, data_points: Vec<DataPoint>) -> Self {
+        self.data_points = data_points;
         self
     }
 

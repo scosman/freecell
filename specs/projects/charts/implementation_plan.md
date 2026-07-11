@@ -125,7 +125,7 @@ perceptual-diff + external round-trip sweep.
 - [x] **P22 — Column & bar.** Both orientations; clustered/stacked/100%; `gapWidth`/`overlap`;
   **Excel horizontal-bar category order**; per-type fills.
 - [x] **P23 — Area.** Standard/stacked/100% (hand-rolled polygon fork); fills.
-- [ ] **P24 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;
+- [x] **P24 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;
   rotation/explosion; on-slice % labels.
 - [ ] **P25 — Scatter.** Two numeric axes + dots; `scatterStyle`.
 - [ ] **P26 — Bubble.** Scatter + `bubbleSize`→radius (√-area + clamp); the final type re-runs

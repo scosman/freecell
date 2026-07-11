@@ -33,10 +33,11 @@
 //! orientation, an all-zero `dLbls`) must **not** raise a false warning (architecture §3.3).
 //! Excluded on the same grounds: the `scaling` wrapper (always present), the **major**-gridline
 //! toggle (`c:majorGridlines` — the line renderer honors it, P13, so its presence *or absence*
-//! renders as authored; **minor** gridlines are a different story — see below), `varyColors`
-//! (matches our palette), `gapWidth`/`overlap` (**honored by the P22 bar renderer**, so any value
-//! renders as authored) / `firstSliceAng` (written at defaults on nearly every pie), and `schemeClr`
-//! (a theme reference we now resolve to a color, P6).
+//! renders as authored; **minor** gridlines are a different story — see below), `varyColors` /
+//! `firstSliceAng` / `holeSize` / `explosion` (**honored by the P24 pie/doughnut renderer** — varied
+//! slice colors, rotation, the doughnut annulus, and exploded slices all render as authored),
+//! `gapWidth`/`overlap` (**honored by the P22 bar renderer**, so any value renders as authored), and
+//! `schemeClr` (a theme reference we now resolve to a color, P6).
 //!
 //! **Auto-dropped / scoped as support arrives.** `smooth` (curved lines) **renders faithfully as
 //! of P6** (on `lineChart`, the only group that draws it), so it left this set. `c:marker` symbols
@@ -113,7 +114,6 @@ const UNSUPPORTED_CHART_GROUPS: &[&str] = &[
 /// (namespace-prefix-agnostic) means the chart won't draw as authored — each is written only
 /// when actually used, so presence alone is a safe trigger. Sourced from
 /// `experiments/chart-poc/ooxml-coverage-matrix.md` sections C/D:
-/// - `c:dPt` — per-point / per-slice color/style override (P1 for pie).
 /// - `a:gradFill` / `a:pattFill` — non-solid fills we don't render. Detected **anywhere** in
 ///   the part (series/point fill *or* a themed chart-/plot-area background). This is the
 ///   deliberate asymmetry with excluding `schemeClr`: a `gradFill`/`pattFill` element is written
@@ -122,15 +122,17 @@ const UNSUPPORTED_CHART_GROUPS: &[&str] = &[
 ///   *do* resolve to a color, so its presence is not by itself a fidelity loss.
 ///
 /// The value-aware / context-scoped features (`numFmt` codes we approximate, axis `scaling`
-/// min/max/reversed line-scoped, `dLbls` toggles line-scoped, the line-scoped marker check, and
-/// per-point `dLbl` overrides) need their value/context inspected and are handled by dedicated
-/// detectors below. `c:smooth` left the set entirely in P6 (rendered on line, and line is the only
-/// group that draws it); `c:marker` and shown `c:dLbls` are now **scoped** — Faithful on a
-/// `lineChart` (P6 renders every symbol, P12 draws labels) but still degrading on a non-line group
-/// (see [`unsupported_marker`] / [`unsupported_data_labels`]). `c:min`/`c:max` and the reversed
-/// `orientation` left the presence set in **P13**: the line renderer now honors axis scaling, so
-/// they are line-scoped in [`unsupported_axis_scaling`].
-const RENDER_AFFECTING_PRESENCE_MARKERS: &[&str] = &["dPt", "gradFill", "pattFill"];
+/// min/max/reversed line-scoped, `dLbls` toggles line-/pie-scoped, the line-scoped marker check, the
+/// pie-scoped `c:dPt` check, and per-point `dLbl` overrides) need their value/context inspected and
+/// are handled by dedicated detectors below. `c:smooth` left the set entirely in P6 (rendered on
+/// line, and line is the only group that draws it); `c:marker` and shown `c:dLbls` are **scoped** —
+/// Faithful on a `lineChart` (P6 renders every symbol, P12 draws labels) but still degrading on a
+/// non-line group (see [`unsupported_marker`] / [`unsupported_data_labels`]). `c:dPt` per-slice
+/// overrides left this presence set in **P24**: the pie/doughnut renderer now honors them (per-slice
+/// fill color + explosion), so they are pie-scoped in [`unsupported_data_point`]. `c:min`/`c:max` and
+/// the reversed `orientation` left the presence set in **P13**: the line renderer now honors axis
+/// scaling, so they are line-scoped in [`unsupported_axis_scaling`].
+const RENDER_AFFECTING_PRESENCE_MARKERS: &[&str] = &["gradFill", "pattFill"];
 
 /// Map a **3-D** chart-group element local-name to its **2-D** equivalent element local-name
 /// (charts/functional_spec §5): `bar3DChart→barChart`, `line3DChart→lineChart`,
@@ -200,7 +202,16 @@ fn has_render_affecting_unsupported_feature(xml: &str) -> bool {
         || unsupported_line_stroke(xml)
         || unsupported_number_format(xml)
         || unsupported_data_labels(xml)
+        || unsupported_data_point(xml)
         || unsupported_marker(xml)
+}
+
+/// A `c:dPt` per-slice / per-point override the renderer does not honor (P24). The pie/doughnut
+/// renderer draws `c:dPt` (per-slice fill color + explosion), so a `dPt` on a pie/doughnut is
+/// Faithful; on any other group (bar/line/area/scatter — their per-point styling is a later phase) a
+/// `dPt` still renders wrong → Degraded. Scoped exactly like the P6 marker / P12 label checks.
+fn unsupported_data_point(xml: &str) -> bool {
+    contains_element(xml, "dPt") && !is_pie_chart(xml)
 }
 
 /// The `cx:` extended-chart family (sunburst, treemap, waterfall, histogram, box-&-whisker,
@@ -288,19 +299,21 @@ fn unsupported_number_format(xml: &str) -> bool {
     })
 }
 
-/// Data-label features the renderer does not draw as authored. Two cases degrade:
+/// Data-label features the renderer does not draw as authored. Cases that degrade:
 /// - a **per-point** label override (`<c:dLbl>` — an idx-keyed custom text / position / deletion)
 ///   on **any** group: we draw uniform series labels, not per-point overrides. Boundary-matched so
 ///   it does **not** fire on the plural `<c:dLbls>` container.
-/// - **shown** series/chart-level labels (`data_labels_shown`) on a **non-line** group: P12's line
-///   renderer draws data labels, but the bar/area/pie/scatter renderers don't yet (their phases are
-///   P16+), so a shown label there still renders wrong.
+/// - **shown** series/chart-level labels (`data_labels_shown`) on a group whose renderer ignores
+///   them (bar/area/scatter — their label phases are later).
 ///
-/// Shown labels on a `lineChart` are Faithful (P12 renders them) — the accessor auto-drops the
-/// feature for the group that honors it, exactly like the P6 marker scoping. Same textual-classifier
-/// combo caveat as [`unsupported_marker`]: in a combo part holding a `lineChart` plus another group,
-/// a shown label on the non-line group is currently treated Faithful (revisit with real multi-group
-/// parsing).
+/// **Scoped to the renderer that honors each label kind** (like the P6 marker scoping): P12's
+/// **line** renderer draws every label kind → any shown label on a `lineChart` is Faithful; P24's
+/// **pie/doughnut** renderer draws on-slice **percent** labels → a pie showing *only* percent is
+/// Faithful, but a pie showing any *non-percent* kind (value / category-name / series-name /
+/// legend-key / bubble-size) still renders wrong → Degraded. Same textual-classifier combo caveat as
+/// [`unsupported_marker`]: in a combo part holding a `lineChart`/`pieChart` plus another group, a
+/// shown label on the other group is currently treated as the scoped group's (revisit with real
+/// multi-group parsing).
 fn unsupported_data_labels(xml: &str) -> bool {
     if contains_element(xml, "dLbl") {
         return true;
@@ -308,7 +321,26 @@ fn unsupported_data_labels(xml: &str) -> bool {
     if is_line_chart(xml) {
         return false;
     }
+    if is_pie_chart(xml) {
+        return pie_shows_non_percent_label(xml);
+    }
     data_labels_shown(xml)
+}
+
+/// A pie/doughnut showing a label kind the pie renderer does not draw (P24). The renderer draws
+/// on-slice **percent** labels (`c:showPercent`), so `showPercent` alone is Faithful; any of the
+/// non-percent `show*` toggles set true still renders wrong.
+fn pie_shows_non_percent_label(xml: &str) -> bool {
+    const NON_PERCENT: &[&str] = &[
+        "showVal",
+        "showCatName",
+        "showSerName",
+        "showLegendKey",
+        "showBubbleSize",
+    ];
+    NON_PERCENT
+        .iter()
+        .any(|toggle| any_opening_tag(xml, toggle, val_is_true))
 }
 
 /// A `c:dLbls` that actually shows something — any `show*` toggle set true. An all-zero
@@ -361,6 +393,14 @@ fn unsupported_marker(xml: &str) -> bool {
 /// for `smooth` to curve, so an unhonored `smooth` on a non-line series changes nothing.
 fn is_line_chart(xml: &str) -> bool {
     contains_element(xml, "lineChart")
+}
+
+/// Whether the source contains a 2-D `c:pieChart` or `c:doughnutChart` group — the groups whose
+/// renderer honors `c:dPt` per-slice overrides + on-slice percent labels (P24). Boundary-aware, so
+/// it does **not** match `pie3DChart` (which degrades as a 3-D group first) or `ofPieChart` (an
+/// Unsupported group, detected earlier).
+fn is_pie_chart(xml: &str) -> bool {
+    contains_element(xml, "pieChart") || contains_element(xml, "doughnutChart")
 }
 
 /// A truthy OOXML boolean `val` attribute (`1` or `true`).
@@ -599,6 +639,48 @@ mod tests {
             Fidelity::Degraded,
             "axis min/max on area → Degraded"
         );
+    }
+
+    #[test]
+    fn p24_pie_dpt_and_percent_labels_faithful_but_other_labels_degrade() {
+        // The P24 pie/doughnut renderer honors c:dPt (per-slice color + explosion), varyColors,
+        // firstSliceAng, holeSize, and on-slice PERCENT labels — so a pie carrying them is Faithful.
+        for faithful in [
+            "<c:pieChart><c:varyColors val=\"1\"/><c:ser><c:dPt><c:idx val=\"1\"/><c:explosion val=\"25\"/></c:dPt></c:ser><c:firstSliceAng val=\"90\"/></c:pieChart>",
+            "<c:doughnutChart><c:ser/><c:holeSize val=\"50\"/></c:doughnutChart>",
+            "<c:pieChart><c:ser><c:dLbls><c:showPercent val=\"1\"/></c:dLbls></c:ser></c:pieChart>",
+        ] {
+            assert_eq!(
+                source_fidelity(faithful),
+                Fidelity::Faithful,
+                "expected Faithful for {faithful}"
+            );
+        }
+
+        // But the pie renderer does NOT draw the OTHER label kinds (value / category / series name /
+        // legend key), so a pie showing any of those keeps its honest Degraded badge.
+        for degraded in [
+            "<c:pieChart><c:ser><c:dLbls><c:showVal val=\"1\"/></c:dLbls></c:ser></c:pieChart>",
+            "<c:pieChart><c:ser><c:dLbls><c:showCatName val=\"1\"/></c:dLbls></c:ser></c:pieChart>",
+            "<c:doughnutChart><c:dLbls><c:showSerName val=\"1\"/></c:dLbls></c:doughnutChart>",
+        ] {
+            assert_eq!(
+                source_fidelity(degraded),
+                Fidelity::Degraded,
+                "expected Degraded for {degraded}"
+            );
+        }
+
+        // c:dPt is pie-SCOPED: a dPt on a non-pie group still renders wrong → Degraded.
+        for group in ["barChart", "lineChart", "areaChart", "scatterChart"] {
+            let xml =
+                format!("<c:{group}><c:ser><c:dPt><c:idx val=\"0\"/></c:dPt></c:ser></c:{group}>");
+            assert_eq!(
+                source_fidelity(&xml),
+                Fidelity::Degraded,
+                "a dPt on {group} → Degraded"
+            );
+        }
     }
 
     #[test]

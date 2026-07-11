@@ -13,8 +13,8 @@ use roxmltree::{Document, Node};
 
 use freecell_chart_model::{
     normalize_3d_chart_group, Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, CfRange,
-    Chart, ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, Grouping,
-    Legend, LegendPosition, LineStroke, Series, SourcePart, SourceXml, ThemeSlot,
+    Chart, ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, DataPoint,
+    Grouping, Legend, LegendPosition, LineStroke, Series, SourcePart, SourceXml, ThemeSlot,
 };
 
 use super::xlsx::{self, attr};
@@ -659,6 +659,8 @@ fn parse_kind(group: &Node, kind_name: &str) -> Result<ChartKind> {
         },
         "pieChart" => ChartKind::Pie {
             doughnut_hole: None,
+            first_slice_ang: first_slice_ang(group),
+            vary_colors: vary_colors(group),
         },
         "doughnutChart" => {
             // c:holeSize is a percentage of the outer radius (default 50 when absent).
@@ -668,6 +670,8 @@ fn parse_kind(group: &Node, kind_name: &str) -> Result<ChartKind> {
                 / 100.0;
             ChartKind::Pie {
                 doughnut_hole: Some(hole),
+                first_slice_ang: first_slice_ang(group),
+                vary_colors: vary_colors(group),
             }
         }
         "scatterChart" => ChartKind::Scatter,
@@ -690,6 +694,27 @@ fn bar_layout(group: &Node) -> BarLayout {
         .map(|o| o.clamp(-100, 100) as i16)
         .unwrap_or(default.overlap);
     BarLayout { gap_width, overlap }
+}
+
+/// `c:firstSliceAng@val` — a pie/doughnut's rotation in **degrees clockwise from 12 o'clock** (P24).
+/// Normalized to `0..360` (`rem_euclid`); an absent element is `0` (Excel's default, and what Excel
+/// emits explicitly). The angle convention maps directly onto gpui-component's `Pie::start_angle`.
+fn first_slice_ang(group: &Node) -> u16 {
+    child_val(group, "firstSliceAng")
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|a| a.rem_euclid(360) as u16)
+        .unwrap_or(0)
+}
+
+/// `c:varyColors@val` — whether each pie/doughnut slice takes its own palette color (P24). The
+/// pie/doughnut default is **true** (Excel varies slice colors and emits `val="1"`), so an absent
+/// element reads `true`; only an explicit `val="0"`/`"false"` turns it off (paint every slice the
+/// single series fill).
+fn vary_colors(group: &Node) -> bool {
+    !matches!(
+        child_val(group, "varyColors").as_deref(),
+        Some("0") | Some("false")
+    )
 }
 
 /// Maps a group's `c:grouping@val` to [`Grouping`], falling back to `default` when absent.
@@ -736,6 +761,10 @@ fn parse_series(
     }
     if let Some(stroke) = parse_series_stroke(ser) {
         series = series.with_stroke(stroke);
+    }
+    let data_points = parse_data_points(ser);
+    if !data_points.is_empty() {
+        series = series.with_data_points(data_points);
     }
     // A series `c:dLbls` (even all-off, an explicit "no labels") overrides the chart-level default;
     // a series with none inherits the chart-level default.
@@ -840,6 +869,32 @@ fn read_data_labels(dlbls: &Node) -> DataLabels {
 /// Whether the first child element named `name` carries a truthy OOXML boolean `val` (`1`/`true`).
 fn child_bool(node: &Node, name: &str) -> bool {
     matches!(child_val(node, name).as_deref(), Some("1") | Some("true"))
+}
+
+/// The series' `c:dPt` per-slice overrides (P24, pie/doughnut): each `c:dPt` carries a `c:idx` (the
+/// 0-based slice — required, so a `c:dPt` without one is skipped), an optional `c:spPr` solid-fill
+/// color (via the shared [`parse_solid_fill`], so a `schemeClr` dPt resolves to a theme color), and
+/// an optional `c:explosion@val` (radial offset percent). Returned in document order. Parsed for
+/// every series shape; only the pie renderer honors them (a `c:dPt` on a non-pie group is classified
+/// Degraded).
+fn parse_data_points(ser: &Node) -> Vec<DataPoint> {
+    ser.children()
+        .filter(|n| n.tag_name().name() == "dPt")
+        .filter_map(|dpt| {
+            let index = child_val(&dpt, "idx").and_then(|v| v.trim().parse::<u32>().ok())?;
+            let color = child(&dpt, "spPr")
+                .and_then(|sp| parse_solid_fill(&sp))
+                .map(|(c, _alpha)| c);
+            let explosion = child_val(&dpt, "explosion")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .map(|e| e.min(u16::MAX as u32) as u16);
+            Some(DataPoint {
+                index,
+                color,
+                explosion,
+            })
+        })
+        .collect()
 }
 
 /// The series fill color from `c:ser/c:spPr/a:solidFill` (P22): an explicit `a:srgbClr` **or** a theme
@@ -1279,16 +1334,77 @@ mod tests {
         assert_eq!(
             parse_chart_xml(pie).unwrap().kind,
             ChartKind::Pie {
-                doughnut_hole: None
+                doughnut_hole: None,
+                // Absent firstSliceAng → 0; absent varyColors → true (pie's default).
+                first_slice_ang: 0,
+                vary_colors: true,
             }
         );
         let dough = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:doughnutChart><c:holeSize val="55"/><c:ser/></c:doughnutChart></c:plotArea></c:chart></c:chartSpace>"#;
         match parse_chart_xml(dough).unwrap().kind {
             ChartKind::Pie {
                 doughnut_hole: Some(h),
+                ..
             } => assert!((h - 0.55).abs() < 1e-6),
             other => panic!("expected doughnut, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_pie_rotation_vary_colors_and_dpt() {
+        // A pie with a rotation, varyColors OFF, and a c:dPt overriding slice 1 (a schemeClr fill +
+        // an explosion) — the P24 per-slice features parse into the model.
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <c:chart><c:plotArea><c:pieChart>
+            <c:varyColors val="0"/>
+            <c:ser>
+              <c:idx val="0"/><c:order val="0"/>
+              <c:dPt>
+                <c:idx val="1"/>
+                <c:explosion val="25"/>
+                <c:spPr><a:solidFill><a:schemeClr val="accent2"/></a:solidFill></c:spPr>
+              </c:dPt>
+              <c:cat><c:strRef><c:strCache>
+                <c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="1"><c:v>B</c:v></c:pt>
+              </c:strCache></c:strRef></c:cat>
+              <c:val><c:numRef><c:numCache>
+                <c:pt idx="0"><c:v>60</c:v></c:pt><c:pt idx="1"><c:v>40</c:v></c:pt>
+              </c:numCache></c:numRef></c:val>
+            </c:ser>
+            <c:firstSliceAng val="90"/>
+          </c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        match chart.kind {
+            ChartKind::Pie {
+                doughnut_hole: None,
+                first_slice_ang,
+                vary_colors,
+            } => {
+                assert_eq!(first_slice_ang, 90, "firstSliceAng parsed");
+                assert!(!vary_colors, "varyColors val=0 → false");
+            }
+            other => panic!("expected pie, got {other:?}"),
+        }
+        let dpts = &chart.series[0].data_points;
+        assert_eq!(dpts.len(), 1, "one c:dPt override");
+        assert_eq!(dpts[0].index, 1, "the dPt targets slice 1");
+        assert_eq!(dpts[0].explosion, Some(25), "the explosion percent");
+        assert_eq!(
+            dpts[0].color,
+            Some(ChartColor::theme(ThemeSlot::Accent2)),
+            "a schemeClr dPt fill resolves to a theme color"
+        );
+
+        // An absent varyColors defaults to true (Excel's pie default).
+        let default_vary = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:pieChart><c:ser/></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        assert!(matches!(
+            parse_chart_xml(default_vary).unwrap().kind,
+            ChartKind::Pie {
+                vary_colors: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1617,12 +1733,13 @@ mod tests {
             specs[1].chart().unwrap().kind,
             ChartKind::Line { .. }
         ));
-        assert_eq!(
+        assert!(matches!(
             specs[2].chart().unwrap().kind,
             ChartKind::Pie {
-                doughnut_hole: None
+                doughnut_hole: None,
+                ..
             }
-        );
+        ));
         assert_eq!(
             specs[1].chart().unwrap().title.as_deref(),
             Some(CHART_TITLES[1])

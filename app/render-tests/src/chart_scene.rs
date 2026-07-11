@@ -13,8 +13,8 @@
 //! grid case table grows.
 
 use freecell_chart_model::{
-    Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartKind, Color, DataLabels, Grouping,
-    Legend, LegendPosition, LineStroke, Marker, MarkerSymbol, Series, ThemeSlot,
+    Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartKind, Color, DataLabels, DataPoint,
+    Grouping, Legend, LegendPosition, LineStroke, Marker, MarkerSymbol, Series, ThemeSlot,
 };
 
 /// One capturable chart fixture: a chart, and the (tight) capture viewport in device px. `name`
@@ -68,6 +68,11 @@ pub fn all() -> Vec<ChartScene> {
         chart_area_stacked(),
         chart_area_percent(),
         chart_area_theme_fills(),
+        // P24 — pie & doughnut.
+        chart_pie_vary_colors(),
+        chart_doughnut_hole(),
+        chart_pie_percent_labels(),
+        chart_pie_exploded(),
     ]
 }
 
@@ -926,6 +931,139 @@ fn chart_area_theme_fills() -> ChartScene {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// P24 — pie & doughnut scenes
+// -------------------------------------------------------------------------------------------------
+
+/// The four market-share categories the pie scenes slice, and a single series over them (a pie is
+/// single-series — its slices are these categories).
+fn market_share() -> Series {
+    Series::category_value(
+        Some("Share"),
+        ["North America", "Europe", "Asia", "Other"]
+            .into_iter()
+            .map(|c| Category::Text(c.into()))
+            .collect(),
+        vec![42.0, 28.0, 20.0, 10.0],
+    )
+}
+
+/// The bread-and-butter **pie** (`c:varyColors`): four slices from one series, each colored from the
+/// palette by slice index, with a right legend keyed to the same per-slice colors. Proves the varied
+/// slice palette + the per-slice (category) legend + the no-axes pie chrome.
+fn chart_pie_vary_colors() -> ChartScene {
+    let chart = Chart {
+        title: Some("Market Share by Region".into()),
+        kind: ChartKind::Pie {
+            doughnut_hole: None,
+            first_slice_ang: 0,
+            vary_colors: true,
+        },
+        series: vec![market_share()],
+        cat_axis: Axis::untitled(),
+        val_axis: Axis::untitled(),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_pie_vary_colors",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The same data as a **doughnut** (`c:holeSize` → `doughnut_hole: 0.5`): the slices render as an
+/// **annulus** with a centre hole. Proves the inner-radius (doughnut) path, distinct from the solid
+/// pie.
+fn chart_doughnut_hole() -> ChartScene {
+    let chart = Chart {
+        title: Some("Revenue Mix".into()),
+        kind: ChartKind::Pie {
+            doughnut_hole: Some(0.5),
+            first_slice_ang: 0,
+            vary_colors: true,
+        },
+        series: vec![market_share()],
+        cat_axis: Axis::untitled(),
+        val_axis: Axis::untitled(),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_doughnut_hole",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A **pie with on-slice percent labels** (`c:dLbls/showPercent`): each slice labeled with its share
+/// of the total (`NN%`) at the slice mid-angle. Proves the percent-of-total label path (pie's part-
+/// to-whole read, gated on `showPercent`).
+fn chart_pie_percent_labels() -> ChartScene {
+    let chart = Chart {
+        title: Some("Budget Allocation".into()),
+        kind: ChartKind::Pie {
+            doughnut_hole: None,
+            first_slice_ang: 0,
+            vary_colors: true,
+        },
+        series: vec![Series::category_value(
+            Some("Budget"),
+            ["Salaries", "Marketing", "R&D", "Operations"]
+                .into_iter()
+                .map(|c| Category::Text(c.into()))
+                .collect(),
+            vec![45.0, 20.0, 25.0, 10.0],
+        )
+        .with_data_labels(DataLabels::new().percent())],
+        cat_axis: Axis::untitled(),
+        val_axis: Axis::untitled(),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_pie_percent_labels",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The pie **rotation + explosion + `c:dPt` custom color** showcase: the pie is rotated
+/// (`first_slice_ang: 90`, so the first slice starts at 3 o'clock), and slice 0 is both **exploded**
+/// (pulled out) and given a **custom `c:dPt` fill** (a distinct purple), while the other slices keep
+/// the varied palette. Proves rotation, explosion geometry, and a per-slice color override in one
+/// capture.
+fn chart_pie_exploded() -> ChartScene {
+    let chart = Chart {
+        title: Some("Segment Focus".into()),
+        kind: ChartKind::Pie {
+            doughnut_hole: None,
+            first_slice_ang: 90,
+            vary_colors: true,
+        },
+        series: vec![Series::category_value(
+            Some("Segments"),
+            ["A", "B", "C", "D"]
+                .into_iter()
+                .map(|c| Category::Text(c.into()))
+                .collect(),
+            vec![35.0, 25.0, 22.0, 18.0],
+        )
+        .with_data_points(vec![DataPoint {
+            // A distinct custom slice color (purple) — clearly NOT one of the varied palette hues, so
+            // the c:dPt override reads as a deliberate per-slice highlight.
+            index: 0,
+            color: Some(ChartColor::Rgb(Color::from_hex(0x8E44AD))),
+            explosion: Some(22),
+        }])],
+        cat_axis: Axis::untitled(),
+        val_axis: Axis::untitled(),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_pie_exploded",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,5 +1354,64 @@ mod tests {
                 .all(|s| matches!(s.color, Some(ChartColor::Theme { .. }))),
             "every area theme-fills series is a schemeClr theme color"
         );
+    }
+
+    #[test]
+    fn p24_scenes_carry_their_pie_kind() {
+        // Every new pie/doughnut scene is a single-series `ChartKind::Pie`.
+        for name in [
+            "chart_pie_vary_colors",
+            "chart_doughnut_hole",
+            "chart_pie_percent_labels",
+            "chart_pie_exploded",
+        ] {
+            let s = get(name).unwrap_or_else(|| panic!("{name} scene"));
+            assert!(
+                matches!(s.chart.kind, ChartKind::Pie { .. }),
+                "{name} must be a pie"
+            );
+            assert_eq!(s.chart.series.len(), 1, "{name} is single-series");
+        }
+
+        // The doughnut scene carries a hole; the pie scenes do not.
+        assert!(matches!(
+            get("chart_doughnut_hole").unwrap().chart.kind,
+            ChartKind::Pie {
+                doughnut_hole: Some(h),
+                ..
+            } if h > 0.0
+        ));
+        assert!(matches!(
+            get("chart_pie_vary_colors").unwrap().chart.kind,
+            ChartKind::Pie {
+                doughnut_hole: None,
+                vary_colors: true,
+                ..
+            }
+        ));
+
+        // The percent-labels scene shows percent labels on its series.
+        let pct = get("chart_pie_percent_labels").unwrap();
+        assert!(
+            pct.chart.series[0]
+                .data_labels
+                .as_ref()
+                .is_some_and(|l| l.show_percent),
+            "percent-labels scene shows percent"
+        );
+
+        // The exploded scene is rotated and carries a c:dPt (custom color + explosion) on slice 0.
+        let exp = get("chart_pie_exploded").unwrap();
+        assert!(matches!(
+            exp.chart.kind,
+            ChartKind::Pie {
+                first_slice_ang: 90,
+                ..
+            }
+        ));
+        let dpts = &exp.chart.series[0].data_points;
+        assert_eq!(dpts.len(), 1, "one dPt override");
+        assert_eq!(dpts[0].index, 0);
+        assert!(dpts[0].color.is_some() && dpts[0].explosion.is_some());
     }
 }

@@ -335,6 +335,43 @@ fn in_grid_area_spec(title: &str) -> ChartSpec {
     )
 }
 
+/// A single-series **pie** (P24) over four market-share slices — the picture the ChartLayer paints
+/// for the in-grid pie case (`grid_chart_pie`). A pie is single-series; its slices are the
+/// categories, colored by the varied palette.
+fn in_grid_pie_chart(title: &str) -> Chart {
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Pie {
+            doughnut_hole: None,
+            first_slice_ang: 0,
+            vary_colors: true,
+        },
+        series: vec![Series::category_value(
+            Some("Share"),
+            ["North", "South", "East", "West"]
+                .into_iter()
+                .map(|c| Category::Text(c.into()))
+                .collect(),
+            vec![40.0, 25.0, 20.0, 15.0],
+        )],
+        cat_axis: Axis::untitled(),
+        val_axis: Axis::untitled(),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** pie `ChartSpec` at [`chart_anchor`], with a `<c:pieChart>` source so it classifies
+/// Faithful — the in-grid proof of the ChartLayer → `pie_element` path (P24), the pie analogue of the
+/// loaded column/area cases.
+fn in_grid_pie_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_pie_chart(title),
+        SourceXml::new("<c:pieChart><c:varyColors val=\"1\"/></c:pieChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
 /// An **Unsupported** spec: a `surfaceChart` source (no faithful 2-D rendering) so the ChartLayer
 /// draws the placeholder box; its `chart` carries the title the placeholder shows.
 fn in_grid_unsupported_spec(title: &str) -> ChartSpec {
@@ -626,6 +663,11 @@ pub fn all() -> Vec<RenderCase> {
         // `grid_chart_*` baseline moves.
         RenderCase::new("grid_chart_area", chart_backing_scene(), CHART_GRID_VP)
             .charts(vec![in_grid_area_spec("Regional Sales")]),
+        // A Faithful PIE chart floating over the same backing table (P24) — the in-grid proof of the
+        // ChartLayer → `pie_element` path. Its own baseline, so no existing `grid_chart_*` baseline
+        // moves.
+        RenderCase::new("grid_chart_pie", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_pie_spec("Regional Share")]),
         // A Degraded chart still renders as a line, plus the corner "⚠ May not display as intended"
         // badge (`ui_design.md §2.2`) — here from a 3-D group (`line3DChart`) rendered as its 2-D
         // line. (A shown `c:dLbls` on a line is Faithful as of P12 — it renders — so the badge case

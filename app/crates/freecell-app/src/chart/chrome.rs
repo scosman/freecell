@@ -20,10 +20,9 @@ use gpui::{
 
 use freecell_chart_model::{BarDir, Chart, ChartKind, LegendPosition, SeriesData};
 
-use super::palette::slice_color;
 use super::style::{
-    hsla, resolve_series_color, AXIS_TITLE_FONT_SIZE, AXIS_TITLE_TEXT, BACKGROUND,
-    LEGEND_FONT_SIZE, TITLE_FONT_SIZE, TITLE_TEXT,
+    hsla, resolve_series_color, resolve_slice_color, AXIS_TITLE_FONT_SIZE, AXIS_TITLE_TEXT,
+    BACKGROUND, LEGEND_FONT_SIZE, TITLE_FONT_SIZE, TITLE_TEXT,
 };
 
 /// Width (px) of the rotated value-axis title column. Also the SVG viewBox width, so the rotated
@@ -44,18 +43,20 @@ pub(crate) struct LegendEntry {
 /// one per series. Each entry's color is the *same* palette function the marks use, so the
 /// legend↔mark colors match by construction. Pure (no gpui) so it is unit-tested directly.
 pub(crate) fn legend_entries(chart: &Chart) -> Vec<LegendEntry> {
-    if matches!(chart.kind, ChartKind::Pie { .. }) {
-        if let Some(SeriesData::CategoryValue { categories, .. }) =
-            chart.series.first().map(|s| &s.data)
-        {
-            return categories
-                .iter()
-                .enumerate()
-                .map(|(i, c)| LegendEntry {
-                    color: slice_color(i).to_hex(),
-                    name: c.label(),
-                })
-                .collect();
+    if let ChartKind::Pie { vary_colors, .. } = chart.kind {
+        if let Some(series) = chart.series.first() {
+            if let SeriesData::CategoryValue { categories, .. } = &series.data {
+                return categories
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| LegendEntry {
+                        // The same per-slice resolver the pie renderer uses (dPt override → varied
+                        // palette → single series fill), so slice↔swatch match by construction (P24).
+                        color: resolve_slice_color(series, i, vary_colors).to_hex(),
+                        name: c.label(),
+                    })
+                    .collect();
+            }
         }
     }
     let is_line = matches!(chart.kind, ChartKind::Line { .. });
@@ -449,6 +450,8 @@ mod tests {
             title: Some("Market Share".into()),
             kind: ChartKind::Pie {
                 doughnut_hole: None,
+                first_slice_ang: 0,
+                vary_colors: true,
             },
             series: vec![Series::category_value(
                 Some("Share"),

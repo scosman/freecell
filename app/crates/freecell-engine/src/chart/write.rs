@@ -165,13 +165,21 @@ fn group_element(chart: &Chart, series_xml: &str) -> String {
         ),
         ChartKind::Pie {
             doughnut_hole: None,
+            first_slice_ang,
+            vary_colors,
         } => format!(
-            r#"<c:pieChart><c:varyColors val="1"/>{series_xml}<c:firstSliceAng val="0"/></c:pieChart>"#
+            // CT_PieChart child order: varyColors?, ser*, dLbls?, firstSliceAng?.
+            r#"<c:pieChart><c:varyColors val="{}"/>{series_xml}<c:firstSliceAng val="{first_slice_ang}"/></c:pieChart>"#,
+            bool_val(*vary_colors),
         ),
         ChartKind::Pie {
             doughnut_hole: Some(hole),
+            first_slice_ang,
+            vary_colors,
         } => format!(
-            r#"<c:doughnutChart><c:varyColors val="1"/>{series_xml}<c:firstSliceAng val="0"/><c:holeSize val="{}"/></c:doughnutChart>"#,
+            // CT_DoughnutChart child order: varyColors?, ser*, dLbls?, firstSliceAng?, holeSize?.
+            r#"<c:doughnutChart><c:varyColors val="{}"/>{series_xml}<c:firstSliceAng val="{first_slice_ang}"/><c:holeSize val="{}"/></c:doughnutChart>"#,
+            bool_val(*vary_colors),
             (hole * 100.0).round() as i64,
         ),
         ChartKind::Scatter => format!(
@@ -192,7 +200,10 @@ fn series_element(idx: usize, series: &Series, refs: Option<&SeriesRefs>) -> Str
         .map(|n| tx_element(n, name_f))
         .unwrap_or_default();
     let sp = sppr_element(series.color.as_ref());
-    // Data labels (`c:dLbls`, P20) sit after `spPr` and before the data roles — schema-valid in
+    // `c:dPt` per-slice overrides (pie/doughnut, P24) sit after `spPr` and before `dLbls` — the
+    // `CT_*Ser` slot valid across every type (empty for non-pie, so only a pie ever emits them).
+    let dpts: String = series.data_points.iter().map(dpt_element).collect();
+    // Data labels (`c:dLbls`, P20) sit after `spPr`/`dPt` and before the data roles — schema-valid in
     // every `CT_*Ser`. Shared with the loaded chrome patch via `chrome::dlbls_element`.
     let dlbls = series
         .data_labels
@@ -215,7 +226,33 @@ fn series_element(idx: usize, series: &Series, refs: Option<&SeriesRefs>) -> Str
             )
         }
     };
-    format!(r#"<c:ser><c:idx val="{idx}"/><c:order val="{idx}"/>{tx}{sp}{dlbls}{data}</c:ser>"#)
+    format!(
+        r#"<c:ser><c:idx val="{idx}"/><c:order val="{idx}"/>{tx}{sp}{dpts}{dlbls}{data}</c:ser>"#
+    )
+}
+
+/// One `<c:dPt>` per-slice override (P24) in `CT_DPt` child order: idx, then `c:explosion`?, then
+/// `c:spPr`? (a solid fill). A theme dPt color resolves to its office-default sRGB — authored charts
+/// use concrete sRGB, matching [`sppr_element`].
+fn dpt_element(dp: &freecell_chart_model::DataPoint) -> String {
+    let explosion = dp
+        .explosion
+        .map(|e| format!(r#"<c:explosion val="{e}"/>"#))
+        .unwrap_or_default();
+    let sp = dp
+        .color
+        .as_ref()
+        .map(|c| {
+            format!(
+                r#"<c:spPr><a:solidFill><a:srgbClr val="{}"/></a:solidFill></c:spPr>"#,
+                srgb_hex(c)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<c:dPt><c:idx val="{}"/>{explosion}{sp}</c:dPt>"#,
+        dp.index
+    )
 }
 
 /// A `<c:tx>` series-name element — a `strRef` (with cache) when a name ref is given, else a plain
@@ -402,6 +439,15 @@ fn bar_dir(d: BarDir) -> &'static str {
     match d {
         BarDir::Col => "col",
         BarDir::Bar => "bar",
+    }
+}
+
+/// An OOXML boolean `val` string (`"1"`/`"0"`) — the shape `c:varyColors`/toggles emit.
+fn bool_val(b: bool) -> &'static str {
+    if b {
+        "1"
+    } else {
+        "0"
     }
 }
 
@@ -931,6 +977,8 @@ mod tests {
                 title: Some("Share".into()),
                 kind: ChartKind::Pie {
                     doughnut_hole: hole,
+                    first_slice_ang: 0,
+                    vary_colors: true,
                 },
                 series: vec![sales_series()],
                 cat_axis: Axis::default(),
@@ -939,6 +987,45 @@ mod tests {
             };
             assert_roundtrip(chart, &sheet1_refs());
         }
+    }
+
+    /// P24: a doughnut carrying the full pie feature set — a **rotation** (`firstSliceAng`),
+    /// `varyColors` OFF, a `holeSize`, and a `c:dPt` per-slice override (sRGB color + explosion) —
+    /// round-trips serialize→parse, so every P24 field survives the write path.
+    #[test]
+    fn serialize_roundtrips_pie_with_dpt_rotation_and_hole() {
+        use freecell_chart_model::DataPoint;
+        let chart = Chart {
+            title: Some("Segments".into()),
+            kind: ChartKind::Pie {
+                doughnut_hole: Some(0.4),
+                first_slice_ang: 90,
+                vary_colors: false,
+            },
+            series: vec![sales_series().with_data_points(vec![DataPoint {
+                index: 1,
+                color: Some(ChartColor::Rgb(Color::from_hex(0xE15759))),
+                explosion: Some(20),
+            }])],
+            cat_axis: Axis::default(),
+            val_axis: Axis::default(),
+            legend: Some(Legend::default()),
+        };
+        let xml = serialize_chart_xml(&chart, &sheet1_refs());
+        assert!(
+            xml.contains(r#"<c:firstSliceAng val="90"/>"#),
+            "rotation:\n{xml}"
+        );
+        assert!(
+            xml.contains(r#"<c:varyColors val="0"/>"#),
+            "varyColors off:\n{xml}"
+        );
+        assert!(
+            xml.contains(r#"<c:explosion val="20"/>"#),
+            "explosion:\n{xml}"
+        );
+        assert!(xml.contains(r#"<c:dPt>"#), "dPt emitted:\n{xml}");
+        assert_roundtrip(chart, &sheet1_refs());
     }
 
     /// P20: an authored series carrying **data labels** serializes a `c:dLbls` (between `spPr` and
@@ -1247,6 +1334,51 @@ mod tests {
             },
             "the reopened chart is a stacked area"
         );
+    }
+
+    /// P24: an **authored** doughnut (holeSize + rotation) written via the write path reopens through
+    /// `discover_and_parse` as `ChartKind::Pie { doughnut_hole: Some(..) }` with the rotation
+    /// preserved — the pie twin of the authored bar/area reopen, proving the full
+    /// write→(IronCalc load)→discover round-trip keeps the pie kind + hole + firstSliceAng.
+    #[test]
+    fn write_authored_pie_reopens_as_pie_with_hole() {
+        let model = data_model_bytes();
+        let doughnut = Chart {
+            title: Some("Authored Doughnut".into()),
+            kind: ChartKind::Pie {
+                doughnut_hole: Some(0.5),
+                first_slice_ang: 45,
+                vary_colors: true,
+            },
+            series: vec![sales_series()],
+            cat_axis: Axis::default(),
+            val_axis: Axis::default(),
+            legend: Some(Legend::default()),
+        };
+        let (bytes, _) = write_authored_charts(
+            &model,
+            &[authored(doughnut, "xl/charts/chart1.xml", sheet1_refs())],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authored_doughnut.xlsx");
+        std::fs::write(&out, &bytes).unwrap();
+        ironcalc::import::load_from_xlsx(out.to_str().unwrap(), "en", "UTC", "en")
+            .expect("authored doughnut reopens in IronCalc");
+
+        let specs = discover_and_parse(&out).unwrap();
+        assert_eq!(specs.len(), 1);
+        match &specs[0].chart().unwrap().kind {
+            ChartKind::Pie {
+                doughnut_hole: Some(h),
+                first_slice_ang,
+                ..
+            } => {
+                assert!((h - 0.5).abs() < 1e-6, "the doughnut hole round-trips");
+                assert_eq!(*first_slice_ang, 45, "the rotation round-trips");
+            }
+            other => panic!("expected a doughnut, got {other:?}"),
+        }
     }
 
     #[test]

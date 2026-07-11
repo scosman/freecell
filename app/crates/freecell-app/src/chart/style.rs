@@ -8,7 +8,7 @@
 
 use gpui::{rgb, Hsla};
 
-use freecell_chart_model::{ChartColor, Color as ModelColor, ThemePalette};
+use freecell_chart_model::{ChartColor, Color as ModelColor, Series, ThemePalette};
 
 use super::palette::series_color;
 
@@ -75,4 +75,30 @@ pub fn resolve_series_color(color: Option<ChartColor>, index: usize) -> ModelCol
 /// [`resolve_series_color`] as a gpui `Hsla` — the form the plot primitives consume.
 pub fn resolve_series_hsla(color: Option<ChartColor>, index: usize) -> Hsla {
     model_hsla(resolve_series_color(color, index))
+}
+
+/// The resolved fill color for pie/doughnut **slice** `index` (P24). Precedence:
+/// 1. a `c:dPt` per-slice override for this index (resolved against the theme), else
+/// 2. the **varied** palette color for the slice, when `vary_colors` is on (the pie default), else
+/// 3. the single series fill (the `c:varyColors="0"` case — every slice the same color).
+///
+/// The renderer ([`super::pie`]) and the legend ([`super::chrome`]) both call this, so a slice and
+/// its legend swatch match **by construction** — including a dPt override and the `varyColors`-off
+/// case.
+pub fn resolve_slice_color(series: &Series, index: usize, vary_colors: bool) -> ModelColor {
+    if let Some(dp) = series
+        .data_points
+        .iter()
+        .find(|d| d.index as usize == index)
+    {
+        if let Some(color) = dp.color {
+            return color.resolve(&render_theme_palette());
+        }
+    }
+    if vary_colors {
+        series_color(index)
+    } else {
+        // varyColors off: every slice takes the single series fill (or palette slot 0 when unset).
+        resolve_series_color(series.color, 0)
+    }
 }

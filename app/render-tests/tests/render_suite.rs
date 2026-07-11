@@ -263,6 +263,8 @@ render_cases! {
     grid_chart_column,
     // In-grid area chart (P23): the ChartLayer painting a real standard area over cells.
     grid_chart_area,
+    // In-grid pie chart (P24): the ChartLayer painting a real varyColors pie over cells.
+    grid_chart_pie,
     // Manipulate (P18): a selected chart with its selection outline + resize handles.
     grid_chart_selected,
     // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
@@ -343,6 +345,9 @@ chart_render_cases! {
     // P23 — area: standard (overlapping filled polygons), stacked (cumulative bands), 100%-stacked
     // (0–100% normalized), and theme-schemeClr area fills.
     chart_area_standard, chart_area_stacked, chart_area_percent, chart_area_theme_fills,
+    // P24 — pie & doughnut: a varyColors pie (per-slice palette + legend), a doughnut (holeSize
+    // annulus), on-slice percent labels, and a rotated + exploded slice with a c:dPt custom color.
+    chart_pie_vary_colors, chart_doughnut_hole, chart_pie_percent_labels, chart_pie_exploded,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

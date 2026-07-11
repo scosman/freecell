@@ -65,9 +65,13 @@ impl ChartInsertKind {
             },
             ChartInsertKind::Pie => ChartKind::Pie {
                 doughnut_hole: None,
+                first_slice_ang: 0,
+                vary_colors: true,
             },
             ChartInsertKind::Doughnut => ChartKind::Pie {
                 doughnut_hole: Some(DOUGHNUT_HOLE),
+                first_slice_ang: 0,
+                vary_colors: true,
             },
             ChartInsertKind::Scatter => ChartKind::Scatter,
         }
@@ -89,9 +93,11 @@ impl ChartInsertKind {
             ChartKind::Area { .. } => ChartInsertKind::Area,
             ChartKind::Pie {
                 doughnut_hole: None,
+                ..
             } => ChartInsertKind::Pie,
             ChartKind::Pie {
                 doughnut_hole: Some(_),
+                ..
             } => ChartInsertKind::Doughnut,
             ChartKind::Scatter => ChartInsertKind::Scatter,
         })
@@ -187,13 +193,16 @@ mod tests {
         assert_eq!(
             ChartInsertKind::Pie.chart_kind(),
             ChartKind::Pie {
-                doughnut_hole: None
+                doughnut_hole: None,
+                first_slice_ang: 0,
+                vary_colors: true,
             }
         );
         assert!(matches!(
             ChartInsertKind::Doughnut.chart_kind(),
             ChartKind::Pie {
-                doughnut_hole: Some(h)
+                doughnut_hole: Some(h),
+                ..
             } if h > 0.0
         ));
         assert_eq!(ChartInsertKind::Scatter.chart_kind(), ChartKind::Scatter);

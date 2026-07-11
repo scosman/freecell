@@ -261,6 +261,8 @@ render_cases! {
     grid_chart_scrolled_clipped,
     // Manipulate (P18): a selected chart with its selection outline + resize handles.
     grid_chart_selected,
+    // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
+    grid_chart_authored_inserted,
     // Editing feel (Phase 2): live mirror + in-cell editor overlay
     cell_mirror_typing, incell_editor_open,
     // Fonts (Phase 5): family + size + row auto-grow

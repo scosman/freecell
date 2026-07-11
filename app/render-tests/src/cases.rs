@@ -4,8 +4,8 @@
 //! baseline filename, so a red CI line names the exact broken feature.
 
 use freecell_chart_model::{
-    Anchor, AnchorCell, Axis, Category, Chart, ChartColor, ChartId, ChartKind, ChartSpec, Grouping,
-    Legend, Series, SourceXml, ThemeSlot,
+    Anchor, AnchorCell, Axis, Category, Chart, ChartColor, ChartId, ChartInsertKind, ChartKind,
+    ChartSpec, Grouping, Legend, Series, SourceXml, ThemeSlot,
 };
 use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
 
@@ -239,6 +239,17 @@ fn in_grid_chart_spec(title: &str, source_xml: &str) -> ChartSpec {
         Vec::new(),
         chart_anchor(),
     )
+}
+
+/// The **near-empty authored** spec the action-bar insert flow produces (P17): a
+/// [`ChartInsertKind::Line`] `near_empty_chart` — one placeholder series ("Series 1" over
+/// categories 1..4), a generic "Chart" title, untitled axes, and a right legend — placed at the
+/// shared [`chart_anchor`]. Unlike every other in-grid chart case (all `ChartSpec::loaded`), this
+/// is an **authored** spec, so it exercises the authored → in-grid render path AND is the exact
+/// picture the user sees the instant they insert a line chart. Authored ⇒
+/// [`Fidelity::Faithful`](freecell_chart_model::Fidelity), so the real single-series line renders.
+fn in_grid_authored_inserted_spec() -> ChartSpec {
+    ChartSpec::authored(ChartInsertKind::Line.near_empty_chart(), chart_anchor())
 }
 
 /// An **Unsupported** spec: a `surfaceChart` source (no faithful 2-D rendering) so the ChartLayer
@@ -561,6 +572,18 @@ pub fn all() -> Vec<RenderCase> {
                 in_grid_chart_spec("Regional Sales", "<c:lineChart/>").with_id(ChartId(1))
             ])
             .selected_chart(ChartId(1)),
+        // The near-empty AUTHORED chart the insert flow produces (P17/P21): a single placeholder
+        // series titled "Chart" over the backing table — the exact picture shown the instant a line
+        // chart is inserted. The only in-grid chart case built from an **authored** spec (all others
+        // are loaded), so it is the pixel proof of the authored → in-grid render path + the insert
+        // visual (`charts/functional_spec.md §6.A`, `ui_design.md §3.1`). Its own baseline, so no
+        // existing `grid_chart_*` baseline moves.
+        RenderCase::new(
+            "grid_chart_authored_inserted",
+            chart_backing_scene(),
+            CHART_GRID_VP,
+        )
+        .charts(vec![in_grid_authored_inserted_spec()]),
         // ---- Editing feel (Phase 2): live mirror + in-cell editor overlay --------------
         RenderCase::new(
             // The active cell shows the raw text being typed (default style, left-aligned)

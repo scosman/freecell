@@ -111,7 +111,7 @@ genuinely new subsystem, the write path, is isolated to P16.
 
 ## v1 MVP ship gate
 
-- [ ] **P21 — MVP sweep → v1 ships.** Full perceptual-diff + external round-trip suites green for
+- [x] **P21 — MVP sweep → v1 ships.** Full perceptual-diff + external round-trip suites green for
   the **line chart** across display + live + preserve + **authoring/editing** (insert / move /
   resize / delete / chrome edits) + badge/placeholder; many-charts / huge-sheet perf re-measured.
   *Exit:* **v1 SHIPPABLE** — the line chart, fully authorable & editable. Breadth (other types)

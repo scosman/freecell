@@ -2119,6 +2119,75 @@ fn retyped_to_pie_chart_roundtrips() {
     );
 }
 
+/// P25 (edited scatter round-trip): switching a ranged chart's type to **Scatter** round-trips as
+/// `ChartKind::Scatter` with an `Xy` series, keeping the XY `c:f` binding — the edited path proof for
+/// the scatter type (the scatter twin of the Column/Area/Pie retype tests). Scatter is the first XY
+/// type, so this also proves the retype rebuilds the series in the xy shape and binds BOTH x and y.
+#[test]
+fn retyped_to_scatter_chart_roundtrips() {
+    let (client, rx, sheet, id) = spawn_new_with_chart_data();
+    client.send(Command::SetChartRange {
+        sheet,
+        id,
+        data: CellRange::from_a1("A1:B3").unwrap(),
+    });
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0) == vec![10.0, 20.0],
+        "the chart is ranged",
+    );
+    client.send(Command::SetChartType {
+        sheet,
+        id,
+        kind: ChartInsertKind::Scatter,
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .find(|(s, _)| *s == sheet)
+                .and_then(|(_, specs)| specs.first())
+                .is_some_and(|sp| {
+                    matches!(
+                        sp.chart().unwrap().kind,
+                        freecell_chart_model::ChartKind::Scatter { .. }
+                    )
+                })
+        },
+        "the retype republishes a scatter chart",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("retyped_scatter.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 94,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 94, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(specs.len(), 1);
+    let chart = specs[0].chart().unwrap();
+    assert!(
+        matches!(chart.kind, freecell_chart_model::ChartKind::Scatter { .. }),
+        "the reopened chart is a scatter chart"
+    );
+    assert!(
+        matches!(
+            chart.series[0].data,
+            freecell_chart_model::SeriesData::Xy { .. }
+        ),
+        "the reopened scatter series is xy"
+    );
+    let ranges: Vec<&str> = specs[0].source_ranges.iter().map(|r| r.as_str()).collect();
+    assert!(
+        ranges.iter().any(|r| r.ends_with("$B$2:$B$3")),
+        "the y range binding survived the retype: {ranges:?}"
+    );
+}
+
 /// Phase-plan item 4 (three-way honesty): one save carrying a LOADED chart + a BOUND (ranged)
 /// authored chart + an UNBOUND authored chart keeps all three straight — loaded byte-preserved,
 /// bound-authored written with `c:f`, unbound-authored written as literals — and all three reopen.

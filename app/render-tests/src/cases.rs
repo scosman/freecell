@@ -5,7 +5,8 @@
 
 use freecell_chart_model::{
     Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartId,
-    ChartInsertKind, ChartKind, ChartSpec, Color, Grouping, Legend, Series, SourceXml, ThemeSlot,
+    ChartInsertKind, ChartKind, ChartSpec, Color, Grouping, Legend, Marker, MarkerSymbol,
+    ScatterStyle, Series, SourceXml, ThemeSlot,
 };
 use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
 
@@ -372,6 +373,49 @@ fn in_grid_pie_spec(title: &str) -> ChartSpec {
     )
 }
 
+/// A two-series **marker scatter** (P25) over two numeric axes — the picture the ChartLayer paints
+/// for the in-grid scatter case (`grid_chart_scatter`). Each series carries its xy pairs, a distinct
+/// color, and a distinct marker symbol.
+fn in_grid_scatter_chart(title: &str) -> Chart {
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Scatter {
+            style: ScatterStyle::Marker,
+        },
+        series: vec![
+            Series::xy(
+                Some("Group A"),
+                vec![1.0, 2.5, 3.5, 5.0, 6.0],
+                vec![12.0, 24.0, 19.0, 33.0, 41.0],
+            )
+            .with_color(Color::from_hex(0x4472C4))
+            .with_marker(Marker::new(MarkerSymbol::Circle)),
+            Series::xy(
+                Some("Group B"),
+                vec![1.5, 3.0, 4.5, 6.0, 7.0],
+                vec![40.0, 32.0, 51.0, 45.0, 62.0],
+            )
+            .with_color(Color::from_hex(0xED7D31))
+            .with_marker(Marker::new(MarkerSymbol::Diamond)),
+        ],
+        cat_axis: Axis::titled("X"),
+        val_axis: Axis::titled("Y"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** marker-scatter `ChartSpec` at [`chart_anchor`], with a `<c:scatterChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `scatter_element` path (P25), the
+/// scatter analogue of the loaded column/area/pie cases.
+fn in_grid_scatter_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_scatter_chart(title),
+        SourceXml::new("<c:scatterChart><c:scatterStyle val=\"marker\"/></c:scatterChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
 /// An **Unsupported** spec: a `surfaceChart` source (no faithful 2-D rendering) so the ChartLayer
 /// draws the placeholder box; its `chart` carries the title the placeholder shows.
 fn in_grid_unsupported_spec(title: &str) -> ChartSpec {
@@ -668,6 +712,11 @@ pub fn all() -> Vec<RenderCase> {
         // moves.
         RenderCase::new("grid_chart_pie", chart_backing_scene(), CHART_GRID_VP)
             .charts(vec![in_grid_pie_spec("Regional Share")]),
+        // A Faithful marker-SCATTER chart floating over the same backing table (P25) — the in-grid
+        // proof of the ChartLayer → `scatter_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_scatter", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_scatter_spec("Measurements")]),
         // A Degraded chart still renders as a line, plus the corner "⚠ May not display as intended"
         // badge (`ui_design.md §2.2`) — here from a 3-D group (`line3DChart`) rendered as its 2-D
         // line. (A shown `c:dLbls` on a line is Faithful as of P12 — it renders — so the badge case

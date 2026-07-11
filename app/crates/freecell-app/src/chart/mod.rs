@@ -39,6 +39,6 @@ pub fn chart_element(chart: &Chart) -> Option<gpui::AnyElement> {
         ChartKind::Bar { .. } => bar::bar_element(chart),
         ChartKind::Area { .. } => area::area_element(chart),
         ChartKind::Pie { .. } => pie::pie_element(chart),
-        ChartKind::Scatter => scatter::scatter_element(chart),
+        ChartKind::Scatter { .. } => scatter::scatter_element(chart),
     }
 }

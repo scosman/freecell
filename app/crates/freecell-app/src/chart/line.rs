@@ -93,8 +93,9 @@ struct LineSeries {
 }
 
 /// Resolve a series' `a:ln@w` (in points) to a clamped device-px stroke width, falling back to the
-/// Excel-like default weight when the series carries no explicit width (P13).
-fn line_width_px(width_pt: Option<f32>) -> f32 {
+/// Excel-like default weight when the series carries no explicit width (P13). Shared with the scatter
+/// renderer ([`super::scatter`]) for its connecting-line width (P25).
+pub(super) fn line_width_px(width_pt: Option<f32>) -> f32 {
     (width_pt.unwrap_or(DEFAULT_LINE_WIDTH_PT) * PT_TO_PX).clamp(MIN_LINE_PX, MAX_LINE_PX)
 }
 
@@ -216,7 +217,14 @@ impl LinePlot {
 /// that specifies no marker looks exactly as it did before P6. Filled shapes
 /// (circle/square/diamond/triangle/star/dot/auto) are painted as a filled path or quad; the open
 /// shapes (plus/x/dash) as a stroked path in the series color; `none` paints nothing.
-fn paint_marker(window: &mut Window, center: Point<Pixels>, marker: Option<Marker>, color: Hsla) {
+///
+/// Shared with the scatter renderer ([`super::scatter`]), whose dots are the same marker mark (P25).
+pub(super) fn paint_marker(
+    window: &mut Window,
+    center: Point<Pixels>,
+    marker: Option<Marker>,
+    color: Hsla,
+) {
     // A series with no `c:marker` defaults to the round dot (the P5 default), so absence resolves to
     // `Circle`; an explicit `none` paints nothing (handled in the match, no early return).
     let symbol = marker.map(|m| m.symbol).unwrap_or(MarkerSymbol::Circle);

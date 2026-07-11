@@ -182,8 +182,10 @@ fn group_element(chart: &Chart, series_xml: &str) -> String {
             bool_val(*vary_colors),
             (hole * 100.0).round() as i64,
         ),
-        ChartKind::Scatter => format!(
-            r#"<c:scatterChart><c:scatterStyle val="lineMarker"/>{series_xml}<c:axId val="{CAT_AX}"/><c:axId val="{VAL_AX}"/></c:scatterChart>"#
+        ChartKind::Scatter { style } => format!(
+            // CT_ScatterChart child order: scatterStyle, varyColors?, ser*, axId, axId.
+            r#"<c:scatterChart><c:scatterStyle val="{}"/>{series_xml}<c:axId val="{CAT_AX}"/><c:axId val="{VAL_AX}"/></c:scatterChart>"#,
+            style.as_ooxml(),
         ),
     }
 }
@@ -375,7 +377,7 @@ fn str_lit_body(values: &[String]) -> String {
 fn axes_xml(chart: &Chart) -> String {
     match &chart.kind {
         ChartKind::Pie { .. } => String::new(),
-        ChartKind::Scatter => format!(
+        ChartKind::Scatter { .. } => format!(
             "{}{}",
             axis_element("valAx", &chart.cat_axis, CAT_AX, VAL_AX, "b"),
             axis_element("valAx", &chart.val_axis, VAL_AX, CAT_AX, "l"),
@@ -783,7 +785,7 @@ mod tests {
     use crate::chart::save::patch_chart_source;
     use crate::document::WorkbookDocument;
     use freecell_chart_model::{
-        Axis, BarLayout, Category, Chart, ChartKind, Color, Legend, SeriesData,
+        Axis, BarLayout, Category, Chart, ChartKind, Color, Legend, ScatterStyle, SeriesData,
     };
     use freecell_core::CellRef;
 
@@ -1055,11 +1057,12 @@ mod tests {
         assert_roundtrip(chart, &sheet1_refs());
     }
 
-    #[test]
-    fn serialize_roundtrips_scatter() {
-        let chart = Chart {
+    /// A one-series scatter with the given style + `Sheet1` refs — the shared shape for the scatter
+    /// round-trip tests.
+    fn scatter_chart(style: ScatterStyle) -> Chart {
+        Chart {
             title: Some("XY".into()),
-            kind: ChartKind::Scatter,
+            kind: ChartKind::Scatter { style },
             series: vec![
                 Series::xy(Some("Pts"), vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0])
                     .with_color(Color::from_hex(0xED7D31)),
@@ -1067,13 +1070,39 @@ mod tests {
             cat_axis: Axis::titled("X"),
             val_axis: Axis::titled("Y"),
             legend: None,
-        };
-        let refs = vec![SeriesRefs {
+        }
+    }
+
+    fn scatter_refs() -> Vec<SeriesRefs> {
+        vec![SeriesRefs {
             name: Some("Sheet1!$A$1".into()),
             categories: Some("Sheet1!$B$1:$B$3".into()),
             values: Some("Sheet1!$C$1:$C$3".into()),
-        }];
-        assert_roundtrip(chart, &refs);
+        }]
+    }
+
+    #[test]
+    fn serialize_roundtrips_scatter() {
+        assert_roundtrip(scatter_chart(ScatterStyle::LineMarker), &scatter_refs());
+    }
+
+    #[test]
+    fn serialize_roundtrips_scatter_styles() {
+        // The c:scatterStyle is emitted from the model and survives serialize→parse for every style.
+        for style in [
+            ScatterStyle::Marker,
+            ScatterStyle::Line,
+            ScatterStyle::LineMarker,
+            ScatterStyle::Smooth,
+            ScatterStyle::SmoothMarker,
+        ] {
+            let xml = serialize_chart_xml(&scatter_chart(style), &scatter_refs());
+            assert!(
+                xml.contains(&format!("<c:scatterStyle val=\"{}\"/>", style.as_ooxml())),
+                "scatterStyle {style:?} emitted from the model:\n{xml}"
+            );
+            assert_roundtrip(scatter_chart(style), &scatter_refs());
+        }
     }
 
     #[test]
@@ -1379,6 +1408,54 @@ mod tests {
             }
             other => panic!("expected a doughnut, got {other:?}"),
         }
+    }
+
+    /// P25: an **authored** scatter (marker style) written via the write path reopens through
+    /// `discover_and_parse` as `ChartKind::Scatter { style: Marker }` with an `Xy` series — the scatter
+    /// twin of the authored bar/area/pie reopen, proving the full write→(IronCalc load)→discover
+    /// round-trip keeps the scatter kind + style + the XY data shape.
+    #[test]
+    fn write_authored_scatter_reopens_as_scatter_with_style() {
+        let model = data_model_bytes();
+        let scatter = Chart {
+            title: Some("Authored Scatter".into()),
+            kind: ChartKind::Scatter {
+                style: ScatterStyle::Marker,
+            },
+            // An xy series: x from the A column (cats ref → xVal), y from the B column (values ref → yVal).
+            series: vec![
+                Series::xy(Some("Pts"), vec![1.0, 2.0, 3.0, 4.0], VALUES.to_vec())
+                    .with_color(Color::from_hex(0x4472C4)),
+            ],
+            cat_axis: Axis::titled("X"),
+            val_axis: Axis::titled("Y"),
+            legend: Some(Legend::default()),
+        };
+        let (bytes, _) = write_authored_charts(
+            &model,
+            &[authored(scatter, "xl/charts/chart1.xml", sheet1_refs())],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authored_scatter.xlsx");
+        std::fs::write(&out, &bytes).unwrap();
+        ironcalc::import::load_from_xlsx(out.to_str().unwrap(), "en", "UTC", "en")
+            .expect("authored scatter reopens in IronCalc");
+
+        let specs = discover_and_parse(&out).unwrap();
+        assert_eq!(specs.len(), 1);
+        let chart = specs[0].chart().unwrap();
+        assert_eq!(
+            chart.kind,
+            ChartKind::Scatter {
+                style: ScatterStyle::Marker
+            },
+            "the reopened chart is a marker scatter"
+        );
+        assert!(
+            matches!(chart.series[0].data, SeriesData::Xy { .. }),
+            "the reopened scatter series is xy"
+        );
     }
 
     #[test]

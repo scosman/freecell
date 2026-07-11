@@ -1228,7 +1228,7 @@ fn collect_chrome_edits(
 
     // --- Axis titles -------------------------------------------------------------------------
     if let Some(plot_area) = child(chart_node, "plotArea") {
-        let is_scatter = matches!(chart.kind, ChartKind::Scatter);
+        let is_scatter = matches!(chart.kind, ChartKind::Scatter { .. });
         let axis_nodes = axis_nodes(&plot_area, is_scatter);
         if chart.cat_axis.title != cached.cat_axis.title {
             if let Some(ax) = axis_nodes.0 {

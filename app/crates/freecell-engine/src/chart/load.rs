@@ -14,7 +14,8 @@ use roxmltree::{Document, Node};
 use freecell_chart_model::{
     normalize_3d_chart_group, Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, CfRange,
     Chart, ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, DataPoint,
-    Grouping, Legend, LegendPosition, LineStroke, Series, SourcePart, SourceXml, ThemeSlot,
+    Grouping, Legend, LegendPosition, LineStroke, ScatterStyle, Series, SourcePart, SourceXml,
+    ThemeSlot,
 };
 
 use super::xlsx::{self, attr};
@@ -609,7 +610,7 @@ pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
     let group_name = group.tag_name().name();
     let kind_name = normalize_3d_chart_group(group_name).unwrap_or(group_name);
     let kind = parse_kind(&group, kind_name)?;
-    let is_scatter = matches!(kind, ChartKind::Scatter);
+    let is_scatter = matches!(kind, ChartKind::Scatter { .. });
 
     // The chart-group-level `c:dLbls` (a direct child of the group, after the series) is the
     // default for every series that has no `c:dLbls` of its own (OOXML: a series `c:dLbls`
@@ -674,7 +675,9 @@ fn parse_kind(group: &Node, kind_name: &str) -> Result<ChartKind> {
                 vary_colors: vary_colors(group),
             }
         }
-        "scatterChart" => ChartKind::Scatter,
+        "scatterChart" => ChartKind::Scatter {
+            style: scatter_style(group),
+        },
         other => return Err(anyhow!("unhandled chart-group element <c:{other}>")),
     })
 }
@@ -715,6 +718,20 @@ fn vary_colors(group: &Node) -> bool {
         child_val(group, "varyColors").as_deref(),
         Some("0") | Some("false")
     )
+}
+
+/// `c:scatterStyle@val` — a scatter's plotting style ([`ScatterStyle`], P25): marker / line /
+/// lineMarker / smooth / smoothMarker. An **absent** (or unrecognized) element reads `LineMarker` —
+/// the value Excel ubiquitously writes and our writer / insert templates use (so a scatter with the
+/// element stripped still renders as a normal scatter). Legacy `none` also maps to `LineMarker`.
+fn scatter_style(group: &Node) -> ScatterStyle {
+    match child_val(group, "scatterStyle").as_deref() {
+        Some("marker") => ScatterStyle::Marker,
+        Some("line") => ScatterStyle::Line,
+        Some("smooth") => ScatterStyle::Smooth,
+        Some("smoothMarker") => ScatterStyle::SmoothMarker,
+        _ => ScatterStyle::LineMarker,
+    }
 }
 
 /// Maps a group's `c:grouping@val` to [`Grouping`], falling back to `default` when absent.
@@ -1315,7 +1332,12 @@ mod tests {
    <c:valAx><c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue</a:t></a:r></a:p></c:rich></c:tx></c:title></c:valAx>
  </c:plotArea></c:chart></c:chartSpace>"#;
         let chart = parse_chart_xml(xml).unwrap();
-        assert_eq!(chart.kind, ChartKind::Scatter);
+        assert_eq!(
+            chart.kind,
+            ChartKind::Scatter {
+                style: ScatterStyle::LineMarker
+            }
+        );
         // X-axis title in cat_axis, Y-axis title in val_axis (scatter renderer convention).
         assert_eq!(chart.cat_axis.title.as_deref(), Some("Ad spend"));
         assert_eq!(chart.val_axis.title.as_deref(), Some("Revenue"));
@@ -1326,6 +1348,38 @@ mod tests {
             }
             other => panic!("expected Xy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_scatter_style() {
+        // Each explicit c:scatterStyle parses into its ScatterStyle; an absent element → LineMarker.
+        let scatter = |style_el: &str| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:scatterChart>{style_el}<c:ser><c:xVal><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:xVal><c:yVal><c:numRef><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:yVal></c:ser></c:scatterChart></c:plotArea></c:chart></c:chartSpace>"#
+            );
+            match parse_chart_xml(&xml).unwrap().kind {
+                ChartKind::Scatter { style } => style,
+                other => panic!("expected scatter, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            scatter("<c:scatterStyle val=\"marker\"/>"),
+            ScatterStyle::Marker
+        );
+        assert_eq!(
+            scatter("<c:scatterStyle val=\"line\"/>"),
+            ScatterStyle::Line
+        );
+        assert_eq!(
+            scatter("<c:scatterStyle val=\"smooth\"/>"),
+            ScatterStyle::Smooth
+        );
+        assert_eq!(
+            scatter("<c:scatterStyle val=\"smoothMarker\"/>"),
+            ScatterStyle::SmoothMarker
+        );
+        // Absent scatterStyle → LineMarker (Excel's ubiquitous default).
+        assert_eq!(scatter(""), ScatterStyle::LineMarker);
     }
 
     #[test]

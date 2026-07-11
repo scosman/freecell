@@ -59,7 +59,12 @@ pub(crate) fn legend_entries(chart: &Chart) -> Vec<LegendEntry> {
             }
         }
     }
-    let is_line = matches!(chart.kind, ChartKind::Line { .. });
+    // Line and scatter marks follow the `a:ln` stroke color (what those renderers draw) when present;
+    // every other kind's mark is the fill/theme/palette color.
+    let follows_stroke = matches!(
+        chart.kind,
+        ChartKind::Line { .. } | ChartKind::Scatter { .. }
+    );
     chart
         .series
         .iter()
@@ -67,9 +72,9 @@ pub(crate) fn legend_entries(chart: &Chart) -> Vec<LegendEntry> {
         .map(|(i, s)| LegendEntry {
             // Resolve the series' explicit sRGB / theme color (or the palette cycle) to the same
             // color its mark uses, so swatch↔mark match by construction (P6 theme colors included).
-            // For a **line** chart the mark is the line, so the swatch follows the `a:ln` stroke
-            // color when the series carries one (P13) — the same precedence the line renderer uses.
-            color: resolve_series_color(line_mark_color(s, is_line), i).to_hex(),
+            // For a **line**/**scatter** chart the mark follows the `a:ln` stroke color when the
+            // series carries one (P13/P25) — the same precedence those renderers use.
+            color: resolve_series_color(mark_color(s, follows_stroke), i).to_hex(),
             name: s
                 .name
                 .clone()
@@ -78,14 +83,15 @@ pub(crate) fn legend_entries(chart: &Chart) -> Vec<LegendEntry> {
         .collect()
 }
 
-/// The color reference a series' legend swatch should use: for a line chart, the `a:ln` stroke color
-/// if present (matching what the line renderer draws), else the series fill/theme color; for other
-/// kinds, the series fill/theme color. Falls through to `None` so the caller applies the palette cycle.
-fn line_mark_color(
+/// The color reference a series' legend swatch should use: for a stroke-following kind (line/scatter),
+/// the `a:ln` stroke color if present (matching what those renderers draw), else the series fill/theme
+/// color; for other kinds, the series fill/theme color. Falls through to `None` so the caller applies
+/// the palette cycle.
+fn mark_color(
     series: &freecell_chart_model::Series,
-    is_line: bool,
+    follows_stroke: bool,
 ) -> Option<freecell_chart_model::ChartColor> {
-    if is_line {
+    if follows_stroke {
         series.stroke.and_then(|st| st.color).or(series.color)
     } else {
         series.color
@@ -416,6 +422,39 @@ mod tests {
         );
         // A series with no stroke still uses its fill/palette color.
         assert_eq!(entries[1].color, series_color(1).to_hex());
+    }
+
+    #[test]
+    fn scatter_legend_follows_series_and_stroke_color() {
+        use freecell_chart_model::{LineStroke, ScatterStyle};
+        // A two-series scatter: one styled by fill color, one only by an `a:ln` stroke color. The
+        // legend swatch matches the dot color in both — the fill for the first, the stroke for the
+        // second (scatter marks follow the stroke color like line, P25).
+        let chart = Chart {
+            title: None,
+            kind: ChartKind::Scatter {
+                style: ScatterStyle::Marker,
+            },
+            series: vec![
+                Series::xy(Some("A"), vec![1.0, 2.0], vec![3.0, 4.0])
+                    .with_color(Color::from_hex(0x123456)),
+                Series::xy(Some("B"), vec![1.0, 2.0], vec![5.0, 6.0])
+                    .with_stroke(LineStroke::new().with_color(Color::from_hex(0xBE4B48))),
+            ],
+            cat_axis: Axis::titled("X"),
+            val_axis: Axis::titled("Y"),
+            legend: Some(Legend::default()),
+        };
+        let entries = legend_entries(&chart);
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
+        assert_eq!(entries[0].color, 0x123456, "swatch follows the fill color");
+        assert_eq!(
+            entries[1].color, 0xBE4B48,
+            "swatch follows the a:ln stroke color"
+        );
     }
 
     #[test]

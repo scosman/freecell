@@ -41,12 +41,15 @@
 //!
 //! **Auto-dropped / scoped as support arrives.** `smooth` (curved lines) **renders faithfully as
 //! of P6** (on `lineChart`, the only group that draws it), so it left this set. `c:marker` symbols
-//! and `c:dLbls` data labels are now **scoped to the renderer that honors them**: P6's line
-//! renderer paints every marker symbol and P12's draws data labels (value / percent / names /
-//! legend key), so a marker **or** a shown label on a `lineChart` is Faithful — but the
-//! scatter/point/bar/area/pie renderers still ignore them (their support is a later phase), so a
-//! non-`circle`/non-`none` marker or a shown label on a **non-line** group still degrades (a wrong
-//! chart must keep its badge). A **per-point** `c:dLbl` override degrades on any group (we draw
+//! and `c:dLbls` data labels are now **scoped to the renderer that honors them**: P6's line renderer
+//! and **P25's scatter renderer** paint every marker symbol (they share `paint_marker`), and P12's
+//! line draws data labels (value / percent / names / legend key), so a marker on a `lineChart` **or**
+//! `scatterChart` — and a shown label on a `lineChart` — is Faithful; but the bar/area/pie renderers
+//! still ignore markers (and bar/area/scatter still ignore labels), so a non-`circle`/non-`none`
+//! marker on **those** groups, or a shown label on a non-line group, still degrades (a wrong chart
+//! must keep its badge). A **smoothed** scatter (`c:scatterStyle val="smooth"`/`"smoothMarker"`)
+//! renders as **straight** segments → Degraded ([`unsupported_scatter_smooth`], P25), the honest
+//! badge for the straight-segment fallback. A **per-point** `c:dLbl` override degrades on any group (we draw
 //! uniform series labels, not per-point ones). `c:numFmt` is now **scoped to codes we approximate**:
 //! P6/P12 apply a **bounded** subset to ticks + labels, so a code we render exactly (`General`,
 //! percent, thousands, decimals, currency) is Faithful and only a code we fall back on (dates /
@@ -204,6 +207,21 @@ fn has_render_affecting_unsupported_feature(xml: &str) -> bool {
         || unsupported_data_labels(xml)
         || unsupported_data_point(xml)
         || unsupported_marker(xml)
+        || unsupported_scatter_smooth(xml)
+}
+
+/// A **smoothed** scatter the renderer draws straight (P25). The scatter renderer approximates
+/// `c:scatterStyle val="smooth"`/`"smoothMarker"` with **straight** connecting segments, so a smoothed
+/// scatter renders as its straight twin → Degraded (an honest badge, not a silent curve-to-straight).
+/// The `marker`/`line`/`lineMarker` styles render exactly → Faithful.
+fn unsupported_scatter_smooth(xml: &str) -> bool {
+    is_scatter_chart(xml)
+        && any_opening_tag(xml, "scatterStyle", |attrs| {
+            matches!(
+                attr_value(attrs, "val"),
+                Some("smooth") | Some("smoothMarker")
+            )
+        })
 }
 
 /// A `c:dPt` per-slice / per-point override the renderer does not honor (P24). The pie/doughnut
@@ -359,21 +377,21 @@ fn data_labels_shown(xml: &str) -> bool {
         .any(|toggle| any_opening_tag(xml, toggle, val_is_true))
 }
 
-/// A `c:marker` with a `c:symbol` shape only the **line** renderer draws. P6's line renderer paints
-/// every OOXML marker symbol, so a marker on a `lineChart` is Faithful; but the scatter/point
-/// renderers still draw a fixed `circle` and ignore `c:marker` (their marker support is a later
-/// phase), so a non-line chart-group carrying a non-`circle`/non-`none` symbol still renders wrong →
-/// Degraded. `circle`/`none` are exactly what the fixed renderer draws (or nothing), so they are
-/// Faithful anywhere. (A `line3DChart` is *not* a `lineChart` — it degrades as a 3-D group first,
-/// which takes precedence in [`source_fidelity`], so the scoping here only ever sees the 2-D line.)
+/// A `c:marker` with a `c:symbol` shape the renderer does not draw. P6's line renderer and P25's
+/// scatter renderer paint **every** OOXML marker symbol (they share `paint_marker`), so a marker on a
+/// `lineChart` **or** a `scatterChart` is Faithful; but any other chart-group (bar/area/pie) still
+/// ignores `c:marker`, so a non-`circle`/non-`none` symbol on those still renders wrong → Degraded.
+/// `circle`/`none` are exactly what the fixed renderers draw (or nothing), so they are Faithful
+/// anywhere. (A `line3DChart` is *not* a `lineChart` — it degrades as a 3-D group first, which takes
+/// precedence in [`source_fidelity`], so the scoping here only ever sees the 2-D line.)
 ///
 /// **Caveat (combo parts):** this classifier is textual, not a DOM, so it can't bind a `<c:marker>`
-/// to its *enclosing* chart-group. In a **combo** part that holds both a `<c:lineChart>` and another
-/// group (e.g. `<c:scatterChart>`), [`is_line_chart`] is true, so a non-circle marker on the
-/// *non-line* series is currently classified Faithful (its advisory badge is dropped) — revisit when
-/// P7 lands real multi-group parsing that can associate a marker with its group.
+/// to its *enclosing* chart-group. In a **combo** part that holds a marker-honoring group
+/// (`<c:lineChart>`/`<c:scatterChart>`) plus another, a non-circle marker on the *other* group is
+/// currently classified Faithful (its advisory badge is dropped) — revisit when real multi-group
+/// parsing can associate a marker with its group.
 fn unsupported_marker(xml: &str) -> bool {
-    if is_line_chart(xml) {
+    if is_line_chart(xml) || is_scatter_chart(xml) {
         return false;
     }
     any_opening_tag(
@@ -401,6 +419,15 @@ fn is_line_chart(xml: &str) -> bool {
 /// Unsupported group, detected earlier).
 fn is_pie_chart(xml: &str) -> bool {
     contains_element(xml, "pieChart") || contains_element(xml, "doughnutChart")
+}
+
+/// Whether the source contains a 2-D `c:scatterChart` group — the group whose renderer honors the
+/// full `c:marker` symbol set (P25, sharing the line renderer's `paint_marker`) and the
+/// `c:scatterStyle` marker/line combination. Boundary-aware. Same textual-classifier caveat as
+/// [`unsupported_marker`] (a combo part with a scatter plus another group returns true for the whole
+/// part).
+fn is_scatter_chart(xml: &str) -> bool {
+    contains_element(xml, "scatterChart")
 }
 
 /// A truthy OOXML boolean `val` attribute (`1` or `true`).
@@ -934,37 +961,64 @@ mod tests {
     }
 
     #[test]
-    fn markers_are_scoped_to_the_line_renderer() {
-        // The marker fidelity is SCOPED: only the line renderer paints the full symbol set. The
-        // scatter/point renderers still draw a fixed circle and ignore `c:marker`, so a non-circle
-        // marker on a non-line group must STILL degrade (no false-Faithful — the wrong chart keeps
-        // its badge), while the same marker on a line chart is Faithful.
+    fn markers_are_scoped_to_the_line_and_scatter_renderers() {
+        // The marker fidelity is SCOPED: the line AND scatter renderers paint the full symbol set
+        // (P6/P25, sharing `paint_marker`), so a non-circle marker on either is Faithful. The
+        // bar/area/pie renderers still ignore `c:marker`, so a non-circle marker on those STILL
+        // degrades (no false-Faithful — the wrong chart keeps its badge).
         let diamond = "<c:ser><c:marker><c:symbol val=\"diamond\"/></c:marker></c:ser>";
 
-        assert_eq!(
-            source_fidelity(&format!("<c:lineChart>{diamond}</c:lineChart>")),
-            Fidelity::Faithful,
-            "line chart renders the diamond marker → Faithful"
-        );
-        assert_eq!(
-            source_fidelity(&format!("<c:scatterChart>{diamond}</c:scatterChart>")),
-            Fidelity::Degraded,
-            "scatter ignores the marker (draws a circle) → Degraded"
-        );
-        assert_eq!(
-            source_fidelity(&format!("<c:barChart>{diamond}</c:barChart>")),
-            Fidelity::Degraded,
-            "a non-line group with a non-circle marker → Degraded"
-        );
+        for group in ["lineChart", "scatterChart"] {
+            assert_eq!(
+                source_fidelity(&format!("<c:{group}>{diamond}</c:{group}>")),
+                Fidelity::Faithful,
+                "{group} renders the diamond marker → Faithful"
+            );
+        }
+        for group in ["barChart", "areaChart", "pieChart"] {
+            assert_eq!(
+                source_fidelity(&format!("<c:{group}>{diamond}</c:{group}>")),
+                Fidelity::Degraded,
+                "{group} ignores the marker (draws its default) → Degraded"
+            );
+        }
 
         // circle / none are what the fixed renderer draws (or nothing) → Faithful anywhere.
         for symbol in ["circle", "none"] {
             let marker =
                 format!("<c:ser><c:marker><c:symbol val=\"{symbol}\"/></c:marker></c:ser>");
             assert_eq!(
-                source_fidelity(&format!("<c:scatterChart>{marker}</c:scatterChart>")),
+                source_fidelity(&format!("<c:barChart>{marker}</c:barChart>")),
                 Fidelity::Faithful,
-                "scatter + {symbol} marker → Faithful"
+                "bar + {symbol} marker → Faithful"
+            );
+        }
+    }
+
+    #[test]
+    fn p25_scatter_markers_faithful_but_smooth_degrades() {
+        // The P25 scatter renderer draws every c:marker symbol and the marker/line/lineMarker styles
+        // exactly → Faithful (with any marker).
+        for faithful in [
+            "<c:scatterChart><c:scatterStyle val=\"marker\"/><c:ser><c:marker><c:symbol val=\"diamond\"/></c:marker></c:ser></c:scatterChart>",
+            "<c:scatterChart><c:scatterStyle val=\"lineMarker\"/><c:ser><c:marker><c:symbol val=\"square\"/></c:marker></c:ser></c:scatterChart>",
+            "<c:scatterChart><c:scatterStyle val=\"line\"/></c:scatterChart>",
+        ] {
+            assert_eq!(
+                source_fidelity(faithful),
+                Fidelity::Faithful,
+                "expected Faithful for {faithful}"
+            );
+        }
+        // But a SMOOTH scatter is drawn straight → Degraded (honest badge for the fallback).
+        for degraded in [
+            "<c:scatterChart><c:scatterStyle val=\"smooth\"/></c:scatterChart>",
+            "<c:scatterChart><c:scatterStyle val=\"smoothMarker\"/><c:ser><c:marker><c:symbol val=\"circle\"/></c:marker></c:ser></c:scatterChart>",
+        ] {
+            assert_eq!(
+                source_fidelity(degraded),
+                Fidelity::Degraded,
+                "expected Degraded for {degraded}"
             );
         }
     }

@@ -14,7 +14,8 @@
 
 use freecell_chart_model::{
     Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartKind, Color, DataLabels, DataPoint,
-    Grouping, Legend, LegendPosition, LineStroke, Marker, MarkerSymbol, Series, ThemeSlot,
+    Grouping, Legend, LegendPosition, LineStroke, Marker, MarkerSymbol, ScatterStyle, Series,
+    ThemeSlot,
 };
 
 /// One capturable chart fixture: a chart, and the (tight) capture viewport in device px. `name`
@@ -73,6 +74,10 @@ pub fn all() -> Vec<ChartScene> {
         chart_doughnut_hole(),
         chart_pie_percent_labels(),
         chart_pie_exploded(),
+        // P25 — scatter (XY).
+        chart_scatter_markers(),
+        chart_scatter_line_markers(),
+        chart_scatter_wide_x(),
     ]
 }
 
@@ -1064,9 +1069,104 @@ fn chart_pie_exploded() -> ChartScene {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// P25 — scatter (XY) scenes
+// -------------------------------------------------------------------------------------------------
+
+/// Two measurement series of xy points — the shared data for the scatter marker/line scenes. Each
+/// series' x-values increase so the `lineMarker` connecting segments thread left→right.
+fn scatter_series() -> Vec<Series> {
+    vec![
+        Series::xy(
+            Some("Group A"),
+            vec![1.0, 2.5, 3.5, 5.0, 6.5, 8.0],
+            vec![12.0, 24.0, 19.0, 33.0, 28.0, 41.0],
+        )
+        .with_color(Color::from_hex(0x4472C4))
+        .with_marker(Marker::new(MarkerSymbol::Circle)),
+        Series::xy(
+            Some("Group B"),
+            vec![1.5, 3.0, 4.5, 6.0, 7.0, 9.0],
+            vec![40.0, 32.0, 51.0, 45.0, 62.0, 58.0],
+        )
+        .with_color(Color::from_hex(0xED7D31))
+        .with_marker(Marker::new(MarkerSymbol::Diamond)),
+    ]
+}
+
+/// The bread-and-butter **marker-only** scatter (`ScatterStyle::Marker`): two series of standalone
+/// dots over **two numeric axes**, distinct series colors + distinct marker symbols, title / both
+/// axis titles / right legend. Proves the two independent nice-tick numeric scales + the dot cloud.
+fn chart_scatter_markers() -> ChartScene {
+    let chart = Chart {
+        title: Some("Sample Measurements".into()),
+        kind: ChartKind::Scatter {
+            style: ScatterStyle::Marker,
+        },
+        series: scatter_series(),
+        cat_axis: Axis::titled("X value"),
+        val_axis: Axis::titled("Y value"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_scatter_markers",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// The same data as **`ScatterStyle::LineMarker`**: straight connecting segments thread the dots (in
+/// data order), on top of the same two numeric axes. Proves the connecting-line path, distinct from
+/// the marker-only scene.
+fn chart_scatter_line_markers() -> ChartScene {
+    let chart = Chart {
+        title: Some("Trend by Sample".into()),
+        kind: ChartKind::Scatter {
+            style: ScatterStyle::LineMarker,
+        },
+        series: scatter_series(),
+        cat_axis: Axis::titled("Sample"),
+        val_axis: Axis::titled("Reading"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_scatter_line_markers",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A single-series scatter whose **X is not 1..n** but spans ~120..880 — proving the numeric X
+/// nice-tick scale over a non-trivial domain (the XY-defining property: X is a real value axis with
+/// its own ticks, not category positions).
+fn chart_scatter_wide_x() -> ChartScene {
+    let chart = Chart {
+        title: Some("Response vs Dose".into()),
+        kind: ChartKind::Scatter {
+            style: ScatterStyle::Marker,
+        },
+        series: vec![Series::xy(
+            Some("Assay"),
+            vec![120.0, 250.0, 340.0, 480.0, 610.0, 720.0, 880.0],
+            vec![8.0, 15.0, 22.0, 19.0, 31.0, 28.0, 44.0],
+        )
+        .with_color(Color::from_hex(0x4472C4))
+        .with_marker(Marker::new(MarkerSymbol::Circle))],
+        cat_axis: Axis::titled("Dose (mg)"),
+        val_axis: Axis::titled("Response"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_scatter_wide_x",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freecell_chart_model::SeriesData;
 
     #[test]
     fn every_scene_is_lookupable_and_nonempty() {
@@ -1413,5 +1513,36 @@ mod tests {
         assert_eq!(dpts.len(), 1, "one dPt override");
         assert_eq!(dpts[0].index, 0);
         assert!(dpts[0].color.is_some() && dpts[0].explosion.is_some());
+    }
+
+    #[test]
+    fn p25_scenes_carry_their_scatter_style() {
+        // Every new scatter scene is a `ChartKind::Scatter` of the intended style over xy series.
+        for (name, style) in [
+            ("chart_scatter_markers", ScatterStyle::Marker),
+            ("chart_scatter_line_markers", ScatterStyle::LineMarker),
+            ("chart_scatter_wide_x", ScatterStyle::Marker),
+        ] {
+            let s = get(name).unwrap_or_else(|| panic!("{name} scene"));
+            assert_eq!(s.chart.kind, ChartKind::Scatter { style }, "{name}");
+            assert!(
+                s.chart
+                    .series
+                    .iter()
+                    .all(|ser| matches!(ser.data, SeriesData::Xy { .. })),
+                "{name} must be xy series"
+            );
+        }
+
+        // The wide-X scene's x-values reach well beyond a 1..n category range (the XY property).
+        let wide = get("chart_scatter_wide_x").unwrap();
+        let max_x = match &wide.chart.series[0].data {
+            SeriesData::Xy { x, .. } => x.iter().copied().fold(f64::MIN, f64::max),
+            other => panic!("expected xy, got {other:?}"),
+        };
+        assert!(
+            max_x > 100.0,
+            "wide-X scene must span a non-trivial numeric X domain, got max {max_x}"
+        );
     }
 }

@@ -265,6 +265,8 @@ render_cases! {
     grid_chart_area,
     // In-grid pie chart (P24): the ChartLayer painting a real varyColors pie over cells.
     grid_chart_pie,
+    // In-grid scatter chart (P25): the ChartLayer painting a real marker scatter over cells.
+    grid_chart_scatter,
     // Manipulate (P18): a selected chart with its selection outline + resize handles.
     grid_chart_selected,
     // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
@@ -348,6 +350,9 @@ chart_render_cases! {
     // P24 — pie & doughnut: a varyColors pie (per-slice palette + legend), a doughnut (holeSize
     // annulus), on-slice percent labels, and a rotated + exploded slice with a c:dPt custom color.
     chart_pie_vary_colors, chart_doughnut_hole, chart_pie_percent_labels, chart_pie_exploded,
+    // P25 — scatter (XY): a marker-only two-series scatter over two numeric axes, a lineMarker scatter
+    // (dots + connecting straight segments), and a scatter with a non-trivial numeric X axis (X not 1..n).
+    chart_scatter_markers, chart_scatter_line_markers, chart_scatter_wide_x,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

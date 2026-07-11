@@ -141,6 +141,59 @@ impl BarLayout {
     }
 }
 
+/// A scatter (XY) chart's plotting style — `c:scatterStyle` (`ST_ScatterStyle`, P25). Governs
+/// whether each series draws **connecting line segments**, **point markers**, or **both**, and
+/// whether those segments are smoothed.
+///
+/// `Smooth`/`SmoothMarker` request a smoothed line; the renderer draws **straight** segments (an
+/// honest fidelity fallback — the chart is badged [`Degraded`](crate::Fidelity::Degraded)), so a
+/// smoothed scatter renders as its `Line`/`LineMarker` twin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScatterStyle {
+    /// `marker` — standalone point markers, no connecting line.
+    Marker,
+    /// `line` — straight connecting segments, no markers.
+    Line,
+    /// `lineMarker` — straight connecting segments **and** markers (Excel's insert default).
+    LineMarker,
+    /// `smooth` — smoothed connecting segments, no markers (drawn straight — Degraded).
+    Smooth,
+    /// `smoothMarker` — smoothed segments **and** markers (drawn straight — Degraded).
+    SmoothMarker,
+}
+
+impl ScatterStyle {
+    /// Whether this style draws connecting line segments between consecutive points.
+    pub fn draws_line(self) -> bool {
+        matches!(
+            self,
+            Self::Line | Self::LineMarker | Self::Smooth | Self::SmoothMarker
+        )
+    }
+
+    /// Whether this style draws point markers.
+    pub fn draws_markers(self) -> bool {
+        matches!(self, Self::Marker | Self::LineMarker | Self::SmoothMarker)
+    }
+
+    /// Whether the style requests smoothed segments (which the renderer approximates with straight
+    /// segments — see the type docs).
+    pub fn is_smooth(self) -> bool {
+        matches!(self, Self::Smooth | Self::SmoothMarker)
+    }
+
+    /// The OOXML `c:scatterStyle@val` string for this style.
+    pub fn as_ooxml(self) -> &'static str {
+        match self {
+            Self::Marker => "marker",
+            Self::Line => "line",
+            Self::LineMarker => "lineMarker",
+            Self::Smooth => "smooth",
+            Self::SmoothMarker => "smoothMarker",
+        }
+    }
+}
+
 /// The chart type + its type-specific options. Mirrors the `c:<type>Chart` element
 /// (functional_spec §2). Only the in-scope PoC types are represented.
 #[derive(Clone, Debug, PartialEq)]
@@ -170,8 +223,10 @@ pub enum ChartKind {
         /// override ([`Series::data_points`]) wins over either.
         vary_colors: bool,
     },
-    /// `c:scatterChart` — uses [`SeriesData::Xy`] series.
-    Scatter,
+    /// `c:scatterChart` — the first **XY** type (P25): each series carries [`SeriesData::Xy`] pairs
+    /// over **two numeric axes** (both value axes with nice-tick scaling), not a category axis.
+    /// `style` is the `c:scatterStyle` plotting style (marker / line / lineMarker / smooth, P25).
+    Scatter { style: ScatterStyle },
 }
 
 /// A single category-axis label from `c:cat` — a cached string (`c:strCache`) or a
@@ -560,6 +615,32 @@ mod tests {
         // A half-open bound leaves the other end auto.
         let half = Axis::untitled().with_bounds(None, Some(50.0));
         assert_eq!((half.min, half.max), (None, Some(50.0)));
+    }
+
+    #[test]
+    fn scatter_style_predicates_and_ooxml_round_trip() {
+        use ScatterStyle::*;
+        // draws_line: everything but Marker.
+        assert!(!Marker.draws_line());
+        for s in [Line, LineMarker, Smooth, SmoothMarker] {
+            assert!(s.draws_line(), "{s:?} draws a line");
+        }
+        // draws_markers: the *Marker variants.
+        for s in [Marker, LineMarker, SmoothMarker] {
+            assert!(s.draws_markers(), "{s:?} draws markers");
+        }
+        for s in [Line, Smooth] {
+            assert!(!s.draws_markers(), "{s:?} draws no markers");
+        }
+        // is_smooth: the Smooth* variants.
+        assert!(Smooth.is_smooth() && SmoothMarker.is_smooth());
+        assert!(!Marker.is_smooth() && !Line.is_smooth() && !LineMarker.is_smooth());
+        // as_ooxml matches the ST_ScatterStyle tokens.
+        assert_eq!(Marker.as_ooxml(), "marker");
+        assert_eq!(Line.as_ooxml(), "line");
+        assert_eq!(LineMarker.as_ooxml(), "lineMarker");
+        assert_eq!(Smooth.as_ooxml(), "smooth");
+        assert_eq!(SmoothMarker.as_ooxml(), "smoothMarker");
     }
 
     #[test]

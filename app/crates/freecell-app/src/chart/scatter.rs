@@ -32,7 +32,9 @@ use gpui_component::plot::{
     AxisLabelSide, AxisText, Grid, IntoPlot, Plot, PlotAxis, StrokeStyle, AXIS_GAP,
 };
 
-use freecell_chart_model::{Chart, ChartKind, Marker, ScatterStyle, SeriesData};
+use freecell_chart_model::{
+    cap_markers_for_paint, Chart, ChartKind, Marker, ScatterStyle, SeriesData, MAX_PAINT_MARKERS,
+};
 
 use super::chrome::chart_frame;
 use super::line::{line_width_px, paint_marker};
@@ -84,7 +86,7 @@ impl ScatterPlot {
 
         let mut series = Vec::new();
         for (i, s) in chart.series.iter().enumerate() {
-            let SeriesData::Xy { x, y } = &s.data else {
+            let SeriesData::Xy { x, y, .. } = &s.data else {
                 continue;
             };
             // Color resolution mirrors the line renderer: prefer the `a:ln` stroke color, then the
@@ -215,9 +217,16 @@ impl Plot for ScatterPlot {
         let draws_markers = self.style.draws_markers();
         for s in &self.series {
             let n = s.xs.len().min(s.ys.len());
-            // Each point's mapped plot-relative pixel (`None` for a non-finite value — dropped).
-            let mapped: Vec<(Option<f32>, Option<f32>)> = (0..n)
-                .map(|i| {
+            // Cloud paint cap (GAPS C-P25-1): a scatter bound to a large range paints one mark (and
+            // one connecting-line vertex) per point — unbounded per frame. `cap_markers_for_paint`
+            // uniformly sub-samples to <= MAX_PAINT_MARKERS (identity below the cap, so no committed
+            // scene moves); both the connecting `Line` and the markers draw over the SAME kept subset,
+            // so a huge scatter stays a bounded-cost frame.
+            let keep = cap_markers_for_paint(n, MAX_PAINT_MARKERS);
+            // Each kept point's mapped plot-relative pixel (`None` for a non-finite value — dropped).
+            let mapped: Vec<(Option<f32>, Option<f32>)> = keep
+                .iter()
+                .map(|&i| {
                     let mx = s.xs[i].is_finite().then(|| x_axis.tick(&s.xs[i])).flatten();
                     let my = s.ys[i].is_finite().then(|| y_axis.tick(&s.ys[i])).flatten();
                     (mx, my)
@@ -225,13 +234,13 @@ impl Plot for ScatterPlot {
                 .collect();
 
             // Connecting segments (`line`/`lineMarker`; `smooth`/`smoothMarker` fall back to straight):
-            // one `Line` per series through its points in data order.
+            // one `Line` per series through its (kept) points in data order.
             if draws_line {
                 let stroke: Background = s.color.into();
                 let xs = mapped.clone();
                 let ys = mapped.clone();
                 Line::new()
-                    .data((0..n).collect::<Vec<usize>>())
+                    .data((0..mapped.len()).collect::<Vec<usize>>())
                     .x(move |j: &usize| xs[*j].0)
                     .y(move |j: &usize| ys[*j].1)
                     .stroke(stroke)
@@ -299,7 +308,7 @@ mod tests {
         // Both shared domains must contain EVERY point of EVERY series — the core "one shared
         // numeric domain per axis over the union of all series" property scatter hinges on.
         for s in &chart.series {
-            if let SeriesData::Xy { x: xs, y: ys } = &s.data {
+            if let SeriesData::Xy { x: xs, y: ys, .. } = &s.data {
                 for &vx in xs {
                     assert!(
                         x.min <= vx && vx <= x.max,

@@ -36,7 +36,9 @@ mod stroke;
 mod theme;
 
 pub use authoring::ChartInsertKind;
-pub use downsample::{downsample_for_paint, MAX_PAINT_VERTICES};
+pub use downsample::{
+    cap_markers_for_paint, downsample_for_paint, MAX_PAINT_MARKERS, MAX_PAINT_VERTICES,
+};
 pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
 pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};
@@ -162,6 +164,49 @@ pub enum ScatterStyle {
     SmoothMarker,
 }
 
+/// How a bubble chart's `c:bubbleSize` value maps to the drawn marker — `c:sizeRepresents`
+/// (`ST_SizeRepresents`, P26). Excel's default is **area** (equal size ratios read as equal *area*
+/// ratios, so radius ∝ √size); `width` maps the size straight to the radius.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeRepresentation {
+    /// `area` — the bubble **area** encodes the size (radius ∝ √size). Excel's default.
+    Area,
+    /// `w` — the bubble **width** (radius) encodes the size (radius ∝ size).
+    Width,
+}
+
+impl SizeRepresentation {
+    /// The `c:sizeRepresents@val` string this maps to (`"area"` / `"w"`).
+    pub fn as_ooxml(self) -> &'static str {
+        match self {
+            Self::Area => "area",
+            Self::Width => "w",
+        }
+    }
+
+    /// Parse a `c:sizeRepresents@val` token; an absent/unknown value is [`Area`](Self::Area) —
+    /// Excel's default, and what it emits.
+    pub fn from_ooxml(val: Option<&str>) -> Self {
+        match val {
+            Some("w") => Self::Width,
+            _ => Self::Area,
+        }
+    }
+}
+
+/// The data shape a series carries — the axis-independent classification the authoring shell builder
+/// ([`build_series_shells`](crate::ChartInsertKind)) and the loader key off (P26). Category/value
+/// (bar/line/area/pie), xy (scatter), or xy+size (bubble).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeriesShape {
+    /// `c:cat` + `c:val` (bar / line / area / pie).
+    CategoryValue,
+    /// `c:xVal` + `c:yVal` (scatter).
+    Xy,
+    /// `c:xVal` + `c:yVal` + `c:bubbleSize` (bubble).
+    Bubble,
+}
+
 impl ScatterStyle {
     /// Whether this style draws connecting line segments between consecutive points.
     pub fn draws_line(self) -> bool {
@@ -227,6 +272,13 @@ pub enum ChartKind {
     /// over **two numeric axes** (both value axes with nice-tick scaling), not a category axis.
     /// `style` is the `c:scatterStyle` plotting style (marker / line / lineMarker / smooth, P25).
     Scatter { style: ScatterStyle },
+    /// `c:bubbleChart` — scatter **plus a third value per point** (`c:bubbleSize`, P26): each series
+    /// carries [`SeriesData::Xy`] pairs with a `size` vector, drawn as a filled circle whose **area**
+    /// (or width) encodes the size over the **same two numeric axes** as scatter.
+    /// `size_representation` is `c:sizeRepresents` (area [default] / width).
+    Bubble {
+        size_representation: SizeRepresentation,
+    },
 }
 
 /// A single category-axis label from `c:cat` — a cached string (`c:strCache`) or a
@@ -263,8 +315,15 @@ pub enum SeriesData {
         categories: Vec<Category>,
         values: Vec<f64>,
     },
-    /// Cached `c:xVal` / `c:yVal` numeric pairs (scatter).
-    Xy { x: Vec<f64>, y: Vec<f64> },
+    /// Cached `c:xVal` / `c:yVal` numeric pairs (scatter, `size = None`) — or, for **bubble**
+    /// (P26), the same pairs with a `c:bubbleSize` value per point (`size = Some`). The `size`
+    /// variant is what distinguishes a bubble series' data from a scatter series' at the value level;
+    /// the chart-level [`ChartKind::Bubble`] is the authoritative type.
+    Xy {
+        x: Vec<f64>,
+        y: Vec<f64>,
+        size: Option<Vec<f64>>,
+    },
 }
 
 /// A `c:dPt` **per-slice / per-point override** on a series (P24, used by pie/doughnut). A pie's
@@ -322,11 +381,34 @@ impl Series {
         }
     }
 
-    /// An xy series (scatter).
+    /// An xy series (scatter) — no per-point size (`SeriesData::Xy { size: None }`).
     pub fn xy(name: Option<impl Into<String>>, x: Vec<f64>, y: Vec<f64>) -> Self {
         Self {
             name: name.map(Into::into),
-            data: SeriesData::Xy { x, y },
+            data: SeriesData::Xy { x, y, size: None },
+            color: None,
+            marker: None,
+            data_labels: None,
+            stroke: None,
+            data_points: Vec::new(),
+        }
+    }
+
+    /// A bubble series (P26) — xy pairs **plus** a per-point `size` (`c:bubbleSize`), stored as
+    /// `SeriesData::Xy { size: Some(size) }`. The `size` vector parallels `x`/`y`.
+    pub fn bubble(
+        name: Option<impl Into<String>>,
+        x: Vec<f64>,
+        y: Vec<f64>,
+        size: Vec<f64>,
+    ) -> Self {
+        Self {
+            name: name.map(Into::into),
+            data: SeriesData::Xy {
+                x,
+                y,
+                size: Some(size),
+            },
             color: None,
             marker: None,
             data_labels: None,
@@ -641,6 +723,52 @@ mod tests {
         assert_eq!(LineMarker.as_ooxml(), "lineMarker");
         assert_eq!(Smooth.as_ooxml(), "smooth");
         assert_eq!(SmoothMarker.as_ooxml(), "smoothMarker");
+    }
+
+    #[test]
+    fn size_representation_ooxml_round_trips() {
+        assert_eq!(SizeRepresentation::Area.as_ooxml(), "area");
+        assert_eq!(SizeRepresentation::Width.as_ooxml(), "w");
+        assert_eq!(
+            SizeRepresentation::from_ooxml(Some("area")),
+            SizeRepresentation::Area
+        );
+        assert_eq!(
+            SizeRepresentation::from_ooxml(Some("w")),
+            SizeRepresentation::Width
+        );
+        // Absent / unknown defaults to Area (Excel's default).
+        assert_eq!(
+            SizeRepresentation::from_ooxml(None),
+            SizeRepresentation::Area
+        );
+        assert_eq!(
+            SizeRepresentation::from_ooxml(Some("garbage")),
+            SizeRepresentation::Area
+        );
+    }
+
+    #[test]
+    fn bubble_series_carries_a_size_but_scatter_does_not() {
+        let scatter = Series::xy(Some("s"), vec![1.0, 2.0], vec![3.0, 4.0]);
+        assert!(
+            matches!(scatter.data, SeriesData::Xy { size: None, .. }),
+            "a scatter series has no per-point size"
+        );
+        let bubble = Series::bubble(Some("b"), vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 9.0]);
+        match &bubble.data {
+            SeriesData::Xy {
+                x,
+                y,
+                size: Some(size),
+            } => {
+                assert_eq!(x, &vec![1.0, 2.0]);
+                assert_eq!(y, &vec![3.0, 4.0]);
+                assert_eq!(size, &vec![5.0, 9.0]);
+            }
+            other => panic!("expected a bubble Xy with size, got {other:?}"),
+        }
+        assert_eq!(bubble.len(), 2, "len reflects the xy pairs");
     }
 
     #[test]

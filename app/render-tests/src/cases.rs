@@ -6,7 +6,7 @@
 use freecell_chart_model::{
     Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartId,
     ChartInsertKind, ChartKind, ChartSpec, Color, Grouping, Legend, Marker, MarkerSymbol,
-    ScatterStyle, Series, SourceXml, ThemeSlot,
+    ScatterStyle, Series, SizeRepresentation, SourceXml, ThemeSlot,
 };
 use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
 
@@ -416,6 +416,49 @@ fn in_grid_scatter_spec(title: &str) -> ChartSpec {
     )
 }
 
+/// A two-series **area-encoded bubble** (P26) over two numeric axes — the picture the ChartLayer
+/// paints for the in-grid bubble case (`grid_chart_bubble`). Each series carries its `(x, y, size)`
+/// points and a distinct color.
+fn in_grid_bubble_chart(title: &str) -> Chart {
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Bubble {
+            size_representation: SizeRepresentation::Area,
+        },
+        series: vec![
+            Series::bubble(
+                Some("North"),
+                vec![2.0, 4.0, 5.5, 7.0],
+                vec![18.0, 34.0, 26.0, 45.0],
+                vec![10.0, 40.0, 22.0, 60.0],
+            )
+            .with_color(Color::from_hex(0x4472C4)),
+            Series::bubble(
+                Some("South"),
+                vec![3.0, 5.0, 6.5, 8.0],
+                vec![52.0, 44.0, 60.0, 55.0],
+                vec![48.0, 18.0, 34.0, 25.0],
+            )
+            .with_color(Color::from_hex(0xED7D31)),
+        ],
+        cat_axis: Axis::titled("X"),
+        val_axis: Axis::titled("Y"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** bubble `ChartSpec` at [`chart_anchor`], with a `<c:bubbleChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `bubble_element` path (P26), the
+/// bubble analogue of the loaded scatter case.
+fn in_grid_bubble_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_bubble_chart(title),
+        SourceXml::new("<c:bubbleChart><c:sizeRepresents val=\"area\"/></c:bubbleChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
 /// An **Unsupported** spec: a `surfaceChart` source (no faithful 2-D rendering) so the ChartLayer
 /// draws the placeholder box; its `chart` carries the title the placeholder shows.
 fn in_grid_unsupported_spec(title: &str) -> ChartSpec {
@@ -717,6 +760,11 @@ pub fn all() -> Vec<RenderCase> {
         // `grid_chart_*` baseline moves.
         RenderCase::new("grid_chart_scatter", chart_backing_scene(), CHART_GRID_VP)
             .charts(vec![in_grid_scatter_spec("Measurements")]),
+        // In-grid bubble (P26): a loaded area-encoded bubble over the backing table — the in-grid
+        // proof of the ChartLayer → `bubble_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_bubble", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_bubble_spec("Segments")]),
         // A Degraded chart still renders as a line, plus the corner "⚠ May not display as intended"
         // badge (`ui_design.md §2.2`) — here from a 3-D group (`line3DChart`) rendered as its 2-D
         // line. (A shown `c:dLbls` on a line is Faithful as of P12 — it renders — so the badge case

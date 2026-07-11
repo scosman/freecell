@@ -267,6 +267,8 @@ render_cases! {
     grid_chart_pie,
     // In-grid scatter chart (P25): the ChartLayer painting a real marker scatter over cells.
     grid_chart_scatter,
+    // In-grid bubble chart (P26): the ChartLayer painting a real area-encoded bubble over cells.
+    grid_chart_bubble,
     // Manipulate (P18): a selected chart with its selection outline + resize handles.
     grid_chart_selected,
     // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
@@ -353,6 +355,9 @@ chart_render_cases! {
     // P25 — scatter (XY): a marker-only two-series scatter over two numeric axes, a lineMarker scatter
     // (dots + connecting straight segments), and a scatter with a non-trivial numeric X axis (X not 1..n).
     chart_scatter_markers, chart_scatter_line_markers, chart_scatter_wide_x,
+    // P26 — bubble (XY + size): a multi-series area-encoded bubble over two numeric axes, and a
+    // single-series bubble spanning a wide size range (proving the min/max radius clamp).
+    chart_bubble_multi, chart_bubble_size_clamp,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

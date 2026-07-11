@@ -1773,10 +1773,13 @@ impl Worker {
         };
         let refs = crate::chart::series_refs_from_block(&data_sheet_name, data);
         let binding = binding_from_refs(&refs);
-        // The range keeps the current type, so the series data shape is unchanged — decide xy the same
-        // way `set_chart_type` does (`ChartInsertKind::is_xy`), not with an ad-hoc `matches!`.
-        let xy = ChartInsertKind::from_chart_kind(&template.kind).is_some_and(|k| k.is_xy());
-        template.series = build_series_shells(refs.len(), xy);
+        // The range keeps the current type, so the series data shape is unchanged — derive the shape
+        // from the current kind (xy for scatter, xy+size for bubble, else category/value) the same
+        // way `set_chart_type` does (`ChartInsertKind::series_shape`), not with an ad-hoc `matches!`.
+        let shape = ChartInsertKind::from_chart_kind(&template.kind)
+            .map(|k| k.series_shape())
+            .unwrap_or(freecell_chart_model::SeriesShape::CategoryValue);
+        template.series = build_series_shells(refs.len(), shape);
         let resolved = self.resolve_authored_chart(sheet, &template, &binding);
         let source_ranges = source_ranges_from_refs(&refs);
 
@@ -1831,7 +1834,7 @@ impl Worker {
                 .cloned()
                 .expect("authored chart has a typed Chart");
             template.kind = kind.chart_kind();
-            template.series = build_series_shells(refs.len(), kind.is_xy());
+            template.series = build_series_shells(refs.len(), kind.series_shape());
             let binding = binding_from_refs(&refs);
             let resolved = self.resolve_authored_chart(sheet, &template, &binding);
             if let Some(slot) = self.authored_charts[pos].spec.chart_mut() {
@@ -2316,7 +2319,7 @@ fn source_ranges_from_refs(refs: &[SeriesRefs]) -> Vec<CfRange> {
     let mut out: Vec<CfRange> = Vec::new();
     for formula in refs
         .iter()
-        .flat_map(|r| [&r.name, &r.categories, &r.values])
+        .flat_map(|r| [&r.name, &r.categories, &r.values, &r.sizes])
         .flatten()
     {
         if !out.iter().any(|r| r.as_str() == formula) {

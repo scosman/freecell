@@ -953,9 +953,13 @@ pub fn patch_chart_source(chart_xml: &str, chart: &Chart) -> Result<String> {
                 push_num_cache(chart_xml, &ser, "val", values, &mut edits);
                 push_category_cache(chart_xml, &ser, "cat", categories, &mut edits);
             }
-            SeriesData::Xy { x, y } => {
+            SeriesData::Xy { x, y, size } => {
                 push_num_cache(chart_xml, &ser, "yVal", y, &mut edits);
                 push_num_cache(chart_xml, &ser, "xVal", x, &mut edits);
+                // Bubble's third range reflows too (P26).
+                if let Some(size) = size {
+                    push_num_cache(chart_xml, &ser, "bubbleSize", size, &mut edits);
+                }
             }
         }
         if let Some(name) = &series.name {

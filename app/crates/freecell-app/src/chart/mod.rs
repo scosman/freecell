@@ -20,6 +20,7 @@ pub mod ticks;
 
 pub mod area;
 pub mod bar;
+pub mod bubble;
 pub mod chrome;
 pub mod in_grid;
 pub mod line;
@@ -40,5 +41,6 @@ pub fn chart_element(chart: &Chart) -> Option<gpui::AnyElement> {
         ChartKind::Area { .. } => area::area_element(chart),
         ChartKind::Pie { .. } => pie::pie_element(chart),
         ChartKind::Scatter { .. } => scatter::scatter_element(chart),
+        ChartKind::Bubble { .. } => bubble::bubble_element(chart),
     }
 }

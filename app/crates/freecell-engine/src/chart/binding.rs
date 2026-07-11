@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use roxmltree::{Document, Node};
 
-use freecell_chart_model::{Anchor, Category, Chart, ChartId, ChartSpec, Series, SeriesData};
+use freecell_chart_model::{
+    Anchor, Category, Chart, ChartId, ChartSpec, Series, SeriesData, SeriesShape,
+};
 use freecell_core::{CellRange, CellRef, SheetId};
 
 use super::load::is_chart_group;
@@ -142,13 +144,17 @@ fn split_sheet_prefix(part: &str) -> (Option<String>, &str) {
 }
 
 /// The `c:f` refs of one series, by role: its name (`c:tx`), its category / x (`c:cat` / `c:xVal`),
-/// and its value / y (`c:val` / `c:yVal`). A role with no cached formula reference is `None` (a
-/// literal name, or an absent axis) and keeps its template value on re-resolve.
+/// its value / y (`c:val` / `c:yVal`), and — for a **bubble** series (P26) — its size
+/// (`c:bubbleSize`). A role with no cached formula reference is `None` (a literal name, an absent
+/// axis, or a non-bubble series' size) and keeps its template value on re-resolve.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SeriesBinding {
     pub name: Option<CfRef>,
     pub cat: Option<CfRef>,
     pub val: Option<CfRef>,
+    /// `c:bubbleSize` (bubble only) — the third range an XY point binds against; `None` for
+    /// category/value and scatter series.
+    pub size: Option<CfRef>,
 }
 
 /// A chart's per-series `c:f` bindings, in the **same order** as the parsed [`Chart`]'s series (both
@@ -183,6 +189,8 @@ pub fn parse_chart_binding(chart_xml: &str) -> ChartBinding {
             name: ser_ref(&ser, &["tx"]),
             cat: ser_ref(&ser, &["cat", "xVal"]),
             val: ser_ref(&ser, &["val", "yVal"]),
+            // A non-bubble series has no `c:bubbleSize`, so this is `None` for scatter/category-value.
+            size: ser_ref(&ser, &["bubbleSize"]),
         })
         .collect();
     ChartBinding { series }
@@ -333,7 +341,7 @@ fn resolve_series(
                 }
             }
         }
-        SeriesData::Xy { x, y } => {
+        SeriesData::Xy { x, y, size } => {
             if let Some(cf) = &binding.cat {
                 if let Some(xs) = resolve_numbers(cf, default_sheet, resolve_sheet, read_cell) {
                     *x = xs;
@@ -342,6 +350,13 @@ fn resolve_series(
             if let Some(cf) = &binding.val {
                 if let Some(ys) = resolve_numbers(cf, default_sheet, resolve_sheet, read_cell) {
                     *y = ys;
+                }
+            }
+            // Bubble's third range: re-resolve `c:bubbleSize` when bound, keeping the `Some` variant
+            // (a scatter series has no size binding, so this is a no-op for it).
+            if let Some(cf) = &binding.size {
+                if let Some(sizes) = resolve_numbers(cf, default_sheet, resolve_sheet, read_cell) {
+                    *size = Some(sizes);
                 }
             }
         }
@@ -385,21 +400,25 @@ pub fn binding_from_refs(refs: &[super::write::SeriesRefs]) -> ChartBinding {
                 name: r.name.as_deref().and_then(parse_cf),
                 cat: r.categories.as_deref().and_then(parse_cf),
                 val: r.values.as_deref().and_then(parse_cf),
+                size: r.sizes.as_deref().and_then(parse_cf),
             })
             .collect(),
     }
 }
 
-/// Empty render [`Series`] shells (one per ref) in the kind's data shape (`xy` for scatter, else
-/// category/value), for [`resolve_chart`] to fill from live cells. Names start `None`; the resolver
-/// sets each from its `c:tx` cell. Used when a re-range / type-switch rebuilds an authored chart's
-/// series to match its new [`SeriesRefs`](super::write::SeriesRefs) (P19).
-pub fn build_series_shells(count: usize, xy: bool) -> Vec<Series> {
+/// Empty render [`Series`] shells (one per ref) in the kind's data [`SeriesShape`] (xy for scatter,
+/// xy+size for bubble, else category/value), for [`resolve_chart`] to fill from live cells. Names
+/// start `None`; the resolver sets each from its `c:tx` cell. Used when a re-range / type-switch
+/// rebuilds an authored chart's series to match its new [`SeriesRefs`](super::write::SeriesRefs)
+/// (P19/P26).
+pub fn build_series_shells(count: usize, shape: SeriesShape) -> Vec<Series> {
     (0..count)
-        .map(|_| {
-            if xy {
-                Series::xy(None::<String>, Vec::new(), Vec::new())
-            } else {
+        .map(|_| match shape {
+            SeriesShape::Xy => Series::xy(None::<String>, Vec::new(), Vec::new()),
+            SeriesShape::Bubble => {
+                Series::bubble(None::<String>, Vec::new(), Vec::new(), Vec::new())
+            }
+            SeriesShape::CategoryValue => {
                 Series::category_value(None::<String>, Vec::new(), Vec::new())
             }
         })
@@ -418,7 +437,7 @@ pub fn binding_is_dirty(
     resolve_sheet: &SheetResolver<'_>,
 ) -> bool {
     for sb in &binding.series {
-        for cf in [&sb.name, &sb.cat, &sb.val].into_iter().flatten() {
+        for cf in [&sb.name, &sb.cat, &sb.val, &sb.size].into_iter().flatten() {
             for area in &cf.areas {
                 let sheet = match &area.sheet {
                     Some(name) => match resolve_sheet(name) {
@@ -871,6 +890,7 @@ mod tests {
                 name: None,
                 cat: parse_cf("Data!$A$2:$A$3"),
                 val: parse_cf("Data!$B$2:$B$3"),
+                size: None,
             }],
         };
         let mut model = FakeModel::one_sheet("Data");
@@ -902,6 +922,7 @@ mod tests {
                 name: None,
                 cat: parse_cf("Ghost!$A$2:$A$3"),
                 val: parse_cf("Ghost!$B$2:$B$3"),
+                size: None,
             }],
         };
         let model = FakeModel::one_sheet("Data"); // no "Ghost" sheet
@@ -911,6 +932,91 @@ mod tests {
         let chart = resolve_chart(&template, &binding, SheetId(0), &resolver, &reader);
         // Unresolvable → the template's cached values are kept unchanged.
         assert_eq!(chart, template);
+    }
+
+    /// P26: a **bubble** chart binds and re-resolves all THREE ranges (x, y, size) and keeps its
+    /// bubble shape; and a `parse_chart_binding` reads the `c:bubbleSize` ref.
+    #[test]
+    fn resolve_bubble_reflects_all_three_ranges_and_size_range_is_dirty() {
+        use freecell_chart_model::{ChartKind, SizeRepresentation};
+        let template = Chart {
+            title: None,
+            kind: ChartKind::Bubble {
+                size_representation: SizeRepresentation::Area,
+            },
+            series: vec![Series::bubble(
+                Some("Pts"),
+                vec![0.0, 0.0],
+                vec![0.0, 0.0],
+                vec![1.0, 1.0],
+            )],
+            cat_axis: freecell_chart_model::Axis::untitled(),
+            val_axis: freecell_chart_model::Axis::untitled(),
+            legend: None,
+        };
+        let binding = ChartBinding {
+            series: vec![SeriesBinding {
+                name: None,
+                cat: parse_cf("Data!$A$2:$A$3"),  // x
+                val: parse_cf("Data!$B$2:$B$3"),  // y
+                size: parse_cf("Data!$C$2:$C$3"), // bubbleSize
+            }],
+        };
+        let mut model = FakeModel::one_sheet("Data");
+        model.set(cell(1, 0), CellData::Number(2.0)); // A2 → x
+        model.set(cell(2, 0), CellData::Number(4.0)); // A3
+        model.set(cell(1, 1), CellData::Number(20.0)); // B2 → y
+        model.set(cell(2, 1), CellData::Number(40.0)); // B3
+        model.set(cell(1, 2), CellData::Number(5.0)); // C2 → size
+        model.set(cell(2, 2), CellData::Number(9.0)); // C3
+        let resolver = model.resolver();
+        let reader = model.reader();
+        let chart = resolve_chart(&template, &binding, SheetId(0), &resolver, &reader);
+        match &chart.series[0].data {
+            SeriesData::Xy { x, y, size } => {
+                assert_eq!(x, &vec![2.0, 4.0], "x re-resolved");
+                assert_eq!(y, &vec![20.0, 40.0], "y re-resolved");
+                assert_eq!(
+                    size.as_deref(),
+                    Some(&[5.0, 9.0][..]),
+                    "size (bubbleSize) re-resolved, bubble shape kept"
+                );
+            }
+            other => panic!("expected a bubble Xy, got {other:?}"),
+        }
+
+        // An edit to the SIZE column marks the chart dirty (the third range participates).
+        assert!(
+            binding_is_dirty(
+                &binding,
+                SheetId(0),
+                &[(SheetId(0), range("C3"))],
+                &[],
+                &resolver
+            ),
+            "an edit to the bubbleSize range marks the bubble dirty"
+        );
+    }
+
+    /// P26: `parse_chart_binding` reads the `c:bubbleSize` ref into `SeriesBinding.size`; a scatter
+    /// series (no bubbleSize element) leaves it `None`.
+    #[test]
+    fn parse_chart_binding_reads_bubble_size_ref() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:bubbleChart><c:ser>
+            <c:xVal><c:numRef><c:f>Data!$A$2:$A$3</c:f></c:numRef></c:xVal>
+            <c:yVal><c:numRef><c:f>Data!$B$2:$B$3</c:f></c:numRef></c:yVal>
+            <c:bubbleSize><c:numRef><c:f>Data!$C$2:$C$3</c:f></c:numRef></c:bubbleSize>
+            </c:ser></c:bubbleChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let binding = parse_chart_binding(xml);
+        assert_eq!(binding.series.len(), 1);
+        let s = &binding.series[0];
+        assert_eq!(s.cat.as_ref().unwrap().areas[0].range, range("A2:A3"));
+        assert_eq!(s.val.as_ref().unwrap().areas[0].range, range("B2:B3"));
+        assert_eq!(
+            s.size.as_ref().expect("bubbleSize ref").areas[0].range,
+            range("C2:C3"),
+            "the third range is bound"
+        );
     }
 
     // --- dirty index ------------------------------------------------------------------------
@@ -939,6 +1045,7 @@ mod tests {
                             name: None,
                             cat: parse_cf("Data!$A$2:$A$5"),
                             val: parse_cf("Data!$B$2:$B$5"),
+                            size: None,
                         }],
                     },
                 },
@@ -952,6 +1059,7 @@ mod tests {
                             name: None,
                             cat: parse_cf("Data!$A$2:$A$5"),
                             val: parse_cf("Data!$D$2:$D$5"),
+                            size: None,
                         }],
                     },
                 },
@@ -1086,6 +1194,7 @@ mod tests {
                 name: None,
                 cat: parse_cf("Data!$A$2:$A$3"),
                 val: parse_cf(val),
+                size: None,
             }],
         };
         let mut bindings = ChartBindings {

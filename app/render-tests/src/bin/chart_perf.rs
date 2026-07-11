@@ -29,8 +29,9 @@ use std::time::Instant;
 
 use freecell_app::grid::chart_layer::{anchor_rect, ChartPlacement, GridGeometry};
 use freecell_chart_model::{
-    downsample_for_paint, Anchor, AnchorCell, Axis, Category, Chart, ChartKind, ChartSpec,
-    Grouping, Legend, Series, SourceXml, MAX_PAINT_VERTICES,
+    cap_markers_for_paint, downsample_for_paint, Anchor, AnchorCell, Axis, Category, Chart,
+    ChartKind, ChartSpec, Grouping, Legend, Series, SourceXml, MAX_PAINT_MARKERS,
+    MAX_PAINT_VERTICES,
 };
 use freecell_core::perf::{fmt_ns, LatencyStats, FRAME_TARGET_NS, FRAME_WORST_NS};
 use freecell_core::{CellRange, CellRef, SheetId};
@@ -69,6 +70,7 @@ fn main() {
     let scroll = measure_scroll_with_k();
     let many = measure_many_line_charts(&many_fixture);
     let large = measure_large_series();
+    let cloud = measure_bubble_cloud();
 
     let _ = std::fs::remove_file(&fixture);
     let _ = std::fs::remove_file(&many_fixture);
@@ -123,6 +125,25 @@ fn main() {
         large.kept,
         large.n as f64 / large.kept as f64,
     );
+    print_op(
+        &format!("bubble/scatter cloud paint-prep, FULL N={BIG_N} (pre-cap per-frame CPU)"),
+        &cloud.prep_full,
+        Some((FRAME_TARGET_NS, FRAME_WORST_NS)),
+    );
+    print_op(
+        &format!(
+            "bubble/scatter cloud paint-prep, CAPPED to {} (post-cap per-frame CPU, C-P25-1)",
+            cloud.kept
+        ),
+        &cloud.prep_capped,
+        Some((FRAME_TARGET_NS, FRAME_WORST_NS)),
+    );
+    println!(
+        "  cloud: {} points retained for save; {} marks painted (cap ~{:.0}x fewer)",
+        cloud.n,
+        cloud.kept,
+        cloud.n as f64 / cloud.kept as f64,
+    );
 
     if let Err(e) = write_json(
         &commit,
@@ -131,6 +152,7 @@ fn main() {
         &scroll,
         &many,
         &large,
+        &cloud,
     ) {
         eprintln!("chart_perf: failed to write results JSON: {e}");
     }
@@ -483,6 +505,102 @@ fn measure_large_series() -> LargeSeriesResult {
 }
 
 // ---------------------------------------------------------------------------------------------
+// bubble/scatter cloud paint-prep + cloud cap (GAPS C-P25-1)
+// ---------------------------------------------------------------------------------------------
+
+struct CloudResult {
+    /// Per-frame paint-prep mapping ALL N cloud points to (pixel + radius) (pre-cap).
+    prep_full: LatencyStats,
+    /// Per-frame paint-prep mapping only the capped subset (post-cap).
+    prep_capped: LatencyStats,
+    /// Points retained (N — the full cloud kept for save).
+    n: usize,
+    /// Marks painted after the cloud cap.
+    kept: usize,
+}
+
+/// Cloud paint-prep perf (GAPS C-P25-1): a scatter/bubble with **N points**. Unlike the line
+/// renderer, the scatter/bubble mark loop maps + draws one mark **per point** with no cap — so this
+/// measures (1) mapping ALL N points to a pixel + radius (what the renderer did before the P26 cap),
+/// and (2) the same over the `cap_markers_for_paint` subset (what it does now). FORCE+ASSERTS that
+/// the full cloud (N points) is retained (the cap is paint-only) while paint touches
+/// `<= MAX_PAINT_MARKERS`.
+fn measure_bubble_cloud() -> CloudResult {
+    // A dense spiral cloud with a size per point — a non-trivial (x, y, size) set.
+    let xs: Vec<f64> = (0..BIG_N)
+        .map(|i| ((i as f64) * 0.01).cos() * 500.0)
+        .collect();
+    let ys: Vec<f64> = (0..BIG_N)
+        .map(|i| ((i as f64) * 0.01).sin() * 500.0)
+        .collect();
+    let sizes: Vec<f64> = (0..BIG_N).map(|i| (i % 97) as f64 + 1.0).collect();
+    let max_size = sizes.iter().copied().fold(0.0_f64, f64::max);
+    let (xmin, xmax) = (-500.0_f64, 500.0_f64);
+    let (ymin, ymax) = (-500.0_f64, 500.0_f64);
+    let (plot_left, plot_w) = (46.0_f32, 700.0_f32);
+    let (plot_bottom, plot_h) = (400.0_f32, 380.0_f32);
+    let x_px = |v: f64| -> f32 { plot_left + (((v - xmin) / (xmax - xmin)) as f32) * plot_w };
+    let y_px = |v: f64| -> f32 { plot_bottom - (((v - ymin) / (ymax - ymin)) as f32) * plot_h };
+    // The √-area radius map (the bubble renderer's arithmetic), clamped like the widget.
+    let r_px = |s: f64| -> f32 { ((s / max_size).sqrt() as f32 * 26.0).clamp(4.0, 26.0) };
+
+    // 1. paint-prep over ALL N (pre-cap): map every point to (x, y, r).
+    let mut full = Vec::new();
+    for i in 0..300 {
+        let started = Instant::now();
+        let marks: Vec<(f32, f32, f32)> = (0..BIG_N)
+            .filter(|&j| xs[j].is_finite() && ys[j].is_finite())
+            .map(|j| (x_px(xs[j]), y_px(ys[j]), r_px(sizes[j])))
+            .collect();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        assert_eq!(marks.len(), BIG_N, "full prep maps every cloud point");
+        std::hint::black_box(marks);
+        if i >= 20 {
+            full.push(elapsed);
+        }
+    }
+
+    // 2. paint-prep over the CAPPED subset (post-cap).
+    let keep = cap_markers_for_paint(BIG_N, MAX_PAINT_MARKERS);
+    let kept = keep.len();
+    let mut capped = Vec::new();
+    for i in 0..300 {
+        let started = Instant::now();
+        let marks: Vec<(f32, f32, f32)> = keep
+            .iter()
+            .filter(|&&j| xs[j].is_finite() && ys[j].is_finite())
+            .map(|&j| (x_px(xs[j]), y_px(ys[j]), r_px(sizes[j])))
+            .collect();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        assert_eq!(marks.len(), kept, "capped prep maps the kept marks");
+        std::hint::black_box(marks);
+        if i >= 20 {
+            capped.push(elapsed);
+        }
+    }
+
+    // FORCE + ASSERT: the full cloud is retained for save (the cap is paint-only), and the cap
+    // bounds the mark count below the full cloud.
+    assert_eq!(
+        xs.len(),
+        BIG_N,
+        "the full N-point cloud is retained for save"
+    );
+    assert!(
+        kept <= MAX_PAINT_MARKERS,
+        "the cap bounds the marks to the budget"
+    );
+    assert!(kept < BIG_N, "the cap actually reduced the full cloud");
+
+    CloudResult {
+        prep_full: LatencyStats::from_samples(&full),
+        prep_capped: LatencyStats::from_samples(&capped),
+        n: BIG_N,
+        kept,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------------------------
 
@@ -520,6 +638,7 @@ fn range(a1: &str) -> CellRange {
     CellRange::from_a1(a1).expect("valid A1 range")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_json(
     commit: &str,
     first_paint: &LatencyStats,
@@ -527,6 +646,7 @@ fn write_json(
     scroll: &ScrollResult,
     many: &LatencyStats,
     large: &LargeSeriesResult,
+    cloud: &CloudResult,
 ) -> std::io::Result<()> {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("results");
     std::fs::create_dir_all(&dir)?;
@@ -559,6 +679,16 @@ fn write_json(
                 "downsample": stats_json(&large.downsample),
                 "paint_prep_full_n": stats_json(&large.prep_full),
                 "paint_prep_downsampled": stats_json(&large.prep_downsampled),
+            },
+            "bubble_scatter_cloud": {
+                "n_points_retained_for_save": cloud.n,
+                "marks_painted": cloud.kept,
+                "max_paint_markers": MAX_PAINT_MARKERS,
+                "reference_frame_target_ns": FRAME_TARGET_NS,
+                "reference_frame_worst_ns": FRAME_WORST_NS,
+                "note": "GAPS C-P25-1: scatter/bubble paint one mark per point; cap_markers_for_paint bounds it to <= max_paint_markers (identity below the cap, so no baseline moves).",
+                "paint_prep_full_n": stats_json(&cloud.prep_full),
+                "paint_prep_capped": stats_json(&cloud.prep_capped),
             },
         },
     });

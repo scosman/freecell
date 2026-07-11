@@ -2188,6 +2188,76 @@ fn retyped_to_scatter_chart_roundtrips() {
     );
 }
 
+/// P26 (edited bubble round-trip): switching a ranged chart's type to **Bubble** round-trips as
+/// `ChartKind::Bubble` with an `Xy` series, keeping the XY `c:f` binding — the edited path proof for
+/// the final type (the bubble twin of the Scatter/Column/Area/Pie retype tests). The size range is
+/// unbound by a plain retype (the block heuristic stays x/y-shaped), so the reopened bubble carries
+/// no bubbleSize values yet — but it IS a bubble, and its x/y binding survives.
+#[test]
+fn retyped_to_bubble_chart_roundtrips() {
+    let (client, rx, sheet, id) = spawn_new_with_chart_data();
+    client.send(Command::SetChartRange {
+        sheet,
+        id,
+        data: CellRange::from_a1("A1:B3").unwrap(),
+    });
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0) == vec![10.0, 20.0],
+        "the chart is ranged",
+    );
+    client.send(Command::SetChartType {
+        sheet,
+        id,
+        kind: ChartInsertKind::Bubble,
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .find(|(s, _)| *s == sheet)
+                .and_then(|(_, specs)| specs.first())
+                .is_some_and(|sp| {
+                    matches!(
+                        sp.chart().unwrap().kind,
+                        freecell_chart_model::ChartKind::Bubble { .. }
+                    )
+                })
+        },
+        "the retype republishes a bubble chart",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("retyped_bubble.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 96,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 96, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(specs.len(), 1);
+    let chart = specs[0].chart().unwrap();
+    assert!(
+        matches!(chart.kind, freecell_chart_model::ChartKind::Bubble { .. }),
+        "the reopened chart is a bubble chart"
+    );
+    assert!(
+        matches!(
+            chart.series[0].data,
+            freecell_chart_model::SeriesData::Xy { .. }
+        ),
+        "the reopened bubble series is xy"
+    );
+    let ranges: Vec<&str> = specs[0].source_ranges.iter().map(|r| r.as_str()).collect();
+    assert!(
+        ranges.iter().any(|r| r.ends_with("$B$2:$B$3")),
+        "the y range binding survived the retype: {ranges:?}"
+    );
+}
+
 /// Phase-plan item 4 (three-way honesty): one save carrying a LOADED chart + a BOUND (ranged)
 /// authored chart + an UNBOUND authored chart keeps all three straight — loaded byte-preserved,
 /// bound-authored written with `c:f`, unbound-authored written as literals — and all three reopen.

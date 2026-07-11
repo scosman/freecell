@@ -128,7 +128,7 @@ perceptual-diff + external round-trip sweep.
 - [x] **P24 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;
   rotation/explosion; on-slice % labels.
 - [x] **P25 — Scatter.** Two numeric axes + dots; `scatterStyle`.
-- [ ] **P26 — Bubble.** Scatter + `bubbleSize`→radius (√-area + clamp); the final type re-runs
+- [x] **P26 — Bubble.** Scatter + `bubbleSize`→radius (√-area + clamp); the final type re-runs
   the full cross-type perceptual-diff + external round-trip sweep.
 
 ---

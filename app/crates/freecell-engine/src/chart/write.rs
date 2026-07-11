@@ -58,10 +58,12 @@ const VAL_AX: &str = "222222222";
 pub struct SeriesRefs {
     /// `c:tx` series-name reference.
     pub name: Option<String>,
-    /// `c:cat` (category/value) or `c:xVal` (scatter) domain reference.
+    /// `c:cat` (category/value) or `c:xVal` (scatter/bubble) domain reference.
     pub categories: Option<String>,
-    /// `c:val` (category/value) or `c:yVal` (scatter) value reference.
+    /// `c:val` (category/value) or `c:yVal` (scatter/bubble) value reference.
     pub values: Option<String>,
+    /// `c:bubbleSize` reference (bubble only, P26) — the third range. `None` for every other type.
+    pub sizes: Option<String>,
 }
 
 /// One authored chart to write into a workbook (components/write-path §3): the render [`Chart`] to
@@ -187,6 +189,15 @@ fn group_element(chart: &Chart, series_xml: &str) -> String {
             r#"<c:scatterChart><c:scatterStyle val="{}"/>{series_xml}<c:axId val="{CAT_AX}"/><c:axId val="{VAL_AX}"/></c:scatterChart>"#,
             style.as_ooxml(),
         ),
+        ChartKind::Bubble {
+            size_representation,
+        } => format!(
+            // CT_BubbleChart child order: varyColors?, ser*, dLbls?, bubble3D?, bubbleScale?,
+            // showNegBubbles?, sizeRepresents?, axId, axId. We emit varyColors, the series, then
+            // sizeRepresents (from the model), then the axId pair — a valid subsequence.
+            r#"<c:bubbleChart><c:varyColors val="0"/>{series_xml}<c:sizeRepresents val="{}"/><c:axId val="{CAT_AX}"/><c:axId val="{VAL_AX}"/></c:bubbleChart>"#,
+            size_representation.as_ooxml(),
+        ),
     }
 }
 
@@ -195,6 +206,7 @@ fn series_element(idx: usize, series: &Series, refs: Option<&SeriesRefs>) -> Str
     let name_f = refs.and_then(|r| r.name.as_deref());
     let cat_f = refs.and_then(|r| r.categories.as_deref());
     let val_f = refs.and_then(|r| r.values.as_deref());
+    let size_f = refs.and_then(|r| r.sizes.as_deref());
 
     let tx = series
         .name
@@ -220,12 +232,17 @@ fn series_element(idx: usize, series: &Series, refs: Option<&SeriesRefs>) -> Str
                 num_role("val", val_f, values)
             )
         }
-        SeriesData::Xy { x, y } => {
-            format!(
+        SeriesData::Xy { x, y, size } => {
+            // CT_ScatterSer/CT_BubbleSer order: xVal, yVal, then (bubble only) bubbleSize.
+            let mut data = format!(
                 "{}{}",
                 num_role("xVal", cat_f, x),
                 num_role("yVal", val_f, y)
-            )
+            );
+            if let Some(size) = size {
+                data.push_str(&num_role("bubbleSize", size_f, size));
+            }
+            data
         }
     };
     format!(
@@ -377,7 +394,8 @@ fn str_lit_body(values: &[String]) -> String {
 fn axes_xml(chart: &Chart) -> String {
     match &chart.kind {
         ChartKind::Pie { .. } => String::new(),
-        ChartKind::Scatter { .. } => format!(
+        // Scatter AND bubble carry two value axes (both numeric).
+        ChartKind::Scatter { .. } | ChartKind::Bubble { .. } => format!(
             "{}{}",
             axis_element("valAx", &chart.cat_axis, CAT_AX, VAL_AX, "b"),
             axis_element("valAx", &chart.val_axis, VAL_AX, CAT_AX, "l"),
@@ -786,6 +804,7 @@ mod tests {
     use crate::document::WorkbookDocument;
     use freecell_chart_model::{
         Axis, BarLayout, Category, Chart, ChartKind, Color, Legend, ScatterStyle, SeriesData,
+        SizeRepresentation,
     };
     use freecell_core::CellRef;
 
@@ -808,6 +827,7 @@ mod tests {
             name: Some("Sheet1!$C$1".into()),
             categories: Some("Sheet1!$A$1:$A$4".into()),
             values: Some("Sheet1!$B$1:$B$4".into()),
+            sizes: None,
         }]
     }
 
@@ -1078,6 +1098,7 @@ mod tests {
             name: Some("Sheet1!$A$1".into()),
             categories: Some("Sheet1!$B$1:$B$3".into()),
             values: Some("Sheet1!$C$1:$C$3".into()),
+            sizes: None,
         }]
     }
 
@@ -1102,6 +1123,103 @@ mod tests {
                 "scatterStyle {style:?} emitted from the model:\n{xml}"
             );
             assert_roundtrip(scatter_chart(style), &scatter_refs());
+        }
+    }
+
+    /// A one-series bubble with the given size representation + refs — the shared shape for the
+    /// bubble round-trip tests. x from the A column, y from the B column, size from the C column.
+    fn bubble_chart(representation: SizeRepresentation) -> Chart {
+        Chart {
+            title: Some("XYZ".into()),
+            kind: ChartKind::Bubble {
+                size_representation: representation,
+            },
+            series: vec![Series::bubble(
+                Some("Pts"),
+                vec![1.0, 2.0, 3.0, 4.0],
+                VALUES.to_vec(),
+                vec![4.0, 16.0, 9.0, 25.0],
+            )
+            .with_color(Color::from_hex(0x4472C4))],
+            cat_axis: Axis::titled("X"),
+            val_axis: Axis::titled("Y"),
+            legend: Some(Legend::default()),
+        }
+    }
+
+    fn bubble_refs() -> Vec<SeriesRefs> {
+        vec![SeriesRefs {
+            name: Some("Sheet1!$D$1".into()),
+            categories: Some("Sheet1!$A$1:$A$4".into()),
+            values: Some("Sheet1!$B$1:$B$4".into()),
+            sizes: Some("Sheet1!$C$1:$C$4".into()),
+        }]
+    }
+
+    #[test]
+    fn serialize_roundtrips_bubble() {
+        // A full serialize→parse == template for a bubble (kind + XY + bubbleSize + axes + legend).
+        assert_roundtrip(bubble_chart(SizeRepresentation::Area), &bubble_refs());
+    }
+
+    #[test]
+    fn serialize_roundtrips_bubble_size_representation() {
+        // `c:sizeRepresents` is emitted FROM the model and survives serialize→parse for both
+        // representations; and the `c:bubbleSize` element is present (the third range).
+        for rep in [SizeRepresentation::Area, SizeRepresentation::Width] {
+            let xml = serialize_chart_xml(&bubble_chart(rep), &bubble_refs());
+            assert!(
+                xml.contains(&format!("<c:sizeRepresents val=\"{}\"/>", rep.as_ooxml())),
+                "sizeRepresents {rep:?} emitted from the model:\n{xml}"
+            );
+            assert!(
+                xml.contains("<c:bubbleSize>"),
+                "bubbleSize (the third range) emitted:\n{xml}"
+            );
+            // CT_BubbleChart order: sizeRepresents precedes the axId pair.
+            let sr = xml.find("<c:sizeRepresents").unwrap();
+            let ax = xml.find("<c:axId").unwrap();
+            assert!(sr < ax, "sizeRepresents must precede axId");
+            assert_roundtrip(bubble_chart(rep), &bubble_refs());
+        }
+    }
+
+    #[test]
+    fn write_authored_bubble_reopens_as_bubble_with_size() {
+        let model = data_model_bytes();
+        let bubble = bubble_chart(SizeRepresentation::Area);
+        let (bytes, _) = write_authored_charts(
+            &model,
+            &[authored(bubble, "xl/charts/chart1.xml", bubble_refs())],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authored_bubble.xlsx");
+        std::fs::write(&out, &bytes).unwrap();
+        ironcalc::import::load_from_xlsx(out.to_str().unwrap(), "en", "UTC", "en")
+            .expect("authored bubble reopens in IronCalc");
+
+        let specs = discover_and_parse(&out).unwrap();
+        assert_eq!(specs.len(), 1);
+        let chart = specs[0].chart().unwrap();
+        assert_eq!(
+            chart.kind,
+            ChartKind::Bubble {
+                size_representation: SizeRepresentation::Area
+            },
+            "the reopened chart is an area-represented bubble"
+        );
+        match &chart.series[0].data {
+            SeriesData::Xy {
+                size: Some(size), ..
+            } => {
+                assert_eq!(
+                    size,
+                    &vec![4.0, 16.0, 9.0, 25.0],
+                    "the bubbleSize survived the write"
+                );
+            }
+            other => panic!("expected a bubble Xy with size, got {other:?}"),
         }
     }
 
@@ -1168,6 +1286,9 @@ mod tests {
             name: Some("Sheet1!$A$1".into()),
             categories: Some("Sheet1!$A$2:$A$5".into()),
             values: Some("Sheet1!$B$2:$B$5".into()),
+            // A size ref so the Bubble template's `c:bubbleSize` round-trips through a numRef cache
+            // (harmless for the non-bubble kinds — their series emit no bubbleSize).
+            sizes: Some("Sheet1!$C$2:$C$5".into()),
         }];
         for kind in [
             ChartInsertKind::Line,
@@ -1177,6 +1298,7 @@ mod tests {
             ChartInsertKind::Pie,
             ChartInsertKind::Doughnut,
             ChartInsertKind::Scatter,
+            ChartInsertKind::Bubble,
         ] {
             let template = kind.near_empty_chart();
             // (a) Full structural + data round-trip with refs.

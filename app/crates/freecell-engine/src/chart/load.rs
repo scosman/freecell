@@ -14,8 +14,8 @@ use roxmltree::{Document, Node};
 use freecell_chart_model::{
     normalize_3d_chart_group, Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, CfRange,
     Chart, ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, DataPoint,
-    Grouping, Legend, LegendPosition, LineStroke, ScatterStyle, Series, SourcePart, SourceXml,
-    ThemeSlot,
+    Grouping, Legend, LegendPosition, LineStroke, ScatterStyle, Series, SeriesShape,
+    SizeRepresentation, SourcePart, SourceXml, ThemeSlot,
 };
 
 use super::xlsx::{self, attr};
@@ -575,6 +575,7 @@ pub(super) const CHART_GROUP_TAGS: &[&str] = &[
     "pieChart",
     "doughnutChart",
     "scatterChart",
+    "bubbleChart",
 ];
 
 /// Whether `local_name` names a chart-group element we parse: one of the 2-D [`CHART_GROUP_TAGS`],
@@ -610,7 +611,9 @@ pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
     let group_name = group.tag_name().name();
     let kind_name = normalize_3d_chart_group(group_name).unwrap_or(group_name);
     let kind = parse_kind(&group, kind_name)?;
-    let is_scatter = matches!(kind, ChartKind::Scatter { .. });
+    let shape = series_shape_of(&kind);
+    // The two XY types (scatter + bubble) both map to two `c:valAx` and read `c:xVal`/`c:yVal`.
+    let is_xy = shape != SeriesShape::CategoryValue;
 
     // The chart-group-level `c:dLbls` (a direct child of the group, after the series) is the
     // default for every series that has no `c:dLbls` of its own (OOXML: a series `c:dLbls`
@@ -620,10 +623,10 @@ pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
     let series = group
         .children()
         .filter(|n| n.tag_name().name() == "ser")
-        .map(|ser| parse_series(&ser, is_scatter, group_labels.as_ref()))
+        .map(|ser| parse_series(&ser, shape, group_labels.as_ref()))
         .collect::<Result<Vec<_>>>()?;
 
-    let (cat_axis, val_axis) = parse_axes(&plot_area, is_scatter);
+    let (cat_axis, val_axis) = parse_axes(&plot_area, is_xy);
 
     Ok(Chart {
         title: parse_title(&chart),
@@ -678,8 +681,24 @@ fn parse_kind(group: &Node, kind_name: &str) -> Result<ChartKind> {
         "scatterChart" => ChartKind::Scatter {
             style: scatter_style(group),
         },
+        "bubbleChart" => ChartKind::Bubble {
+            size_representation: SizeRepresentation::from_ooxml(
+                child_val(group, "sizeRepresents").as_deref(),
+            ),
+        },
         other => return Err(anyhow!("unhandled chart-group element <c:{other}>")),
     })
+}
+
+/// The [`SeriesShape`] a parsed [`ChartKind`] carries (P26): scatter → xy, bubble → xy+size,
+/// everything else → category/value. Drives whether the loader reads `c:xVal`/`c:yVal`(`/c:bubbleSize`)
+/// vs `c:cat`/`c:val`, and whether the plot area has two value axes.
+fn series_shape_of(kind: &ChartKind) -> SeriesShape {
+    match kind {
+        ChartKind::Scatter { .. } => SeriesShape::Xy,
+        ChartKind::Bubble { .. } => SeriesShape::Bubble,
+        _ => SeriesShape::CategoryValue,
+    }
 }
 
 /// The bar-slot spacing ([`BarLayout`], P22) from a `c:barChart` group: `c:gapWidth@val` (clamped to
@@ -745,33 +764,45 @@ fn grouping_of(group: &Node, default: Grouping) -> Grouping {
     }
 }
 
-/// Parses one `<c:ser>` into a [`Series`]. For scatter, reads `c:xVal`/`c:yVal`; otherwise
-/// `c:cat`/`c:val`. Series name from `c:tx` cache; color from `c:spPr` solid fill; data labels
-/// from the series' own `c:dLbls`, falling back to the chart-group-level `default_labels`.
+/// Parses one `<c:ser>` into a [`Series`], by data [`SeriesShape`]. For an [`Xy`](SeriesShape::Xy)
+/// (scatter) series reads `c:xVal`/`c:yVal`; a [`Bubble`](SeriesShape::Bubble) series additionally
+/// reads `c:bubbleSize`; otherwise `c:cat`/`c:val`. Series name from `c:tx` cache; color from
+/// `c:spPr` solid fill; data labels from the series' own `c:dLbls`, falling back to the
+/// chart-group-level `default_labels`.
 fn parse_series(
     ser: &Node,
-    is_scatter: bool,
+    shape: SeriesShape,
     default_labels: Option<&DataLabels>,
 ) -> Result<Series> {
     let name = child(ser, "tx").and_then(|tx| ref_strings(&tx).into_iter().next());
     let color = parse_series_color(ser);
 
-    let mut series = if is_scatter {
-        let x = child(ser, "xVal")
-            .map(|n| ref_numbers(&n))
-            .unwrap_or_default();
-        let y = child(ser, "yVal")
-            .map(|n| ref_numbers(&n))
-            .unwrap_or_default();
-        Series::xy(name, x, y)
-    } else {
-        let categories = child(ser, "cat")
-            .map(|n| ref_categories(&n))
-            .unwrap_or_default();
-        let values = child(ser, "val")
-            .map(|n| ref_numbers(&n))
-            .unwrap_or_default();
-        Series::category_value(name, categories, values)
+    let mut series = match shape {
+        SeriesShape::Xy | SeriesShape::Bubble => {
+            let x = child(ser, "xVal")
+                .map(|n| ref_numbers(&n))
+                .unwrap_or_default();
+            let y = child(ser, "yVal")
+                .map(|n| ref_numbers(&n))
+                .unwrap_or_default();
+            if shape == SeriesShape::Bubble {
+                let size = child(ser, "bubbleSize")
+                    .map(|n| ref_numbers(&n))
+                    .unwrap_or_default();
+                Series::bubble(name, x, y, size)
+            } else {
+                Series::xy(name, x, y)
+            }
+        }
+        SeriesShape::CategoryValue => {
+            let categories = child(ser, "cat")
+                .map(|n| ref_categories(&n))
+                .unwrap_or_default();
+            let values = child(ser, "val")
+                .map(|n| ref_numbers(&n))
+                .unwrap_or_default();
+            Series::category_value(name, categories, values)
+        }
     };
     if let Some(c) = color {
         series = series.with_color(c);
@@ -1007,11 +1038,12 @@ fn parse_title(chart: &Node) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Parses category + value axis titles. For scatter (two `c:valAx`, no `c:catAx`), the first
-/// value axis (X) maps to `cat_axis` and the second (Y) to `val_axis` — the convention the
-/// scatter renderer expects (phase_3 chrome: X title in `cat_axis`, Y title in `val_axis`).
-fn parse_axes(plot_area: &Node, is_scatter: bool) -> (Axis, Axis) {
-    if is_scatter {
+/// Parses category + value axis titles. For an **XY** chart (scatter or bubble — two `c:valAx`, no
+/// `c:catAx`), the first value axis (X) maps to `cat_axis` and the second (Y) to `val_axis` — the
+/// convention the scatter/bubble renderer expects (phase_3 chrome: X title in `cat_axis`, Y title in
+/// `val_axis`).
+fn parse_axes(plot_area: &Node, is_xy: bool) -> (Axis, Axis) {
+    if is_xy {
         let val_axes: Vec<Node> = plot_area
             .children()
             .filter(|n| n.tag_name().name() == "valAx")
@@ -1342,11 +1374,60 @@ mod tests {
         assert_eq!(chart.cat_axis.title.as_deref(), Some("Ad spend"));
         assert_eq!(chart.val_axis.title.as_deref(), Some("Revenue"));
         match &chart.series[0].data {
-            SeriesData::Xy { x, y } => {
+            SeriesData::Xy { x, y, size } => {
                 assert_eq!(x, &vec![1.0, 2.0]);
                 assert_eq!(y, &vec![10.0, 20.0]);
+                assert_eq!(*size, None, "a scatter series has no bubbleSize");
             }
             other => panic!("expected Xy, got {other:?}"),
+        }
+    }
+
+    /// P26: a `c:bubbleChart` parses to `ChartKind::Bubble` with `c:sizeRepresents`, and each series
+    /// reads `c:xVal`/`c:yVal`/`c:bubbleSize` into a bubble `Xy { size: Some(..) }`, over two value
+    /// axes (X→cat_axis, Y→val_axis).
+    #[test]
+    fn parses_bubble_chart_size_and_representation() {
+        let bubble = |size_el: &str| {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:plotArea><c:bubbleChart><c:ser>
+                   <c:xVal><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:xVal>
+                   <c:yVal><c:numRef><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt></c:numCache></c:numRef></c:yVal>
+                   <c:bubbleSize><c:numRef><c:numCache><c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="1"><c:v>7</c:v></c:pt></c:numCache></c:numRef></c:bubbleSize>
+                   </c:ser>{size_el}<c:axId val="1"/><c:axId val="2"/></c:bubbleChart>
+                   <c:valAx><c:title><c:tx><c:rich><a:p><a:r><a:t>Xt</a:t></a:r></a:p></c:rich></c:tx></c:title></c:valAx>
+                   <c:valAx><c:title><c:tx><c:rich><a:p><a:r><a:t>Yt</a:t></a:r></a:p></c:rich></c:tx></c:title></c:valAx>
+                   </c:plotArea></c:chart></c:chartSpace>"#
+            );
+            parse_chart_xml(&xml).unwrap()
+        };
+
+        // Explicit width representation.
+        let w = bubble("<c:sizeRepresents val=\"w\"/>");
+        assert_eq!(
+            w.kind,
+            ChartKind::Bubble {
+                size_representation: SizeRepresentation::Width
+            }
+        );
+        // Absent sizeRepresents → Area (Excel's default).
+        let a = bubble("");
+        assert_eq!(
+            a.kind,
+            ChartKind::Bubble {
+                size_representation: SizeRepresentation::Area
+            }
+        );
+        // XY + size parsed; X title → cat_axis, Y title → val_axis.
+        assert_eq!(a.cat_axis.title.as_deref(), Some("Xt"));
+        assert_eq!(a.val_axis.title.as_deref(), Some("Yt"));
+        match &a.series[0].data {
+            SeriesData::Xy { x, y, size } => {
+                assert_eq!(x, &vec![1.0, 2.0]);
+                assert_eq!(y, &vec![10.0, 20.0]);
+                assert_eq!(size.as_deref(), Some(&[3.0, 7.0][..]));
+            }
+            other => panic!("expected a bubble Xy with size, got {other:?}"),
         }
     }
 

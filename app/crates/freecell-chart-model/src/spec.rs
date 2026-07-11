@@ -178,7 +178,7 @@ pub enum Origin {
 
 /// The render content of a [`ChartSpec`] — either a chart we parsed into a typed render
 /// [`Chart`], or a chart the load walk **reached but could not parse** into one (an unsupported
-/// group — surface / radar / stock / ofPie / bubble / a 3-D type with no 2-D reduction / malformed
+/// group — surface / radar / stock / ofPie / a 3-D type with no 2-D reduction / malformed
 /// chart XML, charts/architecture §6).
 ///
 /// Folding "no typed chart" into the spec this way — rather than an `Option<Chart>` plus a
@@ -553,8 +553,8 @@ mod tests {
     #[test]
     fn unsupported_body_is_always_unsupported_fidelity() {
         let anchor = Anchor::new(AnchorCell::new(0, 0), AnchorCell::new(6, 12));
-        // Even a source that WOULD classify Faithful (a plain, unrecognized-by-us group like
-        // bubbleChart) or Degraded must report Unsupported when the body could not be parsed —
+        // Even a source that WOULD classify Faithful (a plain supported group like bubbleChart, now
+        // a rendered type) or Degraded must report Unsupported when the body could not be parsed —
         // there is no picture to draw, so the placeholder is the only honest outcome.
         for source in [
             "<c:bubbleChart/>",

@@ -88,6 +88,40 @@ pub fn downsample_for_paint(values: &[f64], max_vertices: usize) -> Vec<usize> {
     keep
 }
 
+/// The largest number of **markers** (bubble / scatter points) the renderer paints for one series.
+/// A scatter/bubble series at or under this keeps every point (identity in
+/// [`cap_markers_for_paint`]); a larger one is uniformly sub-sampled to `<=` this. Chosen well above
+/// every committed render scene (all `<= ~13` points), so no baseline moves — only a genuinely huge
+/// (large-range-bound) point cloud is capped.
+pub const MAX_PAINT_MARKERS: usize = 2048;
+
+/// The indices of an **unordered marker cloud** (scatter / bubble points) to PAINT when capping it to
+/// at most `max` markers (charts/architecture §5 challenge 5, GAPS C-P25-1).
+///
+/// Unlike [`downsample_for_paint`] (which decimates an **index-ordered** line by preserving its
+/// value extrema), a scatter/bubble cloud has **no 1-D axis to decimate along** — dropping points
+/// changes the cloud either way. So the cloud cap is a **uniform stride** subsample spread across
+/// `0..n`: it preserves the cloud's overall spatial extent + density far better than "first N", is
+/// deterministic, keeps indices ascending (so a scatter's connecting `Line` still threads points in
+/// data order over the same subset), and always keeps the **last** point.
+///
+/// - `n <= max` (or `max < 2`) returns the identity `0..n` — ordinary charts paint every point,
+///   byte-identically (a degenerate `max` is too small to subsample meaningfully).
+/// - Otherwise returns **at most** `max` strictly-increasing indices linspaced across `[0, n-1]`
+///   inclusive — so the first (`0`) and last (`n-1`) points, and thus the cloud's full extent, are
+///   always kept, and `keep.len() <= max`.
+pub fn cap_markers_for_paint(n: usize, max: usize) -> Vec<usize> {
+    if n <= max || max < 2 {
+        return (0..n).collect();
+    }
+    // `max` samples linspaced over [0, n-1]: index k → round(k * (n-1) / (max-1)). k=0 → 0,
+    // k=max-1 → n-1. Strictly increasing because n > max ⇒ the step (n-1)/(max-1) > 1; dedup guards
+    // the arithmetic corner just in case.
+    let mut keep: Vec<usize> = (0..max).map(|k| k * (n - 1) / (max - 1)).collect();
+    keep.dedup();
+    keep
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +187,35 @@ mod tests {
         assert!(
             keep.contains(&dip),
             "the global min (dip) must survive decimation"
+        );
+    }
+
+    #[test]
+    fn marker_cap_is_identity_below_cap_and_bounded_above() {
+        // Below / at the cap: identity (every point painted, no baseline moves).
+        assert_eq!(
+            cap_markers_for_paint(0, MAX_PAINT_MARKERS),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            cap_markers_for_paint(13, MAX_PAINT_MARKERS),
+            (0..13).collect::<Vec<_>>()
+        );
+        assert_eq!(cap_markers_for_paint(64, 64), (0..64).collect::<Vec<_>>());
+
+        // Above the cap: bounded, strictly increasing, keeps the last point, spans the range.
+        let n = 100_000;
+        let keep = cap_markers_for_paint(n, MAX_PAINT_MARKERS);
+        assert!(keep.len() <= MAX_PAINT_MARKERS, "capped to <= budget");
+        assert!(
+            keep.len() >= MAX_PAINT_MARKERS - 1,
+            "uses ~all of the budget"
+        );
+        assert_eq!(keep.first(), Some(&0), "keeps the first point");
+        assert_eq!(keep.last(), Some(&(n - 1)), "keeps the last point");
+        assert!(
+            keep.windows(2).all(|w| w[0] < w[1]),
+            "indices strictly increasing (order preserved for a connecting line)"
         );
     }
 

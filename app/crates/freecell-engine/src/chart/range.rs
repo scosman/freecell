@@ -38,6 +38,10 @@ pub fn series_refs_from_block(sheet_name: &str, block: CellRange) -> Vec<SeriesR
                 name: Some(qualified(abs_cell(col, r0))),
                 categories: Some(cats.clone()),
                 values: Some(qualified(abs_col_range(col, r0 + 1, r1))),
+                // A bubble's third range (`c:bubbleSize`) is not derived from the block heuristic
+                // (the deterministic column rule stays x/y-shaped, P26); a range-picked bubble binds
+                // x/y and leaves the size unbound until an authored `sizes` ref is supplied.
+                sizes: None,
             })
             .collect();
     }
@@ -48,6 +52,7 @@ pub fn series_refs_from_block(sheet_name: &str, block: CellRange) -> Vec<SeriesR
         name: None,
         categories: None,
         values: Some(qualified(abs_block(block))),
+        sizes: None,
     }]
 }
 

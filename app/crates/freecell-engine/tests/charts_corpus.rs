@@ -63,7 +63,8 @@ fn generated_corpus_opens_and_every_type_classifies_and_is_retained() {
     let path = dir.path().join("corpus.xlsx");
     let manifest = write_corpus_fixture(&path).unwrap();
 
-    // The workbook opens despite carrying surface/radar/stock/bubble/3-D charts + a garbage part.
+    // The workbook opens despite carrying surface/radar/stock/3-D charts + a garbage part (and now a
+    // rendered bubble type).
     assert_opens_in_ironcalc(&path);
 
     // Every chart is RETAINED (nothing dropped): one spec per corpus chart, in document order.

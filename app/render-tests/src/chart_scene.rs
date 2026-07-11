@@ -15,7 +15,7 @@
 use freecell_chart_model::{
     Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartKind, Color, DataLabels, DataPoint,
     Grouping, Legend, LegendPosition, LineStroke, Marker, MarkerSymbol, ScatterStyle, Series,
-    ThemeSlot,
+    SizeRepresentation, ThemeSlot,
 };
 
 /// One capturable chart fixture: a chart, and the (tight) capture viewport in device px. `name`
@@ -78,6 +78,9 @@ pub fn all() -> Vec<ChartScene> {
         chart_scatter_markers(),
         chart_scatter_line_markers(),
         chart_scatter_wide_x(),
+        // P26 — bubble (XY + size).
+        chart_bubble_multi(),
+        chart_bubble_size_clamp(),
     ]
 }
 
@@ -1163,6 +1166,75 @@ fn chart_scatter_wide_x() -> ChartScene {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// P26 — bubble (XY + size) scenes
+// -------------------------------------------------------------------------------------------------
+
+/// The bread-and-butter **multi-series** bubble (area-encoded sizes): two series of `(x, y, size)`
+/// points over **two numeric axes**, distinct series colors, title / both axis titles / right legend.
+/// Proves the two independent nice-tick numeric scales + the √-area sized, translucent bubble cloud.
+fn chart_bubble_multi() -> ChartScene {
+    let chart = Chart {
+        title: Some("Market Segments".into()),
+        kind: ChartKind::Bubble {
+            size_representation: SizeRepresentation::Area,
+        },
+        series: vec![
+            Series::bubble(
+                Some("North"),
+                vec![2.0, 4.0, 5.5, 7.0, 8.5],
+                vec![18.0, 34.0, 26.0, 45.0, 38.0],
+                vec![10.0, 40.0, 22.0, 60.0, 30.0],
+            )
+            .with_color(Color::from_hex(0x4472C4)),
+            Series::bubble(
+                Some("South"),
+                vec![3.0, 4.5, 6.5, 8.0],
+                vec![52.0, 44.0, 60.0, 55.0],
+                vec![48.0, 18.0, 34.0, 25.0],
+            )
+            .with_color(Color::from_hex(0xED7D31)),
+        ],
+        cat_axis: Axis::titled("Reach"),
+        val_axis: Axis::titled("Growth"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_bubble_multi",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A single-series bubble spanning a **very small to very large** size (2 → 900) — proving the
+/// min/max radius clamp: the tiniest size stays a legible dot and the biggest is capped so it can't
+/// swamp the plot (rather than scaling linearly off the chart).
+fn chart_bubble_size_clamp() -> ChartScene {
+    let chart = Chart {
+        title: Some("Size Clamp".into()),
+        kind: ChartKind::Bubble {
+            size_representation: SizeRepresentation::Area,
+        },
+        series: vec![Series::bubble(
+            Some("Samples"),
+            vec![1.0, 2.5, 4.0, 5.5, 7.0],
+            vec![20.0, 35.0, 28.0, 44.0, 32.0],
+            // A tiny value next to a huge one: the clamp keeps the tiny one visible and the huge one
+            // bounded (both hit the radius rails).
+            vec![2.0, 60.0, 180.0, 420.0, 900.0],
+        )
+        .with_color(Color::from_hex(0x2E8B57))],
+        cat_axis: Axis::titled("Trial"),
+        val_axis: Axis::titled("Score"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_bubble_size_clamp",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,6 +1615,42 @@ mod tests {
         assert!(
             max_x > 100.0,
             "wide-X scene must span a non-trivial numeric X domain, got max {max_x}"
+        );
+    }
+
+    #[test]
+    fn p26_scenes_carry_their_bubble_kind() {
+        // Every new bubble scene is a `ChartKind::Bubble` whose series carry per-point sizes.
+        for name in ["chart_bubble_multi", "chart_bubble_size_clamp"] {
+            let s = get(name).unwrap_or_else(|| panic!("{name} scene"));
+            assert!(
+                matches!(s.chart.kind, ChartKind::Bubble { .. }),
+                "{name} must be a bubble"
+            );
+            assert!(
+                s.chart
+                    .series
+                    .iter()
+                    .all(|ser| matches!(ser.data, SeriesData::Xy { size: Some(_), .. })),
+                "{name} series must be bubble xy+size"
+            );
+        }
+
+        // The clamp scene spans a wide size range (tiny next to huge) — the property the clamp guards.
+        let clamp = get("chart_bubble_size_clamp").unwrap();
+        let sizes = match &clamp.chart.series[0].data {
+            SeriesData::Xy {
+                size: Some(sizes), ..
+            } => sizes.clone(),
+            other => panic!("expected bubble xy+size, got {other:?}"),
+        };
+        let (lo, hi) = (
+            sizes.iter().copied().fold(f64::MAX, f64::min),
+            sizes.iter().copied().fold(f64::MIN, f64::max),
+        );
+        assert!(
+            hi / lo > 50.0,
+            "clamp scene must span a wide size ratio, got {lo}..{hi}"
         );
     }
 }

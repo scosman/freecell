@@ -54,6 +54,10 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../../assets/icons/chart-bar.svg"),
     ),
     (
+        "icons/chart-bubble.svg",
+        include_bytes!("../../assets/icons/chart-bubble.svg"),
+    ),
+    (
         "icons/chart-column.svg",
         include_bytes!("../../assets/icons/chart-column.svg"),
     ),

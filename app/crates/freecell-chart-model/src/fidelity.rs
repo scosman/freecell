@@ -49,7 +49,9 @@
 //! marker on **those** groups, or a shown label on a non-line group, still degrades (a wrong chart
 //! must keep its badge). A **smoothed** scatter (`c:scatterStyle val="smooth"`/`"smoothMarker"`)
 //! renders as **straight** segments → Degraded ([`unsupported_scatter_smooth`], P25), the honest
-//! badge for the straight-segment fallback. A **per-point** `c:dLbl` override degrades on any group (we draw
+//! badge for the straight-segment fallback. A **3-D bubble** (`c:bubble3D val="1"`) renders as flat
+//! 2-D circles → Degraded ([`unsupported_bubble_3d`], P26); `c:sizeRepresents` (area/width) is
+//! honored, so it stays Faithful. A **per-point** `c:dLbl` override degrades on any group (we draw
 //! uniform series labels, not per-point ones). `c:numFmt` is now **scoped to codes we approximate**:
 //! P6/P12 apply a **bounded** subset to ticks + labels, so a code we render exactly (`General`,
 //! percent, thousands, decimals, currency) is Faithful and only a code we fall back on (dates /
@@ -208,6 +210,16 @@ fn has_render_affecting_unsupported_feature(xml: &str) -> bool {
         || unsupported_data_point(xml)
         || unsupported_marker(xml)
         || unsupported_scatter_smooth(xml)
+        || unsupported_bubble_3d(xml)
+}
+
+/// A **3-D** bubble the renderer draws flat (P26). The bubble renderer draws flat 2-D circles, so a
+/// `c:bubble3D val="1"`/`"true"` renders without its 3-D shading → Degraded (an honest badge, not a
+/// silent flatten). Excel writes `<c:bubble3D val="0"/>` for a normal 2-D bubble (group-level and
+/// per-series), which is benign; only the truthy form degrades. `c:sizeRepresents` (area/width) is
+/// **honored** by the renderer, so it never degrades.
+fn unsupported_bubble_3d(xml: &str) -> bool {
+    is_bubble_chart(xml) && any_opening_tag(xml, "bubble3D", val_is_true)
 }
 
 /// A **smoothed** scatter the renderer draws straight (P25). The scatter renderer approximates
@@ -430,6 +442,13 @@ fn is_scatter_chart(xml: &str) -> bool {
     contains_element(xml, "scatterChart")
 }
 
+/// Whether the source contains a 2-D `c:bubbleChart` group — the group whose renderer draws sized
+/// circles over two numeric axes (P26). Boundary-aware. Used to scope the `c:bubble3D` degrade
+/// (`unsupported_bubble_3d`) to bubble charts.
+fn is_bubble_chart(xml: &str) -> bool {
+    contains_element(xml, "bubbleChart")
+}
+
 /// A truthy OOXML boolean `val` attribute (`1` or `true`).
 fn val_is_true(attrs: &str) -> bool {
     matches!(attr_value(attrs, "val"), Some("1") | Some("true"))
@@ -572,6 +591,7 @@ mod tests {
             "<c:pieChart/>",
             "<c:doughnutChart><c:holeSize val=\"50\"/></c:doughnutChart>",
             "<c:scatterChart/>",
+            "<c:bubbleChart><c:sizeRepresents val=\"area\"/></c:bubbleChart>",
         ] {
             assert_eq!(
                 source_fidelity(group),
@@ -1021,6 +1041,42 @@ mod tests {
                 "expected Degraded for {degraded}"
             );
         }
+    }
+
+    #[test]
+    fn p26_bubble_faithful_but_3d_degrades() {
+        // The P26 bubble renderer honors two numeric axes, √-area/width size encoding, and
+        // `c:sizeRepresents` (area/width) → Faithful (with either representation, and a benign 2-D
+        // `c:bubble3D val="0"`).
+        for faithful in [
+            "<c:bubbleChart><c:ser><c:bubbleSize><c:numRef/></c:bubbleSize></c:ser><c:sizeRepresents val=\"area\"/></c:bubbleChart>",
+            "<c:bubbleChart><c:sizeRepresents val=\"w\"/></c:bubbleChart>",
+            "<c:bubbleChart><c:ser><c:bubble3D val=\"0\"/></c:ser></c:bubbleChart>",
+        ] {
+            assert_eq!(
+                source_fidelity(faithful),
+                Fidelity::Faithful,
+                "expected Faithful for {faithful}"
+            );
+        }
+        // But a 3-D bubble is drawn flat → Degraded (honest badge for the flatten).
+        for degraded in [
+            "<c:bubbleChart><c:bubble3D val=\"1\"/></c:bubbleChart>",
+            "<c:bubbleChart><c:ser><c:bubble3D val=\"true\"/></c:ser></c:bubbleChart>",
+        ] {
+            assert_eq!(
+                source_fidelity(degraded),
+                Fidelity::Degraded,
+                "expected Degraded for {degraded}"
+            );
+        }
+        // `c:bubble3D` is bubble-scoped: it never appears on other groups, but the scoping guard
+        // means a stray bubble3D on a non-bubble group is ignored (no false badge from this check).
+        assert_eq!(
+            source_fidelity("<c:lineChart><c:bubble3D val=\"1\"/></c:lineChart>"),
+            Fidelity::Faithful,
+            "bubble3D is scoped to bubbleChart"
+        );
     }
 
     #[test]

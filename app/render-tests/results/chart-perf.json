@@ -4,31 +4,31 @@
     "os": "linux",
     "arch": "x86_64",
     "cores": 4,
-    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
     "renderer": "assumed Mesa lavapipe / software Vulkan (ICD presence enforced by perf.sh) — CPU render-build path measured; GPU present NOT measured",
     "profile": "release",
-    "commit": "4805d46 (+uncommitted render scene)"
+    "commit": "6ae1f07 (+uncommitted P26)"
   },
   "note": "chart perf: headless CPU render/engine path. P11 ops (first-paint/edit-rerender/scroll) + P15 many-line-charts (open at scale) and large-series (paint-prep + down-sample). Scroll/large-series prep are reported vs the repo's frame budgets for reference.",
   "ops": {
     "first_paint": {
       "count": 280,
-      "p50_ns": 610294,
-      "p99_ns": 719896,
-      "max_ns": 751900,
-      "p50": "610.29 µs",
-      "p99": "719.90 µs",
-      "max": "751.90 µs"
+      "p50_ns": 384702,
+      "p99_ns": 613219,
+      "max_ns": 657609,
+      "p50": "384.70 µs",
+      "p99": "613.22 µs",
+      "max": "657.61 µs"
     },
     "edit_rerender": {
       "count": 2800,
-      "p50_ns": 2422,
-      "p99_ns": 4302,
-      "max_ns": 33544,
-      "p50": "2.42 µs",
-      "p99": "4.30 µs",
-      "max": "33.54 µs"
+      "p50_ns": 1960,
+      "p99_ns": 3166,
+      "max_ns": 24294,
+      "p50": "1.96 µs",
+      "p99": "3.17 µs",
+      "max": "24.29 µs"
     },
     "scroll_with_k": {
       "k": 1000,
@@ -38,24 +38,24 @@
       "reference_frame_worst_ns": 16666667,
       "stats": {
         "count": 4360,
-        "p50_ns": 8539,
-        "p99_ns": 23390,
-        "max_ns": 52294,
-        "p50": "8.54 µs",
-        "p99": "23.39 µs",
-        "max": "52.29 µs"
+        "p50_ns": 6334,
+        "p99_ns": 9888,
+        "max_ns": 33194,
+        "p50": "6.33 µs",
+        "p99": "9.89 µs",
+        "max": "33.19 µs"
       }
     },
     "many_line_charts_open": {
       "k": 200,
       "stats": {
         "count": 110,
-        "p50_ns": 15650581,
-        "p99_ns": 19495841,
-        "max_ns": 20093238,
-        "p50": "15.65 ms",
-        "p99": "19.50 ms",
-        "max": "20.09 ms"
+        "p50_ns": 11147434,
+        "p99_ns": 13796718,
+        "max_ns": 13847005,
+        "p50": "11.15 ms",
+        "p99": "13.80 ms",
+        "max": "13.85 ms"
       }
     },
     "large_series": {
@@ -66,30 +66,56 @@
       "reference_frame_worst_ns": 16666667,
       "downsample": {
         "count": 280,
-        "p50_ns": 360405,
-        "p99_ns": 439355,
-        "max_ns": 458161,
-        "p50": "360.40 µs",
-        "p99": "439.36 µs",
-        "max": "458.16 µs"
+        "p50_ns": 348871,
+        "p99_ns": 375445,
+        "max_ns": 380581,
+        "p50": "348.87 µs",
+        "p99": "375.44 µs",
+        "max": "380.58 µs"
       },
       "paint_prep_full_n": {
         "count": 280,
-        "p50_ns": 470562,
-        "p99_ns": 526587,
-        "max_ns": 1058399,
-        "p50": "470.56 µs",
-        "p99": "526.59 µs",
-        "max": "1.06 ms"
+        "p50_ns": 288752,
+        "p99_ns": 365205,
+        "max_ns": 397857,
+        "p50": "288.75 µs",
+        "p99": "365.20 µs",
+        "max": "397.86 µs"
       },
       "paint_prep_downsampled": {
         "count": 280,
-        "p50_ns": 11014,
-        "p99_ns": 28578,
-        "max_ns": 41263,
-        "p50": "11.01 µs",
-        "p99": "28.58 µs",
-        "max": "41.26 µs"
+        "p50_ns": 7221,
+        "p99_ns": 18465,
+        "max_ns": 20334,
+        "p50": "7.22 µs",
+        "p99": "18.46 µs",
+        "max": "20.33 µs"
+      }
+    },
+    "bubble_scatter_cloud": {
+      "n_points_retained_for_save": 100000,
+      "marks_painted": 2048,
+      "max_paint_markers": 2048,
+      "reference_frame_target_ns": 8333333,
+      "reference_frame_worst_ns": 16666667,
+      "note": "GAPS C-P25-1: scatter/bubble paint one mark per point; cap_markers_for_paint bounds it to <= max_paint_markers (identity below the cap, so no baseline moves).",
+      "paint_prep_full_n": {
+        "count": 280,
+        "p50_ns": 1045812,
+        "p99_ns": 1099699,
+        "max_ns": 1226382,
+        "p50": "1.05 ms",
+        "p99": "1.10 ms",
+        "max": "1.23 ms"
+      },
+      "paint_prep_capped": {
+        "count": 280,
+        "p50_ns": 21750,
+        "p99_ns": 37120,
+        "max_ns": 48587,
+        "p50": "21.75 µs",
+        "p99": "37.12 µs",
+        "max": "48.59 µs"
       }
     }
   }

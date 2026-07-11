@@ -854,8 +854,8 @@ pub struct CorpusChart {
 
 /// Writes a valid, IronCalc-openable single-sheet workbook to `path` whose one drawing anchors a
 /// broad **corpus** of chart types + edge cases — every supported group (line/column/bar/area/pie/
-/// doughnut/scatter), every 3-D group (→ degraded 2-D), every truly-unsupported group (surface/
-/// radar/stock/ofPie/bubble), and parse edge cases (unresolved `c:f`, empty range, non-numeric
+/// doughnut/scatter/bubble), every 3-D group (→ degraded 2-D), every truly-unsupported group (surface/
+/// radar/stock/ofPie), and parse edge cases (unresolved `c:f`, empty range, non-numeric
 /// cell, a groupless chartSpace, a non-XML "garbage" part). Returns the manifest of expected
 /// classifications, in the drawing's document order — the order `discover_and_parse` returns them.
 pub fn write_corpus_fixture(path: &Path) -> Result<Vec<CorpusChart>> {
@@ -978,9 +978,11 @@ pub fn write_corpus_fixture(path: &Path) -> Result<Vec<CorpusChart>> {
             Unsupported,
         ),
         (
+            // Bubble is a rendered type as of P26 (scatter + bubbleSize) — Faithful, parses into a
+            // typed `ChartKind::Bubble`.
             "bubble",
             xy_group_chart("Bubble", "<c:bubbleChart>", "</c:bubbleChart>"),
-            Unsupported,
+            Faithful,
         ),
         // --- Parse edge cases (functional_spec §7). ---
         ("unresolved_cf", unresolved_cf_line_chart(), Faithful),
@@ -1446,6 +1448,7 @@ pub fn write_authored_line_fixture(path: &Path) -> Result<()> {
             name: Some("Sheet1!$C$1".into()),
             categories: Some("Sheet1!$A$1:$A$4".into()),
             values: Some("Sheet1!$B$1:$B$4".into()),
+            sizes: None,
         }],
     };
 

@@ -90,9 +90,9 @@ const CHART_INSERT_COLS: u32 = 8;
 const CHART_INSERT_ROWS: u32 = 15;
 
 /// The action-bar chart-insert menu entries — `(kind, icon path, label)`, in menu order
-/// (`ui_design §3.1`). Bubble is omitted (no `ChartKind`/renderer yet); the rest each author a
-/// near-empty chart of that type.
-const CHART_MENU: [(ChartInsertKind, &str, &str); 7] = [
+/// (`ui_design §3.1`). Every [`ChartInsertKind`] authors a near-empty chart of that type (bubble
+/// landed as the final type in P26).
+const CHART_MENU: [(ChartInsertKind, &str, &str); 8] = [
     (ChartInsertKind::Line, "icons/chart-line.svg", "Line"),
     (ChartInsertKind::Column, "icons/chart-column.svg", "Column"),
     (ChartInsertKind::Bar, "icons/chart-bar.svg", "Bar"),
@@ -108,6 +108,7 @@ const CHART_MENU: [(ChartInsertKind, &str, &str); 7] = [
         "icons/chart-scatter.svg",
         "Scatter",
     ),
+    (ChartInsertKind::Bubble, "icons/chart-bubble.svg", "Bubble"),
 ];
 
 /// The action-row dropdown/popover triggers whose panel anchors under the button. The buttons are

@@ -38,10 +38,15 @@ use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
-use freecell_core::{Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign};
+use freecell_core::{
+    limits, Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign,
+};
+
+use freecell_chart_model::{Anchor as ChartAnchor, AnchorCell};
 
 use freecell_engine::{
-    BorderLine, BorderPreset, Command, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
+    BorderLine, BorderPreset, ChartInsertKind, Command, EditRejectedReason, StyleAttr, StylePath,
+    WorkerEvent,
 };
 
 use super::{
@@ -75,6 +80,32 @@ const TARGET_ICON_DARK: u32 = 0x1F1F1F;
 
 const ACTION_ROW_H: f32 = 36.0;
 
+/// The default footprint (in cells) of a chart inserted from the action bar — a typical Excel
+/// default chart size (~8 columns × 15 rows), anchored at the active cell (`ui_design §3.1`).
+const CHART_INSERT_COLS: u32 = 8;
+const CHART_INSERT_ROWS: u32 = 15;
+
+/// The action-bar chart-insert menu entries — `(kind, icon path, label)`, in menu order
+/// (`ui_design §3.1`). Bubble is omitted (no `ChartKind`/renderer yet); the rest each author a
+/// near-empty chart of that type.
+const CHART_MENU: [(ChartInsertKind, &str, &str); 7] = [
+    (ChartInsertKind::Line, "icons/chart-line.svg", "Line"),
+    (ChartInsertKind::Column, "icons/chart-column.svg", "Column"),
+    (ChartInsertKind::Bar, "icons/chart-bar.svg", "Bar"),
+    (ChartInsertKind::Area, "icons/chart-area.svg", "Area"),
+    (ChartInsertKind::Pie, "icons/chart-pie.svg", "Pie"),
+    (
+        ChartInsertKind::Doughnut,
+        "icons/chart-doughnut.svg",
+        "Doughnut",
+    ),
+    (
+        ChartInsertKind::Scatter,
+        "icons/chart-scatter.svg",
+        "Scatter",
+    ),
+];
+
 /// The action-row dropdown/popover triggers whose panel anchors under the button. The buttons are
 /// content-sized (their labels — font family, size, number-format category — change width), so a
 /// popover's x-offset can't be a fixed constant (BUG 2c); each trigger's real laid-out left edge is
@@ -88,8 +119,9 @@ enum Anchor {
     Fill = 3,
     Borders = 4,
     NumFmt = 5,
+    Chart = 6,
 }
-const ANCHOR_COUNT: usize = 6;
+const ANCHOR_COUNT: usize = 7;
 
 impl Anchor {
     fn idx(self) -> usize {
@@ -103,8 +135,10 @@ impl Anchor {
 /// document window (1200 px) is far wider. Phase 6 added the borders button (~64 px) + a divider
 /// (816 → 896); the formatting-expansion project adds strikethrough + wrap toggles and the
 /// three-button vertical-align group + a divider (~180 px → 896 → 1080). Recorded in
-/// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips.
-const ACTION_ROW_MIN_W: f32 = 1080.0;
+/// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips. P17 adds the
+/// insert-chart trigger + a divider (~65 px → 1080 → 1145); still far under the 1200 px document
+/// window.
+const ACTION_ROW_MIN_W: f32 = 1152.0;
 
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
@@ -194,6 +228,9 @@ pub struct ChromeView {
     text_color_picker: Entity<ColorPickerState>,
     /// The number-format dropdown's open state (a `ChromeView`-owned menu panel).
     num_fmt_open: bool,
+    /// The chart-insert menu's open state (the action-bar chart-type glyph menu, P17). Like the
+    /// other formatting popovers it closes on click-away / a type pick / degrade.
+    chart_menu_open: bool,
     /// The installed font-family names for the family dropdown, fetched once at build
     /// (`cx.text_system().all_font_names()`), sorted-unique with "Default (Inter)" prepended
     /// (`components/action_bar.md`). `Rc` so the render closure can clone it cheaply.
@@ -312,6 +349,7 @@ impl ChromeView {
             text_color_open: false,
             text_color_picker,
             num_fmt_open: false,
+            chart_menu_open: false,
             anchor_x: [0.0; ANCHOR_COUNT],
             font_names,
             font_family_open: false,
@@ -1046,6 +1084,64 @@ impl ChromeView {
         cx.notify();
     }
 
+    // ---- Action row: insert chart (P17) ---------------------------------------------------
+
+    fn toggle_chart_menu(&mut self, cx: &mut Context<Self>) {
+        self.chart_menu_open = !self.chart_menu_open;
+        cx.notify();
+    }
+
+    /// Inserts a **near-empty authored chart** of `kind` onto the active sheet, anchored at the
+    /// active cell (`ui_design §3.1`). This is a **mutating action-row control**, so it follows the
+    /// same contract as every sibling (toggle style, fill, text color, decimals, font, borders): it
+    /// closes the menu, then **commits any pending in-cell edit first and bails if the commit is
+    /// blocked** (a cap-rejected edit stays editing), so the worker's subsequent publish + grid
+    /// refresh can't clobber a dangling uncommitted cell edit. Degraded-guarded (a backstop to the
+    /// disabled trigger). Fire-and-forget: the worker holds the authored chart + republishes it.
+    pub fn insert_chart(
+        &mut self,
+        kind: ChartInsertKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chart_menu_open = false;
+        if self.degraded {
+            return;
+        }
+        if !self.commit_pending_edit(window, cx) {
+            return; // an invalid pending edit blocks the insert, keeping the field editing
+        }
+        self.client.send(Command::InsertChart {
+            sheet: self.active_sheet,
+            kind,
+            anchor: self.default_chart_anchor(),
+        });
+        cx.notify();
+    }
+
+    /// A default chart placement: the [`CHART_INSERT_COLS`]×[`CHART_INSERT_ROWS`] rectangle from the
+    /// active cell, clamped to the sheet edge so the anchor stays on-sheet.
+    fn default_chart_anchor(&self) -> ChartAnchor {
+        let active = self.selection.active;
+        let to_col = active
+            .col
+            .saturating_add(CHART_INSERT_COLS)
+            .min(limits::MAX_COLS - 1);
+        let to_row = active
+            .row
+            .saturating_add(CHART_INSERT_ROWS)
+            .min(limits::MAX_ROWS - 1);
+        ChartAnchor::new(
+            AnchorCell::new(active.col, active.row),
+            AnchorCell::new(to_col, to_row),
+        )
+    }
+
+    /// Whether the chart-insert menu is open (test/render introspection).
+    pub fn chart_menu_open(&self) -> bool {
+        self.chart_menu_open
+    }
+
     // ---- Action row: SetFont (family + size) ----------------------------------------------
 
     /// Sends one `SetFont` over the selection after committing any pending edit (fire-and-forget,
@@ -1280,6 +1376,7 @@ impl ChromeView {
                 self.font_family_open = false;
                 self.font_size_open = false;
                 self.borders_open = false;
+                self.chart_menu_open = false;
             }
             cx.notify();
         }
@@ -2171,6 +2268,25 @@ impl ChromeView {
                         this.bump_decimals(-1, window, cx);
                     })),
             )
+            .child(action_divider())
+            // Insert-chart menu — the action-bar chart-type glyph menu (`ui_design.md §3.1`, P17).
+            .child(
+                self.anchored_trigger(
+                    Anchor::Chart,
+                    Button::new("insert-chart")
+                        .icon(Icon::empty().path("icons/chart-column.svg"))
+                        .label("▾")
+                        .tooltip("Insert chart")
+                        .ghost()
+                        .small()
+                        .disabled(disabled)
+                        .selected(self.chart_menu_open)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_chart_menu(cx);
+                        })),
+                    cx,
+                ),
+            )
             // Right-aligned evaluating spinner (`ui_design.md §3.1`).
             .child(div().flex_1())
             .when(self.eval.spinner(), |row| row.child(Spinner::new().small()))
@@ -2352,6 +2468,9 @@ impl ChromeView {
         }
         if self.num_fmt_open {
             overlays.push(self.render_num_fmt_popover(cx));
+        }
+        if self.chart_menu_open {
+            overlays.push(self.render_chart_menu(cx));
         }
         if self.font_family_open {
             overlays.push(self.render_font_family_popover(cx));
@@ -2644,6 +2763,61 @@ impl ChromeView {
                     // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
                     .occlude()
                     .debug_selector(|| "numfmt-card".into())
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    .bg(rgb(ACTIVE_TAB_BG))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded_md()
+                    .shadow_md()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
+    /// The chart-insert menu (P17, `ui_design.md §3.1`): a small panel of chart-type glyphs; picking
+    /// one inserts a near-empty authored chart of that type. Same backdrop/occlude/anchor pattern as
+    /// the number-format dropdown.
+    fn render_chart_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut menu = div().flex().flex_col().gap(px(2.0));
+        for (kind, icon_path, label) in CHART_MENU {
+            menu = menu.child(
+                Button::new(gpui::ElementId::Name(format!("chart-{label}").into()))
+                    .icon(Icon::empty().path(icon_path))
+                    .label(label)
+                    .debug_selector(move || format!("chart-menu-{label}"))
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.insert_chart(kind, window, cx);
+                    })),
+            );
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.chart_menu_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(ACTION_ROW_H))
+                    .left(px(self.anchor_x[Anchor::Chart.idx()]))
+                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
+                    .occlude()
+                    .debug_selector(|| "chart-menu-card".into())
                     .flex()
                     .flex_col()
                     .p_1()
@@ -3720,6 +3894,108 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // ---- Action row: insert chart (P17) ---------------------------------------------------
+
+    /// Criterion #1: inserting a chart is a mutating action-row control — it commits any pending
+    /// in-cell edit FIRST (the same rule as every sibling), so the worker's subsequent publish +
+    /// grid refresh can't clobber a dangling edit.
+    #[gpui::test]
+    fn insert_chart_commits_pending_edit_first(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.test_type("=A1", window, cx);
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.insert_chart(ChartInsertKind::Line, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        // The pending edit commits FIRST, then the chart insert.
+        assert!(
+            matches!(cmds.first(), Some(Command::SetCellInput { input, .. }) if input == "=A1"),
+            "pending edit committed first, got {cmds:?}"
+        );
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::InsertChart {
+                kind: ChartInsertKind::Line,
+                ..
+            }
+        )));
+    }
+
+    /// Criterion #1 (blocking half): a cap-rejected pending edit blocks the insert — no
+    /// `InsertChart` is sent and the field stays editing, so the invalid edit isn't clobbered.
+    #[gpui::test]
+    fn cap_rejected_edit_blocks_insert_chart(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        let huge = format!("={}", "1".repeat(MAX_INPUT_LEN));
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.test_type(&huge, window, cx);
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.insert_chart(ChartInsertKind::Line, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command::InsertChart { .. })),
+            "a cap-rejected pending edit blocks the insert, got {cmds:?}"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    /// Inserting anchors the chart at the active cell (8×15 cells) on the active sheet.
+    #[gpui::test]
+    fn insert_chart_sends_command_for_active_sheet_from_active_cell(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(3, 2)), window, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.insert_chart(ChartInsertKind::Column, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        let inserted = cmds.iter().find_map(|cmd| match cmd {
+            Command::InsertChart {
+                sheet,
+                kind,
+                anchor,
+            } => Some((*sheet, *kind, *anchor)),
+            _ => None,
+        });
+        let (sheet, kind, anchor) = inserted.expect("an InsertChart command was sent");
+        assert_eq!(sheet, SheetId(0));
+        assert_eq!(kind, ChartInsertKind::Column);
+        // From the active cell (col 2, row 3), spanning 8 cols × 15 rows.
+        assert_eq!((anchor.from.col, anchor.from.row), (2, 3));
+        assert_eq!((anchor.to.col, anchor.to.row), (2 + 8, 3 + 15));
+    }
+
+    /// Criterion #2 (disabled-in-degraded parity): OPEN the chart menu, THEN degrade — the menu
+    /// must close (so a type glyph can't be clicked after the trigger disables), mirroring how the
+    /// other formatting popovers close on degrade.
+    #[gpui::test]
+    fn degrade_closes_open_chart_menu(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| c.toggle_chart_menu(cx));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.chart_menu_open()),
+            "the chart menu opened"
+        );
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.chart_menu_open()),
+            "degrading closes the open chart menu"
+        );
+        assert!(upd(&h, cx, |c, _w, _cx| c.is_degraded()));
     }
 
     // ---- Action row: SetStylePath (text color, alignment, number format) ------------------

@@ -31,8 +31,11 @@ use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
+use freecell_chart_model::{Anchor, ChartInsertKind, ChartSpec};
+
 use crate::cache;
 use crate::chart::binding::{CellData, ChartBindings};
+use crate::chart::write::AuthoredChart;
 use crate::document::{DocumentSource, FontFlag, SaveError, WorkbookDocument};
 use std::path::Path;
 
@@ -100,6 +103,20 @@ struct ClipboardSlot {
     cut: bool,
 }
 
+/// One **authored** chart the worker holds (P17, charts/write-path §1 mode 3). Distinct from the
+/// loaded [`ChartBindings`]: an authored chart is **snapshot-but-not-live** — it rides the published
+/// [`ChartSnapshot`] so the grid renders it, but it carries no `c:f` binding yet (ranges arrive in
+/// P19), so it is **never** touched by the dirty-set re-resolve and is saved by the
+/// **write-from-model** path ([`write::write_authored_charts`](crate::chart::write::write_authored_charts)),
+/// never the loaded re-inject. `spec.origin` is always [`Authored`](freecell_chart_model::Origin::Authored).
+struct AuthoredEntry {
+    /// The worksheet the chart is anchored on (keys the published snapshot; resolved to the current
+    /// worksheet name at save time, so an in-session rename follows and a deleted host drops it).
+    anchor_sheet: SheetId,
+    /// The authored render envelope (a `ChartSpec::authored`, no retained source).
+    spec: ChartSpec,
+}
+
 /// The outcome of a guarded paste (`run_guarded_paste`): applied (with the pasted 0-based
 /// rectangle the engine re-selected), a clean engine error, or a caught panic.
 enum PasteOutcome {
@@ -158,6 +175,10 @@ pub(super) struct Worker {
     /// The live-bound charts this workbook owns (P9, charts/architecture §4.1) — the range→chart
     /// index the worker re-resolves on edit. Empty for a new/unopened or chart-less workbook.
     charts: ChartBindings,
+    /// The **authored** (in-app inserted) charts this workbook owns (P17), held separately from the
+    /// loaded [`charts`](Self::charts): they ride the published snapshot but are never re-resolved
+    /// (no binding yet) and are saved via the write-from-model path, not the loaded re-inject.
+    authored_charts: Vec<AuthoredEntry>,
     /// The published [`ChartSnapshot`] version — bumped on load (when charts exist) and on each
     /// dirty re-resolve, so the UI installs charts only when they actually change.
     chart_version: u64,
@@ -227,6 +248,7 @@ impl Worker {
             redo_touches: Vec::new(),
             clipboard: None,
             charts: ChartBindings::default(),
+            authored_charts: Vec::new(),
             chart_version: 0,
             chart_source_path: match &source {
                 DocumentSource::OpenFile(path) => Some(path.clone()),
@@ -301,6 +323,9 @@ impl Worker {
         // diff-lists (one style paste + K row-height runs), so the touch-set must stay 1:1 with
         // the undo stack — they can't ride the generic coalesced edit path.
         let mut font_ops: Vec<Command> = Vec::new();
+        // Chart inserts (`InsertChart`) also run one-by-one after the edit batch: each mutates the
+        // authored-chart set + republishes the chart snapshot (P17); it is not an IronCalc edit.
+        let mut insert_chart_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
         // Every sheet activated in this drained batch (in order), so lazy chart discovery walks
         // EACH one — not just the batch's final active sheet (a batch that activates A then B must
@@ -332,6 +357,7 @@ impl Worker {
                 | Command::PasteInternal { .. }
                 | Command::PasteTsv { .. }) => clipboard_ops.push(clip),
                 font @ Command::SetFont { .. } => font_ops.push(font),
+                insert @ Command::InsertChart { .. } => insert_chart_ops.push(insert),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
                 | Command::SetStyleAttr { .. }
@@ -394,6 +420,19 @@ impl Worker {
             } = font
             {
                 self.apply_set_font(sheet, range, family, size_pt);
+            }
+        }
+
+        // Chart inserts after the edit batch (each is standalone: it pushes an authored chart +
+        // republishes the chart snapshot; not an IronCalc edit, so it rides no undo/touch entry).
+        for insert in insert_chart_ops {
+            if let Command::InsertChart {
+                sheet,
+                kind,
+                anchor,
+            } = insert
+            {
+                self.insert_authored_chart(sheet, kind, anchor);
             }
         }
 
@@ -1411,34 +1450,166 @@ impl Worker {
         // — otherwise a chart on a sheet the user never scrolled to would be silently dropped by the
         // chart-less writer.
         self.ensure_all_charts_discovered();
-        let Some(original) = self.chart_source_path.clone() else {
-            return self.doc.save(path); // never opened from a file → nothing to re-inject
-        };
-        if self.charts.is_empty() {
-            return self.doc.save(path); // opened file has no charts → unchanged save path
+
+        // Mode 1/2 (loaded re-inject) applies only to a workbook opened from a file that still
+        // carries loaded charts; mode 3 (authored write-from-model) applies to any inserted chart.
+        let reinject_source = self
+            .chart_source_path
+            .clone()
+            .filter(|_| !self.charts.is_empty());
+        let has_authored = !self.authored_charts.is_empty();
+
+        // No charts at all → the plain (chart-less) writer, byte-identical to the pre-chart path.
+        if reinject_source.is_none() && !has_authored {
+            return self.doc.save(path);
         }
 
-        let model_bytes = self.doc.to_xlsx_bytes()?;
-        // Each chart's host worksheet is resolved through its stable anchor `SheetId` → CURRENT name,
-        // so a renamed sheet still maps and a deleted one drops gracefully (never a save failure).
-        let live = self.charts.live_charts(|id| self.sheet_name_of(id));
-        let (final_bytes, _report) =
-            crate::chart::reinject_live_charts(&original, &model_bytes, &live)
+        let mut bytes = self.doc.to_xlsx_bytes()?;
+
+        // Mode 1/2: re-inject the LOADED charts (byte-preserve unedited, patch edited-loaded) from
+        // the original file into the current model body. Each chart's host worksheet resolves
+        // through its stable anchor `SheetId` → CURRENT name (rename-safe; a deleted host drops).
+        if let Some(original) = &reinject_source {
+            let live = self.charts.live_charts(|id| self.sheet_name_of(id));
+            let (reinjected, _report) = crate::chart::reinject_live_charts(original, &bytes, &live)
                 .map_err(|e| SaveError::Serialize(format!("charts couldn't be saved: {e:#}")))?;
-        crate::document::write_xlsx_bytes_atomic(path, &final_bytes)?;
-        // The written file now carries every chart part + drawing — a valid source for re-injecting
-        // on the next save (e.g. after a Save-As, even if the original is later removed).
-        self.chart_source_path = Some(path.to_path_buf());
+            bytes = reinjected;
+        }
+
+        // Mode 3: synthesize the AUTHORED charts on top (write-from-model). This runs AFTER the
+        // loaded re-inject, so an authored chart on a sheet that already carries a loaded chart's
+        // drawing hits `write_authored_charts`' fail-loud precondition (merging into an existing
+        // drawing is not yet supported) — surfaced here as a `SaveError`, never a silent drop or a
+        // double `<drawing>` (charts/architecture §6). The two save reports (`SaveReport` vs
+        // `AuthoredWriteReport`) stay distinct — a written-from-scratch chart is never conflated with
+        // a byte-preserved one.
+        if has_authored {
+            let authored = self.authored_write_list(&bytes);
+            if !authored.is_empty() {
+                let (written, _report) = crate::chart::write_authored_charts(&bytes, &authored)
+                    .map_err(|e| {
+                        SaveError::Serialize(format!("authored charts couldn't be saved: {e:#}"))
+                    })?;
+                bytes = written;
+            }
+        }
+
+        crate::document::write_xlsx_bytes_atomic(path, &bytes)?;
+
+        // Advance the re-inject source to the just-saved file ONLY when there are no authored charts
+        // — the saved file is then a self-contained superset of the LOADED charts, valid to
+        // re-inject from on the next save (surviving a Save-As away from a since-deleted original,
+        // P10). We must NOT point it at a file that also holds authored drawings: `reinject` carries
+        // every `xl/charts/*` + `xl/drawings/*` by prefix, so a resave would carry the authored parts
+        // AND re-synthesize them → duplicates. With authored charts present the source stays put, so
+        // each save re-synthesizes them fresh from `authored_charts`.
+        if !has_authored {
+            self.chart_source_path = Some(path.to_path_buf());
+        }
         Ok(())
     }
 
+    /// The authored charts as [`AuthoredChart`]s for the write-from-model save, resolving each one's
+    /// host worksheet name (dropping a chart whose host sheet was deleted in-session, like a loaded
+    /// chart) and assigning it a **free** `xl/charts/chartN.xml` part — one that collides with
+    /// neither an existing part in `package_bytes` (loaded charts already re-injected) nor another
+    /// authored chart. The chart carries no `c:f` refs yet (ranges arrive in P19), so `refs` is
+    /// empty and the serializer emits schema-valid literals.
+    fn authored_write_list(&self, package_bytes: &[u8]) -> Vec<AuthoredChart> {
+        let mut used = existing_chart_parts(package_bytes);
+        let mut out = Vec::new();
+        for entry in &self.authored_charts {
+            let Some(sheet_name) = self.sheet_name_of(entry.anchor_sheet) else {
+                tracing::warn!("dropping an authored chart whose host worksheet was deleted");
+                continue;
+            };
+            let Some(chart) = entry.spec.chart().cloned() else {
+                continue; // an authored chart always has a typed Chart; defensive
+            };
+            out.push(AuthoredChart {
+                sheet_name,
+                chart_part: next_chart_part(&mut used),
+                chart,
+                anchor: entry.spec.anchor,
+                refs: Vec::new(),
+            });
+        }
+        out
+    }
+
+    /// Insert a near-empty **authored** chart of `kind` onto `sheet` at `anchor` (P17,
+    /// charts/ui_design §3.1). A degraded worker rejects it (like every mutating op). Otherwise it
+    /// builds the template chart, holds it as an Authored [`ChartSpec`] (snapshot-but-not-live —
+    /// no `c:f` binding, so it never enters the dirty-set re-resolve), marks the document dirty, and
+    /// republishes the chart snapshot so the window's `sync_charts` installs it into the grid.
+    fn insert_authored_chart(&mut self, sheet: SheetId, kind: ChartInsertKind, anchor: Anchor) {
+        // A degraded worker refuses edits (consistent with the edit batch / paste / SetFont).
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        // The host sheet must exist (the UI only ever sends the active sheet; this is a backstop).
+        if self.resolve(sheet).is_none() {
+            tracing::warn!(sheet = sheet.0, "InsertChart onto a missing sheet ignored");
+            return;
+        }
+        self.authored_charts.push(AuthoredEntry {
+            anchor_sheet: sheet,
+            spec: ChartSpec::authored(kind.near_empty_chart(), anchor),
+        });
+        // Mark the document dirty so the unsaved chart can be saved. An insert is NOT an
+        // IronCalc-undoable op — it pushes no undo/touch entry (undo/delete of a chart is P18), so
+        // it never desyncs the undo/touch stacks; `ops_seen` is a monotonic committed-op counter
+        // consumed only by the dirty flag + the `Saved` ack.
+        self.ops_seen += 1;
+        self.shared
+            .committed_ops
+            .store(self.ops_seen, Ordering::Release);
+        // Publish the new chart on the same seam the loaded charts ride, so the window installs it.
+        self.chart_version += 1;
+        self.store_chart_snapshot();
+        self.emit(WorkerEvent::Published);
+    }
+
     /// Store the current bound charts as the published [`ChartSnapshot`] (charts/architecture §4.1),
-    /// riding the same wait-free `arc_swap` container as the cell publication.
+    /// riding the same wait-free `arc_swap` container as the cell publication. Merges the loaded
+    /// (live-bound) charts with the **authored** ones (P17) into per-sheet groups.
     fn store_chart_snapshot(&self) {
+        let sheets = if self.authored_charts.is_empty() {
+            // Fast path (no authored charts): share the worker's `Arc<[ChartSpec]>` allocations
+            // directly (P11 "off-screen free" — no per-publish deep copy of the loaded specs).
+            self.charts.specs_by_sheet()
+        } else {
+            self.charts_by_sheet_with_authored()
+        };
         self.shared.chart_snapshot.store(Arc::new(ChartSnapshot {
             version: self.chart_version,
-            sheets: self.charts.specs_by_sheet(),
+            sheets,
         }));
+    }
+
+    /// The loaded specs (grouped by sheet) with each authored chart appended to its anchor sheet's
+    /// group — the snapshot payload when the workbook carries authored charts. Loaded charts keep
+    /// their discovery order; authored charts follow in insert order.
+    fn charts_by_sheet_with_authored(&self) -> Vec<(SheetId, Arc<[ChartSpec]>)> {
+        let mut groups: Vec<(SheetId, Vec<ChartSpec>)> = self
+            .charts
+            .specs_by_sheet()
+            .into_iter()
+            .map(|(sheet, specs)| (sheet, specs.to_vec()))
+            .collect();
+        for entry in &self.authored_charts {
+            match groups.iter_mut().find(|(s, _)| *s == entry.anchor_sheet) {
+                Some((_, specs)) => specs.push(entry.spec.clone()),
+                None => groups.push((entry.anchor_sheet, vec![entry.spec.clone()])),
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(sheet, specs)| (sheet, Arc::from(specs)))
+            .collect()
     }
 
     /// Publish the active sheet's viewport snapshot, THEN bump the generation — a bump always
@@ -1699,6 +1870,32 @@ fn any_cell_lacks(
     Ok(false)
 }
 
+/// The `xl/charts/chartN.xml` part names already present in a serialized package (loaded charts
+/// re-injected by mode 1/2) — the used set the authored-chart part assignment avoids colliding with.
+/// A package that can't be read as a zip yields an empty set (the write path then validates any real
+/// collision and fails loudly).
+fn existing_chart_parts(package_bytes: &[u8]) -> HashSet<String> {
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(package_bytes)) else {
+        return HashSet::new();
+    };
+    (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter(|n| n.starts_with("xl/charts/") && n.ends_with(".xml") && !n.contains("/_rels/"))
+        .collect()
+}
+
+/// The next free `xl/charts/chartN.xml` part, marking it used (mirrors `write::next_drawing_part`).
+fn next_chart_part(used: &mut HashSet<String>) -> String {
+    let mut n = 1;
+    loop {
+        let candidate = format!("xl/charts/chart{n}.xml");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Resolve a stable [`SheetId`] to a worksheet index, or an engine-style error message.
 fn resolve_idx(doc: &WorkbookDocument, sheet: SheetId) -> Result<u32, String> {
     doc.sheet_properties()
@@ -1877,6 +2074,7 @@ mod tests {
             redo_touches: Vec::new(),
             clipboard: None,
             charts: ChartBindings::default(),
+            authored_charts: Vec::new(),
             chart_version: 0,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),
@@ -2941,6 +3139,91 @@ mod tests {
         )));
     }
 
+    /// A default authored-chart anchor (8 cols × 15 rows from A1), matching the chrome's insert.
+    fn test_anchor() -> Anchor {
+        Anchor::new(
+            freecell_chart_model::AnchorCell::new(0, 0),
+            freecell_chart_model::AnchorCell::new(8, 15),
+        )
+    }
+
+    #[test]
+    fn insert_chart_publishes_authored_snapshot() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let before = worker.chart_version;
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+
+        // The insert holds one authored chart, bumps the version, and publishes.
+        assert_eq!(worker.authored_charts.len(), 1);
+        assert!(
+            worker.chart_version > before,
+            "the insert bumps the chart version"
+        );
+        assert!(drain_events(&rx)
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::Published)));
+
+        // The published snapshot carries the authored (snapshot-but-not-live) line chart.
+        let snap = worker.shared.chart_snapshot.load_full();
+        let (snap_sheet, specs) = &snap.sheets[0];
+        assert_eq!(*snap_sheet, sheet);
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].is_authored(),
+            "the inserted chart is Authored (no retained source, no live binding)"
+        );
+        assert!(matches!(
+            specs[0].chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Line { .. }
+        ));
+        // Dirty tracking: one committed op is recorded so the chart can be saved.
+        assert_eq!(worker.shared.committed_ops.load(Ordering::Acquire), 1);
+    }
+
+    /// Criterion #3: a degraded worker MUST reject `InsertChart` (consistent with the edit batch /
+    /// paste / SetFont), pushing no authored chart and bumping no version.
+    #[test]
+    fn insert_chart_rejected_when_degraded() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::TestPanic]);
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(worker.degraded);
+        drain_events(&rx);
+        let version_before = worker.chart_version;
+
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+        }]);
+
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Degraded
+                }
+            )),
+            "a degraded worker rejects InsertChart"
+        );
+        assert!(
+            worker.authored_charts.is_empty(),
+            "no authored chart is held when degraded"
+        );
+        assert_eq!(
+            worker.chart_version, version_before,
+            "no publish / version bump when degraded"
+        );
+    }
+
     #[test]
     fn undo_redo_agreement_walk() {
         // A scripted edit/undo/redo walk: the cache must agree with the engine after EVERY step.
@@ -3907,6 +4190,7 @@ mod tests {
             redo_touches: Vec::new(),
             clipboard: None,
             charts: ChartBindings::default(),
+            authored_charts: Vec::new(),
             chart_version: 0,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),

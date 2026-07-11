@@ -43,6 +43,36 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
         "icons/bold.svg",
         include_bytes!("../../assets/icons/bold.svg"),
     ),
+    // Chart-type glyphs for the action-bar insert menu (P17). Lucide chart icons in the same
+    // tintable form; `chart-doughnut` is a hand-authored ring (Lucide ships no doughnut glyph).
+    (
+        "icons/chart-area.svg",
+        include_bytes!("../../assets/icons/chart-area.svg"),
+    ),
+    (
+        "icons/chart-bar.svg",
+        include_bytes!("../../assets/icons/chart-bar.svg"),
+    ),
+    (
+        "icons/chart-column.svg",
+        include_bytes!("../../assets/icons/chart-column.svg"),
+    ),
+    (
+        "icons/chart-doughnut.svg",
+        include_bytes!("../../assets/icons/chart-doughnut.svg"),
+    ),
+    (
+        "icons/chart-line.svg",
+        include_bytes!("../../assets/icons/chart-line.svg"),
+    ),
+    (
+        "icons/chart-pie.svg",
+        include_bytes!("../../assets/icons/chart-pie.svg"),
+    ),
+    (
+        "icons/chart-scatter.svg",
+        include_bytes!("../../assets/icons/chart-scatter.svg"),
+    ),
     (
         "icons/decimals-arrow-left.svg",
         include_bytes!("../../assets/icons/decimals-arrow-left.svg"),

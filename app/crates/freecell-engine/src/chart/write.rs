@@ -931,6 +931,59 @@ mod tests {
         assert!(!xml.contains("<c:f/>") && !xml.contains("<c:f></c:f>"));
     }
 
+    /// P17 round-trip guard: **every** [`ChartInsertKind`]'s near-empty insert template must survive
+    /// the write path (serialize → parse), not just Line. P22–P26 build breadth directly on these
+    /// templates, so a template that emits something the serializer/loader can't round-trip must fail
+    /// here rather than in a later phase.
+    ///
+    /// Two shapes, per kind:
+    /// - **with refs** — a full `serialize→parse == template` (the refs make the placeholder DATA
+    ///   round-trip through `numRef`/`strRef` caches, so the whole template is checked, not just its
+    ///   chrome);
+    /// - **ref-less** — the *actual* insert/save shape (`&[]` → literals, §2.3) must still be
+    ///   well-formed XML whose structure re-parses (a ref-less template legitimately loses its literal
+    ///   data on reload — the loader reads caches, not literals — so this half asserts structure only).
+    #[test]
+    fn near_empty_insert_templates_round_trip_through_the_write_path() {
+        use freecell_chart_model::ChartInsertKind;
+
+        let refs = vec![SeriesRefs {
+            name: Some("Sheet1!$A$1".into()),
+            categories: Some("Sheet1!$A$2:$A$5".into()),
+            values: Some("Sheet1!$B$2:$B$5".into()),
+        }];
+        for kind in [
+            ChartInsertKind::Line,
+            ChartInsertKind::Column,
+            ChartInsertKind::Bar,
+            ChartInsertKind::Area,
+            ChartInsertKind::Pie,
+            ChartInsertKind::Doughnut,
+            ChartInsertKind::Scatter,
+        ] {
+            let template = kind.near_empty_chart();
+            // (a) Full structural + data round-trip with refs.
+            assert_roundtrip(template.clone(), &refs);
+
+            // (b) The real ref-less insert/save shape (literals) is still well-formed, and its
+            // structure (kind / title / axes / legend / series name) re-parses.
+            let literal_xml = serialize_chart_xml(&template, &[]);
+            assert!(
+                roxmltree::Document::parse(&literal_xml).is_ok(),
+                "{kind:?} ref-less near-empty template must be well-formed XML:\n{literal_xml}"
+            );
+            let reparsed = parse_chart_xml(&literal_xml).unwrap_or_else(|e| {
+                panic!("{kind:?} ref-less re-parse failed: {e:#}\n{literal_xml}")
+            });
+            assert_eq!(reparsed.kind, template.kind, "{kind:?} kind round-trips");
+            assert_eq!(reparsed.title, template.title, "{kind:?} title round-trips");
+            assert_eq!(
+                reparsed.legend, template.legend,
+                "{kind:?} legend round-trips"
+            );
+        }
+    }
+
     // --- drawing synthesis -------------------------------------------------------------------
 
     #[test]

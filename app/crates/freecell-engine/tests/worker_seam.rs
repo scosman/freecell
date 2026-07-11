@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use freecell_chart_model::SeriesData;
+use freecell_chart_model::{Anchor, AnchorCell, SeriesData};
 use freecell_core::{CellRange, CellRef, SheetId};
 use freecell_engine::{
-    fixtures, ChartSnapshot, Command, DocumentClient, DocumentSource, EditRejectedReason,
-    SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
+    fixtures, ChartInsertKind, ChartSnapshot, Command, DocumentClient, DocumentSource,
+    EditRejectedReason, SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
 };
 use tempfile::tempdir;
 
@@ -1319,4 +1319,182 @@ fn chart_save_atomic_on_failure_leaves_destination_untouched() {
     // No temp-file litter beside the target.
     let entries: Vec<_> = std::fs::read_dir(target_dir.path()).unwrap().collect();
     assert_eq!(entries.len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// P17 — insert flow: `Command::InsertChart` authors a near-empty chart that renders + saves
+// (charts/architecture §4.1, ui_design §3.1, components/write-path §1 mode 3)
+// ---------------------------------------------------------------------------------------------
+
+/// A default authored-chart anchor (8 cols × 15 rows from the given top-left cell), matching the
+/// chrome's insert placement.
+fn chart_anchor(from_col: u32, from_row: u32) -> Anchor {
+    Anchor::new(
+        AnchorCell::new(from_col, from_row),
+        AnchorCell::new(from_col + 8, from_row + 15),
+    )
+}
+
+/// Add a sheet through the worker and return the new sheet's stable id (the one absent from
+/// `existing`).
+fn add_sheet_and_id(
+    client: &DocumentClient,
+    rx: &WorkerEventReceiver,
+    existing: SheetId,
+) -> SheetId {
+    client.send(Command::AddSheet);
+    let ev = wait_for(rx, |e| matches!(e, WorkerEvent::SheetsChanged { .. }));
+    match ev {
+        Some(WorkerEvent::SheetsChanged { sheets }) => {
+            sheets.iter().find(|s| s.id != existing).unwrap().id
+        }
+        other => panic!("expected SheetsChanged, got {other:?}"),
+    }
+}
+
+/// Inserting a chart through the worker publishes an **authored** (snapshot-but-not-live) chart on
+/// the chart seam the grid installs from — the render half of the exit criterion.
+#[test]
+fn insert_line_chart_publishes_authored_snapshot() {
+    let (client, _rx, sheet) = spawn_new();
+    let base = client.chart_snapshot().version;
+
+    client.send(Command::InsertChart {
+        sheet,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(0, 0),
+    });
+    poll_until(
+        || client.chart_snapshot().version > base,
+        "InsertChart publishes the authored chart on the seam",
+    );
+
+    let snap = client.chart_snapshot();
+    let (snap_sheet, specs) = &snap.sheets[0];
+    assert_eq!(*snap_sheet, sheet, "anchored on the active sheet");
+    assert_eq!(specs.len(), 1);
+    assert!(
+        specs[0].is_authored(),
+        "the inserted chart is Authored (no retained source, no live binding)"
+    );
+    assert!(matches!(
+        specs[0].chart().unwrap().kind,
+        freecell_chart_model::ChartKind::Line { .. }
+    ));
+    // A near-empty chart still carries one placeholder series so it renders as its real kind.
+    assert_eq!(specs[0].chart().unwrap().series.len(), 1);
+}
+
+/// Criterion #4 (headline seam): a combined save runs BOTH the loaded re-inject (mode 1/2) AND the
+/// authored write-from-model (mode 3) over one workbook. Open a line-chart file, add a second sheet,
+/// insert an authored chart on THAT sheet, save → reopen carries BOTH charts.
+#[test]
+fn combined_save_writes_loaded_and_authored_charts() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("line.xlsx");
+    freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
+    let data_sheet = sheets[0].id;
+
+    // Paint the Data sheet so its loaded line chart is discovered (lazy, P11).
+    client.send(full_viewport(data_sheet));
+    poll_until(
+        || client.chart_snapshot().version >= 1,
+        "the loaded line chart is discovered on first paint",
+    );
+
+    // Add a SECOND sheet and author a chart onto it (a different sheet from the loaded chart).
+    let other_sheet = add_sheet_and_id(&client, &rx, data_sheet);
+    client.send(Command::InsertChart {
+        sheet: other_sheet,
+        kind: ChartInsertKind::Line,
+        anchor: chart_anchor(1, 1),
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .any(|(s, specs)| *s == other_sheet && specs.iter().any(|sp| sp.is_authored()))
+        },
+        "the authored chart is published on the second sheet",
+    );
+
+    // Save through the worker's Save command (the combined loaded + authored save).
+    let out = dir.path().join("out.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 71,
+    });
+    assert!(
+        wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 71, .. })).is_some(),
+        "the combined loaded + authored save succeeds"
+    );
+
+    // Reopen: IronCalc accepts it AND our loader re-parses BOTH charts (the loaded line + the
+    // authored line, now a Loaded spec).
+    freecell_engine::WorkbookDocument::open(&out).expect("combined-save workbook reopens");
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(
+        specs.len(),
+        2,
+        "both the loaded and the authored chart survive the combined save"
+    );
+    assert!(specs.iter().all(|s| matches!(
+        s.chart().unwrap().kind,
+        freecell_chart_model::ChartKind::Line { .. }
+    )));
+}
+
+/// Criterion #4 (fail-loud): authoring a chart onto the SAME sheet as a loaded chart is not yet
+/// supported (it would mean merging into that sheet's existing `<drawing>`), so the combined save
+/// must **fail loudly** (`SaveFailed`) rather than silently drop a chart or emit a double drawing —
+/// the two write reports (SaveReport vs AuthoredWriteReport) are not conflated.
+#[test]
+fn authored_chart_on_a_loaded_charts_sheet_fails_loudly() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("line.xlsx");
+    freecell_engine::chart::authoring::write_line_fixture(&path).unwrap();
+    let (client, rx, sheets) = spawn(DocumentSource::OpenFile(path));
+    let data_sheet = sheets[0].id;
+
+    client.send(full_viewport(data_sheet));
+    poll_until(
+        || client.chart_snapshot().version >= 1,
+        "the loaded line chart is discovered on first paint",
+    );
+
+    // Author a chart onto the loaded chart's OWN sheet.
+    client.send(Command::InsertChart {
+        sheet: data_sheet,
+        kind: ChartInsertKind::Column,
+        anchor: chart_anchor(6, 6),
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .any(|(s, specs)| *s == data_sheet && specs.iter().any(|sp| sp.is_authored()))
+        },
+        "the authored chart is published on the Data sheet",
+    );
+
+    let out = dir.path().join("out.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 72,
+    });
+    assert!(
+        wait_for(&rx, |e| matches!(
+            e,
+            WorkerEvent::SaveFailed { req_id: 72, .. }
+        ))
+        .is_some(),
+        "authoring onto a sheet that already has a loaded chart's drawing fails loudly on save"
+    );
+    // The atomic save wrote nothing (no partial/corrupt output at the target).
+    assert!(!out.exists(), "a failed save leaves no output file");
 }

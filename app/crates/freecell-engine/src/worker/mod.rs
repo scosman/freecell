@@ -21,6 +21,7 @@ mod run;
 
 pub use charts::ChartSnapshot;
 pub use client::{DocumentClient, WorkerEventReceiver, WORKER_STACK_SIZE};
+pub use freecell_chart_model::ChartInsertKind;
 pub use protocol::{
     BorderLine, BorderPreset, Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
     StylePath, WorkerEvent,

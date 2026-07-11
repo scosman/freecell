@@ -2,14 +2,16 @@
 //! types (`architecture.md §2`, `components/engine_worker.md §Public interface`).
 //!
 //! Every type here is **engine-free**: it names only `freecell-core` types (`SheetId`,
-//! `CellRef`, `CellRange`, `Rgb`, `InputRejection`, `SheetNameError`), `std`, and the
-//! Phase-3 typed file errors (`LoadError` / `SaveError`, which carry only `String`s). **No
-//! IronCalc type crosses this seam** — that is the headless boundary `freecell-engine`
-//! exists to hold (`architecture.md §2`).
+//! `CellRef`, `CellRange`, `Rgb`, `InputRejection`, `SheetNameError`), the pure
+//! `freecell-chart-model` types (`Anchor`, `ChartInsertKind` — which already cross this seam via
+//! [`ChartSnapshot`](super::charts::ChartSnapshot)/`ChartSpec`), `std`, and the Phase-3 typed file
+//! errors (`LoadError` / `SaveError`, which carry only `String`s). **No IronCalc type crosses this
+//! seam** — that is the headless boundary `freecell-engine` exists to hold (`architecture.md §2`).
 
 use std::ops::Range;
 use std::path::PathBuf;
 
+use freecell_chart_model::{Anchor, ChartInsertKind};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
 use freecell_core::{CellRange, CellRef, Rgb, SheetId};
@@ -297,6 +299,19 @@ pub enum Command {
         sheet: SheetId,
         cell: CellRef,
         req_id: u64,
+    },
+    /// Insert a **near-empty authored chart** of `kind` onto `sheet`, placed at `anchor` (P17,
+    /// charts/ui_design §3.1). The worker builds the template chart
+    /// ([`ChartInsertKind::near_empty_chart`]), holds it as an
+    /// [`Authored`](freecell_chart_model::Origin::Authored) `ChartSpec` **snapshot-but-not-live**
+    /// (it has no `c:f` binding yet — ranges arrive in P19), and publishes it on the chart snapshot
+    /// so the grid renders it. On save it takes the **write-from-model** path
+    /// (`write::write_authored_charts`), never the loaded re-inject. Rejected with
+    /// [`EditRejectedReason::Degraded`] when the worker is degraded (like every mutating op).
+    InsertChart {
+        sheet: SheetId,
+        kind: ChartInsertKind,
+        anchor: Anchor,
     },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },

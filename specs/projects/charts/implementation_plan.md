@@ -95,7 +95,7 @@ genuinely new subsystem, the write path, is isolated to P16.
   panel, then **write-from-model** (authored) + **source-patch** (edited). *Exit:* a
   model-built chart serializes to a valid `.xlsx` reopenable in Excel + LibreOffice; round-trip
   tests.
-- [ ] **P17 — Insert flow.** Action-bar chart-icon menu (type glyphs) → insert a near-empty
+- [x] **P17 — Insert flow.** Action-bar chart-icon menu (type glyphs) → insert a near-empty
   chart of that type → it appears in the grid. *Exit:* insert a line chart via the UI; it
   renders + saves.
 - [ ] **P18 — Manipulate.** Select (outline + handles), move, resize, delete on the ChartLayer.

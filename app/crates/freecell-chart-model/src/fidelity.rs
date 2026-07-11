@@ -570,6 +570,38 @@ mod tests {
     }
 
     #[test]
+    fn p23_area_stays_faithful_but_line_scoped_features_degrade() {
+        // A plain area (even carrying a resolved `schemeClr` series fill) is Faithful — the P23 area
+        // renderer draws all three groupings + theme fills.
+        let faithful = r#"
+            <c:areaChart>
+              <c:grouping val="stacked"/>
+              <c:ser>
+                <c:spPr><a:solidFill><a:schemeClr val="accent3"><a:lumOff val="40000"/></a:schemeClr></a:solidFill></c:spPr>
+              </c:ser>
+              <c:axId val="1"/><c:axId val="2"/>
+            </c:areaChart>
+        "#;
+        assert_eq!(source_fidelity(faithful), Fidelity::Faithful);
+
+        // But the area renderer does NOT draw data labels or honor axis scaling (those stay
+        // line-scoped, exactly like bar), so an area carrying either keeps its honest Degraded badge.
+        let shown_labels = "<c:areaChart><c:dLbls><c:showVal val=\"1\"/></c:dLbls></c:areaChart>";
+        assert_eq!(
+            source_fidelity(shown_labels),
+            Fidelity::Degraded,
+            "shown data labels on area → Degraded"
+        );
+        let scaled =
+            "<c:areaChart/><c:valAx><c:scaling><c:min val=\"0\"/><c:max val=\"100\"/></c:scaling></c:valAx>";
+        assert_eq!(
+            source_fidelity(scaled),
+            Fidelity::Degraded,
+            "axis min/max on area → Degraded"
+        );
+    }
+
+    #[test]
     fn unsupported_groups_are_unsupported() {
         for group in [
             "<c:surfaceChart/>",

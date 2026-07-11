@@ -1993,6 +1993,69 @@ fn retyped_authored_chart_roundtrips() {
     );
 }
 
+/// P23 (edited area round-trip): switching a ranged chart's type to **Area** round-trips as
+/// `ChartKind::Area`, keeping the `c:f` binding — the edited path proof for the area type (the area
+/// twin of `retyped_authored_chart_roundtrips`'s Column switch).
+#[test]
+fn retyped_to_area_chart_roundtrips() {
+    let (client, rx, sheet, id) = spawn_new_with_chart_data();
+    client.send(Command::SetChartRange {
+        sheet,
+        id,
+        data: CellRange::from_a1("A1:B3").unwrap(),
+    });
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), sheet, 0, 0) == vec![10.0, 20.0],
+        "the chart is ranged",
+    );
+    client.send(Command::SetChartType {
+        sheet,
+        id,
+        kind: ChartInsertKind::Area,
+    });
+    poll_until(
+        || {
+            client
+                .chart_snapshot()
+                .sheets
+                .iter()
+                .find(|(s, _)| *s == sheet)
+                .and_then(|(_, specs)| specs.first())
+                .is_some_and(|sp| {
+                    matches!(
+                        sp.chart().unwrap().kind,
+                        freecell_chart_model::ChartKind::Area { .. }
+                    )
+                })
+        },
+        "the retype republishes an area chart",
+    );
+
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("retyped_area.xlsx");
+    client.send(Command::Save {
+        path: out.clone(),
+        req_id: 92,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 92, .. })).is_some());
+    freecell_engine::WorkbookDocument::open(&out).expect("reopens");
+
+    let specs = freecell_engine::chart::discover_and_parse(&out).unwrap();
+    assert_eq!(specs.len(), 1);
+    assert!(
+        matches!(
+            specs[0].chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Area { .. }
+        ),
+        "the reopened chart is an area chart"
+    );
+    let ranges: Vec<&str> = specs[0].source_ranges.iter().map(|r| r.as_str()).collect();
+    assert!(
+        ranges.iter().any(|r| r.ends_with("$B$2:$B$3")),
+        "the range binding survived the retype: {ranges:?}"
+    );
+}
+
 /// Phase-plan item 4 (three-way honesty): one save carrying a LOADED chart + a BOUND (ranged)
 /// authored chart + an UNBOUND authored chart keeps all three straight — loaded byte-preserved,
 /// bound-authored written with `c:f`, unbound-authored written as literals — and all three reopen.

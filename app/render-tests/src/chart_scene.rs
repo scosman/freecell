@@ -63,6 +63,11 @@ pub fn all() -> Vec<ChartScene> {
         chart_bar_clustered(),
         chart_column_gap_overlap(),
         chart_column_theme_fills(),
+        // P23 — area.
+        chart_area_standard(),
+        chart_area_stacked(),
+        chart_area_percent(),
+        chart_area_theme_fills(),
     ]
 }
 
@@ -795,6 +800,132 @@ fn chart_column_theme_fills() -> ChartScene {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// P23 — area scenes
+// -------------------------------------------------------------------------------------------------
+
+/// Three web-traffic series over six months — the shared data for the area grouping scenes. Authored
+/// **tallest-first** (Direct ≥ Search ≥ Social overall) so the standard back-to-front alpha layering
+/// reads as three overlapping translucent regions rather than a muddle. `color` is applied per scene.
+fn area_traffic() -> [(&'static str, Vec<f64>); 3] {
+    [
+        ("Direct", vec![48.0, 42.0, 55.0, 50.0, 62.0, 58.0]),
+        ("Search", vec![32.0, 40.0, 36.0, 45.0, 41.0, 50.0]),
+        ("Social", vec![14.0, 22.0, 19.0, 27.0, 24.0, 33.0]),
+    ]
+}
+
+/// Build the three area series with an explicit color per series (sRGB or theme).
+fn area_series(colors: [ChartColor; 3]) -> Vec<Series> {
+    area_traffic()
+        .into_iter()
+        .zip(colors)
+        .map(|((name, values), color)| {
+            Series::category_value(Some(name), months(), values).with_color(color)
+        })
+        .collect()
+}
+
+/// The Office-like sRGB fills the sRGB area scenes use (blue / orange / grey), matching the column
+/// scenes' palette so the area fills read as the same product family.
+fn area_srgb_fills() -> [ChartColor; 3] {
+    [
+        ChartColor::Rgb(Color::from_hex(0x4472C4)),
+        ChartColor::Rgb(Color::from_hex(0xED7D31)),
+        ChartColor::Rgb(Color::from_hex(0xFFC000)),
+    ]
+}
+
+/// A **standard** (overlapping) area chart (`grouping=standard`, area's default): three series each
+/// rising from the zero baseline as its own semi-transparent filled polygon, painted back-to-front so
+/// the earlier (taller) bands show through the later ones. The bread-and-butter area chart — proves the
+/// overlapping filled-polygon fork + per-series fills + the zero-baseline value axis.
+fn chart_area_standard() -> ChartScene {
+    let chart = Chart {
+        title: Some("Traffic by Source".into()),
+        kind: ChartKind::Area {
+            grouping: Grouping::Standard,
+        },
+        series: area_series(area_srgb_fills()),
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Visits (thousands)"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_area_standard",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A **stacked** area chart (`grouping=stacked`): the same three series stacked into cumulative bands
+/// (each band sits on the running total below it), the value axis reaching the tallest stack total.
+/// Proves the wavy per-x stacked baseline the hand-rolled polygon fork exists for (gpui-component's flat
+/// `y0` `Area` can't draw it).
+fn chart_area_stacked() -> ChartScene {
+    let chart = Chart {
+        title: Some("Traffic by Source (stacked)".into()),
+        kind: ChartKind::Area {
+            grouping: Grouping::Stacked,
+        },
+        series: area_series(area_srgb_fills()),
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Visits (thousands)"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_area_stacked",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A **100%-stacked** area chart (`grouping=percentStacked`): each month's stack normalized to fill
+/// 0–100%, so the value axis is a fixed 0–100% and the bands show each source's share over time. Proves
+/// the percent normalization + `%` tick labels on the area fork.
+fn chart_area_percent() -> ChartScene {
+    let chart = Chart {
+        title: Some("Traffic Mix (100% stacked)".into()),
+        kind: ChartKind::Area {
+            grouping: Grouping::PercentStacked,
+        },
+        series: area_series(area_srgb_fills()),
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Share"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_area_percent",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A standard area whose series carry **theme `schemeClr`** fills (accent1/2/3) rather than explicit
+/// sRGB — proves per-type fill theme resolution for an **area** series (`ooxml-coverage-matrix.md` §C),
+/// the area analogue of `chart_column_theme_fills`.
+fn chart_area_theme_fills() -> ChartScene {
+    let chart = Chart {
+        title: Some("Revenue by Channel".into()),
+        kind: ChartKind::Area {
+            grouping: Grouping::Standard,
+        },
+        series: area_series([
+            ChartColor::theme(ThemeSlot::Accent1),
+            ChartColor::theme(ThemeSlot::Accent2),
+            ChartColor::theme(ThemeSlot::Accent3),
+        ]),
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Revenue"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_area_theme_fills",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,6 +1187,34 @@ mod tests {
                 .iter()
                 .all(|s| matches!(s.color, Some(ChartColor::Theme { .. }))),
             "every theme-fills series is a schemeClr theme color"
+        );
+    }
+
+    #[test]
+    fn p23_scenes_carry_their_area_kind() {
+        // Every new area scene is an `Area` of the intended grouping.
+        for (name, grouping) in [
+            ("chart_area_standard", Grouping::Standard),
+            ("chart_area_stacked", Grouping::Stacked),
+            ("chart_area_percent", Grouping::PercentStacked),
+            ("chart_area_theme_fills", Grouping::Standard),
+        ] {
+            let s = get(name).unwrap_or_else(|| panic!("{name} scene"));
+            assert_eq!(s.chart.kind, ChartKind::Area { grouping }, "{name}");
+            // A multi-series area (the overlapping / stacking is only meaningful with >1 series).
+            assert!(s.chart.series.len() >= 2, "{name} must be multi-series");
+        }
+
+        // The theme-fills area resolves every series to a theme color (proves area fill theme
+        // resolution, distinct from the sRGB scenes).
+        let theme = get("chart_area_theme_fills").expect("area theme-fills scene");
+        assert!(
+            theme
+                .chart
+                .series
+                .iter()
+                .all(|s| matches!(s.color, Some(ChartColor::Theme { .. }))),
+            "every area theme-fills series is a schemeClr theme color"
         );
     }
 }

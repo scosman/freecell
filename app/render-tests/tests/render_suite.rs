@@ -261,6 +261,8 @@ render_cases! {
     grid_chart_scrolled_clipped,
     // In-grid column chart (P22): the ChartLayer painting a real clustered column over cells.
     grid_chart_column,
+    // In-grid area chart (P23): the ChartLayer painting a real standard area over cells.
+    grid_chart_area,
     // Manipulate (P18): a selected chart with its selection outline + resize handles.
     grid_chart_selected,
     // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
@@ -338,6 +340,9 @@ chart_render_cases! {
     // reversed Excel category order), a non-default gapWidth/overlap geometry, and theme-schemeClr fills.
     chart_column_clustered, chart_column_stacked, chart_column_percent, chart_bar_clustered,
     chart_column_gap_overlap, chart_column_theme_fills,
+    // P23 — area: standard (overlapping filled polygons), stacked (cumulative bands), 100%-stacked
+    // (0–100% normalized), and theme-schemeClr area fills.
+    chart_area_standard, chart_area_stacked, chart_area_percent, chart_area_theme_fills,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

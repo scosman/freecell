@@ -294,6 +294,47 @@ fn in_grid_column_spec(title: &str) -> ChartSpec {
     )
 }
 
+/// A three-region standard **area** chart (P23) over the backing table's quarters — the picture the
+/// ChartLayer paints for the in-grid area case (`grid_chart_area`). Authored tallest-first so the
+/// overlapping bands read.
+fn in_grid_area_chart(title: &str) -> Chart {
+    let months = || {
+        ["Jan", "Feb", "Mar", "Apr"]
+            .into_iter()
+            .map(|m| Category::Text(m.into()))
+            .collect::<Vec<_>>()
+    };
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Area {
+            grouping: Grouping::Standard,
+        },
+        series: vec![
+            Series::category_value(Some("North"), months(), vec![74.0, 60.0, 68.0, 82.0])
+                .with_color(Color::from_hex(0x4472C4)),
+            Series::category_value(Some("South"), months(), vec![50.0, 54.0, 49.0, 58.0])
+                .with_color(Color::from_hex(0xED7D31)),
+            Series::category_value(Some("West"), months(), vec![32.0, 41.0, 36.0, 45.0])
+                .with_color(Color::from_hex(0xFFC000)),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** standard-area `ChartSpec` at [`chart_anchor`], with a `<c:areaChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `area_element` path (P23), the area
+/// analogue of the loaded column case.
+fn in_grid_area_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_area_chart(title),
+        SourceXml::new("<c:areaChart><c:grouping val=\"standard\"/></c:areaChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
 /// An **Unsupported** spec: a `surfaceChart` source (no faithful 2-D rendering) so the ChartLayer
 /// draws the placeholder box; its `chart` carries the title the placeholder shows.
 fn in_grid_unsupported_spec(title: &str) -> ChartSpec {
@@ -580,6 +621,11 @@ pub fn all() -> Vec<RenderCase> {
         // `grid_chart_*` baseline moves.
         RenderCase::new("grid_chart_column", chart_backing_scene(), CHART_GRID_VP)
             .charts(vec![in_grid_column_spec("Regional Sales")]),
+        // A Faithful standard-AREA chart floating over the same backing table (P23) — the in-grid
+        // proof of the ChartLayer → `area_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_area", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_area_spec("Regional Sales")]),
         // A Degraded chart still renders as a line, plus the corner "⚠ May not display as intended"
         // badge (`ui_design.md §2.2`) — here from a 3-D group (`line3DChart`) rendered as its 2-D
         // line. (A shown `c:dLbls` on a line is Faithful as of P12 — it renders — so the badge case

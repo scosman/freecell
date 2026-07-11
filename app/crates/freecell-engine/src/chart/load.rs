@@ -1188,6 +1188,63 @@ mod tests {
         }
     }
 
+    /// P23: a `c:areaChart` parses each `c:grouping` into the right [`Grouping`], defaults to
+    /// `Standard` when the element is absent (area's OOXML default), and a series `a:schemeClr` fill
+    /// parses to a theme [`ChartColor`] (the P22 theme-aware reader applies to area too).
+    #[test]
+    fn parses_area_grouping_and_theme_fill() {
+        // Each explicit grouping maps to its Grouping variant.
+        for (val, expected) in [
+            ("standard", Grouping::Standard),
+            ("stacked", Grouping::Stacked),
+            ("percentStacked", Grouping::PercentStacked),
+        ] {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+ <c:chart><c:plotArea><c:areaChart><c:grouping val="{val}"/>
+   <c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+ </c:areaChart></c:plotArea></c:chart></c:chartSpace>"#
+            );
+            assert_eq!(
+                parse_chart_xml(&xml).unwrap().kind,
+                ChartKind::Area { grouping: expected },
+                "areaChart grouping={val}"
+            );
+        }
+
+        // An absent grouping defaults to Standard (area's default, unlike bar's Clustered).
+        let no_grouping = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+ <c:chart><c:plotArea><c:areaChart>
+   <c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+ </c:areaChart></c:plotArea></c:chart></c:chartSpace>"#;
+        assert_eq!(
+            parse_chart_xml(no_grouping).unwrap().kind,
+            ChartKind::Area {
+                grouping: Grouping::Standard
+            },
+            "an absent grouping defaults to Standard"
+        );
+
+        // A themed area series fill (a:schemeClr + lumOff) parses to a ChartColor::Theme.
+        let themed = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+ <c:chart><c:plotArea><c:areaChart><c:grouping val="stacked"/>
+   <c:ser>
+    <c:spPr><a:solidFill><a:schemeClr val="accent3"><a:lumOff val="40000"/></a:schemeClr></a:solidFill></c:spPr>
+    <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val>
+   </c:ser>
+ </c:areaChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(themed).unwrap();
+        assert_eq!(
+            chart.series[0].color,
+            Some(ChartColor::Theme {
+                slot: ThemeSlot::Accent3,
+                lum_mod: None,
+                lum_off: Some(0.4),
+            })
+        );
+    }
+
     #[test]
     fn scatter_maps_two_value_axes_and_xy_series() {
         let xml = r#"<?xml version="1.0"?>

@@ -903,6 +903,27 @@ mod tests {
         assert_roundtrip(chart, &sheet1_refs());
     }
 
+    /// P23: an authored area serializes + round-trips through the loader in **all three groupings**
+    /// (standard / stacked / percentStacked), so each grouping survives the write→parse cycle.
+    #[test]
+    fn serialize_roundtrips_area_all_groupings() {
+        for grouping in [
+            Grouping::Standard,
+            Grouping::Stacked,
+            Grouping::PercentStacked,
+        ] {
+            let chart = Chart {
+                title: Some("Traffic".into()),
+                kind: ChartKind::Area { grouping },
+                series: vec![sales_series()],
+                cat_axis: Axis::titled("Quarter"),
+                val_axis: Axis::titled("Visits"),
+                legend: Some(Legend::default()),
+            };
+            assert_roundtrip(chart, &sheet1_refs());
+        }
+    }
+
     #[test]
     fn serialize_roundtrips_pie_and_doughnut() {
         for hole in [None, Some(0.5)] {
@@ -1186,6 +1207,45 @@ mod tests {
                 layout: BarLayout::new(75, 25),
             },
             "the reopened chart is a horizontal bar with its authored gap/overlap"
+        );
+    }
+
+    /// P23: an **authored** stacked area written via the write path reopens through
+    /// `discover_and_parse` as `ChartKind::Area { grouping: Stacked }` — the area twin of the authored
+    /// bar reopen, proving the full write→(IronCalc load)→discover round-trip preserves the area kind +
+    /// grouping.
+    #[test]
+    fn write_authored_area_reopens_as_area_with_grouping() {
+        let model = data_model_bytes();
+        let area = Chart {
+            title: Some("Authored Area".into()),
+            kind: ChartKind::Area {
+                grouping: Grouping::Stacked,
+            },
+            series: vec![sales_series()],
+            cat_axis: Axis::titled("Quarter"),
+            val_axis: Axis::default(),
+            legend: Some(Legend::default()),
+        };
+        let (bytes, _) = write_authored_charts(
+            &model,
+            &[authored(area, "xl/charts/chart1.xml", sheet1_refs())],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authored_area.xlsx");
+        std::fs::write(&out, &bytes).unwrap();
+        ironcalc::import::load_from_xlsx(out.to_str().unwrap(), "en", "UTC", "en")
+            .expect("authored area reopens in IronCalc");
+
+        let specs = discover_and_parse(&out).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].chart().unwrap().kind,
+            ChartKind::Area {
+                grouping: Grouping::Stacked,
+            },
+            "the reopened chart is a stacked area"
         );
     }
 

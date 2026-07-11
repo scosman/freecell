@@ -61,10 +61,22 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
 - The chart **Edit panel** is a **new floating window docked to the right side of the sheet**
   (a chrome overlay, not a popover on the chart). It is how a chart is shaped/edited.
 - **Options it exposes** (indicative): **chart type, data range, title, axis titles**, … and
-  the rest of the §6.B chrome (legend, series colors, data-label toggles).
-- **Deferred:** the panel's exact layout, control set, and interaction are **specced when we
-  start that phase**, per your call — this doc only fixes its *form* (right-side floating
-  window) and *entry* (opens on insert / when a chart is selected).
+  the rest of the §6.B chrome (legend, series colors, data-label toggles). The chart-**type**
+  list orders **Line → Area → Column → Bar → …** (Excel grouping); the **legend** control is a
+  row of lucide icons — `panel-top`/`panel-right`/`panel-left`/`panel-bottom` for the four
+  positions, `square-x` for Off.
+- **Live editing:** the **title** and **axis-title** fields update the chart **per keystroke**
+  (not on Enter/blur), so shaping is immediate. A live worker republish never clobbers an
+  in-progress edit (fields re-seed only when the *selected chart changes*, not on same-chart
+  republish).
+- **Dismissal:** the panel closes on its × button, on **click-away** (a click on a cell / empty
+  grid), on the chart's deletion, or on degrade. Clicking **another chart** re-points the panel
+  to it (a switch, not a close). Its body **scrolls vertically** and is **clipped to its own
+  bounds**, so every control stays reachable and it never paints over other chrome at any window
+  height.
+- **Deferred:** the panel's exact layout beyond the above is refined as the editing phases land;
+  this doc fixes its *form* (right-side floating window), *entry* (opens on insert / when a chart
+  is selected), and the interaction rules above.
 
 ## 5. UX principles
 

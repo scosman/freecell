@@ -97,6 +97,18 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
         "icons/paint-bucket.svg",
         include_bytes!("../../assets/icons/paint-bucket.svg"),
     ),
+    // Legend-position glyphs for the chart edit panel (`panel-top` / `square-x`, post-v1 Batch 2).
+    // The bundle ships `panel-right/left/bottom` but not `panel-top`, and no `square-x` at all, so
+    // these two are vendored in the same tintable Lucide form; the other three resolve from the
+    // bundle via `icons/panel-*.svg`.
+    (
+        "icons/panel-top.svg",
+        include_bytes!("../../assets/icons/panel-top.svg"),
+    ),
+    (
+        "icons/square-x.svg",
+        include_bytes!("../../assets/icons/square-x.svg"),
+    ),
     (
         "icons/separator-horizontal.svg",
         include_bytes!("../../assets/icons/separator-horizontal.svg"),
@@ -204,6 +216,25 @@ mod tests {
             loader.is_some(),
             "gpui-component bundle icon must still resolve"
         );
+    }
+
+    /// The chart legend-position icons all resolve through the combined source: `panel-top` +
+    /// `square-x` are FreeCell-vendored, while `panel-right/left/bottom` fall through to the bundle
+    /// (post-v1 Batch 2 legend controls).
+    #[test]
+    fn legend_position_icons_all_resolve() {
+        for path in [
+            "icons/panel-top.svg",
+            "icons/panel-right.svg",
+            "icons/panel-left.svg",
+            "icons/panel-bottom.svg",
+            "icons/square-x.svg",
+        ] {
+            assert!(
+                matches!(AppAssets.load(path), Ok(Some(_))),
+                "legend icon {path} must resolve"
+            );
+        }
     }
 
     /// A path in neither FreeCell's icons nor the bundle delegates straight through to the

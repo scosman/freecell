@@ -113,3 +113,13 @@ registry: each entry is a short description plus a pointer to a design note unde
   IronCalc, so its rename doesn't touch them. This project reflows the `c:f` sheet-name prefixes on
   a rename (engine-side, keyed off the rename event) so the link stays live.
   → [`projects/chart-cf-rewrite-on-rename.md`](projects/chart-cf-rewrite-on-rename.md)
+
+- **Chart edit-panel range picking under click-away-close** — *Future (deferred from charts
+  post-v1 Batch 2, item 12, 2026-07-11).* Batch 2 made the chart edit panel close on click-away, so
+  the old "open panel → drag a range → Use selection" flow no longer works (the drag closes the
+  panel first). A workable order survives — select the range **first**, then click the chart (which
+  preserves the selection and opens the panel with "Use selection" ready) — the rough edge is a
+  freshly-inserted chart whose panel auto-opens. Options: a "pick range" mode that temporarily
+  suspends click-away, or an in-panel select-first hint. Batch 3's item 8 (default range = selection
+  at creation) already mitigates the most common freshly-inserted case.
+  → [`projects/chart-panel-range-pick.md`](projects/chart-panel-range-pick.md)

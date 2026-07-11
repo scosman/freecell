@@ -91,12 +91,15 @@ const CHART_INSERT_ROWS: u32 = 15;
 
 /// The action-bar chart-insert menu entries — `(kind, icon path, label)`, in menu order
 /// (`ui_design §3.1`). Every [`ChartInsertKind`] authors a near-empty chart of that type (bubble
-/// landed as the final type in P26).
+/// landed as the final type in P26). Order matches how Excel groups the types: **Area sits right
+/// after Line** (both are trend charts) before the Column/Bar pair (post-v1 Batch 2, item 13). This
+/// is the single canonical order shared by the action-bar dropdown ([`render_chart_menu`]) and the
+/// edit panel's Type row ([`render_chart_type_row`]).
 const CHART_MENU: [(ChartInsertKind, &str, &str); 8] = [
     (ChartInsertKind::Line, "icons/chart-line.svg", "Line"),
+    (ChartInsertKind::Area, "icons/chart-area.svg", "Area"),
     (ChartInsertKind::Column, "icons/chart-column.svg", "Column"),
     (ChartInsertKind::Bar, "icons/chart-bar.svg", "Bar"),
-    (ChartInsertKind::Area, "icons/chart-area.svg", "Area"),
     (ChartInsertKind::Pie, "icons/chart-pie.svg", "Pie"),
     (
         ChartInsertKind::Doughnut,
@@ -298,15 +301,17 @@ pub struct ChromeView {
     /// The chart-insert menu's open state (the action-bar chart-type glyph menu, P17). Like the
     /// other formatting popovers it closes on click-away / a type pick / degrade.
     chart_menu_open: bool,
-    /// The right-docked **chart edit panel** (P19, `ui_design §4`), open while an **authored** chart
-    /// is being shaped. Unlike the action-bar popovers it is not click-away dismissed (the user picks
-    /// data cells in the grid with it open) — it closes on its × button, on the chart's deletion, or
-    /// on degrade. The window drives open/close/refresh (`shell::window`); the panel's controls send
-    /// `SetChartType` / `SetChartRange` for its `(sheet, id)`.
+    /// The right-docked **chart edit panel** (P19, `ui_design §4`), open while a chart is being
+    /// shaped. It closes on its × button, on **click-away** (a grid click on a cell/empty area,
+    /// routed through [`on_selection_changed`](Self::on_selection_changed) — post-v1 Batch 2, item
+    /// 12), on the chart's deletion, or on degrade. Clicking *another* chart re-points it (a switch).
+    /// The window drives open/close/refresh (`shell::window`); the panel's controls send
+    /// `SetChartType` / `SetChartRange` / `SetChartChrome` for its `(sheet, id)`.
     chart_panel: Option<ChartPanel>,
     /// The chart edit-panel's text inputs (P20 chrome): title + category/value axis titles. Seeded
     /// when the panel opens for a NEW chart id (never on a live republish — so an in-progress edit
-    /// isn't clobbered), committed on Enter / blur.
+    /// isn't clobbered), committed **live per keystroke** (`Change`), with Enter/blur as redundant
+    /// commit points (post-v1 Batch 2, item 6).
     chart_title_input: Entity<InputState>,
     chart_cat_axis_input: Entity<InputState>,
     chart_val_axis_input: Entity<InputState>,
@@ -544,6 +549,12 @@ impl ChromeView {
         // A selection change ends any pending edit — close the in-cell overlay + clear the mirror.
         self.edit.close();
         self.refresh_edit_grid_state(window, cx);
+        // Click-away closes the chart edit panel (post-v1 Batch 2, item 12): a grid click on a
+        // cell/header/empty area (or a paste / sheet switch) routes here and dismisses the panel.
+        // A click on *another chart* does NOT route here — the grid emits `ChartSelected` instead,
+        // which re-points the panel (a switch, not a close) — and the panel's own controls never
+        // change the grid selection, so they can't dismiss it either.
+        self.close_chart_panel(cx);
         cx.notify();
     }
 
@@ -1485,15 +1496,32 @@ impl ChromeView {
     }
 
     /// Classify a chart-input event into the shared handling: capture the target on `Focus`, or
-    /// return `true` to **commit** on Enter / blur **only if** the panel still points at the chart the
-    /// input was focused for (else a re-pointed panel drops the stale text — the cross-chart clobber
-    /// guard). Any other event returns `false` (no commit).
+    /// return `true` to **commit** the field's current text as a live chrome edit.
+    ///
+    /// The title + axis-title fields commit **live, per keystroke** (`Change`) so the chart updates
+    /// as the user types (post-v1 Batch 2, item 6) — not only on Enter/blur. `Change` reads the panel
+    /// *synchronously* with the keystroke, so it always targets the chart currently shown. Enter/blur
+    /// remain commit points too (a redundant safety net once live commits have already synced).
+    ///
+    /// Every commit is guarded against the **cross-chart clobber**: it fires only if the panel still
+    /// points at the chart the field was focused for. A `Change` keeps the captured focus (typing
+    /// continues); Enter/blur consume it (`take`). Seeding uses `set_value`, which suppresses `Change`
+    /// (`InputState::emit_events`), so re-seeding a field on a chart switch never emits a spurious
+    /// live edit — and a live republish of the *same* chart never re-seeds (only an id change does,
+    /// [`open_chart_panel`]), so it can't clobber in-progress typing.
     fn chart_input_should_commit(&mut self, event: &InputEvent) -> bool {
         match event {
             InputEvent::Focus => {
                 self.chart_input_focus = self.chart_panel_key();
                 false
             }
+            // Live per-keystroke commit: keep the focus capture (more keystrokes will follow) and
+            // commit only while the panel still points at the focused chart.
+            InputEvent::Change => match self.chart_input_focus {
+                Some(focused) => self.chart_panel_key() == Some(focused),
+                // No captured focus (e.g. a direct test call) → allow if a panel is open.
+                None => self.chart_panel_key().is_some(),
+            },
             InputEvent::PressEnter { .. } | InputEvent::Blur => match self.chart_input_focus.take()
             {
                 // Commit only if the panel still points at the chart the field was focused for; a
@@ -1502,13 +1530,12 @@ impl ChromeView {
                 // No captured focus (e.g. a direct call) → allow (send_chart_chrome still guards).
                 None => true,
             },
-            _ => false,
         }
     }
 
-    /// Commit the chart title input on Enter / blur — only when it differs from the panel's current
-    /// title (so an idle blur doesn't re-send the same value) and the panel hasn't been re-pointed
-    /// since focus (the staleness guard).
+    /// Commit the chart title input live per keystroke (`Change`), and on Enter / blur — only when it
+    /// differs from the panel's current title (so a redundant event doesn't re-send the same value)
+    /// and the panel hasn't been re-pointed since focus (the staleness guard).
     fn on_chart_title_event(
         &mut self,
         _input: &Entity<InputState>,
@@ -3253,9 +3280,11 @@ impl ChromeView {
     /// The right-docked chart **edit panel** (P19, `ui_design §4`): a floating card on the right side
     /// of the sheet with a **Type** row (the `CHART_MENU` glyphs, current kind highlighted) and a
     /// **Data range** section ("use the current selection" applies it as the chart's range). It is a
-    /// chrome overlay (no pixel baseline), not a popover on the chart, and — unlike the action-bar
-    /// popovers — it has **no click-away backdrop**, so the user can click data cells in the grid
-    /// while it stays open. Closed by its × button, the chart's deletion, or a degrade.
+    /// chrome overlay (no pixel baseline), not a popover on the chart. It closes on its × button, on
+    /// **click-away** (a click on a cell / header / empty grid, routed via `on_selection_changed` —
+    /// post-v1 Batch 2, item 12), on the chart's deletion, or on a degrade; clicking **another chart**
+    /// re-points the panel to it (a switch, not a close). Its body scrolls + clips to its own bounds
+    /// (item 7).
     fn render_chart_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let panel = self
             .chart_panel
@@ -3300,7 +3329,9 @@ impl ChromeView {
                     })),
             );
 
-        let mut sections: Vec<gpui::AnyElement> = vec![header.into_any_element()];
+        // The scrollable body sections (the header stays pinned above them, so the × is always
+        // reachable — post-v1 Batch 2, item 7).
+        let mut sections: Vec<gpui::AnyElement> = Vec::new();
 
         // Type + Data range — authored charts only (loaded re-type/re-range is not P20).
         if panel.is_authored {
@@ -3371,13 +3402,32 @@ impl ChromeView {
             .debug_selector(|| "chart-panel-card".into())
             .flex()
             .flex_col()
-            .gap_3()
-            .p_3()
+            // Clip to the panel's own bounds so overflowing controls never paint over the tab bar /
+            // grid on a short window (post-v1 Batch 2, item 7).
+            .overflow_hidden()
             .bg(rgb(ACTIVE_TAB_BG))
             .border_l_1()
             .border_color(rgb(HAIRLINE))
             .shadow_md()
-            .children(sections)
+            // Pinned header (never scrolls, so the close × is always reachable).
+            .child(div().flex_shrink_0().px_3().pt_3().pb_2().child(header))
+            // Scrollable body: fills the remaining height and scrolls when the controls overflow, so
+            // every control (data-label toggles, etc.) is reachable at any window height. `min_h_0`
+            // lets the flex child shrink below its content so `overflow_y_scroll` engages; the `id`
+            // gives it a tracked scroll offset.
+            .child(
+                div()
+                    .id("chart-panel-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .px_3()
+                    .pb_3()
+                    .children(sections),
+            )
             .into_any_element()
     }
 
@@ -3441,39 +3491,54 @@ impl ChromeView {
             .into_any_element()
     }
 
-    /// The Legend row: an Off button + one per position (Right / Top / Bottom / Left), the current
-    /// one selected.
+    /// The Legend row: one lucide icon per position (`panel-top` / `panel-right` / `panel-left` /
+    /// `panel-bottom`, showing where the legend docks) + `square-x` for Off, the current one selected
+    /// (post-v1 Batch 2, item 11). Same behavior as before — each button sets the legend position or
+    /// turns it off — just iconized. `panel-top` + `square-x` are FreeCell-vendored; the other three
+    /// resolve from the gpui-component bundle (`shell::assets`).
     fn render_chart_legend_row(
         &self,
         current: Option<LegendPosition>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let mut row = div().flex().flex_wrap().gap(px(2.0)).child(
-            Button::new("chart-panel-legend-off")
-                .label("Off")
-                .debug_selector(|| "chart-panel-legend-off".into())
-                .small()
-                .selected(current.is_none())
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.set_chart_legend_from_panel(None, window, cx);
-                })),
-        );
-        for (pos, label) in [
-            (LegendPosition::Right, "R"),
-            (LegendPosition::Top, "T"),
-            (LegendPosition::Bottom, "B"),
-            (LegendPosition::Left, "L"),
-        ] {
+        // `(target position, icon path, id/selector tag, tooltip)`. `None` = Off. Debug-selector
+        // tags stay stable (`off` / `R`/`T`/`B`/`L`) so existing selectors keep resolving.
+        let entries: [(Option<LegendPosition>, &str, &str, &str); 5] = [
+            (Some(LegendPosition::Top), "icons/panel-top.svg", "T", "Top"),
+            (
+                Some(LegendPosition::Right),
+                "icons/panel-right.svg",
+                "R",
+                "Right",
+            ),
+            (
+                Some(LegendPosition::Left),
+                "icons/panel-left.svg",
+                "L",
+                "Left",
+            ),
+            (
+                Some(LegendPosition::Bottom),
+                "icons/panel-bottom.svg",
+                "B",
+                "Bottom",
+            ),
+            (None, "icons/square-x.svg", "off", "Off"),
+        ];
+        let mut row = div().flex().flex_wrap().gap(px(2.0));
+        for (pos, icon_path, tag, tooltip) in entries {
             row = row.child(
                 Button::new(gpui::ElementId::Name(
-                    format!("chart-panel-legend-{label}").into(),
+                    format!("chart-panel-legend-{tag}").into(),
                 ))
-                .label(label)
-                .debug_selector(move || format!("chart-panel-legend-{label}"))
+                .icon(Icon::empty().path(icon_path))
+                .tooltip(tooltip)
+                .debug_selector(move || format!("chart-panel-legend-{tag}"))
+                .ghost()
                 .small()
-                .selected(current == Some(pos))
+                .selected(current == pos)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.set_chart_legend_from_panel(Some(pos), window, cx);
+                    this.set_chart_legend_from_panel(pos, window, cx);
                 })),
             );
         }
@@ -4247,6 +4312,16 @@ mod tests {
         }
     }
 
+    /// A short stand-in grid body, so the chrome (and thus the absolutely-positioned chart panel,
+    /// sized between the data row and the tab bar) is **height-constrained** — the condition under
+    /// which the panel's control stack overflows and must scroll + clip (item 7).
+    struct ShortBodyStub;
+    impl gpui::Render for ShortBodyStub {
+        fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().h(px(40.0)).w_full()
+        }
+    }
+
     /// One sheet in a tall window with a (stub) grid body, for the popover-click tests: every item
     /// lays out on-screen over a full-height backdrop.
     fn tall_sheet(cx: &mut TestAppContext) -> Harness {
@@ -4937,25 +5012,34 @@ mod tests {
 
     // ---- Chart edit panel: chrome (P20) ---------------------------------------------------
 
+    /// The canonical chrome-editing [`ChartPanel`] over chart 7 (host sheet 0) with one series —
+    /// authored, seeded title "Chart". Spread with `..chart_7_panel()` to vary a field.
+    fn chart_7_panel() -> ChartPanel {
+        ChartPanel {
+            sheet: SheetId(0),
+            id: ChartId(7),
+            is_authored: true,
+            kind: ChartInsertKind::Line,
+            ranges: None,
+            title: Some("Chart".into()),
+            legend: Some(LegendPosition::Right),
+            cat_axis_title: None,
+            val_axis_title: None,
+            series: vec![ChartPanelSeries {
+                name: "Widgets".into(),
+                color: Some(Rgb::from_hex(0x4472C4)),
+            }],
+            labels: DataLabelToggles::default(),
+        }
+    }
+
     /// Open a chrome-editing panel over chart 7 (host sheet 0) with one series.
     fn open_chrome_panel(h: &Harness, cx: &mut TestAppContext, is_authored: bool) {
         upd(h, cx, |c, window, cx| {
             c.open_chart_panel(
                 ChartPanel {
-                    sheet: SheetId(0),
-                    id: ChartId(7),
                     is_authored,
-                    kind: ChartInsertKind::Line,
-                    ranges: None,
-                    title: Some("Chart".into()),
-                    legend: Some(LegendPosition::Right),
-                    cat_axis_title: None,
-                    val_axis_title: None,
-                    series: vec![ChartPanelSeries {
-                        name: "Widgets".into(),
-                        color: Some(Rgb::from_hex(0x4472C4)),
-                    }],
-                    labels: DataLabelToggles::default(),
+                    ..chart_7_panel()
                 },
                 window,
                 cx,
@@ -5231,6 +5315,217 @@ mod tests {
             last_chrome_edit(&h),
             ChartChromeEdit::Title(Some("Kept".into())),
             "a same-chart focus→blur commits the field",
+        );
+    }
+
+    // ---- Chart edit panel: post-v1 Batch 2 (live titles / click-away / scroll / order) ----
+
+    /// Item 6: typing in the Title field commits the chart title **live, per keystroke** (`Change`) —
+    /// no Enter/blur needed. Each keystroke sends the current text as a chrome edit.
+    #[gpui::test]
+    fn chart_panel_title_input_commits_live_on_each_keystroke(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        open_chrome_panel(&h, cx, true); // seeded title = "Chart"
+        upd(&h, cx, |c, window, cx| {
+            let handle = c.chart_title_input.clone();
+            c.on_chart_title_event(&handle, &InputEvent::Focus, window, cx);
+            handle.update(cx, |i, cx| i.set_value("S", window, cx));
+            c.on_chart_title_event(&handle, &InputEvent::Change, window, cx);
+        });
+        assert_eq!(
+            last_chrome_edit(&h),
+            ChartChromeEdit::Title(Some("S".into())),
+            "the first keystroke commits live",
+        );
+        upd(&h, cx, |c, window, cx| {
+            let handle = c.chart_title_input.clone();
+            handle.update(cx, |i, cx| i.set_value("Sa", window, cx));
+            c.on_chart_title_event(&handle, &InputEvent::Change, window, cx);
+        });
+        assert_eq!(
+            last_chrome_edit(&h),
+            ChartChromeEdit::Title(Some("Sa".into())),
+            "the next keystroke commits live too",
+        );
+    }
+
+    /// Item 6: the axis-title fields also commit live per keystroke.
+    #[gpui::test]
+    fn chart_panel_axis_title_input_commits_live_on_change(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        open_chrome_panel(&h, cx, true); // cat/val axis titles seeded empty
+        upd(&h, cx, |c, window, cx| {
+            let handle = c.chart_cat_axis_input.clone();
+            c.on_chart_cat_axis_event(&handle, &InputEvent::Focus, window, cx);
+            handle.update(cx, |i, cx| i.set_value("Month", window, cx));
+            c.on_chart_cat_axis_event(&handle, &InputEvent::Change, window, cx);
+        });
+        assert_eq!(
+            last_chrome_edit(&h),
+            ChartChromeEdit::AxisTitle {
+                axis: ChartAxisKind::Category,
+                title: Some("Month".into()),
+            },
+        );
+    }
+
+    /// Item 6 anti-clobber: a live **republish of the same chart** (a same-id reconcile) must NOT
+    /// re-seed the field, so it never overwrites what the user is actively typing.
+    #[gpui::test]
+    fn chart_panel_same_chart_republish_does_not_clobber_typing(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        open_chrome_panel(&h, cx, true); // chart 7, title "Chart" seeded
+                                         // The user is mid-type: the field holds unsaved text (set_value stands in for typing).
+        upd(&h, cx, |c, window, cx| {
+            let handle = c.chart_title_input.clone();
+            c.on_chart_title_event(&handle, &InputEvent::Focus, window, cx);
+            handle.update(cx, |i, cx| i.set_value("My draft title", window, cx));
+        });
+        // A worker republish reconciles the SAME chart (id 7) with the stale snapshot title.
+        upd(&h, cx, |c, window, cx| {
+            c.open_chart_panel(
+                ChartPanel {
+                    title: Some("Chart".into()),
+                    ..chart_7_panel()
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c
+                .chart_title_input
+                .read(cx)
+                .value()
+                .to_string()),
+            "My draft title",
+            "a same-chart republish must not re-seed / clobber the in-progress edit",
+        );
+    }
+
+    /// Item 6 anti-clobber counterpart: **switching** the selected chart (a new id) DOES re-seed the
+    /// fields to the new chart's values.
+    #[gpui::test]
+    fn chart_panel_switch_reseeds_the_title_field(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        open_chrome_panel(&h, cx, true); // chart 7, title "Chart"
+        upd(&h, cx, |c, window, cx| {
+            c.open_chart_panel(
+                ChartPanel {
+                    id: ChartId(9),
+                    title: Some("Nine".into()),
+                    ..chart_7_panel()
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c
+                .chart_title_input
+                .read(cx)
+                .value()
+                .to_string()),
+            "Nine",
+            "switching to another chart re-seeds the field to its value",
+        );
+    }
+
+    /// Item 12: a grid selection change (a click on a cell / empty grid) closes the edit panel.
+    #[gpui::test]
+    fn chart_panel_closes_on_grid_click_away(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        open_chrome_panel(&h, cx, true);
+        assert!(upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_some()));
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(2, 2)), window, cx)
+        });
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_none()),
+            "a grid click (selection change) closes the edit panel",
+        );
+    }
+
+    /// Item 12: selecting **another chart** re-points the panel (the window routes a chart click
+    /// through `open_chart_panel`, not `on_selection_changed`), so it switches rather than closing.
+    #[gpui::test]
+    fn chart_panel_another_chart_switches_not_closes(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        open_chrome_panel(&h, cx, true); // chart 7
+        upd(&h, cx, |c, window, cx| {
+            c.open_chart_panel(
+                ChartPanel::skeleton(SheetId(0), ChartId(9), true, ChartInsertKind::Line),
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target()),
+            Some(ChartId(9)),
+            "clicking another chart switches the panel to it, not close",
+        );
+    }
+
+    /// Item 11: the legend icon buttons set the right position / off (behavior unchanged, just
+    /// iconized). Exercises the same setter the icon `on_click`s call.
+    #[gpui::test]
+    fn chart_panel_legend_icons_set_position_and_off(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        open_chrome_panel(&h, cx, true);
+        for pos in [
+            Some(LegendPosition::Top),
+            Some(LegendPosition::Right),
+            Some(LegendPosition::Left),
+            Some(LegendPosition::Bottom),
+            None,
+        ] {
+            upd(&h, cx, |c, window, cx| {
+                c.set_chart_legend_from_panel(pos, window, cx)
+            });
+            assert_eq!(last_chrome_edit(&h), ChartChromeEdit::Legend(pos));
+        }
+    }
+
+    /// Item 13: the shared chart-type order places **Area right after Line** (Excel grouping), then
+    /// the Column/Bar pair — the single canonical order used by both the panel Type row and the
+    /// action-bar dropdown.
+    #[test]
+    fn chart_type_order_places_area_after_line() {
+        let kinds: Vec<ChartInsertKind> = CHART_MENU.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(
+            &kinds[..4],
+            &[
+                ChartInsertKind::Line,
+                ChartInsertKind::Area,
+                ChartInsertKind::Column,
+                ChartInsertKind::Bar,
+            ],
+            "Line → Area → Column → Bar",
+        );
+    }
+
+    /// Item 7: the panel paints (scrollable body + clipped to its bounds) on a **short** window where
+    /// its control stack overflows — without panicking and while staying open.
+    #[gpui::test]
+    fn chart_panel_paints_scrollable_on_a_short_window(cx: &mut TestAppContext) {
+        let h = build_win(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            160.0,
+        );
+        upd(&h, cx, |c, _w, cx| {
+            let body: gpui::AnyView = cx.new(|_| ShortBodyStub).into();
+            c.set_grid_body(body, cx);
+        });
+        open_chrome_panel(&h, cx, true);
+        {
+            let vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+        }
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_some()),
+            "the panel paints (scrollable + clipped) on a short window and stays open",
         );
     }
 

@@ -34,8 +34,9 @@
 //! Excluded on the same grounds: the `scaling` wrapper (always present), the **major**-gridline
 //! toggle (`c:majorGridlines` — the line renderer honors it, P13, so its presence *or absence*
 //! renders as authored; **minor** gridlines are a different story — see below), `varyColors`
-//! (matches our palette), `gapWidth`/`overlap`/`firstSliceAng` (written at defaults on nearly every
-//! bar/pie), and `schemeClr` (a theme reference we now resolve to a color, P6).
+//! (matches our palette), `gapWidth`/`overlap` (**honored by the P22 bar renderer**, so any value
+//! renders as authored) / `firstSliceAng` (written at defaults on nearly every pie), and `schemeClr`
+//! (a theme reference we now resolve to a color, P6).
 //!
 //! **Auto-dropped / scoped as support arrives.** `smooth` (curved lines) **renders faithfully as
 //! of P6** (on `lineChart`, the only group that draws it), so it left this set. `c:marker` symbols
@@ -547,6 +548,23 @@ mod tests {
                 <c:legend><c:legendPos val="r"/></c:legend>
               </c:chart>
             </c:chartSpace>
+        "#;
+        assert_eq!(source_fidelity(xml), Fidelity::Faithful);
+    }
+
+    #[test]
+    fn p22_bar_gap_overlap_and_theme_fill_stay_faithful() {
+        // The P22 bar renderer honors `c:gapWidth` / `c:overlap` and resolves a `schemeClr` series
+        // fill, so a bar chart carrying non-default spacing + a theme fill must NOT be badged.
+        let xml = r#"
+            <c:barChart>
+              <c:barDir val="bar"/><c:grouping val="clustered"/>
+              <c:ser>
+                <c:spPr><a:solidFill><a:schemeClr val="accent2"><a:lumMod val="75000"/></a:schemeClr></a:solidFill></c:spPr>
+              </c:ser>
+              <c:gapWidth val="40"/><c:overlap val="50"/>
+              <c:axId val="1"/><c:axId val="2"/>
+            </c:barChart>
         "#;
         assert_eq!(source_fidelity(xml), Fidelity::Faithful);
     }

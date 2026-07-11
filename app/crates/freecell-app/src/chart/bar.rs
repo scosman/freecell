@@ -47,12 +47,59 @@ const CATEGORY_AXIS_GUTTER: f32 = 64.0;
 const PLOT_TOP_GAP: f32 = 12.0;
 /// Reserved space at the right of the plot.
 const PLOT_RIGHT_GAP: f32 = 16.0;
-/// Fraction of a category slot the bars/cluster occupy (the rest is the inter-category gap).
-const GROUP_FILL: f32 = 0.7;
-/// Fraction of a clustered sub-slot the bar itself occupies (the rest is the inter-bar gap).
-const SUB_BAR_FILL: f32 = 0.86;
 /// Roughly how many value-axis ticks to aim for.
 const TARGET_TICKS: usize = 5;
+
+/// Bar-slot geometry from the OOXML `c:gapWidth` / `c:overlap` percentages ([`BarLayout`], P22):
+/// the width of one clustered bar and the center-to-center **advance** between adjacent bars in a
+/// cluster, for a category `slot` px wide holding `n` bars.
+///
+/// From the OOXML definitions: `gap_width` is the gap between category clusters as a percentage of a
+/// single bar's width, and `overlap` is how much adjacent bars in a cluster overlap as a percentage of
+/// a bar's width. Let `f = 1 - overlap/100` (the advance as a fraction of bar width — `overlap=0` ⇒
+/// contiguous bars, `overlap=100` ⇒ fully overlaid, negative ⇒ a gap between them). One slot holds the
+/// cluster (`bar_w · (1 + (n-1)·f)`) plus one inter-cluster gap (`bar_w · gap_width/100`), so
+/// `bar_w = slot / (1 + (n-1)·f + gap_width/100)`.
+fn clustered_metrics(slot: f32, n: usize, gap_width: u16, overlap: i16) -> (f32, f32) {
+    let n = n.max(1) as f32;
+    let gap = f32::from(gap_width.min(500)) / 100.0;
+    let f = 1.0 - f32::from(overlap.clamp(-100, 100)) / 100.0;
+    let denom = (1.0 + (n - 1.0) * f + gap).max(f32::EPSILON);
+    let bar_w = slot / denom;
+    (bar_w, bar_w * f)
+}
+
+/// The center-relative **near-edge** offset of clustered bar `j` of `n` — the cluster (span
+/// `bar_w + (n-1)·advance`) is centered in the slot, so bar `j` starts at `-span/2 + j·advance`.
+fn clustered_bar_offset(j: usize, n: usize, bar_w: f32, advance: f32) -> f32 {
+    let span = bar_w + (n.max(1) as f32 - 1.0) * advance;
+    -span / 2.0 + j as f32 * advance
+}
+
+/// The width of the single column a stacked / percent category draws, for a `slot` px wide — one bar
+/// plus one `gap_width` gap (`overlap` is inapplicable to a lone stacked column).
+fn stacked_bar_width(slot: f32, gap_width: u16) -> f32 {
+    slot / (1.0 + f32::from(gap_width.min(500)) / 100.0)
+}
+
+/// The category-slot **center** pixels along the category axis. Columns (`horizontal = false`) run
+/// first→last from `lo`→`hi` (first category at the left); horizontal bars run first→last from
+/// `hi`→`lo` — Excel draws the **first** category at the **bottom** of a bar chart, reversing the
+/// category axis vs. a column (`ooxml-coverage-matrix.md` §B; `SYNTHESIS §4.3` — the classic
+/// bar-chart gotcha). The category labels read `centers[i]`, so they follow their bars.
+fn category_centers(horizontal: bool, lo: f32, hi: f32, n: usize) -> Vec<f32> {
+    let n = n.max(1);
+    let slot = (hi - lo) / n as f32;
+    (0..n)
+        .map(|i| {
+            if horizontal {
+                hi - slot * (i as f32 + 0.5) // first category at the bottom
+            } else {
+                lo + slot * (i as f32 + 0.5) // first category at the left
+            }
+        })
+        .collect()
+}
 
 /// One series ready to draw: its per-category values and resolved color.
 #[derive(Clone)]
@@ -69,6 +116,10 @@ pub struct BarPlot {
     series: Vec<BarSeries>,
     dir: BarDir,
     grouping: Grouping,
+    /// `c:gapWidth` — the inter-cluster gap as a percentage of a bar's width (P22).
+    gap_width: u16,
+    /// `c:overlap` — how much clustered bars overlap, as a percentage of a bar's width (P22).
+    overlap: i16,
     /// The value domain: single-value span (clustered), stacked-total span (stacked), or the
     /// fixed 0–100 percent span.
     scale: NiceScale,
@@ -81,7 +132,12 @@ impl BarPlot {
     /// series contributes its values. Returns `None` for a non-bar chart or one with no
     /// category/value data.
     pub fn from_chart(chart: &Chart) -> Option<Self> {
-        let ChartKind::Bar { dir, grouping } = chart.kind else {
+        let ChartKind::Bar {
+            dir,
+            grouping,
+            layout,
+        } = chart.kind
+        else {
             return None;
         };
 
@@ -131,6 +187,8 @@ impl BarPlot {
             series,
             dir,
             grouping,
+            gap_width: layout.gap_width,
+            overlap: layout.overlap,
             scale,
             percent,
         })
@@ -161,12 +219,6 @@ struct Geometry {
     slot: f32,
 }
 
-impl Geometry {
-    fn category_center(span_start: f32, slot: f32, i: usize) -> f32 {
-        span_start + slot * (i as f32 + 0.5)
-    }
-}
-
 impl Plot for BarPlot {
     fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut gpui::App) {
         let w = bounds.size.width.as_f32();
@@ -188,16 +240,15 @@ impl Plot for BarPlot {
         let ticks = self.scale.ticks();
 
         let geo = if horizontal {
-            // Value axis runs left→right; categories stack top→bottom.
+            // Value axis runs left→right; categories stack top→bottom, but in Excel's REVERSED
+            // order (first category at the bottom — see `category_centers`).
             let value_scale = ScaleLinear::new(
                 vec![self.scale.min, self.scale.max],
                 vec![plot_left, plot_right],
             );
             let baseline_px = value_scale.tick(&0.0).unwrap_or(plot_left);
             let slot = (plot_bottom - plot_top) / n as f32;
-            let centers = (0..n)
-                .map(|i| Geometry::category_center(plot_top, slot, i))
-                .collect();
+            let centers = category_centers(true, plot_top, plot_bottom, n);
             Geometry {
                 value_scale,
                 baseline_px,
@@ -205,16 +256,14 @@ impl Plot for BarPlot {
                 slot,
             }
         } else {
-            // Value axis runs bottom→top (inverted); categories run left→right.
+            // Value axis runs bottom→top (inverted); categories run left→right (first at the left).
             let value_scale = ScaleLinear::new(
                 vec![self.scale.min, self.scale.max],
                 vec![plot_bottom, plot_top],
             );
             let baseline_px = value_scale.tick(&0.0).unwrap_or(plot_bottom);
             let slot = (plot_right - plot_left) / n as f32;
-            let centers = (0..n)
-                .map(|i| Geometry::category_center(plot_left, slot, i))
-                .collect();
+            let centers = category_centers(false, plot_left, plot_right, n);
             Geometry {
                 value_scale,
                 baseline_px,
@@ -338,28 +387,26 @@ impl BarPlot {
         geo: &Geometry,
     ) {
         let n_series = self.series.len().max(1);
-        let group_width = geo.slot * GROUP_FILL;
-        let sub_w = group_width / n_series as f32;
-        let bar_w = sub_w * SUB_BAR_FILL;
+        let (bar_w, advance) = clustered_metrics(geo.slot, n_series, self.gap_width, self.overlap);
         let baseline = geo.baseline_px;
 
+        // Painted in series order, so with a positive overlap later series draw over earlier ones
+        // (Excel's convention).
         for (j, s) in self.series.iter().enumerate() {
             let centers = geo.centers.clone();
             let values = s.values.clone();
             let value_scale = geo.value_scale.clone();
             let bar_bg: Background = s.color.into();
             let n = values.len().min(centers.len());
-            // Center this series' sub-bar within its sub-slot of the category group.
-            let offset =
-                -group_width / 2.0 + sub_w * j as f32 + (sub_w - bar_w) / 2.0 + bar_w / 2.0;
+            // The bar's near edge (`cross`) relative to the category-slot center.
+            let near_edge = clustered_bar_offset(j, n_series, bar_w, advance);
 
             Bar::new()
                 .data((0..n).collect::<Vec<usize>>())
                 .alignment(alignment)
                 .band_width(bar_w)
                 .base(move |_| baseline)
-                // `cross` is the bar's near edge, so subtract half the bar width from the center.
-                .cross(move |i: &usize| Some(centers[*i] + offset - bar_w / 2.0))
+                .cross(move |i: &usize| Some(centers[*i] + near_edge))
                 .value(move |i: &usize| value_scale.tick(&values[*i]))
                 .fill(move |_, _, _| bar_bg)
                 .corner_radii(Corners::all(px(2.)))
@@ -380,8 +427,9 @@ impl BarPlot {
         let Some(segments) = self.segments() else {
             return;
         };
-        let group_width = geo.slot * GROUP_FILL;
-        let offset = -group_width / 2.0;
+        // One column per category, centered in the slot; `gap_width` sets how wide (overlap N/A).
+        let bar_w = stacked_bar_width(geo.slot, self.gap_width);
+        let offset = -bar_w / 2.0;
 
         for (s, row) in segments.iter().enumerate() {
             let centers = geo.centers.clone();
@@ -395,7 +443,7 @@ impl BarPlot {
             Bar::new()
                 .data((0..n).collect::<Vec<usize>>())
                 .alignment(alignment)
-                .band_width(group_width)
+                .band_width(bar_w)
                 .cross(move |i: &usize| Some(centers[*i] + offset))
                 .base(move |i: &usize| vs_lo.tick(&seg_lo[*i].lo).unwrap_or(0.0))
                 .value(move |i: &usize| value_scale.tick(&seg_row[*i].hi))
@@ -415,7 +463,7 @@ pub fn bar_element(chart: &Chart) -> Option<gpui::AnyElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freecell_chart_model::{Axis, Category, Legend, Series};
+    use freecell_chart_model::{Axis, BarLayout, Category, Legend, Series};
 
     fn cats() -> Vec<Category> {
         vec![
@@ -426,9 +474,17 @@ mod tests {
     }
 
     fn bar_chart(dir: BarDir, grouping: Grouping) -> Chart {
+        bar_chart_with(dir, grouping, BarLayout::default())
+    }
+
+    fn bar_chart_with(dir: BarDir, grouping: Grouping, layout: BarLayout) -> Chart {
         Chart {
             title: Some("Sales".into()),
-            kind: ChartKind::Bar { dir, grouping },
+            kind: ChartKind::Bar {
+                dir,
+                grouping,
+                layout,
+            },
             series: vec![
                 Series::category_value(Some("A"), cats(), vec![10.0, 20.0, 30.0]),
                 Series::category_value(Some("B"), cats(), vec![15.0, 25.0, 35.0]),
@@ -440,30 +496,108 @@ mod tests {
         }
     }
 
+    /// The clustered bars for one category must be disjoint (at the default overlap 0) and centered
+    /// within the slot, using the OOXML `gapWidth`/`overlap` geometry.
     #[test]
-    fn grouped_offsets_partition_the_band() {
-        // The clustered sub-bars for a category must be disjoint and lie within the group.
-        let plot = BarPlot::from_chart(&bar_chart(BarDir::Col, Grouping::Clustered)).unwrap();
-        let n_series = plot.series.len();
+    fn grouped_offsets_partition_the_slot() {
         let slot = 120.0_f32;
-        let group_width = slot * GROUP_FILL;
-        let sub_w = group_width / n_series as f32;
-        let bar_w = sub_w * SUB_BAR_FILL;
+        let n = 3;
+        let (bar_w, advance) = clustered_metrics(slot, n, 150, 0);
 
-        let mut spans = Vec::new();
-        for j in 0..n_series {
-            let offset = -group_width / 2.0 + sub_w * j as f32 + (sub_w - bar_w) / 2.0;
-            spans.push((offset, offset + bar_w));
-        }
-        // Each bar sits within the group half-widths.
+        // Near/far edge of each bar (near edge from `clustered_bar_offset`, width `bar_w`).
+        let spans: Vec<(f32, f32)> = (0..n)
+            .map(|j| {
+                let near = clustered_bar_offset(j, n, bar_w, advance);
+                (near, near + bar_w)
+            })
+            .collect();
+
+        // The whole cluster fits within the slot.
         for (lo, hi) in &spans {
-            assert!(*lo >= -group_width / 2.0 - 1e-3, "bar spills left of group");
-            assert!(*hi <= group_width / 2.0 + 1e-3, "bar spills right of group");
+            assert!(*lo >= -slot / 2.0 - 1e-3, "bar spills left of the slot");
+            assert!(*hi <= slot / 2.0 + 1e-3, "bar spills right of the slot");
         }
-        // Bars don't overlap (next bar starts after the previous ends).
+        // At overlap 0 the bars are contiguous but do not overlap (advance == bar_w).
+        assert!(
+            (advance - bar_w).abs() < 1e-3,
+            "overlap 0 ⇒ advance == bar width"
+        );
         for pair in spans.windows(2) {
-            assert!(pair[0].1 <= pair[1].0 + 1e-3, "clustered bars overlap");
+            assert!(
+                pair[0].1 <= pair[1].0 + 1e-3,
+                "clustered bars overlap at overlap=0"
+            );
         }
+        // The cluster is centered: first near edge is the negative mirror of the last far edge.
+        assert!(
+            (spans[0].0 + spans[n - 1].1).abs() < 1e-3,
+            "cluster not centered"
+        );
+    }
+
+    /// A wider `gapWidth` thins the bars; a positive `overlap` makes clustered bars overlap; a
+    /// negative `overlap` leaves a gap between them.
+    #[test]
+    fn gap_and_overlap_reshape_the_cluster() {
+        let slot = 120.0_f32;
+        let (wide_gap, _) = clustered_metrics(slot, 3, 300, 0);
+        let (narrow_gap, _) = clustered_metrics(slot, 3, 30, 0);
+        assert!(wide_gap < narrow_gap, "a larger gapWidth thins the bars");
+
+        let (bar_w, advance) = clustered_metrics(slot, 2, 50, 50);
+        assert!(
+            advance < bar_w,
+            "overlap 50 ⇒ advance < bar width (bars overlap)"
+        );
+        let far0 = clustered_bar_offset(0, 2, bar_w, advance) + bar_w;
+        let near1 = clustered_bar_offset(1, 2, bar_w, advance);
+        assert!(
+            near1 < far0,
+            "positive overlap ⇒ bar 1 starts before bar 0 ends"
+        );
+
+        let (bar_w, advance) = clustered_metrics(slot, 2, 50, -50);
+        let far0 = clustered_bar_offset(0, 2, bar_w, advance) + bar_w;
+        let near1 = clustered_bar_offset(1, 2, bar_w, advance);
+        assert!(near1 > far0, "negative overlap ⇒ a gap between the bars");
+    }
+
+    /// The stacked column narrows as `gapWidth` grows (overlap is inapplicable to a lone column).
+    #[test]
+    fn stacked_bar_width_shrinks_with_gap() {
+        let slot = 100.0_f32;
+        assert!(
+            (stacked_bar_width(slot, 0) - 100.0).abs() < 1e-3,
+            "gap 0 ⇒ full slot"
+        );
+        assert!(
+            (stacked_bar_width(slot, 100) - 50.0).abs() < 1e-3,
+            "gap 100 ⇒ half slot"
+        );
+        assert!(stacked_bar_width(slot, 300) < stacked_bar_width(slot, 100));
+    }
+
+    /// Excel draws the FIRST category at the BOTTOM of a horizontal bar chart — the category axis
+    /// is reversed vs. a column (the classic gotcha). Columns keep first→last left→right.
+    #[test]
+    fn horizontal_category_order_is_reversed() {
+        // Horizontal: lo=top(0), hi=bottom(300). Category 0 must be nearer the bottom (larger y).
+        let bars = category_centers(true, 0.0, 300.0, 4);
+        assert!(
+            bars[0] > bars[3],
+            "first category is below the last (Excel bar order)"
+        );
+        assert!(
+            bars.windows(2).all(|w| w[0] > w[1]),
+            "categories run bottom→top as index rises"
+        );
+        // Columns: lo=left, hi=right. Category 0 is nearer the left (smaller x), ascending.
+        let cols = category_centers(false, 0.0, 300.0, 4);
+        assert!(cols[0] < cols[3], "first column is left of the last");
+        assert!(
+            cols.windows(2).all(|w| w[0] < w[1]),
+            "columns run left→right"
+        );
     }
 
     #[test]

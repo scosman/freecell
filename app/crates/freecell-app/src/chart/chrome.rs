@@ -508,6 +508,7 @@ mod tests {
         chart.kind = ChartKind::Bar {
             dir: BarDir::Bar,
             grouping: Grouping::Clustered,
+            layout: freecell_chart_model::BarLayout::default(),
         };
         assert_eq!(captions(&chart), ("Month".to_string(), "Units".to_string()));
 

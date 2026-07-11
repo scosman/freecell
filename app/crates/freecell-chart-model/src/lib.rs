@@ -107,12 +107,51 @@ pub enum Grouping {
     PercentStacked,
 }
 
+/// A bar chart's spacing knobs (`c:gapWidth` + `c:overlap`), the two `c:barChart` layout
+/// percentages that govern the bar-slot geometry (`ooxml-coverage-matrix.md` §E). Both are stored
+/// as their OOXML integer percentages; the renderer derives pixel widths from them.
+///
+/// [`Default`] is the OOXML schema default (`ST_GapAmount` 150 %, `ST_Overlap` 0 %) — the value the
+/// loader uses when a `c:barChart` omits the element (Excel omits them at default), so a plain bar
+/// chart round-trips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BarLayout {
+    /// `c:gapWidth` — the gap between category clusters as a percentage of a single bar's width
+    /// (`ST_GapAmount`, 0..=500; Excel default 150). A larger gap ⇒ thinner bars.
+    pub gap_width: u16,
+    /// `c:overlap` — how much bars **within** a clustered category overlap, as a percentage of a
+    /// bar's width (`ST_Overlap`, -100..=100; Excel default 0 for clustered). `0` ⇒ contiguous bars,
+    /// `100` ⇒ fully overlaid, negative ⇒ a gap between them. Inapplicable to a single stacked column.
+    pub overlap: i16,
+}
+
+impl Default for BarLayout {
+    fn default() -> Self {
+        Self {
+            gap_width: 150,
+            overlap: 0,
+        }
+    }
+}
+
+impl BarLayout {
+    /// Build an explicit layout (builder-free — the two fields are the whole shape).
+    pub fn new(gap_width: u16, overlap: i16) -> Self {
+        Self { gap_width, overlap }
+    }
+}
+
 /// The chart type + its type-specific options. Mirrors the `c:<type>Chart` element
 /// (functional_spec §2). Only the in-scope PoC types are represented.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChartKind {
-    /// `c:barChart` — columns or horizontal bars.
-    Bar { dir: BarDir, grouping: Grouping },
+    /// `c:barChart` — columns or horizontal bars. `layout` carries the `c:gapWidth` / `c:overlap`
+    /// bar-slot spacing ([`BarLayout`], P22).
+    Bar {
+        dir: BarDir,
+        grouping: Grouping,
+        layout: BarLayout,
+    },
     /// `c:lineChart`.
     Line { grouping: Grouping, smooth: bool },
     /// `c:areaChart`.
@@ -515,6 +554,7 @@ mod tests {
             kind: ChartKind::Bar {
                 dir: BarDir::Col,
                 grouping: Grouping::Clustered,
+                layout: BarLayout::default(),
             },
             series: vec![Series::category_value(
                 Some("2024"),
@@ -536,7 +576,8 @@ mod tests {
             chart.kind,
             ChartKind::Bar {
                 dir: BarDir::Col,
-                grouping: Grouping::Clustered
+                grouping: Grouping::Clustered,
+                layout: BarLayout::default(),
             }
         );
         assert_eq!(chart.series.len(), 1);

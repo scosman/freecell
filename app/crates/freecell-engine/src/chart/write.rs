@@ -135,10 +135,18 @@ pub fn serialize_chart_xml(chart: &Chart, refs: &[SeriesRefs]) -> String {
 /// order follows the `CT_*Chart` schema sequence so strict readers (Excel) accept it.
 fn group_element(chart: &Chart, series_xml: &str) -> String {
     match &chart.kind {
-        ChartKind::Bar { dir, grouping } => format!(
-            r#"<c:barChart><c:barDir val="{}"/><c:grouping val="{}"/><c:varyColors val="0"/>{series_xml}<c:axId val="{CAT_AX}"/><c:axId val="{VAL_AX}"/></c:barChart>"#,
+        ChartKind::Bar {
+            dir,
+            grouping,
+            layout,
+        } => format!(
+            // `c:gapWidth` / `c:overlap` sit after the series and before the `c:axId` pair — the
+            // `CT_BarChart` child order — so the output round-trips through `parse_chart_xml` (P22).
+            r#"<c:barChart><c:barDir val="{}"/><c:grouping val="{}"/><c:varyColors val="0"/>{series_xml}<c:gapWidth val="{}"/><c:overlap val="{}"/><c:axId val="{CAT_AX}"/><c:axId val="{VAL_AX}"/></c:barChart>"#,
             bar_dir(*dir),
             grouping_val(*grouping),
+            layout.gap_width,
+            layout.overlap,
         ),
         ChartKind::Line { grouping, smooth } => {
             let smooth_el = if *smooth {
@@ -728,7 +736,9 @@ mod tests {
     use crate::chart::load::{discover_and_parse, parse_chart_xml};
     use crate::chart::save::patch_chart_source;
     use crate::document::WorkbookDocument;
-    use freecell_chart_model::{Axis, Category, Chart, ChartKind, Color, Legend, SeriesData};
+    use freecell_chart_model::{
+        Axis, BarLayout, Category, Chart, ChartKind, Color, Legend, SeriesData,
+    };
     use freecell_core::CellRef;
 
     const CATS: [&str; 4] = ["Q1", "Q2", "Q3", "Q4"];
@@ -824,20 +834,56 @@ mod tests {
 
     #[test]
     fn serialize_roundtrips_bar_both_orientations() {
+        // Both orientations × both a default and a NON-default gap/overlap layout — the P22
+        // `c:gapWidth`/`c:overlap` must round-trip serialize→parse, not just the default.
         for dir in [BarDir::Col, BarDir::Bar] {
-            let chart = Chart {
-                title: Some("Bars".into()),
-                kind: ChartKind::Bar {
-                    dir,
-                    grouping: Grouping::Clustered,
-                },
-                series: vec![sales_series()],
-                cat_axis: Axis::titled("Quarter"),
-                val_axis: Axis::default(),
-                legend: Some(Legend::default()),
-            };
-            assert_roundtrip(chart, &sheet1_refs());
+            for layout in [BarLayout::default(), BarLayout::new(60, 40)] {
+                let chart = Chart {
+                    title: Some("Bars".into()),
+                    kind: ChartKind::Bar {
+                        dir,
+                        grouping: Grouping::Clustered,
+                        layout,
+                    },
+                    series: vec![sales_series()],
+                    cat_axis: Axis::titled("Quarter"),
+                    val_axis: Axis::default(),
+                    legend: Some(Legend::default()),
+                };
+                assert_roundtrip(chart, &sheet1_refs());
+            }
         }
+    }
+
+    /// The serialized `c:barChart` carries the `c:gapWidth` / `c:overlap` (in schema order, before the
+    /// `c:axId` pair) — the P22 layout is emitted, not just modeled.
+    #[test]
+    fn serialize_emits_gap_width_and_overlap() {
+        let chart = Chart {
+            title: Some("Bars".into()),
+            kind: ChartKind::Bar {
+                dir: BarDir::Col,
+                grouping: Grouping::Clustered,
+                layout: BarLayout::new(75, -20),
+            },
+            series: vec![sales_series()],
+            cat_axis: Axis::default(),
+            val_axis: Axis::default(),
+            legend: None,
+        };
+        let xml = serialize_chart_xml(&chart, &sheet1_refs());
+        assert!(
+            xml.contains(r#"<c:gapWidth val="75"/>"#),
+            "gapWidth emitted:\n{xml}"
+        );
+        assert!(
+            xml.contains(r#"<c:overlap val="-20"/>"#),
+            "overlap emitted:\n{xml}"
+        );
+        // Schema order: both spacing knobs precede the axId pair.
+        let gap = xml.find("<c:gapWidth").unwrap();
+        let ax = xml.find("<c:axId").unwrap();
+        assert!(gap < ax, "gapWidth/overlap must precede axId");
     }
 
     #[test]
@@ -1102,6 +1148,47 @@ mod tests {
         assert!(ct.contains("/xl/drawings/drawing1.xml"));
     }
 
+    /// P22 end-to-end: an authored **horizontal bar** with a non-default `gapWidth`/`overlap` reopens
+    /// through the full write→discover path as a `ChartKind::Bar { dir: Bar }` carrying its layout.
+    #[test]
+    fn write_authored_bar_reopens_as_horizontal_bar_with_layout() {
+        let model = data_model_bytes();
+        let bar = Chart {
+            title: Some("Authored Bars".into()),
+            kind: ChartKind::Bar {
+                dir: BarDir::Bar,
+                grouping: Grouping::Clustered,
+                layout: BarLayout::new(75, 25),
+            },
+            series: vec![sales_series()],
+            cat_axis: Axis::titled("Quarter"),
+            val_axis: Axis::default(),
+            legend: Some(Legend::default()),
+        };
+        let (bytes, _) = write_authored_charts(
+            &model,
+            &[authored(bar, "xl/charts/chart1.xml", sheet1_refs())],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("authored_bar.xlsx");
+        std::fs::write(&out, &bytes).unwrap();
+        ironcalc::import::load_from_xlsx(out.to_str().unwrap(), "en", "UTC", "en")
+            .expect("authored bar reopens in IronCalc");
+
+        let specs = discover_and_parse(&out).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].chart().unwrap().kind,
+            ChartKind::Bar {
+                dir: BarDir::Bar,
+                grouping: Grouping::Clustered,
+                layout: BarLayout::new(75, 25),
+            },
+            "the reopened chart is a horizontal bar with its authored gap/overlap"
+        );
+    }
+
     #[test]
     fn write_two_authored_charts_on_one_sheet_share_a_drawing() {
         let model = data_model_bytes();
@@ -1110,6 +1197,7 @@ mod tests {
             kind: ChartKind::Bar {
                 dir: BarDir::Col,
                 grouping: Grouping::Clustered,
+                layout: BarLayout::default(),
             },
             series: vec![sales_series()],
             cat_axis: Axis::titled("Quarter"),

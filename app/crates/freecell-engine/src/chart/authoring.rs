@@ -1479,7 +1479,8 @@ mod tests {
             parse_chart_xml(&column_chart()).unwrap().kind,
             ChartKind::Bar {
                 dir: BarDir::Col,
-                grouping: Grouping::Clustered
+                grouping: Grouping::Clustered,
+                ..
             }
         ));
         assert!(matches!(

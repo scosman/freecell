@@ -205,6 +205,7 @@ mod tests {
         bar.kind = ChartKind::Bar {
             dir: freecell_chart_model::BarDir::Col,
             grouping: freecell_chart_model::Grouping::Clustered,
+            layout: freecell_chart_model::BarLayout::default(),
         };
         assert!(PiePlot::from_chart(&bar).is_none());
     }

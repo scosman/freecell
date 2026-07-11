@@ -338,6 +338,7 @@ mod tests {
         bar.kind = ChartKind::Bar {
             dir: freecell_chart_model::BarDir::Col,
             grouping: Grouping::Stacked,
+            layout: freecell_chart_model::BarLayout::default(),
         };
         assert!(AreaPlot::from_chart(&bar).is_none());
     }

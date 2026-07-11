@@ -4,8 +4,8 @@
 //! baseline filename, so a red CI line names the exact broken feature.
 
 use freecell_chart_model::{
-    Anchor, AnchorCell, Axis, Category, Chart, ChartColor, ChartId, ChartInsertKind, ChartKind,
-    ChartSpec, Grouping, Legend, Series, SourceXml, ThemeSlot,
+    Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartId,
+    ChartInsertKind, ChartKind, ChartSpec, Color, Grouping, Legend, Series, SourceXml, ThemeSlot,
 };
 use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
 
@@ -250,6 +250,48 @@ fn in_grid_chart_spec(title: &str, source_xml: &str) -> ChartSpec {
 /// [`Fidelity::Faithful`](freecell_chart_model::Fidelity), so the real single-series line renders.
 fn in_grid_authored_inserted_spec() -> ChartSpec {
     ChartSpec::authored(ChartInsertKind::Line.near_empty_chart(), chart_anchor())
+}
+
+/// A three-region clustered **column** chart (P22) over the backing table's quarters — the picture the
+/// ChartLayer paints for the in-grid column case (`grid_chart_column`).
+fn in_grid_column_chart(title: &str) -> Chart {
+    let months = || {
+        ["Jan", "Feb", "Mar", "Apr"]
+            .into_iter()
+            .map(|m| Category::Text(m.into()))
+            .collect::<Vec<_>>()
+    };
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::Clustered,
+            layout: BarLayout::default(),
+        },
+        series: vec![
+            Series::category_value(Some("North"), months(), vec![32.0, 41.0, 55.0, 62.0])
+                .with_color(Color::from_hex(0x4472C4)),
+            Series::category_value(Some("South"), months(), vec![74.0, 60.0, 48.0, 52.0])
+                .with_color(Color::from_hex(0xED7D31)),
+            Series::category_value(Some("West"), months(), vec![50.0, 54.0, 49.0, 58.0])
+                .with_color(Color::from_hex(0xFFC000)),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** clustered-column `ChartSpec` at [`chart_anchor`], with a `<c:barChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `bar_element` path (P22), the column
+/// analogue of the loaded line case.
+fn in_grid_column_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_column_chart(title),
+        SourceXml::new("<c:barChart><c:barDir val=\"col\"/></c:barChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
 }
 
 /// An **Unsupported** spec: a `surfaceChart` source (no faithful 2-D rendering) so the ChartLayer
@@ -533,6 +575,11 @@ pub fn all() -> Vec<RenderCase> {
         // A Faithful line chart floating over the data table (`charts/functional_spec.md §1`).
         RenderCase::new("grid_chart_line", chart_backing_scene(), CHART_GRID_VP)
             .charts(vec![in_grid_chart_spec("Regional Sales", "<c:lineChart/>")]),
+        // A Faithful clustered-COLUMN chart floating over the same backing table (P22) — the in-grid
+        // proof of the ChartLayer → `bar_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_column", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_column_spec("Regional Sales")]),
         // A Degraded chart still renders as a line, plus the corner "⚠ May not display as intended"
         // badge (`ui_design.md §2.2`) — here from a 3-D group (`line3DChart`) rendered as its 2-D
         // line. (A shown `c:dLbls` on a line is Faithful as of P12 — it renders — so the badge case

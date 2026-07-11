@@ -122,7 +122,7 @@ Each: renderer + type fidelity + reuse anchor/bind/save/**author/edit** + its ow
 baselines + round-trip. Ordered by prevalence/ROI; the final type re-runs the full cross-type
 perceptual-diff + external round-trip sweep.
 
-- [ ] **P22 — Column & bar.** Both orientations; clustered/stacked/100%; `gapWidth`/`overlap`;
+- [x] **P22 — Column & bar.** Both orientations; clustered/stacked/100%; `gapWidth`/`overlap`;
   **Excel horizontal-bar category order**; per-type fills.
 - [ ] **P23 — Area.** Standard/stacked/100% (hand-rolled polygon fork); fills.
 - [ ] **P24 — Pie & doughnut.** `c:dPt` per-slice colors + `varyColors`; `holeSize`;

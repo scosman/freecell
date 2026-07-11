@@ -707,6 +707,7 @@ mod tests {
         bar.kind = ChartKind::Bar {
             dir: freecell_chart_model::BarDir::Col,
             grouping: Grouping::Clustered,
+            layout: freecell_chart_model::BarLayout::default(),
         };
         assert!(LinePlot::multi_series(&bar).is_none());
 

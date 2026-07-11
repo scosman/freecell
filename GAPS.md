@@ -190,6 +190,14 @@ Non-blocking forward-looking note from the P18 (select/move/resize/delete) revie
 |---|---|---|---|---|
 | C-P18-1 | **Moving/resizing a LOADED chart whose drawing anchor is a `oneCellAnchor` or `absoluteAnchor` moves its position but keeps its original size (cosmetic).** The overwhelmingly-common `twoCellAnchor` (used by real files, our loader, and the authored writer) is fully rewritten; the two rarer anchor kinds carry an `<xdr:ext>` (size) instead of `<xdr:to>`. | Excel moves + resizes any anchor kind. | `chart::save::patch_drawing_xml` rewrites `<xdr:from>`/`<xdr:to>` for the target anchor; a `oneCellAnchor`/`absoluteAnchor` has no `<xdr:to>`, so its `<xdr:from>` corner is updated (position moves) but its `<xdr:ext>` is left untouched (size preserved). **No corruption** — the patched drawing stays valid and reopens; only the size edit is dropped. | Extend the P18 edit path to rewrite `<xdr:ext>` (and, for a resize, convert to `twoCellAnchor` if needed) when the target anchor is not a `twoCellAnchor`. Small once a real file needs it. |
 
+### Charts — column & bar (Charts P22, 2026-07-11)
+
+Non-blocking Mild note from the P22 (column & bar) review. Not a defect — recorded so it isn't re-litigated.
+
+| # | Item | Severity | Root cause / current behavior | Follow-up if needed |
+|---|---|---|---|---|
+| C-P22-1 | **`BarLayout::new` and the bar write path don't clamp `gapWidth`/`overlap` to their OOXML ST ranges.** `BarLayout::new(gap_width, overlap)` stores whatever it's given, and `write::group_element` emits the stored values verbatim; only the **load** path (`load::bar_layout`) clamps (`gapWidth` 0..=500, `overlap` -100..=100) and the **renderer** clamps for geometry. | Mild — **purely theoretical today.** Every real path is safe: loaded charts are load-clamped, authored/insert charts use `BarLayout::default()` (150/0), and the render fixtures pass in-range values. gap/overlap are **not panel-editable yet**, so no path can construct an out-of-range `BarLayout` that reaches the writer. | When gap/overlap become editable via the edit panel (a later chrome-editing extension), clamp in `BarLayout::new` (or at the write arm) to `ST_GapAmount`/`ST_Overlap` before an out-of-range value can be serialized. Trivial — a `.clamp()` at construction — but unreachable until then, so deferred. |
+
 ### `mvp-gaps` UI review — accepted limitations (owner-approved 2026-07-06)
 
 Two judgment calls from the post-Phase-8 **UI-review bug-fix round**, reviewed and accepted by

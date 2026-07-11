@@ -12,9 +12,9 @@ use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
 use freecell_chart_model::{
-    normalize_3d_chart_group, Anchor, AnchorCell, Axis, BarDir, Category, CfRange, Chart,
-    ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, Grouping, Legend,
-    LegendPosition, LineStroke, Series, SourcePart, SourceXml, ThemeSlot,
+    normalize_3d_chart_group, Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, CfRange,
+    Chart, ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, Grouping,
+    Legend, LegendPosition, LineStroke, Series, SourcePart, SourceXml, ThemeSlot,
 };
 
 use super::xlsx::{self, attr};
@@ -647,6 +647,7 @@ fn parse_kind(group: &Node, kind_name: &str) -> Result<ChartKind> {
             ChartKind::Bar {
                 dir,
                 grouping: grouping_of(group, Grouping::Clustered),
+                layout: bar_layout(group),
             }
         }
         "lineChart" => ChartKind::Line {
@@ -672,6 +673,23 @@ fn parse_kind(group: &Node, kind_name: &str) -> Result<ChartKind> {
         "scatterChart" => ChartKind::Scatter,
         other => return Err(anyhow!("unhandled chart-group element <c:{other}>")),
     })
+}
+
+/// The bar-slot spacing ([`BarLayout`], P22) from a `c:barChart` group: `c:gapWidth@val` (clamped to
+/// the OOXML `ST_GapAmount` 0..=500, default 150) and `c:overlap@val` (clamped to `ST_Overlap`
+/// -100..=100, default 0). An absent element takes its default — Excel omits them at the default, so a
+/// plain bar chart round-trips.
+fn bar_layout(group: &Node) -> BarLayout {
+    let default = BarLayout::default();
+    let gap_width = child_val(group, "gapWidth")
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|g| g.clamp(0, 500) as u16)
+        .unwrap_or(default.gap_width);
+    let overlap = child_val(group, "overlap")
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|o| o.clamp(-100, 100) as i16)
+        .unwrap_or(default.overlap);
+    BarLayout { gap_width, overlap }
 }
 
 /// Maps a group's `c:grouping@val` to [`Grouping`], falling back to `default` when absent.
@@ -824,14 +842,14 @@ fn child_bool(node: &Node, name: &str) -> bool {
     matches!(child_val(node, name).as_deref(), Some("1") | Some("true"))
 }
 
-/// The series color from `c:ser/c:spPr/a:solidFill/a:srgbClr@val`, if present.
-fn parse_series_color(ser: &Node) -> Option<freecell_chart_model::Color> {
+/// The series fill color from `c:ser/c:spPr/a:solidFill` (P22): an explicit `a:srgbClr` **or** a theme
+/// `a:schemeClr` (+ `lumMod`/`lumOff` tint), via the shared [`parse_solid_fill`] — the same reader the
+/// line stroke uses, so a bar/area/pie series fill honors theme colors (`ooxml-coverage-matrix.md` §C),
+/// not only sRGB. The fill's `a:alpha` is dropped (the [`Series`] color model carries none). `None`
+/// when the series has no `c:spPr` solid fill (the renderer then cycles the palette).
+fn parse_series_color(ser: &Node) -> Option<ChartColor> {
     let sp_pr = child(ser, "spPr")?;
-    let solid = child(&sp_pr, "solidFill")?;
-    let srgb = child(&solid, "srgbClr")?;
-    let hex = attr(&srgb, "val")?;
-    let v = u32::from_str_radix(hex.trim(), 16).ok()?;
-    Some(freecell_chart_model::Color::from_hex(v))
+    parse_solid_fill(&sp_pr).map(|(color, _alpha)| color)
 }
 
 /// Reads the cached string values under a data-reference holder (`c:tx`, `c:cat`, …): the
@@ -1067,7 +1085,9 @@ mod tests {
             chart.kind,
             ChartKind::Bar {
                 dir: BarDir::Col,
-                grouping: Grouping::Clustered
+                grouping: Grouping::Clustered,
+                // COLUMN_CHART omits c:gapWidth/c:overlap, so they take the OOXML defaults.
+                layout: BarLayout::default(),
             }
         );
         assert_eq!(chart.cat_axis.title.as_deref(), Some("Quarter"));
@@ -1095,6 +1115,76 @@ mod tests {
                 assert_eq!(values, &vec![120.0, 150.0]);
             }
             other => panic!("expected CategoryValue, got {other:?}"),
+        }
+    }
+
+    /// P22: a `c:barChart` parses its `c:gapWidth` / `c:overlap` into [`BarLayout`], and a series
+    /// `a:schemeClr` fill parses to a theme [`ChartColor`] (not just `a:srgbClr`).
+    #[test]
+    fn parses_bar_gap_overlap_and_theme_fill() {
+        let xml = r#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+ <c:chart><c:plotArea>
+  <c:barChart>
+   <c:barDir val="bar"/>
+   <c:grouping val="clustered"/>
+   <c:ser>
+    <c:idx val="0"/>
+    <c:spPr><a:solidFill><a:schemeClr val="accent2"><a:lumMod val="75000"/></a:schemeClr></a:solidFill></c:spPr>
+    <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt></c:numCache></c:numRef></c:val>
+   </c:ser>
+   <c:gapWidth val="75"/>
+   <c:overlap val="-20"/>
+   <c:axId val="1"/><c:axId val="2"/>
+  </c:barChart>
+ </c:plotArea></c:chart></c:chartSpace>"#;
+        let chart = parse_chart_xml(xml).unwrap();
+        assert_eq!(
+            chart.kind,
+            ChartKind::Bar {
+                dir: BarDir::Bar,
+                grouping: Grouping::Clustered,
+                layout: freecell_chart_model::BarLayout::new(75, -20),
+            }
+        );
+        // The series fill is a theme reference (accent2 + lumMod), not an sRGB.
+        assert_eq!(
+            chart.series[0].color,
+            Some(ChartColor::Theme {
+                slot: ThemeSlot::Accent2,
+                lum_mod: Some(0.75),
+                lum_off: None,
+            })
+        );
+    }
+
+    /// A `c:barChart` that omits `c:gapWidth` / `c:overlap` takes the OOXML defaults (150 / 0), and
+    /// an out-of-range value is clamped to its `ST_GapAmount` / `ST_Overlap` bounds.
+    #[test]
+    fn bar_layout_defaults_and_clamps() {
+        let no_layout = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+ <c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>
+   <c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+ </c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        match parse_chart_xml(no_layout).unwrap().kind {
+            ChartKind::Bar { layout, .. } => {
+                assert_eq!(layout, freecell_chart_model::BarLayout::default());
+            }
+            other => panic!("expected Bar, got {other:?}"),
+        }
+
+        let out_of_range = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+ <c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+   <c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+   <c:gapWidth val="900"/><c:overlap val="250"/>
+ </c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        match parse_chart_xml(out_of_range).unwrap().kind {
+            ChartKind::Bar { layout, .. } => {
+                assert_eq!(layout.gap_width, 500, "gapWidth clamps to 500");
+                assert_eq!(layout.overlap, 100, "overlap clamps to 100");
+            }
+            other => panic!("expected Bar, got {other:?}"),
         }
     }
 

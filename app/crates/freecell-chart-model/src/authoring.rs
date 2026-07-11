@@ -12,7 +12,7 @@
 //! template the user reshapes (set the data range / title) via the edit panel (P19+). It carries no
 //! `c:f` refs, so on save the write path emits literals (no live binding until a range is set).
 
-use crate::{Axis, BarDir, Category, Chart, ChartKind, Grouping, Legend, Series};
+use crate::{Axis, BarDir, BarLayout, Category, Chart, ChartKind, Grouping, Legend, Series};
 
 /// A chart type the action-bar insert menu can author (charts/ui_design §3.1). Each maps to a
 /// [`ChartKind`] and has both an in-grid renderer and a write-path serializer. Bubble is
@@ -53,10 +53,12 @@ impl ChartInsertKind {
             ChartInsertKind::Column => ChartKind::Bar {
                 dir: BarDir::Col,
                 grouping: Grouping::Clustered,
+                layout: BarLayout::default(),
             },
             ChartInsertKind::Bar => ChartKind::Bar {
                 dir: BarDir::Bar,
                 grouping: Grouping::Clustered,
+                layout: BarLayout::default(),
             },
             ChartInsertKind::Area => ChartKind::Area {
                 grouping: Grouping::Standard,

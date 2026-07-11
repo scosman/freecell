@@ -13,8 +13,8 @@
 //! grid case table grows.
 
 use freecell_chart_model::{
-    Axis, Category, Chart, ChartColor, ChartKind, Color, DataLabels, Grouping, Legend,
-    LegendPosition, LineStroke, Marker, MarkerSymbol, Series, ThemeSlot,
+    Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartKind, Color, DataLabels, Grouping,
+    Legend, LegendPosition, LineStroke, Marker, MarkerSymbol, Series, ThemeSlot,
 };
 
 /// One capturable chart fixture: a chart, and the (tight) capture viewport in device px. `name`
@@ -56,6 +56,13 @@ pub fn all() -> Vec<ChartScene> {
         chart_line_no_gridlines(),
         chart_line_styled(),
         chart_line_legend_bottom(),
+        // P22 — column & bar.
+        chart_column_clustered(),
+        chart_column_stacked(),
+        chart_column_percent(),
+        chart_bar_clustered(),
+        chart_column_gap_overlap(),
+        chart_column_theme_fills(),
     ]
 }
 
@@ -609,6 +616,185 @@ fn chart_line_legend_bottom() -> ChartScene {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// P22 — column & bar scenes
+// -------------------------------------------------------------------------------------------------
+
+/// Three product series over four quarters — the shared data for the column grouping scenes.
+fn products() -> Vec<Series> {
+    vec![
+        Series::category_value(Some("Widgets"), quarters(), vec![120.0, 150.0, 90.0, 170.0])
+            .with_color(Color::from_hex(0x4472C4)),
+        Series::category_value(Some("Gadgets"), quarters(), vec![80.0, 110.0, 130.0, 95.0])
+            .with_color(Color::from_hex(0xED7D31)),
+        Series::category_value(Some("Gizmos"), quarters(), vec![60.0, 70.0, 55.0, 120.0])
+            .with_color(Color::from_hex(0xFFC000)),
+    ]
+}
+
+/// A clustered **column** chart (`barDir=col`, `grouping=clustered`): three series side-by-side per
+/// quarter with explicit sRGB fills, title, both axis titles, and a right legend. The bread-and-butter
+/// column chart — proves the multi-series clustered geometry + per-series fills.
+fn chart_column_clustered() -> ChartScene {
+    let chart = Chart {
+        title: Some("Quarterly Sales by Product".into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::Clustered,
+            layout: BarLayout::default(),
+        },
+        series: products(),
+        cat_axis: Axis::titled("Quarter"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_column_clustered",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A **stacked** column chart (`grouping=stacked`): the same three product series stacked into one
+/// column per quarter, the value axis reaching the tallest stack total. Proves the cumulative-segment
+/// geometry.
+fn chart_column_stacked() -> ChartScene {
+    let chart = Chart {
+        title: Some("Quarterly Sales (stacked)".into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::Stacked,
+            layout: BarLayout::default(),
+        },
+        series: products(),
+        cat_axis: Axis::titled("Quarter"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_column_stacked",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A **100%-stacked** column chart (`grouping=percentStacked`): each quarter's stack normalized to fill
+/// 0–100%, so the value axis is a fixed 0–100% and every column is full height. Proves the percent
+/// normalization + `%` tick labels.
+fn chart_column_percent() -> ChartScene {
+    let chart = Chart {
+        title: Some("Product Mix (100% stacked)".into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::PercentStacked,
+            layout: BarLayout::default(),
+        },
+        series: products(),
+        cat_axis: Axis::titled("Quarter"),
+        val_axis: Axis::titled("Share"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_column_percent",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A clustered **horizontal bar** chart (`barDir=bar`): two series over four **distinct** categories
+/// (Alpha/Bravo/Charlie/Delta) so the **reversed** category order is visually unambiguous — Excel draws
+/// the FIRST category (Alpha) at the BOTTOM (`ooxml-coverage-matrix.md` §B; the classic gotcha). The
+/// category labels run down the left, the value axis along the bottom.
+fn chart_bar_clustered() -> ChartScene {
+    let categories = || {
+        ["Alpha", "Bravo", "Charlie", "Delta"]
+            .into_iter()
+            .map(|c| Category::Text(c.into()))
+            .collect::<Vec<_>>()
+    };
+    let chart = Chart {
+        title: Some("Scores by Team".into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Bar,
+            grouping: Grouping::Clustered,
+            layout: BarLayout::default(),
+        },
+        series: vec![
+            Series::category_value(Some("Q1"), categories(), vec![45.0, 62.0, 38.0, 74.0])
+                .with_color(Color::from_hex(0x4472C4)),
+            Series::category_value(Some("Q2"), categories(), vec![58.0, 49.0, 66.0, 52.0])
+                .with_color(Color::from_hex(0xED7D31)),
+        ],
+        cat_axis: Axis::titled("Team"),
+        val_axis: Axis::titled("Score"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_bar_clustered",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A clustered column with a **non-default** `gapWidth` + `overlap` (`BarLayout::new(40, 50)`): a narrow
+/// inter-cluster gap makes the bars wide and a positive overlap makes the two series' bars overlap —
+/// visibly different geometry from the default `chart_column_clustered`. Proves the `c:gapWidth` /
+/// `c:overlap` geometry is honored (P22).
+fn chart_column_gap_overlap() -> ChartScene {
+    let chart = Chart {
+        title: Some("Tight Gap / 50% Overlap".into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::Clustered,
+            layout: BarLayout::new(40, 50),
+        },
+        series: vec![
+            Series::category_value(Some("Plan"), quarters(), vec![120.0, 150.0, 90.0, 170.0])
+                .with_color(Color::from_hex(0x4472C4)),
+            Series::category_value(Some("Actual"), quarters(), vec![100.0, 165.0, 110.0, 140.0])
+                .with_color(Color::from_hex(0xED7D31)),
+        ],
+        cat_axis: Axis::titled("Quarter"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_column_gap_overlap",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
+/// A clustered column whose series carry **theme `schemeClr`** fills (accent1/2/3) rather than explicit
+/// sRGB — proves per-type fill theme resolution (`ooxml-coverage-matrix.md` §C), the bar analogue of the
+/// line marker/theme scene.
+fn chart_column_theme_fills() -> ChartScene {
+    let chart = Chart {
+        title: Some("Revenue by Region".into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::Clustered,
+            layout: BarLayout::default(),
+        },
+        series: vec![
+            Series::category_value(Some("North"), quarters(), vec![120.0, 150.0, 90.0, 170.0])
+                .with_color(ChartColor::theme(ThemeSlot::Accent1)),
+            Series::category_value(Some("South"), quarters(), vec![80.0, 110.0, 130.0, 95.0])
+                .with_color(ChartColor::theme(ThemeSlot::Accent2)),
+            Series::category_value(Some("West"), quarters(), vec![60.0, 70.0, 55.0, 120.0])
+                .with_color(ChartColor::theme(ThemeSlot::Accent3)),
+        ],
+        cat_axis: Axis::titled("Quarter"),
+        val_axis: Axis::titled("Revenue"),
+        legend: Some(Legend::default()),
+    };
+    ChartScene {
+        name: "chart_column_theme_fills",
+        viewport: WIDE_VP,
+        chart,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +1000,62 @@ mod tests {
             bottom.chart.legend.map(|l| l.position),
             Some(LegendPosition::Bottom),
             "legend is bottom-placed"
+        );
+    }
+
+    #[test]
+    fn p22_scenes_carry_their_bar_kind_and_layout() {
+        // Every column scene is a vertical bar of the intended grouping.
+        for (name, grouping) in [
+            ("chart_column_clustered", Grouping::Clustered),
+            ("chart_column_stacked", Grouping::Stacked),
+            ("chart_column_percent", Grouping::PercentStacked),
+            ("chart_column_theme_fills", Grouping::Clustered),
+        ] {
+            let s = get(name).unwrap_or_else(|| panic!("{name} scene"));
+            assert_eq!(
+                s.chart.kind,
+                ChartKind::Bar {
+                    dir: BarDir::Col,
+                    grouping,
+                    layout: BarLayout::default(),
+                },
+                "{name}"
+            );
+        }
+
+        // The bar scene is HORIZONTAL (proves the reversed-order path) over distinct categories.
+        let bar = get("chart_bar_clustered").expect("bar scene");
+        assert!(matches!(
+            bar.chart.kind,
+            ChartKind::Bar {
+                dir: BarDir::Bar,
+                ..
+            }
+        ));
+
+        // The gap/overlap scene carries the NON-default layout.
+        let go = get("chart_column_gap_overlap").expect("gap/overlap scene");
+        assert!(matches!(
+            go.chart.kind,
+            ChartKind::Bar {
+                layout: BarLayout {
+                    gap_width: 40,
+                    overlap: 50
+                },
+                ..
+            }
+        ));
+
+        // The theme-fills scene resolves every series to a theme color.
+        let theme = get("chart_column_theme_fills").expect("theme-fills scene");
+        assert!(
+            theme
+                .chart
+                .series
+                .iter()
+                .all(|s| matches!(s.color, Some(ChartColor::Theme { .. }))),
+            "every theme-fills series is a schemeClr theme color"
         );
     }
 }

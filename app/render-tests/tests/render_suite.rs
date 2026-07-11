@@ -259,6 +259,8 @@ render_cases! {
     // corner badge, the Unsupported placeholder, and a scrolled/clipped chart.
     grid_chart_line, grid_chart_degraded_badge, grid_chart_unsupported_placeholder,
     grid_chart_scrolled_clipped,
+    // In-grid column chart (P22): the ChartLayer painting a real clustered column over cells.
+    grid_chart_column,
     // Manipulate (P18): a selected chart with its selection outline + resize handles.
     grid_chart_selected,
     // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
@@ -332,6 +334,10 @@ chart_render_cases! {
     // title (P13 observations A/B), which move every existing chart_line_* baseline.
     chart_line_reversed, chart_line_scaled, chart_line_no_gridlines, chart_line_styled,
     chart_line_legend_bottom,
+    // P22 — column & bar: clustered / stacked / 100%-stacked columns, a horizontal bar (proving the
+    // reversed Excel category order), a non-default gapWidth/overlap geometry, and theme-schemeClr fills.
+    chart_column_clustered, chart_column_stacked, chart_column_percent, chart_bar_clustered,
+    chart_column_gap_overlap, chart_column_theme_fills,
 }
 
 /// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift

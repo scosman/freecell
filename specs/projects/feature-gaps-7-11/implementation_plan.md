@@ -29,7 +29,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       mouse-caret / Home / End / modified-arrow; thread `quick_edit` into
       `ChromeGridRequest::EditState`. gpui view/unit tests. *(No pixel impact.)*
 
-- [ ] **Phase 3 — Text spill** (§2): gpui-free neighbor-scan + direction helper in
+- [x] **Phase 3 — Text spill** (§2): gpui-free neighbor-scan + direction helper in
       `grid/layout.rs` (unit-tested); spill-rect element in `build_grid_layers`/`cell_element`;
       text-only, wrap-off, alignment-aware (rightward must-have, left/center gated together
       and punt-able); coverage-edge safety. Iterate with `render_tests.sh test spill_`.

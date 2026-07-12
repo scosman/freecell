@@ -250,6 +250,10 @@ render_cases! {
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
     cell_wrap_multiline_clipped,
     cell_valign_top, cell_valign_middle, cell_valign_bottom, cell_wrap_valign_bottom,
+    // Text spill / overflow (Phase 3): direction-aware spill, stop conditions, non-spill types
+    spill_right_over_empties, spill_left_right_aligned, spill_center_both,
+    spill_stop_at_nonempty, spill_over_fill_only_neighbor, spill_wrap_on_no_spill,
+    spill_number_no_spill, spill_stop_at_coverage_edge,
     // Whole-grid scenes
     grid_empty_origin, grid_headers_scrolled_deep, grid_selection_single, grid_selection_range,
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,

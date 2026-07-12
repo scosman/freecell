@@ -13,7 +13,7 @@
 use std::ops::Range;
 
 use freecell_core::refs::{CellRange, CellRef};
-use freecell_core::Axis;
+use freecell_core::{Align, Axis};
 
 /// Column-header strip height (px) — `ui_design.md §3.3` (~24 px).
 pub const COL_HEADER_H: f32 = 24.0;
@@ -329,6 +329,121 @@ pub fn range_overlay_rects(range: CellRange, active: CellRef) -> Vec<(Range<u32>
         rects.push((ar..ar + 1, ac + 1..c1 + 1));
     }
     rects
+}
+
+// --- Text spill / overflow (`functional_spec.md §2`, `architecture.md §2`) ------------------
+//
+// Pure, gpui-free geometry for horizontal text spill: which direction a wrap-off text cell
+// spills, how far it reaches across empty neighbours, and a cheap width gate that keeps
+// comfortably-fitting text off the spill path entirely. The render integration
+// (`grid/view.rs`) supplies the per-column occupancy probe (mirror / coverage / published
+// content) and paints the spill element; everything decision-shaped lives here so it is unit-
+// testable without a `Window`.
+
+/// The direction(s) a wrap-off **text** cell spills over empty neighbours, from its effective
+/// horizontal alignment (`functional_spec.md §2.2`, Excel-accurate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillDirection {
+    /// General / left-aligned text spills to the right (the common case).
+    Right,
+    /// Right-aligned text spills to the left.
+    Left,
+    /// Center-aligned text spills both ways, centred over the empty run on each side.
+    Both,
+}
+
+/// The spill direction implied by a cell's **effective** horizontal alignment (the explicit
+/// `h_align` else the cell type's default). Only text cells spill, and text defaults to
+/// [`Align::Left`], so a plain/general text cell spills [`SpillDirection::Right`].
+pub fn spill_direction(align: Align) -> SpillDirection {
+    match align {
+        Align::Left => SpillDirection::Right,
+        Align::Right => SpillDirection::Left,
+        Align::Center => SpillDirection::Both,
+    }
+}
+
+/// Whether a candidate neighbour column can be spilled over. `Empty` = no content **and**
+/// coverage is known (the spill may extend across it); `Blocked` = has content, is being
+/// edited, or its coverage is unknown (the spill stops *before* it — never treat "beyond the
+/// covered region" as reliably empty, `functional_spec.md §2.5`). Fill/border alone does NOT
+/// make a cell `Blocked` (content-only), which the caller's probe reflects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Occupancy {
+    Empty,
+    Blocked,
+}
+
+/// The inclusive column span `[left, right]` a spilling cell's text is painted across; it always
+/// contains the origin column. `left == right == origin` means there is no empty neighbour in the
+/// spill direction, i.e. the cell does not spill (see [`SpillSpan::spills`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpillSpan {
+    pub left: u32,
+    pub right: u32,
+}
+
+impl SpillSpan {
+    /// Whether the span actually extends beyond the origin column (there is something to spill
+    /// over). A no-op span (`left == right == origin`) is not a spill.
+    pub fn spills(&self, origin: u32) -> bool {
+        self.left < origin || self.right > origin
+    }
+}
+
+/// Scans outward from `origin` in `direction`, extending across [`Occupancy::Empty`] neighbour
+/// columns and stopping at the first [`Occupancy::Blocked`] column or the inclusive scan bounds
+/// `[min_col, max_col]` (the visible frame edge, which is always within publication coverage).
+/// `occupancy(col)` classifies a neighbour column in the origin's row; it is invoked only for
+/// candidate columns and MUST return `Blocked` for anything whose emptiness/coverage is unknown.
+pub fn spill_span(
+    origin: u32,
+    direction: SpillDirection,
+    min_col: u32,
+    max_col: u32,
+    mut occupancy: impl FnMut(u32) -> Occupancy,
+) -> SpillSpan {
+    let mut span = SpillSpan {
+        left: origin,
+        right: origin,
+    };
+    if matches!(direction, SpillDirection::Right | SpillDirection::Both) {
+        let mut c = origin;
+        while c < max_col && occupancy(c + 1) == Occupancy::Empty {
+            c += 1;
+            span.right = c;
+        }
+    }
+    if matches!(direction, SpillDirection::Left | SpillDirection::Both) {
+        let mut c = origin;
+        while c > min_col && occupancy(c - 1) == Occupancy::Empty {
+            c -= 1;
+            span.left = c;
+        }
+    }
+    span
+}
+
+/// Average glyph advance as a fraction of the font size, used only by [`estimated_text_width`].
+/// A deliberate UNDER-estimate for a proportional UI font (Excel-ish ≈ 0.5em) so a cell whose
+/// text comfortably fits its column is never treated as a spill candidate.
+const SPILL_AVG_GLYPH_EM: f32 = 0.5;
+
+/// A conservative estimate of `text`'s rendered width (px) at `font_px`, used **only** as the
+/// spill width gate — never for layout (the actual clip bounds do the real work). Deliberately an
+/// under-estimate (see [`SPILL_AVG_GLYPH_EM`]): a comfortably-fitting cell must not spill (that
+/// keeps its non-spill render path — and thus its pixels — untouched), while genuinely long text
+/// still exceeds any column. No allocation, O(chars).
+pub fn estimated_text_width(text: &str, font_px: f32) -> f32 {
+    text.chars().count() as f32 * font_px * SPILL_AVG_GLYPH_EM
+}
+
+/// Whether `text` at `font_px` is wide enough to overflow a `col_w`-px column (minus the cell's
+/// horizontal padding `h_pad` on both sides) — i.e. the cell is a spill candidate
+/// (`functional_spec.md §2.1`). Uses the conservative [`estimated_text_width`], so a snug-fitting
+/// label reads as "fits" and takes the unchanged render path.
+pub fn text_overflows_column(text: &str, font_px: f32, col_w: f32, h_pad: f32) -> bool {
+    estimated_text_width(text, font_px) > (col_w - 2.0 * h_pad).max(0.0)
 }
 
 #[cfg(test)]
@@ -736,5 +851,86 @@ mod tests {
             !covered.contains(&(2, 2)),
             "active cell must stay uncovered"
         );
+    }
+
+    // --- Text spill (`functional_spec.md §2`) -------------------------------------------
+
+    /// A row occupancy map for the scan tests: `Blocked` iff the column is in `blocked`, else
+    /// `Empty`. Mirrors what the render probe produces (content/coverage → `Blocked`).
+    fn occ(blocked: &[u32]) -> impl Fn(u32) -> Occupancy + '_ {
+        move |c| {
+            if blocked.contains(&c) {
+                Occupancy::Blocked
+            } else {
+                Occupancy::Empty
+            }
+        }
+    }
+
+    #[test]
+    fn spill_direction_follows_alignment() {
+        assert_eq!(spill_direction(Align::Left), SpillDirection::Right);
+        assert_eq!(spill_direction(Align::Right), SpillDirection::Left);
+        assert_eq!(spill_direction(Align::Center), SpillDirection::Both);
+    }
+
+    #[test]
+    fn spill_span_extends_right_over_empties_stops_at_content() {
+        // Origin at col 1; col 4 holds content. Rightward spill covers 1..=3 and stops before 4.
+        let span = spill_span(1, SpillDirection::Right, 0, 20, occ(&[4]));
+        assert_eq!(span, SpillSpan { left: 1, right: 3 });
+        assert!(span.spills(1));
+    }
+
+    #[test]
+    fn spill_span_extends_left_for_right_aligned() {
+        // Origin at col 5; col 1 holds content. Leftward spill covers 2..=5 and stops before 1.
+        let span = spill_span(5, SpillDirection::Left, 0, 20, occ(&[1]));
+        assert_eq!(span, SpillSpan { left: 2, right: 5 });
+        assert!(span.spills(5));
+    }
+
+    #[test]
+    fn spill_span_center_extends_both_bounded_each_side() {
+        // Origin at col 4; blockers at col 1 (left) and col 7 (right). Center spill covers 2..=6,
+        // each side bounded independently by the nearest content cell.
+        let span = spill_span(4, SpillDirection::Both, 0, 20, occ(&[1, 7]));
+        assert_eq!(span, SpillSpan { left: 2, right: 6 });
+    }
+
+    #[test]
+    fn spill_span_stops_at_scan_bound() {
+        // No content anywhere, but the inclusive scan bound clamps both directions (the visible
+        // frame / coverage edge — never spill into the unknown region past it, §2.5).
+        let span = spill_span(5, SpillDirection::Both, 3, 7, occ(&[]));
+        assert_eq!(span, SpillSpan { left: 3, right: 7 });
+        // Rightward-only from the last in-bounds column cannot extend.
+        let at_edge = spill_span(7, SpillDirection::Right, 3, 7, occ(&[]));
+        assert!(!at_edge.spills(7));
+    }
+
+    #[test]
+    fn spill_span_no_empty_neighbor_is_no_spill() {
+        // The immediate neighbour in the spill direction has content → no spill.
+        let span = spill_span(2, SpillDirection::Right, 0, 20, occ(&[3]));
+        assert_eq!(span, SpillSpan { left: 2, right: 2 });
+        assert!(!span.spills(2));
+    }
+
+    #[test]
+    fn estimated_width_and_overflow_gate() {
+        // A comfortably-fitting short label does NOT overflow a default-ish column…
+        assert!(!text_overflows_column("Exactly", 13.0, 62.0, 4.0));
+        // …while genuinely long text does, in the same column.
+        assert!(text_overflows_column(
+            "clipped-very-long-text-abcdefghijklmnop",
+            13.0,
+            100.0,
+            4.0
+        ));
+        // The estimate scales with length and font size (monotone), and empty text is zero.
+        assert_eq!(estimated_text_width("", 13.0), 0.0);
+        assert!(estimated_text_width("aaaa", 26.0) > estimated_text_width("aaaa", 13.0));
+        assert!(estimated_text_width("aaaaaaaa", 13.0) > estimated_text_width("aaaa", 13.0));
     }
 }

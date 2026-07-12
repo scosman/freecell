@@ -448,6 +448,25 @@ struct FrameTiming {
     content_cells: u32,
 }
 
+/// A deferred text-spill paint (`functional_spec.md §2`): the origin row + the inclusive
+/// [`layout::SpillSpan`] of empty neighbour columns the text is painted across, plus the origin
+/// cell's resolved text attributes. Collected during the cell loop (whose origin cells suppress
+/// their own clipped text) and painted as separate positioned elements after the cell + border
+/// layers, so the spilled text sits over the neighbours' fills/gridlines/borders.
+struct SpillPlan {
+    row: u32,
+    span: layout::SpillSpan,
+    text: String,
+    text_color: Rgba,
+    /// The origin cell's effective horizontal alignment — anchors the text within the spill rect
+    /// (left → start, right → end, center → centred).
+    align: Align,
+    /// The origin cell's resolved style (bold/italic/underline/strike/size/vertical-align), or
+    /// `None` for the grid default.
+    style: Option<RenderStyle>,
+    font_family: Option<SharedString>,
+}
+
 impl GridView {
     /// Builds the grid over `sources`, delivering [`GridEvent`]s to `events`. The active
     /// sheet defaults to the publication's sheet, at origin scroll with an A1 selection.
@@ -678,6 +697,29 @@ impl GridView {
                 Some(text.as_ref())
             }
             _ => None,
+        }
+    }
+
+    /// Classifies a candidate spill-neighbour `(row, col)` for the text-spill scan
+    /// (`functional_spec.md §2`): [`layout::Occupancy::Empty`] only when the cell is content-free
+    /// **and** its coverage is known — a pending edit (mirror), an off-coverage cell (never treat
+    /// "beyond covered" as empty, §2.5), or a published (non-empty) cell all read `Blocked`. A
+    /// fill/border-only empty cell is `Empty` (content-only stop): it carries a resolved style but
+    /// no entry in the publication-derived `cell_index`. Called only for in-frame columns, where
+    /// `cell_index` is authoritative over the published cells.
+    fn neighbor_occupancy(
+        &self,
+        row: u32,
+        col: u32,
+        publication: &Publication,
+    ) -> layout::Occupancy {
+        if self.mirror_text_for(CellRef::new(row, col)).is_some()
+            || !publication.covers(row, col)
+            || self.cell_index.contains_key(&(row, col))
+        {
+            layout::Occupancy::Blocked
+        } else {
+            layout::Occupancy::Empty
         }
     }
 
@@ -2124,6 +2166,9 @@ impl GridView {
             ((frame.rows.end - frame.rows.start) * (frame.cols.end - frame.cols.start)) as usize
                 + 16,
         );
+        // Deferred text-spill paints (`functional_spec.md §2`); typically empty. Painted after
+        // the cell + border layers so spilled text sits over the neighbours' fills/gridlines.
+        let mut spill_plans: Vec<SpillPlan> = Vec::new();
 
         for r in frame.rows.clone() {
             for c in frame.cols.clone() {
@@ -2165,18 +2210,76 @@ impl GridView {
                         .filter(|name| !name.is_empty())
                         .cloned()
                 });
-                content_children.push(cell_element(
-                    x,
-                    y,
-                    w,
-                    h,
-                    fill,
-                    text,
-                    text_color,
-                    kind,
-                    attr_style,
-                    font_family,
-                ));
+
+                // Text spill (`functional_spec.md §2`): a committed, wrap-off TEXT cell whose text
+                // overflows its column spills over empty neighbours in its alignment direction.
+                // Numbers/dates/bools/errors and mirrored (being-edited) cells never spill; a
+                // fitting cell falls through to the unchanged render path (pixels untouched).
+                let spill = if covers_active
+                    && kind == CellKind::Text
+                    && !text.is_empty()
+                    && attr_style.is_none_or(|s| !s.wrap)
+                    && self.mirror_text_for(CellRef::new(r, c)).is_none()
+                {
+                    let align = attr_style
+                        .and_then(|s| s.h_align)
+                        .unwrap_or_else(|| kind.default_align());
+                    let font_px = attr_style.map(font_px_of).unwrap_or(CELL_FONT_PX);
+                    if layout::text_overflows_column(&text, font_px, w, CELL_H_PAD) {
+                        let span = layout::spill_span(
+                            c,
+                            layout::spill_direction(align),
+                            frame.cols.start,
+                            frame.cols.end.saturating_sub(1),
+                            |nc| self.neighbor_occupancy(r, nc, &publication),
+                        );
+                        span.spills(c).then_some((span, align))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                match spill {
+                    // A spilling cell suppresses its own clipped text (the spill element repaints
+                    // the full run — no double-paint); the origin div still draws fill + gridlines.
+                    Some((span, align)) => {
+                        content_children.push(cell_element(
+                            x,
+                            y,
+                            w,
+                            h,
+                            fill,
+                            String::new(),
+                            text_color,
+                            kind,
+                            attr_style,
+                            font_family.clone(),
+                        ));
+                        spill_plans.push(SpillPlan {
+                            row: r,
+                            span,
+                            text,
+                            text_color,
+                            align,
+                            style: attr_style,
+                            font_family,
+                        });
+                    }
+                    None => content_children.push(cell_element(
+                        x,
+                        y,
+                        w,
+                        h,
+                        fill,
+                        text,
+                        text_color,
+                        kind,
+                        attr_style,
+                        font_family,
+                    )),
+                }
             }
         }
 
@@ -2224,6 +2327,30 @@ impl GridView {
                     }
                 }
             }
+        }
+
+        // ---- Text spill (`functional_spec.md §2`): paint each overflowing text cell's content as
+        // a separate positioned element over its empty-neighbour run, ABOVE the cell fills /
+        // gridlines / borders (so the text reads continuously across gridlines) but still inside
+        // the content clip wrapper — it never escapes into the headers. The origin cell already
+        // suppressed its own clipped text, so there is no double-paint.
+        for plan in spill_plans {
+            let (sx, sy, sw, sh) = span_rect(
+                plan.row..plan.row + 1,
+                plan.span.left..plan.span.right + 1,
+                frame,
+            );
+            content_children.push(spill_element(
+                sx,
+                sy,
+                sw,
+                sh,
+                plan.text,
+                plan.text_color,
+                plan.align,
+                plan.style,
+                plan.font_family,
+            ));
         }
 
         // Selection: translucent overlay (range − active), range border, active border.
@@ -3158,6 +3285,95 @@ fn cell_element(
     } else {
         el.child(text).into_any_element()
     }
+}
+
+/// The rendered font size (px) for a resolved style, mirroring [`cell_element`]: the grid default
+/// [`CELL_FONT_PX`] unless the style pins a non-default quarter-point size (`q/4` pt → px). Shared
+/// by the spill width gate so it measures against the same size the cell paints at.
+fn font_px_of(style: RenderStyle) -> f32 {
+    if style.font_size_q != 0 {
+        style.font_size_q as f32 / 4.0 * 96.0 / 72.0
+    } else {
+        CELL_FONT_PX
+    }
+}
+
+/// Builds a text-spill overlay element (`functional_spec.md §2.4`): the origin cell's text painted
+/// across the spill rect `(x, y, w, h)` — the origin cell through its last empty neighbour — with
+/// **no** fill, border, or gridline (those belong to the underlying cells). It mirrors
+/// [`cell_element`]'s text styling exactly (padding, size, colour, family, bold/italic/underline/
+/// strike, vertical alignment) so the origin portion paints identically to a non-spilling cell;
+/// only the horizontal anchor differs, per the spill direction:
+///
+/// - **Left** (rightward spill): the box's left edge is the origin cell start → `justify_start`
+///   pins the text at the origin, flowing right.
+/// - **Right** (leftward spill): the box's right edge is the origin cell end → `justify_end` pins
+///   the text at the origin's right, flowing left.
+/// - **Center** (both): `justify_center` centres the text over the empty run.
+///
+/// `overflow_hidden` clips to the spill rect; `whitespace_nowrap` keeps it one line (wrap-on cells
+/// never reach here).
+#[allow(clippy::too_many_arguments)]
+fn spill_element(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    text: String,
+    text_color: Rgba,
+    align: Align,
+    style: Option<RenderStyle>,
+    font_family: Option<SharedString>,
+) -> AnyElement {
+    let mut el = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(h))
+        .flex()
+        // Default vertical placement is BOTTOM (decision C), matching `cell_element`; an explicit
+        // `v_align` below overrides it so spilled text sits at the origin cell's vertical position.
+        .items_end()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .px(px(CELL_H_PAD))
+        .text_size(px(CELL_FONT_PX))
+        .text_color(text_color)
+        .font_family(GRID_FONT_FAMILY);
+
+    el = match align {
+        Align::Left => el.justify_start(),
+        Align::Center => el.justify_center(),
+        Align::Right => el.justify_end(),
+    };
+    if let Some(s) = style {
+        if s.bold {
+            el = el.font_weight(FontWeight::BOLD);
+        }
+        if s.italic {
+            el = el.italic();
+        }
+        if s.underline {
+            el = el.underline();
+        }
+        if s.strikethrough {
+            el = el.line_through();
+        }
+        el = match s.v_align {
+            Some(VAlign::Top) => el.items_start(),
+            Some(VAlign::Center) => el.items_center(),
+            Some(VAlign::Bottom) => el.items_end(),
+            None => el,
+        };
+        if s.font_size_q != 0 {
+            el = el.text_size(px(font_px_of(s)));
+        }
+    }
+    if let Some(name) = font_family {
+        el = el.font_family(name);
+    }
+    el.child(text).into_any_element()
 }
 
 /// Builds one header label cell (`selected` gives the darker tint).

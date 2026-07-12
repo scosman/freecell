@@ -661,6 +661,72 @@ pub fn all() -> Vec<RenderCase> {
             "cell_narrow_column_clipped_number",
             Scene::new().input(1, 1, "123456789").col_width(1, 40.0),
         ),
+        // ---- Text spill / overflow (Phase 3, `functional_spec.md §2`) -------------------
+        // Long general/left text spills RIGHT over the empty neighbours (B2 → C2, D2 …), reading
+        // as one continuous run crossing the gridlines (the must-have case).
+        cell(
+            "spill_right_over_empties",
+            Scene::new().input(1, 1, "This long label spills to the right"),
+        ),
+        // Right-aligned long text spills LEFT: the origin (D2) is anchored at its right edge and the
+        // text flows back over the empty C2/B2/A2.
+        cell(
+            "spill_left_right_aligned",
+            Scene::new()
+                .input(1, 3, "spilling to the left here")
+                .align(1, 3, Align::Right),
+        ),
+        // Center-aligned long text spills BOTH ways, centred over the empty run; blockers at A2/E2
+        // bound each side independently (the text spans B2–D2, centred over C2).
+        cell(
+            "spill_center_both",
+            Scene::new()
+                .input(1, 0, "L")
+                .input(1, 4, "R")
+                .input(1, 2, "centered spill across")
+                .align(1, 2, Align::Center),
+        ),
+        // Spill STOPS at the first cell with content: B2's long text spills over the empty C2 but
+        // clips at D2 ("STOP"). Content — not fill/border — is what stops a spill.
+        cell(
+            "spill_stop_at_nonempty",
+            Scene::new()
+                .input(1, 1, "long text stops at the next value")
+                .input(1, 3, "STOP"),
+        ),
+        // A fill-only (content-less) neighbour does NOT stop the spill: B2's text spills over the
+        // yellow-filled C2 (the fill still paints; the text sits on top).
+        cell(
+            "spill_over_fill_only_neighbor",
+            Scene::new()
+                .input(1, 1, "spills over a filled empty cell")
+                .fill(1, 2, 0xFFEB3B),
+        ),
+        // Wrap-on cells never spill (mutually exclusive with §3): the long text wraps within the
+        // column and clips to the row height — no overflow into C2.
+        cell(
+            "spill_wrap_on_no_spill",
+            Scene::new()
+                .input(1, 1, "wrapped long text does not spill it wraps instead")
+                .col_width(1, 80.0)
+                .row_height(1, 48.0)
+                .wrap(1, 1),
+        ),
+        // Numbers never spill — a too-wide number clips as today (the `#####` indicator is out of
+        // scope), leaving the empty neighbour blank.
+        cell(
+            "spill_number_no_spill",
+            Scene::new().input(1, 1, "123456789").col_width(1, 50.0),
+        ),
+        // Spill is bounded by the covered region: publishing only cols 0..3 makes cols ≥3 uncovered,
+        // so B2's long text spills over the covered-empty C2 but STOPS at the coverage edge — it
+        // never treats the uncovered (blank-rendered) cells to the right as reliably empty (§2.5).
+        cell(
+            "spill_stop_at_coverage_edge",
+            Scene::new()
+                .input(1, 1, "long text bounded by the coverage edge")
+                .publish(0..80, 0..3),
+        ),
         // ---- Whole-grid scenes ---------------------------------------------------------
         RenderCase::new("grid_empty_origin", Scene::new(), GRID_VP),
         RenderCase::new("grid_headers_scrolled_deep", Scene::new(), GRID_VP).reveal(500, 30),

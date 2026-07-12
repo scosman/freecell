@@ -63,6 +63,18 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
 - **Select** a chart → selection outline + resize handles on the ChartLayer.
 - **Move** (drag body) / **resize** (drag handle) → anchor updates; **delete** via
   `Delete`/`Backspace` or a context-menu entry. (Interaction detail with 6.A.)
+- **Undo/redo (charts feedback item 4):** chart **insert, delete, move/resize, and set-range**
+  ops now ride the **same unified Ctrl+Z/Ctrl+Y timeline** as cell edits. Ctrl+Z reverses the
+  single most-recent action regardless of kind (so deleting a chart then Ctrl+Z **brings it
+  back**, and a following Ctrl+Y re-deletes it), and an interleave of cell edits + chart ops
+  undoes/redoes in exact most-recent-first order. This **reverses** the earlier P18 decision that
+  kept chart ops off the undo stack. Worker-side, an IronCalc cell edit and a chart op are two
+  entry kinds on one ordered stack; a chart entry inverts from a stashed worker snapshot and never
+  calls IronCalc's own undo/redo, so the cell entries stay 1:1 with IronCalc's stack (no desync).
+  A loaded (imported) chart's delete/move restores its save-set bookkeeping (`loaded_deletes` /
+  `loaded_anchor_edits`) on undo, so a later save writes the correct package. (Chart **type** and
+  **chrome** edits stay immediate — not individually undoable — but still invalidate a pending
+  redo.)
 
 ## 4. Editing — the Edit panel (end-phase; **detailed speccing deferred**)
 

@@ -500,6 +500,30 @@ impl BoundChart {
     }
 }
 
+/// A bound loaded chart lifted out of [`ChartBindings`] whole — its list `index` plus the full
+/// [`BoundChart`] — so a delete can be **undone** by re-binding it exactly where it was
+/// ([`ChartBindings::reinsert_removed`]). Opaque to the worker: it stashes the value and hands it
+/// back untouched, exposing only the `chart_part` / `id` the save-set + redo bookkeeping needs
+/// (charts feedback item 4).
+#[derive(Clone, Debug)]
+pub struct RemovedChart {
+    index: usize,
+    chart: BoundChart,
+}
+
+impl RemovedChart {
+    /// The removed chart's `xl/charts/chartN.xml` part — the key the save drops and the worker's
+    /// `loaded_deletes` set tracks.
+    pub fn chart_part(&self) -> &str {
+        &self.chart.chart_part
+    }
+
+    /// The removed chart's stable [`ChartId`] (so a redo can re-delete it by id).
+    pub fn id(&self) -> ChartId {
+        self.chart.id
+    }
+}
+
 /// The worker's set of live-bound charts — the range→chart index (challenge 2). Built once on load
 /// from the discovered [`ChartSpec`]s; queried by [`dirty_indices`](Self::dirty_indices) and mutated
 /// by [`reresolve`](Self::reresolve) on each edit; snapshotted by
@@ -605,6 +629,35 @@ impl ChartBindings {
     pub fn remove_by_id(&mut self, id: ChartId) -> Option<String> {
         let pos = self.charts.iter().position(|bc| bc.id == id)?;
         Some(self.charts.remove(pos).chart_part)
+    }
+
+    /// Remove the bound chart with stable id `id`, returning it **whole** — its list index plus the
+    /// full [`BoundChart`] — so an undo can re-bind it exactly ([`reinsert_removed`](Self::reinsert_removed)),
+    /// or `None` if no bound chart has that id. Unlike [`remove_by_id`](Self::remove_by_id), which
+    /// keeps only the `chart_part`, this retains the entry so a deleted loaded chart can come back on
+    /// Ctrl+Z (charts feedback item 4 — chart ops now ride the undo timeline).
+    pub fn take_by_id(&mut self, id: ChartId) -> Option<RemovedChart> {
+        let index = self.charts.iter().position(|bc| bc.id == id)?;
+        let chart = self.charts.remove(index);
+        Some(RemovedChart { index, chart })
+    }
+
+    /// Re-insert a [`RemovedChart`] at its original list index (undo of a delete). The index is
+    /// clamped to the current length — defensive; in the single-threaded worker the list can only
+    /// have shrunk since the removal, so the original slot is always in range.
+    pub fn reinsert_removed(&mut self, removed: RemovedChart) {
+        let index = removed.index.min(self.charts.len());
+        self.charts.insert(index, removed.chart);
+    }
+
+    /// The current render anchor of the bound chart with stable id `id`, or `None` if none has it.
+    /// Read before a [`set_anchor_by_id`](Self::set_anchor_by_id) so an undo can restore the prior
+    /// placement (charts feedback item 4).
+    pub fn anchor_by_id(&self, id: ChartId) -> Option<Anchor> {
+        self.charts
+            .iter()
+            .find(|bc| bc.id == id)
+            .map(|bc| bc.spec.anchor)
     }
 
     /// Append the charts in `groups` that aren't **already bound**, anchoring each to its group's

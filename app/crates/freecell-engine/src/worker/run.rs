@@ -38,7 +38,7 @@ use freecell_chart_model::{
 use crate::cache;
 use crate::chart::binding::{
     binding_from_refs, binding_is_dirty, build_series_shells, resolve_chart, CellData,
-    ChartBindings, SheetResolver,
+    ChartBindings, RemovedChart, SheetResolver,
 };
 use crate::chart::write::{AuthoredChart, SeriesRefs};
 use crate::document::{DocumentSource, FontFlag, SaveError, WorkbookDocument};
@@ -117,6 +117,7 @@ struct ClipboardSlot {
 /// P19), so it is **never** touched by the dirty-set re-resolve and is saved by the
 /// **write-from-model** path ([`write::write_authored_charts`](crate::chart::write::write_authored_charts)),
 /// never the loaded re-inject. `spec.origin` is always [`Authored`](freecell_chart_model::Origin::Authored).
+#[derive(Clone)]
 struct AuthoredEntry {
     /// The worksheet the chart is anchored on (keys the published snapshot; resolved to the current
     /// worksheet name at save time, so an in-session rename follows and a deleted host drops it).
@@ -160,6 +161,75 @@ enum AppliedOp {
     Redo,
 }
 
+/// One entry on the **unified undo/redo timeline** (charts feedback item 4). Ctrl+Z pops the single
+/// most-recent user action regardless of kind, so IronCalc-backed cell/style/sheet edits and
+/// worker-side chart ops share one ordered stack:
+/// - `Cell(touch)` — an IronCalc-undoable edit. Its inverse is IronCalc's own `undo()`, and the
+///   [`Touch`] is re-read to keep the caches in agreement. These entries stay **1:1** with
+///   IronCalc's undo stack (a chart entry never pushes onto it), so the two never desync.
+/// - `Chart(cu)` — a chart insert/delete/anchor/range op, inverted from a stashed snapshot
+///   ([`ChartUndo`]) entirely worker-side (no IronCalc undo/redo call).
+///
+/// This **reverses** the earlier P18 decision (chart ops off the Ctrl+Z stack): a half-integration
+/// would desync ordering on an interleave (cellEdit → insertChart → deleteChart, then Undo×2 must
+/// restore-then-remove the chart, not restore-then-undo-the-cell), so all four chart ops ride here.
+enum UndoEntry {
+    Cell(Touch),
+    Chart(ChartUndo),
+}
+
+/// The stashed inverse (and redo) of one chart op — enough whole worker state to both revert it and
+/// re-apply it. Deliberately snapshot-based (clone the affected entry) rather than delta-based:
+/// simple + obviously correct over lean. The heavy snapshots ([`AuthoredEntry`] / [`RemovedChart`])
+/// are boxed so the enum stays small (an undo stack is cold, so the indirection is free).
+enum ChartUndo {
+    /// Insert of an **authored** chart at list `index` (the born-live `entry` stashed whole, so a
+    /// redo re-inserts it with its Batch-3 range binding intact — no re-derivation). Undo removes
+    /// index; redo re-inserts `entry` at index.
+    InsertAuthored {
+        index: usize,
+        entry: Box<AuthoredEntry>,
+    },
+    /// Delete of an **authored** chart. Undo re-inserts `entry` at `index`; redo removes index.
+    DeleteAuthored {
+        index: usize,
+        entry: Box<AuthoredEntry>,
+    },
+    /// Delete of a **loaded** chart. `removed` is the whole binding (so undo re-binds it exactly);
+    /// `chart_part` is the save-drop key the delete added to `loaded_deletes`; `prior_anchor_edit`
+    /// is the `loaded_anchor_edits` value the delete evicted (restored on undo). Undo re-binds +
+    /// clears the save-set bookkeeping; redo re-runs the delete effects.
+    DeleteLoaded {
+        removed: Box<RemovedChart>,
+        chart_part: String,
+        prior_anchor_edit: Option<Anchor>,
+    },
+    /// Anchor move/resize of an **authored** chart: swap `prior` and `applied` on the chart's model
+    /// anchor.
+    SetAnchorAuthored {
+        id: ChartId,
+        prior: Anchor,
+        applied: Anchor,
+    },
+    /// Anchor move/resize of a **loaded** chart: swap the render anchor AND the `loaded_anchor_edits`
+    /// entry. `prior_render` is the render anchor before the move; `prior_edit` is the
+    /// `loaded_anchor_edits` value the move replaced (restored on undo).
+    SetAnchorLoaded {
+        id: ChartId,
+        chart_part: String,
+        prior_render: Anchor,
+        prior_edit: Option<Anchor>,
+        applied: Anchor,
+    },
+    /// Range bind of an **authored** chart (P19): the whole pre-bind `prior` entry and post-bind
+    /// `applied` entry are stashed, so undo/redo just restore the clone (no re-derivation).
+    SetRangeAuthored {
+        index: usize,
+        prior: Box<AuthoredEntry>,
+        applied: Box<AuthoredEntry>,
+    },
+}
+
 /// The per-window worker: owns the document + the shared read-surfaces and drives the loop.
 pub(super) struct Worker {
     doc: WorkbookDocument,
@@ -181,12 +251,15 @@ pub(super) struct Worker {
     degraded: bool,
     /// Count of caught panics (a second one, or an unresponsive probe, degrades the worker).
     panic_count: u32,
-    /// Per-op cache touch-sets, aligned 1:1 with IronCalc's undo stack. A new undoable edit
-    /// pushes here (clearing `redo_touches`); `Undo` pops here → `redo_touches`; `Redo` the
-    /// reverse. Re-reading the popped touch-set keeps the cache in agreement across undo/redo.
-    undo_touches: Vec<Touch>,
-    /// The redo side of the touch-set history (mirrors IronCalc's redo stack).
-    redo_touches: Vec<Touch>,
+    /// The **unified undo timeline** ([`UndoEntry`], charts feedback item 4): one ordered stack over
+    /// IronCalc-backed cell edits AND worker-side chart ops, so Ctrl+Z pops the single most-recent
+    /// action regardless of kind. A new undoable action (edit OR chart op) pushes here + clears
+    /// `redo_stack`; `Undo` pops here → `redo_stack`; `Redo` the reverse. The `Cell(Touch)` entries
+    /// stay 1:1 with IronCalc's undo stack (a `Chart` entry never touches it) and re-read the popped
+    /// touch-set to keep the caches in agreement; `Chart` entries invert from their stashed snapshot.
+    undo_stack: Vec<UndoEntry>,
+    /// The redo side of the unified timeline (mirrors IronCalc's redo stack for its `Cell` entries).
+    redo_stack: Vec<UndoEntry>,
     /// The range clipboard slot (`architecture.md §6`): `Some` after a copy/cut, replaced by the
     /// next copy/cut, and cleared after a cut is pasted (single-use).
     clipboard: Option<ClipboardSlot>,
@@ -274,8 +347,8 @@ impl Worker {
             eval_count: 0,
             degraded: false,
             panic_count: 0,
-            undo_touches: Vec::new(),
-            redo_touches: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: None,
             charts: ChartBindings::default(),
             authored_charts: Vec::new(),
@@ -356,10 +429,16 @@ impl Worker {
         // diff-lists (one style paste + K row-height runs), so the touch-set must stay 1:1 with
         // the undo stack — they can't ride the generic coalesced edit path.
         let mut font_ops: Vec<Command> = Vec::new();
-        // Chart ops (`InsertChart` / `SetChartAnchor` / `DeleteChart`) also run one-by-one after the
-        // edit batch: each mutates the authored/loaded chart set + republishes the chart snapshot
-        // (P17/P18); none is an IronCalc edit, so none rides the undo/touch stacks.
+        // Chart ops (`InsertChart` / `SetChartAnchor` / `DeleteChart` / `SetChartRange` / type /
+        // chrome) run one-by-one after the edit batch: each mutates the authored/loaded chart set +
+        // republishes the chart snapshot. Insert/delete/anchor/range now push onto the unified undo
+        // timeline (charts feedback item 4); type/chrome stay immediate (they only invalidate redo).
         let mut chart_ops: Vec<Command> = Vec::new();
+        // Undo / Redo run one-by-one AFTER the edit + chart ops (a coalesced batch applies its
+        // forward ops first, then peels them back in most-recent-first order). Each dispatches on the
+        // unified timeline's top entry: a `Cell` top drives IronCalc's undo/redo (via the single-
+        // command edit path), a `Chart` top is inverted worker-side (charts feedback item 4).
+        let mut undo_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
         // Every sheet activated in this drained batch (in order), so lazy chart discovery walks
         // EACH one — not just the batch's final active sheet (a batch that activates A then B must
@@ -410,9 +489,8 @@ impl Worker {
                 | Command::DeleteColumns { .. }
                 | Command::AddSheet
                 | Command::RenameSheet { .. }
-                | Command::DeleteSheet { .. }
-                | Command::Undo
-                | Command::Redo) => edits.push(edit),
+                | Command::DeleteSheet { .. }) => edits.push(edit),
+                undo @ (Command::Undo | Command::Redo) => undo_ops.push(undo),
                 #[cfg(test)]
                 edit @ Command::TestPanic => edits.push(edit),
             }
@@ -463,8 +541,9 @@ impl Worker {
         }
 
         // Chart ops after the edit batch (each is standalone: it mutates the authored/loaded chart
-        // set + republishes the chart snapshot; not an IronCalc edit, so it rides no undo/touch
-        // entry — see the P18 undo note on `insert_authored_chart`).
+        // set + republishes the chart snapshot). Insert/delete/anchor/range push a `Chart` entry onto
+        // the unified undo timeline (charts feedback item 4); none is an IronCalc edit, so none
+        // touches IronCalc's own undo stack — see the `UndoEntry` doc + `push_chart_undo`.
         for op in chart_ops {
             match op {
                 Command::InsertChart {
@@ -483,6 +562,16 @@ impl Worker {
                     self.set_chart_chrome(sheet, id, edit)
                 }
                 _ => unreachable!("only chart ops are bucketed here"),
+            }
+        }
+
+        // Undo / Redo after the forward ops (edits + charts), so a coalesced batch peels back its
+        // most-recent action first. Each dispatches on the unified timeline (charts feedback item 4).
+        for op in undo_ops {
+            match op {
+                Command::Undo => self.apply_undo(),
+                Command::Redo => self.apply_redo(),
+                _ => unreachable!("only Undo/Redo are bucketed here"),
             }
         }
 
@@ -920,8 +1009,9 @@ impl Worker {
 
         // One paste = one engine undo entry → one touch-entry (possibly multi-range), and a
         // fresh edit invalidates the redo stack.
-        self.undo_touches.push(Touch::Ranges(touched.clone()));
-        self.redo_touches.clear();
+        self.undo_stack
+            .push(UndoEntry::Cell(Touch::Ranges(touched.clone())));
+        self.redo_stack.clear();
         for sheet in self.refresh_cache_cells(&touched) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
         }
@@ -1035,12 +1125,12 @@ impl Worker {
                 // One touch per committed diff-list (all covering the clamped range — re-reading it
                 // syncs both the styles and the row heights), and a fresh edit clears the redo side.
                 for _ in 0..diff_lists {
-                    self.undo_touches.push(Touch::Cells {
+                    self.undo_stack.push(UndoEntry::Cell(Touch::Cells {
                         sheet,
                         range: clamped,
-                    });
+                    }));
                 }
-                self.redo_touches.clear();
+                self.redo_stack.clear();
                 for s in self.refresh_cache_cells(&[(sheet, clamped)]) {
                     self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
                 }
@@ -1077,33 +1167,50 @@ impl Worker {
         for op in applied_ops {
             match op {
                 AppliedOp::Cells { sheet, range } => {
-                    self.undo_touches.push(Touch::Cells { sheet, range });
-                    self.redo_touches.clear(); // a fresh edit invalidates the redo stack
+                    self.undo_stack
+                        .push(UndoEntry::Cell(Touch::Cells { sheet, range }));
+                    self.redo_stack.clear(); // a fresh edit invalidates the redo stack
                     refresh.push((sheet, range));
                 }
                 AppliedOp::Sheets => {
-                    self.undo_touches.push(Touch::Sheets);
-                    self.redo_touches.clear();
+                    self.undo_stack.push(UndoEntry::Cell(Touch::Sheets));
+                    self.redo_stack.clear();
                 }
                 AppliedOp::Rebuild { sheet } => {
-                    self.undo_touches.push(Touch::Rebuild { sheet });
-                    self.redo_touches.clear();
+                    self.undo_stack
+                        .push(UndoEntry::Cell(Touch::Rebuild { sheet }));
+                    self.redo_stack.clear();
                     rebuild.push(sheet);
                 }
-                AppliedOp::Undo => {
-                    if let Some(touch) = self.undo_touches.pop() {
+                // Only a **cell** undo reaches the IronCalc edit path (a chart undo is applied
+                // worker-side by `undo_chart_op`, never routed here), so the popped entry is a
+                // `Cell` — pop it, re-read its touch-set, and mirror it onto the redo stack.
+                AppliedOp::Undo => match self.undo_stack.pop() {
+                    Some(UndoEntry::Cell(touch)) => {
                         refresh.extend(touch_refresh_ranges(&touch));
                         rebuild.extend(touch_rebuild_sheets(&touch));
-                        self.redo_touches.push(touch);
+                        self.redo_stack.push(UndoEntry::Cell(touch));
                     }
-                }
-                AppliedOp::Redo => {
-                    if let Some(touch) = self.redo_touches.pop() {
+                    // Unreachable (routing guarantees a `Cell` top); restore + warn, never panic
+                    // out of the worker loop.
+                    Some(other) => {
+                        tracing::error!("cell-undo path popped a chart entry; restoring");
+                        self.undo_stack.push(other);
+                    }
+                    None => {}
+                },
+                AppliedOp::Redo => match self.redo_stack.pop() {
+                    Some(UndoEntry::Cell(touch)) => {
                         refresh.extend(touch_refresh_ranges(&touch));
                         rebuild.extend(touch_rebuild_sheets(&touch));
-                        self.undo_touches.push(touch);
+                        self.undo_stack.push(UndoEntry::Cell(touch));
                     }
-                }
+                    Some(other) => {
+                        tracing::error!("cell-redo path popped a chart entry; restoring");
+                        self.redo_stack.push(other);
+                    }
+                    None => {}
+                },
             }
         }
         (refresh, rebuild)
@@ -1677,27 +1784,21 @@ impl Worker {
         // it right now so the chart is born LIVE (real `c:f` refs + resolved values) — same block→
         // series binding as `SetChartRange`, on the id we just assigned. The data lives on the insert
         // `sheet` (the selection's own — anchor — sheet). A `None` selection stays near-empty.
+        let pos = self.authored_charts.len() - 1;
         if let Some(data) = data {
             if let Some(data_sheet_name) = self.sheet_name_of(sheet) {
-                let pos = self.authored_charts.len() - 1;
                 self.bind_authored_range_at(pos, sheet, &data_sheet_name, data);
             }
         }
-        // Mark the document dirty so the unsaved chart can be saved. A chart op is NOT an
-        // IronCalc-undoable op — it pushes no undo/touch entry, so it never desyncs the undo/touch
-        // stacks; `ops_seen` is a monotonic committed-op counter consumed only by the dirty flag +
-        // the `Saved` ack. **P18 undo decision:** chart insert/move/resize/delete are worker-side
-        // state with no IronCalc undo hook; interleaving a chart-undo history with IronCalc's stacks
-        // is a large, desync-prone subsystem the interaction spec doesn't call for, so chart ops are
-        // deliberately immediate and off the Ctrl+Z stack (cell undo/redo stays correct alongside).
-        self.ops_seen += 1;
-        self.shared
-            .committed_ops
-            .store(self.ops_seen, Ordering::Release);
+        // **Undo timeline (charts feedback item 4, reversing the earlier P18 "charts off Ctrl+Z"
+        // decision):** an insert now pushes onto the unified undo stack. We stash the FINAL entry
+        // (after any born-live range bind above) so a redo re-inserts it whole — refs/series intact,
+        // no re-derivation. A chart entry never touches IronCalc's own undo stack, so the `Cell`
+        // entries stay 1:1 with it (no desync). `ops_seen` still counts the op for the dirty flag.
+        let entry = Box::new(self.authored_charts[pos].clone());
+        self.push_chart_undo(ChartUndo::InsertAuthored { index: pos, entry });
         // Publish the new chart on the same seam the loaded charts ride, so the window installs it.
-        self.chart_version += 1;
-        self.store_chart_snapshot();
-        self.emit(WorkerEvent::Published);
+        self.commit_chart_op();
     }
 
     /// Move/resize a chart (P18, `Command::SetChartAnchor`): set the chart named by `id` to `anchor`.
@@ -1712,29 +1813,45 @@ impl Worker {
             });
             return;
         }
-        // Authored first (its ids never collide with loaded ones — one shared counter).
+        // Authored first (its ids never collide with loaded ones — one shared counter). Each branch
+        // stashes the prior placement onto the undo timeline (charts feedback item 4) before the move.
         if let Some(entry) = self.authored_charts.iter_mut().find(|e| e.id == id) {
+            let prior = entry.spec.anchor;
             entry.spec.anchor = anchor;
-        } else if let Some(chart_part) = self.charts.set_anchor_by_id(id, anchor) {
-            self.loaded_anchor_edits.insert(chart_part, anchor);
+            self.push_chart_undo(ChartUndo::SetAnchorAuthored {
+                id,
+                prior,
+                applied: anchor,
+            });
+        } else if let Some(prior_render) = self.charts.anchor_by_id(id) {
+            let chart_part = self
+                .charts
+                .set_anchor_by_id(id, anchor)
+                .expect("id resolved by anchor_by_id");
+            // `insert` returns the value it replaced — the prior `loaded_anchor_edits` state to
+            // restore on undo (a chart moved twice in-session has a prior edit; a first move has None).
+            let prior_edit = self.loaded_anchor_edits.insert(chart_part.clone(), anchor);
+            self.push_chart_undo(ChartUndo::SetAnchorLoaded {
+                id,
+                chart_part,
+                prior_render,
+                prior_edit,
+                applied: anchor,
+            });
         } else {
             tracing::warn!(id = id.0, "SetChartAnchor for an unknown chart id ignored");
             return;
         }
-        self.ops_seen += 1;
-        self.shared
-            .committed_ops
-            .store(self.ops_seen, Ordering::Release);
-        self.chart_version += 1;
-        self.store_chart_snapshot();
-        self.emit(WorkerEvent::Published);
+        self.commit_chart_op();
     }
 
     /// Delete a chart (P18, `Command::DeleteChart`): drop the chart named by `id`. Degraded-guarded.
     /// An **authored** chart is removed from the authored set; a **loaded** chart is unbound and its
     /// `chart_part` recorded in `loaded_deletes` so the source-first save drops it from the package
     /// (its `twoCellAnchor` + part chain) — and the save-time discovery sweep skips it so it can't be
-    /// re-bound. Republishes so the grid drops it.
+    /// re-bound. Republishes so the grid drops it. Both provenances stash enough state to **undo** the
+    /// delete (charts feedback item 4): the removed authored entry, or the whole removed loaded
+    /// binding + the save-set bookkeeping it changed.
     fn delete_chart(&mut self, _sheet: SheetId, id: ChartId) {
         if self.degraded {
             self.emit(WorkerEvent::EditRejected {
@@ -1743,21 +1860,23 @@ impl Worker {
             return;
         }
         if let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) {
-            self.authored_charts.remove(pos);
-        } else if let Some(chart_part) = self.charts.remove_by_id(id) {
-            self.loaded_anchor_edits.remove(&chart_part);
-            self.loaded_deletes.insert(chart_part);
+            let entry = Box::new(self.authored_charts.remove(pos));
+            self.push_chart_undo(ChartUndo::DeleteAuthored { index: pos, entry });
+        } else if let Some(removed) = self.charts.take_by_id(id) {
+            let chart_part = removed.chart_part().to_string();
+            // `remove` returns the anchor-edit the delete evicts — restored on undo.
+            let prior_anchor_edit = self.loaded_anchor_edits.remove(&chart_part);
+            self.loaded_deletes.insert(chart_part.clone());
+            self.push_chart_undo(ChartUndo::DeleteLoaded {
+                removed: Box::new(removed),
+                chart_part,
+                prior_anchor_edit,
+            });
         } else {
             tracing::warn!(id = id.0, "DeleteChart for an unknown chart id ignored");
             return;
         }
-        self.ops_seen += 1;
-        self.shared
-            .committed_ops
-            .store(self.ops_seen, Ordering::Release);
-        self.chart_version += 1;
-        self.store_chart_snapshot();
-        self.emit(WorkerEvent::Published);
+        self.commit_chart_op();
     }
 
     /// Set an **authored** chart's data range (P19, `Command::SetChartRange`): give the chart named by
@@ -1788,7 +1907,16 @@ impl Worker {
             );
             return;
         };
+        // Stash the whole pre-bind entry (refs/series/source_ranges) and the post-bind entry, so the
+        // undo timeline can restore either clone without re-deriving (charts feedback item 4).
+        let prior = Box::new(self.authored_charts[pos].clone());
         self.bind_authored_range_at(pos, sheet, &data_sheet_name, data);
+        let applied = Box::new(self.authored_charts[pos].clone());
+        self.push_chart_undo(ChartUndo::SetRangeAuthored {
+            index: pos,
+            prior,
+            applied,
+        });
         self.commit_chart_op();
     }
 
@@ -1876,6 +2004,10 @@ impl Worker {
                 *slot = resolved;
             }
         }
+        // Type change stays IMMEDIATE (not itself undoable — charts feedback item 4 covers only
+        // insert/delete/anchor/range), but it is a new forward action, so it invalidates the redo
+        // stack (a pending redo must not resurrect pre-retype state).
+        self.redo_stack.clear();
         self.commit_chart_op();
     }
 
@@ -1892,10 +2024,13 @@ impl Worker {
             });
             return;
         }
-        // Authored first (its ids never collide with loaded ones — one shared counter).
+        // Authored first (its ids never collide with loaded ones — one shared counter). Chrome edits
+        // stay IMMEDIATE (not themselves undoable — charts feedback item 4 covers only insert/delete/
+        // anchor/range), but each is a new forward action, so it invalidates the redo stack.
         if let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) {
             if let Some(chart) = self.authored_charts[pos].spec.chart_mut() {
                 apply_chrome_edit(chart, &edit);
+                self.redo_stack.clear();
                 self.commit_chart_op();
             }
             return;
@@ -1906,6 +2041,7 @@ impl Worker {
             .charts
             .edit_chart_by_id(id, |chart| apply_chrome_edit(chart, &edit))
         {
+            self.redo_stack.clear();
             self.commit_chart_op();
             return;
         }
@@ -1985,9 +2121,11 @@ impl Worker {
         changed
     }
 
-    /// Shared post-mutation bookkeeping for a chart op (P19): count the committed op (dirty +
-    /// savable), bump the chart version, re-store the snapshot, and publish. Chart ops are OFF the
-    /// IronCalc undo stack (the P18 decision), so this pushes no undo/touch entry.
+    /// Shared post-mutation bookkeeping for a chart op: count the committed op (dirty + savable),
+    /// bump the chart version, re-store the snapshot, and publish. Deliberately does **not** touch
+    /// the undo/redo stacks — the caller (a forward op via [`push_chart_undo`](Self::push_chart_undo),
+    /// or an undo/redo via [`undo_chart_op`](Self::undo_chart_op)) owns the timeline — so it is reused
+    /// verbatim by both the forward chart ops and the chart undo/redo republish.
     fn commit_chart_op(&mut self) {
         self.ops_seen += 1;
         self.shared
@@ -1996,6 +2134,238 @@ impl Worker {
         self.chart_version += 1;
         self.store_chart_snapshot();
         self.emit(WorkerEvent::Published);
+    }
+
+    /// Push a chart op onto the unified undo timeline (charts feedback item 4) and clear the redo
+    /// stack — a new forward action always invalidates redo. Called by the four undoable chart ops
+    /// (insert / delete / anchor / range) just before [`commit_chart_op`](Self::commit_chart_op).
+    fn push_chart_undo(&mut self, cu: ChartUndo) {
+        self.undo_stack.push(UndoEntry::Chart(cu));
+        self.redo_stack.clear();
+    }
+
+    /// Undo the single most-recent action (`Command::Undo`). Dispatches on the unified timeline's top
+    /// entry: a `Cell` top drives IronCalc's own undo through the single-command edit path (which
+    /// re-reads the popped touch-set); a `Chart` top is inverted worker-side without touching
+    /// IronCalc's stack. An empty stack routes to the edit path too, reproducing the old no-op undo.
+    fn apply_undo(&mut self) {
+        if matches!(self.undo_stack.last(), Some(UndoEntry::Chart(_))) {
+            self.undo_chart_op();
+        } else {
+            // `Cell` top or empty → the IronCalc undo path (degraded-guarded inside; the empty case
+            // is a no-op, identical to before charts joined the timeline).
+            self.apply_edit_batch(vec![Command::Undo]);
+        }
+    }
+
+    /// Redo the single most-recent undone action (`Command::Redo`) — the mirror of
+    /// [`apply_undo`](Self::apply_undo), dispatching on the redo stack's top entry.
+    fn apply_redo(&mut self) {
+        if matches!(self.redo_stack.last(), Some(UndoEntry::Chart(_))) {
+            self.redo_chart_op();
+        } else {
+            self.apply_edit_batch(vec![Command::Redo]);
+        }
+    }
+
+    /// Undo a chart op: pop the `Chart` entry (the caller guaranteed one is on top), apply its
+    /// inverse worker-side, push the counterpart onto the redo stack, and republish. Degraded-guarded
+    /// like every mutating op — a degraded worker refuses (leaving the stacks untouched). Does NOT
+    /// call IronCalc's `undo()`, so the `Cell` entries stay 1:1 with IronCalc's stack.
+    fn undo_chart_op(&mut self) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(UndoEntry::Chart(cu)) = self.undo_stack.pop() else {
+            return; // caller guarantees a Chart entry is on top
+        };
+        let counterpart = self.undo_chart_entry(cu);
+        self.redo_stack.push(UndoEntry::Chart(counterpart));
+        self.commit_chart_op();
+    }
+
+    /// Redo a chart op: the mirror of [`undo_chart_op`](Self::undo_chart_op) over the redo stack.
+    fn redo_chart_op(&mut self) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(UndoEntry::Chart(cu)) = self.redo_stack.pop() else {
+            return;
+        };
+        let counterpart = self.redo_chart_entry(cu);
+        self.undo_stack.push(UndoEntry::Chart(counterpart));
+        self.commit_chart_op();
+    }
+
+    /// Apply the **inverse** of one chart op (revert it), and return the [`ChartUndo`] to push onto
+    /// the redo stack (the same variant — [`redo_chart_entry`](Self::redo_chart_entry) re-applies it
+    /// forward). Snapshot-based, so each arm just restores or removes stashed whole state.
+    fn undo_chart_entry(&mut self, cu: ChartUndo) -> ChartUndo {
+        match cu {
+            // Undo an insert → remove it (redo re-inserts `entry`).
+            ChartUndo::InsertAuthored { index, entry } => {
+                if index < self.authored_charts.len() {
+                    self.authored_charts.remove(index);
+                }
+                ChartUndo::InsertAuthored { index, entry }
+            }
+            // Undo a delete → re-insert `entry` at its old slot (redo removes it again).
+            ChartUndo::DeleteAuthored { index, entry } => {
+                let at = index.min(self.authored_charts.len());
+                self.authored_charts.insert(at, (*entry).clone());
+                ChartUndo::DeleteAuthored { index, entry }
+            }
+            // Undo a loaded delete → re-bind the chart, clear the save-set bookkeeping the delete
+            // added, and restore the anchor-edit it evicted.
+            ChartUndo::DeleteLoaded {
+                removed,
+                chart_part,
+                prior_anchor_edit,
+            } => {
+                self.charts.reinsert_removed((*removed).clone());
+                self.loaded_deletes.remove(&chart_part);
+                match prior_anchor_edit {
+                    Some(a) => {
+                        self.loaded_anchor_edits.insert(chart_part.clone(), a);
+                    }
+                    None => {
+                        self.loaded_anchor_edits.remove(&chart_part);
+                    }
+                }
+                ChartUndo::DeleteLoaded {
+                    removed,
+                    chart_part,
+                    prior_anchor_edit,
+                }
+            }
+            ChartUndo::SetAnchorAuthored { id, prior, applied } => {
+                if let Some(e) = self.authored_charts.iter_mut().find(|e| e.id == id) {
+                    e.spec.anchor = prior;
+                }
+                ChartUndo::SetAnchorAuthored { id, prior, applied }
+            }
+            ChartUndo::SetAnchorLoaded {
+                id,
+                chart_part,
+                prior_render,
+                prior_edit,
+                applied,
+            } => {
+                self.charts.set_anchor_by_id(id, prior_render);
+                match prior_edit {
+                    Some(a) => {
+                        self.loaded_anchor_edits.insert(chart_part.clone(), a);
+                    }
+                    None => {
+                        self.loaded_anchor_edits.remove(&chart_part);
+                    }
+                }
+                ChartUndo::SetAnchorLoaded {
+                    id,
+                    chart_part,
+                    prior_render,
+                    prior_edit,
+                    applied,
+                }
+            }
+            ChartUndo::SetRangeAuthored {
+                index,
+                prior,
+                applied,
+            } => {
+                if index < self.authored_charts.len() {
+                    self.authored_charts[index] = (*prior).clone();
+                }
+                ChartUndo::SetRangeAuthored {
+                    index,
+                    prior,
+                    applied,
+                }
+            }
+        }
+    }
+
+    /// Apply the **forward** of one chart op (re-apply it), and return the [`ChartUndo`] to push onto
+    /// the undo stack — the mirror of [`undo_chart_entry`](Self::undo_chart_entry).
+    fn redo_chart_entry(&mut self, cu: ChartUndo) -> ChartUndo {
+        match cu {
+            // Redo an insert → re-insert `entry` at its slot.
+            ChartUndo::InsertAuthored { index, entry } => {
+                let at = index.min(self.authored_charts.len());
+                self.authored_charts.insert(at, (*entry).clone());
+                ChartUndo::InsertAuthored { index, entry }
+            }
+            // Redo a delete → remove it again.
+            ChartUndo::DeleteAuthored { index, entry } => {
+                if index < self.authored_charts.len() {
+                    self.authored_charts.remove(index);
+                }
+                ChartUndo::DeleteAuthored { index, entry }
+            }
+            // Redo a loaded delete → re-run the delete effects: take the chart out again (a fresh
+            // whole binding for a later undo), re-add its part to `loaded_deletes`, drop the
+            // anchor-edit the undo restored.
+            ChartUndo::DeleteLoaded {
+                removed,
+                chart_part,
+                prior_anchor_edit,
+            } => {
+                let fresh = self.charts.take_by_id(removed.id());
+                self.loaded_anchor_edits.remove(&chart_part);
+                self.loaded_deletes.insert(chart_part.clone());
+                // A fresh whole binding for a later undo (identical to `removed`; the chart wasn't
+                // touched while re-bound), falling back to the stash if the take somehow missed.
+                let removed = fresh.map(Box::new).unwrap_or(removed);
+                ChartUndo::DeleteLoaded {
+                    removed,
+                    chart_part,
+                    prior_anchor_edit,
+                }
+            }
+            ChartUndo::SetAnchorAuthored { id, prior, applied } => {
+                if let Some(e) = self.authored_charts.iter_mut().find(|e| e.id == id) {
+                    e.spec.anchor = applied;
+                }
+                ChartUndo::SetAnchorAuthored { id, prior, applied }
+            }
+            ChartUndo::SetAnchorLoaded {
+                id,
+                chart_part,
+                prior_render,
+                prior_edit,
+                applied,
+            } => {
+                self.charts.set_anchor_by_id(id, applied);
+                self.loaded_anchor_edits.insert(chart_part.clone(), applied);
+                ChartUndo::SetAnchorLoaded {
+                    id,
+                    chart_part,
+                    prior_render,
+                    prior_edit,
+                    applied,
+                }
+            }
+            ChartUndo::SetRangeAuthored {
+                index,
+                prior,
+                applied,
+            } => {
+                if index < self.authored_charts.len() {
+                    self.authored_charts[index] = (*applied).clone();
+                }
+                ChartUndo::SetRangeAuthored {
+                    index,
+                    prior,
+                    applied,
+                }
+            }
+        }
     }
 
     /// Store the current bound charts as the published [`ChartSnapshot`] (charts/architecture §4.1),
@@ -2550,8 +2920,8 @@ mod tests {
             eval_count: 0,
             degraded: false,
             panic_count: 0,
-            undo_touches: Vec::new(),
-            redo_touches: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: None,
             charts: ChartBindings::default(),
             authored_charts: Vec::new(),
@@ -3853,9 +4223,10 @@ mod tests {
         assert_eq!(worker.authored_charts.len(), 1);
     }
 
-    /// P18 undo decision (documented): chart ops are OFF the IronCalc undo stack, and a cell
-    /// undo/redo stays correct while an authored chart rides the snapshot (charts are independent
-    /// of IronCalc's undo/touch stacks). This guards that a chart's presence never breaks cell undo.
+    /// Unified undo timeline (charts feedback item 4): with a chart present but the **cell edit** the
+    /// most-recent action, Ctrl+Z targets the cell (not the chart), and the chart is left untouched.
+    /// The `Cell` entries stay 1:1 with IronCalc's stack even with a `Chart` entry beneath them, so a
+    /// chart's presence never breaks cell undo/redo.
     #[test]
     fn cell_undo_redo_correct_with_authored_chart_present() {
         let (mut worker, _rx) = test_worker();
@@ -3880,6 +4251,368 @@ mod tests {
         assert_eq!(cell00(&worker), "hello", "cell redo works too");
         // The authored chart is untouched by the cell undo/redo.
         assert_eq!(worker.authored_charts.len(), 1);
+    }
+
+    // --- Charts feedback item 4: chart ops on the unified undo timeline ----------------------
+
+    /// Build + install a single **loaded** chart on `sheet` with the given `chart_part`, returning
+    /// its assigned [`ChartId`]. Mirrors a discovered file-loaded chart so its delete/anchor undo can
+    /// be exercised at the worker level (no real xlsx needed).
+    fn install_loaded_chart(worker: &mut Worker, sheet: SheetId, chart_part: &str) -> ChartId {
+        use freecell_chart_model::{
+            Axis, Category, Chart, ChartKind, Grouping, Legend, Series, SourceXml,
+        };
+        let chart = Chart {
+            title: None,
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![Series::category_value(
+                Some("Loaded"),
+                vec![Category::Text("Q1".into())],
+                vec![1.0],
+            )],
+            cat_axis: Axis::untitled(),
+            val_axis: Axis::untitled(),
+            legend: Some(Legend::default()),
+        };
+        let spec = ChartSpec::loaded(
+            chart,
+            SourceXml::new("<c:chartSpace/>"),
+            Vec::new(),
+            test_anchor(),
+        );
+        worker.charts =
+            ChartBindings::from_specs_by_sheet(vec![(sheet, vec![(chart_part.to_string(), spec)])]);
+        let id = ChartId(worker.next_chart_id);
+        worker.charts.assign_missing_ids(&mut worker.next_chart_id);
+        id
+    }
+
+    /// Delete an authored chart → Undo restores it (same id/kind/anchor) → Redo removes it again.
+    #[test]
+    fn delete_authored_chart_undo_redo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+            data: None,
+        }]);
+        let id = worker.authored_charts[0].id;
+        let anchor = worker.authored_charts[0].spec.anchor;
+        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
+        assert!(
+            worker.authored_charts.is_empty(),
+            "delete removes the chart"
+        );
+
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(worker.authored_charts.len(), 1, "undo brings it back");
+        assert_eq!(worker.authored_charts[0].id, id, "same id restored");
+        assert_eq!(worker.authored_charts[0].spec.anchor, anchor, "same anchor");
+        assert!(matches!(
+            worker.authored_charts[0].spec.chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Line { .. }
+        ));
+
+        worker.process_batch(vec![Command::Redo]);
+        assert!(worker.authored_charts.is_empty(), "redo re-deletes it");
+    }
+
+    /// Delete a **loaded** chart → Undo re-binds it AND drops its part from `loaded_deletes` → Redo
+    /// re-deletes it AND restores the part to `loaded_deletes` (so a later save writes the right set).
+    #[test]
+    fn delete_loaded_chart_undo_redo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let part = "xl/charts/chart1.xml";
+        let id = install_loaded_chart(&mut worker, sheet, part);
+        assert!(!worker.charts.is_empty());
+
+        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
+        assert!(worker.charts.is_empty(), "delete unbinds the loaded chart");
+        assert!(
+            worker.loaded_deletes.contains(part),
+            "delete records the part in loaded_deletes"
+        );
+
+        worker.process_batch(vec![Command::Undo]);
+        assert!(!worker.charts.is_empty(), "undo re-binds the loaded chart");
+        assert_eq!(
+            worker.charts.anchor_by_id(id),
+            Some(test_anchor()),
+            "the re-bound chart keeps its id + anchor"
+        );
+        assert!(
+            !worker.loaded_deletes.contains(part),
+            "undo clears the loaded-delete record"
+        );
+
+        worker.process_batch(vec![Command::Redo]);
+        assert!(worker.charts.is_empty(), "redo re-deletes it");
+        assert!(
+            worker.loaded_deletes.contains(part),
+            "redo restores the loaded-delete record"
+        );
+    }
+
+    /// Insert a chart → Undo removes it → Redo re-inserts it.
+    #[test]
+    fn insert_chart_undo_redo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Bar,
+            anchor: test_anchor(),
+            data: None,
+        }]);
+        assert_eq!(worker.authored_charts.len(), 1);
+
+        worker.process_batch(vec![Command::Undo]);
+        assert!(worker.authored_charts.is_empty(), "undo removes the insert");
+
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(worker.authored_charts.len(), 1, "redo re-inserts it");
+        assert!(matches!(
+            worker.authored_charts[0].spec.chart().unwrap().kind,
+            freecell_chart_model::ChartKind::Bar { .. }
+        ));
+    }
+
+    /// SetAnchor (authored) → Undo restores the prior anchor → Redo re-applies the new one.
+    #[test]
+    fn set_anchor_authored_undo_redo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+            data: None,
+        }]);
+        let id = worker.authored_charts[0].id;
+        let prior = worker.authored_charts[0].spec.anchor;
+        let moved = Anchor::new(
+            freecell_chart_model::AnchorCell::new(3, 3),
+            freecell_chart_model::AnchorCell::new(11, 18),
+        );
+        worker.process_batch(vec![Command::SetChartAnchor {
+            sheet,
+            id,
+            anchor: moved,
+        }]);
+        assert_eq!(worker.authored_charts[0].spec.anchor, moved);
+
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            worker.authored_charts[0].spec.anchor, prior,
+            "undo restores"
+        );
+
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(
+            worker.authored_charts[0].spec.anchor, moved,
+            "redo re-applies"
+        );
+    }
+
+    /// SetAnchor (loaded) → Undo restores the prior render anchor AND clears the `loaded_anchor_edits`
+    /// entry the move added → Redo re-applies both.
+    #[test]
+    fn set_anchor_loaded_undo_redo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let part = "xl/charts/chart1.xml";
+        let id = install_loaded_chart(&mut worker, sheet, part);
+        let moved = Anchor::new(
+            freecell_chart_model::AnchorCell::new(3, 3),
+            freecell_chart_model::AnchorCell::new(11, 18),
+        );
+        worker.process_batch(vec![Command::SetChartAnchor {
+            sheet,
+            id,
+            anchor: moved,
+        }]);
+        assert_eq!(worker.charts.anchor_by_id(id), Some(moved));
+        assert_eq!(worker.loaded_anchor_edits.get(part), Some(&moved));
+
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            worker.charts.anchor_by_id(id),
+            Some(test_anchor()),
+            "undo restores the render anchor"
+        );
+        assert!(
+            !worker.loaded_anchor_edits.contains_key(part),
+            "undo clears the anchor-edit the move added"
+        );
+
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(worker.charts.anchor_by_id(id), Some(moved));
+        assert_eq!(worker.loaded_anchor_edits.get(part), Some(&moved));
+    }
+
+    /// SetRange (authored, born-live) → Undo restores the pre-bind (near-empty) state → Redo re-binds.
+    #[test]
+    fn set_range_authored_undo_redo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        seed_chart_data(&mut worker, sheet); // A1:B3 = Widgets / Q1,Q2 / 10,20
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+            data: None,
+        }]);
+        assert!(
+            worker.authored_charts[0].refs.is_empty(),
+            "inserted near-empty (no range yet)"
+        );
+        let id = worker.authored_charts[0].id;
+        worker.process_batch(vec![Command::SetChartRange {
+            sheet,
+            id,
+            data: CellRange::from_a1("A1:B3").unwrap(),
+        }]);
+        assert!(
+            !worker.authored_charts[0].refs.is_empty(),
+            "range bound it live"
+        );
+        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
+
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            worker.authored_charts[0].refs.is_empty(),
+            "undo restores the pre-bind (unbound) state"
+        );
+
+        worker.process_batch(vec![Command::Redo]);
+        assert!(
+            !worker.authored_charts[0].refs.is_empty(),
+            "redo re-binds the range"
+        );
+        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
+    }
+
+    /// The key correctness test: an INTERLEAVE of cell edit + chart ops undoes/redoes in exact
+    /// most-recent-first order across both op families (cellEdit → InsertChart → DeleteChart, then
+    /// Undo×3 restores-then-removes-the-chart-then-undoes-the-cell, and Redo×3 replays forward).
+    #[test]
+    fn interleaved_cell_and_chart_undo_redo_ordering() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let cell00 = |w: &Worker| w.doc.formatted_value(0, CellRef::new(0, 0)).unwrap();
+
+        worker.process_batch(vec![set_input(sheet, 0, 0, "hello")]);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+            data: None,
+        }]);
+        let id = worker.authored_charts[0].id;
+        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
+        assert!(worker.authored_charts.is_empty());
+        assert_eq!(cell00(&worker), "hello");
+
+        // Undo #1 → most recent = DeleteChart → the chart comes back.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(worker.authored_charts.len(), 1, "undo1 restores the chart");
+        assert_eq!(cell00(&worker), "hello", "the cell edit is untouched");
+        // Undo #2 → InsertChart → the chart goes away (NOT the cell edit).
+        worker.process_batch(vec![Command::Undo]);
+        assert!(worker.authored_charts.is_empty(), "undo2 removes the chart");
+        assert_eq!(cell00(&worker), "hello", "the cell edit is still untouched");
+        // Undo #3 → the cell edit.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(cell00(&worker), "", "undo3 undoes the cell edit");
+
+        // Redo replays forward: cell → insert → delete.
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(cell00(&worker), "hello", "redo1 re-applies the cell edit");
+        assert!(
+            worker.authored_charts.is_empty(),
+            "chart still gone after redo1"
+        );
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(
+            worker.authored_charts.len(),
+            1,
+            "redo2 re-inserts the chart"
+        );
+        worker.process_batch(vec![Command::Redo]);
+        assert!(
+            worker.authored_charts.is_empty(),
+            "redo3 re-deletes the chart"
+        );
+    }
+
+    /// A new action after an undo clears the redo stack: chart op → Undo → cell edit → the pending
+    /// chart redo is discarded, so Redo is a no-op (the chart is not resurrected).
+    #[test]
+    fn new_action_after_undo_clears_chart_redo() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+            data: None,
+        }]);
+        worker.process_batch(vec![Command::Undo]);
+        assert!(worker.authored_charts.is_empty());
+        assert_eq!(worker.redo_stack.len(), 1, "the insert is redoable");
+
+        // A new (cell) action must invalidate the pending chart redo.
+        worker.process_batch(vec![set_input(sheet, 0, 0, "x")]);
+        assert!(worker.redo_stack.is_empty(), "a new action clears redo");
+
+        worker.process_batch(vec![Command::Redo]);
+        assert!(
+            worker.authored_charts.is_empty(),
+            "redo is a no-op — the chart is not resurrected"
+        );
+    }
+
+    /// A degraded worker refuses a chart Undo/Redo (like every mutating op), leaving the timeline +
+    /// chart state untouched.
+    #[test]
+    fn chart_undo_rejected_when_degraded() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+            data: None,
+        }]);
+        let id = worker.authored_charts[0].id;
+        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::TestPanic]);
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(worker.degraded);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Degraded
+                }
+            )),
+            "a degraded worker rejects a chart undo"
+        );
+        assert!(
+            worker.authored_charts.is_empty(),
+            "the delete is not undone while degraded"
+        );
     }
 
     // --- P19: edit panel range/type ---------------------------------------------------------
@@ -5256,8 +5989,8 @@ mod tests {
             eval_count: 0,
             degraded: false,
             panic_count: 0,
-            undo_touches: Vec::new(),
-            redo_touches: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: None,
             charts: ChartBindings::default(),
             authored_charts: Vec::new(),

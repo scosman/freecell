@@ -62,6 +62,29 @@ FreeCell. This is the standing way of working, not a one-off.
   **force + assert** the measured op so it can't measure a no-op; report **p50/p99**,
   environment-stamped; **adversarially review** surprising numbers before trusting them.
 - **Commit + push regularly** — the working container is ephemeral.
+- **Build/check efficiency — scope the work; don't full-workspace everything.** A full `cargo
+  build`/`cargo test --workspace` on this GPUI workspace is **slow** (~15–25 min warm, worse
+  cold), and the pixel suite is slower still — so match the check to the change instead of
+  rebuilding the world each iteration:
+  - **Single-crate change → crate-scoped checks:** `cargo build -p <crate>` + `cargo test -p
+    <crate> --lib` (add `-p freecell-engine` when the engine is touched) — minutes, not tens of
+    minutes. Reserve `--workspace` build/test for genuinely cross-crate changes or a single
+    final pre-merge validation, not every iteration.
+  - **Always run `cargo fmt --all --check` (whole workspace).** It's cheap (no compile), and a
+    crate-scoped `cargo fmt -p <crate>` does **not** format sibling crates — a `render-tests`
+    (or other sibling-crate) edit can otherwise slip a fmt violation past a crate-scoped check
+    and fail the CI `checks` gate.
+  - **Pixel render suite: subset while iterating, full suite once.** A full run is many minutes
+    (software lavapipe) and busts the prompt cache. Run only the relevant `render_tests.sh test
+    <prefix>` subset per change; defer the **full** suite + CI `render` gate to one late
+    validation (see the Render-tests section). Never full-run per coding step.
+  - **Code review can be diff-only.** A reviewer that trusts the author's crate-scoped-green
+    result and reads the `git diff` (compiling only the one affected crate if it needs to) is
+    far cheaper than one that rebuilds the whole workspace to re-verify.
+  - Run cargo from **`app/`** (the pinned toolchain activates there). If `render-tests` hits an
+    intermittent `ld` bus error under full parallelism, build/test it with `-j 2`. Disk is a
+    fixed per-session allowance; `target/` grows large (~25 GB) — deleting stale build dirs
+    frees space immediately.
 
 ## Render tests — agent-driven (no automatic every-push gate)
 

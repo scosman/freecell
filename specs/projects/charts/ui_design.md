@@ -27,6 +27,13 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
   subtle ~1px light-grey outline around the chart's outer edge (every chart type, pie/doughnut
   included). No **selection** border / resize handles in v1 core (read-only). Off-screen charts
   aren't drawn; partially-scrolled charts are clipped.
+- **Point markers (line/scatter):** a point indicator (the round dot, and any explicit
+  `c:marker` symbol) is sized so its **visible colored disc** — the mark minus its two white
+  edges — is at least **2× the series line width** (and never below a ~6px absolute floor), so a
+  marker always reads as a clearly larger dot sitting *on* the line rather than a bump the same
+  width as the line. An explicit `c:marker` size is honored only when it is **larger** than that
+  floor. The data-label offset uses the **same** effective marker radius, so a label always clears
+  the (possibly enlarged) marker (`chart::line::marker_diameter`, shared with the scatter renderer).
 
 ### 2.2 Compatibility warning (functional_spec §5)
 - When a chart's `compatibility_warning` flag is set, show a small **inline** label in the

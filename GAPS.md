@@ -220,12 +220,12 @@ One non-blocking Mild note from the P26 (bubble) review — an authoring-complet
 ### Charts — post-v1 rendering feedback (Batch 1, 2026-07-11)
 
 One latent (non-manifesting) note surfaced while landing the Batch-1 chart rendering fixes (gridline/
-axis clipping to the plot rect, solid value-axis line, marker size floor, chart outline). Not a defect
-— recorded so it isn't re-litigated.
+axis clipping to the plot rect, solid value-axis line, marker size floor, chart outline). Now
+**RESOLVED** by the Batch-1 marker-size reopen (2026-07-12) — recorded so it isn't re-litigated.
 
 | # | Item | Severity | Root cause / current behavior | Follow-up if needed |
 |---|---|---|---|---|
-| C-FB1-1 | **Line data-label offset uses a fixed `DOT_SIZE/2` (3px), not the marker's actual radius.** `line.rs` `paint_data_labels` (~L557) offsets an `Above`/`Below` (etc.) data label from its point by a constant `half_marker = DOT_SIZE / 2.0` (3px). Batch-1 Fix 2 now floors a marker's diameter to `max(requested, 2× line width, 6px)`, so a **heavy-line** series' marker can be ~12–16px (radius 6–8px) — larger than the 3px the label offset assumes, so a label could kiss/overlap an enlarged marker when a heavy line **and** data labels combine on the same series. | Mild — **currently NON-MANIFESTING.** No committed fixture triggers it: every data-label scene (`chart_line_value_labels`/`_percent_labels`/`_named_labels`) uses default-width (~2.7px) lines whose markers stay 6px = `DOT_SIZE`, so the 3px offset is still exactly right and no baseline moved. The offset already ignored an explicit `marker.size` (pre-existing), so Fix 2 only widened the same latent gap. | Mirror `paint_marker`'s diameter floor in the label offset: derive the same effective marker diameter (from the series `width_px` + any `marker.size`) and offset by `effective_diameter / 2` instead of the constant `DOT_SIZE / 2`. Trivial once a heavy-line + data-labels fixture needs it. |
+| C-FB1-1 | **RESOLVED (2026-07-12).** ~~Line data-label offset uses a fixed `DOT_SIZE/2` (3px), not the marker's actual radius.~~ The data-label offset now derives the **effective marker radius** from the shared `marker_diameter(s.marker, s.width_px) / 2.0` helper — the exact diameter `paint_marker` draws — instead of the old constant `half_marker = DOT_SIZE / 2.0`. So a heavy-line series' enlarged marker (now sized so the *visible colored* disc is `≥ 2× line width`) and its `Above`/`Below`/`Left`/`Right` data label stay clear of each other; the offset tracks the marker for any width or explicit `c:marker` size. `DOT_SIZE` was removed in the same refactor (both former call sites now go through `marker_diameter`). | ~~Mild~~ Resolved — the label offset and the marker painter share one diameter source, so they can no longer disagree. | Done. (The default-width data-label scenes are unchanged: a default line's marker is now an 8px total dot = the same 4px radius the label offset uses, so those baselines did not move; the reopen intentionally enlarged the *default-dot* baselines — the marker scenes — not the label geometry.) |
 
 ### Charts — post-v1 undo feedback (Batch 4, 2026-07-12)
 

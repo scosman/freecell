@@ -2,14 +2,16 @@
 //! types (`architecture.md §2`, `components/engine_worker.md §Public interface`).
 //!
 //! Every type here is **engine-free**: it names only `freecell-core` types (`SheetId`,
-//! `CellRef`, `CellRange`, `Rgb`, `InputRejection`, `SheetNameError`), `std`, and the
-//! Phase-3 typed file errors (`LoadError` / `SaveError`, which carry only `String`s). **No
-//! IronCalc type crosses this seam** — that is the headless boundary `freecell-engine`
-//! exists to hold (`architecture.md §2`).
+//! `CellRef`, `CellRange`, `Rgb`, `InputRejection`, `SheetNameError`), the pure
+//! `freecell-chart-model` types (`Anchor`, `ChartInsertKind` — which already cross this seam via
+//! [`ChartSnapshot`](super::charts::ChartSnapshot)/`ChartSpec`), `std`, and the Phase-3 typed file
+//! errors (`LoadError` / `SaveError`, which carry only `String`s). **No IronCalc type crosses this
+//! seam** — that is the headless boundary `freecell-engine` exists to hold (`architecture.md §2`).
 
 use std::ops::Range;
 use std::path::PathBuf;
 
+use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
 use freecell_core::{CellRange, CellRef, Rgb, SheetId};
@@ -142,6 +144,47 @@ impl BorderPreset {
             BorderPreset::None => "None",
         }
     }
+}
+
+/// Which axis a [`ChartChromeEdit::AxisTitle`] targets — the category (`c:catAx`, or scatter's X
+/// `c:valAx`) or the value (`c:valAx`, or scatter's Y) axis, matching the model's
+/// `Chart::cat_axis` / `Chart::val_axis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartAxisKind {
+    Category,
+    Value,
+}
+
+/// The data-label **show** toggles a [`ChartChromeEdit::DataLabels`] applies across every series of a
+/// chart (`c:dLbls` `showVal` / `showCatName` / `showPercent`, functional_spec §6.B). Each series'
+/// existing label number-format / separator / position (and any legend-key / series-name already on)
+/// is preserved; only these three flags are set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DataLabelToggles {
+    pub show_value: bool,
+    pub show_category_name: bool,
+    pub show_percent: bool,
+}
+
+/// One chrome attribute change carried by [`Command::SetChartChrome`] (P20, functional_spec §6.B).
+/// Each variant names exactly one field of the render [`Chart`](freecell_chart_model::Chart) — so the
+/// loaded-chart source patch can splice **only** that sub-element and leave everything else
+/// byte-stable (the edit contract).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChartChromeEdit {
+    /// Set (or clear, `None`) the chart title.
+    Title(Option<String>),
+    /// Turn the legend on at a position, or off (`None`).
+    Legend(Option<LegendPosition>),
+    /// Set (or clear, `None`) an axis title.
+    AxisTitle {
+        axis: ChartAxisKind,
+        title: Option<String>,
+    },
+    /// Set (or clear back to the palette, `None`) one series' color, by 0-based series index.
+    SeriesColor { series: usize, color: Option<Rgb> },
+    /// Apply the data-label toggles across every series.
+    DataLabels(DataLabelToggles),
 }
 
 /// A command the UI hands the worker over the (unbounded, non-blocking) command channel.
@@ -297,6 +340,78 @@ pub enum Command {
         sheet: SheetId,
         cell: CellRef,
         req_id: u64,
+    },
+    /// Insert an **authored chart** of `kind` onto `sheet`, placed at `anchor` (P17,
+    /// charts/ui_design §3.1). The worker builds the template chart
+    /// ([`ChartInsertKind::near_empty_chart`]), holds it as an
+    /// [`Authored`](freecell_chart_model::Origin::Authored) `ChartSpec`, and publishes it on the
+    /// chart snapshot so the grid renders it. On save it takes the **write-from-model** path
+    /// (`write::write_authored_charts`), never the loaded re-inject. Rejected with
+    /// [`EditRejectedReason::Degraded`] when the worker is degraded (like every mutating op).
+    ///
+    /// `data` seeds the chart's initial **data range** (post-v1 Batch 3, item 8): when the action
+    /// bar captures a real multi-cell selection at insert time, the worker binds that range
+    /// **immediately** — running the same block→series binding as [`SetChartRange`](Command::SetChartRange)
+    /// on the freshly-assigned id — so the chart is born **LIVE** (real `c:f` refs + resolved values),
+    /// no follow-up "Use selection" click. `None` (a single-cell/empty selection) keeps the P17
+    /// snapshot-but-not-live placeholder (no `c:f` binding until a range is set). The range's cells
+    /// live on the insert `sheet` (the active sheet the selection came from).
+    InsertChart {
+        sheet: SheetId,
+        kind: ChartInsertKind,
+        anchor: Anchor,
+        data: Option<CellRange>,
+    },
+    /// **Move or resize** a chart on `sheet` (P18, `ui_design §3.2`): set the chart named by its
+    /// stable [`ChartId`] to a new [`Anchor`] (both move and resize produce one). For an **authored**
+    /// chart the worker rewrites the model anchor; for a **loaded** chart it updates the render
+    /// anchor and records a drawing-anchor patch the source-first save applies to the retained
+    /// `twoCellAnchor`. Degraded-guarded like every mutating op.
+    SetChartAnchor {
+        sheet: SheetId,
+        id: ChartId,
+        anchor: Anchor,
+    },
+    /// **Delete** a chart on `sheet` (P18, Delete/Backspace or the chart context menu): drop the
+    /// chart named by its [`ChartId`]. An **authored** chart is removed from the authored set; a
+    /// **loaded** chart is unbound and recorded so the save drops it from the package (its
+    /// `twoCellAnchor` + part chain) without corrupting the rest. Degraded-guarded.
+    DeleteChart { sheet: SheetId, id: ChartId },
+    /// **Set an authored chart's data range** (P19, the edit panel): bind the chart named by its
+    /// [`ChartId`] to the rectangular `data` block on `sheet`. The chart is resolved by **`id`** (not
+    /// `sheet`), so `sheet` names the worksheet the **data** lives on — the worker qualifies the
+    /// emitted `c:f` with it and reads the values there; it may differ from the chart's host/anchor
+    /// sheet (valid cross-sheet chart data). The worker interprets the block (first row = series
+    /// names, first column = categories/x, each remaining column a series), gives the chart real `c:f`
+    /// refs, and re-resolves its values from the current cells — so it transitions from P17's
+    /// snapshot-but-not-live placeholder to a **LIVE** chart that re-renders on edit and saves with
+    /// `c:f` + caches (write-from-model). Degraded-guarded; a loaded/unknown id is ignored (loaded
+    /// re-range is P20).
+    SetChartRange {
+        sheet: SheetId,
+        id: ChartId,
+        data: CellRange,
+    },
+    /// **Switch an authored chart's type** (P19, the edit panel): rebuild the chart named by its
+    /// [`ChartId`] to `kind`, preserving its data-range binding + title where sensible, so it renders
+    /// as the new kind and round-trips. Degraded-guarded; a loaded/unknown id is ignored.
+    SetChartType {
+        sheet: SheetId,
+        id: ChartId,
+        kind: ChartInsertKind,
+    },
+    /// **Edit a chart's chrome** (P20, the edit panel): change one chrome attribute — title, legend,
+    /// axis title, series color, or data-label toggles — of the chart named by its [`ChartId`]. Unlike
+    /// range/type, this applies to **both** provenances: an **authored** chart's model is mutated and
+    /// re-serialized on save (write-from-model); a **loaded** chart's retained render model is mutated
+    /// (so it re-renders live) and its retained `chartN.xml` is **source-patched** on save — only the
+    /// changed sub-element is spliced, so unmodeled OOXML styling is preserved byte-for-byte (the edit
+    /// contract, functional_spec §6). `sheet` is advisory (the panel's host sheet); the chart is found
+    /// by `id`. Degraded-guarded; an unknown id is ignored.
+    SetChartChrome {
+        sheet: SheetId,
+        id: ChartId,
+        edit: ChartChromeEdit,
     },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },

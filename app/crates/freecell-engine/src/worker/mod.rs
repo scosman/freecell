@@ -9,17 +9,20 @@
 //!
 //! - [`protocol`] — the engine-free `Command` / `WorkerEvent` contract.
 //! - [`client`] — [`DocumentClient`] + the shared read-surfaces + [`WorkerEventReceiver`].
-//! - [`run`] — the worker's loop (coalescing, publish-then-bump, catch_unwind + degraded
+//! - `run` — the worker's loop (coalescing, publish-then-bump, catch_unwind + degraded
 //!   policy, dirty-op accounting).
 //!
 //! [`WorkbookDocument`]: crate::WorkbookDocument
 
+pub mod charts;
 pub mod client;
 pub mod protocol;
 mod run;
 
+pub use charts::ChartSnapshot;
 pub use client::{DocumentClient, WorkerEventReceiver, WORKER_STACK_SIZE};
+pub use freecell_chart_model::{ChartId, ChartInsertKind};
 pub use protocol::{
-    BorderLine, BorderPreset, Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
-    StylePath, WorkerEvent,
+    BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, Command, DataLabelToggles,
+    EditRejectedReason, PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent,
 };

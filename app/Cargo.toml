@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/freecell-core",
+    "crates/freecell-chart-model",
     "crates/freecell-engine",
     "crates/freecell-app",
     "render-tests",
@@ -33,6 +34,9 @@ publish = false
 [workspace.dependencies]
 # Internal crates
 freecell-core = { path = "crates/freecell-core" }
+# `freecell-chart-model` (charts project, P1): the gpui-free / ironcalc-free chart data model —
+# the stable seam the engine parses into and the app renders from.
+freecell-chart-model = { path = "crates/freecell-chart-model" }
 freecell-engine = { path = "crates/freecell-engine" }
 # `freecell-app` exposes a `[lib]` (`freecell_app`, Phase 6): `render-tests` (Phase 7) and
 # the perf harness (Phase 12) depend on it to render the real grid over fixtures.
@@ -57,6 +61,11 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 thiserror = "2"
 anyhow = "1"
 tempfile = "3"
+# OOXML chart file layer (charts project, `freecell-engine::chart`): the same `zip` + `roxmltree`
+# second-pass an `.xlsx` (an OPC zip of XML parts) needs to walk the worksheet→drawing→chart
+# chain on load and re-inject chart parts on save. Both are already resolved in `Cargo.lock`.
+zip = "0.6"
+roxmltree = "0.19"
 # Worker seam (Phase 4, components/engine_worker.md §Threading & channels):
 # `arc-swap` = the lock-free `Publication` snapshot slot (publish-then-bump);
 # `async-channel` = the worker→UI `WorkerEvent` channel (the type `smol::channel`

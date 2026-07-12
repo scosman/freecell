@@ -3,6 +3,11 @@
 //! rows here (stated as a review requirement in `README.md`). `name` is snake_case and IS the
 //! baseline filename, so a red CI line names the exact broken feature.
 
+use freecell_chart_model::{
+    Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartId,
+    ChartInsertKind, ChartKind, ChartSpec, Color, Grouping, Legend, Marker, MarkerSymbol,
+    ScatterStyle, Series, SizeRepresentation, SourceXml, ThemeSlot,
+};
 use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
 
 use crate::scene::Scene;
@@ -68,6 +73,13 @@ pub struct RenderCase {
     /// §7.1, §9`). The row is just a div, so it renders in the Linux harness too — the *native*
     /// macOS integration (transparent titlebar + traffic lights) is the on-device smoke.
     pub titlebar: Option<&'static str>,
+    /// Charts installed on the grid's **ChartLayer** for this case (P8, `charts/architecture.md
+    /// §4.2`) — the harness hands them to `GridView::set_sheet_charts` for the active sheet. Empty
+    /// for every non-chart case (no ChartLayer painted → no baseline change).
+    pub charts: Vec<ChartSpec>,
+    /// A selected chart (P18) — its stable [`ChartId`], drawn with the selection outline + resize
+    /// handles. `None` (the default) draws no selection chrome, so no existing baseline moves.
+    pub selected_chart: Option<ChartId>,
 }
 
 impl RenderCase {
@@ -83,11 +95,25 @@ impl RenderCase {
             mirror: None,
             in_cell: None,
             titlebar: None,
+            charts: Vec::new(),
+            selected_chart: None,
         }
     }
 
     fn selection(mut self, selection: SelectionModel) -> Self {
         self.selection = Some(selection);
+        self
+    }
+
+    /// Installs charts on the case's ChartLayer (P8).
+    fn charts(mut self, charts: Vec<ChartSpec>) -> Self {
+        self.charts = charts;
+        self
+    }
+
+    /// Selects the chart with this [`ChartId`] (P18) — draws the selection outline + resize handles.
+    fn selected_chart(mut self, id: ChartId) -> Self {
+        self.selected_chart = Some(id);
         self
     }
 
@@ -132,6 +158,316 @@ fn sel(anchor: (u32, u32), active: (u32, u32)) -> SelectionModel {
         anchor: CellRef::new(anchor.0, anchor.1),
         active: CellRef::new(active.0, active.1),
     }
+}
+
+// ---- In-grid chart fixtures (P8, `charts/architecture.md §4.2`) ----------------------------
+// A grid-chart case is an ordinary engine-backed grid scene plus `.charts(...)`, so the ChartLayer
+// paints over real cells at the chart's anchor. The anchor + viewport are sized against the default
+// 100 px column / 24 px row geometry so the chart lands over the data table below it.
+
+/// Viewport for the in-grid chart scenes — wide/tall enough to show the anchored chart (which spans
+/// ~500×312 content px) plus the surrounding header row + label column.
+const CHART_GRID_VP: (u32, u32) = (760, 420);
+
+/// The shared chart placement: a `twoCellAnchor` from B2 (col 1, row 1) to G15 (col 6, row 14), so
+/// the chart floats **over** the data table's numbers (cols B–D) while the header row / label column
+/// stay visible around it. Carries small EMU offsets so the intra-cell offset path is exercised.
+fn chart_anchor() -> Anchor {
+    Anchor::new(
+        AnchorCell::with_offsets(1, 9_525, 1, 9_525),
+        AnchorCell::with_offsets(6, 0, 14, 0),
+    )
+}
+
+/// A small data table + header row/label column the chart floats over — the "spreadsheet with a
+/// chart in it" look (`ui_design.md §1`).
+fn chart_backing_scene() -> Scene {
+    Scene::new()
+        .input(0, 0, "Region")
+        .input(0, 1, "Q1")
+        .input(0, 2, "Q2")
+        .input(0, 3, "Q3")
+        .input(1, 0, "North")
+        .input(2, 0, "South")
+        .input(3, 0, "West")
+        .input(1, 1, "32")
+        .input(1, 2, "55")
+        .input(1, 3, "78")
+        .input(2, 1, "74")
+        .input(2, 2, "48")
+        .input(2, 3, "63")
+        .input(3, 1, "50")
+        .input(3, 2, "49")
+        .input(3, 3, "61")
+}
+
+/// A three-region multi-series line chart (theme colors + markers), the picture the ChartLayer
+/// paints for the Faithful / Degraded cases.
+fn in_grid_line_chart(title: &str) -> Chart {
+    let months = || {
+        ["Jan", "Feb", "Mar", "Apr"]
+            .into_iter()
+            .map(|m| Category::Text(m.into()))
+            .collect::<Vec<_>>()
+    };
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        },
+        series: vec![
+            Series::category_value(Some("North"), months(), vec![32.0, 41.0, 55.0, 62.0])
+                .with_color(ChartColor::theme(ThemeSlot::Accent1)),
+            Series::category_value(Some("South"), months(), vec![74.0, 60.0, 48.0, 52.0])
+                .with_color(ChartColor::theme(ThemeSlot::Accent2)),
+            Series::category_value(Some("West"), months(), vec![50.0, 54.0, 49.0, 58.0])
+                .with_color(ChartColor::theme(ThemeSlot::Accent3)),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** line-chart spec at [`chart_anchor`], whose retained source classifies to a chosen
+/// [`Fidelity`](freecell_chart_model::Fidelity) (via `source_xml`) so a single fixture drives the
+/// Faithful and Degraded cases.
+fn in_grid_chart_spec(title: &str, source_xml: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_line_chart(title),
+        SourceXml::new(source_xml),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
+/// The **near-empty authored** spec the action-bar insert flow produces (P17): a
+/// [`ChartInsertKind::Line`] `near_empty_chart` — one placeholder series ("Series 1" over
+/// categories 1..4), a generic "Chart" title, untitled axes, and a right legend — placed at the
+/// shared [`chart_anchor`]. Unlike every other in-grid chart case (all `ChartSpec::loaded`), this
+/// is an **authored** spec, so it exercises the authored → in-grid render path AND is the exact
+/// picture the user sees the instant they insert a line chart. Authored ⇒
+/// [`Fidelity::Faithful`](freecell_chart_model::Fidelity), so the real single-series line renders.
+fn in_grid_authored_inserted_spec() -> ChartSpec {
+    ChartSpec::authored(ChartInsertKind::Line.near_empty_chart(), chart_anchor())
+}
+
+/// A three-region clustered **column** chart (P22) over the backing table's quarters — the picture the
+/// ChartLayer paints for the in-grid column case (`grid_chart_column`).
+fn in_grid_column_chart(title: &str) -> Chart {
+    let months = || {
+        ["Jan", "Feb", "Mar", "Apr"]
+            .into_iter()
+            .map(|m| Category::Text(m.into()))
+            .collect::<Vec<_>>()
+    };
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::Clustered,
+            layout: BarLayout::default(),
+        },
+        series: vec![
+            Series::category_value(Some("North"), months(), vec![32.0, 41.0, 55.0, 62.0])
+                .with_color(Color::from_hex(0x4472C4)),
+            Series::category_value(Some("South"), months(), vec![74.0, 60.0, 48.0, 52.0])
+                .with_color(Color::from_hex(0xED7D31)),
+            Series::category_value(Some("West"), months(), vec![50.0, 54.0, 49.0, 58.0])
+                .with_color(Color::from_hex(0xFFC000)),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** clustered-column `ChartSpec` at [`chart_anchor`], with a `<c:barChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `bar_element` path (P22), the column
+/// analogue of the loaded line case.
+fn in_grid_column_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_column_chart(title),
+        SourceXml::new("<c:barChart><c:barDir val=\"col\"/></c:barChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
+/// A three-region standard **area** chart (P23) over the backing table's quarters — the picture the
+/// ChartLayer paints for the in-grid area case (`grid_chart_area`). Authored tallest-first so the
+/// overlapping bands read.
+fn in_grid_area_chart(title: &str) -> Chart {
+    let months = || {
+        ["Jan", "Feb", "Mar", "Apr"]
+            .into_iter()
+            .map(|m| Category::Text(m.into()))
+            .collect::<Vec<_>>()
+    };
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Area {
+            grouping: Grouping::Standard,
+        },
+        series: vec![
+            Series::category_value(Some("North"), months(), vec![74.0, 60.0, 68.0, 82.0])
+                .with_color(Color::from_hex(0x4472C4)),
+            Series::category_value(Some("South"), months(), vec![50.0, 54.0, 49.0, 58.0])
+                .with_color(Color::from_hex(0xED7D31)),
+            Series::category_value(Some("West"), months(), vec![32.0, 41.0, 36.0, 45.0])
+                .with_color(Color::from_hex(0xFFC000)),
+        ],
+        cat_axis: Axis::titled("Month"),
+        val_axis: Axis::titled("Units"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** standard-area `ChartSpec` at [`chart_anchor`], with a `<c:areaChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `area_element` path (P23), the area
+/// analogue of the loaded column case.
+fn in_grid_area_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_area_chart(title),
+        SourceXml::new("<c:areaChart><c:grouping val=\"standard\"/></c:areaChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
+/// A single-series **pie** (P24) over four market-share slices — the picture the ChartLayer paints
+/// for the in-grid pie case (`grid_chart_pie`). A pie is single-series; its slices are the
+/// categories, colored by the varied palette.
+fn in_grid_pie_chart(title: &str) -> Chart {
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Pie {
+            doughnut_hole: None,
+            first_slice_ang: 0,
+            vary_colors: true,
+        },
+        series: vec![Series::category_value(
+            Some("Share"),
+            ["North", "South", "East", "West"]
+                .into_iter()
+                .map(|c| Category::Text(c.into()))
+                .collect(),
+            vec![40.0, 25.0, 20.0, 15.0],
+        )],
+        cat_axis: Axis::untitled(),
+        val_axis: Axis::untitled(),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** pie `ChartSpec` at [`chart_anchor`], with a `<c:pieChart>` source so it classifies
+/// Faithful — the in-grid proof of the ChartLayer → `pie_element` path (P24), the pie analogue of the
+/// loaded column/area cases.
+fn in_grid_pie_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_pie_chart(title),
+        SourceXml::new("<c:pieChart><c:varyColors val=\"1\"/></c:pieChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
+/// A two-series **marker scatter** (P25) over two numeric axes — the picture the ChartLayer paints
+/// for the in-grid scatter case (`grid_chart_scatter`). Each series carries its xy pairs, a distinct
+/// color, and a distinct marker symbol.
+fn in_grid_scatter_chart(title: &str) -> Chart {
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Scatter {
+            style: ScatterStyle::Marker,
+        },
+        series: vec![
+            Series::xy(
+                Some("Group A"),
+                vec![1.0, 2.5, 3.5, 5.0, 6.0],
+                vec![12.0, 24.0, 19.0, 33.0, 41.0],
+            )
+            .with_color(Color::from_hex(0x4472C4))
+            .with_marker(Marker::new(MarkerSymbol::Circle)),
+            Series::xy(
+                Some("Group B"),
+                vec![1.5, 3.0, 4.5, 6.0, 7.0],
+                vec![40.0, 32.0, 51.0, 45.0, 62.0],
+            )
+            .with_color(Color::from_hex(0xED7D31))
+            .with_marker(Marker::new(MarkerSymbol::Diamond)),
+        ],
+        cat_axis: Axis::titled("X"),
+        val_axis: Axis::titled("Y"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** marker-scatter `ChartSpec` at [`chart_anchor`], with a `<c:scatterChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `scatter_element` path (P25), the
+/// scatter analogue of the loaded column/area/pie cases.
+fn in_grid_scatter_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_scatter_chart(title),
+        SourceXml::new("<c:scatterChart><c:scatterStyle val=\"marker\"/></c:scatterChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
+/// A two-series **area-encoded bubble** (P26) over two numeric axes — the picture the ChartLayer
+/// paints for the in-grid bubble case (`grid_chart_bubble`). Each series carries its `(x, y, size)`
+/// points and a distinct color.
+fn in_grid_bubble_chart(title: &str) -> Chart {
+    Chart {
+        title: Some(title.into()),
+        kind: ChartKind::Bubble {
+            size_representation: SizeRepresentation::Area,
+        },
+        series: vec![
+            Series::bubble(
+                Some("North"),
+                vec![2.0, 4.0, 5.5, 7.0],
+                vec![18.0, 34.0, 26.0, 45.0],
+                vec![10.0, 40.0, 22.0, 60.0],
+            )
+            .with_color(Color::from_hex(0x4472C4)),
+            Series::bubble(
+                Some("South"),
+                vec![3.0, 5.0, 6.5, 8.0],
+                vec![52.0, 44.0, 60.0, 55.0],
+                vec![48.0, 18.0, 34.0, 25.0],
+            )
+            .with_color(Color::from_hex(0xED7D31)),
+        ],
+        cat_axis: Axis::titled("X"),
+        val_axis: Axis::titled("Y"),
+        legend: Some(Legend::default()),
+    }
+}
+
+/// A **loaded** bubble `ChartSpec` at [`chart_anchor`], with a `<c:bubbleChart>` source so it
+/// classifies Faithful — the in-grid proof of the ChartLayer → `bubble_element` path (P26), the
+/// bubble analogue of the loaded scatter case.
+fn in_grid_bubble_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_bubble_chart(title),
+        SourceXml::new("<c:bubbleChart><c:sizeRepresents val=\"area\"/></c:bubbleChart>"),
+        Vec::new(),
+        chart_anchor(),
+    )
+}
+
+/// An **Unsupported** spec: a `surfaceChart` source (no faithful 2-D rendering) so the ChartLayer
+/// draws the placeholder box; its `chart` carries the title the placeholder shows.
+fn in_grid_unsupported_spec(title: &str) -> ChartSpec {
+    ChartSpec::loaded(
+        in_grid_line_chart(title),
+        SourceXml::new("<c:surfaceChart/>"),
+        Vec::new(),
+        chart_anchor(),
+    )
 }
 
 /// The whole initial suite (~45 cases). Rebuilt fresh on each call — the `render_scene` bin
@@ -400,6 +736,86 @@ pub fn all() -> Vec<RenderCase> {
         .force_scrollbars(),
         RenderCase::new("grid_mixed_content", mixed_content_scene(), (720, 400))
             .selection(sel((2, 1), (4, 3))),
+        // ---- In-grid charts (P8): the ChartLayer painted over cells at the anchor rect --------
+        // A Faithful line chart floating over the data table (`charts/functional_spec.md §1`).
+        RenderCase::new("grid_chart_line", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_chart_spec("Regional Sales", "<c:lineChart/>")]),
+        // A Faithful clustered-COLUMN chart floating over the same backing table (P22) — the in-grid
+        // proof of the ChartLayer → `bar_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_column", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_column_spec("Regional Sales")]),
+        // A Faithful standard-AREA chart floating over the same backing table (P23) — the in-grid
+        // proof of the ChartLayer → `area_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_area", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_area_spec("Regional Sales")]),
+        // A Faithful PIE chart floating over the same backing table (P24) — the in-grid proof of the
+        // ChartLayer → `pie_element` path. Its own baseline, so no existing `grid_chart_*` baseline
+        // moves.
+        RenderCase::new("grid_chart_pie", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_pie_spec("Regional Share")]),
+        // A Faithful marker-SCATTER chart floating over the same backing table (P25) — the in-grid
+        // proof of the ChartLayer → `scatter_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_scatter", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_scatter_spec("Measurements")]),
+        // In-grid bubble (P26): a loaded area-encoded bubble over the backing table — the in-grid
+        // proof of the ChartLayer → `bubble_element` path. Its own baseline, so no existing
+        // `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_bubble", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![in_grid_bubble_spec("Segments")]),
+        // A Degraded chart still renders as a line, plus the corner "⚠ May not display as intended"
+        // badge (`ui_design.md §2.2`) — here from a 3-D group (`line3DChart`) rendered as its 2-D
+        // line. (A shown `c:dLbls` on a line is Faithful as of P12 — it renders — so the badge case
+        // uses the 3-D→2-D reduction, which keeps the same rendered line + badge, hence the baseline
+        // is unchanged.)
+        RenderCase::new(
+            "grid_chart_degraded_badge",
+            chart_backing_scene(),
+            CHART_GRID_VP,
+        )
+        .charts(vec![in_grid_chart_spec(
+            "Regional Sales",
+            "<c:line3DChart/>",
+        )]),
+        // An Unsupported group draws the placeholder box (title + "Unsupported chart type"),
+        // occupying the chart's space (`ui_design.md §2.3`).
+        RenderCase::new(
+            "grid_chart_unsupported_placeholder",
+            chart_backing_scene(),
+            CHART_GRID_VP,
+        )
+        .charts(vec![in_grid_unsupported_spec("Surface Data")]),
+        // The same Faithful chart scrolled deep so its top-left is clipped at the content edge —
+        // proves the anchor tracks scroll and the layer clips to the viewport (`architecture.md §5`).
+        RenderCase::new(
+            "grid_chart_scrolled_clipped",
+            chart_backing_scene(),
+            CHART_GRID_VP,
+        )
+        .charts(vec![in_grid_chart_spec("Regional Sales", "<c:lineChart/>")])
+        .reveal(22, 8),
+        // A SELECTED chart (P18): the same Faithful line chart with the selection outline + eight
+        // resize handles drawn over its rect (`ui_design.md §3.2`). New ChartLayer chrome — its own
+        // baseline, so no existing `grid_chart_*` baseline moves.
+        RenderCase::new("grid_chart_selected", chart_backing_scene(), CHART_GRID_VP)
+            .charts(vec![
+                in_grid_chart_spec("Regional Sales", "<c:lineChart/>").with_id(ChartId(1))
+            ])
+            .selected_chart(ChartId(1)),
+        // The near-empty AUTHORED chart the insert flow produces (P17/P21): a single placeholder
+        // series titled "Chart" over the backing table — the exact picture shown the instant a line
+        // chart is inserted. The only in-grid chart case built from an **authored** spec (all others
+        // are loaded), so it is the pixel proof of the authored → in-grid render path + the insert
+        // visual (`charts/functional_spec.md §6.A`, `ui_design.md §3.1`). Its own baseline, so no
+        // existing `grid_chart_*` baseline moves.
+        RenderCase::new(
+            "grid_chart_authored_inserted",
+            chart_backing_scene(),
+            CHART_GRID_VP,
+        )
+        .charts(vec![in_grid_authored_inserted_spec()]),
         // ---- Editing feel (Phase 2): live mirror + in-cell editor overlay --------------
         RenderCase::new(
             // The active cell shows the raw text being typed (default style, left-aligned)

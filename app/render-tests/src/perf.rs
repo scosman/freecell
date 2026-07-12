@@ -2,7 +2,7 @@
 //! **1M×100 styled fixture**, plus the "zero engine calls on the scroll path" gate
 //! (`architecture.md §4, §9`; ported scenario from `experiments/04-ui-poc`).
 //!
-//! This module owns the two engine-side pieces the driver ([`crate::bin`] `perf_harness`)
+//! This module owns the two engine-side pieces the driver (the `perf_harness` bin)
 //! composes with the real `GridView::measure_frame`:
 //!
 //! 1. [`build_fixture`] — builds a **1M×100 styled** sheet through the real
@@ -107,7 +107,7 @@ impl Fixture {
         &self.events
     }
 
-    /// Drain worker events until the queue stays empty for [`IDLE_GAP`] (the worker went idle).
+    /// Drain worker events until the queue stays empty for `IDLE_GAP` (the worker went idle).
     pub fn drain_to_idle(&self) -> Result<()> {
         drain_to_idle(&self.events)
     }

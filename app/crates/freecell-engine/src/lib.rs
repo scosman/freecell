@@ -15,7 +15,7 @@
 //! the worker-side input-cap re-check, `catch_unwind` + degraded policy, and dirty-op
 //! accounting.
 //!
-//! Phase 5 adds the **style & geometry cache** ([`cache`]): the IronCalc-facing builder/mutator
+//! Phase 5 adds the **style & geometry cache** (the `cache` module): the IronCalc-facing builder/mutator
 //! that converts engine geometry + `Style` into the engine-free
 //! [`SheetCache`](freecell_core::SheetCache) read model (resolved `RenderStyle`s + px geometry).
 //! The worker builds it on sheet activation and mirrors each issued edit into it (re-reading the
@@ -23,6 +23,7 @@
 //! engine re-read (the load-bearing contract).
 
 pub(crate) mod cache;
+pub mod chart;
 pub mod document;
 pub mod fixtures;
 pub mod instrument;
@@ -34,8 +35,9 @@ pub use document::{
 };
 pub use instrument::{engine_call_count, reset_engine_call_count};
 pub use worker::{
-    BorderLine, BorderPreset, Command, DocumentClient, EditRejectedReason, PasteError, SheetMeta,
-    StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver, WORKER_STACK_SIZE,
+    BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, ChartId, ChartInsertKind,
+    ChartSnapshot, Command, DataLabelToggles, DocumentClient, EditRejectedReason, PasteError,
+    SheetMeta, StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver, WORKER_STACK_SIZE,
 };
 
 /// Re-export of the pinned IronCalc workbook type the worker will own. `pub(crate)` — the

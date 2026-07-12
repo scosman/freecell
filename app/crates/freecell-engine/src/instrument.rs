@@ -3,7 +3,7 @@
 //!
 //! Every method on [`WorkbookDocument`](crate::document::WorkbookDocument) that reads or
 //! mutates the constructed IronCalc `UserModel` bumps this process-global counter via
-//! [`record_engine_call`] at its entry — the per-cell/geometry reads (`formatted_value`,
+//! `record_engine_call` at its entry — the per-cell/geometry reads (`formatted_value`,
 //! `cell_content`, `cell_own_style`, `row_band_style`, `col_band_style`, `row_height_px`,
 //! `col_width_px`, `worksheet`), the sheet-metadata reads (`sheet_names`, `sheet_count`,
 //! `sheet_properties`, `sheet_properties_with_content`), the edits (`set_cell_input`,

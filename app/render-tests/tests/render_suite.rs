@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use render_tests::diff::{diff_image, diff_png_files, DiffOptions};
-use render_tests::{capture_available, render_all};
+use render_tests::{capture_available, render_all, render_charts};
 
 /// The outcome of the one-time render-all.
 enum Rendered {
@@ -28,6 +28,10 @@ enum Rendered {
 }
 
 static RENDERED: OnceLock<Rendered> = OnceLock::new();
+
+/// The chart scenes' one-time render, independent of the grid's [`RENDERED`] so that filtering to
+/// the `chart_` tests renders **only** the chart scenes (the grid `OnceLock` stays cold).
+static CHART_RENDERED: OnceLock<Rendered> = OnceLock::new();
 
 fn baselines_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("baselines")
@@ -91,6 +95,27 @@ fn rendered() -> &'static Rendered {
     })
 }
 
+/// Render every chart scene once (guarded exactly like the grid [`rendered`]), returning where
+/// the captures live (or why they don't). Kept separate from [`rendered`] so the two suites are
+/// independent — a `chart_`-filtered run never triggers the grid render, and vice-versa.
+fn chart_rendered() -> &'static Rendered {
+    CHART_RENDERED.get_or_init(|| {
+        let want_render = std::env::var("FREECELL_RENDER").ok().as_deref() == Some("1");
+        match gate(want_render, capture_available()) {
+            Gate::Skip(reason) => Rendered::Skipped(reason),
+            Gate::Fail(reason) => Rendered::Failed(reason),
+            Gate::Render => {
+                let bin = Path::new(env!("CARGO_BIN_EXE_render_scene"));
+                let out = target_subdir("chart-render-actual");
+                match render_charts(bin, &out, None) {
+                    Ok(_) => Rendered::Ok(out),
+                    Err(err) => Rendered::Failed(format!("{err:#}")),
+                }
+            }
+        }
+    })
+}
+
 /// The committed baseline path for `name`, or an **actionable** error (telling the human to
 /// regenerate) when it is missing — not a panic deep in the diff. Pure (no display), so the
 /// missing-baseline contract is testable without rendering.
@@ -134,6 +159,43 @@ fn check_case(name: &str) {
         }
         Err(err) => {
             // A dimension mismatch (a size change) is a hard failure; still surface the pair.
+            write_failure_artifacts(name, &baseline, &actual, &opts);
+            panic!(
+                "{name}: {err:#} (artifacts in {})",
+                target_subdir("render-failures").display()
+            );
+        }
+    }
+}
+
+/// Diff one chart scene's fresh capture against its committed baseline — the chart analogue of
+/// [`check_case`], reusing the same baseline / diff / failure-artifact machinery over the chart
+/// [`chart_rendered`] captures.
+fn check_chart_case(name: &str) {
+    let dir = match chart_rendered() {
+        Rendered::Skipped(reason) => {
+            eprintln!("chart render suite skipped ({name}): {reason}");
+            return;
+        }
+        Rendered::Failed(err) => panic!("chart render-all failed for the suite: {err}"),
+        Rendered::Ok(dir) => dir,
+    };
+
+    let actual = dir.join(format!("{name}.png"));
+    let baseline = require_baseline(name).unwrap_or_else(|msg| panic!("{msg}"));
+
+    let opts = DiffOptions::default();
+    match diff_png_files(&baseline, &actual, &opts) {
+        Ok(report) if report.passed => {}
+        Ok(report) => {
+            write_failure_artifacts(name, &baseline, &actual, &opts);
+            panic!(
+                "{name}: chart render differs from baseline — {} (artifacts in {})",
+                report.summary(),
+                target_subdir("render-failures").display()
+            );
+        }
+        Err(err) => {
             write_failure_artifacts(name, &baseline, &actual, &opts);
             panic!(
                 "{name}: {err:#} (artifacts in {})",
@@ -193,6 +255,24 @@ render_cases! {
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
     grid_selection_scrolled, grid_variable_geometry, grid_loading_overlay,
     grid_scrollbars_visible, grid_mixed_content,
+    // In-grid charts (P8): the ChartLayer painted over cells — a line chart in place, the Degraded
+    // corner badge, the Unsupported placeholder, and a scrolled/clipped chart.
+    grid_chart_line, grid_chart_degraded_badge, grid_chart_unsupported_placeholder,
+    grid_chart_scrolled_clipped,
+    // In-grid column chart (P22): the ChartLayer painting a real clustered column over cells.
+    grid_chart_column,
+    // In-grid area chart (P23): the ChartLayer painting a real standard area over cells.
+    grid_chart_area,
+    // In-grid pie chart (P24): the ChartLayer painting a real varyColors pie over cells.
+    grid_chart_pie,
+    // In-grid scatter chart (P25): the ChartLayer painting a real marker scatter over cells.
+    grid_chart_scatter,
+    // In-grid bubble chart (P26): the ChartLayer painting a real area-encoded bubble over cells.
+    grid_chart_bubble,
+    // Manipulate (P18): a selected chart with its selection outline + resize handles.
+    grid_chart_selected,
+    // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
+    grid_chart_authored_inserted,
     // Editing feel (Phase 2): live mirror + in-cell editor overlay
     cell_mirror_typing, incell_editor_open,
     // Fonts (Phase 5): family + size + row auto-grow
@@ -225,6 +305,75 @@ fn case_names_match_table() {
     assert_eq!(
         names, table,
         "the render_cases! macro list and cases::all() have drifted — keep them in sync"
+    );
+}
+
+/// Generate one `#[test]` per chart scene (calling [`check_chart_case`]) + a `CHART_SCENE_NAMES`
+/// slice used to guard drift against `chart_scene::all()`. Named `chart_*` so `render_tests.sh
+/// test chart_` runs only these (and thus renders only the chart scenes).
+macro_rules! chart_render_cases {
+    ($($name:ident),+ $(,)?) => {
+        const CHART_SCENE_NAMES: &[&str] = &[$(stringify!($name)),+];
+        $(
+            #[test]
+            fn $name() { check_chart_case(stringify!($name)); }
+        )+
+    };
+}
+
+chart_render_cases! {
+    // P4 — the make-or-break multi-series line scene that proves the chart render → capture →
+    // diff path.
+    chart_line_multi,
+    // P5 — production line coverage: single-series, a zero-crossing nice-tick value axis,
+    // legend-off (plot uses full width), and title/axis-title collapse (legend still shown).
+    chart_line_single, chart_line_negative, chart_line_no_legend, chart_line_no_titles,
+    // P6 — line P1 fidelity: theme colors + per-series markers + currency numFmt ticks
+    // (chart_line_markers), and a smooth curve + percent numFmt ticks (chart_line_smooth).
+    chart_line_markers, chart_line_smooth,
+    // P12 — data labels: value labels with a currency numFmt (chart_line_value_labels), percent
+    // labels / share-of-total (chart_line_percent_labels), and composed series+category+value
+    // labels with a legend-key swatch (chart_line_named_labels).
+    chart_line_value_labels, chart_line_percent_labels, chart_line_named_labels,
+    // P13 — axis breadth & line styling: reversed category axis (chart_line_reversed), explicit
+    // value-axis min/max scaling (chart_line_scaled), gridlines-off (chart_line_no_gridlines),
+    // `a:ln` width/color/alpha styling (chart_line_styled), and a bottom-placed legend
+    // (chart_line_legend_bottom). These also carry the tuned fonts + the true-rotated value-axis
+    // title (P13 observations A/B), which move every existing chart_line_* baseline.
+    chart_line_reversed, chart_line_scaled, chart_line_no_gridlines, chart_line_styled,
+    chart_line_legend_bottom,
+    // P22 — column & bar: clustered / stacked / 100%-stacked columns, a horizontal bar (proving the
+    // reversed Excel category order), a non-default gapWidth/overlap geometry, and theme-schemeClr fills.
+    chart_column_clustered, chart_column_stacked, chart_column_percent, chart_bar_clustered,
+    chart_column_gap_overlap, chart_column_theme_fills,
+    // P23 — area: standard (overlapping filled polygons), stacked (cumulative bands), 100%-stacked
+    // (0–100% normalized), and theme-schemeClr area fills.
+    chart_area_standard, chart_area_stacked, chart_area_percent, chart_area_theme_fills,
+    // P24 — pie & doughnut: a varyColors pie (per-slice palette + legend), a doughnut (holeSize
+    // annulus), on-slice percent labels, and a rotated + exploded slice with a c:dPt custom color.
+    chart_pie_vary_colors, chart_doughnut_hole, chart_pie_percent_labels, chart_pie_exploded,
+    // P25 — scatter (XY): a marker-only two-series scatter over two numeric axes, a lineMarker scatter
+    // (dots + connecting straight segments), and a scatter with a non-trivial numeric X axis (X not 1..n).
+    chart_scatter_markers, chart_scatter_line_markers, chart_scatter_wide_x,
+    // P26 — bubble (XY + size): a multi-series area-encoded bubble over two numeric axes, and a
+    // single-series bubble spanning a wide size range (proving the min/max radius clamp).
+    chart_bubble_multi, chart_bubble_size_clamp,
+}
+
+/// The `chart_render_cases!` list must stay in lockstep with `chart_scene::all()` — same drift
+/// guard as `case_names_match_table`, for the chart fixtures.
+#[test]
+fn chart_scene_names_match_table() {
+    let mut table: Vec<&str> = render_tests::chart_scene::all()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    table.sort_unstable();
+    let mut names: Vec<&str> = CHART_SCENE_NAMES.to_vec();
+    names.sort_unstable();
+    assert_eq!(
+        names, table,
+        "the chart_render_cases! macro list and chart_scene::all() have drifted — keep them in sync"
     );
 }
 

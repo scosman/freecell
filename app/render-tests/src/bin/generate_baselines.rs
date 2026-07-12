@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use render_tests::diff::{diff_png_files, DiffOptions};
-use render_tests::{render_all, sibling_render_scene_bin};
+use render_tests::{render_all, render_charts, sibling_render_scene_bin};
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
@@ -34,9 +34,12 @@ fn run() -> Result<()> {
     std::fs::create_dir_all(&baselines)?;
 
     // Render into a temp dir first so we can classify each result against the existing baseline
-    // before overwriting it.
+    // before overwriting it. Grid cases + chart scenes share `baselines/` (names never collide —
+    // chart scenes are `chart_*`); the `--only <prefix>` filter selects across both (e.g.
+    // `--only chart_` renders only chart scenes, `--only cell_` only grid cells).
     let staging = std::env::temp_dir().join(format!("freecell-baselines-{}", std::process::id()));
-    let rendered = render_all(&render_scene_bin, &staging, only.as_deref())?;
+    let mut rendered = render_all(&render_scene_bin, &staging, only.as_deref())?;
+    rendered.extend(render_charts(&render_scene_bin, &staging, only.as_deref())?);
 
     let opts = DiffOptions::default();
     let (mut new, mut changed, mut unchanged) = (Vec::new(), Vec::new(), Vec::new());

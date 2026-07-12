@@ -103,3 +103,23 @@ registry: each entry is a short description plus a pointer to a design note unde
   exist. This adds macOS Developer-ID signing + notarization, Windows Authenticode, and the
   switch to attaching signed assets to a GitHub Release. Hard-gated on the
   pre-distribution security audit above. → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
+
+- **Rewrite chart `c:f` on sheet rename** — *Future (deferred from charts P10, 2026-07-10).*
+  Chart save is source-first (charts/architecture §5): it byte-preserves / targeted-patches the
+  retained chart XML, keeping each data reference's `c:f` **verbatim**. So after an in-session
+  data-sheet rename (`Data`→`Data2`), a preserved/patched chart's internal `c:f` still reads
+  `Data!…` — the **cached values are correct** (the chart shows the right data on reopen), but the
+  live data link **dangles** in Excel/LibreOffice (they can't refresh it). Charts are invisible to
+  IronCalc, so its rename doesn't touch them. This project reflows the `c:f` sheet-name prefixes on
+  a rename (engine-side, keyed off the rename event) so the link stays live.
+  → [`projects/chart-cf-rewrite-on-rename.md`](projects/chart-cf-rewrite-on-rename.md)
+
+- **Chart edit-panel range picking under click-away-close** — *Future (deferred from charts
+  post-v1 Batch 2, item 12, 2026-07-11).* Batch 2 made the chart edit panel close on click-away, so
+  the old "open panel → drag a range → Use selection" flow no longer works (the drag closes the
+  panel first). A workable order survives — select the range **first**, then click the chart (which
+  preserves the selection and opens the panel with "Use selection" ready) — the rough edge is a
+  freshly-inserted chart whose panel auto-opens. Options: a "pick range" mode that temporarily
+  suspends click-away, or an in-panel select-first hint. Batch 3's item 8 (default range = selection
+  at creation) already mitigates the most common freshly-inserted case.
+  → [`projects/chart-panel-range-pick.md`](projects/chart-panel-range-pick.md)

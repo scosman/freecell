@@ -24,6 +24,8 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
 use gpui_component::{Icon, IconName, Sizable as _};
 
+use freecell_chart_model::{ChartId, ChartSpec};
+
 use freecell_core::cache::SheetCaches;
 use freecell_core::color::Rgb;
 use freecell_core::publication::{CellKind, Publication};
@@ -35,6 +37,7 @@ use freecell_core::{
     RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
+use super::chart_layer::{self, ChartPlacement, ChartRect, Handle};
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
     self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
@@ -115,6 +118,72 @@ struct ResizeDrag {
     origin_coord: f32,
 }
 
+/// What an in-flight chart drag on the ChartLayer is doing (P18, `ui_design §3.2`): moving the whole
+/// chart body, or resizing it from one of its eight [`Handle`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartDragMode {
+    Move,
+    Resize(Handle),
+}
+
+/// An in-flight chart move/resize drag on the ChartLayer (P18). `grab` is the content-local pointer
+/// position at mouse-down; `start_rect` the chart's rect then; `current_rect` the live previewed rect
+/// (recomputed each move). On release [`rect_to_anchor`](chart_layer::rect_to_anchor) maps the final
+/// rect back to an [`Anchor`] the worker persists.
+#[derive(Debug, Clone, Copy)]
+struct ChartDrag {
+    id: ChartId,
+    mode: ChartDragMode,
+    grab: (f32, f32),
+    start_rect: ChartRect,
+    current_rect: ChartRect,
+}
+
+/// A right-click "Delete chart" context menu over a chart (P18, `ui_design §3.2` — the alternate
+/// delete affordance to Delete/Backspace). `x`/`y` are grid-local.
+#[derive(Debug, Clone, Copy)]
+struct ChartMenu {
+    id: ChartId,
+    x: f32,
+    y: f32,
+}
+
+/// What a content-local point grabbed on the ChartLayer ([`GridView::chart_hit_test`]).
+#[derive(Debug, Clone, Copy)]
+enum ChartHit {
+    /// A resize handle of the selected chart.
+    Handle {
+        id: ChartId,
+        handle: Handle,
+        rect: ChartRect,
+    },
+    /// A chart body (the whole rect) — selects + begins a move.
+    Body { id: ChartId, rect: ChartRect },
+}
+
+/// A [`chart_layer::GridGeometry`] over a frame's committed axes — the seam
+/// [`GridView::chart_hit_test`] resolves chart rects against on the mouse path (which reads the
+/// axes directly under the caches lock rather than building a full [`Frame`]).
+struct AxisGeometry<'a> {
+    col_axis: &'a Axis,
+    row_axis: &'a Axis,
+}
+
+impl chart_layer::GridGeometry for AxisGeometry<'_> {
+    fn col_start(&self, col: u32) -> f64 {
+        self.col_axis.offset_of(col)
+    }
+    fn row_start(&self, row: u32) -> f64 {
+        self.row_axis.offset_of(row)
+    }
+    fn col_at(&self, x: f64) -> u32 {
+        self.col_axis.index_at(x)
+    }
+    fn row_at(&self, y: f64) -> u32 {
+        self.row_axis.index_at(y)
+    }
+}
+
 /// The custom virtualized grid view.
 pub struct GridView {
     sources: GridDataSources,
@@ -185,6 +254,34 @@ pub struct GridView {
     incell_input: Option<Entity<InputState>>,
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
+
+    /// The charts painted on each sheet's **ChartLayer** (P8/P11, `charts/architecture.md §4.2`,
+    /// §5 challenge 5), keyed by sheet. See [`SheetChartLayer`]: the per-sheet spec list is **shared**
+    /// with the engine's published snapshot (no app-side copy), and the per-frame scan reads only the
+    /// tiny [`ChartPlacement`]s, materializing the heavy render `Chart` for the on-screen few.
+    charts: HashMap<SheetId, SheetChartLayer>,
+    /// The currently **selected** chart (P18) — drawn with a selection outline + resize handles.
+    /// `None` when no chart is selected. Keyed by the stable [`ChartId`] the worker stamps, so a
+    /// live re-resolve republish keeps the selection; a selection whose chart is gone is dropped on
+    /// the next [`set_sheet_charts`](Self::set_sheet_charts).
+    selected_chart: Option<ChartId>,
+    /// The in-flight chart move/resize drag, if any (`None` = not dragging a chart).
+    chart_drag: Option<ChartDrag>,
+    /// The open right-click "Delete chart" context menu, if any.
+    chart_menu: Option<ChartMenu>,
+}
+
+/// One sheet's installed charts (P11, `charts/architecture.md §5` challenge 5, "off-screen free").
+///
+/// `specs` is the **shared** `Arc<[ChartSpec]>` the engine published — the grid holds a refcount, not
+/// a copy, so a sheet with K charts adds no independent resident duplicate of their render pictures
+/// or retained source. `placements` is one tiny [`ChartPlacement`] per spec (anchor + derived
+/// fidelity), classified once at install so the per-frame cull scan never re-parses source XML. The
+/// heavy `specs[i].chart()` is borrowed **only** for a chart that is currently on-screen; an off-screen
+/// chart contributes nothing but its placement to the scan (and re-materializes when it scrolls in).
+struct SheetChartLayer {
+    specs: Arc<[ChartSpec]>,
+    placements: Vec<ChartPlacement>,
 }
 
 /// A live-resize preview applied to **one** axis as a cheap **O(1) per-track delta**, NOT a
@@ -299,6 +396,27 @@ impl Frame {
     }
 }
 
+/// The frame's committed (pre-scroll) column/row start offsets are exactly what a chart anchor
+/// maps against (`charts/architecture.md §5` challenge 1) — so the ChartLayer reads the same
+/// geometry (incl. a live resize preview) the cells do, and scroll/zoom come free.
+impl chart_layer::GridGeometry for Frame {
+    fn col_start(&self, col: u32) -> f64 {
+        self.col_offset(col)
+    }
+    fn row_start(&self, row: u32) -> f64 {
+        self.row_offset(row)
+    }
+    // The inverse (content x/y → track) resolves against the committed axes. Chart manipulation and
+    // a live/frozen resize are separate interaction modes (a chart drag never runs while resizing),
+    // so the previewed offset the render path uses and this committed inverse agree in practice.
+    fn col_at(&self, x: f64) -> u32 {
+        self.col_axis.index_at(x)
+    }
+    fn row_at(&self, y: f64) -> u32 {
+        self.row_axis.index_at(y)
+    }
+}
+
 /// Optional per-frame timing captured by [`GridView::build_grid_layers`] for the Phase-12
 /// perf harness (`freecell_core::perf`). `None` on the normal render path — zero overhead
 /// (no `Instant` is even read).
@@ -350,7 +468,145 @@ impl GridView {
             incell_open: None,
             incell_input: None,
             incell_cap: None,
+            charts: HashMap::new(),
+            selected_chart: None,
+            chart_drag: None,
+            chart_menu: None,
         }
+    }
+
+    /// Installs the charts to paint on `sheet`'s **ChartLayer** (P8/P11, `charts/architecture.md
+    /// §4.2`, §5 challenge 5). `specs` is the **shared** `Arc<[ChartSpec]>` the engine published: the
+    /// grid keeps the `Arc` (a refcount bump — no per-chart copy of its render picture / retained
+    /// source) and derives one tiny [`ChartPlacement`] per spec (anchor + fidelity) for the per-frame
+    /// cull scan. An empty install clears the sheet's charts. Live re-resolves arrive as fresh
+    /// snapshots on later `Published` events (P9); each is installed here, replacing the shared slice.
+    pub fn set_sheet_charts(
+        &mut self,
+        sheet: SheetId,
+        specs: Arc<[ChartSpec]>,
+        cx: &mut Context<Self>,
+    ) {
+        if specs.is_empty() {
+            self.charts.remove(&sheet);
+        } else {
+            let placements = specs.iter().map(ChartPlacement::from_spec).collect();
+            self.charts
+                .insert(sheet, SheetChartLayer { specs, placements });
+        }
+        // Drop a selection / drag / menu whose chart no longer exists on the active sheet (e.g. it
+        // was deleted, or its sheet was cleared). A live re-resolve republish keeps the same ids, so
+        // it does NOT clear the selection.
+        if sheet == self.active_sheet && !self.active_chart_id_present(self.selected_chart) {
+            self.selected_chart = None;
+            self.chart_drag = None;
+            self.chart_menu = None;
+        }
+        cx.notify();
+    }
+
+    /// Whether `id` (if any) names a chart currently installed on the **active** sheet's ChartLayer.
+    fn active_chart_id_present(&self, id: Option<ChartId>) -> bool {
+        let Some(id) = id else {
+            return false;
+        };
+        self.charts
+            .get(&self.active_sheet)
+            .is_some_and(|layer| layer.specs.iter().any(|s| s.id == id))
+    }
+
+    /// Selects `id`'s chart on the active sheet (P18) — drives the selection outline + resize
+    /// handles. `None` clears the selection. The window sets this on chart-manipulation events; the
+    /// render harness sets it to baseline the selection chrome.
+    pub fn set_selected_chart(&mut self, id: Option<ChartId>, cx: &mut Context<Self>) {
+        self.selected_chart = id;
+        cx.notify();
+    }
+
+    /// The charts of `layer` that fall within the content viewport at the given scroll, as
+    /// `(spec index, content-local rect)` pairs — the on-screen set the ChartLayer materializes (P11
+    /// "off-screen free"). Scans only the tiny [`ChartPlacement`]s (never the heavy `Chart`), mapping
+    /// each anchor to a rect and dropping the ones [`is_offscreen`](chart_layer::ChartRect::is_offscreen)
+    /// culls. The single source of truth for both the paint loop and its test helper.
+    fn visible_charts(
+        layer: &SheetChartLayer,
+        geom: &impl chart_layer::GridGeometry,
+        scroll_x: f64,
+        scroll_y: f64,
+        content_w: f64,
+        content_h: f64,
+    ) -> Vec<(usize, chart_layer::ChartRect)> {
+        layer
+            .placements
+            .iter()
+            .enumerate()
+            .filter_map(|(i, placement)| {
+                let rect = chart_layer::anchor_rect(&placement.anchor, geom, scroll_x, scroll_y);
+                (!rect.is_offscreen(content_w, content_h)).then_some((i, rect))
+            })
+            .collect()
+    }
+
+    /// What a content-local point grabs on the active sheet's ChartLayer (P18): a resize
+    /// [`Handle`] of the currently-selected chart (checked first — handles straddle the border and
+    /// win over the body), or a chart **body** (topmost-first). `None` = the point missed every
+    /// chart (the caller then falls through to cell hit-testing / deselects). Scans only the tiny
+    /// [`ChartPlacement`]s via [`visible_charts`](Self::visible_charts).
+    fn chart_hit_test(
+        &self,
+        geom: &impl chart_layer::GridGeometry,
+        scroll: (f64, f64),
+        content: (f64, f64),
+        point: (f32, f32),
+    ) -> Option<ChartHit> {
+        let layer = self.charts.get(&self.active_sheet)?;
+        let (cx, cy) = point;
+        let visible = Self::visible_charts(layer, geom, scroll.0, scroll.1, content.0, content.1);
+        // A handle of the SELECTED chart wins first (handles sit on/just outside the border).
+        if let Some(sel) = self.selected_chart {
+            if let Some((_, rect)) = visible.iter().find(|(i, _)| layer.specs[*i].id == sel) {
+                if let Some(handle) = chart_layer::handle_at(*rect, cx, cy) {
+                    return Some(ChartHit::Handle {
+                        id: sel,
+                        handle,
+                        rect: *rect,
+                    });
+                }
+            }
+        }
+        // Otherwise the topmost chart body under the point (later charts paint on top).
+        visible.iter().rev().find_map(|(i, rect)| {
+            let inside =
+                cx >= rect.x && cx <= rect.x + rect.w && cy >= rect.y && cy <= rect.y + rect.h;
+            inside.then(|| ChartHit::Body {
+                id: layer.specs[*i].id,
+                rect: *rect,
+            })
+        })
+    }
+
+    /// Test introspection for P11 "off-screen free": the spec indices of `sheet`'s charts that are
+    /// on-screen at the given scroll/viewport (against a supplied geometry) — proving off-screen
+    /// charts are culled out of the materialized set and re-enter it when scrolled back into view.
+    #[cfg(test)]
+    pub(crate) fn on_screen_chart_indices(
+        &self,
+        sheet: SheetId,
+        geom: &impl chart_layer::GridGeometry,
+        scroll_x: f64,
+        scroll_y: f64,
+        content_w: f64,
+        content_h: f64,
+    ) -> Vec<usize> {
+        self.charts
+            .get(&sheet)
+            .map(|layer| {
+                Self::visible_charts(layer, geom, scroll_x, scroll_y, content_w, content_h)
+                    .into_iter()
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Installs the reused in-cell editor input the chrome owns, so the grid can render the overlay
@@ -772,8 +1028,10 @@ impl GridView {
         if self.resize_drag.is_some() {
             return;
         }
-        // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op).
+        // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op) and
+        // closes an open chart context menu.
         self.resize_preview = None;
+        self.chart_menu = None;
 
         // Focus the grid so arrow keys route here (the window arranges focus after commits).
         let handle = self.focus_handle.clone();
@@ -782,17 +1040,36 @@ impl GridView {
         let (local_x, local_y) = self.event_local(event.position);
         let active = self.active_sheet;
         let (scroll_x, scroll_y) = self.scroll_of(active);
-        let (_, viewport_h) = self.viewport_wh(window);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
-        let hit = {
+        let (hit, chart_hit) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
             let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            layout::hit_test(
+            // A chart floats above the cells, so hit-test the ChartLayer first — but only in the
+            // content area (a point over a header can't be over a clipped chart).
+            let content_x = local_x - row_header_w;
+            let content_y = local_y - COL_HEADER_H;
+            let chart_hit = if content_x >= 0.0 && content_y >= 0.0 {
+                let content_w = (viewport_w - row_header_w as f64).max(0.0);
+                let geom = AxisGeometry {
+                    col_axis: &col_axis,
+                    row_axis: &row_axis,
+                };
+                self.chart_hit_test(
+                    &geom,
+                    (scroll_x, scroll_y),
+                    (content_w, content_h),
+                    (content_x, content_y),
+                )
+            } else {
+                None
+            };
+            let hit = layout::hit_test(
                 local_x,
                 local_y,
                 row_header_w,
@@ -800,8 +1077,25 @@ impl GridView {
                 scroll_y,
                 &row_axis,
                 &col_axis,
-            )
+            );
+            (hit, chart_hit)
         };
+        // A chart under the pointer wins over the cell beneath it (this is the left-button handler:
+        // a chart click = select + begin a move/resize drag).
+        if let Some(chart_hit) = chart_hit {
+            let id = match chart_hit {
+                ChartHit::Handle { id, .. } | ChartHit::Body { id, .. } => id,
+            };
+            self.begin_chart_interaction(chart_hit, (local_x, local_y), cx);
+            // Tell the owner a chart was selected (P19) so it opens the edit panel. A programmatic
+            // `set_selected_chart` stays silent; only a user click emits this.
+            self.events.emit(&GridEvent::ChartSelected(id), window, cx);
+            return;
+        }
+        // A click that missed every chart deselects the current chart.
+        if self.selected_chart.take().is_some() {
+            cx.notify();
+        }
         match hit {
             GridHit::Cell { row, col } => self.mouse_down_cell(row, col, event, window, cx),
             GridHit::ColHeader { col } => {
@@ -825,6 +1119,61 @@ impl GridView {
                 cx.notify();
             }
         }
+    }
+
+    /// Begin a chart interaction from a [`ChartHit`] (P18): select the hit chart and arm a
+    /// move (body hit) or resize (handle hit) drag from `grab` (grid-local mouse-down px). Cancels
+    /// any cell drag (a chart interaction is never also a selection drag).
+    fn begin_chart_interaction(&mut self, hit: ChartHit, grab: (f32, f32), cx: &mut Context<Self>) {
+        let (id, mode, rect) = match hit {
+            ChartHit::Handle { id, handle, rect } => (id, ChartDragMode::Resize(handle), rect),
+            ChartHit::Body { id, rect } => (id, ChartDragMode::Move, rect),
+        };
+        self.selected_chart = Some(id);
+        self.drag = None;
+        self.chart_drag = Some(ChartDrag {
+            id,
+            mode,
+            grab,
+            start_rect: rect,
+            current_rect: rect,
+        });
+        cx.notify();
+    }
+
+    /// Commit a chart move/resize on release (P18): map the final content-local rect back to an
+    /// [`Anchor`] against the committed geometry and emit [`GridEvent::ChartAnchorChanged`] so the
+    /// worker persists it. A press that never moved (`current_rect == start_rect`) is a pure select
+    /// — nothing is persisted.
+    fn commit_chart_drag(&mut self, drag: ChartDrag, window: &mut Window, cx: &mut Context<Self>) {
+        if drag.current_rect == drag.start_rect {
+            cx.notify();
+            return;
+        }
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let anchor = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                cx.notify();
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let geom = AxisGeometry {
+                col_axis: &col_axis,
+                row_axis: &row_axis,
+            };
+            chart_layer::rect_to_anchor(drag.current_rect, &geom, scroll_x, scroll_y)
+        };
+        self.events.emit(
+            &GridEvent::ChartAnchorChanged {
+                id: drag.id,
+                anchor,
+            },
+            window,
+            cx,
+        );
+        cx.notify();
     }
 
     /// The data-cell branch of [`handle_mouse_down`]: set/extend the selection (shift extends the
@@ -949,6 +1298,20 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         let (local_x, local_y) = self.event_local(event.position);
+        // A live chart move/resize takes precedence — its delta is measured from the grab point in
+        // grid-local px (== content px; the constant header offset cancels), so it needs no lock.
+        if let Some(drag) = self.chart_drag.as_mut() {
+            let dx = local_x - drag.grab.0;
+            let dy = local_y - drag.grab.1;
+            drag.current_rect = match drag.mode {
+                ChartDragMode::Move => chart_layer::move_rect(drag.start_rect, dx, dy),
+                ChartDragMode::Resize(handle) => {
+                    chart_layer::resize_rect(drag.start_rect, handle, dx, dy)
+                }
+            };
+            cx.notify();
+            return;
+        }
         if self.resize_drag.is_some() {
             self.update_resize(local_x, local_y, cx);
             return;
@@ -985,6 +1348,10 @@ impl GridView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drag) = self.chart_drag.take() {
+            self.commit_chart_drag(drag, window, cx);
+            return;
+        }
         if let Some(rd) = self.resize_drag.take() {
             self.commit_resize(rd, window, cx);
             return;
@@ -1186,16 +1553,33 @@ impl GridView {
         let (local_x, local_y) = self.event_local(event.position);
         let active = self.active_sheet;
         let (scroll_x, scroll_y) = self.scroll_of(active);
-        let (_, viewport_h) = self.viewport_wh(window);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
-        // Hit-test + read the merge list under one lock.
-        let (hit, merges) = {
+        // Hit-test the ChartLayer + headers + read the merge list under one lock.
+        let (hit, chart_hit, merges) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
             let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_x = local_x - row_header_w;
+            let content_y = local_y - COL_HEADER_H;
+            let chart_hit = if content_x >= 0.0 && content_y >= 0.0 {
+                let content_w = (viewport_w - row_header_w as f64).max(0.0);
+                let geom = AxisGeometry {
+                    col_axis: &col_axis,
+                    row_axis: &row_axis,
+                };
+                self.chart_hit_test(
+                    &geom,
+                    (scroll_x, scroll_y),
+                    (content_w, content_h),
+                    (content_x, content_y),
+                )
+            } else {
+                None
+            };
             let hit = layout::hit_test(
                 local_x,
                 local_y,
@@ -1205,8 +1589,29 @@ impl GridView {
                 &row_axis,
                 &col_axis,
             );
-            (hit, cache.merges().to_vec())
+            (hit, chart_hit, cache.merges().to_vec())
         };
+        // A right-click on a chart selects it and opens the "Delete chart" context menu (P18) — the
+        // alternate delete affordance. Any chart hit (body or a handle of the already-selected
+        // chart) targets that chart.
+        if let Some(chart_hit) = chart_hit {
+            let id = match chart_hit {
+                ChartHit::Handle { id, .. } | ChartHit::Body { id, .. } => id,
+            };
+            self.selected_chart = Some(id);
+            self.header_menu = None;
+            self.chart_menu = Some(ChartMenu {
+                id,
+                x: local_x,
+                y: local_y,
+            });
+            cx.notify();
+            return;
+        }
+        // A right-click off any chart dismisses an open chart menu (but continues to the header menu).
+        if self.chart_menu.take().is_some() {
+            cx.notify();
+        }
         let (axis, index) = match hit {
             GridHit::ColHeader { col } => (RowOrCol::Col, col),
             GridHit::RowHeader { row } => (RowOrCol::Row, row),
@@ -1531,6 +1936,33 @@ impl GridView {
 
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
+
+        // Chart selection intercepts (P18, `ui_design §3.2`): a selected chart owns Escape (cancel a
+        // drag / clear the selection + menu) and Delete/Backspace (delete the chart) — handled here,
+        // BEFORE the `ClearCells` mapping below, so deleting a selected chart never also clears the
+        // cell selection's contents.
+        if self.chart_drag.is_some() || self.selected_chart.is_some() || self.chart_menu.is_some() {
+            match key {
+                "escape" => {
+                    self.chart_drag = None;
+                    self.selected_chart = None;
+                    self.chart_menu = None;
+                    cx.notify();
+                    return;
+                }
+                "delete" | "backspace" if self.chart_drag.is_none() && !modifiers.modified() => {
+                    if let Some(id) = self.selected_chart.take() {
+                        self.chart_menu = None;
+                        self.events
+                            .emit(&GridEvent::ChartDeleted { id }, window, cx);
+                        cx.notify();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Escape cancels a live resize (no command sent) — the preview clears, geometry reverts
         // (`functional_spec.md §5.1`) — clears a lingering frozen preview (e.g. a degraded-mode
         // post-commit preview), or closes the header context menu.
@@ -1834,6 +2266,89 @@ impl GridView {
                 .children(content_children)
                 .into_any_element(),
         );
+
+        // ---- ChartLayer: charts painted OVER the cells, BELOW the header/chrome layers, clipped
+        // to the content area (P8, `charts/architecture.md §4.2`, `ui_design.md §1`). Each chart's
+        // `twoCellAnchor` maps to a content-local pixel rect through the same frame geometry the
+        // cells use (so scroll/zoom are free); off-screen charts are culled; the dispatch draws the
+        // plot (+ a corner badge when Degraded) or the placeholder (Unsupported). A chart being
+        // dragged (P18) paints at its live drag rect; the selected chart gets a selection outline +
+        // resize handles overlaid. When the active sheet has no charts, nothing is pushed.
+        if let Some(layer) = self.charts.get(&self.active_sheet) {
+            // The per-frame scan touches only the tiny `placements` (P11 "off-screen free", via
+            // [`on_screen_charts`]): off-screen charts are culled without ever borrowing their heavy
+            // render `Chart`; the shared `specs[i].chart()` is materialized only for the on-screen few
+            // (re-materialized when a chart scrolls back into view).
+            let visible = Self::visible_charts(
+                layer,
+                frame,
+                frame.scroll_x,
+                frame.scroll_y,
+                frame.content_w,
+                frame.content_h,
+            );
+            let mut chart_children: Vec<AnyElement> = Vec::with_capacity(visible.len());
+            // The paint rect of the selected chart (for the outline + handles), if it is on-screen.
+            let mut selected_rect: Option<ChartRect> = None;
+            for (i, anchored) in visible {
+                let id = layer.specs[i].id;
+                // A chart being dragged paints at its live preview rect; every other at its anchor.
+                let rect = match self.chart_drag {
+                    Some(drag) if drag.id == id => drag.current_rect,
+                    _ => anchored,
+                };
+                if self.selected_chart == Some(id) {
+                    selected_rect = Some(rect);
+                }
+                chart_children.push(
+                    div()
+                        .absolute()
+                        .left(px(rect.x))
+                        .top(px(rect.y))
+                        .w(px(rect.w))
+                        .h(px(rect.h))
+                        .child(crate::chart::in_grid_chart_element(
+                            layer.specs[i].chart(),
+                            layer.specs[i].title(),
+                            layer.placements[i].fidelity,
+                        ))
+                        .into_any_element(),
+                );
+            }
+            // Selection chrome (P18): an accent outline + eight resize-handle squares over the
+            // selected chart's rect. New ChartLayer chrome → the `grid_chart_selected` baseline.
+            if let Some(rect) = selected_rect {
+                chart_children.push(
+                    rect_div(rect.x, rect.y, rect.w, rect.h)
+                        .border_2()
+                        .border_color(rgb(ACCENT))
+                        .into_any_element(),
+                );
+                for handle in Handle::ALL {
+                    let sq = handle.square(rect);
+                    chart_children.push(
+                        rect_div(sq.x, sq.y, sq.w, sq.h)
+                            .bg(rgb(CELL_BG))
+                            .border_1()
+                            .border_color(rgb(ACCENT))
+                            .into_any_element(),
+                    );
+                }
+            }
+            if !chart_children.is_empty() {
+                root_children.push(
+                    div()
+                        .absolute()
+                        .left(px(frame.row_header_w))
+                        .top(px(COL_HEADER_H))
+                        .w(px(frame.content_w as f32))
+                        .h(px(frame.content_h as f32))
+                        .overflow_hidden()
+                        .children(chart_children)
+                        .into_any_element(),
+                );
+            }
+        }
 
         // ---- Header layer (fixed, opaque, clipped to its strip) ---------------------
         let (sel_r0, sel_r1) = (range.start.row, range.end.row);
@@ -2206,6 +2721,79 @@ impl GridView {
                 MouseButton::Right,
                 cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
                     this.close_header_menu(cx);
+                    cx.stop_propagation();
+                }),
+            );
+        vec![
+            deferred(backdrop).into_any_element(),
+            deferred(card).into_any_element(),
+        ]
+    }
+
+    /// Closes the chart context menu (click-away / Escape / after the item runs).
+    fn close_chart_menu(&mut self, cx: &mut Context<Self>) {
+        if self.chart_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The right-click chart context menu overlay (P18, `ui_design §3.2`): a click-away backdrop +
+    /// a one-item "Delete chart" card. Mirrors [`header_menu_elements`](Self::header_menu_elements).
+    fn chart_menu_elements(&self, menu: ChartMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let id = menu.id;
+        let card = div()
+            .debug_selector(|| "chart-menu-card".into())
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            .occlude()
+            .flex()
+            .flex_col()
+            .p(px(4.0))
+            .bg(rgb(CELL_BG))
+            .border_1()
+            .border_color(rgb(HEADER_HAIRLINE))
+            .rounded_md()
+            .shadow_md()
+            .text_size(px(CELL_FONT_PX))
+            .min_w(px(140.0))
+            .child(
+                div()
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded_sm()
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .text_color(rgb(CELL_TEXT))
+                    .hover(|s| s.bg(rgb(HEADER_SELECTED_BG)))
+                    .child("Delete chart")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                            this.selected_chart = None;
+                            this.events
+                                .emit(&GridEvent::ChartDeleted { id }, window, cx);
+                            this.close_chart_menu(cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        let backdrop = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
+                    this.close_chart_menu(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
+                    this.close_chart_menu(cx);
                     cx.stop_propagation();
                 }),
             );
@@ -2878,6 +3466,10 @@ impl Render for GridView {
         if let Some(menu) = self.header_menu {
             root_children.extend(self.header_menu_elements(menu, cx));
         }
+        // Chart "Delete chart" context menu (P18) — same deferred overlay pattern.
+        if let Some(menu) = self.chart_menu {
+            root_children.extend(self.chart_menu_elements(menu, cx));
+        }
 
         // ---- Loading overlay (over everything) ------------------------------------------
         if let Some(name) = self.loading.clone() {
@@ -2993,6 +3585,19 @@ impl GridView {
         self.drag.is_some()
     }
 
+    /// The derived fidelity of each installed chart on `sheet`, in install order (P8 test
+    /// introspection — proves `set_sheet_charts` resolves + classifies the specs).
+    #[cfg(test)]
+    pub(crate) fn sheet_chart_fidelities(
+        &self,
+        sheet: SheetId,
+    ) -> Vec<freecell_chart_model::Fidelity> {
+        self.charts
+            .get(&sheet)
+            .map(|layer| layer.placements.iter().map(|p| p.fidelity).collect())
+            .unwrap_or_default()
+    }
+
     /// The cell the in-cell overlay currently covers, if open (test introspection for BUG #5 — the
     /// commit/cancel handlers close it, which proves an in-cell key command routed through the grid).
     #[cfg(test)]
@@ -3084,6 +3689,467 @@ mod tests {
             "a deep scroll must change the visible row range"
         );
         assert!(deep.0.start > origin.0.start, "scrolled downward");
+    }
+
+    // ---- ChartLayer install (P8, `charts/architecture.md §4.2`) ----------------------------
+
+    /// `set_sheet_charts` resolves each spec into a `RenderedChart`, deriving its display fidelity
+    /// from the retained source — a Faithful line, a Degraded (3-D→2-D) chart, and an Unsupported
+    /// group, in order; an empty list then clears them.
+    #[gpui::test]
+    fn set_sheet_charts_stores_and_derives_fidelity(cx: &mut TestAppContext) {
+        use freecell_chart_model::{
+            Anchor, AnchorCell, Axis, Category, Chart, ChartKind, Fidelity, Grouping, Legend,
+            Series, SourceXml,
+        };
+
+        let line = || Chart {
+            title: Some("Sales".into()),
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![Series::category_value(
+                Some("A"),
+                vec![Category::Text("Q1".into()), Category::Text("Q2".into())],
+                vec![1.0, 2.0],
+            )],
+            cat_axis: Axis::untitled(),
+            val_axis: Axis::untitled(),
+            legend: Some(Legend::default()),
+        };
+        let anchor = Anchor::new(AnchorCell::new(1, 1), AnchorCell::new(6, 14));
+        let spec = |xml: &str| ChartSpec::loaded(line(), SourceXml::new(xml), Vec::new(), anchor);
+
+        let grid = grid(cx);
+        let fidelities = grid.update(cx, |g, cx| {
+            let sheet = g.active_sheet();
+            g.set_sheet_charts(
+                sheet,
+                Arc::from(vec![
+                    spec("<c:lineChart/>"),
+                    spec("<c:bar3DChart/>"),
+                    spec("<c:surfaceChart/>"),
+                ]),
+                cx,
+            );
+            g.sheet_chart_fidelities(sheet)
+        });
+        assert_eq!(
+            fidelities,
+            vec![
+                Fidelity::Faithful,
+                Fidelity::Degraded,
+                Fidelity::Unsupported
+            ]
+        );
+
+        // An empty install clears the sheet's charts.
+        let cleared = grid.update(cx, |g, cx| {
+            let sheet = g.active_sheet();
+            g.set_sheet_charts(sheet, Arc::from(Vec::new()), cx);
+            g.sheet_chart_fidelities(sheet)
+        });
+        assert!(cleared.is_empty(), "an empty install clears the ChartLayer");
+    }
+
+    /// P11 "off-screen free": the ChartLayer materializes only the on-screen charts and culls the
+    /// off-screen ones from the build; a chart that scrolls out is freed from the materialized set
+    /// and re-materializes when it scrolls back in. Driven through the grid's placement-based cull
+    /// against a mock geometry (the paint loop uses the same [`GridView::visible_charts`]).
+    #[gpui::test]
+    fn offscreen_charts_are_freed_and_rematerialize_on_scrollback(cx: &mut TestAppContext) {
+        use freecell_chart_model::{
+            Anchor, AnchorCell, Axis, Category, Chart, ChartKind, Grouping, Legend, Series,
+            SourceXml,
+        };
+
+        // A uniform grid geometry (100 px columns, 24 px rows) so the anchor→pixel mapping is exact.
+        struct UniformGeom;
+        impl chart_layer::GridGeometry for UniformGeom {
+            fn col_start(&self, col: u32) -> f64 {
+                col as f64 * 100.0
+            }
+            fn row_start(&self, row: u32) -> f64 {
+                row as f64 * 24.0
+            }
+            fn col_at(&self, x: f64) -> u32 {
+                (x.max(0.0) / 100.0).floor() as u32
+            }
+            fn row_at(&self, y: f64) -> u32 {
+                (y.max(0.0) / 24.0).floor() as u32
+            }
+        }
+
+        let line = || Chart {
+            title: Some("S".into()),
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![Series::category_value(
+                Some("A"),
+                vec![Category::Text("Q1".into())],
+                vec![1.0],
+            )],
+            cat_axis: Axis::untitled(),
+            val_axis: Axis::untitled(),
+            legend: Some(Legend::default()),
+        };
+        // Three charts spread far apart horizontally: cols 0–5, 20–25, 40–45 (x ≈ 0, 2000, 4000 px).
+        let spec_at = |from_col: u32, to_col: u32| {
+            ChartSpec::loaded(
+                line(),
+                SourceXml::new("<c:lineChart/>"),
+                Vec::new(),
+                Anchor::new(AnchorCell::new(from_col, 0), AnchorCell::new(to_col, 5)),
+            )
+        };
+        let specs = Arc::from(vec![spec_at(0, 5), spec_at(20, 25), spec_at(40, 45)]);
+
+        let grid = grid(cx);
+        let sheet = grid.update(cx, |g, cx| {
+            let s = g.active_sheet();
+            g.set_sheet_charts(s, specs, cx);
+            s
+        });
+
+        let geom = UniformGeom;
+        let (cw, ch) = (600.0_f64, 300.0_f64);
+
+        let on_screen = |cx: &mut TestAppContext, scroll_x: f64| {
+            grid.update(cx, |g, _cx| {
+                g.on_screen_chart_indices(sheet, &geom, scroll_x, 0.0, cw, ch)
+            })
+        };
+
+        // At the origin only chart 0 (x 0..500) is on-screen; the far ones are freed (culled).
+        assert_eq!(
+            on_screen(cx, 0.0),
+            vec![0],
+            "only the on-screen chart is materialized",
+        );
+
+        // Scroll right so chart 1 (cols 20–25) maps into the viewport; chart 0 is now freed.
+        assert_eq!(
+            on_screen(cx, 2000.0),
+            vec![1],
+            "a previously off-screen chart re-materializes; the scrolled-away one is freed",
+        );
+
+        // Scroll back to the origin → chart 0 re-materializes (correct on scroll-back).
+        assert_eq!(
+            on_screen(cx, 0.0),
+            vec![0],
+            "scrolling back re-materializes the origin chart",
+        );
+    }
+
+    // ---- P18: chart manipulation (select / move / resize / delete) --------------------------
+
+    /// A loaded line-chart spec at `anchor` stamped with `id`, for the manipulation tests.
+    fn chart_spec_at(anchor: freecell_chart_model::Anchor, id: ChartId) -> ChartSpec {
+        use freecell_chart_model::{
+            Axis as CAxis, Category, Chart, ChartKind, Grouping, Legend, Series, SourceXml,
+        };
+        let chart = Chart {
+            title: Some("Sales".into()),
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![Series::category_value(
+                Some("A"),
+                vec![Category::Text("Q1".into()), Category::Text("Q2".into())],
+                vec![1.0, 2.0],
+            )],
+            cat_axis: CAxis::untitled(),
+            val_axis: CAxis::untitled(),
+            legend: Some(Legend::default()),
+        };
+        ChartSpec::loaded(chart, SourceXml::new("<c:lineChart/>"), Vec::new(), anchor).with_id(id)
+    }
+
+    /// A chart anchored over cols 1..6, rows 1..15 — content rect ≈ x[100,680] y[24,380] against the
+    /// demo geometry (100 px cols / 24 px rows). A grid-local click at (400, 200) lands inside it.
+    fn big_chart_anchor() -> freecell_chart_model::Anchor {
+        use freecell_chart_model::{Anchor, AnchorCell};
+        Anchor::new(AnchorCell::new(1, 1), AnchorCell::new(6, 15))
+    }
+
+    #[gpui::test]
+    fn chart_body_click_selects_and_move_persists_new_anchor(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.set_sheet_charts(
+                        sheet,
+                        Arc::from(vec![chart_spec_at(big_chart_anchor(), ChartId(7))]),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    // Mouse-down on the chart body selects it + arms a move drag (no cell selection).
+                    let before_sel = *grid.selection();
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, 400.0, 200.0), window, cx);
+                    assert_eq!(grid.selected_chart, Some(ChartId(7)), "chart selected");
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::ChartSelected(ChartId(7)))),
+                        "a chart click emits ChartSelected so the window opens the edit panel (P19)"
+                    );
+                    assert!(
+                        matches!(
+                            grid.chart_drag,
+                            Some(ChartDrag {
+                                mode: ChartDragMode::Move,
+                                ..
+                            })
+                        ),
+                        "a body click arms a move drag"
+                    );
+                    assert_eq!(
+                        *grid.selection(),
+                        before_sel,
+                        "chart click didn't move the cell selection"
+                    );
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "no SelectionChanged from a chart click"
+                    );
+                    // Drag right+down by 60,48 px, then release → anchor persists.
+                    grid.handle_mouse_move(&move_ev(460.0, 248.0), window, cx);
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    assert!(grid.chart_drag.is_none(), "drag cleared on release");
+                    let moved = events
+                        .borrow()
+                        .iter()
+                        .find_map(|e| match e {
+                            GridEvent::ChartAnchorChanged { id, anchor } if *id == ChartId(7) => {
+                                Some(*anchor)
+                            }
+                            _ => None,
+                        })
+                        .expect("a move emits ChartAnchorChanged");
+                    // The chart translated right (+60 px = past col 1's 180 px? no → same col, +offset)
+                    // and down, so the from-corner shifted from the original A-B2 anchor.
+                    assert_ne!(
+                        moved,
+                        big_chart_anchor(),
+                        "the persisted anchor reflects the move"
+                    );
+                    assert!(
+                        moved.from.col > 1 || moved.from.col_off_emu > 0,
+                        "the from corner moved right: {moved:?}"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn no_movement_click_is_a_pure_select(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.set_sheet_charts(
+                        sheet,
+                        Arc::from(vec![chart_spec_at(big_chart_anchor(), ChartId(7))]),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, 400.0, 200.0), window, cx);
+                    grid.handle_mouse_up(&up_ev(), window, cx); // released without moving
+                    assert_eq!(grid.selected_chart, Some(ChartId(7)));
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::ChartAnchorChanged { .. })),
+                        "a click that never moved persists no anchor"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn chart_handle_resize_persists_larger_anchor(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.set_sheet_charts(
+                        sheet,
+                        Arc::from(vec![chart_spec_at(big_chart_anchor(), ChartId(7))]),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    // Arm a bottom-right resize directly (avoids pixel-precise handle hit math).
+                    let rect = ChartRect {
+                        x: 100.0,
+                        y: 24.0,
+                        w: 580.0,
+                        h: 356.0,
+                    };
+                    grid.begin_chart_interaction(
+                        ChartHit::Handle {
+                            id: ChartId(7),
+                            handle: Handle::BottomRight,
+                            rect,
+                        },
+                        (680.0, 380.0),
+                        cx,
+                    );
+                    // Drag the bottom-right corner out by +100,+100 → the chart grows.
+                    grid.handle_mouse_move(&move_ev(780.0, 480.0), window, cx);
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    let resized = events
+                        .borrow()
+                        .iter()
+                        .find_map(|e| match e {
+                            GridEvent::ChartAnchorChanged { id, anchor } if *id == ChartId(7) => {
+                                Some(*anchor)
+                            }
+                            _ => None,
+                        })
+                        .expect("a resize emits ChartAnchorChanged");
+                    // The from-corner is unchanged (bottom-right resize pins the top-left); the
+                    // to-corner grew past the original col 6 / row 15.
+                    assert_eq!(resized.from, big_chart_anchor().from, "top-left pinned");
+                    assert!(
+                        resized.to.col > 6 || (resized.to.col == 6 && resized.to.col_off_emu > 0),
+                        "the chart grew to the right: {resized:?}"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn delete_key_emits_chart_deleted_and_clears_selection(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.set_sheet_charts(
+                        sheet,
+                        Arc::from(vec![chart_spec_at(big_chart_anchor(), ChartId(7))]),
+                        cx,
+                    );
+                    grid.set_selected_chart(Some(ChartId(7)), cx);
+                    events.borrow_mut().clear();
+                    grid.handle_key_down(&key_ev("delete", None, false), window, cx);
+                    assert!(grid.selected_chart.is_none(), "selection cleared on delete");
+                    assert!(
+                        events.borrow().iter().any(
+                            |e| matches!(e, GridEvent::ChartDeleted { id } if *id == ChartId(7))
+                        ),
+                        "Delete emits ChartDeleted"
+                    );
+                    // The chart is NOT also treated as a cell clear.
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::ClearCells(_))),
+                        "deleting a selected chart does not clear cell contents"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn miss_click_clears_chart_selection(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.set_sheet_charts(
+                        sheet,
+                        Arc::from(vec![chart_spec_at(big_chart_anchor(), ChartId(7))]),
+                        cx,
+                    );
+                    grid.set_selected_chart(Some(ChartId(7)), cx);
+                    // A click in the column-header strip (content_y < 0) misses every chart → deselect.
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, 60.0, 10.0), window, cx);
+                    assert!(
+                        grid.selected_chart.is_none(),
+                        "a miss-click clears the chart selection"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_cancels_chart_drag_and_selection(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let rect = ChartRect {
+                        x: 100.0,
+                        y: 24.0,
+                        w: 200.0,
+                        h: 120.0,
+                    };
+                    grid.begin_chart_interaction(
+                        ChartHit::Body {
+                            id: ChartId(7),
+                            rect,
+                        },
+                        (200.0, 80.0),
+                        cx,
+                    );
+                    assert!(grid.chart_drag.is_some());
+                    grid.handle_key_down(&key_ev("escape", None, false), window, cx);
+                    assert!(grid.chart_drag.is_none() && grid.selected_chart.is_none());
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn right_click_chart_opens_delete_menu(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.set_sheet_charts(
+                        sheet,
+                        Arc::from(vec![chart_spec_at(big_chart_anchor(), ChartId(7))]),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 200.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid
+                        .chart_menu
+                        .expect("a right-click on a chart opens its menu");
+                    assert_eq!(menu.id, ChartId(7));
+                    assert_eq!(grid.selected_chart, Some(ChartId(7)));
+                    // A header right-click was NOT opened (chart took priority).
+                    assert!(grid.header_menu.is_none());
+                });
+            })
+            .unwrap();
     }
 
     // ---- Editing-feel input triggers (`components/edit_controller.md §Grid integration`) ----
@@ -3193,6 +4259,25 @@ mod tests {
             modifiers: Modifiers::default(),
             click_count: 1,
             first_mouse: false,
+        }
+    }
+
+    /// A left-button mouse-move to grid-local `(x, y)` (P18 chart-drag tests).
+    fn move_ev(x: f32, y: f32) -> MouseMoveEvent {
+        MouseMoveEvent {
+            position: gpui::point(px(x), px(y)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    /// A left mouse-up (position is irrelevant to the chart-drag commit).
+    fn up_ev() -> MouseUpEvent {
+        MouseUpEvent {
+            button: MouseButton::Left,
+            position: gpui::point(px(0.0), px(0.0)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
         }
     }
 

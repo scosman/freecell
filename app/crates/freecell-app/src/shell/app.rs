@@ -732,7 +732,7 @@ mod tests {
 
     use super::*;
     use freecell_core::recent::DisplayEntry;
-    use freecell_engine::{LoadError, SaveError, WorkerEvent};
+    use freecell_engine::{ChartSnapshot, LoadError, SaveError, WorkerEvent};
     use gpui::TestAppContext;
     use tempfile::tempdir;
 
@@ -1533,6 +1533,96 @@ mod tests {
         assert_eq!(
             cx.update(|cx| entity.read(cx).active_sheet_for_test()),
             SheetId(3)
+        );
+    }
+
+    /// A minimal loaded line-chart spec for the seam-install test (`<c:lineChart/>` → Faithful).
+    fn chart_spec_for_test() -> freecell_chart_model::ChartSpec {
+        use freecell_chart_model::{
+            Anchor, AnchorCell, Axis, Category, Chart, ChartKind, ChartSpec, Grouping, Legend,
+            Series, SourceXml,
+        };
+        let chart = Chart {
+            title: Some("T".into()),
+            kind: ChartKind::Line {
+                grouping: Grouping::Standard,
+                smooth: false,
+            },
+            series: vec![Series::category_value(
+                Some("S"),
+                vec![Category::Text("Q1".into())],
+                vec![1.0],
+            )],
+            cat_axis: Axis::untitled(),
+            val_axis: Axis::untitled(),
+            legend: Some(Legend::default()),
+        };
+        ChartSpec::loaded(
+            chart,
+            SourceXml::new("<c:lineChart/>"),
+            Vec::new(),
+            Anchor::new(AnchorCell::new(0, 0), AnchorCell::new(4, 8)),
+        )
+    }
+
+    /// P9: charts install from the publication seam on `Published`, gated on the snapshot version —
+    /// an unchanged version is a no-op, and a version that drops a sheet clears its charts.
+    #[gpui::test]
+    fn charts_install_from_seam_and_are_version_gated(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        let sheet = SheetId(3);
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+        let client = cx.update(|cx| entity.read(cx).client_for_test());
+
+        let inject_published = |cx: &mut TestAppContext| {
+            handle
+                .update(cx, |_root, window, appcx| {
+                    entity.update(appcx, |w, ctx| {
+                        w.inject_worker_event_for_test(WorkerEvent::Published, window, ctx);
+                    });
+                })
+                .unwrap();
+        };
+        let installed = |cx: &mut TestAppContext| {
+            cx.update(|cx| grid.read(cx).sheet_chart_fidelities(sheet).len())
+        };
+
+        // 1) A v1 snapshot with one chart installs on the next Published.
+        client.set_chart_snapshot(ChartSnapshot {
+            version: 1,
+            sheets: vec![(sheet, std::sync::Arc::from(vec![chart_spec_for_test()]))],
+        });
+        inject_published(cx);
+        assert_eq!(
+            installed(cx),
+            1,
+            "a new snapshot version installs its charts"
+        );
+
+        // 2) A snapshot with the SAME version but no charts is IGNORED (version-gated no-op) — a
+        // re-install would have cleared the sheet.
+        client.set_chart_snapshot(ChartSnapshot {
+            version: 1,
+            sheets: Vec::new(),
+        });
+        inject_published(cx);
+        assert_eq!(
+            installed(cx),
+            1,
+            "an unchanged version does not re-run the install — the charts stay"
+        );
+
+        // 3) A higher version that drops the sheet clears its charts (the dropped-sheet branch).
+        client.set_chart_snapshot(ChartSnapshot {
+            version: 2,
+            sheets: Vec::new(),
+        });
+        inject_published(cx);
+        assert_eq!(
+            installed(cx),
+            0,
+            "a new version dropping the sheet clears its charts"
         );
     }
 

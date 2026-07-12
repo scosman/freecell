@@ -1,13 +1,16 @@
-//! The per-case gpui renderer (`render_scene --case <name> [--exit-after-ms N]`). Opens ONE
-//! window with the real grid over the named case's engine-built sources and self-quits; the
-//! capture harness ([`render_tests::capture`]) forces presentation and grabs the pixels.
+//! The per-case gpui renderer:
+//! - `render_scene --case <name>` opens ONE window with the real grid over the named grid case's
+//!   engine-built sources, and
+//! - `render_scene --chart <name>` opens ONE window with the standalone chart widget for the
+//!   named chart scene.
 //!
-//! Isolating each case in its own process gives a clean gpui/Vulkan lifecycle per capture, needs
-//! no window-resize API, and rules out stale-pixel races between cases.
+//! Either way it self-quits; the capture harness ([`render_tests::capture`]) forces presentation
+//! and grabs the pixels. Isolating each fixture in its own process gives a clean gpui/Vulkan
+//! lifecycle per capture, needs no window-resize API, and rules out stale-pixel races.
 
 use std::process::ExitCode;
 
-use render_tests::render::run_render_scene;
+use render_tests::render::{run_chart_scene, run_render_scene};
 
 /// Default window lifetime — long enough for the harness to settle, xrefresh, and capture.
 const DEFAULT_EXIT_AFTER_MS: u64 = 9000;
@@ -29,18 +32,27 @@ fn main() -> ExitCode {
         .try_init();
 
     let args: Vec<String> = std::env::args().collect();
-    let Some(case) = arg_value(&args, "--case") else {
-        eprintln!("usage: render_scene --case <name> [--exit-after-ms <n>]");
-        return ExitCode::from(2);
-    };
     let exit_after_ms = arg_value(&args, "--exit-after-ms")
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_EXIT_AFTER_MS);
 
-    match run_render_scene(&case, exit_after_ms) {
+    // `--chart` (a chart scene) and `--case` (a grid case) are mutually exclusive; `--chart`
+    // takes precedence if both are somehow given.
+    let (kind, name, result) = if let Some(scene) = arg_value(&args, "--chart") {
+        let r = run_chart_scene(&scene, exit_after_ms);
+        ("chart scene", scene, r)
+    } else if let Some(case) = arg_value(&args, "--case") {
+        let r = run_render_scene(&case, exit_after_ms);
+        ("case", case, r)
+    } else {
+        eprintln!("usage: render_scene (--case <name> | --chart <name>) [--exit-after-ms <n>]");
+        return ExitCode::from(2);
+    };
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("render_scene failed for case {case}: {err:#}");
+            eprintln!("render_scene failed for {kind} {name}: {err:#}");
             ExitCode::FAILURE
         }
     }

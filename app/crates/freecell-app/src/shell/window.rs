@@ -14,6 +14,7 @@
 //! windows + panels + dialogs, and mediates the grid/chrome/worker seams.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -23,13 +24,14 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 
-use freecell_core::{limits, SelectionModel, SheetId};
+use freecell_chart_model::{ChartColor, ChartId, ChartInsertKind};
+use freecell_core::{limits, Rgb, SelectionModel, SheetId};
 use freecell_engine::{
-    Command, DocumentClient, DocumentSource, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
-    WorkerEvent, WorkerEventReceiver,
+    Command, DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, PasteError,
+    SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
 };
 
-use crate::chrome::{ChromeGridRequest, ChromeGridSink, ChromeView};
+use crate::chrome::{ChartPanel, ChartPanelSeries, ChromeGridRequest, ChromeGridSink, ChromeView};
 use crate::grid::{GridDataSources, GridEvent, GridEventSink, GridView, RowOrCol};
 
 use super::clipboard::ClipboardCoordinator;
@@ -126,6 +128,19 @@ pub struct WorkbookWindow {
     /// The in-flight save's request id (matched against `Saved`/`SaveFailed`).
     pending_save_req: Option<u64>,
     next_req_id: u64,
+
+    /// The [`ChartSnapshot`](freecell_engine::ChartSnapshot) version last installed into the grid
+    /// (P9). The worker bumps the snapshot version on load and on each dirty re-resolve; the window
+    /// re-installs only when this differs, so a scroll-only publish never rebuilds the charts.
+    installed_chart_version: u64,
+    /// The sheets that currently have charts installed — so a snapshot that drops a sheet's charts
+    /// can clear them.
+    installed_chart_sheets: Vec<SheetId>,
+    /// The **authored** chart ids seen in the installed snapshot (P19). A newly-appeared authored id
+    /// means the user just inserted a chart, so its edit panel auto-opens (the insert→shape flow,
+    /// `ui_design §3.1`); loaded charts are never tracked here, so opening a file never auto-opens a
+    /// panel.
+    known_authored_charts: HashSet<ChartId>,
 
     /// Keeps the worker→UI event task alive for the window's lifetime.
     _event_task: gpui::Task<()>,
@@ -269,6 +284,9 @@ impl WorkbookWindow {
             pending_save_path: None,
             pending_save_req: None,
             next_req_id: 0,
+            installed_chart_version: 0,
+            installed_chart_sheets: Vec::new(),
+            known_authored_charts: HashSet::new(),
             _event_task: event_task,
         }
     }
@@ -293,6 +311,100 @@ impl WorkbookWindow {
         })
     }
 
+    /// Installs the worker's live-bound charts into the grid's **ChartLayer** from the publication
+    /// seam (P9, `charts/functional_spec.md §2`, `architecture.md §4.1`). The worker owns chart
+    /// discovery + live binding; the window just reads the wait-free
+    /// [`ChartSnapshot`](freecell_engine::ChartSnapshot) on `Loaded` / `Published` and installs it
+    /// when its version changed — so an edit that re-resolves a chart repaints it, while a
+    /// scroll-only publish (or an edit touching no chart) is a no-op. A chart-less / unsaved workbook
+    /// publishes the empty (version 0) snapshot, so this never installs anything for it.
+    ///
+    /// The snapshot is grouped by anchor worksheet (multi-sheet, P10); charts are discovered lazily
+    /// on a sheet's first paint (P11), so a version bump can carry newly-parsed charts as well as
+    /// live re-resolves. Each per-sheet list is a **shared** `Arc<[ChartSpec]>` — installing it into
+    /// the grid bumps a refcount, never copies the charts (P11 "off-screen free").
+    fn sync_charts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.client.chart_snapshot();
+        if snapshot.version == self.installed_chart_version {
+            return; // charts unchanged since the last install
+        }
+        // Clear any sheet that no longer carries charts, then (re)install the current set.
+        let present: Vec<SheetId> = snapshot.sheets.iter().map(|(sheet, _)| *sheet).collect();
+        let dropped: Vec<SheetId> = self
+            .installed_chart_sheets
+            .iter()
+            .filter(|s| !present.contains(s))
+            .copied()
+            .collect();
+        self.grid.update(cx, |g, cx| {
+            for sheet in dropped {
+                g.set_sheet_charts(sheet, std::sync::Arc::from(Vec::new()), cx);
+            }
+            for (sheet, specs) in &snapshot.sheets {
+                // The per-sheet `Arc<[ChartSpec]>` is **shared** with the worker's published snapshot
+                // — this `clone` bumps a refcount, it does not copy the charts (P11 "off-screen free").
+                g.set_sheet_charts(*sheet, specs.clone(), cx);
+            }
+        });
+        self.installed_chart_sheets = present;
+        self.installed_chart_version = snapshot.version;
+
+        // Drive the chart edit panel off the fresh snapshot (P19/P20): auto-open a just-inserted
+        // authored chart, or reconcile an already-open panel's shown state (or close it if its chart
+        // is gone).
+        self.refresh_chart_panel(window, cx);
+    }
+
+    /// Reconcile the right-docked chart **edit panel** with the current snapshot (P19 skeleton + P20
+    /// chrome): a newly-appeared **authored** chart (the user just inserted one) auto-opens its panel
+    /// — the insert→shape flow (`ui_design §3.1`); otherwise an already-open panel (authored **or**
+    /// loaded — a loaded chart's panel opens on click, `ChartSelected`) is refreshed to the chart's
+    /// current state (or closed if the chart was deleted). Loaded charts never auto-open (they aren't
+    /// tracked), so opening a file never pops the panel. A same-chart reconcile does **not** re-seed
+    /// the text inputs (only an id change does), so a live republish can't clobber an in-progress edit.
+    fn refresh_chart_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.client.chart_snapshot();
+        let authored_now: HashSet<ChartId> = snapshot
+            .sheets
+            .iter()
+            .flat_map(|(_, specs)| specs.iter())
+            .filter(|s| s.is_authored())
+            .map(|s| s.id)
+            .collect();
+        let newly_inserted = authored_now
+            .iter()
+            .find(|id| !self.known_authored_charts.contains(id))
+            .copied();
+        self.known_authored_charts = authored_now;
+
+        if let Some(id) = newly_inserted {
+            self.open_chart_panel_for(id, window, cx);
+            return;
+        }
+        // Reconcile an already-open panel.
+        let Some(target) = self.chrome.read(cx).chart_panel_target() else {
+            return;
+        };
+        match chart_panel_info(&self.client, target) {
+            Some(panel) => self
+                .chrome
+                .update(cx, |c, cx| c.open_chart_panel(panel, window, cx)),
+            None => self.chrome.update(cx, |c, cx| c.close_chart_panel(cx)),
+        }
+    }
+
+    /// Open the edit panel for chart `id` + outline it in the grid (P19). Used on insert-auto-open (a
+    /// user click already outlined the chart, so the grid select there is a harmless re-set).
+    fn open_chart_panel_for(&mut self, id: ChartId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = chart_panel_info(&self.client, id) else {
+            return;
+        };
+        self.grid
+            .update(cx, |g, cx| g.set_selected_chart(Some(id), cx));
+        self.chrome
+            .update(cx, |c, cx| c.open_chart_panel(panel, window, cx));
+    }
+
     /// Folds a worker event (`components/engine_worker.md`), routing each to the window's
     /// lifecycle state, the grid (repaint), and/or the chrome (data row, tabs, spinner).
     fn on_worker_event(&mut self, event: WorkerEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -302,6 +414,11 @@ impl WorkbookWindow {
                 self.grid.update(cx, |g, cx| g.set_loading(None, cx));
                 self.reconcile_sheets(sheets, window, cx);
                 self.refresh_dirty(window, cx);
+                // Install this file's live-bound charts from the worker's publication seam (P9,
+                // `charts/architecture.md §4.1`). The worker discovered + bound them before the
+                // first publish; per-chart non-fatal, so a chart-less/broken-chart file loads as
+                // before. Live re-resolves arrive on later `Published` events.
+                self.sync_charts(window, cx);
                 // The document finished loading → the welcome window (if still up) can close.
                 FreeCellApp::note_window_loaded(self.key, cx);
                 cx.notify();
@@ -322,6 +439,9 @@ impl WorkbookWindow {
                 // A fresh generation is available — repaint the grid from the new publication
                 // (the grid re-reads the `ArcSwap` each frame; `notify` schedules that frame).
                 self.grid.update(cx, |_g, cx| cx.notify());
+                // Install any live-bound chart changes that rode this publish (P9). Version-gated,
+                // so a scroll-only publish is a no-op.
+                self.sync_charts(window, cx);
                 self.refresh_dirty(window, cx);
             }
             WorkerEvent::StyleCacheUpdated { sheet } => {
@@ -825,6 +945,14 @@ impl WorkbookWindow {
         self.grid.clone()
     }
 
+    /// Test seam: the window's worker client, so a test can publish a `ChartSnapshot` into the seam
+    /// (via `DocumentClient::set_chart_snapshot`) and then drive `sync_charts` through an injected
+    /// `Published` event.
+    #[cfg(test)]
+    pub(crate) fn client_for_test(&self) -> std::rc::Rc<DocumentClient> {
+        self.client.clone()
+    }
+
     /// Test seam: the composed chrome entity.
     #[cfg(test)]
     pub(crate) fn chrome_for_test(&self) -> Entity<ChromeView> {
@@ -1116,6 +1244,80 @@ fn route_selection_changed(
 /// Builds the grid's [`GridEventSink`] — routes grid events to the sibling chrome + the worker
 /// **without touching the `WorkbookWindow` entity** (the sink fires from inside the grid's own
 /// `update`). Cyclic follow-ups (the cap-reject selection revert) are deferred.
+/// Resolve the full chart **edit-panel** state for the chart with [`ChartId`] `id` from the worker's
+/// current snapshot (P19 skeleton + P20 chrome), for **either** provenance. `None` if no such chart
+/// is published, or it is an [`Unsupported`](freecell_chart_model::ChartBody::Unsupported) chart (no
+/// render picture → nothing to edit). The window builds the panel from this on select / insert / a
+/// republish reconcile.
+fn chart_panel_info(client: &DocumentClient, id: ChartId) -> Option<ChartPanel> {
+    let snapshot = client.chart_snapshot();
+    for (sheet, specs) in &snapshot.sheets {
+        for spec in specs.iter() {
+            if spec.id != id {
+                continue;
+            }
+            let chart = spec.chart()?;
+            let kind = ChartInsertKind::from_chart_kind(&chart.kind)?;
+            let ranges = (!spec.source_ranges.is_empty()).then(|| {
+                spec.source_ranges
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            // The chart-wide label toggles read from its first series (chrome edits apply to all).
+            let labels = chart
+                .series
+                .first()
+                .and_then(|s| s.data_labels.as_ref())
+                .map(|l| DataLabelToggles {
+                    show_value: l.show_value,
+                    show_category_name: l.show_category_name,
+                    show_percent: l.show_percent,
+                })
+                .unwrap_or_default();
+            let series = chart
+                .series
+                .iter()
+                .enumerate()
+                .map(|(i, s)| ChartPanelSeries {
+                    name: s
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("Series {}", i + 1)),
+                    color: s.color.as_ref().and_then(chart_color_rgb),
+                })
+                .collect();
+            return Some(ChartPanel {
+                sheet: *sheet,
+                id,
+                is_authored: spec.is_authored(),
+                kind,
+                ranges,
+                title: chart.title.clone(),
+                legend: chart.legend.map(|l| l.position),
+                cat_axis_title: chart.cat_axis.title.clone(),
+                val_axis_title: chart.val_axis.title.clone(),
+                series,
+                labels,
+            });
+        }
+    }
+    None
+}
+
+/// The panel swatch color for a series' [`ChartColor`] — a concrete sRGB for an explicit color, or
+/// its office-default RGB for a theme reference (so a themed series still shows a highlighted swatch).
+fn chart_color_rgb(c: &ChartColor) -> Option<Rgb> {
+    let color = match c {
+        ChartColor::Rgb(color) => *color,
+        ChartColor::Theme { slot, .. } => {
+            freecell_chart_model::ThemePalette::office_default().color(*slot)
+        }
+    };
+    Some(Rgb::from_hex(color.to_hex()))
+}
+
 fn make_grid_sink(
     chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>>,
     grid_slot: Rc<OnceCell<WeakEntity<GridView>>>,
@@ -1242,6 +1444,40 @@ fn make_grid_sink(
             col: *at,
             count: *count,
         }),
+        // Chart manipulation (P18): move/resize (a new anchor) + delete route straight to the worker,
+        // like the other grid-initiated structure ops. The worker resolves the `ChartId` to the
+        // authored set or a loaded binding and republishes the chart snapshot.
+        GridEvent::ChartAnchorChanged { id, anchor } => client.send(Command::SetChartAnchor {
+            sheet: shared.active_sheet.get(),
+            id: *id,
+            anchor: *anchor,
+        }),
+        GridEvent::ChartDeleted { id } => {
+            client.send(Command::DeleteChart {
+                sheet: shared.active_sheet.get(),
+                id: *id,
+            });
+            // Close the edit panel eagerly if it was shaping the just-deleted chart (the next sync
+            // would close it anyway once the chart drops from the snapshot).
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let id = *id;
+                chrome.update(cx, |c, cx| {
+                    if c.chart_panel_target() == Some(id) {
+                        c.close_chart_panel(cx);
+                    }
+                });
+            }
+        }
+        // A chart was clicked (P19/P20): open the right-docked edit panel for it — authored OR loaded
+        // (the grid already outlined it in `begin_chart_interaction`). A loaded chart's panel shows
+        // only the chrome controls (no Type/Data-range).
+        GridEvent::ChartSelected(id) => {
+            if let Some(panel) = chart_panel_info(&client, *id) {
+                if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                    chrome.update(cx, |c, cx| c.open_chart_panel(panel, window, cx));
+                }
+            }
+        }
     })
 }
 

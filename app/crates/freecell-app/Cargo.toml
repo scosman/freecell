@@ -56,6 +56,9 @@ path = "src/main.rs"
 
 [dependencies]
 freecell-core.workspace = true
+# Chart render layer (`chart` module, charts/architecture §2, §4.2): renders the gpui-free
+# `freecell-chart-model` seam through gpui-component's `plot/` primitives.
+freecell-chart-model.workspace = true
 freecell-engine.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true

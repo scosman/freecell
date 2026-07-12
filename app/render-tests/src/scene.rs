@@ -5,7 +5,7 @@
 //! A [`Scene`] is a declarative recipe (cell inputs + styles + geometry). [`build_sources`]
 //! runs it through the **real** stack: it spawns a [`DocumentClient`] over a new in-memory
 //! workbook, applies the inputs/styles as real worker commands, sets the viewport, waits for
-//! the worker's publish, and reads back the real [`Publication`] + [`SheetCaches`]. So a pixel
+//! the worker's publish, and reads back the real `Publication` + [`SheetCaches`]. So a pixel
 //! test failing means the product is wrong, not a stub (`components/render_test_harness.md`).
 //!
 //! ## Command-less render features
@@ -14,7 +14,7 @@
 //! four action-row style toggles (`SetStyleAttr`: bold / italic / underline / fill). Alignment,
 //! explicit font colour, and column/row geometry have **no edit command** — in the product they
 //! arrive from an opened file, not a user edit. The scene applies those to the real
-//! [`SheetCache`] the grid consumes (via its public mutators `set_col_width` / `set_cell_style`,
+//! `SheetCache` the grid consumes (via its public mutators `set_col_width` / `set_cell_style`,
 //! the same ones the worker uses) after the worker builds it. This mirrors how Phase 6 itself
 //! exercised alignment/geometry, and keeps the render path (the thing under test) fully real.
 

@@ -2044,6 +2044,7 @@ dependencies = [
  "arc-swap",
  "dirs",
  "fontdb",
+ "freecell-chart-model",
  "freecell-core",
  "freecell-engine",
  "gpui",
@@ -2055,6 +2056,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "freecell-chart-model"
+version = "0.1.0"
 
 [[package]]
 name = "freecell-core"
@@ -2070,12 +2075,15 @@ dependencies = [
 name = "freecell-engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "async-channel 2.5.0",
+ "freecell-chart-model",
  "freecell-core",
  "ironcalc",
  "ironcalc_base",
  "parking_lot",
+ "roxmltree 0.19.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -5579,6 +5587,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "freecell-app",
+ "freecell-chart-model",
  "freecell-core",
  "freecell-engine",
  "gpui",

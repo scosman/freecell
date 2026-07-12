@@ -23,7 +23,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       `EnvFilter` (`shell/main.rs`); keep `RUST_LOG` override working; smoke-launch to
       confirm the two WARN lines are gone. *(Trivial quick win. No pixel impact.)*
 
-- [ ] **Phase 2 — Quick-edit mode** (§5): `quick_edit` flag on `ChromeView`; set in
+- [x] **Phase 2 — Quick-edit mode** (§5): `quick_edit` flag on `ChromeView`; set in
       `begin_typed`, cleared in `begin_in_cell` / formula-bar focus; arrow interception in
       the data-row + in-cell `capture_key_down` handlers → `commit_and_move`; cancel on
       mouse-caret / Home / End / modified-arrow; thread `quick_edit` into

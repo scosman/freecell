@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use gpui::{
     canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
+    Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
@@ -41,6 +41,8 @@ use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
     limits, Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign,
 };
+
+use crate::grid::caret_intent_modifiers;
 
 use freecell_chart_model::{Anchor as ChartAnchor, AnchorCell, ChartId, LegendPosition};
 
@@ -271,6 +273,12 @@ pub struct ChromeView {
     /// Whether the last edit-state push to the grid was non-empty (a mirror / overlay was shown),
     /// so an idle selection move doesn't re-push an all-`None` clear on every keystroke.
     edit_state_shown: bool,
+    /// Whether the current pending edit is in **quick-edit** mode (`functional_spec.md §5`). Set by
+    /// `begin_typed` (type-to-replace entry); cleared by `begin_in_cell`, by any caret-intent signal
+    /// (mouse-down in the field, Home/End, a modified arrow — see [`leave_quick_edit`](Self::leave_quick_edit)),
+    /// and on commit/cancel. While set + editing, an unmodified arrow commits + moves the active cell
+    /// instead of the caret.
+    quick_edit: bool,
     /// The `(sheet, cell)` whose fetched content currently lives in the reducer's `committed`
     /// field. The in-cell editor seeds from `committed` **only** for this exact sheet+cell — the
     /// single shared reducer keeps a previous cell's `committed` across a single→single selection
@@ -439,6 +447,7 @@ impl ChromeView {
             content_input,
             edit: EditController::new(in_cell_input),
             edit_state_shown: false,
+            quick_edit: false,
             committed_cell: None,
             cap_error_external: None,
             eval: EvalIndicator::default(),
@@ -571,9 +580,11 @@ impl ChromeView {
         self.apply_data_effects(effects, window, cx);
         let committed = self.data_row.mode() != FieldMode::Editing;
         self.note_commit(was_editing);
-        // A committed (or absent) edit closes the overlay; a cap-rejected one stays open + editing.
+        // A committed (or absent) edit closes the overlay + leaves quick-edit; a cap-rejected one
+        // stays open + editing.
         if committed {
             self.edit.close();
+            self.quick_edit = false;
         }
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
@@ -591,6 +602,7 @@ impl ChromeView {
         self.mirror_to_in_cell(window, cx);
         self.apply_data_effects(effects, window, cx);
         self.edit.close();
+        self.quick_edit = false;
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -613,6 +625,9 @@ impl ChromeView {
         self.edit.close();
         self.edit.set_origin(EditOrigin::DataRow);
         self.cap_error_external = None;
+        // Type-to-replace is the sole entry into quick-edit (`functional_spec.md §5.1`): an
+        // unmodified arrow now commits + moves the active cell instead of the caret.
+        self.quick_edit = true;
         // Force Editing with the typed char (supersedes any pending fetch / disabled multi state).
         let effects = self.data_row.reduce(DataRowEvent::Edited {
             text: text.to_string(),
@@ -640,6 +655,9 @@ impl ChromeView {
             return;
         }
         self.cap_error_external = None;
+        // The in-cell editor (double-click / F2) is never quick-edit — arrows control the caret
+        // (`functional_spec.md §5.1`), even if this promotes an in-progress type-to-replace.
+        self.quick_edit = false;
         // Enter Editing seeded with the committed raw content, unless already editing this cell
         // (F2 mid-edit keeps the pending text) or the fetch for THIS cell hasn't landed yet. The
         // reducer keeps a previous cell's `committed` across a single→single selection change, so
@@ -714,9 +732,11 @@ impl ChromeView {
         }
         self.apply_data_effects(effects, window, cx);
         self.note_commit(was_editing);
-        // A successful commit ends the edit → close the overlay; a cap-rejected one stays open.
+        // A successful commit ends the edit → close the overlay + leave quick-edit; a cap-rejected
+        // one stays open (and stays in quick-edit so a re-arrow retries the commit).
         if self.data_row.mode() != FieldMode::Editing {
             self.edit.close();
+            self.quick_edit = false;
         }
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
@@ -731,6 +751,76 @@ impl ChromeView {
     fn note_commit(&mut self, was_editing: bool) {
         if was_editing && self.data_row.mode() != FieldMode::Editing {
             self.committed_cell = Some((self.active_sheet, self.selection.active));
+        }
+    }
+
+    /// A caret-intent signal ended quick-edit (`functional_spec.md §5.3`): a mouse-down in the
+    /// field, Home/End, or a modified arrow. For the remainder of this edit, arrows control the text
+    /// caret, not the active cell. Idempotent; re-pushes the grid's edit state so its copy tracks.
+    fn leave_quick_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.quick_edit {
+            return;
+        }
+        self.quick_edit = false;
+        self.refresh_edit_grid_state(window, cx);
+    }
+
+    /// The data-row `capture_key_down` for a live edit (`functional_spec.md §5.2–5.3`), factored out
+    /// so it is unit-testable without routing a keystroke through the nested input. Returns whether
+    /// the key was **consumed** (the caller must then `stop_propagation` so the input doesn't also
+    /// act on it); `false` lets the key fall through to the input (caret op).
+    ///
+    /// - Tab / Shift+Tab always commit + move right / left (unchanged, quick-edit or not).
+    /// - In quick-edit, an **unmodified** arrow commits + moves the active cell in that direction.
+    /// - A caret-intent modified arrow (Shift/Cmd/Ctrl/Alt — see [`caret_intent_modifiers`]) or
+    ///   Home/End signals caret intent: it leaves quick-edit and falls through to the caret, and
+    ///   (for a modified arrow) does **not** move the active cell.
+    fn handle_data_row_edit_key(
+        &mut self,
+        key: &str,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.data_mode() != FieldMode::Editing {
+            return false;
+        }
+        if key == "tab" {
+            let dir = if modifiers.shift {
+                Direction::Left
+            } else {
+                Direction::Right
+            };
+            self.commit_and_move(dir, window, cx);
+            return true;
+        }
+        if !self.quick_edit {
+            return false;
+        }
+        match key {
+            "left" | "right" | "up" | "down" => {
+                if caret_intent_modifiers(&modifiers) {
+                    // Modified arrow = caret/selection op: leave quick-edit, do NOT move the active
+                    // cell, and let the key reach the input.
+                    self.leave_quick_edit(window, cx);
+                    false
+                } else {
+                    let dir = match key {
+                        "left" => Direction::Left,
+                        "right" => Direction::Right,
+                        "up" => Direction::Up,
+                        _ => Direction::Down,
+                    };
+                    self.commit_and_move(dir, window, cx);
+                    true
+                }
+            }
+            "home" | "end" => {
+                // Explicit caret positioning: leave quick-edit; the input moves the caret.
+                self.leave_quick_edit(window, cx);
+                false
+            }
+            _ => false,
         }
     }
 
@@ -813,6 +903,9 @@ impl ChromeView {
             .then(|| self.cap_error_message())
             .flatten()
             .map(SharedString::from);
+        // Quick-edit is meaningful only while the edit is live; gate on `editing` so the grid's copy
+        // auto-clears the instant the edit ends (`functional_spec.md §5`).
+        let quick_edit = editing && self.quick_edit;
         let nonempty = mirror.is_some() || in_cell.is_some();
         // Skip an all-`None` clear when nothing was shown (idle selection moves would otherwise
         // re-push every keystroke); always push when something is/was shown so the clear lands.
@@ -825,6 +918,7 @@ impl ChromeView {
                 mirror,
                 in_cell,
                 cap,
+                quick_edit,
             },
             window,
             cx,
@@ -2777,18 +2871,20 @@ impl ChromeView {
                     this.escape_edit(window, cx);
                 }
             }))
-            // Tab / Shift+Tab commit + move right/left (`functional_spec.md §1.4`). Captured
-            // **before** the input consumes the key (the bare gpui-component Input emits no commit
-            // on Tab — `components/edit_controller.md §Tab interception`).
+            // Tab / Shift+Tab commit + move right/left (`functional_spec.md §1.4`), and — in
+            // quick-edit — arrow keys commit + move the active cell while Home/End or a modified
+            // arrow leave quick-edit (`functional_spec.md §5.2–5.3`). Captured **before** the input
+            // consumes the key (the bare gpui-component Input emits no commit on Tab —
+            // `components/edit_controller.md §Tab interception`).
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "tab" && this.data_mode() == FieldMode::Editing {
+                let consumed = this.handle_data_row_edit_key(
+                    event.keystroke.key.as_str(),
+                    event.keystroke.modifiers,
+                    window,
+                    cx,
+                );
+                if consumed {
                     cx.stop_propagation();
-                    let dir = if event.keystroke.modifiers.shift {
-                        Direction::Left
-                    } else {
-                        Direction::Right
-                    };
-                    this.commit_and_move(dir, window, cx);
                 }
             }))
             // Ref box: read-only A1 address.
@@ -2814,6 +2910,16 @@ impl ChromeView {
                 div()
                     .flex_1()
                     .debug_selector(|| "data-content-field".into())
+                    // Clicking to place the caret in the field ends quick-edit (`functional_spec.md
+                    // §5.3`): arrows then move the caret, not the active cell. The gpui-component
+                    // `Input` does not `stop_propagation` on mouse-down, so this bubble-phase
+                    // listener still fires on a click into the field.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.leave_quick_edit(window, cx);
+                        }),
+                    )
                     .when(cap_error, |d| {
                         d.border_1().border_color(rgb(DANGER)).rounded_md()
                     })
@@ -4253,7 +4359,7 @@ mod tests {
     use freecell_core::input_cap::MAX_INPUT_LEN;
     use freecell_core::{CellRef, SelectionModel};
     use freecell_engine::{BorderPreset, Command, SheetMeta, StyleAttr, WorkerEvent};
-    use gpui::{px, size, TestAppContext};
+    use gpui::{px, size, Modifiers, TestAppContext};
     use gpui_component::Root;
     use std::cell::RefCell;
 
@@ -6923,7 +7029,16 @@ mod tests {
                 mirror,
                 in_cell,
                 cap,
+                ..
             } => Some((mirror.clone(), *in_cell, cap.clone())),
+            _ => None,
+        })
+    }
+
+    /// The `quick_edit` flag on the most recent edit-state push (`functional_spec.md §5`).
+    fn last_edit_state_quick(reqs: &[ChromeGridRequest]) -> Option<bool> {
+        reqs.iter().rev().find_map(|r| match r {
+            ChromeGridRequest::EditState { quick_edit, .. } => Some(*quick_edit),
             _ => None,
         })
     }
@@ -7171,6 +7286,316 @@ mod tests {
             r,
             ChromeGridRequest::MoveActive(Motion::Move(Direction::Left))
         )));
+    }
+
+    // ---- Quick-edit mode (`functional_spec.md §5`) ----------------------------------------
+
+    /// No modifiers held (a plain keystroke).
+    fn plain() -> Modifiers {
+        Modifiers::default()
+    }
+
+    #[gpui::test]
+    fn quick_edit_arrow_commits_and_moves(cx: &mut TestAppContext) {
+        // Type-to-replace enters quick-edit; an unmodified arrow commits + moves the active cell.
+        let h = idle_on_a1(cx, "");
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("abcd", window, cx);
+            c.handle_data_row_edit_key("right", plain(), window, cx)
+        });
+        assert!(
+            consumed,
+            "an unmodified arrow in quick-edit must be consumed (commit + move)"
+        );
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "abcd"),
+            "expected SetCellInput \"abcd\", got {cmds:?}"
+        );
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+        // The edit ended — back to normal navigation.
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+    }
+
+    #[gpui::test]
+    fn quick_edit_arrows_move_each_direction(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        for (key, dir) in [
+            ("left", Direction::Left),
+            ("right", Direction::Right),
+            ("up", Direction::Up),
+            ("down", Direction::Down),
+        ] {
+            h.client.take_commands();
+            h.grid_requests.borrow_mut().clear();
+            let consumed = upd(&h, cx, |c, window, cx| {
+                c.begin_typed("v", window, cx);
+                c.handle_data_row_edit_key(key, plain(), window, cx)
+            });
+            assert!(consumed, "arrow {key} must be consumed in quick-edit");
+            assert!(
+                h.grid_requests.borrow().iter().any(|r| matches!(
+                    r,
+                    ChromeGridRequest::MoveActive(Motion::Move(d)) if *d == dir
+                )),
+                "arrow {key} must move the active cell {dir:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn quick_edit_not_entered_by_in_cell(cx: &mut TestAppContext) {
+        // Double-click / F2 (in-cell) edits are NOT quick-edit: arrows control the caret.
+        let h = idle_on_a1(cx, "");
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type("z", window, cx);
+            c.handle_data_row_edit_key("right", plain(), window, cx)
+        });
+        assert!(
+            !consumed,
+            "an in-cell edit must not consume the arrow (caret op)"
+        );
+        assert!(!h
+            .client
+            .take_commands()
+            .iter()
+            .any(|cmd| matches!(cmd, Command::SetCellInput { .. })));
+        assert!(!h
+            .grid_requests
+            .borrow()
+            .iter()
+            .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn quick_edit_caret_intent_modifier_arrow_leaves_without_moving(cx: &mut TestAppContext) {
+        // Each caret-intent modifier (Shift / Ctrl / Alt / Cmd-platform) + arrow is a caret op: it
+        // leaves quick-edit and does NOT move the active cell. `function` is deliberately excluded
+        // (tested separately) so a plain macOS arrow — which carries `function` — still moves.
+        let cases: [(&str, Modifiers); 4] = [
+            (
+                "shift",
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "control",
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "alt",
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "platform",
+                Modifiers {
+                    platform: true,
+                    ..Modifiers::default()
+                },
+            ),
+        ];
+        for (name, mods) in cases {
+            let h = idle_on_a1(cx, "");
+            let consumed = upd(&h, cx, |c, window, cx| {
+                c.begin_typed("v", window, cx);
+                c.handle_data_row_edit_key("right", mods, window, cx)
+            });
+            assert!(!consumed, "{name}+arrow must fall through to the caret");
+            assert!(
+                !h.client
+                    .take_commands()
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::SetCellInput { .. })),
+                "{name}+arrow must not commit"
+            );
+            assert!(
+                !h.grid_requests
+                    .borrow()
+                    .iter()
+                    .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))),
+                "{name}+arrow must not move the active cell"
+            );
+            assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+            // Quick-edit is now off: even a subsequent unmodified arrow does not move.
+            h.grid_requests.borrow_mut().clear();
+            let consumed2 = upd(&h, cx, |c, window, cx| {
+                c.handle_data_row_edit_key("right", plain(), window, cx)
+            });
+            assert!(
+                !consumed2,
+                "after {name}+arrow, arrows are caret ops for the rest of the edit"
+            );
+            assert!(!h
+                .grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))));
+        }
+    }
+
+    #[gpui::test]
+    fn quick_edit_plain_arrow_with_function_flag_still_moves(cx: &mut TestAppContext) {
+        // Cross-platform regression: macOS sets `Modifiers::function` on a *plain* arrow keystroke.
+        // The caret-intent predicate excludes `function`, so §5.2's commit + move must still fire —
+        // otherwise quick-edit's core feature never works on macOS.
+        let h = idle_on_a1(cx, "");
+        let fn_only = Modifiers {
+            function: true,
+            ..Modifiers::default()
+        };
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("abcd", window, cx);
+            c.handle_data_row_edit_key("right", fn_only, window, cx)
+        });
+        assert!(
+            consumed,
+            "a plain arrow carrying only the function flag (macOS) must still commit + move"
+        );
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "abcd"),
+            "expected SetCellInput \"abcd\", got {cmds:?}"
+        );
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+    }
+
+    #[gpui::test]
+    fn quick_edit_home_leaves(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.handle_data_row_edit_key("home", plain(), window, cx)
+        });
+        assert!(!consumed, "Home is caret positioning — not consumed");
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "Home leaves quick-edit"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn quick_edit_mouse_down_in_field_leaves(cx: &mut TestAppContext) {
+        // The data-row field's on_mouse_down calls leave_quick_edit (placing the caret by click).
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.leave_quick_edit(window, cx);
+        });
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false)
+        );
+        h.client.take_commands();
+        h.grid_requests.borrow_mut().clear();
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.handle_data_row_edit_key("right", plain(), window, cx)
+        });
+        assert!(
+            !consumed,
+            "after a click into the field, arrows are caret ops"
+        );
+        assert!(!h
+            .grid_requests
+            .borrow()
+            .iter()
+            .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))));
+    }
+
+    #[gpui::test]
+    fn quick_edit_flag_pushed_to_grid_and_cleared(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        // Type-to-replace pushes quick_edit = true.
+        upd(&h, cx, |c, window, cx| c.begin_typed("v", window, cx));
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(true),
+            "type-to-replace pushes quick_edit=true to the grid"
+        );
+        // Opening the in-cell editor pushes quick_edit = false.
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx)
+        });
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "the in-cell editor is never quick-edit"
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_cleared_in_grid_push_after_commit(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.handle_data_row_edit_key("down", plain(), window, cx);
+        });
+        // The commit clears the mirror and quick_edit for the grid.
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false)
+        );
+        assert_eq!(
+            last_edit_state(&h.grid_requests.borrow()).and_then(|(m, _, _)| m),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_preserves_tab_and_enter(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        // Tab still commits + moves right in quick-edit.
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.handle_data_row_edit_key("tab", plain(), window, cx)
+        });
+        assert!(consumed);
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+        // Enter still commits + moves down.
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.test_press_enter(false, window, cx);
+        });
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Down))
+        )));
+    }
+
+    #[gpui::test]
+    fn quick_edit_escape_resets_flag(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "42");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.escape_edit(window, cx);
+        });
+        // Escape ends the edit; the grid's quick_edit copy is cleared.
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false)
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
     }
 
     #[gpui::test]

@@ -1535,6 +1535,7 @@ fn make_chrome_grid_sink(
                 mirror,
                 in_cell,
                 cap,
+                quick_edit,
             } => {
                 // Deferred: the chrome may be emitting this from inside the grid's own `update`
                 // (a grid-originated type-to-replace / in-cell trigger), so touching the grid now
@@ -1542,9 +1543,12 @@ fn make_chrome_grid_sink(
                 let mirror = mirror.clone();
                 let in_cell = *in_cell;
                 let cap = cap.clone();
+                let quick_edit = *quick_edit;
                 window.defer(cx, move |_window, cx| {
                     if let Some(grid) = grid.upgrade() {
-                        grid.update(cx, |g, cx| g.set_edit_state(mirror, in_cell, cap, cx));
+                        grid.update(cx, |g, cx| {
+                            g.set_edit_state(mirror, in_cell, cap, quick_edit, cx)
+                        });
                     }
                 });
             }

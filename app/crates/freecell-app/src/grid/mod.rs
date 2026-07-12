@@ -26,6 +26,7 @@ use freecell_chart_model::{Anchor, ChartId};
 use freecell_core::selection::Direction;
 use freecell_core::{CellRange, CellRef, SelectionModel};
 
+pub(crate) use view::caret_intent_modifiers;
 pub use view::{GridDataSources, GridView};
 
 // --- Look constants (`ui_design.md §3.3`) -------------------------------------------

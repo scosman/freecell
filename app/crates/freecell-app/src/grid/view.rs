@@ -17,8 +17,8 @@ use parking_lot::RwLock;
 
 use gpui::{
     canvas, deferred, div, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context, Entity,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Rgba, SharedString, Window,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, Window,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
@@ -55,6 +55,17 @@ const RESIZE_HOTSPOT_HALF: f32 = 3.0;
 /// Minimum column width / row height a resize drag clamps to (`functional_spec.md §5.1`).
 const MIN_COL_WIDTH_PX: f32 = 8.0;
 const MIN_ROW_HEIGHT_PX: f32 = 12.0;
+
+/// Whether a keystroke's modifiers signal **caret / selection intent** for quick-edit
+/// (`functional_spec.md §5.3`): Shift, Cmd/Ctrl (`platform`/`control`), or Alt/Option. Deliberately
+/// **excludes** `function` — macOS sets `Modifiers::function` on the arrow / Home / End cluster
+/// itself, so `Modifiers::modified()` would report a *plain* arrow as modified and defeat §5.2's
+/// commit-and-move on macOS. This mirrors [`command_for_key`](super::input::command_for_key), which
+/// decomposes arrows into `(secondary, shift)` and never consults `function`. Shared by the data-row
+/// and in-cell arrow arms so both apply the identical rule.
+pub(crate) fn caret_intent_modifiers(modifiers: &Modifiers) -> bool {
+    modifiers.shift || modifiers.control || modifiers.alt || modifiers.platform
+}
 
 /// The worker-written / UI-read data the grid renders from (`components/grid.md §Public
 /// interface`). In Phase 6 these are built from hand fixtures ([`super::fixtures`]); the
@@ -254,6 +265,13 @@ pub struct GridView {
     incell_input: Option<Entity<InputState>>,
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
+    /// Whether the current pending edit is in **quick-edit** mode (pushed by the chrome via
+    /// [`set_edit_state`](Self::set_edit_state), `functional_spec.md §5`). Consumed by the grid-root
+    /// `capture_key_down` so an unmodified arrow in the in-cell overlay commits + moves the active
+    /// cell instead of the caret. In the current flow type-to-replace edits in the data row and
+    /// `begin_in_cell` clears quick-edit, so this is a defensive symmetric mirror of the data-row
+    /// path (only ever `true` while an edit is live).
+    quick_edit: bool,
 
     /// The charts painted on each sheet's **ChartLayer** (P8/P11, `charts/architecture.md §4.2`,
     /// §5 challenge 5), keyed by sheet. See [`SheetChartLayer`]: the per-sheet spec list is **shared**
@@ -468,6 +486,7 @@ impl GridView {
             incell_open: None,
             incell_input: None,
             incell_cap: None,
+            quick_edit: false,
             charts: HashMap::new(),
             selected_chart: None,
             chart_drag: None,
@@ -624,9 +643,11 @@ impl GridView {
         mirror: Option<(SheetId, CellRef, SharedString)>,
         incell_open: Option<CellRef>,
         incell_cap: Option<SharedString>,
+        quick_edit: bool,
         cx: &mut Context<Self>,
     ) {
         self.mirror = mirror;
+        self.quick_edit = quick_edit;
         // Opening the in-cell editor ends any grid selection drag at its root (BUG #2): a drag armed
         // before the editor opened must not survive into (or past) the editor's lifetime. The
         // overlay `.occlude()`s the follow-up mouse-up, so the grid would never clear such a drag,
@@ -3547,10 +3568,11 @@ impl Render for GridView {
                 if this.incell_open.is_none() {
                     return;
                 }
+                let modifiers = event.keystroke.modifiers;
                 match event.keystroke.key.as_str() {
                     "tab" => {
                         cx.stop_propagation();
-                        let dir = if event.keystroke.modifiers.shift {
+                        let dir = if modifiers.shift {
                             Direction::Left
                         } else {
                             Direction::Right
@@ -3561,6 +3583,26 @@ impl Render for GridView {
                     "escape" => {
                         cx.stop_propagation();
                         this.events.emit(&GridEvent::InCellCancel, window, cx);
+                    }
+                    // Quick-edit: an unmodified arrow commits + moves the active cell
+                    // (`functional_spec.md §5.2`), reusing the Tab commit-move plumbing. Uses the
+                    // shared caret-intent predicate (excludes `function`, which macOS sets on the
+                    // arrow cluster) so a plain arrow still moves. Defensive symmetric mirror of the
+                    // data-row path — type-to-replace edits in the data row, and `begin_in_cell`
+                    // clears quick-edit, so the in-cell overlay is not open in quick-edit today; kept
+                    // in sync so a future overlay-hosted quick-edit works.
+                    key @ ("left" | "right" | "up" | "down")
+                        if this.quick_edit && !caret_intent_modifiers(&modifiers) =>
+                    {
+                        cx.stop_propagation();
+                        let dir = match key {
+                            "left" => Direction::Left,
+                            "right" => Direction::Right,
+                            "up" => Direction::Up,
+                            _ => Direction::Down,
+                        };
+                        this.events
+                            .emit(&GridEvent::InCellCommitMove(dir), window, cx);
                     }
                     _ => {}
                 }
@@ -3603,6 +3645,13 @@ impl GridView {
     #[cfg(test)]
     pub(crate) fn incell_open_for_test(&self) -> Option<CellRef> {
         self.incell_open
+    }
+
+    /// Test seam: whether the grid's copy of the chrome's quick-edit flag is set (proves
+    /// [`set_edit_state`](Self::set_edit_state) threads it, `functional_spec.md §5`).
+    #[cfg(test)]
+    pub(crate) fn quick_edit_for_test(&self) -> bool {
+        self.quick_edit
     }
 
     /// Emits [`GridEvent::InCellCommitMove`] exactly as the `capture_key_down` Tab handler does — for
@@ -4231,7 +4280,7 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
                     events.borrow_mut().clear();
                     // A printable key and an arrow both no-op while the overlay owns the keyboard.
                     grid.handle_key_down(&key_ev("x", Some("x"), false), window, cx);
@@ -4247,6 +4296,29 @@ mod tests {
             "the in-cell overlay must own the keyboard: {:?}",
             events.borrow()
         );
+    }
+
+    #[gpui::test]
+    fn set_edit_state_threads_quick_edit(cx: &mut TestAppContext) {
+        // The chrome pushes quick-edit through the edit-state; the grid stores it for its in-cell
+        // arrow branch (`functional_spec.md §5`).
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, cx);
+                    assert!(
+                        grid.quick_edit_for_test(),
+                        "quick_edit must thread through set_edit_state"
+                    );
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
+                    assert!(
+                        !grid.quick_edit_for_test(),
+                        "quick_edit clears when pushed false"
+                    );
+                });
+            })
+            .unwrap();
     }
 
     // ---- Phase 7: structure (resize, header selection, merge-menu) ------------------------
@@ -4562,7 +4634,7 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
                 });
                 input
             })
@@ -4640,7 +4712,7 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input, cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
                 });
             })
             .unwrap();
@@ -4715,7 +4787,7 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
                     grid.mouse_down_cell(
                         2,
                         2,
@@ -4764,13 +4836,13 @@ mod tests {
                     );
                     assert!(grid.has_active_drag(), "a single click arms a cell drag");
                     // Open the editor → the drag must be cleared at the root.
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
                     assert!(
                         !grid.has_active_drag(),
                         "opening the in-cell editor clears the pre-armed drag"
                     );
                     // Close the editor; the drag must stay cleared (no move-gate applies now).
-                    grid.set_edit_state(None, None, None, cx);
+                    grid.set_edit_state(None, None, None, false, cx);
                     assert!(
                         !grid.has_active_drag(),
                         "the drag stays cleared after the editor closes"

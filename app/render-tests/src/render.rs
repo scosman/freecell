@@ -123,6 +123,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             Some((sheet, CellRef::new(row, col), text.into())),
                             None,
                             None,
+                            false,
                             cx,
                         );
                     }
@@ -133,7 +134,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             state
                         });
                         view.set_incell_input(input, cx);
-                        view.set_edit_state(None, Some(CellRef::new(row, col)), None, cx);
+                        view.set_edit_state(None, Some(CellRef::new(row, col)), None, false, cx);
                     }
                     view
                 });

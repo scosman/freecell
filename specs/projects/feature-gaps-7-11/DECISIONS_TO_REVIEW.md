@@ -3,7 +3,16 @@
 Judgment calls made during coding that a human may want to sanity-check. One bullet per call,
 tagged by phase.
 
+> **Phase 8 closeout sweep (2026-07-12).** Every decision below was reviewed at the render-
+> validation + closeout phase. All are **accepted as shipped** (per-phase note under each heading),
+> and the Phase 8 full pixel suite re-confirmed all 136 committed baselines byte-match (no incidental
+> regression). **One item is still OPEN:** the Phase 4 "Replace All is N undo steps" decision
+> (§Phase 4, first bullet) — its single-undo fix is **Phase 9** (a standalone `scosman/ironcalc`
+> fork fix, `UserModel::set_user_inputs`) and is **NOT yet done**. Phase 9 has not been started.
+
 ## Phase 2 — Quick-edit mode (§5)
+
+*Sweep (Phase 8): all three calls accepted as shipped.*
 
 - **"Modified arrow" excludes the `function` modifier (cross-platform fix).** The caret-intent
   predicate is `shift || control || alt || platform` (shared helper `grid::caret_intent_modifiers`),
@@ -39,6 +48,11 @@ tagged by phase.
   wiring back to the chrome.
 
 ## Phase 3 — Text spill / overflow (§2)
+
+*Sweep (Phase 8): all accepted as shipped. The three legitimately-changed pre-existing baselines
+(`cell_text_clipped`, `grid_mixed_content`, `font_size_24_row_grown`) were re-confirmed byte-matching
+their committed versions in the Phase 8 full-suite run — no reviewer took the "block the neighbour"
+cosmetic option, so they stay as the genuine spills the feature produces.*
 
 - **Width gate is a cheap gpui-free ESTIMATE, not a real glyph measure.** `architecture.md §2.1.2`
   wanted to avoid a per-cell glyph measurement on the render hot path. I gate spill with
@@ -87,8 +101,14 @@ tagged by phase.
 
 ## Phase 4 — Find / replace (§4)
 
+*Sweep (Phase 8): all calls accepted as shipped **except the first bullet** — **Replace All is N undo
+steps**, whose single-undo fix remains **OPEN and deferred to Phase 9** (a standalone `scosman/ironcalc`
+fork fix + the two FreeCell call-site swaps). **Phase 9 is NOT yet done.** The other four Phase-4 calls
+(search.svg from the bundle, `ReplaceOne` worker-computes, select-on-open via `on_next_frame`, toggle
+glyph + non-degraded search button) are accepted as-is.*
+
 - **Replace All is N undo steps for now — its own final phase (Phase 9) delivers single-undo via a
-  standalone ironcalc fork fix (verified IronCalc gap).** `functional_spec.md §4.4` requires Replace
+  standalone ironcalc fork fix (verified IronCalc gap). — STILL OPEN (Phase 9 not started).** `functional_spec.md §4.4` requires Replace
   All to be ONE undoable batch. IronCalc **can't** group scattered writes from FreeCell's accessible
   API: paste's single-undo mechanism (`History::push` / `UserModel::push_diff_list`) is `pub(crate)`,
   and the public rectangle pastes (`paste_csv_string` clears+rewrites the whole rectangle;
@@ -142,6 +162,9 @@ tagged by phase.
 
 ## Phase 6b — Sheet reorder wiring + tab drag (§6)
 
+*Sweep (Phase 8): all five calls accepted as shipped. (Phase 6a's fork `set_worksheet_index` — folded
+into `freecell-fixes`, no upstream PR yet by owner's choice — is recorded in `phase_plans/phase_6a.md`.)*
+
 - **Drag `on_mouse_move` / `on_mouse_up` live on the tab-bar CONTAINER, not per-tab (as the task
   literally suggested).** gpui gates `on_mouse_move` on `hitbox.is_hovered` — a per-tab move handler
   only fires while *that* tab is under the pointer, so it goes dead the instant the drag crosses onto
@@ -189,6 +212,10 @@ tagged by phase.
   stuck indicator is ever observed in practice.
 
 ## Phase 7 — Auto-grow rows (§3)
+
+*Sweep (Phase 8): all six calls accepted as shipped. The six net-new `autogrow_` baselines they produced
+were re-confirmed byte-matching in the Phase 8 full-suite run, and the isolation finding (zero
+pre-existing baselines moved) holds.*
 
 - **Wrap auto-grow is a CACHE-ONLY geometry update — it never touches IronCalc, `ops_seen`, or the
   undo stacks — so it adds NO user-visible undo step (§3.4).** `architecture.md §3.2` said heights

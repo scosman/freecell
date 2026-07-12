@@ -69,7 +69,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       auto-grow. Unit + worker + `render_tests.sh test autogrow_`. *(Moves pixels — baselines
       in Phase 8.)*
 
-- [ ] **Phase 8 — Render validation + closeout** (§8): full pixel suite under a ~10-min
+- [x] **Phase 8 — Render validation + closeout** (§8): full pixel suite under a ~10-min
       watchdog; regenerate + **eyeball** the intentional `spill_` + `autogrow_` baseline
       changes and commit them; dispatch the CI `render` gate on the branch and confirm green;
       final Xvfb smoke of the chrome features (find bar, tab drag, quick-edit); update

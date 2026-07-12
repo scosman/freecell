@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: Feature Gaps 7_11
@@ -78,6 +78,13 @@ A cell's text spills iff **all** of:
 - **Center-aligned** text: spills **both** directions (text centered over the run of empty
   cells on both sides).
 
+**Scope note (approved 2026-07-12):** rightward spill (left/general-aligned text) is the
+**must-have** — it's the overwhelmingly common case. The left/center variants are
+Excel-accurate but **punt-able**: if wiring alignment-aware bidirectional spill into the
+render path proves disproportionately complex, ship rightward-only first and leave
+left/center spill (right-aligned text clips as today) as a fast-follow. Architecture calls
+whether both fit cheaply.
+
 ### 2.3 How far it spills
 
 - Spill extends across **consecutive empty** neighbor cells in the spill direction and
@@ -126,6 +133,14 @@ A cell's text spills iff **all** of:
 
 A row grows its height to fit its tallest cell, so large fonts and wrapped/multiline text
 are fully visible — **unless the user has manually set that row's height**.
+
+**Sequencing note (approved 2026-07-12):** this is the trickiest feature (wrap-driven
+height needs UI-thread text measurement — see architecture) and is the **least certain**.
+It is therefore sequenced as the **last coding phase** and built to be **independently
+revertible** — dropping it must not require unwinding any other feature in this batch. The
+baseline behaviors in §3.1 (font-size + explicit-newline auto-grow) already ship and are
+**not** part of this phase's revertible scope; only the **new wrap-driven growth** (§3.2)
+and the **manual-height flag** (§3.3) are.
 
 ### 3.1 What already exists (baseline)
 

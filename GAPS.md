@@ -16,6 +16,11 @@ section). Give it: what's missing, where the spec/expectation is, severity, curr
 behavior, root cause, and a home (a `projects/*.md` note, or inline detail if small).
 Don't silently drop a gap — record it here first.
 
+**Release targets (added 2026-07-12):** every *open* gap in this file — plus newly
+identified ones — is consolidated and tagged **v0.5 / v1.0 / v2.0** in the
+[Release-target gap analysis](#release-target-gap-analysis--v05--v10--v20-2026-07-12)
+section at the bottom. When adding a new gap, also add it to the tier table there.
+
 ---
 
 ## MVP — deferred functional-spec behaviors
@@ -33,7 +38,7 @@ these are presentation / entry-point behaviors consciously deferred. Each also a
 | 2 | **`[Red]` number-format text color** | §3.6 | Mild | ✅ **Resolved (mvp-gaps Phase 1)** — the worker resolves per-cell `text_color` (explicit font colour → number-format colour); `[Red]` negatives render red | Worker doesn't publish resolved per-cell color | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
 | 3 | **Input-cap rejection message text** — "Formula too long / too deeply nested" popover | §3.3 | Mild | ✅ **Resolved (mvp-gaps Phase 1 + 2)** — a tooltip-style popover shows the length/depth reason under the **data row** (Phase 1) and the **in-cell editor** (Phase 2); dismisses on the next keystroke/focus change | `DataRowEffect::ShowCapError` was a no-op in the chrome; message-popover not built | *inline below* |
 | 4 | **macOS Finder open-file** — double-click / `open -a` / drag-onto-Dock | §2.1 | Moderate | Only the **CLI-argv** open path is wired; the primary-platform "double-click a file" flow does not open it | Pinned gpui rev's `on_open_urls` callback lacks a context (`cx`) arg | *inline below* |
-| 5 | **Bundled Inter font** — ship Inter via `add_fonts` at startup | §3.3/§3.6 | Nicety (not a functional gap) | App renders on the platform default font; render baselines pinned to the CI runner image | Fonts not vendored; `register_fonts` is a documented no-op | [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md) |
+| 5 | **Bundled Inter font** — ship Inter via `add_fonts` at startup | §3.3/§3.6 | Nicety (not a functional gap) | ✅ **Resolved (2026-07-06)** — Inter (SIL OFL) vendored at `crates/freecell-app/assets/fonts/inter/` and registered at startup (`shell/fonts.rs`); grid + chrome render Inter on every platform, and baselines were regenerated on it | (was) Fonts not vendored; `register_fonts` was a documented no-op | [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md) |
 
 ### Detail for the two without a dedicated note
 
@@ -68,9 +73,9 @@ deferred dispatch; then map the incoming URLs through the existing `do_open_path
 ### When picking these up
 
 Items **#1, #2, and #3 are RESOLVED** by the `specs/projects/mvp-gaps` build (Phases 1–2 —
-publication type/color + type-aware alignment + the cap-error popover). **Still open:** #4
-(macOS Finder open-file — needs a gpui-capability spike before estimating) and #5 (bundled
-Inter font — a nicety, not a functional gap). Neither is blocked by the other.
+publication type/color + type-aware alignment + the cap-error popover), and **#5 (bundled
+Inter font) is RESOLVED** (vendored + registered 2026-07-06). **Still open:** #4 only
+(macOS Finder open-file — needs a gpui-capability spike before estimating).
 
 ---
 
@@ -147,7 +152,7 @@ N engine undo steps until then.
 | **Find (Cmd+F) / replace** ✅ **Resolved (feature-gaps-7-11 Phase 4)** | Moderate | Find-only would cover most usage; replace adds engine-write fan-out. **Shipped:** a ⌘F find/replace bar (worker-side search over the used range, match-case + whole-cell toggles, Next/Prev with wrap, single Replace, and Replace All with one eval/publish). Residual: Replace All is single-*undo* only after the **open** Phase 9 fork fix (`UserModel::set_user_inputs`); today it records N engine undo entries. |
 | **Autofit column width** (double-click header divider) | Mild | Pairs with the resize UI shipping in `mvp-gaps`; needs text measurement over the column's cells. |
 | **Cmd+arrow jumps to edge-of-*sheet*, not edge-of-*data*** | Mild | MVP behavior (spec §3.2) is the nonstandard one; edge-of-data needs a cheap occupied-extent query. |
-| **Recent files on Welcome window** | Mild | Spec'd out of MVP (§2.2); needs a small persisted MRU store. |
+| **Recent files on Welcome window** ✅ **Resolved (recent-files-welcome project)** | Mild | **Shipped:** persisted MRU store (`freecell-core/recent.rs` + `shell/recents.rs`), surfaced as the welcome-window recents list + the File ▸ Open Recent submenu. |
 | **Freeze panes** | Moderate | Viewport-split rendering + scroll clamping in the custom grid — real complexity, defer until asked for. Engine side is trivial when picked up: `UserModel::set_frozen_rows_count/set_frozen_columns_count` exist and are undoable (2026-07-04 audit). |
 | **Sort / filter** | Moderate | Large feature (engine ops + UI + selection semantics); own project when picked up. |
 | **Text overflow into empty neighbors + wrap** ✅ **Resolved (feature-gaps-7-11 Phases 3 & 7)** | Moderate | Spec §3.6 clips at cell boundary; overflow needs neighbor-emptiness lookups on the render path, wrap needs row-height interaction. **Shipped:** Excel-style horizontal **spill** of wrap-off text over empty neighbours — direction from alignment (general/left → right, right → left, center → both), stops at the first cell with content (fills/borders don't stop it), never past the publication-covered region (Phase 3); and wrap-on **row auto-grow** (Phase 7 — see F1 below). |
@@ -259,4 +264,139 @@ border formatting). Recorded so the follow-up isn't lost.
 | F1 | **Wrap text auto-grows row height** — a wrapped cell should expand its row to fit all lines (true Excel wrap) | `formatting-expansion/functional_spec.md` §1.2 | Moderate | ✅ **Resolved (feature-gaps-7-11 Phase 7).** Wrap-on cells now auto-grow their row: the render/UI thread measures each dirty wrap-on cell's wrapped height at its column width (line count × gpui line-height), takes the row max, and drives an **auto** row height — capped at `MAX_AUTO_ROW_HEIGHT_PX` (240px ≈ 10 lines; content beyond clips within the cell) — that a **manual** row resize still overrides (session-scoped manual-rows set). Auto rows shrink back when tall content is removed or the column widens. Session-scoped: not persisted to xlsx (recomputed on open), matching the manual-flag posture. Previously shipped as "wrap within current row height" (option 2A). | (was) No content-driven variable row height in the grid. | **Done** (Phase 7). Auto-grow is cache-only geometry (no undo step, §3.4); the pre-existing font-size + explicit-newline auto-grow paths are unchanged. Related survey row: "Text overflow into empty neighbors + wrap" above. |
 | F2 | **Border restyle-all with no target selected (P2)** — adjusting style/color with no "which lines" target selected restyles all existing borders in the selection in place | `formatting-expansion/functional_spec.md` §2.5 | Mild | MVP: with no target selected, changing a control only updates the pen (what the next target click paints); existing borders are untouched. | Restyle-in-place needs read-modify-write of each cell's existing edges (preserve which edges exist, swap style/color) rather than the type-based paint the target path uses. | Build on the border pipeline once shipped: enumerate existing edges in the selection, re-emit each with the new pen. |
 | F3 | **Dotted + dash-dot border line styles** — not offered in the line-style gallery | `formatting-expansion/functional_spec.md` §2.3 | Mild | Gallery ships thin/medium/thick solid + dashed + double. Dotted and dash-dot are absent. | **Dotted:** at IronCalc 0.7.1 `Dotted` degraded to `Thin` on `.xlsx` import → shipping it would silently lose the style on round-trip; dropped rather than degrade. **Dash-dot:** niche; skipped to keep the new render-pattern work minimal. | Dotted: verify/fix the fork's import path (per fix-upstream policy), then add the gallery entry + dot render pattern. Dash-dot: add the gallery entry + dash-dot render pattern. Each is small once the dashed/double render path exists. |
+
+---
+
+## Release-target gap analysis — v0.5 / v1.0 / v2.0 (2026-07-12)
+
+A full-product gap analysis vs. the brand-name spreadsheets (Excel / Google Sheets /
+Numbers), grounded in a source inventory of what is actually implemented today
+(`app/crates` sweep + the round-2/3 engine audits). **Every open gap gets a target-release
+tag here** — both the gaps already logged above (linked back to their detail rows) and
+newly identified ones (marked **NEW**, with the feature-exists check noted). The detailed
+sections above remain the log of record; an open row above inherits the tier assigned here.
+
+**Release tiers (product definitions):**
+
+- **v0.5 — a pretty good spreadsheet.** Can't do everything the brand names can, but
+  ~90% task coverage at great UX. Daily home use feels complete, nothing embarrassing in
+  the first hour. *Current chart coverage (8 types: line, area, column, bar, pie,
+  doughnut, scatter, bubble; insert/move/resize/delete + edit panel) is already at the
+  v0.5 bar.*
+- **v1.0 — ~95% feature coverage.** Most home users who don't have 80 functions
+  memorized are fully happy; same high usability bar. Not yet for banks / complex
+  workloads.
+- **v2.0 — ~99% feature coverage.** Pivot tables, more chart types, power-user data
+  tools.
+
+**Where FreeCell stands today (inventory summary, 2026-07-12):** solid core editing
+(in-cell + data-row editing, quick-edit, undo/redo, range clipboard + TSV, find/replace,
+insert/delete rows/cols, sheet add/rename/delete/reorder, resize), solid formatting
+(font/size/B/I/U/S, text+fill color, borders, alignment, wrap + row auto-grow, 7
+number-format presets), 8 chart types with live-bound editing, xlsx open/save with
+`.back` backup, recent files + welcome window, multiple windows. Engine (IronCalc fork):
+345/506 Excel functions (81.5% of the common set), 96.4% golden-suite correctness,
+high-fidelity styles, engine-owned display formatting incl. custom format codes.
+
+### v0.5 — table stakes for "pretty good" (target: ~90% at great UX)
+
+Ordered roughly by how fast a new user hits the gap.
+
+| Gap | Logged? | Readiness / notes |
+|---|---|---|
+| **Cell-area right-click context menu** (cut/copy/paste/clear, insert/delete rows/cols, format…) | Above (Post-MVP survey) | First thing users try; header + chart menus exist, the cell body has none (`grid/view.rs` `handle_right_mouse_down` just dismisses). Cheap now that range clipboard is in. |
+| **Fill down/right (⌘D/⌘R) + drag fill handle + series autofill** (1,2,3… / Jan,Feb…) | Above (Post-MVP survey) | Engine ready & undoable: `UserModel::auto_fill_rows/auto_fill_columns` incl. sequence detection. The fill handle is *the* signature spreadsheet affordance; its absence reads instantly as "not a real spreadsheet". |
+| **Basic sort** (A→Z / Z→A on a selection/column, header-aware) | Above ("Sort / filter" — split) | Sort is v0.5; **filter is v1.0**. Needs an engine range-sort op (fork) + UI entry points (context menu / action bar). |
+| **Freeze panes** | Above + [`projects/freeze-panes.md`](projects/freeze-panes.md) | Frozen header rows are near-universal in real sheets. Engine fully ready (`set_frozen_rows_count/…`, undoable, round-trips); the work is split-viewport rendering in the custom grid. |
+| **Merged cells — render + selection (tiers a+b)** | Above + [`projects/merged-cells.md`](projects/merged-cells.md) | Zero engine changes, plan written. Files containing merges are everywhere; today they render as broken-looking separate cells. (Merge/unmerge **UI** = v1.0.) |
+| **Autofit column width / row height** (double-click header divider) | Above (Post-MVP survey) | Pairs with shipped drag-resize; needs text measurement over the column. Wrap-driven row auto-grow already exists. |
+| **⌘+arrow → edge-of-data** (not edge-of-sheet) | Above (Post-MVP survey) | Still sheet-edge (`freecell-core/selection.rs:40`). Muscle-memory breaker for anyone from Excel/Sheets; needs a cheap occupied-extent query. |
+| **Hide / unhide rows & columns** | **NEW** (checked: no command/UI; engine `Row.hidden` round-trips but has no `UserModel` setter; `Col` has no hidden field at all) | Header context-menu entries. Engine half is fork work (row setter + column-hidden modelling/round-trip, upstreamed per policy). |
+| **Status bar with selection stats** (Sum · Avg · Count, click for Min/Max) | **NEW** (checked: no status bar exists) | Hallmark great-UX cheap win — everyone totals a selection this way. Values are already in the published viewport; render-side only. |
+| **Number-format preset breadth** (thousands-separator style, currency-symbol choice, more date/time forms, scientific/fraction) | **NEW** (checked: 7 presets + decimals ± only, `freecell-core/format_ui.rs:42`) | Engine renders arbitrary format codes already — this is purely widening the UI preset list. (Custom format-code **editor** = v1.0.) |
+| **Paste values** (⌘⇧V minimum paste-special) | **NEW** (checked: Shift+V reserved but unbound, `grid/input.rs:66`) | "Paste without formatting / without formulas" is a daily op. Full paste-special dialog = v1.0. |
+| **CSV/TSV import + export** | **NEW** (checked: engine open/save is xlsx-only) | Opening a downloaded `.csv` is a top-3 home task. Import can reuse the TSV-paste parsing; export walks the used range. Decide: open-as-untitled-workbook (simple) vs. true csv save-in-place. |
+| **Function autocomplete + signature hints** (type `=SU` → SUM, SUMIF…; show arg template) | **NEW** (checked: data row is a plain input; no completion logic anywhere) | This *is* the "don't have 80 functions memorized" bar — start it at v0.5. Needs a FreeCell-static function list (the engine's 345-variant `Function` enum is private). |
+| **Formula range highlighting + point-mode** (colored refs while editing; click/drag a range to insert it) | **NEW** (checked: no reference-insert / highlight code) | The other half of formula-entry UX; without point-mode every formula must be typed by hand. Engine's public `Lexer`/`Parser` AST can drive tokenization. |
+| **Missing everyday scalar functions + TRIM bug** (SUMPRODUCT, TRANSPOSE, PROPER, REPLACE, CHAR, CODE, CLEAN, DOLLAR, ADDRESS, HYPERLINK-fn, PERCENTILE.INC, QUARTILE.INC, XMATCH; TRIM doesn't collapse internal runs) | Partially (round-2 SP3 findings; not previously in GAPS) | ~14 independently-implementable engine functions — clean one-per-PR upstream candidates per the fork policy. SUMPRODUCT/TRANSPOSE absence bites real home sheets. |
+| **Warn-before-strip on save** | Above (listed as intentional MVP exclusion) + [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md) | Promote to v0.5: one honest dialog ("this file contains comments/validation/… FreeCell won't preserve") before a destructive save. Full **preservation** (pass-through) = v1.0. |
+| **Render-fidelity polish pair** (fill covers interior gridlines; full-row selection darkens row header) | Above (render-baseline eyeball 2026-07-06) | Both cheap, both instantly visible quality signals. |
+| **macOS Finder open-file** (double-click / drag-to-Dock) | Above (MVP #4) | Primary-platform basics; needs the gpui `on_open_urls` spike first. |
+
+### v1.0 — the 95% bar (home users fully happy)
+
+| Gap | Logged? | Readiness / notes |
+|---|---|---|
+| **Dynamic arrays + spill** (FILTER, SORT, SORTBY, UNIQUE, SEQUENCE, TAKE/DROP, HSTACK/VSTACK, TEXTSPLIT…; XLOOKUP spilling; `#SPILL!`; spill refs `A1#`) | Above (listed as intentional exclusion, §8) + round-2 SP3 (0/17 category) | **The single biggest engine gap** — a *capability* (spill semantics in the value/cell-ownership model), not 17 functions. Modern Excel/Sheets users hit `=FILTER(...)` fast; flagged in both round-2 and round-3 syntheses as the explicit product decision. Fork/upstream scale: large. |
+| **Function coverage → ~95% of the common set** (compat-alias shim: MODE, PERCENTILE, QUARTILE, RANK, STDEV, VAR…; remaining text/financial/stat) | **NEW** (round-2 SP3: 345/506 overall, 81.5% common; aliases 0%) | The alias shim is thin (modern `.INC`/`.S` forms mostly exist). Lookup 63.6% / text 51.2% / financial 50.9% are the weak categories. |
+| **Conditional formatting** (rules: cell-value, top/bottom, data bars, color scales; render + round-trip) | **NEW** (checked: engine has no CF type/field at all; round-3 B audit) | The most-used "serious" formatting feature. Full-stack: engine modelling + xlsx round-trip (fork/upstream) + rule UI + render. Flagged OPEN in both syntheses. |
+| **Data validation + in-cell dropdowns** | **NEW** (checked: engine ignores `<dataValidation>` on import, writes none) | List-validation dropdowns are everywhere in shared sheets. Engine modelling + round-trip + dropdown UI; also removes one strip-on-save data-loss class. |
+| **Filter (AutoFilter dropdowns)** | Above ("Sort / filter") | The v1.0 half of sort/filter. Filter UI + engine row-visibility; interacts with hidden-rows (v0.5) plumbing. |
+| **Merge / unmerge UI** (tier c) | Above + [`projects/merged-cells.md`](projects/merged-cells.md) | Blocked on a fork `UserModel` merge API (upstream preferred) + the structural-edit adjustment landmine. |
+| **Comments/notes — view + preserve** (authoring welcome, threading = v2.0) | **NEW** (checked: engine imports comments, **drops them on export**; no create/edit API) | Silent comment loss is a trust-breaker on shared files. Minimum: preserve on save + hover-view; fork work. |
+| **Hyperlinks** (open, create/edit, preserve) | **NEW** (checked: engine neither imports nor exports hyperlinks) | Common in home sheets (link lists, indexes). Fork modelling + UI (click-to-open, ⌘K to add). |
+| **Named ranges — name box + manager** | **NEW** (checked: engine API fully ready — `new/update/delete_defined_name`, undoable, both scopes; zero UI) | Also delivers **go-to**: today's ref box is read-only (`chrome/view.rs` `ref_box_text`). Editable name box = navigate + define names; small manager dialog for the rest. |
+| **Zoom control** | Above (Post-MVP survey) | Accessibility + big-monitor basics; known high blast radius (geometry, hit-testing, baselines) — schedule deliberately. |
+| **Multi-area selection (⌘-click)** | Above + [`projects/disjoint-selection.md`](projects/disjoint-selection.md) | Core `SelectionModel` refactor; ripples into render/motion/clipboard/formatting. |
+| **Excel clipboard interop** (HTML / rich flavors both directions) | [`projects/excel-clipboard.md`](projects/excel-clipboard.md) | Today external clipboard is TSV-only — formatting is lost pasting to/from Excel, Sheets, Numbers. |
+| **Paste special — full** (formats-only, transpose, skip blanks, add/multiply) | **NEW** | Builds on v0.5 paste-values. |
+| **Per-cell relative fill on paste-fill** (U2) | Above (`mvp-gaps` accepted deviations) | Needs an engine relative-fill API or relaxing the one-undo-step constraint. |
+| **Cut visual indicator** (marching ants / dimmed source, Esc cancels) | Above (accepted deviations) | Cheap cue; today ⌘X looks identical to copy. |
+| **Replace All = single undo** (fork `set_user_inputs`) | Above (feature-gaps-7-11 residual, Phase 9) | Standalone fork fix, already scoped. |
+| **Format painter** | **NEW** (checked: absent) | One-click style copy; style read/write plumbing already exists. |
+| **Custom number-format editor** (format-code entry w/ live preview) | **NEW** | Engine already renders arbitrary codes — UI-only. |
+| **Print / export PDF** | **NEW** (checked: no print or PDF path) | Even home users occasionally print. Stage it: export-PDF (paginate the styled grid) first; real print dialogs later. Big; start design early. |
+| **Autosave + crash recovery** | **NEW** (checked: `.back` first-save backup exists; no periodic snapshot / reopen-after-crash) | We're alpha with a full-strip writer — periodic recovery snapshots close the data-loss window between explicit saves. |
+| **IME / international text input** (+ dead keys, decimal-comma entry) | [`projects/ime-text-input.md`](projects/ime-text-input.md) | Blocks CJK + many European users entirely; carries a cheap gpui probe first. |
+| **`.xlsx` unknown-part preservation** (zip-level pass-through) | [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md) | The v1.0 half of the save-fidelity story (v0.5 = warn). Pass-through keeps charts we don't own, pivots, images, VBA… intact instead of stripped. |
+| **Sheet management extras** (duplicate sheet, tab colors, hide/unhide sheets) | **NEW** (checked: no UI/commands; engine has `hide_sheet`/`unhide_sheet`/`set_sheet_color`; duplicate needs fork work) | Rounds out the tab bar; hide-sheets is common in template files. |
+| **Gridlines toggle** (per-sheet, persisted) | **NEW** (checked: gridlines unconditional in `grid/mod.rs`; engine models `set_show_grid_lines` + round-trips) | Small; engine-ready. |
+| **Entry shortcuts bundle** (F4 abs/rel reference cycling, Ctrl+Enter fill-selection, ⌘;/⌘⇧; date/time stamps) | **NEW** | Small individually; batch them like feature-gaps-7-11. |
+| **Show formulas toggle** (⌘`) | **NEW** | Cheap view mode; pairs with formula-UX work. |
+| **Cross-app file-fidelity defaults** (persist `sheetFormatPr` defaults + workbook font; Excel-like default column width on foreign files; Inter fallback for missing explicit fonts) | Above ("Engine defaults — cross-app fidelity") | Three known rows; fork + FreeCell halves already sketched. |
+| **Action-bar overflow** (small windows) + **TSV-paste empty-token clearing** | Above (accepted deviations) | Both small; fold into a polish batch. |
+| **Incremental / interruptible recalc** | **NEW as a logged gap** (plan-of-record caveat: every edit runs full-workbook `evaluate()`, ~2s at 1M cells, non-cancellable — round-2 synthesis "source of every caveat") | Orthogonal to feature coverage but core to the product promise ("stupid-fast on huge sheets") — a v1.0 quality bar. Engine-side (fork/upstream) dirty-graph or at least cancellable eval. |
+| **Charts — v1.0 fidelity batch** (dashed/compound line styles C-P13-3; minor gridlines C-P13-4; legend-chip alpha C-P13-5; bubble authoring size-bind C-P26-1; gap/overlap edit + clamp C-P22-1; `c:f` rewrite on sheet rename; panel range-picking UX) | Above (charts sections) + [`projects/chart-cf-rewrite-on-rename.md`](projects/chart-cf-rewrite-on-rename.md), [`projects/chart-panel-range-pick.md`](projects/chart-panel-range-pick.md) | Keeps chart *types* at the (already good) v0.5 set while closing the known fidelity/editing residuals. |
+| **Border polish** (F2 restyle-in-place; F3 dotted + dash-dot styles) | Above (Formatting expansion F2/F3) | F3's dotted half is gated on a fork import fix per policy. |
+
+### v2.0 — the 99% bar (power features)
+
+| Gap | Logged? | Readiness / notes |
+|---|---|---|
+| **Pivot tables** | **NEW** (checked: nothing engine- or UI-side; never modeled by IronCalc) | The headline v2.0 feature (owner-named). Whole-stack: engine aggregation model + xlsx round-trip + dedicated UI. Until then, pass-through preservation (v1.0) keeps foreign pivots from being destroyed. |
+| **More chart types** (combo/dual-axis, radar, stock, histogram/Pareto, waterfall, treemap, sunburst, funnel, box & whisker; true 3-D render — today 3-D degrades to 2-D honestly) | **NEW** (checked: `ChartKind` = bar/line/area/pie/scatter/bubble; unsupported kinds → placeholder, 3-D → degraded 2-D) | Owner-named v2.0. Combo (line+column, secondary axis) should lead — it's the most-requested beyond the basics. |
+| **Sparklines** | **NEW** | In-cell mini-charts; independent of the chart layer's anchored model. |
+| **Chart trendlines + error bars** | **NEW** | Natural follow-on to the v1.0 chart fidelity batch. |
+| **Tables / structured references** (ListObjects: banded styles, header/total rows, auto-expand, `Table1[Col]` refs) | **NEW** (checked: never modeled; stripped on save) | Big engine + formula-language surface; also unlocks better sort/filter UX. |
+| **LET / LAMBDA + helper family** (BYROW, BYCOL, MAP, REDUCE, SCAN) | Round-2 SP3 (absent) | Power-user formula layer; sequence after dynamic arrays (v1.0) since the helpers assume arrays. |
+| **Outline / group rows-cols** (+ SUBTOTAL-driven collapse UX) | **NEW** | Common in finance-shaped sheets; render + engine `<outlinePr>` round-trip. |
+| **Data tools** (text-to-columns, remove duplicates, flash-fill-style splitting) | **NEW** | Classic data-cleanup trio. |
+| **Sheet & workbook protection** (locked cells, protected sheets, password) | **NEW** (checked: not modeled) | Needed once files are shared for real; round-trip first (don't strip), enforce later. |
+| **Split panes** (independent of freeze) | **NEW** | Reuses the freeze-panes viewport-split machinery (v0.5). |
+| **Dark mode / app theming + cell styles gallery / document themes** | **NEW** (checked: fixed light palette) | App-wide render work; baselines double. |
+| **Images & shapes on sheets** (render + insert; preserve arrives with v1.0 pass-through) | **NEW** | The drawing layer already exists for charts; images are the next drawing kind. |
+| **Goal seek** (what-if) | **NEW** | Small solver loop over the engine; disproportionate power-user credibility. |
+| **Iterative calculation option** (circular refs currently → typed `#CIRC!`) | Round-3 D findings (by design) | Opt-in max-iterations/delta mode like Excel; engine work. |
+| **External workbook links** (`[Book1.xlsx]Sheet1!A1`) | **NEW** | Rare at home, table stakes at banks — deliberately last. |
+| **Comments — authoring + threads** | **NEW** (view/preserve = v1.0) | |
+| **Session restore** (reopen last windows/files on launch) | **NEW** | |
+| **Localization pass** (locale number formats incl. date ids 14–22 (E3), decimal-comma locales, translated UI) | Above (E3) + partially NEW | Pairs with IME (v1.0); E3's residual numFmt ids land here. |
+| **Remaining accepted-deviation tails** (row/col font band for future cells; oneCell/absoluteAnchor chart resize C-P18-1; rotated-axis-title font C-P13-1; line-label offset C-FB1-1) | Above | All Mild, all currently non-manifesting or cosmetic. |
+
+### Out of scope / release-orthogonal (tracked, but not tier-tagged)
+
+- **Windows + Linux ports** ([`projects/windows-port.md`](projects/windows-port.md)) —
+  platform reach, not feature coverage; packaging is wired, app halves untouched. Decide
+  commercially, not by tier.
+- **Release signing + pre-distribution security audit**
+  ([`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md),
+  [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)) —
+  **prerequisites for the first public binary** (i.e. before any v0.5 ships), not feature gaps.
+- **Real-time collaboration / co-editing** — beyond v2.0; note the engine already carries
+  replica-sync primitives (`flush_send_queue`/`apply_external_diffs`, round-3 B audit) if
+  this is ever picked up.
+- **VBA / macros / scripting** — non-goal to *execute*; v1.0 pass-through preservation
+  must keep macro parts intact so FreeCell never corrupts a macro workbook.
+- **Accessibility (screen readers)** — gated on gpui capabilities at the pinned rev;
+  probe alongside any gpui bump.
 

@@ -261,11 +261,26 @@ pub enum Command {
     },
     /// Set the height of an inclusive row run `[row_start, row_end]` (0-based) to `px` **device
     /// px** (`functional_spec.md §5.1`). Geometry-only (no evaluation); cf. [`Command::SetColumnWidths`].
+    /// A **user** row-resize — so the worker marks the run **manual**, exempting it from wrap-driven
+    /// auto-grow (`functional_spec.md §3.3`).
     SetRowHeights {
         sheet: SheetId,
         row_start: u32,
         row_end: u32,
         px: f64,
+    },
+    /// Wrap-driven row auto-grow (`functional_spec.md §3.2`, `architecture.md §3`): the UI measured
+    /// each 0-based `row`'s wrapped height (device px) on the render thread — the worker can't (no
+    /// gpui text system). **Distinct** from [`Command::SetRowHeights`] so the worker knows these are
+    /// **auto** (never marked manual). Applied as a **cache-only** geometry update — final row height
+    /// = `max(base IronCalc height, wrap)`, clamped to the cap — so it never shrinks below a
+    /// font/newline auto-fit, **skips manual rows**, does **not** touch IronCalc / `ops_seen` / the
+    /// undo stack (rides the causing edit — no separate undo step, §3.4), and republishes only when a
+    /// height actually changed. A per-row value `<= default` drops that row's wrap contribution
+    /// (shrink on unwrap / clear / column-widen).
+    AutoGrowRowHeights {
+        sheet: SheetId,
+        heights: Vec<(u32, f32)>,
     },
     /// Insert `count` blank rows so new rows appear at 0-based `row` (`functional_spec.md §5.3`);
     /// content at/after `row` shifts down and formulas adjust. Undoable; needs evaluation. The

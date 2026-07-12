@@ -16,9 +16,9 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use gpui::{
-    canvas, deferred, div, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context, Entity,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, Window,
+    canvas, deferred, div, font, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context,
+    Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, LineFragment, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, Window,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
@@ -26,7 +26,7 @@ use gpui_component::{Icon, IconName, Sizable as _};
 
 use freecell_chart_model::{ChartId, ChartSpec};
 
-use freecell_core::cache::SheetCaches;
+use freecell_core::cache::{SheetCaches, DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX};
 use freecell_core::color::Rgb;
 use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
@@ -55,6 +55,12 @@ const RESIZE_HOTSPOT_HALF: f32 = 3.0;
 /// Minimum column width / row height a resize drag clamps to (`functional_spec.md §5.1`).
 const MIN_COL_WIDTH_PX: f32 = 8.0;
 const MIN_ROW_HEIGHT_PX: f32 = 12.0;
+
+/// gpui's default text line-height multiple — the golden ratio `phi` (`gpui::geometry::phi` =
+/// `relative(1.618034)`, applied as `Style::line_height`). The wrap auto-grow measurement uses the
+/// SAME factor so a grown row fits exactly the number of lines gpui renders (a smaller factor would
+/// under-grow and clip the top line).
+const GRID_LINE_HEIGHT_FACTOR: f32 = 1.618_034;
 
 /// Whether a keystroke's modifiers signal **caret / selection intent** for quick-edit
 /// (`functional_spec.md §5.3`): Shift, Cmd/Ctrl (`platform`/`control`), or Alt/Option. Deliberately
@@ -287,6 +293,32 @@ pub struct GridView {
     chart_drag: Option<ChartDrag>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
+
+    // ---- Wrap-driven row auto-grow (`functional_spec.md §3`) ----------------------------------
+    /// Reused per-frame buffer of the visible **wrap-on, non-empty** cells (populated in
+    /// `build_grid_layers` on the render path only — the perf harness leaves it empty). The
+    /// post-layout auto-grow pass measures these to grow their rows to fit the wrapped text.
+    wrap_cells: Vec<WrapCell>,
+    /// Per active-sheet 0-based row → the last-measured **signature** of its wrap inputs
+    /// (content / font / column width — NOT the row height). A row is re-measured only when its
+    /// signature changes, so a height-only republish never re-triggers auto-grow: the feedback loop
+    /// converges in one frame (`architecture.md §3.2`). Cleared on sheet switch.
+    wrap_sig: HashMap<u32, u64>,
+}
+
+/// A visible wrap-on, non-empty cell captured during the frame build, carrying exactly what the
+/// post-layout auto-grow measurement needs (`architecture.md §3.2`): the committed text, the
+/// resolved font (size / weight / style / family), and the cell's column width. Collected instead
+/// of measured inline because measurement needs the render thread's `Window` (a text system), which
+/// `build_grid_layers` doesn't hold.
+struct WrapCell {
+    row: u32,
+    text: SharedString,
+    font_px: f32,
+    bold: bool,
+    italic: bool,
+    font_family: Option<SharedString>,
+    col_w: f32,
 }
 
 /// One sheet's installed charts (P11, `charts/architecture.md §5` challenge 5, "off-screen free").
@@ -510,6 +542,8 @@ impl GridView {
             selected_chart: None,
             chart_drag: None,
             chart_menu: None,
+            wrap_cells: Vec::new(),
+            wrap_sig: HashMap::new(),
         }
     }
 
@@ -761,6 +795,9 @@ impl GridView {
         self.resize_drag = None;
         self.resize_preview = None;
         self.header_menu = None;
+        // The wrap-measurement signatures are per-sheet; drop them so the new sheet's wrap rows are
+        // measured fresh (heights themselves live in the worker's cache, so this only re-measures).
+        self.wrap_sig.clear();
         cx.notify();
     }
 
@@ -2184,6 +2221,10 @@ impl GridView {
         // Deferred text-spill paints (`functional_spec.md §2`); typically empty. Painted after
         // the cell + border layers so spilled text sits over the neighbours' fills/gridlines.
         let mut spill_plans: Vec<SpillPlan> = Vec::new();
+        // Reset the wrap-on-cell buffer the post-layout auto-grow pass reads (`functional_spec.md
+        // §3`). Only the real render path fills it; the perf harness (`timing` set) leaves it empty
+        // so its measurement is untouched.
+        self.wrap_cells.clear();
 
         for r in frame.rows.clone() {
             for c in frame.cols.clone() {
@@ -2225,6 +2266,27 @@ impl GridView {
                         .filter(|name| !name.is_empty())
                         .cloned()
                 });
+
+                // Auto-grow (`functional_spec.md §3`): capture each committed **wrap-on**, non-empty
+                // cell so the post-layout pass (which has the render thread's text system) can
+                // measure its wrapped height at the column width `w`. Mirrored (being-edited) cells
+                // carry `attr_style: None`, so the `.wrap` gate skips them; only the real render path
+                // collects (`timing.is_none()`) — the perf harness stays allocation-light.
+                if timing.is_none() {
+                    if let Some(s) = attr_style {
+                        if s.wrap && !text.is_empty() {
+                            self.wrap_cells.push(WrapCell {
+                                row: r,
+                                text: text.clone().into(),
+                                font_px: font_px_of(s),
+                                bold: s.bold,
+                                italic: s.italic,
+                                font_family: font_family.clone(),
+                                col_w: w,
+                            });
+                        }
+                    }
+                }
 
                 // Text spill (`functional_spec.md §2`): a committed, wrap-off TEXT cell whose text
                 // overflows its column spills over empty neighbours in its alignment direction.
@@ -2686,6 +2748,171 @@ impl GridView {
         }
 
         root_children
+    }
+
+    /// The wrap-driven row-height a set of same-row wrap-on cells needs (`functional_spec.md §3.2`):
+    /// the **max** over the cells of each cell's own wrapped height. A cell's height is
+    /// `lines * line_height + vpad`, where `lines` is its soft-wrap line count at the column width
+    /// (from gpui's real `LineWrapper`, so the grown row fits the text the grid actually paints,
+    /// summed over its explicit-`\n` segments) and `line_height` is gpui's default **`phi`** line box
+    /// (`round(1.618 * font_px)`, matching `Style::line_height` — NOT a made-up factor, so the row
+    /// fits the rendered lines exactly). `vpad` is the slack a single default line leaves in the
+    /// default row height, so a one-line default cell measures to the default. Clamped to
+    /// `[default, MAX_AUTO_ROW_HEIGHT_PX]` (content beyond the cap clips within the cell).
+    fn measure_wrap_height(cells: &[&WrapCell], window: &mut Window) -> f32 {
+        let line_px = |font_px: f32| (GRID_LINE_HEIGHT_FACTOR * font_px).round();
+        // The vertical slack a default single line leaves (so `lines == 1` at the default size ⇒ the
+        // default row height).
+        let vpad = DEFAULT_ROW_HEIGHT_PX - line_px(CELL_FONT_PX);
+        let mut needed = DEFAULT_ROW_HEIGHT_PX;
+        for wc in cells {
+            let avail = (wc.col_w - 2.0 * CELL_H_PAD).max(1.0);
+            let family = wc
+                .font_family
+                .clone()
+                .unwrap_or_else(|| SharedString::from(GRID_FONT_FAMILY));
+            let mut cell_font = font(family);
+            if wc.bold {
+                cell_font = cell_font.bold();
+            }
+            if wc.italic {
+                cell_font = cell_font.italic();
+            }
+            let mut wrapper = window.text_system().line_wrapper(cell_font, px(wc.font_px));
+            // Each explicit-newline segment wraps independently; visual lines = boundaries + 1.
+            let lines: u32 = wc
+                .text
+                .split('\n')
+                .map(|segment| {
+                    1 + wrapper
+                        .wrap_line(&[LineFragment::text(segment)], px(avail))
+                        .count() as u32
+                })
+                .sum();
+            let cell_h = lines as f32 * line_px(wc.font_px) + vpad;
+            needed = needed.max(cell_h);
+        }
+        needed.clamp(DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX)
+    }
+
+    /// A per-row signature of the wrap inputs (content / font / column width) that drive its wrapped
+    /// height — deliberately **excluding the row height** so a height-only republish leaves it
+    /// unchanged (the convergence guard, `architecture.md §3.2`).
+    fn wrap_row_signature(cells: &[&WrapCell]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for wc in cells {
+            wc.text.hash(&mut hasher);
+            wc.font_px.to_bits().hash(&mut hasher);
+            wc.bold.hash(&mut hasher);
+            wc.italic.hash(&mut hasher);
+            wc.font_family.hash(&mut hasher);
+            wc.col_w.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// The post-layout wrap auto-grow pass (`functional_spec.md §3`, run from [`Render::render`]):
+    /// group this frame's visible wrap-on cells by row, measure the rows whose wrap **inputs**
+    /// changed since last frame (plus rows that stopped wrapping → shrink to default), and emit one
+    /// [`GridEvent::AutoGrowRows`] with the measured heights. Clearing the dirty rows by storing the
+    /// fresh signature is what makes the loop converge: after the worker applies the height and
+    /// republishes, the re-render measures the same inputs → same signature → no re-emit.
+    fn run_autogrow(&mut self, frame: &Frame, window: &mut Window, cx: &mut Context<Self>) {
+        // Zero-cost early-out for the overwhelmingly common case (no wrap-on cells anywhere in the
+        // viewport, and none previously grown): the whole pass is skipped, so a normal sheet pays
+        // nothing per frame. When wrap-on cells ARE visible the pass is O(visible wrap cells): it
+        // re-hashes each wrapped cell's text every frame to detect input changes (measurement itself
+        // is gated on that signature, so it only runs on a real change). Re-hashing short, rare wrap
+        // text on idle repaints is cheap; a coarser gate was avoided because a style-only edit
+        // (font/wrap-toggle) doesn't bump the publication generation, so it would risk missing a
+        // genuine change. Accepted tradeoff.
+        if self.wrap_cells.is_empty() && self.wrap_sig.is_empty() {
+            return;
+        }
+        // Group the frame's wrap-on cells by row (indices into `self.wrap_cells`).
+        let mut by_row: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, wc) in self.wrap_cells.iter().enumerate() {
+            by_row.entry(wc.row).or_default().push(i);
+        }
+
+        let mut heights: Vec<(u32, f32)> = Vec::new();
+        let mut fresh_sigs: HashMap<u32, u64> = HashMap::with_capacity(by_row.len());
+        for (row, idxs) in &by_row {
+            let cells: Vec<&WrapCell> = idxs.iter().map(|&i| &self.wrap_cells[i]).collect();
+            let sig = Self::wrap_row_signature(&cells);
+            fresh_sigs.insert(*row, sig);
+            if self.wrap_sig.get(row) != Some(&sig) {
+                let px = Self::measure_wrap_height(&cells, window);
+                heights.push((*row, px));
+            }
+        }
+
+        // Shrink: a row that used to wrap but has no wrap-on cell this frame (wrap toggled off,
+        // content cleared) — and is still in the visible range — is told to drop its wrap
+        // contribution (the worker floors it at the base / default). Bounded by the small
+        // `wrap_sig` set.
+        let visible = frame.rows.clone();
+        let shrunk: Vec<u32> = self
+            .wrap_sig
+            .keys()
+            .copied()
+            .filter(|row| !by_row.contains_key(row) && visible.contains(row))
+            .collect();
+        for row in shrunk {
+            heights.push((row, DEFAULT_ROW_HEIGHT_PX));
+            self.wrap_sig.remove(&row);
+        }
+
+        // Commit the fresh signatures (measured rows are no longer dirty → convergence).
+        for (row, sig) in fresh_sigs {
+            self.wrap_sig.insert(row, sig);
+        }
+
+        if !heights.is_empty() {
+            self.events
+                .emit(&GridEvent::AutoGrowRows { heights }, window, cx);
+        }
+    }
+
+    /// Render-test hook (`render.rs`): the pixel harness renders a single static frame over a
+    /// shut-down worker, so the live measure→worker→republish loop can't round-trip in-capture.
+    /// This runs the **real** wrap measurement once, up front, and applies each grown height
+    /// **directly** to the shared cache the grid reads — for rows **without** an existing non-default
+    /// override, emulating the worker's manual-skip (a file/injected custom height = manual). It
+    /// mutates only the cache (never the worker), and is never called by the app.
+    pub fn autogrow_measure_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (vw, vh) = self.viewport_wh(window);
+        let Some(frame) = self.resolve_frame(vw, vh) else {
+            return;
+        };
+        // Populate `self.wrap_cells` for the frame (discard the built layers).
+        let _ = self.build_grid_layers(&frame, None);
+
+        let mut by_row: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, wc) in self.wrap_cells.iter().enumerate() {
+            by_row.entry(wc.row).or_default().push(i);
+        }
+        let mut grown: Vec<(u32, f32)> = Vec::new();
+        for (row, idxs) in &by_row {
+            let cells: Vec<&WrapCell> = idxs.iter().map(|&i| &self.wrap_cells[i]).collect();
+            grown.push((*row, Self::measure_wrap_height(&cells, window)));
+        }
+
+        {
+            let mut caches = self.sources.caches.write();
+            if let Some(cache) = caches.get_mut(self.active_sheet) {
+                for (row, px) in grown {
+                    // A row already carrying a non-default height is treated as manual (file/injected
+                    // custom height) — auto-grow leaves it. An auto (default) row grows to fit.
+                    let has_override = (cache.row_height(row) - DEFAULT_ROW_HEIGHT_PX).abs() > 0.5;
+                    if !has_override && px > DEFAULT_ROW_HEIGHT_PX + 0.5 {
+                        cache.set_row_height(row, px);
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// The divider resize hotspots — a 6 px `col-resize` / `row-resize` zone centered on each
@@ -3285,8 +3512,10 @@ fn cell_element(
         // has a definite width. Wrap it in a full-width content box (which sets `whitespace_normal`,
         // overriding the cell's base `whitespace_nowrap`) so gpui wraps at the column width.
         // Horizontal placement moves from the flex's justify-content to the box's text-align; the
-        // outer flex's `items_*` still positions the whole block vertically, and `overflow_hidden`
-        // clips the lines that don't fit the row height (no auto-grow — GAPS F1).
+        // outer flex's `items_*` still positions the whole block vertically. The row now auto-grows
+        // to fit the wrapped lines (`functional_spec.md §3`, the render-thread measurement pass), so
+        // `overflow_hidden` only clips content beyond the auto-grow cap `MAX_AUTO_ROW_HEIGHT_PX` (or
+        // a manually-shrunk row).
         let h_align = style
             .and_then(|s| s.h_align)
             .unwrap_or_else(|| kind.default_align());
@@ -3710,6 +3939,11 @@ impl Render for GridView {
             }
 
             root_children.extend(self.build_grid_layers(&frame, None));
+            // Wrap-driven row auto-grow (`functional_spec.md §3`): measure the just-laid-out wrap-on
+            // cells and, for rows whose wrap inputs changed, ask the worker to grow/shrink them.
+            // Runs after the layer build (which filled `self.wrap_cells`) so it has the real column
+            // widths; the emit routes to `Command::AutoGrowRowHeights`.
+            self.run_autogrow(&frame, window, cx);
             // Divider resize hotspots paint last (over the header strips) so they win the hit-test.
             root_children.extend(self.resize_hotspots(&frame, cx));
         }
@@ -4456,6 +4690,178 @@ mod tests {
             Root::new(g, window, cx)
         });
         (out.expect("grid built"), window, events)
+    }
+
+    /// A long single line that wraps to several visual lines at a narrow column — the auto-grow
+    /// measurement fixture.
+    const WRAP_LONG: &str = "this note wraps across several visual lines at a narrow column width";
+
+    /// Sources with a wrap-on long-text cell at B2, optionally a second wrap-on cell at B3 carrying
+    /// a manual row-height override (for the harness-hook skip test).
+    fn wrap_sources(col_w: f32, b3_override: Option<f32>) -> (GridDataSources, SheetId) {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::{CellKind, Publication, PublishedCell};
+        let sheet = SheetId(0);
+        let wrap = RenderStyle {
+            wrap: true,
+            ..RenderStyle::default()
+        };
+        let cell = |row, col, text: &str| PublishedCell {
+            row,
+            col,
+            display_text: text.to_string(),
+            kind: CellKind::Text,
+            text_color: None,
+        };
+        let mut builder = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .col_width(1, col_w)
+        .cell_style(1, 1, wrap);
+        let mut cells = vec![cell(1, 1, WRAP_LONG)];
+        if let Some(h) = b3_override {
+            builder = builder.cell_style(2, 1, wrap).row_height(2, h);
+            cells.push(cell(2, 1, WRAP_LONG));
+        }
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, builder.build());
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells,
+        };
+        (
+            GridDataSources {
+                publication: Arc::new(ArcSwap::from_pointee(publication)),
+                caches: Arc::new(RwLock::new(caches)),
+            },
+            sheet,
+        )
+    }
+
+    /// A recording `GridView` over the given sources (mirrors [`grid_recording`] but lets the caller
+    /// pick the sources — the auto-grow fixtures need a wrap-on cell).
+    #[allow(clippy::type_complexity)]
+    fn recording_over(
+        cx: &mut TestAppContext,
+        sources: GridDataSources,
+    ) -> (
+        gpui::Entity<GridView>,
+        gpui::WindowHandle<Root>,
+        Rc<RefCell<Vec<GridEvent>>>,
+    ) {
+        cx.update(gpui_component::init);
+        let events: Rc<RefCell<Vec<GridEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let ev = events.clone();
+        let mut out: Option<gpui::Entity<GridView>> = None;
+        let slot = &mut out;
+        let window = cx.open_window(size(px(1200.0), px(800.0)), |window, cx| {
+            let sink = GridEventSink::new(move |e, _w, _cx| ev.borrow_mut().push(e.clone()));
+            let g = cx.new(|cx| GridView::new(sources, sink, cx));
+            *slot = Some(g.clone());
+            Root::new(g, window, cx)
+        });
+        (out.expect("grid built"), window, events)
+    }
+
+    /// The heights carried by the single `AutoGrowRows` the recording captured, or `None`.
+    fn captured_autogrow(events: &Rc<RefCell<Vec<GridEvent>>>) -> Option<Vec<(u32, f32)>> {
+        events.borrow().iter().find_map(|e| match e {
+            GridEvent::AutoGrowRows { heights } => Some(heights.clone()),
+            _ => None,
+        })
+    }
+
+    /// Runs the real post-layout auto-grow pass once (resolve a frame, fill the wrap buffer, measure
+    /// + emit) — the render-path measurement without a full paint.
+    fn drive_autogrow(
+        cx: &mut TestAppContext,
+        g: &gpui::Entity<GridView>,
+        window: &gpui::WindowHandle<Root>,
+    ) {
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame resolves");
+                    let _ = grid.build_grid_layers(&frame, None);
+                    grid.run_autogrow(&frame, window, cx);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn autogrow_measures_wrapped_height_and_emits_once_then_converges(cx: &mut TestAppContext) {
+        // A wrap-on long-text cell at a narrow column is measured to a height > default and emitted
+        // ONCE; a second identical pass emits nothing — the wrap-input signature is unchanged, so a
+        // height-only republish never re-triggers auto-grow (convergence, no oscillation).
+        let (sources, _sheet) = wrap_sources(80.0, None);
+        let (g, window, events) = recording_over(cx, sources);
+
+        drive_autogrow(cx, &g, &window);
+        let heights = captured_autogrow(&events).expect("first pass emits AutoGrowRows");
+        assert_eq!(heights.len(), 1, "one dirty wrap row");
+        let (row, px) = heights[0];
+        assert_eq!(row, 1);
+        assert!(
+            px > DEFAULT_ROW_HEIGHT_PX + 1.0,
+            "the narrow wrap row grew beyond default (got {px})"
+        );
+
+        // Second pass over the same inputs → the dirty set is empty → NO further command.
+        events.borrow_mut().clear();
+        drive_autogrow(cx, &g, &window);
+        assert!(
+            captured_autogrow(&events).is_none(),
+            "a settled wrap row must not re-emit (converges in one step)"
+        );
+    }
+
+    #[gpui::test]
+    fn autogrow_narrower_column_grows_taller(cx: &mut TestAppContext) {
+        // Narrowing the column produces more wrapped lines → a taller measured height (§3.2).
+        let measure = |cx: &mut TestAppContext, col_w: f32| -> f32 {
+            let (sources, _s) = wrap_sources(col_w, None);
+            let (g, window, events) = recording_over(cx, sources);
+            drive_autogrow(cx, &g, &window);
+            captured_autogrow(&events).expect("emits")[0].1
+        };
+        let wide = measure(cx, 200.0);
+        let narrow = measure(cx, 60.0);
+        assert!(
+            narrow > wide + 1.0,
+            "narrower column grows the row taller (narrow {narrow} vs wide {wide})"
+        );
+    }
+
+    #[gpui::test]
+    fn autogrow_measure_now_grows_default_but_skips_overridden(cx: &mut TestAppContext) {
+        // The render-harness hook grows a default-height wrap row and leaves an already-overridden
+        // (manual) wrap row untouched.
+        let (sources, sheet) = wrap_sources(80.0, Some(30.0));
+        let (g, window, _events) = recording_over(cx, sources);
+        let (grown, manual) = window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.autogrow_measure_now(window, cx);
+                    let guard = grid.sources.caches.read();
+                    let cache = guard.get(sheet).unwrap();
+                    (cache.row_height(1), cache.row_height(2))
+                })
+            })
+            .unwrap();
+        assert!(
+            grown > DEFAULT_ROW_HEIGHT_PX + 1.0,
+            "the default wrap row grew (got {grown})"
+        );
+        assert!(
+            (manual - 30.0).abs() < 0.6,
+            "the manually-sized wrap row is unchanged (got {manual})"
+        );
     }
 
     fn key_ev(key: &str, key_char: Option<&str>, shift: bool) -> KeyDownEvent {

@@ -250,6 +250,10 @@ render_cases! {
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
     cell_wrap_multiline_clipped,
     cell_valign_top, cell_valign_middle, cell_valign_bottom, cell_wrap_valign_bottom,
+    // Auto-grow rows (Phase 7): wrap-driven growth, column-width response, manual-wins, cap clip,
+    // and the retained large-font regression.
+    autogrow_wrap_grows, autogrow_narrow_col_more_lines, autogrow_wide_col_fewer_lines,
+    autogrow_manual_row_unchanged, autogrow_cap_clip, autogrow_large_font_grows,
     // Text spill / overflow (Phase 3): direction-aware spill, stop conditions, non-spill types
     spill_right_over_empties, spill_left_right_aligned, spill_center_both,
     spill_stop_at_nonempty, spill_over_fill_only_neighbor, spill_wrap_on_no_spill,

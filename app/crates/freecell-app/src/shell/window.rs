@@ -1433,6 +1433,17 @@ fn make_grid_sink(
             };
             client.send(cmd);
         }
+        // Wrap-driven auto-grow (`functional_spec.md §3`): the grid measured these row heights on
+        // the render thread; route them to the worker as the distinct cache-only command (auto rows
+        // only — never marks them manual, adds no undo step).
+        GridEvent::AutoGrowRows { heights } => {
+            if !heights.is_empty() {
+                client.send(Command::AutoGrowRowHeights {
+                    sheet: shared.active_sheet.get(),
+                    heights: heights.clone(),
+                });
+            }
+        }
         GridEvent::InsertRows { at, count } => client.send(Command::InsertRows {
             sheet: shared.active_sheet.get(),
             row: *at,

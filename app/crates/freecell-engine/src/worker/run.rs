@@ -23,7 +23,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Instant;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use freecell_core::input_cap::validate_input;
 use freecell_core::merge_guard::{blocks_col_op, blocks_row_op};
@@ -237,6 +237,19 @@ pub(super) struct Worker {
     /// the chart follows the rename on save (`live_sheet_targets` resolves `SheetId → current
     /// name`). Empty for a workbook never opened from a file, or if the map couldn't be read.
     chart_sheet_parts: HashMap<SheetId, String>,
+    /// Per-sheet **manually-resized** 0-based rows (`functional_spec.md §3.3`). A row enters when a
+    /// **user** [`Command::SetRowHeights`] commits, or is seeded at first cache build from a loaded
+    /// `custom_height` row. Wrap-driven auto-grow ([`Command::AutoGrowRowHeights`]) never touches a
+    /// manual row (neither grows nor shrinks it) and never adds to this set. **Session-scoped** — not
+    /// persisted to xlsx (a reloaded file's non-custom-height rows start auto).
+    manual_rows: HashMap<SheetId, HashSet<u32>>,
+    /// Per-sheet **wrap-driven** row heights (device px) the UI measured on the render thread — the
+    /// auto-grow **contribution** kept separate from IronCalc's own row heights (font/newline
+    /// auto-fit / user resize). The resident cache's height for such a row is
+    /// `max(base_ironcalc, wrap)`; holding the wrap part here lets it **survive a full cache rebuild**
+    /// (resize / insert / delete / band edit) — re-projected in [`build_and_store_cache`] — instead of
+    /// being wiped back to the IronCalc base. Only ever holds **auto** rows (manual rows are dropped).
+    wrap_heights: HashMap<SheetId, BTreeMap<u32, f32>>,
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -292,6 +305,8 @@ impl Worker {
             // discovered" so save takes the plain path without a wasted walk.
             charts_fully_discovered: matches!(source, DocumentSource::NewWorkbook),
             chart_sheet_parts: HashMap::new(),
+            manual_rows: HashMap::new(),
+            wrap_heights: HashMap::new(),
         };
 
         // Point the active sheet at the first sheet's real stable id, and seed an empty
@@ -366,6 +381,10 @@ impl Worker {
         // aligned (`functional_spec.md §4`).
         let mut find_ops: Vec<(SheetId, String, bool, bool)> = Vec::new();
         let mut replace_ops: Vec<Command> = Vec::new();
+        // Wrap-driven auto-grow (`Command::AutoGrowRowHeights`): a cache-only geometry update
+        // applied after the edit batch (so it sees the batch's fresh IronCalc row heights as its
+        // `base`). Never an IronCalc edit → rides no undo/touch stack (§3.4).
+        let mut autogrow_ops: Vec<(SheetId, Vec<(u32, f32)>)> = Vec::new();
         let mut viewport_changed = false;
         // Every sheet activated in this drained batch (in order), so lazy chart discovery walks
         // EACH one — not just the batch's final active sheet (a batch that activates A then B must
@@ -399,6 +418,9 @@ impl Worker {
                 } => find_ops.push((sheet, query, match_case, whole_cell)),
                 replace @ (Command::ReplaceOne { .. } | Command::ReplaceAll { .. }) => {
                     replace_ops.push(replace)
+                }
+                Command::AutoGrowRowHeights { sheet, heights } => {
+                    autogrow_ops.push((sheet, heights))
                 }
                 Command::Save { path, req_id } => saves.push((path, req_id)),
                 Command::Shutdown => shutdown = true,
@@ -476,6 +498,13 @@ impl Worker {
             {
                 self.apply_set_font(sheet, range, family, size_pt);
             }
+        }
+
+        // Wrap-driven auto-grow after the edit + font batches (so the font auto-grow already set
+        // its IronCalc base height): a cache-only geometry update per sheet, riding no undo/touch
+        // stack (`functional_spec.md §3.4`).
+        for (sheet, heights) in autogrow_ops {
+            self.apply_auto_grow(sheet, heights);
         }
 
         // Chart ops after the edit batch (each is standalone: it mutates the authored/loaded chart
@@ -584,6 +613,22 @@ impl Worker {
         // reconcile without threading a flag out of every undo path.
         let sheets_before = self.sheet_metas();
 
+        // A user row-resize (`SetRowHeights`) marks its rows **manual** (exempt from wrap auto-grow,
+        // §3.3). Collected before the apply closure moves `valid`; applied only after a successful
+        // apply so the marks land before this batch's cache rebuild re-projects wrap heights.
+        let resized_rows: Vec<(SheetId, u32, u32)> = valid
+            .iter()
+            .filter_map(|e| match e {
+                Command::SetRowHeights {
+                    sheet,
+                    row_start,
+                    row_end,
+                    ..
+                } => Some((*sheet, *row_start, *row_end)),
+                _ => None,
+            })
+            .collect();
+
         self.emit(WorkerEvent::EvalStarted);
 
         // The IronCalc apply+eval is the only panic-prone region (round-3 D belt-and-braces).
@@ -657,6 +702,11 @@ impl Worker {
                 }
                 if applied == 0 {
                     return false;
+                }
+                // Mark user-resized rows manual BEFORE the cache rebuild below re-projects wrap
+                // heights, so the resize wins over any prior auto-grow contribution.
+                for (sheet, start, end) in &resized_rows {
+                    self.mark_rows_manual(*sheet, *start, *end);
                 }
                 if needs_eval {
                     self.eval_count += 1;
@@ -1392,7 +1442,7 @@ impl Worker {
     /// pathologically large one — falls back to a full (populated-cell-bounded) rebuild that reads
     /// the bands back from the engine. Non-band ranges take the cheap per-cell path, plus a
     /// row-height mirror (a value edit can auto-fit a row taller).
-    fn refresh_cache_cells(&self, refresh: &[(SheetId, CellRange)]) -> Vec<SheetId> {
+    fn refresh_cache_cells(&mut self, refresh: &[(SheetId, CellRange)]) -> Vec<SheetId> {
         let caches = Arc::clone(&self.shared.caches);
         let mut touched: Vec<SheetId> = Vec::new();
         for (sheet, range) in refresh {
@@ -1427,10 +1477,33 @@ impl Worker {
                         }
                     }
                     // Mirror IronCalc's row-height auto-fit over the touched rows (one axis
-                    // rebuild). Cheap: a non-band range spans a bounded number of rows.
+                    // rebuild). Cheap: a non-band range spans a bounded number of rows. CRITICAL:
+                    // fold in the persisted wrap-driven contribution here too — otherwise a cheap
+                    // per-cell refresh (a value/style edit to ANY cell in the row, e.g. a short cell
+                    // beside a wrapped notes cell) would reset the row to the IronCalc base and
+                    // collapse a wrap-grown row, which the render thread would NOT re-measure (the
+                    // wrapped cell's inputs didn't change). `manual` rows keep their IronCalc height;
+                    // auto rows take `max(base, wrap)`, exactly as `project_wrap_heights` does on a
+                    // full rebuild.
+                    let manual = self.manual_rows.get(sheet);
+                    let wrap = self.wrap_heights.get(sheet);
+                    let default_px = freecell_core::cache::DEFAULT_ROW_HEIGHT_PX;
                     let heights: Vec<(u32, Option<f32>)> = range
                         .rows()
-                        .map(|row| (row, cache::row_override_px(&self.doc, idx, row)))
+                        .map(|row| {
+                            let base = cache::row_override_px(&self.doc, idx, row);
+                            if manual.is_some_and(|m| m.contains(&row)) {
+                                return (row, base);
+                            }
+                            let wrap_px = wrap.and_then(|w| w.get(&row)).copied().unwrap_or(0.0);
+                            let final_px = base.unwrap_or(default_px).max(wrap_px);
+                            let target = if (final_px - default_px).abs() < AUTO_GROW_EPS_PX {
+                                None
+                            } else {
+                                Some(final_px)
+                            };
+                            (row, target)
+                        })
                         .collect();
                     cache.set_row_heights(&heights);
                 }
@@ -1453,7 +1526,7 @@ impl Worker {
     /// (correct-but-plain) instead. (`build_sheet_cache`'s getters only error on an invalid sheet
     /// index, and callers resolve the index first, so the `Err` path is effectively unreachable
     /// today; the drop keeps the invariant robust regardless.)
-    fn build_and_store_cache(&self, sheet: SheetId) -> bool {
+    fn build_and_store_cache(&mut self, sheet: SheetId) -> bool {
         let idx = match self.resolve(sheet) {
             Some(i) => i,
             None => {
@@ -1462,7 +1535,18 @@ impl Worker {
             }
         };
         match cache::build_sheet_cache(&self.doc, idx) {
-            Ok(built) => {
+            Ok(mut built) => {
+                // Seed the manual set on the FIRST build for this sheet from the freshly built
+                // cache's height overrides — a loaded `custom_height` row starts **manual** so
+                // auto-grow never shrinks a file's intentional heights (§3.3). Only on the first
+                // build: a later rebuild must NOT re-derive manual from `custom_height`, because
+                // IronCalc's own font/newline auto-fit sets `custom_height` on **auto** rows too.
+                self.manual_rows
+                    .entry(sheet)
+                    .or_insert_with(|| built.row_overrides().keys().copied().collect());
+                // Re-project persisted wrap-driven heights (auto rows only) so a rebuild doesn't
+                // wipe grown rows back to the IronCalc base.
+                self.project_wrap_heights(sheet, &mut built);
                 self.shared.caches.write().insert(sheet, built);
                 true
             }
@@ -1478,10 +1562,125 @@ impl Worker {
         }
     }
 
+    /// Apply this sheet's persisted wrap-driven heights onto a freshly built cache, so grown rows
+    /// survive the rebuild. Each **auto** row's height becomes `max(built base, wrap)` — never
+    /// below a font/newline auto-fit already in the built cache. Manual rows are skipped (their
+    /// height is the IronCalc value the build already carries).
+    fn project_wrap_heights(&self, sheet: SheetId, built: &mut freecell_core::cache::SheetCache) {
+        let Some(wh) = self.wrap_heights.get(&sheet) else {
+            return;
+        };
+        let manual = self.manual_rows.get(&sheet);
+        let updates: Vec<(u32, Option<f32>)> = wh
+            .iter()
+            .filter(|(row, _)| manual.is_none_or(|m| !m.contains(*row)))
+            .map(|(&row, &wrap_px)| {
+                let final_px = built.row_height(row).max(wrap_px);
+                let target = if (final_px - freecell_core::cache::DEFAULT_ROW_HEIGHT_PX).abs()
+                    < AUTO_GROW_EPS_PX
+                {
+                    None
+                } else {
+                    Some(final_px)
+                };
+                (row, target)
+            })
+            .collect();
+        if !updates.is_empty() {
+            built.set_row_heights(&updates);
+        }
+    }
+
+    /// Mark an inclusive 0-based row run `[start, end]` **manual** (a user resize, §3.3), and drop
+    /// any wrap-driven contribution for those rows so the manual height wins outright.
+    fn mark_rows_manual(&mut self, sheet: SheetId, start: u32, end: u32) {
+        let set = self.manual_rows.entry(sheet).or_default();
+        for row in start..=end {
+            set.insert(row);
+        }
+        if let Some(wh) = self.wrap_heights.get_mut(&sheet) {
+            for row in start..=end {
+                wh.remove(&row);
+            }
+        }
+    }
+
+    /// Apply a wrap-driven row auto-grow ([`Command::AutoGrowRowHeights`]) as a **cache-only**
+    /// geometry update (`architecture.md §3`). For each `(row, wrap_px)`: manual rows are skipped;
+    /// an auto row's clamped wrap contribution is stored (or dropped when `<= default`), and the
+    /// resident cache's row height is set to `max(base IronCalc height, wrap)` — but only for rows
+    /// whose height actually changes, so a settled measurement emits no `StyleCacheUpdated` (the
+    /// convergence / no-oscillation guard). Touches neither IronCalc, `ops_seen`, nor the undo
+    /// stacks, so it adds no user-visible undo step (§3.4).
+    fn apply_auto_grow(&mut self, sheet: SheetId, heights: Vec<(u32, f32)>) {
+        if self.degraded {
+            return; // cosmetic geometry; a degraded worker silently skips it
+        }
+        let Some(idx) = self.resolve(sheet) else {
+            return;
+        };
+        let default_px = freecell_core::cache::DEFAULT_ROW_HEIGHT_PX;
+        let manual = self.manual_rows.get(&sheet).cloned().unwrap_or_default();
+        // Precompute the IronCalc base height per row BEFORE borrowing `wrap_heights` mutably.
+        let bases: Vec<(u32, f32, f32)> = heights
+            .iter()
+            .map(|(row, px)| {
+                let base = cache::row_override_px(&self.doc, idx, *row).unwrap_or(default_px);
+                (*row, base, *px)
+            })
+            .collect();
+        let wh = self.wrap_heights.entry(sheet).or_default();
+        let mut targets: Vec<(u32, Option<f32>)> = Vec::new();
+        for (row, base, px) in bases {
+            if manual.contains(&row) {
+                wh.remove(&row); // manual wins — drop any stale wrap contribution
+                continue;
+            }
+            let clamped = px.clamp(default_px, freecell_core::cache::MAX_AUTO_ROW_HEIGHT_PX);
+            if clamped > default_px + AUTO_GROW_EPS_PX {
+                wh.insert(row, clamped);
+            } else {
+                wh.remove(&row);
+            }
+            let wrap = wh.get(&row).copied().unwrap_or(0.0);
+            let final_px = base.max(wrap);
+            let target = if (final_px - default_px).abs() < AUTO_GROW_EPS_PX {
+                None
+            } else {
+                Some(final_px)
+            };
+            targets.push((row, target));
+        }
+
+        let mut changed = false;
+        {
+            let caches = Arc::clone(&self.shared.caches);
+            let mut guard = caches.write();
+            if let Some(cache) = guard.get_mut(sheet) {
+                // Only the rows whose committed height actually moves — a settled row is a no-op,
+                // so a confirming re-measure produces no command and the loop converges.
+                let real: Vec<(u32, Option<f32>)> = targets
+                    .into_iter()
+                    .filter(|(row, target)| {
+                        let want = target.unwrap_or(default_px);
+                        (cache.row_height(*row) - want).abs() > AUTO_GROW_EPS_PX
+                    })
+                    .collect();
+                if !real.is_empty() {
+                    cache.set_row_heights(&real);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+    }
+
     /// Ensure the active sheet has a resident cache, building it if absent. Returns whether this
     /// call built one (so the caller emits `StyleCacheUpdated`) — `false` if it was already
     /// resident or the build failed (in which case the entry stays absent, not stale).
-    fn ensure_active_cache_built(&self) -> bool {
+    fn ensure_active_cache_built(&mut self) -> bool {
         if self.shared.caches.read().contains(self.active_sheet) {
             return false;
         }
@@ -2740,6 +2939,11 @@ fn is_band_creating(range: &CellRange) -> bool {
 /// a pathologically large selection. Comfortably exceeds any real user selection.
 const MAX_REFRESH_CELLS: u64 = 100_000;
 
+/// Epsilon (device px) for wrap-driven row-height comparisons — a settled row (measured height ==
+/// committed height within this) is treated as unchanged, so a confirming re-measure emits no
+/// command and the feedback loop converges (`architecture.md §3`).
+const AUTO_GROW_EPS_PX: f32 = 0.5;
+
 /// The largest overscan window the worker will publish, per axis. These bounds cap the
 /// per-cell probe cost at `MAX_PUBLISH_ROWS * MAX_PUBLISH_COLS` = 131,072 cells so a
 /// pathological `SetViewport` (e.g. the whole sheet) can't wedge the worker in a billion-cell
@@ -2807,6 +3011,8 @@ mod tests {
             discovered_chart_sheets: HashSet::new(),
             charts_fully_discovered: true,
             chart_sheet_parts: HashMap::new(),
+            manual_rows: HashMap::new(),
+            wrap_heights: HashMap::new(),
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;
@@ -4907,7 +5113,7 @@ mod tests {
         // A rebuild that cannot produce a cache (here: a SheetId that no longer resolves — the
         // reachable proxy for a build error) must DROP the entry rather than leave the stale
         // pre-edit cache in place, and report failure so no StyleCacheUpdated is announced.
-        let (worker, _rx) = test_worker();
+        let (mut worker, _rx) = test_worker();
         let bogus = SheetId(9999);
         worker
             .shared
@@ -5522,6 +5728,131 @@ mod tests {
         );
     }
 
+    fn auto_grow(sheet: SheetId, heights: Vec<(u32, f32)>) -> Command {
+        Command::AutoGrowRowHeights { sheet, heights }
+    }
+
+    #[test]
+    fn auto_grow_grows_an_auto_row_without_marking_manual_or_adding_undo() {
+        // Wrap-driven auto-grow is a cache-only geometry update (`functional_spec.md §3.4`): it
+        // grows the row but does NOT mark it manual, bump the undo counter, or add an undo step.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![auto_grow(sheet, vec![(2, 96.0)])]);
+        assert!(
+            (row_h(&worker, sheet, 2) - 96.0).abs() < 1.0,
+            "auto row grew to the measured height (got {})",
+            row_h(&worker, sheet, 2)
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "auto-grow must not bump the undo op counter (no separate undo step)"
+        );
+        assert!(
+            !worker
+                .manual_rows
+                .get(&sheet)
+                .is_some_and(|m| m.contains(&2)),
+            "auto-grow must NOT mark the row manual"
+        );
+    }
+
+    #[test]
+    fn user_resize_marks_manual_and_auto_grow_skips_it() {
+        // A user `SetRowHeights` marks the row manual; a later auto-grow leaves it untouched, while
+        // an auto (unmarked) row still grows (§3.3).
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetRowHeights {
+            sheet,
+            row_start: 3,
+            row_end: 3,
+            px: 50.0,
+        }]);
+        assert!(
+            worker
+                .manual_rows
+                .get(&sheet)
+                .is_some_and(|m| m.contains(&3)),
+            "a user resize marks the row manual"
+        );
+        // Auto-grow both the manual row 3 and an auto row 4.
+        worker.process_batch(vec![auto_grow(sheet, vec![(3, 120.0), (4, 120.0)])]);
+        assert!(
+            (row_h(&worker, sheet, 3) - 50.0).abs() < 1.0,
+            "manual row is not grown by auto-grow (stayed {})",
+            row_h(&worker, sheet, 3)
+        );
+        assert!(
+            (row_h(&worker, sheet, 4) - 120.0).abs() < 1.0,
+            "auto row grows (got {})",
+            row_h(&worker, sheet, 4)
+        );
+        // A rebuild must NOT re-derive manual from `custom_height` (row 3's resize set it): row 3
+        // stays manual, so auto-grow still skips it.
+        worker.build_and_store_cache(sheet);
+        worker.process_batch(vec![auto_grow(sheet, vec![(3, 200.0)])]);
+        assert!(
+            (row_h(&worker, sheet, 3) - 50.0).abs() < 1.0,
+            "manual row stays manual across a rebuild (got {})",
+            row_h(&worker, sheet, 3)
+        );
+    }
+
+    #[test]
+    fn auto_grow_survives_rebuild_and_shrinks_back() {
+        // A grown auto height survives a full cache rebuild (a column resize elsewhere) via the
+        // persisted wrap-height projection, and a `<= default` height shrinks the row back.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![auto_grow(sheet, vec![(4, 130.0)])]);
+        assert!((row_h(&worker, sheet, 4) - 130.0).abs() < 1.0);
+        // A resize on a DIFFERENT column triggers a full sheet rebuild.
+        worker.process_batch(vec![Command::SetColumnWidths {
+            sheet,
+            col_start: 6,
+            col_end: 6,
+            px: 200.0,
+        }]);
+        assert!(
+            (row_h(&worker, sheet, 4) - 130.0).abs() < 1.0,
+            "the grown height survives an unrelated rebuild (got {})",
+            row_h(&worker, sheet, 4)
+        );
+        // Shrink: a default-or-smaller measurement drops the wrap contribution.
+        worker.process_batch(vec![auto_grow(sheet, vec![(4, 24.0)])]);
+        assert!(
+            (row_h(&worker, sheet, 4) - 24.0).abs() < 1.0,
+            "the row shrinks back to default when the wrap need is gone (got {})",
+            row_h(&worker, sheet, 4)
+        );
+    }
+
+    #[test]
+    fn auto_grow_survives_a_neighbor_cell_edit() {
+        // The COMMON case: a wrapped notes cell grew its row; editing a SHORT neighbour cell in the
+        // same row takes the cheap per-cell cache-refresh path (not a full rebuild). The grown
+        // height must be preserved — the render thread won't re-measure (the wrapped cell's inputs
+        // didn't change). Regression guard for the per-cell mirror folding in `wrap_heights`.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..10,
+            cols: 0..10,
+        }]);
+        worker.process_batch(vec![auto_grow(sheet, vec![(4, 130.0)])]);
+        assert!((row_h(&worker, sheet, 4) - 130.0).abs() < 1.0);
+        // Edit a neighbour cell in the SAME row (a bounded, non-band range → the per-cell mirror).
+        worker.process_batch(vec![set_input(sheet, 4, 6, "hi")]);
+        assert!(
+            (row_h(&worker, sheet, 4) - 130.0).abs() < 1.0,
+            "a per-cell edit to a neighbour must NOT collapse the wrap-grown row (got {})",
+            row_h(&worker, sheet, 4)
+        );
+    }
+
     #[test]
     fn insert_rows_shifts_and_undo() {
         let (mut worker, _rx) = test_worker();
@@ -5661,6 +5992,8 @@ mod tests {
             discovered_chart_sheets: HashSet::new(),
             charts_fully_discovered: true,
             chart_sheet_parts: HashMap::new(),
+            manual_rows: HashMap::new(),
+            wrap_heights: HashMap::new(),
         };
         if let Some(first) = worker.sheet_metas().first() {
             worker.active_sheet = first.id;

@@ -126,6 +126,12 @@ pub enum GridEvent {
     Copy { cut: bool },
     /// Cmd/Ctrl+V on the focused grid — paste at the selection anchor (`functional_spec.md §2.2`).
     Paste,
+    /// Wrap-driven row auto-grow (`functional_spec.md §3`): the render thread measured each
+    /// `(row, px)`'s wrapped height (device px) at its column width — geometry the worker can't
+    /// compute (no gpui text system). The window forwards it as `Command::AutoGrowRowHeights` for
+    /// the active sheet; the worker applies it cache-only (auto rows only, no undo step). Emitted
+    /// only when a row's wrap **inputs** changed, so a height-only republish never re-emits.
+    AutoGrowRows { heights: Vec<(u32, f32)> },
     /// A row/column resize was committed on release (`functional_spec.md §5.1`). `start..=end` is
     /// the inclusive 0-based track run — the dragged index alone, or the whole selected header run
     /// when the dragged header sits inside a header selection; `px` is the released device-px size.

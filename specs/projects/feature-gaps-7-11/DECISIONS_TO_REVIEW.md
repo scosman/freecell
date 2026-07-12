@@ -187,3 +187,62 @@ tagged by phase.
   next tab `on_mouse_down` resets the state (it self-heals on the next press). Matches the grid's own
   resize-drag scoping (handlers on the grid area). Acceptable for a tab-strip interaction; flag if a
   stuck indicator is ever observed in practice.
+
+## Phase 7 — Auto-grow rows (§3)
+
+- **Wrap auto-grow is a CACHE-ONLY geometry update — it never touches IronCalc, `ops_seen`, or the
+  undo stacks — so it adds NO user-visible undo step (§3.4).** `architecture.md §3.2` said heights
+  "still live in `SheetCache`/IronCalc, still undoable, still saved," but §3.4 also required "no
+  separate undo entry." These pull opposite ways: `set_rows_height` records IronCalc history (an undo
+  step) and FreeCell mirrors it 1:1 with a `Touch`, so routing wrap growth through it would add the
+  very undo step §3.4 forbids. I resolved it in favour of §3.4: `Command::AutoGrowRowHeights` mutates
+  only the resident `SheetCache` row axis (`max(base_ironcalc, wrap)`), bumps nothing, pushes no
+  `Touch`. Consequence (accepted, matches the func-spec "session-scoped" framing for the manual flag):
+  wrap-grown heights are **not persisted to xlsx** and are recomputed on next open — the same
+  session-scoped posture §3.3 already takes. The pre-existing font-size (`SetFont`) and explicit-
+  newline (IronCalc) auto-grow paths are **unchanged** and still undoable/saved.
+
+- **Wrap heights are persisted in WORKER state (`wrap_heights: HashMap<SheetId, BTreeMap<u32,f32>>`)
+  and re-projected on every full cache rebuild.** Because the cache-only height would otherwise be
+  wiped whenever the sheet cache is rebuilt from IronCalc (any resize / insert / delete / band edit),
+  the worker keeps the wrap contribution and re-applies `max(base, wrap)` in `build_and_store_cache`.
+  This is what makes a grown row survive an unrelated rebuild (covered by
+  `auto_grow_survives_rebuild_and_shrinks_back`). `build_and_store_cache` became `&mut self` (cascade:
+  `refresh_cache_cells`, `ensure_active_cache_built`) — all callers already held `&mut self`.
+
+- **The UI (`run_autogrow`) is MANUAL-AGNOSTIC; the WORKER enforces "auto rows only".** The task's
+  step 3 says emit "AND the row is not manual." Threading the manual set into the read-model cache so
+  the render thread could pre-filter would add coupling and hurt the phase's revertibility, and buys
+  little: the grid emits at most **one** `AutoGrowRowHeights` per genuine wrap-input change (the
+  signature guard), and the worker skips manual rows outright, so a manual row is never grown and
+  never re-emitted in a loop. Net behaviour matches §3.3; the manual check lives solely in the worker
+  (`apply_auto_grow` + `mark_rows_manual`, covered by `user_resize_marks_manual_and_auto_grow_skips_it`).
+
+- **Convergence rests on a per-row wrap-INPUT signature (content/font/column-width), NOT the row
+  height.** A dirty row is one whose signature changed; a settled row's height-only republish leaves
+  the signature unchanged → not dirty → no re-emit → the loop converges in one frame (the "dirty set
+  empties" assertion, `autogrow_measures_wrapped_height_and_emits_once_then_converges`). The worker
+  additionally republishes `StyleCacheUpdated` only when a height actually moved (a double guard).
+
+- **Line-height factor = gpui's real default `phi` (`1.618034`), not a made-up 1.25.** The first
+  baseline generation clipped the top wrapped line: gpui's `Style::line_height` default is `phi()`
+  (golden ratio), so a grown row must reserve `round(1.618 * font_px)` per line or it under-grows.
+  Using the true factor makes the grown row fit exactly the lines gpui paints (verified by eyeballing
+  the regenerated baselines).
+
+- **Cap `MAX_AUTO_ROW_HEIGHT_PX = default * 10 = 240 px` (~10 lines).** Homed in `freecell-core::cache`
+  next to `DEFAULT_ROW_HEIGHT_PX` and shared by the UI clamp + the worker's defensive re-clamp; content
+  beyond it clips within the cell (`autogrow_cap_clip`).
+
+- **Render cases run the REAL measurement via an OPT-IN harness hook (`autogrow_measure_now`); NO
+  pre-existing baseline moved.** The pixel harness renders a single static frame over a shut-down
+  worker, so the live measure→worker→republish loop can't round-trip in-capture (the same limitation
+  `font_size_24_row_grown` calls out with "simulated by the injected height"). Rather than hand-inject
+  heights, an **opt-in** (`RenderCase::auto_grow`) hook runs the product's real wrap measurement once,
+  pre-first-paint, and applies the measured heights straight to the shared cache (skipping rows that
+  already carry a non-default override = manual). Because it is opt-in, only the six new `autogrow_`
+  cases grow — the **isolation check found ZERO pre-existing baselines changed** (all six are net-new
+  files; every other `.png` is byte-identical). Trade-off: pre-existing default-height wrap scenes
+  (e.g. `spill_wrap_on_no_spill`) are **not** re-grown in the harness, so they keep their committed
+  (clipped) look — a deliberate containment choice (keeps the change to `autogrow_` only, per the phase
+  brief) rather than a correctness gap; a follow-up could refresh them if desired.

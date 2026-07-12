@@ -62,7 +62,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       `SheetId`. Worker test + gpui view test (index-compute helper as pure fn) + smoke
       launch. *(No pixel impact — tab bar not baselined.)*
 
-- [ ] **Phase 7 — Auto-grow rows** (§3) *(LAST coding phase; independently revertible)*:
+- [x] **Phase 7 — Auto-grow rows** (§3) *(LAST coding phase; independently revertible)*:
       manual-rows set (`SheetCache`), marked on user resize only; UI-thread wrap measurement
       of dirty visible wrap-on cells; `Command::AutoGrowRowHeights` (auto rows only, no undo
       spam, doesn't mark manual); oscillation guard; cap. Retain existing font/newline

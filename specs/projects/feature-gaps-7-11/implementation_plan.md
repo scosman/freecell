@@ -46,11 +46,15 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       right-click shows Insert/Delete with correct counts + applies, merge guard intact.
       File a bug only if a real gap surfaces; else close as verified. *(No code expected.)*
 
-- [ ] **Phase 6a — IronCalc fork: sheet-reorder API** (§6.1): on `scosman/ironcalc`, add an
-      undoable, xlsx-order-preserving `UserModel::set_worksheet_index`/`move_sheet` with
-      upstream-style tests on a clean `fix/sheet-reorder` branch; open the upstream PR; fold
-      into `freecell-fixes`; bump FreeCell's patch pin + `Cargo.lock`. *(Separate repo — see
-      CLAUDE.md / `specs/projects/ironcalc-upstreaming` operating model. Gates 6b.)*
+- [x] **Phase 6a — IronCalc fork: sheet-reorder API** (§6.1): on `scosman/ironcalc`, added an
+      undoable, xlsx-order-preserving `UserModel::set_worksheet_index` (wrapping
+      `Model::move_sheet`) with upstream-style tests on a clean `fix/sheet-reorder` branch
+      (commit `21cde33`); folded into `freecell-fixes` (`a49cfd60`); both fork branches pushed,
+      **no upstream PR opened** (owner offers upstream later). FreeCell re-pinned
+      `#48b0b23 → #a49cfd60` (`Cargo.lock` only — branch pin unchanged); builds + fmt + clippy
+      clean; `cargo test --workspace` green modulo the 2 known LibreOffice failures. See
+      `phase_plans/phase_6a.md`. *(Separate repo — see CLAUDE.md /
+      `specs/projects/ironcalc-upstreaming` operating model. Gates 6b.)*
 
 - [ ] **Phase 6b — Sheet reorder wiring + tab drag** (§6.2–6.3): `Command::MoveSheet` +
       worker dispatch + `document.rs::move_sheet` + republish `SheetsChanged`; tab drag state

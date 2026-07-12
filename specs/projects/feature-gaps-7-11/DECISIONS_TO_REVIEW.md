@@ -406,3 +406,56 @@ because they call `handle_data_row_edit_key` directly instead of routing an actu
   `tests/fixtures/libreoffice_custom_height_wrap.xlsx`) loads the real LibreOffice workbook and asserts
   the title/subtitle/header rows load at their stored tall heights on load with no edit
   (~50.6 / 27.0 / 41.6 px) and that the previously flag-dropped wrap cells (B5:H5) import wrap-on.
+
+## Follow-up UX fix — In-cell editor grows to fit the text (grow-right / grow-down)
+
+- **The problem.** The in-cell editor overlay (`grid/view.rs::in_cell_overlay_elements`) was sized to
+  the cell rect (only floored at the 80 px minimum), so editing a long string in a narrow column was
+  almost unusable — especially now that non-editing text spills over neighbours (Phase 3). Excel-style
+  behaviour: while editing, the active editor grows to fit its own text, painted **above** everything
+  (unlike non-editing spill, it may overlap non-empty neighbours). On leaving edit it returns to
+  normal rendering (a non-empty next cell truncates it, as today).
+
+- **What ships.**
+  - **Wrap-off cell:** the editor's WIDTH grows to `max(cell_w, 80, measured_text_w + slack)` and is
+    capped at the content viewport's right edge (content-local `content_w`) so it never draws into the
+    row header or outside the grid; the content layer's existing `overflow_hidden` is the belt-and-
+    braces clip. It re-measures live on each keystroke (the grid re-renders on the chrome's mirror
+    push) and paints above the cells (already `deferred()`). Height stays the cell height.
+  - **Wrap-on cell:** the WIDTH stays the cell width (floored at 80, unchanged from today) and the
+    HEIGHT grows to the wrapped-line height, reusing Phase 7's `measure_wrap_height` (same
+    `LineWrapper` + `MAX_AUTO_ROW_HEIGHT_PX` cap), floored at the cell height. The box previews the
+    committed multi-line footprint.
+
+- **How it's computed + clamped.** A pure, unit-tested `incell_editor_size(...)` does the growth +
+  viewport clamp (no `Window` needed — fully testable). The measurement that feeds it runs in
+  `Render::render` (which holds the text system) via `measure_incell_geom`, stashed in a new
+  `incell_geom: Option<(f32,f32)>` field the overlay reads; a non-`render` build path (perf/test
+  harness) leaves it `None` and the overlay falls back to the base cell-rect size (no behaviour change
+  there). Only the **single editing cell** is measured (one `shape_line` for width, or one
+  `measure_wrap_height` for height) — O(1)/frame, no per-grid cost. The live text is read straight from
+  the hosted `InputState` value (the exact glyphs the input paints), which is kept in sync with the
+  mirror by the chrome and works identically in the render harness (which sets the input value but no
+  mirror). Z-order/clip: the overlay is already `deferred()` (above cells + selection borders) and
+  lives inside the `overflow_hidden` content container (clips at the viewport edges).
+
+- **Judgment call — wrap-on box grows but the hosted input stays single-line.** The chrome's
+  `in_cell_input` is a **single-line** `InputState` (Enter commits; making it multi-line would turn
+  Enter into a newline and break commit-on-Enter — out of scope for a geometry fix). So a wrap-on
+  editor grows its **box** downward to the wrapped height, with the single-line input pinned to the
+  **top** (`items_start`, first-line control height from the cell height) — it shows the first line and
+  previews the wrapped footprint below, rather than truly wrapping the live text. The primary win
+  (wrap-off grow-right) is fully functional; genuine multi-line editing of a wrap-on cell would need
+  the shared input reworked into a multi-line mode with Enter-commit interception, deferred as a
+  possible follow-up. See the `incell_editor_grow_wrap` baseline.
+
+- **Type-to-replace untouched.** That path edits in the data row (no in-cell overlay box), so it is
+  left as-is; the overlay change only affects the double-click/F2 in-cell editor.
+
+- **Tests + render.** Pure `incell_editor_size_grows_and_clamps` (grow, viewport clamp, edge-cell
+  keep-base, wrap-on grow + cap) + two gpui view tests (`incell_editor_grows_right_for_long_text`,
+  `incell_editor_grows_down_for_wrapped_text`) asserting the rendered overlay bounds grow with the text
+  and that commit/cancel removes the overlay. Two new `incell_` render baselines
+  (`incell_editor_grow_right`, `incell_editor_grow_wrap`) were generated + eyeballed; the existing
+  `incell_editor_open` baseline is **unchanged** (its `=SUM(A1:A3)` text fits the 80 px base, so no
+  pixels move) and still passes. Isolation confirmed — only the two new baselines were added.

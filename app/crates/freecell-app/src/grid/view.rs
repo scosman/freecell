@@ -17,8 +17,9 @@ use parking_lot::RwLock;
 
 use gpui::{
     canvas, deferred, div, font, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context,
-    Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, LineFragment, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, Window,
+    Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyDownEvent, LineFragment, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, TextRun,
+    Window,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
@@ -271,6 +272,13 @@ pub struct GridView {
     incell_input: Option<Entity<InputState>>,
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
+    /// The in-cell editor overlay's measured, viewport-clamped `(width, height)` in device px for the
+    /// current frame, or `None` when the editor is closed (or on a non-`render` build path that skips
+    /// measurement — the overlay then falls back to its base cell-rect size). Computed in
+    /// [`Render::render`] (which holds the `Window` text system) so the editor **grows** to fit the
+    /// live text: rightward over neighbours for a wrap-off cell, downward for a wrap-on one
+    /// (`DECISIONS_TO_REVIEW.md`). Only the single editing cell is measured, so it stays O(1)/frame.
+    incell_geom: Option<(f32, f32)>,
     /// Whether the current pending edit is in **quick-edit** mode (pushed by the chrome via
     /// [`set_edit_state`](Self::set_edit_state), `functional_spec.md §5`). Consumed by the grid-root
     /// `capture_key_down` so an unmodified arrow in the in-cell overlay commits + moves the active
@@ -537,6 +545,7 @@ impl GridView {
             incell_open: None,
             incell_input: None,
             incell_cap: None,
+            incell_geom: None,
             quick_edit: false,
             charts: HashMap::new(),
             selected_chart: None,
@@ -3676,6 +3685,11 @@ fn resize_tooltip(x: f32, y: f32, label: String) -> AnyElement {
 /// The in-cell editor overlay's minimum width (px) — grows rightward over neighbours for narrow
 /// columns (`functional_spec.md §1.3`, `ui_design.md §3`).
 const IN_CELL_MIN_W: f32 = 80.0;
+/// Horizontal slack (px) added to the measured glyph width when the wrap-off in-cell editor grows
+/// rightward: `2 × CELL_H_PAD` so the text is not flush against the accent border, plus a caret's
+/// worth of room so the last glyph + blinking caret stay visible as the user types
+/// (`DECISIONS_TO_REVIEW.md`).
+const IN_CELL_GROW_SLACK_PX: f32 = 2.0 * CELL_H_PAD + 4.0;
 /// The in-cell editor's cap-reject danger border/tooltip colour (theme danger, matching chrome).
 const IN_CELL_DANGER: u32 = 0xDC2626;
 /// Dark tooltip fill + text for the in-cell cap-error popover (`ui_design.md §4`, matching chrome).
@@ -3691,6 +3705,101 @@ const IN_CELL_BORDER_TOTAL_PX: f32 = 4.0;
 /// `ceil(font_px * 1.25) + 4`) — but that height is in IronCalc space and is scaled ×24/28 to
 /// device px before it reaches the render path, so the two do NOT cancel (see below).
 const IN_CELL_LINE_HEIGHT_FACTOR: f32 = 1.25;
+
+/// Pure sizing math for the in-cell editor overlay's grown box (`DECISIONS_TO_REVIEW.md`): given the
+/// anchored cell's geometry and the pre-measured content, returns the editor's `(width, height)` in
+/// **content-local** device px. Extracted from the render path so the growth + viewport clamp is
+/// unit-testable without a `Window`.
+///
+/// - **Wrap-off** (`wrap == false`): the WIDTH grows to `max(cell_w, min_w, measured_text_w + slack)`
+///   so a long string in a narrow column is readable, then is capped at the content viewport's right
+///   edge — the editor never draws past `content_w` (content-local), i.e. never into the row header
+///   or outside the grid. When the anchored cell is at/over the right edge (`avail < base`) or
+///   scrolled off, the box keeps its base size and the content layer's `overflow_hidden` does the
+///   clipping. Height stays the cell's own height.
+/// - **Wrap-on** (`wrap == true`): the WIDTH is left at the cell's own width (floored at `min_w`, as
+///   today) and the HEIGHT grows to the pre-measured wrapped height, floored at the cell height and
+///   capped at `max_h` (Phase 7's `MAX_AUTO_ROW_HEIGHT_PX`) — the box previews the committed wrapped
+///   footprint.
+///
+/// `cell_x` is the cell's content-local left edge (may be negative when scrolled under the gutter —
+/// the left side is then clipped by `overflow_hidden`, not by this math).
+#[allow(clippy::too_many_arguments)]
+fn incell_editor_size(
+    cell_x: f32,
+    cell_w: f32,
+    cell_h: f32,
+    content_w: f32,
+    min_w: f32,
+    wrap: bool,
+    measured_text_w: f32,
+    slack: f32,
+    wrapped_h: f32,
+    max_h: f32,
+) -> (f32, f32) {
+    let base_w = cell_w.max(min_w);
+    if wrap {
+        let h = wrapped_h.clamp(cell_h, max_h.max(cell_h));
+        (base_w, h)
+    } else {
+        let desired = (measured_text_w + slack).max(base_w);
+        // Distance from the cell's left edge to the content viewport's right edge. `avail >= base_w`
+        // exactly when the whole base box fits before the edge (always true for a fully-visible cell);
+        // there we grow up to `min(desired, avail)` so the right border lands at most at the edge.
+        // Otherwise the cell straddles / is past the edge, so keep the base box and let the content
+        // layer's `overflow_hidden` clip it.
+        let avail = content_w - cell_x;
+        let w = if avail >= base_w {
+            desired.min(avail)
+        } else {
+            base_w
+        };
+        (w, cell_h)
+    }
+}
+
+/// The shaped width (device px) of `text` at the given resolved cell font, using the render thread's
+/// text system — the exact advance the in-cell editor's hosted input paints, so the grown box fits it
+/// (`DECISIONS_TO_REVIEW.md`). Empty text is zero-width (no shaping). One shaped line per frame for
+/// the single active editor — O(text), not O(grid).
+fn measure_incell_text_width(
+    text: &str,
+    font_px: f32,
+    family: Option<SharedString>,
+    bold: bool,
+    italic: bool,
+    window: &mut Window,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let family = family.unwrap_or_else(|| SharedString::from(GRID_FONT_FAMILY));
+    let mut cell_font = font(family);
+    if bold {
+        cell_font = cell_font.bold();
+    }
+    if italic {
+        cell_font = cell_font.italic();
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: cell_font,
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(
+            SharedString::from(text.to_string()),
+            px(font_px),
+            &[run],
+            None,
+        )
+        .width()
+        .as_f32()
+}
 
 /// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
 /// clipped vertically (BUG A): `(control_height, line_height)` in **device** px.
@@ -3764,6 +3873,82 @@ fn resolve_incell_font(style: Option<RenderStyle>, families: &[SharedString]) ->
 }
 
 impl GridView {
+    /// Measures the in-cell editor overlay's grown, viewport-clamped `(width, height)` for `cell`
+    /// this frame (`DECISIONS_TO_REVIEW.md`). Reads the live edit text straight from the hosted
+    /// [`InputState`] — the exact glyphs the input paints, so the grown box fits them, and it tracks
+    /// each keystroke (the grid re-renders on the chrome's mirror push). For a **wrap-off** cell the
+    /// text is shaped once to grow the WIDTH; for a **wrap-on** cell the wrapped HEIGHT is measured
+    /// via the shared [`measure_wrap_height`](Self::measure_wrap_height) (same `LineWrapper` +
+    /// `MAX_AUTO_ROW_HEIGHT_PX` cap as Phase 7 auto-grow). Pure clamping is delegated to
+    /// [`incell_editor_size`]. Only the one editing cell is measured, so this is O(1)/frame.
+    fn measure_incell_geom(
+        &self,
+        cell: CellRef,
+        frame: &Frame,
+        window: &mut Window,
+        cx: &App,
+    ) -> Option<(f32, f32)> {
+        let (x, _y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let style = self.visible_styles.get(&(cell.row, cell.col)).copied();
+        let wrap = style.map(|s| s.wrap).unwrap_or(false);
+        let content_w = frame.content_w as f32;
+        // The editor's live text is the hosted input's own value (kept in sync with the mirror by the
+        // chrome). Empty (or a missing input) simply keeps the base box.
+        let text = self
+            .incell_input
+            .as_ref()
+            .map(|input| input.read(cx).value())
+            .unwrap_or_default();
+        let IncellFont {
+            size_px,
+            family,
+            bold,
+            italic,
+            underline: _,
+        } = resolve_incell_font(style, &self.visible_font_families);
+        if wrap {
+            // Measure the wrapped height of the live text at the cell's own width, reusing the Phase 7
+            // measurement (clamped to `[default, MAX_AUTO_ROW_HEIGHT_PX]`); `incell_editor_size` then
+            // floors it at the cell height and re-applies the cap.
+            let wc = WrapCell {
+                row: cell.row,
+                text,
+                font_px: size_px,
+                bold,
+                italic,
+                font_family: family,
+                col_w: cell_w,
+            };
+            let wrapped_h = Self::measure_wrap_height(&[&wc], window);
+            Some(incell_editor_size(
+                x,
+                cell_w,
+                cell_h,
+                content_w,
+                IN_CELL_MIN_W,
+                true,
+                0.0,
+                0.0,
+                wrapped_h,
+                MAX_AUTO_ROW_HEIGHT_PX,
+            ))
+        } else {
+            let measured = measure_incell_text_width(&text, size_px, family, bold, italic, window);
+            Some(incell_editor_size(
+                x,
+                cell_w,
+                cell_h,
+                content_w,
+                IN_CELL_MIN_W,
+                false,
+                measured,
+                IN_CELL_GROW_SLACK_PX,
+                0.0,
+                MAX_AUTO_ROW_HEIGHT_PX,
+            ))
+        }
+    }
+
     /// The in-cell editor overlay elements at `cell`: the bordered white editor box holding the
     /// reused `Input`, plus the cap-error popover below it when a cap rejection is active
     /// (`components/edit_controller.md §4.4`, `ui_design.md §3–4`). Both are `deferred()` so they
@@ -3774,8 +3959,18 @@ impl GridView {
         input: &Entity<InputState>,
         frame: &Frame,
     ) -> Vec<AnyElement> {
-        let (x, y, w, h) = cell_rect(cell.row, cell.col, frame);
-        let w = w.max(IN_CELL_MIN_W);
+        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let wrap = self
+            .visible_styles
+            .get(&(cell.row, cell.col))
+            .map(|s| s.wrap)
+            .unwrap_or(false);
+        // The grown box measured this frame (`measure_incell_geom`): rightward over neighbours for a
+        // wrap-off cell, downward for a wrap-on one. `None` on a non-`render` build path (perf/test
+        // harness) → the base cell-rect size, matching the pre-grow behaviour there.
+        let (w, h) = self
+            .incell_geom
+            .unwrap_or((cell_w.max(IN_CELL_MIN_W), cell_h));
         let danger = self.incell_cap.is_some();
         let border = if danger {
             rgb(IN_CELL_DANGER)
@@ -3803,8 +3998,11 @@ impl GridView {
         // the single-line control height via `min_h`/`max_h` (both applied after gpui-component's
         // `input_h` via `refine_style`) and override the line box. `incell_input_geometry` fills the
         // cell inner height where it can and floors at the line box otherwise (the control may then
-        // overflow the cell wrapper a few px — visible, not clipped; see its doc).
-        let (control_h, line_h) = incell_input_geometry(h, font_px);
+        // overflow the cell wrapper a few px — visible, not clipped; see its doc). Sized from the
+        // CELL height (not the grown box `h`): a wrap-on editor grows its box downward but its hosted
+        // single-line input stays a first-line control at the top, so the caret is not left floating
+        // in the middle of a tall box.
+        let (control_h, line_h) = incell_input_geometry(cell_h, font_px);
         let mut input_el = Input::new(input)
             .appearance(false)
             .text_size(px(font_px))
@@ -3839,7 +4037,10 @@ impl GridView {
             // commits (outside-commit preserved).
             .occlude()
             .flex()
-            .items_center()
+            // Wrap-off: the box is the cell height, so centre the single line. Wrap-on: the box grows
+            // downward, so pin the input to the top (first line) — see `incell_input_geometry` above.
+            .when(wrap, |d| d.items_start())
+            .when(!wrap, |d| d.items_center())
             .bg(rgb(CELL_BG))
             .border_2()
             .border_color(border)
@@ -3938,6 +4139,14 @@ impl Render for GridView {
                 );
             }
 
+            // Measure the in-cell editor's grown size (it grows to fit the live text — rightward for
+            // a wrap-off cell, downward for a wrap-on one) BEFORE the layer build reads it, because
+            // measuring needs the render thread's text system (`window`). Only the single editing
+            // cell is measured, so this is O(1)/frame. `None` closes/clears it (the base cell-rect
+            // size then applies). `visible_styles` was just populated by `resolve_frame`.
+            self.incell_geom = self
+                .incell_open
+                .and_then(|cell| self.measure_incell_geom(cell, &frame, window, cx));
             root_children.extend(self.build_grid_layers(&frame, None));
             // Wrap-driven row auto-grow (`functional_spec.md §3`): measure the just-laid-out wrap-on
             // cells and, for rows whose wrap inputs changed, ask the worker to grow/shrink them.
@@ -5581,6 +5790,223 @@ mod tests {
         assert!(
             dl <= dc,
             "default line box ({dl}) must fit the default control ({dc})"
+        );
+    }
+
+    #[test]
+    fn incell_editor_size_grows_and_clamps() {
+        // The pure sizing math behind the grow-right / grow-down in-cell editor
+        // (`DECISIONS_TO_REVIEW.md`). Cell at content-local x=100, 64×24 px, min box 80, viewport
+        // right edge at 800, wrap-on cap 240.
+        let (cx, cw, ch, cont_w, min_w, max_h) = (100.0, 64.0, 24.0, 800.0, 80.0, 240.0);
+
+        // Wrap-off, text that fits the base box: stays at the base (min) width, cell height.
+        let (w, h) = incell_editor_size(cx, cw, ch, cont_w, min_w, false, 20.0, 12.0, 0.0, max_h);
+        assert!(
+            (w - min_w).abs() < 1e-3,
+            "short text keeps the base width, got {w}"
+        );
+        assert!(
+            (h - ch).abs() < 1e-6,
+            "wrap-off height stays the cell height, got {h}"
+        );
+
+        // Wrap-off, long text: width grows to measured + slack, wider than the cell.
+        let (w2, _) = incell_editor_size(cx, cw, ch, cont_w, min_w, false, 300.0, 12.0, 0.0, max_h);
+        assert!(
+            (w2 - 312.0).abs() < 1e-3,
+            "grows to measured+slack, got {w2}"
+        );
+        assert!(w2 > cw, "editor wider than the cell");
+
+        // Wrap-off, text far wider than the viewport: clamped at the content viewport's right edge —
+        // never drawn past `content_w` (into the row header / outside the grid).
+        let (w3, _) =
+            incell_editor_size(cx, cw, ch, cont_w, min_w, false, 5000.0, 12.0, 0.0, max_h);
+        assert!(
+            (w3 - (cont_w - cx)).abs() < 1e-3,
+            "clamped to the viewport edge, got {w3}"
+        );
+        assert!(
+            cx + w3 <= cont_w + 1e-3,
+            "never past the content right edge"
+        );
+
+        // Anchored cell straddling / past the right edge (avail < base): keep the base box; the
+        // content layer's `overflow_hidden` does the clipping.
+        let (w4, _) = incell_editor_size(
+            cont_w - 10.0,
+            cw,
+            ch,
+            cont_w,
+            min_w,
+            false,
+            5000.0,
+            12.0,
+            0.0,
+            max_h,
+        );
+        assert!(
+            (w4 - min_w).abs() < 1e-3,
+            "edge cell keeps the base width, got {w4}"
+        );
+
+        // Wrap-on: width stays the cell width (floored at min); height grows to the wrapped height.
+        let (ww, wh) =
+            incell_editor_size(cx, 120.0, ch, cont_w, min_w, true, 0.0, 0.0, 96.0, max_h);
+        assert!(
+            (ww - 120.0).abs() < 1e-6,
+            "wrap-on keeps the cell width, got {ww}"
+        );
+        assert!(
+            (wh - 96.0).abs() < 1e-6,
+            "wrap-on grows to the wrapped height, got {wh}"
+        );
+        assert!(wh > ch, "editor taller than the cell");
+
+        // Wrap-on cap: a pathologically tall wrapped height is capped at max_h (Phase 7's cap).
+        let (_, wh2) = incell_editor_size(
+            cx, 120.0, ch, cont_w, min_w, true, 0.0, 0.0, 10_000.0, max_h,
+        );
+        assert!(
+            (wh2 - max_h).abs() < 1e-6,
+            "wrap-on height capped at max_h, got {wh2}"
+        );
+    }
+
+    #[gpui::test]
+    fn incell_editor_grows_right_for_long_text(cx: &mut TestAppContext) {
+        // Editing a long string in a wrap-off cell grows the editor box WIDER than the cell (it grows
+        // with the text); a short string keeps it at the base size. On close the overlay is gone.
+        let (g, window, _events) = grid_recording(cx);
+        let input = window
+            .update(cx, |_root, window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                g.update(cx, |grid, cx| {
+                    grid.set_incell_input(input.clone(), cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                });
+                input
+            })
+            .unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Short live text → base box.
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| i.set_value("x", window, cx));
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let base = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+
+        // Long live text → grows wider than the base.
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| {
+                i.set_value(
+                    "a really long label that overflows a narrow column and grows the editor",
+                    window,
+                    cx,
+                )
+            });
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let grown = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+        assert!(
+            grown.size.width > base.size.width,
+            "a long string must grow the wrap-off editor wider than a short one: {:?} vs {:?}",
+            grown.size.width,
+            base.size.width
+        );
+        // Height unchanged (wrap-off grows only rightward).
+        assert!(
+            (grown.size.height.as_f32() - base.size.height.as_f32()).abs() < 0.5,
+            "wrap-off editor height must not change when it grows right"
+        );
+
+        // Cancel closes the overlay — normal rendering resumes (no persistent overlay).
+        vcx.update(|_window, cx| {
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, None, None, false, cx)
+            })
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("in-cell-editor").is_none(),
+            "closing the in-cell editor must remove the overlay"
+        );
+    }
+
+    #[gpui::test]
+    fn incell_editor_grows_down_for_wrapped_text(cx: &mut TestAppContext) {
+        // Editing a wrap-ON cell grows the editor box TALLER for wrapped text (not wider) — the box
+        // previews the committed multi-line footprint. Commit closes it.
+        let (sources, _sheet) = wrap_sources(80.0, None);
+        let (g, window, _events) = recording_over(cx, sources);
+        let cell = CellRef::new(1, 1); // B2 — the wrap-on cell in `wrap_sources`.
+        let input = window
+            .update(cx, |_root, window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                g.update(cx, |grid, cx| {
+                    grid.set_incell_input(input.clone(), cx);
+                    grid.set_edit_state(None, Some(cell), None, false, cx);
+                });
+                input
+            })
+            .unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| i.set_value("x", window, cx));
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(cell), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let base = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| i.set_value(WRAP_LONG, window, cx));
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(cell), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let grown = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+        assert!(
+            grown.size.height > base.size.height,
+            "a wrap-on cell must grow the editor taller for wrapped text: {:?} vs {:?}",
+            grown.size.height,
+            base.size.height
+        );
+        // Grows DOWN, not right: width unchanged (stays the cell width).
+        assert!(
+            (grown.size.width.as_f32() - base.size.width.as_f32()).abs() < 0.5,
+            "wrap-on editor keeps its width; only height grows"
+        );
+
+        // Commit closes the overlay.
+        vcx.update(|_window, cx| {
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, None, None, false, cx)
+            })
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("in-cell-editor").is_none(),
+            "committing the in-cell editor must remove the overlay"
         );
     }
 

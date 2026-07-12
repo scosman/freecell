@@ -281,8 +281,8 @@ render_cases! {
     grid_chart_selected,
     // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
     grid_chart_authored_inserted,
-    // Editing feel (Phase 2): live mirror + in-cell editor overlay
-    cell_mirror_typing, incell_editor_open,
+    // Editing feel (Phase 2): live mirror + in-cell editor overlay + its grow-right / grow-down
+    cell_mirror_typing, incell_editor_open, incell_editor_grow_right, incell_editor_grow_wrap,
     // Fonts (Phase 5): family + size + row auto-grow
     font_family_serif, font_size_24_row_grown, font_missing_family_fallback,
     // Borders (Phase 6): edge paint, presets, shared-edge precedence

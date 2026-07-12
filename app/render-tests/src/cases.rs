@@ -971,13 +971,38 @@ pub fn all() -> Vec<RenderCase> {
         .mirror(1, 1, "=1+2"),
         RenderCase::new(
             // The in-cell editor overlay open over B2 (2 px accent border, raw content;
-            // `functional_spec.md §1.3`).
+            // `functional_spec.md §1.3`). The editor grows to fit its own text (here just wide enough
+            // for `=SUM(A1:A3)`), painted above the cells (`DECISIONS_TO_REVIEW.md`).
             "incell_editor_open",
             Scene::new().input(1, 1, "42"),
             CELL_VP,
         )
         .selection(sel((1, 1), (1, 1)))
         .in_cell(1, 1, "=SUM(A1:A3)"),
+        RenderCase::new(
+            // A wrap-off in-cell editor GROWS RIGHTWARD over its neighbours to fit a long string in a
+            // narrow column, painted above the cells and clamped at the content viewport's right edge
+            // (`DECISIONS_TO_REVIEW.md`).
+            "incell_editor_grow_right",
+            Scene::new().input(1, 1, "x").col_width(1, 56.0),
+            CELL_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(
+            1,
+            1,
+            "A really long label that grows the editor rightward over its neighbours",
+        ),
+        RenderCase::new(
+            // A wrap-ON in-cell editor GROWS DOWNWARD (taller) instead of rightward, previewing the
+            // committed multi-line footprint; its hosted single-line input stays a first-line control
+            // at the top (`DECISIONS_TO_REVIEW.md`).
+            "incell_editor_grow_wrap",
+            Scene::new().input(1, 1, "x").col_width(1, 96.0).wrap(1, 1),
+            (480, 220),
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(1, 1, "wrap this text onto several visual lines while editing in place"),
         // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
         cell(
             // A serif family (visibly distinct from the default sans) rendered per-cell. NOTE:

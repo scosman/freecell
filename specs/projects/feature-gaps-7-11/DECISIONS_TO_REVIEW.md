@@ -139,3 +139,51 @@ tagged by phase.
   carry the meaning). And the action-row search button stays enabled in degraded/read-only mode
   because **find is a read** — only the bar's Replace / Replace All are gated on `degraded` (and on
   having a current match / any matches). Consistent with "every *mutating* control disables".
+
+## Phase 6b — Sheet reorder wiring + tab drag (§6)
+
+- **Drag `on_mouse_move` / `on_mouse_up` live on the tab-bar CONTAINER, not per-tab (as the task
+  literally suggested).** gpui gates `on_mouse_move` on `hitbox.is_hovered` — a per-tab move handler
+  only fires while *that* tab is under the pointer, so it goes dead the instant the drag crosses onto
+  a neighbor (and gaps between tabs fire nothing). The full-width tab-bar container reliably tracks
+  the drag across tabs and the release. `on_mouse_down(Left)` stays per-tab (it must know which sheet
+  was pressed). This is the `ResizeDrag` pattern (manual state + move/up on a wide element), not
+  gpui's built-in drag-and-drop. Net behavior matches §6; only the handler placement differs from the
+  prompt's per-tab wording.
+
+- **Click-select is left to fire on a drop-back-on-origin (no extra suppression guard).** gpui forms
+  `on_click` only when the pointer releases over the SAME tab it pressed. A real drag to a different
+  slot releases over a different tab, so the origin tab's `on_click` never fires and no other tab's
+  does either (no pending mouse-down there) — the container's `on_mouse_up` alone sends `MoveSheet`.
+  The only overlap is a past-threshold drag that returns to and releases on the origin tab: that's a
+  no-op move (no command) AND `on_click` fires `select_sheet(origin)` — harmless (it just reselects
+  the sheet the user was dragging). So double-click→rename (needs `click_count ≥ 2`) and
+  right-click→menu (`on_mouse_down(Right)`) are naturally guarded against a left-drag without a
+  dedicated flag. Low risk; flag if a reviewer wants a drop-on-origin to be a strict no-op with zero
+  select.
+
+- **A same-index (`to == from`) MoveSheet is never SENT, not just ignored — deliberate, to keep the
+  fork-history and FreeCell `undo_touches` stacks 1:1.** The fork's `set_worksheet_index` no-ops a
+  same-index move WITHOUT recording history, but the worker's `apply_one` would still count a
+  `SheetOp` and push a FreeCell `Touch::Sheets`, desyncing the parallel undo-bookkeeping stack (same
+  latent characteristic the existing same-name `RenameSheet` has). `tab_move_target` returns `None`
+  for a drop on the origin slot, so the UI sends nothing — the correct layer to enforce it (mirrors
+  §6.4 "dropping back on its original position is a no-op, no engine command, no undo step"). No
+  worker-side no-op guard was added (out of scope; would need a non-counting `AppliedKind`).
+
+- **Tab geometry is captured by per-tab `canvas` bounds probes (window x), read back via the pure
+  `tab_insertion_index` helper — no glyph measurement.** Tabs are content-width (variable), so the
+  insertion math needs real laid-out bounds, not a computed width. Each tab embeds a zero-cost
+  `canvas` probe (the `anchored_trigger` idiom) that upserts its window-space span into `tab_spans`
+  with NO `notify` (the value is consumed on the next mouse event, so it can't render-loop). The
+  reorder computation is fully unit-tested via the pure `tab_insertion_index` + `move_target_for_gap`
+  fns; the gpui view tests set `tab_spans` directly because the unit harness does not paint (so the
+  probes never run in-test — same constraint the Phase 4 `on_next_frame` note called out).
+
+- **Release OUTSIDE the tab strip leaves the drag pending until the next tab press.** The move/up
+  handlers only cover the tab bar; a release over the grid won't clear `tab_drag`. The lift +
+  indicator are driven by drag STATE (`tab_drag_active()`), not by the pointer being in the strip —
+  so an out-of-strip release leaves `tab_drag` set and, with it, the lift/indicator visible until the
+  next tab `on_mouse_down` resets the state (it self-heals on the next press). Matches the grid's own
+  resize-drag scoping (handlers on the grid area). Acceptable for a tab-strip interaction; flag if a
+  stuck indicator is ever observed in practice.

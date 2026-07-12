@@ -19,8 +19,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
+    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
+    Focusable, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
@@ -161,6 +162,15 @@ const DATA_ROW_H: f32 = 32.0;
 /// (`Size::Medium` → 32 px) and fills the row edge-to-edge, which reads as cramped.
 const DATA_ROW_FIELD_H: f32 = DATA_ROW_H - 4.0;
 const TAB_BAR_H: f32 = 30.0;
+/// A tab press that moves less than this (device px) is a click (select / rename), not a drag —
+/// only past it does the lift + drop indicator appear (`ui_design.md §3`).
+const TAB_DRAG_THRESHOLD_PX: f32 = 4.0;
+/// The reorder drop indicator + dragged-tab outline accent (Office Accent 1, matching the
+/// borders popover's selected-swatch ring). `ui_design.md §3`: a 2 px accent vertical bar.
+const TAB_DROP_ACCENT: u32 = 0x4472C4;
+/// Half the inter-tab gap (`gap_1` = 4 px), used to place the drop indicator in the gap when it
+/// lands before the first / after the last tab.
+const TAB_GAP_HALF: f32 = 2.0;
 const REF_BOX_W: f32 = 72.0;
 /// The find/replace bar's two text fields' width (`ui_design.md §1`: ~220 px each).
 const FIND_FIELD_W: f32 = 220.0;
@@ -232,6 +242,51 @@ impl ChartPanel {
             labels: DataLabelToggles::default(),
         }
     }
+}
+
+/// A potential or in-flight sheet-tab reorder drag (`functional_spec.md §6.1`, `ui_design.md §3`).
+/// Recorded on a tab mouse-down as a *potential* drag; `dragging` flips true only once the pointer
+/// crosses [`TAB_DRAG_THRESHOLD_PX`] from `start_x`, at which point the lift + drop indicator
+/// appear. Modeled off the grid's `ResizeDrag`. All coordinates are window-space device px.
+#[derive(Debug, Clone, Copy)]
+struct TabDrag {
+    /// The sheet being dragged. The active sheet follows this **id** across the move (not the
+    /// slot), so a reorder never changes which sheet is active.
+    sheet: SheetId,
+    /// Window x at mouse-down — the threshold origin.
+    start_x: f32,
+    /// Live window x, updated on every move.
+    cur_x: f32,
+    /// Whether the pointer has crossed the movement threshold (past it = a real drag, not a click).
+    dragging: bool,
+}
+
+/// One tab's captured window-space horizontal span, written by a per-tab `canvas` bounds probe
+/// during paint (the Window-free geometry the pure insertion computation reads). Keyed by
+/// [`SheetId`] and read back in `self.sheets` order, so a stale/partial capture is simply ignored.
+#[derive(Debug, Clone, Copy)]
+struct TabSpan {
+    sheet: SheetId,
+    left: f32,
+    right: f32,
+}
+
+/// The insertion gap a tab drop would land in: the count of tab centers at/left of `cursor_x`
+/// (`tab_centers` ordered left→right, in the same coordinate space as `cursor_x`). Returns an
+/// index in `0..=n` — the gap the 2 px drop indicator snaps to, already clamped so a drop cannot
+/// pass the trailing `+` button. Pure (no `Window`), so the drag geometry is unit-testable.
+fn tab_insertion_index(cursor_x: f32, tab_centers: &[f32]) -> usize {
+    tab_centers.iter().filter(|&&c| cursor_x >= c).count()
+}
+
+/// Convert an insertion `gap` (`0..=n`, from [`tab_insertion_index`]) into the fork's final
+/// `to_index` for a sheet currently at `from_slot`, or `None` when the drop is a no-op (lands back
+/// on the origin slot). Removing the dragged tab shifts every later gap left by one, so a gap past
+/// the origin maps to `gap - 1`; both gaps adjacent to the origin (`from` and `from + 1`) resolve
+/// to `from` — a no-op. Pure, so it is unit-testable alongside [`tab_insertion_index`].
+fn move_target_for_gap(gap: usize, from_slot: usize) -> Option<usize> {
+    let to = if gap <= from_slot { gap } else { gap - 1 };
+    (to != from_slot).then_some(to)
 }
 
 /// The chrome around the grid: action row + data row + sheet tab bar.
@@ -374,6 +429,12 @@ pub struct ChromeView {
     context_menu: Option<SheetId>,
     /// The sheet pending a delete confirmation (non-empty sheet), if any.
     confirm_delete: Option<SheetId>,
+    /// A potential or in-flight tab reorder drag (`functional_spec.md §6`, `ui_design.md §3`).
+    tab_drag: Option<TabDrag>,
+    /// Each tab's captured window-space horizontal span, refreshed by a per-tab `canvas` probe on
+    /// every paint — the geometry the pure insertion-index computation reads (a `Window`-free
+    /// snapshot). Keyed by [`SheetId`]; read back in `self.sheets` order.
+    tab_spans: Vec<TabSpan>,
 
     // ---- Find / replace bar (`functional_spec.md §4`, `ui_design.md §1`) -------------------
     /// Whether the find/replace bar is open (rendered below the data row, pushing the grid down).
@@ -511,6 +572,8 @@ impl ChromeView {
             rename_error: false,
             context_menu: None,
             confirm_delete: None,
+            tab_drag: None,
+            tab_spans: Vec::new(),
             find_open: false,
             find_input,
             replace_input,
@@ -1994,7 +2057,15 @@ impl ChromeView {
     pub fn set_sheets(&mut self, sheets: Vec<SheetTab>, active: SheetId, cx: &mut Context<Self>) {
         self.sheets = sheets;
         self.active_sheet = active;
+        self.prune_tab_spans();
         cx.notify();
+    }
+
+    /// Drops captured tab spans for sheets that no longer exist (deleted / reloaded), so the
+    /// insertion geometry never reads a stale slot. Survivors are re-measured on the next paint.
+    fn prune_tab_spans(&mut self) {
+        self.tab_spans
+            .retain(|span| self.sheets.iter().any(|t| t.id == span.sheet));
     }
 
     /// Merges a worker sheet-meta list into the tab mirror. `has_content` is now sourced
@@ -2014,6 +2085,7 @@ impl ChromeView {
                 self.active_sheet = first.id;
             }
         }
+        self.prune_tab_spans();
     }
 
     /// Adopts `id` as the active sheet because the *window* (not a tab click) switched it — the
@@ -2056,6 +2128,110 @@ impl ChromeView {
     /// Adds a sheet (the worker names it and republishes; the UI switches on `SheetsChanged`).
     pub fn add_sheet(&self) {
         self.client.send(Command::AddSheet);
+    }
+
+    // ---- Sheet-tab reorder drag (`functional_spec.md §6`, `ui_design.md §3`) ---------------
+
+    /// Records a *potential* tab reorder drag on mouse-down at window `x` (no movement yet). A
+    /// plain click / double-click never crosses the threshold, so this stays a no-op until then.
+    fn tab_press(&mut self, sheet: SheetId, x: f32) {
+        self.tab_drag = Some(TabDrag {
+            sheet,
+            start_x: x,
+            cur_x: x,
+            dragging: false,
+        });
+    }
+
+    /// Advances a live tab drag to window `x`; crosses into `dragging` past the threshold, at which
+    /// point the lift + drop indicator repaint. No-op when no press is pending.
+    fn tab_drag_move(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag.as_mut() else {
+            return;
+        };
+        drag.cur_x = x;
+        if !drag.dragging && (x - drag.start_x).abs() > TAB_DRAG_THRESHOLD_PX {
+            drag.dragging = true;
+        }
+        if drag.dragging {
+            cx.notify();
+        }
+    }
+
+    /// Ends a tab drag at window `x`: a real drag to a new slot sends `MoveSheet`; a sub-threshold
+    /// press (a click) or a drop back on the origin slot sends nothing (the click-select path fires
+    /// separately). Always clears the drag state.
+    fn tab_drag_end(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag.take() else {
+            return;
+        };
+        if drag.dragging {
+            if let Some(to_index) = self.tab_move_target(drag.sheet, x) {
+                self.client.send(Command::MoveSheet {
+                    sheet: drag.sheet,
+                    to_index,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// The current tabs' captured centers (window x), in `self.sheets` slot order. Empty unless
+    /// every tab has a captured span — the caller treats an incomplete capture as "geometry not
+    /// ready" and skips the move.
+    fn ordered_tab_centers(&self) -> Vec<f32> {
+        self.sheets
+            .iter()
+            .filter_map(|t| self.tab_spans.iter().find(|s| s.sheet == t.id))
+            .map(|s| (s.left + s.right) / 2.0)
+            .collect()
+    }
+
+    /// The fork `to_index` a drop at window `cursor_x` maps to for the dragged `sheet`, or `None`
+    /// for a no-op (drop on the origin slot) or when the tab geometry is not fully captured yet.
+    fn tab_move_target(&self, sheet: SheetId, cursor_x: f32) -> Option<u32> {
+        let centers = self.ordered_tab_centers();
+        if centers.len() != self.sheets.len() {
+            return None; // some tab hasn't been measured — don't guess a reorder
+        }
+        let from_slot = self.sheets.iter().position(|t| t.id == sheet)?;
+        let gap = tab_insertion_index(cursor_x, &centers);
+        move_target_for_gap(gap, from_slot).map(|to| to as u32)
+    }
+
+    /// The window-x at which to paint the 2 px drop indicator for the live drag, or `None` when
+    /// not dragging / the geometry is not fully captured. Snaps to the midpoint of the neighboring
+    /// tab edges (outer edges offset by half the inter-tab gap).
+    fn tab_drop_indicator_x(&self) -> Option<f32> {
+        let drag = self.tab_drag?;
+        if !drag.dragging {
+            return None;
+        }
+        let spans: Vec<(f32, f32)> = self
+            .sheets
+            .iter()
+            .filter_map(|t| self.tab_spans.iter().find(|s| s.sheet == t.id))
+            .map(|s| (s.left, s.right))
+            .collect();
+        if spans.is_empty() || spans.len() != self.sheets.len() {
+            return None;
+        }
+        let centers: Vec<f32> = spans.iter().map(|(l, r)| (l + r) / 2.0).collect();
+        let gap = tab_insertion_index(drag.cur_x, &centers);
+        let n = spans.len();
+        let x = if gap == 0 {
+            spans[0].0 - TAB_GAP_HALF
+        } else if gap >= n {
+            spans[n - 1].1 + TAB_GAP_HALF
+        } else {
+            (spans[gap - 1].1 + spans[gap].0) / 2.0
+        };
+        Some(x)
+    }
+
+    /// Whether a tab reorder drag has crossed the threshold (drives the lift + cursor + indicator).
+    fn tab_drag_active(&self) -> bool {
+        self.tab_drag.is_some_and(|d| d.dragging)
     }
 
     /// Starts an inline rename of `id`, seeding + focusing the rename input.
@@ -3413,7 +3589,11 @@ impl ChromeView {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dragging = self.tab_drag_active();
         let mut row = div()
+            // `relative` so the drop indicator (an absolute child, positioned in window x — the
+            // tab bar's origin x is 0) lands in the right gap.
+            .relative()
             .flex()
             .items_center()
             .gap_1()
@@ -3422,13 +3602,28 @@ impl ChromeView {
             .px_2()
             .bg(rgb(CHROME_BG))
             .border_t_1()
-            .border_color(rgb(HAIRLINE));
+            .border_color(rgb(HAIRLINE))
+            // The move / up handlers live on the full-width container, not the individual tabs: a
+            // per-tab `on_mouse_move` only fires while *that* tab is hovered, so it would go dead
+            // the instant the pointer crossed onto a neighbor mid-drag. The container spans the
+            // whole strip, so it tracks the drag across tabs and the release anywhere in the bar.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                this.tab_drag_move(f32::from(event.position.x), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.tab_drag_end(f32::from(event.position.x), cx);
+                }),
+            )
+            // `grabbing` while a reorder drag is live (`ui_design.md §6`).
+            .when(dragging, |d| d.cursor(CursorStyle::ClosedHand));
 
         for tab in &self.sheets {
             row = row.child(self.render_tab(tab, cx));
         }
 
-        row.child(
+        row = row.child(
             Button::new("add-sheet")
                 .label("+")
                 .tooltip("New sheet")
@@ -3438,7 +3633,22 @@ impl ChromeView {
                     this.add_sheet();
                     cx.notify();
                 })),
-        )
+        );
+
+        // The 2 px accent drop indicator at the insertion gap while dragging (`ui_design.md §3`).
+        if let Some(x) = self.tab_drop_indicator_x() {
+            row = row.child(
+                div()
+                    .absolute()
+                    .left(px(x - 1.0))
+                    .top_0()
+                    .h_full()
+                    .w(px(2.0))
+                    .bg(rgb(TAB_DROP_ACCENT)),
+            );
+        }
+
+        row
     }
 
     fn render_tab(&self, tab: &SheetTab, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -3456,23 +3666,64 @@ impl ChromeView {
                 .into_any_element();
         }
 
+        // The dragged tab lifts while a reorder drag is live on it (`ui_design.md §3`): stronger
+        // bg, a 1 px accent outline, ~90 % opacity.
+        let lifted = self.tab_drag.is_some_and(|d| d.dragging && d.sheet == id);
+        // A per-tab zero-cost `canvas` probe records the tab's window-space span into `tab_spans`
+        // each paint — the geometry the pure insertion computation reads. No `notify` (the value
+        // is consumed on the next mouse event, not this frame), so it never render-loops.
+        let probe = cx.entity().downgrade();
+        let span_probe = canvas(
+            move |bounds, _window, app| {
+                probe
+                    .update(app, |this, _cx| {
+                        let left = f32::from(bounds.origin.x);
+                        let right = left + f32::from(bounds.size.width);
+                        if let Some(span) = this.tab_spans.iter_mut().find(|s| s.sheet == id) {
+                            span.left = left;
+                            span.right = right;
+                        } else {
+                            this.tab_spans.push(TabSpan {
+                                sheet: id,
+                                left,
+                                right,
+                            });
+                        }
+                    })
+                    .ok();
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
         div()
             .id(gpui::ElementId::Name(format!("tab-{}", id.0).into()))
+            // `relative` so the span probe (`absolute().size_full()`) fills the tab exactly.
+            .relative()
             .px_3()
             .h(px(24.0))
             .flex()
             .items_center()
             .rounded_t_md()
-            .bg(rgb(if is_active { ACTIVE_TAB_BG } else { CHROME_BG }))
+            .bg(rgb(if is_active || lifted {
+                ACTIVE_TAB_BG
+            } else {
+                CHROME_BG
+            }))
             .text_size(px(13.0))
             .text_color(rgb(if is_active { TEXT } else { MUTED_TEXT }))
-            .when(is_active, |d| {
+            .when(is_active && !lifted, |d| {
                 d.border_t_1()
                     .border_l_1()
                     .border_r_1()
                     .border_color(rgb(HAIRLINE))
             })
+            .when(lifted, |d| {
+                d.border_1().border_color(rgb(TAB_DROP_ACCENT)).opacity(0.9)
+            })
             .child(tab.name.clone())
+            .child(span_probe)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
                     this.rename_start(id, window, cx);
@@ -3480,6 +3731,16 @@ impl ChromeView {
                     this.select_sheet(id, window, cx);
                 }
             }))
+            // Record a potential drag; movement past the threshold (tracked on the container) turns
+            // it into a real drag. No `stop_propagation`, so the `on_click` above still forms for a
+            // plain click / double-click (gpui gates that click on releasing over this same tab, so
+            // a real drag — which releases over a different tab — never fires it).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, _cx| {
+                    this.tab_press(id, f32::from(event.position.x));
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -7815,6 +8076,161 @@ mod tests {
             c.sheets().iter().map(|t| t.name.clone()).collect()
         });
         assert_eq!(names, vec!["Sheet1".to_string(), "Sheet2".to_string()]);
+    }
+
+    // ---- Sheet-tab reorder drag (Phase 6b, `functional_spec.md §6`) ------------------------
+
+    /// Three tabs at slots 0/1/2 with 60 px-wide spans pre-loaded (centers 30/90/150), so the pure
+    /// insertion geometry can be exercised without a paint pass — the unit harness does not paint,
+    /// so the per-tab `canvas` span probes never run in-test.
+    fn three_sheets_with_spans(cx: &mut TestAppContext) -> Harness {
+        let h = build(
+            cx,
+            vec![
+                SheetTab::new(SheetId(0), "S0"),
+                SheetTab::new(SheetId(1), "S1"),
+                SheetTab::new(SheetId(2), "S2"),
+            ],
+            SheetId(0),
+        );
+        upd(&h, cx, |c, _w, _cx| {
+            c.tab_spans = vec![
+                TabSpan {
+                    sheet: SheetId(0),
+                    left: 0.0,
+                    right: 60.0,
+                },
+                TabSpan {
+                    sheet: SheetId(1),
+                    left: 60.0,
+                    right: 120.0,
+                },
+                TabSpan {
+                    sheet: SheetId(2),
+                    left: 120.0,
+                    right: 180.0,
+                },
+            ];
+        });
+        h.client.take_commands(); // drain any setup commands so tests assert only the drag's
+        h
+    }
+
+    #[test]
+    fn tab_insertion_index_maps_cursor_to_gap() {
+        let centers = [30.0, 90.0, 150.0];
+        assert_eq!(
+            tab_insertion_index(10.0, &centers),
+            0,
+            "before every tab → gap 0"
+        );
+        assert_eq!(
+            tab_insertion_index(30.0, &centers),
+            1,
+            "at a center counts it"
+        );
+        assert_eq!(
+            tab_insertion_index(60.0, &centers),
+            1,
+            "between slot 0 and 1 → gap 1"
+        );
+        assert_eq!(tab_insertion_index(100.0, &centers), 2);
+        assert_eq!(
+            tab_insertion_index(200.0, &centers),
+            3,
+            "after every tab → gap n"
+        );
+    }
+
+    #[test]
+    fn move_target_for_gap_handles_noop_and_shift() {
+        // Dragging slot 0: the two gaps bracketing it are no-ops; further gaps shift left by one.
+        assert_eq!(move_target_for_gap(0, 0), None);
+        assert_eq!(move_target_for_gap(1, 0), None);
+        assert_eq!(move_target_for_gap(2, 0), Some(1));
+        assert_eq!(move_target_for_gap(3, 0), Some(2));
+        // Dragging slot 2 leftward.
+        assert_eq!(move_target_for_gap(0, 2), Some(0));
+        assert_eq!(move_target_for_gap(1, 2), Some(1));
+        assert_eq!(move_target_for_gap(2, 2), None);
+        assert_eq!(move_target_for_gap(3, 2), None);
+    }
+
+    #[gpui::test]
+    fn tab_drag_reorders_sends_move(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            // Past the threshold, into the left half of slot 2 (cursor 140 < its center 150), so the
+            // drop inserts BEFORE slot 2 → gap 2 → final index 1 (removing S0 shifts the gap left).
+            c.tab_drag_move(140.0, cx);
+            c.tab_drag_end(140.0, cx);
+        });
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::MoveSheet {
+                    sheet: SheetId(0),
+                    to_index: 1
+                }]
+            ),
+            "a real drop before slot 2 moves S0 to final index 1"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_drag_below_threshold_is_no_command(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            c.tab_drag_move(32.0, cx); // 2 px < threshold → still a click
+            c.tab_drag_end(32.0, cx);
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a sub-threshold press stays a click, sends no MoveSheet"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_drag_to_origin_sends_nothing(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            c.tab_drag_move(36.0, cx); // crosses the threshold but stays over the origin tab
+            c.tab_drag_end(36.0, cx);
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "dropping back on the origin slot is a no-op"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_drag_sets_indicator(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        let (active, indicator) = upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            c.tab_drag_move(140.0, cx);
+            (c.tab_drag_active(), c.tab_drop_indicator_x())
+        });
+        assert!(active, "past the threshold the drag is active");
+        assert_eq!(
+            indicator,
+            Some(120.0),
+            "the indicator snaps to the gap between slots 1 and 2"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_move_target_skips_without_geometry(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, _cx| c.tab_spans.clear());
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.tab_move_target(SheetId(0), 140.0)),
+            None,
+            "an unmeasured tab strip never guesses a reorder"
+        );
     }
 
     #[gpui::test]

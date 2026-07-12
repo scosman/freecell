@@ -1002,6 +1002,16 @@ impl WorkbookDocument {
         self.model.delete_sheet(sheet_idx)
     }
 
+    /// Moves the sheet at `sheet_idx` to `to_index` (`MoveSheet`), shifting the intervening
+    /// sheets so the moved sheet lands at exactly `to_index`. Undoable (rides the fork's
+    /// history); the new order is preserved on xlsx save; cross-sheet references stay valid
+    /// (sheet order is a vector position, not an identity). Wraps the fork's index-based
+    /// `UserModel::set_worksheet_index` (Phase 6a). A same-index move is a fork-level no-op.
+    pub(crate) fn move_sheet(&mut self, sheet_idx: u32, to_index: u32) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model.set_worksheet_index(sheet_idx, to_index)
+    }
+
     /// Undoes the last committed edit (engine history). Auto-evaluates unless paused.
     pub(crate) fn undo(&mut self) -> Result<(), String> {
         crate::instrument::record_engine_call();

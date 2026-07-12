@@ -426,6 +426,7 @@ impl Worker {
                 | Command::AddSheet
                 | Command::RenameSheet { .. }
                 | Command::DeleteSheet { .. }
+                | Command::MoveSheet { .. }
                 | Command::Undo
                 | Command::Redo) => edits.push(edit),
                 #[cfg(test)]
@@ -2505,6 +2506,14 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.delete_sheet(idx)?;
             Ok(AppliedKind::SheetOp)
         }
+        Command::MoveSheet { sheet, to_index } => {
+            // Map the stable id → its CURRENT worksheet index, then reorder by index (the fork
+            // API is index-based). A `SheetsChanged` republish is driven by the batch's
+            // before/after `sheet_metas()` comparison, so tabs rebuild in the new engine order.
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.move_sheet(idx, *to_index)?;
+            Ok(AppliedKind::SheetOp)
+        }
         Command::Undo => {
             doc.undo()?;
             Ok(AppliedKind::Cell)
@@ -2654,9 +2663,10 @@ fn op_of(edit: &Command) -> AppliedOp {
         | Command::InsertColumns { sheet, .. }
         | Command::DeleteRows { sheet, .. }
         | Command::DeleteColumns { sheet, .. } => AppliedOp::Rebuild { sheet: *sheet },
-        Command::AddSheet | Command::RenameSheet { .. } | Command::DeleteSheet { .. } => {
-            AppliedOp::Sheets
-        }
+        Command::AddSheet
+        | Command::RenameSheet { .. }
+        | Command::DeleteSheet { .. }
+        | Command::MoveSheet { .. } => AppliedOp::Sheets,
         Command::Undo => AppliedOp::Undo,
         Command::Redo => AppliedOp::Redo,
         _ => unreachable!("op_of called on a non-edit command"),
@@ -4713,6 +4723,49 @@ mod tests {
         // Deleting it drops its resident cache.
         worker.process_batch(vec![Command::DeleteSheet { sheet: sheet1_id }]);
         assert!(!worker.shared.caches.read().contains(sheet1_id));
+    }
+
+    #[test]
+    fn move_sheet_reorders_metas_and_undo_restores() {
+        let (mut worker, rx) = test_worker();
+        // Three sheets: [s0, s1, s2] in workbook order.
+        worker.process_batch(vec![Command::AddSheet]);
+        worker.process_batch(vec![Command::AddSheet]);
+        let before: Vec<SheetId> = worker.sheet_metas().iter().map(|m| m.id).collect();
+        assert_eq!(before.len(), 3, "expected three sheets");
+        drain_events(&rx);
+
+        // Move the first sheet to the last index → [s1, s2, s0].
+        worker.process_batch(vec![Command::MoveSheet {
+            sheet: before[0],
+            to_index: 2,
+        }]);
+        let after: Vec<SheetId> = worker.sheet_metas().iter().map(|m| m.id).collect();
+        assert_eq!(
+            after,
+            vec![before[1], before[2], before[0]],
+            "MoveSheet reorders the sheet metas"
+        );
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::SheetsChanged { .. })),
+            "a reorder republishes SheetsChanged so the tab bar rebuilds in engine order"
+        );
+
+        // Undo restores the prior order and re-publishes.
+        worker.process_batch(vec![Command::Undo]);
+        let restored: Vec<SheetId> = worker.sheet_metas().iter().map(|m| m.id).collect();
+        assert_eq!(
+            restored, before,
+            "undo of a reorder restores the prior order"
+        );
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::SheetsChanged { .. })),
+            "undo of a reorder republishes SheetsChanged"
+        );
     }
 
     /// Probes that include cells FAR out on a row/column, so a band that fills the whole row/column

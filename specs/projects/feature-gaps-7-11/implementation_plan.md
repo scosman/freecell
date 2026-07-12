@@ -56,7 +56,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       `phase_plans/phase_6a.md`. *(Separate repo — see CLAUDE.md /
       `specs/projects/ironcalc-upstreaming` operating model. Gates 6b.)*
 
-- [ ] **Phase 6b — Sheet reorder wiring + tab drag** (§6.2–6.3): `Command::MoveSheet` +
+- [x] **Phase 6b — Sheet reorder wiring + tab drag** (§6.2–6.3): `Command::MoveSheet` +
       worker dispatch + `document.rs::move_sheet` + republish `SheetsChanged`; tab drag state
       + threshold + drop indicator + lift in `render_tab`; drop → `MoveSheet`; active follows
       `SheetId`. Worker test + gpui view test (index-compute helper as pure fn) + smoke

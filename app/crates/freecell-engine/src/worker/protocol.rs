@@ -300,6 +300,12 @@ pub enum Command {
     RenameSheet { sheet: SheetId, name: String },
     /// Delete a sheet.
     DeleteSheet { sheet: SheetId },
+    /// Move the sheet with stable id `sheet` so it lands at 0-based worksheet index `to_index`,
+    /// shifting the intervening sheets (`functional_spec.md §6`). Undoable (rides the fork's
+    /// history); the new order is preserved on xlsx save. The worker maps `sheet` → its current
+    /// worksheet index before calling the fork's index-based reorder API. Republishes
+    /// [`WorkerEvent::SheetsChanged`] so the tab bar rebuilds in the new engine order.
+    MoveSheet { sheet: SheetId, to_index: u32 },
     /// Undo the last committed edit.
     Undo,
     /// Redo the last undone edit.

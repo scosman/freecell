@@ -471,7 +471,8 @@ impl Worker {
                     sheet,
                     kind,
                     anchor,
-                } => self.insert_authored_chart(sheet, kind, anchor),
+                    data,
+                } => self.insert_authored_chart(sheet, kind, anchor, data),
                 Command::SetChartAnchor { sheet, id, anchor } => {
                     self.set_chart_anchor(sheet, id, anchor)
                 }
@@ -1635,12 +1636,21 @@ impl Worker {
         out
     }
 
-    /// Insert a near-empty **authored** chart of `kind` onto `sheet` at `anchor` (P17,
-    /// charts/ui_design §3.1). A degraded worker rejects it (like every mutating op). Otherwise it
-    /// builds the template chart, holds it as an Authored [`ChartSpec`] (snapshot-but-not-live —
-    /// no `c:f` binding, so it never enters the dirty-set re-resolve), marks the document dirty, and
-    /// republishes the chart snapshot so the window's `sync_charts` installs it into the grid.
-    fn insert_authored_chart(&mut self, sheet: SheetId, kind: ChartInsertKind, anchor: Anchor) {
+    /// Insert an **authored** chart of `kind` onto `sheet` at `anchor` (P17, charts/ui_design §3.1).
+    /// A degraded worker rejects it (like every mutating op). Otherwise it builds the template chart
+    /// and holds it as an Authored [`ChartSpec`], marks the document dirty, and republishes the chart
+    /// snapshot so the window's `sync_charts` installs it into the grid. When `data` is `Some` (the
+    /// action bar captured a real selection — Batch 3 item 8) the chart is **bound at creation** via
+    /// [`bind_authored_range_at`](Self::bind_authored_range_at), so it is born LIVE; when `None` it
+    /// stays snapshot-but-not-live (no `c:f` binding, so it never enters the dirty-set re-resolve
+    /// until a range is set in P19).
+    fn insert_authored_chart(
+        &mut self,
+        sheet: SheetId,
+        kind: ChartInsertKind,
+        anchor: Anchor,
+        data: Option<CellRange>,
+    ) {
         // A degraded worker refuses edits (consistent with the edit batch / paste / SetFont).
         if self.degraded {
             self.emit(WorkerEvent::EditRejected {
@@ -1663,6 +1673,16 @@ impl Worker {
             // is set (P19). Empty `refs` keeps it snapshot-but-not-live, saved as literals.
             refs: Vec::new(),
         });
+        // Post-v1 Batch 3, item 8: if the action bar captured a real selection at insert time, bind
+        // it right now so the chart is born LIVE (real `c:f` refs + resolved values) — same block→
+        // series binding as `SetChartRange`, on the id we just assigned. The data lives on the insert
+        // `sheet` (the selection's own — anchor — sheet). A `None` selection stays near-empty.
+        if let Some(data) = data {
+            if let Some(data_sheet_name) = self.sheet_name_of(sheet) {
+                let pos = self.authored_charts.len() - 1;
+                self.bind_authored_range_at(pos, sheet, &data_sheet_name, data);
+            }
+        }
         // Mark the document dirty so the unsaved chart can be saved. A chart op is NOT an
         // IronCalc-undoable op — it pushes no undo/touch entry, so it never desyncs the undo/touch
         // stacks; `ops_seen` is a monotonic committed-op counter consumed only by the dirty flag +
@@ -1768,10 +1788,26 @@ impl Worker {
             );
             return;
         };
+        self.bind_authored_range_at(pos, sheet, &data_sheet_name, data);
+        self.commit_chart_op();
+    }
+
+    /// Bind the authored chart at index `pos` to the `data` block on `data_sheet` (named
+    /// `data_sheet_name`): derive its `c:f` refs, rebuild its series shells in the current kind's data
+    /// shape, and re-resolve their values from the current cells — turning a near-empty placeholder
+    /// into a **LIVE** chart. The shared body of `SetChartRange` (P19) and the range-at-insert path
+    /// (Batch 3 item 8). Does **not** publish — the caller commits/publishes once.
+    fn bind_authored_range_at(
+        &mut self,
+        pos: usize,
+        data_sheet: SheetId,
+        data_sheet_name: &str,
+        data: CellRange,
+    ) {
         let Some(mut template) = self.authored_charts[pos].spec.chart().cloned() else {
             return; // an authored chart always has a typed Chart; defensive
         };
-        let refs = crate::chart::series_refs_from_block(&data_sheet_name, data);
+        let refs = crate::chart::series_refs_from_block(data_sheet_name, data);
         let binding = binding_from_refs(&refs);
         // The range keeps the current type, so the series data shape is unchanged — derive the shape
         // from the current kind (xy for scatter, xy+size for bubble, else category/value) the same
@@ -1780,7 +1816,7 @@ impl Worker {
             .map(|k| k.series_shape())
             .unwrap_or(freecell_chart_model::SeriesShape::CategoryValue);
         template.series = build_series_shells(refs.len(), shape);
-        let resolved = self.resolve_authored_chart(sheet, &template, &binding);
+        let resolved = self.resolve_authored_chart(data_sheet, &template, &binding);
         let source_ranges = source_ranges_from_refs(&refs);
 
         let entry = &mut self.authored_charts[pos];
@@ -1789,7 +1825,6 @@ impl Worker {
         }
         entry.spec.source_ranges = source_ranges;
         entry.refs = refs;
-        self.commit_chart_op();
     }
 
     /// Switch an **authored** chart's type (P19, `Command::SetChartType`): rebuild the chart named by
@@ -3604,6 +3639,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
 
         // The insert holds one authored chart, bumps the version, and publishes.
@@ -3633,6 +3669,51 @@ mod tests {
         assert_eq!(worker.shared.committed_ops.load(Ordering::Acquire), 1);
     }
 
+    /// Batch 3 item 8: inserting a chart with a `data` range binds it **at creation** — the published
+    /// chart is born LIVE (real `c:f` refs + values resolved from the current cells), exactly as if a
+    /// `SetChartRange` had followed the insert, but in one op. A `data: None` insert (asserted by
+    /// `insert_chart_publishes_authored_snapshot`) stays the near-empty placeholder.
+    #[test]
+    fn insert_chart_with_data_binds_range_at_creation() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        seed_chart_data(&mut worker, sheet); // A1:B3 = Widgets / Q1,Q2 / 10,20
+        let before = worker.chart_version;
+        worker.process_batch(vec![Command::InsertChart {
+            sheet,
+            kind: ChartInsertKind::Line,
+            anchor: test_anchor(),
+            data: Some(CellRange::from_a1("A1:B3").unwrap()),
+        }]);
+
+        // Exactly one authored chart, bound at creation (non-empty refs) — no follow-up SetChartRange.
+        assert_eq!(worker.authored_charts.len(), 1);
+        let entry = &worker.authored_charts[0];
+        assert!(
+            !entry.refs.is_empty(),
+            "inserting with a data range binds `c:f` refs at creation"
+        );
+        assert!(
+            entry
+                .spec
+                .source_ranges
+                .iter()
+                .any(|r| r.as_str().contains("$B$2:$B$3")),
+            "the value range is published on the spec (the chart is LIVE, not near-empty)"
+        );
+        // The series resolved LIVE from B2:B3 (10, 20), not the placeholder literals.
+        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
+        assert_eq!(
+            entry.spec.chart().unwrap().series[0].name.as_deref(),
+            Some("Widgets"),
+            "the series name resolved from B1 at creation"
+        );
+        assert!(
+            worker.chart_version > before,
+            "the create-and-bind publishes once"
+        );
+    }
+
     /// Criterion #3: a degraded worker MUST reject `InsertChart` (consistent with the edit batch /
     /// paste / SetFont), pushing no authored chart and bumping no version.
     #[test]
@@ -3651,6 +3732,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
 
         assert!(
@@ -3681,6 +3763,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         let version_before = worker.chart_version;
@@ -3707,11 +3790,13 @@ mod tests {
                 sheet,
                 kind: ChartInsertKind::Line,
                 anchor: test_anchor(),
+                data: None,
             },
             Command::InsertChart {
                 sheet,
                 kind: ChartInsertKind::Bar,
                 anchor: test_anchor(),
+                data: None,
             },
         ]);
         assert_eq!(worker.authored_charts.len(), 2);
@@ -3734,6 +3819,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         quiet_panics(|| {
@@ -3783,6 +3869,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let cell00 = |w: &Worker| w.doc.formatted_value(0, CellRef::new(0, 0)).unwrap();
         worker.process_batch(vec![set_input(sheet, 0, 0, "hello")]);
@@ -3833,6 +3920,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         let version_before = worker.chart_version;
@@ -3887,6 +3975,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         worker.process_batch(vec![Command::SetChartRange {
@@ -3920,6 +4009,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         worker.process_batch(vec![Command::SetChartRange {
@@ -3944,6 +4034,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         let version_before = worker.chart_version;
@@ -3985,6 +4076,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         worker.process_batch(vec![Command::SetChartRange {
@@ -4016,6 +4108,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         quiet_panics(|| {
@@ -4077,6 +4170,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
 
@@ -4168,6 +4262,7 @@ mod tests {
             sheet,
             kind: ChartInsertKind::Line,
             anchor: test_anchor(),
+            data: None,
         }]);
         let id = worker.authored_charts[0].id;
         let title_before = authored_chart(&worker, 0).title;

@@ -44,12 +44,20 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
 
 ### 3.1 Insert a chart
 - **Entry point:** a **chart icon on the action bar** (`chrome/view.rs`). Clicking it opens a
-  **menu of chart types**, each shown as a **glyph** of that type (line, column, bar, area,
-  pie, doughnut, scatter, bubble).
+  **menu of chart types**, each a **glyph + label**, ordered **Line → Area → Column → Bar → Pie
+  → Doughnut → Scatter → Bubble** (Excel grouping — the single canonical `CHART_MENU` list, shared
+  with the edit panel's Type row). Menu items are **left-aligned** (icon + label pack at the left,
+  not centered — post-v1 Batch 3, item 14). The dropdown **paints above** the right-docked edit
+  panel when both are open (item 10).
 - **Choosing a type** inserts a chart of that type onto the sheet and immediately opens its
-  **edit panel** (§4). The chart comes up **nearly empty** — the user is expected to **edit it
-  into good form** (set its range, title, etc.) via the panel. (No pre-selected range
-  required.)
+  **edit panel** (§4).
+  - **Default data range (post-v1 Batch 3, item 8):** if a **real range** (more than one cell) is
+    selected at insert time, the new chart is **bound to that selection immediately** — it comes up
+    as a **live chart** of the chosen type (real `c:f` refs + resolved values), no follow-up "Use
+    selection" click. The worker binds it at creation (same block→series binding as `SetChartRange`,
+    on the freshly-inserted id).
+  - With **no usable selection** (a single cell / empty), the chart comes up **nearly empty** — the
+    user shapes it (set its range, title, etc.) via the panel.
 
 ### 3.2 Manipulate a chart object
 - **Select** a chart → selection outline + resize handles on the ChartLayer.

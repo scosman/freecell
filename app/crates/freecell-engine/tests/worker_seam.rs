@@ -1364,6 +1364,7 @@ fn insert_line_chart_publishes_authored_snapshot() {
         sheet,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(0, 0),
+        data: None,
     });
     poll_until(
         || client.chart_snapshot().version > base,
@@ -1410,6 +1411,7 @@ fn combined_save_writes_loaded_and_authored_charts() {
         sheet: other_sheet,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(1, 1),
+        data: None,
     });
     poll_until(
         || {
@@ -1471,6 +1473,7 @@ fn authored_chart_on_a_loaded_charts_sheet_fails_loudly() {
         sheet: data_sheet,
         kind: ChartInsertKind::Column,
         anchor: chart_anchor(6, 6),
+        data: None,
     });
     poll_until(
         || {
@@ -1553,6 +1556,7 @@ fn move_authored_chart_roundtrips() {
         sheet,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(0, 0),
+        data: None,
     });
     poll_until(
         || first_chart_id(&client, sheet).is_some(),
@@ -1594,11 +1598,13 @@ fn delete_authored_chart_roundtrips() {
         sheet,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(0, 0),
+        data: None,
     });
     client.send(Command::InsertChart {
         sheet,
         kind: ChartInsertKind::Bar,
         anchor: chart_anchor(10, 0),
+        data: None,
     });
     poll_until(
         || chart_count_on(&client, sheet) == 2,
@@ -1805,6 +1811,7 @@ fn moved_loaded_chart_with_authored_present_resave_is_stable() {
         sheet: other,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(1, 1),
+        data: None,
     });
     poll_until(
         || chart_count_on(&client, other) == 1,
@@ -1873,6 +1880,7 @@ fn spawn_new_with_chart_data() -> (DocumentClient, WorkerEventReceiver, SheetId,
         sheet,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(4, 0),
+        data: None,
     });
     poll_until(
         || first_chart_id(&client, sheet).is_some(),
@@ -2294,6 +2302,7 @@ fn combined_save_mixes_loaded_bound_and_unbound_authored_charts() {
         sheet: sheet2,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(4, 0),
+        data: None,
     });
     poll_until(
         || chart_count_on(&client, sheet2) == 1,
@@ -2315,6 +2324,7 @@ fn combined_save_mixes_loaded_bound_and_unbound_authored_charts() {
         sheet: sheet2,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(14, 0),
+        data: None,
     });
     poll_until(
         || chart_count_on(&client, sheet2) == 2,
@@ -2566,6 +2576,7 @@ fn authored_chart_chrome_edits_roundtrip() {
         sheet,
         kind: ChartInsertKind::Line,
         anchor: chart_anchor(0, 0),
+        data: None,
     });
     poll_until(
         || first_chart_id(&client, sheet).is_some(),

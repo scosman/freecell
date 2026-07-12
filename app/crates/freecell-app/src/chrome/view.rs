@@ -1220,10 +1220,17 @@ impl ChromeView {
         if !self.commit_pending_edit(window, cx) {
             return; // an invalid pending edit blocks the insert, keeping the field editing
         }
+        // Post-v1 Batch 3, item 8: seed the new chart's data range from the current selection when it
+        // is a **real range** (more than one cell) — the worker binds it at creation, so the chart is
+        // born as a live chart of the chosen type, no follow-up "Use selection" click. A single-cell
+        // (or trivial) selection passes `None`, keeping the near-empty placeholder behavior. Reuses
+        // the P19 `SetChartRange` binding (`series_refs_from_block`), now on the freshly-inserted id.
+        let data = (!self.selection.is_single()).then(|| self.selection.range());
         self.client.send(Command::InsertChart {
             sheet: self.active_sheet,
             kind,
             anchor: self.default_chart_anchor(),
+            data,
         });
         cx.notify();
     }
@@ -2896,6 +2903,15 @@ impl ChromeView {
     fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut overlays: Vec<gpui::AnyElement> = Vec::new();
 
+        // The right-docked chart edit panel is pushed FIRST so it is the **bottom-most** overlay:
+        // gpui paints sibling overlays in vector order (later = on top), so every action-bar
+        // dropdown/popover below — the new-chart menu in particular (post-v1 Batch 3, item 10) —
+        // floats ABOVE the docked panel instead of dropping behind it. The panel is a persistent
+        // docked surface; the transient popovers layer on top of it.
+        if self.chart_panel.is_some() {
+            overlays.push(self.render_chart_panel(cx));
+        }
+
         // The data-row cap popover anchors under the data row only when it is the active editor;
         // an in-cell cap error is shown under the overlay by the grid (`edit_controller.md §4.2`).
         if self.edit.origin() == EditOrigin::DataRow {
@@ -2929,9 +2945,6 @@ impl ChromeView {
         }
         if let Some(id) = self.confirm_delete {
             overlays.push(self.render_delete_confirm(id, cx));
-        }
-        if self.chart_panel.is_some() {
-            overlays.push(self.render_chart_panel(cx));
         }
         overlays
     }
@@ -3226,7 +3239,12 @@ impl ChromeView {
     /// one inserts a near-empty authored chart of that type. Same backdrop/occlude/anchor pattern as
     /// the number-format dropdown.
     fn render_chart_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let mut menu = div().flex().flex_col().gap(px(2.0));
+        // `items_start` keeps each entry content-sized (not stretched to the widest row), so its
+        // icon + label pack at the LEFT edge instead of being centered in a full-width button
+        // (post-v1 Batch 3, item 14: left-align the dropdown items like a normal menu). Without it
+        // the flex column's default `stretch` widens every button to "Doughnut" and the inner
+        // label flex (which gpui-component hardcodes to `justify_center`) centers the glyph + text.
+        let mut menu = div().flex().flex_col().items_start().gap(px(2.0));
         for (kind, icon_path, label) in CHART_MENU {
             menu = menu.child(
                 Button::new(gpui::ElementId::Name(format!("chart-{label}").into()))
@@ -4819,15 +4837,48 @@ mod tests {
                 sheet,
                 kind,
                 anchor,
-            } => Some((*sheet, *kind, *anchor)),
+                data,
+            } => Some((*sheet, *kind, *anchor, *data)),
             _ => None,
         });
-        let (sheet, kind, anchor) = inserted.expect("an InsertChart command was sent");
+        let (sheet, kind, anchor, data) = inserted.expect("an InsertChart command was sent");
         assert_eq!(sheet, SheetId(0));
         assert_eq!(kind, ChartInsertKind::Column);
         // From the active cell (col 2, row 3), spanning 8 cols × 15 rows.
         assert_eq!((anchor.from.col, anchor.from.row), (2, 3));
         assert_eq!((anchor.to.col, anchor.to.row), (2 + 8, 3 + 15));
+        // A single-cell selection carries no data range (the chart stays near-empty).
+        assert_eq!(data, None, "a single-cell selection seeds no data range");
+    }
+
+    /// Batch 3 item 8: inserting a chart with a **range** selection (more than one cell) threads that
+    /// range into `InsertChart` as its data, so the worker binds it at creation (no "Use selection"
+    /// click). A single-cell selection threads `None` (covered above), keeping the near-empty chart.
+    #[gpui::test]
+    fn insert_chart_with_range_selection_seeds_data_range(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // Select a real B2:D9 block, then insert.
+        let sel = SelectionModel {
+            anchor: cell(1, 1),
+            active: cell(8, 3),
+        };
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(sel, window, cx)
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.insert_chart(ChartInsertKind::Line, window, cx)
+        });
+        let cmds = h.client.take_commands();
+        let data = cmds.iter().find_map(|cmd| match cmd {
+            Command::InsertChart { data, .. } => Some(*data),
+            _ => None,
+        });
+        assert_eq!(
+            data,
+            Some(Some(sel.range())),
+            "a range selection is threaded into InsertChart as its data, got {cmds:?}"
+        );
     }
 
     /// Criterion #2 (disabled-in-degraded parity): OPEN the chart menu, THEN degrade — the menu
@@ -5247,6 +5298,33 @@ mod tests {
         assert!(
             upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_some()),
             "the loaded (chrome-only) panel painted and stayed open"
+        );
+    }
+
+    /// Batch 3 item 10: the action-bar new-chart dropdown and the right-docked edit panel can be open
+    /// **at the same time** and the chrome paints without panicking. The panel is pushed as the
+    /// bottom-most overlay so the dropdown (pushed later) paints ABOVE it; this forces a real draw of
+    /// that coexistence path (chrome is out of pixel scope — z-order itself is verified in the Xvfb
+    /// smoke launch, this guards the both-open render path).
+    #[gpui::test]
+    fn chart_menu_and_panel_coexist_and_paint(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        open_chrome_panel(&h, cx, true); // right-docked edit panel open (authored chart 7)
+        upd(&h, cx, |c, _w, cx| c.toggle_chart_menu(cx)); // action-bar new-chart dropdown open
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.chart_menu_open())
+                && upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_some()),
+            "the dropdown and the edit panel are both open"
+        );
+        {
+            let vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+        }
+        // Both survived the paint (the overlay-ordering path drew cleanly, no panic).
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.chart_menu_open())
+                && upd(&h, cx, |c, _w, _cx| c.chart_panel_target().is_some()),
+            "the dropdown-over-panel overlay stack painted and both stayed open"
         );
     }
 

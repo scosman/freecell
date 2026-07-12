@@ -341,18 +341,26 @@ pub enum Command {
         cell: CellRef,
         req_id: u64,
     },
-    /// Insert a **near-empty authored chart** of `kind` onto `sheet`, placed at `anchor` (P17,
+    /// Insert an **authored chart** of `kind` onto `sheet`, placed at `anchor` (P17,
     /// charts/ui_design §3.1). The worker builds the template chart
     /// ([`ChartInsertKind::near_empty_chart`]), holds it as an
-    /// [`Authored`](freecell_chart_model::Origin::Authored) `ChartSpec` **snapshot-but-not-live**
-    /// (it has no `c:f` binding yet — ranges arrive in P19), and publishes it on the chart snapshot
-    /// so the grid renders it. On save it takes the **write-from-model** path
+    /// [`Authored`](freecell_chart_model::Origin::Authored) `ChartSpec`, and publishes it on the
+    /// chart snapshot so the grid renders it. On save it takes the **write-from-model** path
     /// (`write::write_authored_charts`), never the loaded re-inject. Rejected with
     /// [`EditRejectedReason::Degraded`] when the worker is degraded (like every mutating op).
+    ///
+    /// `data` seeds the chart's initial **data range** (post-v1 Batch 3, item 8): when the action
+    /// bar captures a real multi-cell selection at insert time, the worker binds that range
+    /// **immediately** — running the same block→series binding as [`SetChartRange`](Command::SetChartRange)
+    /// on the freshly-assigned id — so the chart is born **LIVE** (real `c:f` refs + resolved values),
+    /// no follow-up "Use selection" click. `None` (a single-cell/empty selection) keeps the P17
+    /// snapshot-but-not-live placeholder (no `c:f` binding until a range is set). The range's cells
+    /// live on the insert `sheet` (the active sheet the selection came from).
     InsertChart {
         sheet: SheetId,
         kind: ChartInsertKind,
         anchor: Anchor,
+        data: Option<CellRange>,
     },
     /// **Move or resize** a chart on `sheet` (P18, `ui_design §3.2`): set the chart named by its
     /// stable [`ChartId`] to a new [`Anchor`] (both move and resize produce one). For an **authored**

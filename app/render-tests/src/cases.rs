@@ -1002,7 +1002,11 @@ pub fn all() -> Vec<RenderCase> {
             (480, 220),
         )
         .selection(sel((1, 1), (1, 1)))
-        .in_cell(1, 1, "wrap this text onto several visual lines while editing in place"),
+        .in_cell(
+            1,
+            1,
+            "wrap this text onto several visual lines while editing in place",
+        ),
         // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
         cell(
             // A serif family (visibly distinct from the default sans) rendered per-cell. NOTE:

@@ -238,15 +238,17 @@ mod tests {
     }
 
     /// The find/replace bar's icons all resolve through the combined source: `search` (action-row
-    /// trigger) + `chevron-up`/`chevron-down` (prev/next) come from the gpui-component bundle. The
-    /// dismiss (`×`) and whole-cell (`Whole cell`) controls are text-label buttons, not icons, so
-    /// they don't appear here (`functional_spec.md §4`, `ui_design.md §1–2`).
+    /// trigger), `chevron-up`/`chevron-down` (prev/next), and `close` (the shared Lucide-"x" dismiss
+    /// button — gpui-component's `IconName::Close`) all come from the gpui-component bundle. The
+    /// whole-cell (`Whole cell`) control is a text-label button, not an icon, so it doesn't appear
+    /// here (`functional_spec.md §4`, `ui_design.md §1–2`).
     #[test]
     fn find_bar_icons_all_resolve() {
         for path in [
             "icons/search.svg",
             "icons/chevron-up.svg",
             "icons/chevron-down.svg",
+            "icons/close.svg",
         ] {
             assert!(
                 matches!(AppAssets.load(path), Ok(Some(_))),

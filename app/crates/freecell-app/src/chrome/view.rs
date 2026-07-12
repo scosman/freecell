@@ -19,15 +19,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
-    Focusable, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Rgba, SharedString, Window,
+    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, CursorStyle, ElementId, Entity,
+    FocusHandle, Focusable, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::spinner::Spinner;
-use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
@@ -2688,6 +2688,22 @@ fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
     icon.into_any_element()
 }
 
+/// The shared **close / dismiss** button for the chrome's overlay surfaces (the find bar, the chart
+/// edit panel — `functional_spec.md §4`, `ui_design.md §3`). A ghost, `small` icon button rendering
+/// the bundled Lucide "x" ([`IconName::Close`] → `icons/close.svg`, resolved from the gpui-component
+/// icon bundle), so every dismiss affordance is visually identical instead of an ad-hoc `×` text
+/// glyph. Returns the `Button` so each call site chains its own `tooltip` / `debug_selector`.
+fn close_button(
+    id: impl Into<ElementId>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    Button::new(id)
+        .icon(IconName::Close)
+        .ghost()
+        .small()
+        .on_click(on_click)
+}
+
 /// A borders **line-style preview** (`ui_design.md §2.3`): a short horizontal sample of the real
 /// line, vertically centered in a ~34px box. Solid weights are one dark bar (1/2/3px); dashed is a
 /// row of short dark dashes; double is two 1px dark bars with a gap.
@@ -3368,14 +3384,13 @@ impl ChromeView {
                     })),
             )
             .child(
-                Button::new("find-close")
-                    .label("×")
-                    .tooltip("Close (Esc)")
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                close_button(
+                    "find-close",
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.close_find(window, cx);
-                    })),
+                    }),
+                )
+                .tooltip("Close (Esc)"),
             )
     }
 
@@ -4223,14 +4238,13 @@ impl ChromeView {
                     .child("Edit chart"),
             )
             .child(
-                Button::new("chart-panel-close")
-                    .label("×")
-                    .debug_selector(|| "chart-panel-close".into())
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                close_button(
+                    "chart-panel-close",
+                    cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.close_chart_panel(cx);
-                    })),
+                    }),
+                )
+                .debug_selector(|| "chart-panel-close".into()),
             );
 
         // The scrollable body sections (the header stays pinned above them, so the × is always

@@ -37,12 +37,24 @@ fn xlsx_arg() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Default `tracing` filter, used only when `RUST_LOG` is unset.
+///
+/// `info` for the app, but the `gpui::svg_renderer` target is raised to `error` to silence two
+/// benign startup `WARN`s: gpui core hard-codes Zed's own bundled font asset paths
+/// (`fonts/ibm-plex-sans/…`, `fonts/lilex/…`) and tries to load them through our `AssetSource`
+/// to build a font DB for `<text>` inside SVGs. FreeCell doesn't serve those paths and its icon
+/// SVGs contain no `<text>`, so the loads fail harmlessly and that font DB is never used —
+/// nothing renders wrong (functional_spec.md §1). An explicit `RUST_LOG` still overrides this,
+/// so the warning can be re-enabled for debugging.
+const DEFAULT_LOG_FILTER: &str = "info,gpui::svg_renderer=error";
+
 fn main() {
     // Logging setup per architecture.md §8 (tracing + env-filter). Best-effort init.
+    // `try_from_default_env` reads `RUST_LOG`, so an explicit `RUST_LOG` still wins.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
         .try_init();
 
@@ -81,4 +93,24 @@ fn main() {
             .detach();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_LOG_FILTER;
+    use tracing_subscriber::EnvFilter;
+
+    /// The default filter (used when `RUST_LOG` is unset) must raise the `gpui::svg_renderer`
+    /// target above `WARN` so the two benign bundled-font load warnings never appear
+    /// (functional_spec.md §1, architecture.md §1), and it must be a well-formed directive.
+    #[test]
+    fn default_log_filter_silences_svg_renderer_warning() {
+        assert!(
+            DEFAULT_LOG_FILTER.contains("gpui::svg_renderer=error"),
+            "default filter must silence the gpui::svg_renderer WARN, got: {DEFAULT_LOG_FILTER}",
+        );
+        EnvFilter::builder()
+            .parse(DEFAULT_LOG_FILTER)
+            .expect("default log filter must be a valid EnvFilter directive");
+    }
 }

@@ -19,7 +19,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
 
 ## Phases
 
-- [ ] **Phase 1 — Font-warning fix** (§1): add `gpui::svg_renderer=error` to the default
+- [x] **Phase 1 — Font-warning fix** (§1): add `gpui::svg_renderer=error` to the default
       `EnvFilter` (`shell/main.rs`); keep `RUST_LOG` override working; smoke-launch to
       confirm the two WARN lines are gone. *(Trivial quick win. No pixel impact.)*
 

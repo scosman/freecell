@@ -39,7 +39,8 @@ use super::lifecycle::{self, SaveTarget};
 use super::registry::WindowKey;
 use super::titlebar;
 use super::{
-    CloseWindow, FreeCellApp, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
+    CloseWindow, FreeCellApp, OpenFind, Redo, Save, SaveAs, ToggleBold, ToggleItalic,
+    ToggleUnderline, Undo,
 };
 
 /// Shared, lock-free state the grid/chrome sinks read on the UI thread (they run from inside a
@@ -463,8 +464,11 @@ impl WorkbookWindow {
             }
             WorkerEvent::CellContent { .. }
             | WorkerEvent::EvalStarted
-            | WorkerEvent::EvalFinished => {
-                // Data-row content reply + evaluating-spinner drive live on the chrome.
+            | WorkerEvent::EvalFinished
+            | WorkerEvent::FindResults { .. }
+            | WorkerEvent::ReplacedCount { .. } => {
+                // Data-row content reply + evaluating-spinner drive + find/replace results live on
+                // the chrome (`functional_spec.md §4`).
                 self.chrome
                     .update(cx, |c, cx| c.on_worker_event(event, window, cx));
             }
@@ -1038,6 +1042,11 @@ impl Render for WorkbookWindow {
             .on_action(cx.listener(|this, _: &ToggleUnderline, window, cx| {
                 this.toggle_style(StyleAttr::Underline, window, cx)
             }))
+            // ⌘F / Ctrl-F opens (toggles) the find/replace bar over the grid (`functional_spec.md
+            // §4.2`) — the same path as the action-row search button.
+            .on_action(cx.listener(|this, _: &OpenFind, window, cx| {
+                this.chrome.update(cx, |c, cx| c.toggle_find(window, cx));
+            }))
             // macOS custom titlebar (§7.1): the very top row, drawn only when the master switch
             // is on (Linux omits it → server decorations, unaffected). Its native integration is
             // the on-device smoke gate.
@@ -1516,6 +1525,29 @@ fn make_chrome_grid_sink(
                 window.defer(cx, move |window, cx| {
                     if let Some(grid) = grid.upgrade() {
                         grid.update(cx, |g, cx| g.move_active(motion, window, cx));
+                    }
+                });
+            }
+            ChromeGridRequest::SelectAndReveal(cell) => {
+                // The find bar's current match: select the cell + scroll it into view, and mirror
+                // the selection into the shared state + the chrome (ref box / toggles) — WITHOUT
+                // returning focus to the grid, so the find field keeps focus for the next next/prev
+                // (`functional_spec.md §4.3`). Deferred (BUG #5): emitted from inside the chrome's
+                // update while the grid may be leased.
+                let cell = *cell;
+                let chrome = chrome_slot.get().cloned();
+                let shared = shared.clone();
+                window.defer(cx, move |window, cx| {
+                    let Some(grid) = grid.upgrade() else {
+                        return;
+                    };
+                    let sel = grid.update(cx, |g, cx| {
+                        g.select_and_reveal(cell, window, cx);
+                        *g.selection()
+                    });
+                    shared.last_selection.set(sel);
+                    if let Some(chrome) = chrome.and_then(|w| w.upgrade()) {
+                        chrome.update(cx, |c, cx| c.on_selection_changed(sel, window, cx));
                     }
                 });
             }

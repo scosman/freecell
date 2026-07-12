@@ -17,6 +17,7 @@ pub mod cache;
 pub mod color;
 pub mod data_row;
 pub mod eval_indicator;
+pub mod find;
 pub mod format_color;
 pub mod format_ui;
 pub mod input_cap;

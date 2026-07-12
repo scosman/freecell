@@ -237,6 +237,24 @@ mod tests {
         }
     }
 
+    /// The find/replace bar's icons all resolve through the combined source: `search` (action-row
+    /// trigger) + `chevron-up`/`chevron-down` (prev/next) come from the gpui-component bundle, and
+    /// `square-x` (dismiss) is FreeCell-vendored (`functional_spec.md §4`, `ui_design.md §1–2`).
+    #[test]
+    fn find_bar_icons_all_resolve() {
+        for path in [
+            "icons/search.svg",
+            "icons/chevron-up.svg",
+            "icons/chevron-down.svg",
+            "icons/square-x.svg",
+        ] {
+            assert!(
+                matches!(AppAssets.load(path), Ok(Some(_))),
+                "find-bar icon {path} must resolve"
+            );
+        }
+    }
+
     /// A path in neither FreeCell's icons nor the bundle delegates straight through to the
     /// bundle, which reports a missing asset as `Err` — the pre-existing `gpui_component_assets`
     /// behavior the app already relied on (the combined source doesn't change it).

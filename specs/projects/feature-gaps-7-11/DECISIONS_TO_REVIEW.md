@@ -84,3 +84,58 @@ tagged by phase.
   three cases to keep demonstrating their original intent (clip / font / canary) without incidental
   spill, block the neighbour (or widen the column) in the scene — a cosmetic test-fixture choice, not
   a correctness issue.
+
+## Phase 4 — Find / replace (§4)
+
+- **Replace All is N undo steps for now — its own final phase (Phase 9) delivers single-undo via a
+  standalone ironcalc fork fix (verified IronCalc gap).** `functional_spec.md §4.4` requires Replace
+  All to be ONE undoable batch. IronCalc **can't** group scattered writes from FreeCell's accessible
+  API: paste's single-undo mechanism (`History::push` / `UserModel::push_diff_list`) is `pub(crate)`,
+  and the public rectangle pastes (`paste_csv_string` clears+rewrites the whole rectangle;
+  `paste_from_clipboard` needs the crate-private `ClipboardCell`) are unusable for scattered
+  find/replace matches without a FreeCell-side hack CLAUDE.md forbids. **Interim shipped:**
+  `Command::ReplaceAll` works fully (one eval, one publish) but records one engine undo entry per
+  changed cell — the accepted `SetFont` "K+1 undo steps" precedent. **Resolution (project owner):
+  this is NOT folded into Phase 6 — it is its own new standalone final phase, `implementation_plan.md`
+  Phase 9, with its own clean single-feature ironcalc `fix/` branch + upstream PR, independently
+  revertible.** Phase 9 adds `UserModel::set_user_inputs(&[(sheet,row,col,String)])` (one `diff_list`,
+  no rectangle clear) to the fork, folds it into `freecell-fixes`, re-pins FreeCell + bumps
+  `Cargo.lock`, then swaps the **two** isolated FreeCell call sites so ReplaceAll becomes one undo
+  step: (1) `document.rs::replace_all_matches` (the per-cell `set_user_input` loop → one batch call),
+  and (2) `worker/run.rs::apply_replace_all` (which currently pushes one `Touch::Cells` + one
+  `ops_seen` per changed cell and must **collapse to a single undo touch/op** when the batch lands).
+  Full write-up: `phase_plans/phase_4.md` §ROADBLOCK.
+
+- **`search.svg` is referenced from the gpui-component bundle, NOT vendored.** The task/`ui_design §2`
+  said to add a NEW vendored `search.svg` to `FREECELL_ICONS`. But the bundle **already ships**
+  `icons/search.svg` (tintable) AND gpui-component itself renders it via `IconName::Search`. Vendoring
+  it would *shadow* a bundle icon (violating `assets.rs`'s documented "FreeCell icons are disjoint
+  from the bundle" invariant) and change gpui-component's internal Search rendering. So the action-row
+  button uses the bundle's `icons/search.svg` directly — exactly the existing precedent for
+  `panel-right/left/bottom` (referenced from the bundle, not vendored). Net effect identical (a
+  tintable magnifier); nothing vendored, nothing shadowed. Covered by `find_bar_icons_all_resolve`.
+
+- **`Command::ReplaceOne` is a new command (worker computes), not a reused `SetCellInput`.** The task
+  said "reuse `SetCellInput` — prefer the WORKER computing the replacement (avoid a stale-content
+  race)." Those pull opposite ways (reuse = UI computes; worker-computes = new command). I honored the
+  parenthetical intent: `ReplaceOne` carries `(cell, query, replacement, flags)` and the worker
+  re-reads fresh content + applies the shared `replace_in_cell` helper, so there is no stale-content
+  race and single-cell replace shares one predicate with Replace All. A single-cell replace is
+  inherently one undo step, so this adds no undo concern. Low risk.
+
+- **"Select existing find text on open" IS implemented — no fork, via `on_next_frame` + gpui-component
+  `SelectAll`.** `InputState::select_all` is `pub(super)` (no public selection setter), but the
+  `SelectAll` **action** is public (`gpui_component::input::SelectAll`) and the field's `Input` element
+  registers a handler for it. `open_find` focuses the field, then schedules a dispatch of `SelectAll`
+  to the field's focus handle via `window.on_next_frame` (the field must be in the rendered dispatch
+  tree first — a `defer` runs before the repaint and would fizzle). No gpui-component fork. The unit
+  harness does not auto-draw on notify, so `on_next_frame` can't fire in-test (it does in the real
+  event loop); `open_find_selects_existing_text` instead drives the same `SelectAll`-on-the-focused-
+  field dispatch and asserts the whole value is selected, verifying the mechanism the on-open
+  scheduling relies on.
+
+- **Match-entire-cell toggle glyph is `▢` (U+25A2); the search button is NOT degraded-disabled.**
+  The match-case/whole-cell toggles use text labels ("Aa" / "▢") per the `ui_design §1` mock (tooltips
+  carry the meaning). And the action-row search button stays enabled in degraded/read-only mode
+  because **find is a read** — only the bar's Replace / Replace All are gated on `degraded` (and on
+  having a current match / any matches). Consistent with "every *mutating* control disables".

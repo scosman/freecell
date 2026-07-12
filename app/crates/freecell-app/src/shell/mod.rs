@@ -66,6 +66,8 @@ actions!(
         ToggleItalic,
         /// Toggle underline over the focused workbook's selection.
         ToggleUnderline,
+        /// Open (or toggle) the find/replace bar over the focused workbook (`functional_spec.md §4`).
+        OpenFind,
         /// Quit the application (prompts each dirty window).
         Quit,
         /// Show the About window.

@@ -66,6 +66,11 @@ impl SheetTab {
 pub enum ChromeGridRequest {
     /// Move the active cell (Enter after a commit → down; Tab → right; etc.).
     MoveActive(Motion),
+    /// Select a single cell and scroll it into view (the find bar's current match —
+    /// `functional_spec.md §4.3`). Unlike [`MoveActive`](Self::MoveActive) it targets an absolute
+    /// cell (not a relative motion) and does **not** return focus to the grid (the find field keeps
+    /// focus), so the user can keep pressing next/prev.
+    SelectAndReveal(CellRef),
     /// Return keyboard focus to the grid (after a commit / Escape).
     FocusGrid,
     /// Switch the grid to `sheet` (tab click).

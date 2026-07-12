@@ -341,6 +341,44 @@ pub enum Command {
         cell: CellRef,
         req_id: u64,
     },
+    /// Scan `sheet`'s used range for cells whose **raw content** (formula text for formula cells)
+    /// matches `query` under the case / whole-cell rules (`functional_spec.md §4.3`). A **read**: no
+    /// evaluation, no publish. Replies with [`WorkerEvent::FindResults`] (row-major matches). Runs in
+    /// the worker (which owns the model) so a huge sheet's scan never blocks the UI (`§4.5`).
+    Find {
+        sheet: SheetId,
+        query: String,
+        match_case: bool,
+        whole_cell: bool,
+    },
+    /// Replace the match in a single cell (`functional_spec.md §4.4`): the **worker** re-reads the
+    /// cell's raw content and applies the replacement (substring, or whole content if `whole_cell`),
+    /// then commits it via the normal edit path — recomputing the replacement worker-side (from fresh
+    /// `cell_content`) avoids a stale-content race with the UI. A single-cell edit is inherently one
+    /// undo step. Replies [`WorkerEvent::ReplacedCount`] (`n = 1` if it wrote, else `0`).
+    ReplaceOne {
+        sheet: SheetId,
+        cell: CellRef,
+        query: String,
+        replacement: String,
+        match_case: bool,
+        whole_cell: bool,
+    },
+    /// Replace **every** match in `sheet`'s used range (`functional_spec.md §4.4`), evaluate once,
+    /// publish, and reply [`WorkerEvent::ReplacedCount`] with the number of cells changed.
+    ///
+    /// INTENDED as one undoable batch (`§4.4`). IronCalc's atomic multi-cell undo mechanism
+    /// (`History::push`) is `pub(crate)` and the public rectangle pastes are unusable for scattered
+    /// matches, so this currently records **one engine undo entry per changed cell** (like the
+    /// accepted `SetFont` "K+1 undo steps" precedent) pending a fork `set_user_inputs` batch method —
+    /// see `phase_plans/phase_4.md` ROADBLOCK + `DECISIONS_TO_REVIEW.md`.
+    ReplaceAll {
+        sheet: SheetId,
+        query: String,
+        replacement: String,
+        match_case: bool,
+        whole_cell: bool,
+    },
     /// Insert an **authored chart** of `kind` onto `sheet`, placed at `anchor` (P17,
     /// charts/ui_design §3.1). The worker builds the template chart
     /// ([`ChartInsertKind::near_empty_chart`]), holds it as an
@@ -485,6 +523,13 @@ pub enum WorkerEvent {
     EvalFinished,
     /// Reply to `GetCellContent`: the cell's raw text.
     CellContent { req_id: u64, raw: String },
+    /// Reply to [`Command::Find`]: the matching cells in **row-major** order (empty = no matches).
+    /// The UI stores these, selects + reveals the current one, and drives the "N of M" counter
+    /// (`functional_spec.md §4.3`).
+    FindResults { matches: Vec<CellRef> },
+    /// Reply to [`Command::ReplaceOne`] / [`Command::ReplaceAll`]: how many cells were changed
+    /// (`functional_spec.md §4.4` — "Replaced 7"; `0` when nothing matched).
+    ReplacedCount { n: usize },
     /// Reply to `Save`: success, acking the op-index the file now contains.
     Saved { req_id: u64, ops_seen: u64 },
     /// Reply to `Save`: failure (typed; the original file is untouched — atomic save).

@@ -778,6 +778,21 @@ impl GridView {
         cx.notify();
     }
 
+    /// Select a single cell and scroll it into view — the find bar's current-match reveal
+    /// (`functional_spec.md §4.3`). Sets the selection **without** emitting a grid
+    /// `SelectionChanged` (the chrome-grid sink mirrors it into the chrome itself, avoiding a
+    /// double fold), then reveals it (which announces the possibly-widened viewport so an
+    /// off-screen match is published). The caller keeps the find field focused.
+    pub fn select_and_reveal(
+        &mut self,
+        cell: CellRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selection(SelectionModel::single(cell), cx);
+        self.reveal_and_announce(cell.row, cell.col, window, cx);
+    }
+
     /// Shows/hides the file-open loading overlay ("Opening *name*…").
     pub fn set_loading(&mut self, loading: Option<String>, cx: &mut Context<Self>) {
         self.loading = loading;

@@ -35,7 +35,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       and punt-able); coverage-edge safety. Iterate with `render_tests.sh test spill_`.
       *(Moves pixels — baselines refreshed in Phase 8.)*
 
-- [ ] **Phase 4 — Find/replace** (§4): `render_find_bar` under the data row + `find_open` /
+- [x] **Phase 4 — Find/replace** (§4): `render_find_bar` under the data row + `find_open` /
       field / toggle / match state on `ChromeView`; `search.svg` icon + action-row button;
       worker `Command::Find` + `WorkerEvent::FindResults`, `Command::ReplaceAll` (one undo
       batch) + single-replace via `SetCellInput`; `OpenFind` action + `⌘F` keybinding +
@@ -71,3 +71,18 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       final Xvfb smoke of the chrome features (find bar, tab drag, quick-edit); update
       `GAPS.md` (spill/overflow F1, wrap+auto-grow) + note the shipped features; sweep
       `DECISIONS_TO_REVIEW.md`.
+
+- [ ] **Phase 9 — Replace All single-undo (ironcalc fork)** (§4.4): make Replace All ONE undo step.
+      Phase 4 shipped `Command::ReplaceAll` working but with N engine undo entries (one per changed
+      cell — the `SetFont` "K+1" precedent) because IronCalc exposes no public way to group scattered
+      cell writes into one `diff_list` (`History::push`/`push_diff_list` are `pub(crate)`; the public
+      rectangle pastes are unusable for scattered matches). Per CLAUDE.md, add
+      `UserModel::set_user_inputs(&[(sheet,row,col,String)])` (one `diff_list`, no rectangle clear) to
+      the `scosman/ironcalc` fork on its **own clean single-feature `fix/` branch** (upstream-style
+      tests, one focused upstream PR — do NOT reuse Phase 6's sheet-reorder branch); fold into
+      `freecell-fixes`; re-pin FreeCell's `[patch.crates-io]` + bump `Cargo.lock`. Then swap the two
+      isolated FreeCell call sites to the batch method so a single Undo reverts the whole replace:
+      (1) `document.rs::replace_all_matches` (per-cell loop → one batch call) and
+      (2) `worker/run.rs::apply_replace_all` (collapse the per-cell `Touch`/`ops_seen` pushes to a
+      single undo touch/op). Keep it **independently revertible**. *(Separate repo — see CLAUDE.md /
+      `specs/projects/ironcalc-upstreaming`. No pixel impact — chrome not baselined.)*

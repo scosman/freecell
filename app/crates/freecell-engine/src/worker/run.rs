@@ -360,6 +360,12 @@ impl Worker {
         // edit batch: each mutates the authored/loaded chart set + republishes the chart snapshot
         // (P17/P18); none is an IronCalc edit, so none rides the undo/touch stacks.
         let mut chart_ops: Vec<Command> = Vec::new();
+        // Find scans (`Command::Find`) are pure reads (no eval/publish); replace ops
+        // (`ReplaceOne`/`ReplaceAll`) mutate one-by-one after the edit batch, each carrying its own
+        // eval + publish + undo touch entry (like clipboard ops), so the undo/touch stacks stay
+        // aligned (`functional_spec.md §4`).
+        let mut find_ops: Vec<(SheetId, String, bool, bool)> = Vec::new();
+        let mut replace_ops: Vec<Command> = Vec::new();
         let mut viewport_changed = false;
         // Every sheet activated in this drained batch (in order), so lazy chart discovery walks
         // EACH one — not just the batch's final active sheet (a batch that activates A then B must
@@ -385,6 +391,15 @@ impl Worker {
                     cell,
                     req_id,
                 } => reads.push((sheet, cell, req_id)),
+                Command::Find {
+                    sheet,
+                    query,
+                    match_case,
+                    whole_cell,
+                } => find_ops.push((sheet, query, match_case, whole_cell)),
+                replace @ (Command::ReplaceOne { .. } | Command::ReplaceAll { .. }) => {
+                    replace_ops.push(replace)
+                }
                 Command::Save { path, req_id } => saves.push((path, req_id)),
                 Command::Shutdown => shutdown = true,
                 clip @ (Command::CopySelection { .. }
@@ -490,6 +505,25 @@ impl Worker {
         // publish + one undo entry).
         for clip in clipboard_ops {
             self.apply_clipboard_op(clip);
+        }
+
+        // Replace ops after the edit batch (each mutates the model: its own guarded eval + publish +
+        // undo touch entries), so a find run below sees the replaced state.
+        for replace in replace_ops {
+            self.apply_replace_op(replace);
+        }
+
+        // Find scans are pure reads (no eval/publish) — run them last so they observe every mutation
+        // in this batch.
+        for (sheet, query, match_case, whole_cell) in find_ops {
+            let matches = match self.resolve(sheet) {
+                Some(idx) => self
+                    .doc
+                    .find_matches(idx, &query, match_case, whole_cell)
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            self.emit(WorkerEvent::FindResults { matches });
         }
 
         for (sheet, cell, req_id) in reads {
@@ -686,6 +720,206 @@ impl Worker {
             } => self.apply_paste_tsv(sheet, anchor, &text),
             // Only the three clipboard commands are bucketed here.
             _ => {}
+        }
+    }
+
+    /// Dispatch one replace op (`functional_spec.md §4.4`). Each mutates the model standalone: its
+    /// own guarded paused-eval + single `evaluate()` + publish + undo touch entry(ies), then a
+    /// `ReplacedCount` reply the find bar shows.
+    fn apply_replace_op(&mut self, cmd: Command) {
+        match cmd {
+            Command::ReplaceOne {
+                sheet,
+                cell,
+                query,
+                replacement,
+                match_case,
+                whole_cell,
+            } => self.apply_replace_one(sheet, cell, &query, &replacement, match_case, whole_cell),
+            Command::ReplaceAll {
+                sheet,
+                query,
+                replacement,
+                match_case,
+                whole_cell,
+            } => self.apply_replace_all(sheet, &query, &replacement, match_case, whole_cell),
+            // Only the two replace commands are bucketed here.
+            _ => {}
+        }
+    }
+
+    /// Replace the current match in a single cell (`Command::ReplaceOne`). The worker recomputes the
+    /// replacement from the cell's fresh raw content (race-free), commits it (one undo entry), and
+    /// replies `ReplacedCount { n }` (`1` if it wrote, else `0`).
+    fn apply_replace_one(
+        &mut self,
+        sheet: SheetId,
+        cell: CellRef,
+        query: &str,
+        replacement: &str,
+        match_case: bool,
+        whole_cell: bool,
+    ) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            return;
+        }
+        let Some(idx) = self.resolve(sheet) else {
+            self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            return;
+        };
+        self.emit(WorkerEvent::EvalStarted);
+        let outcome = {
+            let doc = &mut self.doc;
+            let (q, r) = (query.to_string(), replacement.to_string());
+            catch_unwind(AssertUnwindSafe(move || {
+                doc.pause_evaluation();
+                let wrote = doc.replace_one(idx, cell, &q, &r, match_case, whole_cell);
+                doc.resume_evaluation();
+                if matches!(wrote, Ok(true)) {
+                    doc.evaluate();
+                }
+                wrote
+            }))
+        };
+        self.emit(WorkerEvent::EvalFinished);
+        match outcome {
+            Ok(Ok(true)) => {
+                let touched = vec![(sheet, CellRange::new(cell, cell))];
+                self.commit_replacements(&touched);
+                self.emit(WorkerEvent::ReplacedCount { n: 1 });
+            }
+            Ok(Ok(false)) => self.emit(WorkerEvent::ReplacedCount { n: 0 }),
+            Ok(Err(msg)) => {
+                self.emit(WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(msg),
+                });
+                self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            }
+            Err(_) => {
+                {
+                    let doc = &mut self.doc;
+                    let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                }
+                tracing::debug!("worker: caught panic in ReplaceOne; entering recovery");
+                self.handle_caught_panic();
+                self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            }
+        }
+    }
+
+    /// Replace **every** match in the used range (`Command::ReplaceAll`). One guarded paused-eval,
+    /// one `evaluate()`, one publish. Records **one engine undo entry per changed cell** (the
+    /// N-undo interim — see the ROADBLOCK in `phase_plans/phase_4.md`), so it pushes one touch per
+    /// changed cell to keep the undo/touch stacks 1:1 aligned (the `SetFont` K-entry precedent).
+    /// Replies `ReplacedCount { n }`.
+    fn apply_replace_all(
+        &mut self,
+        sheet: SheetId,
+        query: &str,
+        replacement: &str,
+        match_case: bool,
+        whole_cell: bool,
+    ) {
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            return;
+        }
+        let Some(idx) = self.resolve(sheet) else {
+            self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            return;
+        };
+        self.emit(WorkerEvent::EvalStarted);
+        let outcome = {
+            let doc = &mut self.doc;
+            let (q, r) = (query.to_string(), replacement.to_string());
+            catch_unwind(AssertUnwindSafe(move || {
+                doc.pause_evaluation();
+                let changed = doc.replace_all_matches(idx, &q, &r, match_case, whole_cell);
+                doc.resume_evaluation();
+                if matches!(&changed, Ok(cells) if !cells.is_empty()) {
+                    doc.evaluate(); // the ONE coalesced recompute for the whole replace
+                }
+                changed
+            }))
+        };
+        self.emit(WorkerEvent::EvalFinished);
+        match outcome {
+            Ok(Ok(changed)) => {
+                let n = changed.len();
+                if n > 0 {
+                    // One engine undo entry per changed cell → one touch per cell (kept 1:1 so a
+                    // later Undo pops the matching touch), and a fresh edit clears the redo side.
+                    let touched: Vec<(SheetId, CellRange)> = changed
+                        .iter()
+                        .map(|&c| (sheet, CellRange::new(c, c)))
+                        .collect();
+                    self.eval_count += 1;
+                    self.ops_seen += n as u64;
+                    self.shared
+                        .committed_ops
+                        .store(self.ops_seen, Ordering::Release);
+                    self.reresolve_charts(&touched, &[]);
+                    self.publish();
+                    self.emit(WorkerEvent::Published);
+                    for (s, range) in &touched {
+                        self.undo_touches.push(Touch::Cells {
+                            sheet: *s,
+                            range: *range,
+                        });
+                    }
+                    self.redo_touches.clear();
+                    for s in self.refresh_cache_cells(&touched) {
+                        self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
+                    }
+                }
+                self.emit(WorkerEvent::ReplacedCount { n });
+            }
+            Ok(Err(msg)) => {
+                self.emit(WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(msg),
+                });
+                self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            }
+            Err(_) => {
+                {
+                    let doc = &mut self.doc;
+                    let _ = catch_unwind(AssertUnwindSafe(|| doc.resume_evaluation()));
+                }
+                tracing::debug!("worker: caught panic in ReplaceAll; entering recovery");
+                self.handle_caught_panic();
+                self.emit(WorkerEvent::ReplacedCount { n: 0 });
+            }
+        }
+    }
+
+    /// Shared post-replace bookkeeping for a single-cell replace (`ReplaceOne`): count the op,
+    /// re-resolve any charts the change touched, publish, push one undo touch entry, and refresh the
+    /// touched cache cell. (`ReplaceAll` inlines the multi-entry variant.)
+    fn commit_replacements(&mut self, touched: &[(SheetId, CellRange)]) {
+        self.eval_count += 1;
+        self.ops_seen += 1;
+        self.shared
+            .committed_ops
+            .store(self.ops_seen, Ordering::Release);
+        self.reresolve_charts(touched, &[]);
+        self.publish();
+        self.emit(WorkerEvent::Published);
+        for (sheet, range) in touched {
+            self.undo_touches.push(Touch::Cells {
+                sheet: *sheet,
+                range: *range,
+            });
+        }
+        self.redo_touches.clear();
+        for sheet in self.refresh_cache_cells(touched) {
+            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
         }
     }
 
@@ -2628,6 +2862,111 @@ mod tests {
         assert_eq!(
             worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
             "30"
+        );
+    }
+
+    #[test]
+    fn find_command_emits_row_major_results() {
+        // Populate a few cells, then a `Find` batch replies with the matching cells in row-major
+        // order — a pure read (no publish).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "apple"),     // A1
+            set_input(sheet, 1, 1, "APPLE pie"), // B2
+            set_input(sheet, 2, 0, "grape"),     // A3 (no match)
+        ]);
+        let _ = drain_events(&rx);
+
+        worker.process_batch(vec![Command::Find {
+            sheet,
+            query: "apple".to_string(),
+            match_case: false,
+            whole_cell: false,
+        }]);
+        let events = drain_events(&rx);
+        let matches = events
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::FindResults { matches } => Some(matches.clone()),
+                _ => None,
+            })
+            .expect("a Find batch replies FindResults");
+        assert_eq!(matches, vec![CellRef::new(0, 0), CellRef::new(1, 1)]);
+        // A find is a read — it publishes nothing.
+        assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
+    }
+
+    #[test]
+    fn replace_all_command_replaces_reports_count_and_publishes() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "cat"),  // A1
+            set_input(sheet, 0, 1, "cats"), // B1
+            set_input(sheet, 1, 0, "dog"),  // A2 (no match)
+        ]);
+        let _ = drain_events(&rx);
+        let touches_before = worker.undo_touches.len();
+
+        worker.process_batch(vec![Command::ReplaceAll {
+            sheet,
+            query: "cat".to_string(),
+            replacement: "dog".to_string(),
+            match_case: true,
+            whole_cell: false,
+        }]);
+        let events = drain_events(&rx);
+        let n = events
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::ReplacedCount { n } => Some(*n),
+                _ => None,
+            })
+            .expect("a ReplaceAll batch replies ReplacedCount");
+        assert_eq!(n, 2);
+        assert!(
+            events.iter().any(|e| matches!(e, WorkerEvent::Published)),
+            "ReplaceAll republishes"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "dog"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 1)).unwrap(),
+            "dogs"
+        );
+        // N-undo interim: one engine op per changed cell (one new touch per replaced cell).
+        assert_eq!(
+            worker.undo_touches.len() - touches_before,
+            2,
+            "one touch per replaced cell"
+        );
+    }
+
+    #[test]
+    fn replace_one_command_rewrites_single_cell() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "foobar")]);
+        let _ = drain_events(&rx);
+
+        worker.process_batch(vec![Command::ReplaceOne {
+            sheet,
+            cell: CellRef::new(0, 0),
+            query: "foo".to_string(),
+            replacement: "qux".to_string(),
+            match_case: true,
+            whole_cell: false,
+        }]);
+        let events = drain_events(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ReplacedCount { n: 1 })));
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "quxbar"
         );
     }
 

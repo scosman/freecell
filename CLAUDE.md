@@ -46,6 +46,11 @@ FreeCell. This is the standing way of working, not a one-off.
   with upstream-style tests) = one clean PR; `freecell-fixes` = integration branch FreeCell builds
   against. Sync `main` from upstream periodically (rebase `fix/*` + `freecell-fixes`); expect
   incidental drift to reconcile on the FreeCell side.
+- **One fix = one branch = one focused single-feature upstream PR. Never fold multiple fork fixes
+  into a single `fix/` branch (or a single FreeCell phase).** Upstream wants independent,
+  single-feature PRs they can review + merge in isolation; a bundled branch is not acceptable
+  upstream and is harder to revert. If a FreeCell phase needs two unrelated fork capabilities, each
+  gets its own `fix/<slug>` branch + PR.
 - An agent can work both repos in one container (FreeCell here; fork at `/workspace/ironcalc` via
   `add_repo scosman/ironcalc`). **Full process + the per-issue loop:**
   [`specs/projects/ironcalc-upstreaming/implementation_plan.md`](specs/projects/ironcalc-upstreaming/implementation_plan.md)

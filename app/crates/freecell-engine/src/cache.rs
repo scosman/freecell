@@ -1159,4 +1159,53 @@ mod tests {
             "2k-cell viewport lookup took {elapsed:?} — suspiciously slow (possible O(n) lookup)"
         );
     }
+
+    #[test]
+    fn libreoffice_true_form_booleans_honored_on_load() {
+        // Regression for the IronCalc xlsx importer bool-parse fix (fork `fix/xlsx-bool-import`).
+        // LibreOffice writes xsd:boolean attributes in the `"true"`/`"false"` form; the pre-fix
+        // importer only recognised Excel's `"1"`/`"0"`, so `customHeight="true"` and
+        // `wrapText="true"` were silently dropped — tall title rows loaded at the default height
+        // (until edited) and wrapped header cells imported as non-wrapping. With the importer
+        // fixed, FreeCell's EXISTING `build_sheet_cache` honors both on load with no workaround:
+        // `custom_height` seeds the row-height override (the `r.custom_height` gate above) and
+        // `wrap_text` flows into `RenderStyle::wrap`.
+        //
+        // `libreoffice_custom_height_wrap.xlsx` is a real LibreOffice-authored workbook. On its
+        // first sheet ("Sales Overview") rows 2/3/5 carry `customHeight="true"` with
+        // ht = 33.75 / 18 / 27.75 pt, and cells B5:H5 use a style with `wrapText="true"`.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/libreoffice_custom_height_wrap.xlsx");
+        let doc = WorkbookDocument::open(&path).expect("LibreOffice demo workbook should open");
+        let cache = build_sheet_cache(&doc, 0).expect("sheet 0 cache builds");
+
+        // Custom row heights are seeded at their stored tall height on load (no edit). Points →
+        // IronCalc px (× ROW_HEIGHT_FACTOR 1.5625) → device px (× 24/25): 33.75pt → 50.625,
+        // 18pt → 27.0, 27.75pt → 41.625 — each well above the 24px default a dropped flag gives.
+        let approx = |got: f32, want: f32| (got - want).abs() < 0.1;
+        assert!(
+            approx(cache.row_height(1), 50.625),
+            "title row (xlsx r2) should load ~50.6px, got {}",
+            cache.row_height(1)
+        );
+        assert!(
+            approx(cache.row_height(2), 27.0),
+            "subtitle row (xlsx r3) should load ~27px, got {}",
+            cache.row_height(2)
+        );
+        assert!(
+            approx(cache.row_height(4), 41.625),
+            "header row (xlsx r5) should load ~41.6px, got {}",
+            cache.row_height(4)
+        );
+        // A row with no custom height stays at the grid default — proof we aren't reading tall
+        // everywhere (and that a dropped flag would have shown here as the default too).
+        assert_eq!(cache.row_height(500), DEFAULT_ROW_HEIGHT_PX);
+
+        // The previously flag-dropped wrap cells (B5:H5) now import wrap-on.
+        let b5 = cache
+            .render_style(4, 1)
+            .expect("wrapped header cell B5 is stored");
+        assert!(b5.wrap, "B5 should be wrap-on after import");
+    }
 }

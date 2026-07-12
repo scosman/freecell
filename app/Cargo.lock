@@ -3133,7 +3133,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -3405,7 +3405,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironcalc"
 version = "0.7.1"
-source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#7d4b215e01137a94eb0df2a3d37463b8acda233c"
+source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#81feec4024332cf35b0f4b6a53f28694b28db325"
 dependencies = [
  "bitcode",
  "chrono",
@@ -3421,7 +3421,7 @@ dependencies = [
 [[package]]
 name = "ironcalc_base"
 version = "0.7.1"
-source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#7d4b215e01137a94eb0df2a3d37463b8acda233c"
+source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#81feec4024332cf35b0f4b6a53f28694b28db325"
 dependencies = [
  "bitcode",
  "chrono",

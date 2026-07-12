@@ -373,3 +373,36 @@ because they call `handle_data_row_edit_key` directly instead of routing an actu
   data-row input. The Left/Right cases fail against the pre-fix code (caret moved, no commit/move),
   which is exactly the gap the direct-call tests couldn't catch. The original direct-call
   `handle_data_row_edit_key` tests are kept unchanged.
+
+## Follow-up bug fix — LibreOffice xlsx: custom row heights + wrap dropped on load (ironcalc fork `fix/xlsx-bool-import`)
+
+- **Root cause was an IronCalc importer bug, not FreeCell.** A user's LibreOffice-authored `.xlsx`
+  loaded with wrong row heights (tall title rows rendered at the default height until edited) and its
+  wrap-on cells were not wrap-on after import. The IronCalc xlsx importer parsed `xsd:boolean`
+  attributes with helpers (`get_bool` / `get_bool_false` in `xlsx/src/import/util.rs`) that only
+  recognised the Excel lexical form `"1"`/`"0"` and silently mishandled the equally-valid ECMA-376 /
+  ISO 29500 form `"true"`/`"false"`. LibreOffice emits `customHeight="true"` and `wrapText="true"`, so
+  the custom-height flag and wrap flag were dropped on import (the real `ht` value survived, but with
+  `custom_height=false` FreeCell never seeds the override; wrap was lost outright). The row importer in
+  `xlsx/src/import/worksheets.rs` also parsed `customHeight`/`customWidth`/`customFormat`/`hidden` with
+  inline `matches!(…, Some("1"))` checks that had the same blind spot.
+
+- **Fixed upstream-first in the fork, no FreeCell workaround.** Per CLAUDE.md (fix the fork, don't hack
+  FreeCell), the parse is corrected on a new single-feature branch `fix/xlsx-bool-import` (off `main`;
+  folded into `freecell-fixes`): `xsd:boolean`'s lexical space is exactly `{true, false, 1, 0}` (W3C XML
+  Schema Part 2), so the helpers now accept all four (`"1"`/`"true"` → true, `"0"`/`"false"`/absent →
+  false, case-insensitive + whitespace-tolerant) and the row importer's inline checks route through the
+  shared helper. It deliberately does **not** over-accept — tokens outside the `xsd:boolean` lexical
+  space (`"yes"`, `"on"`, garbage) fall back to the schema default, never read as true — so it stays
+  spec-compliant and Excel `"1"`/`"0"` files are unaffected. Upstream-style unit tests cover all four
+  forms + the non-over-accept cases. **No upstream PR yet** (owner opens it).
+
+- **FreeCell honors it via existing code.** With the flags no longer dropped, FreeCell's existing
+  `build_sheet_cache` seeds the custom row-height override (its `r.custom_height` gate) and carries
+  `wrap_text` into `RenderStyle::wrap` — **no compensating workaround was added** (in particular the
+  previously-reverted cache.rs `>default` row-height seeding was **not** re-added; the importer fix makes
+  it unnecessary). `app/Cargo.lock` was re-pinned to the new `freecell-fixes` head. A new regression test
+  (`cache::tests::libreoffice_true_form_booleans_honored_on_load`, fixture
+  `tests/fixtures/libreoffice_custom_height_wrap.xlsx`) loads the real LibreOffice workbook and asserts
+  the title/subtitle/header rows load at their stored tall heights on load with no edit
+  (~50.6 / 27.0 / 41.6 px) and that the previously flag-dropped wrap cells (B5:H5) import wrap-on.

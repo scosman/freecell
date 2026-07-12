@@ -3304,7 +3304,7 @@ impl ChromeView {
             ))
             .child(toggle(
                 "find-whole-cell",
-                "▢",
+                "Whole cell",
                 "Match entire cell",
                 self.whole_cell,
                 cx,
@@ -3369,7 +3369,7 @@ impl ChromeView {
             )
             .child(
                 Button::new("find-close")
-                    .icon(Icon::empty().path("icons/square-x.svg"))
+                    .label("×")
                     .tooltip("Close (Esc)")
                     .ghost()
                     .small()

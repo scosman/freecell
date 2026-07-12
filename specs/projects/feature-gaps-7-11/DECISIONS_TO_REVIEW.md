@@ -6,9 +6,10 @@ tagged by phase.
 > **Phase 8 closeout sweep (2026-07-12).** Every decision below was reviewed at the render-
 > validation + closeout phase. All are **accepted as shipped** (per-phase note under each heading),
 > and the Phase 8 full pixel suite re-confirmed all 136 committed baselines byte-match (no incidental
-> regression). **One item is still OPEN:** the Phase 4 "Replace All is N undo steps" decision
-> (§Phase 4, first bullet) — its single-undo fix is **Phase 9** (a standalone `scosman/ironcalc`
-> fork fix, `UserModel::set_user_inputs`) and is **NOT yet done**. Phase 9 has not been started.
+> regression). The one item that was OPEN — the Phase 4 "Replace All is N undo steps" decision
+> (§Phase 4, first bullet) — is now **RESOLVED in Phase 9**: the standalone `scosman/ironcalc` fork
+> fix `UserModel::set_user_inputs` shipped and both FreeCell call sites were swapped, so Replace All
+> is a **single undo step** (see §Phase 9 below).
 
 ## Phase 2 — Quick-edit mode (§5)
 
@@ -102,10 +103,10 @@ cosmetic option, so they stay as the genuine spills the feature produces.*
 ## Phase 4 — Find / replace (§4)
 
 *Sweep (Phase 8): all calls accepted as shipped **except the first bullet** — **Replace All is N undo
-steps**, whose single-undo fix remains **OPEN and deferred to Phase 9** (a standalone `scosman/ironcalc`
-fork fix + the two FreeCell call-site swaps). **Phase 9 is NOT yet done.** The other four Phase-4 calls
-(search.svg from the bundle, `ReplaceOne` worker-computes, select-on-open via `on_next_frame`, toggle
-glyph + non-degraded search button) are accepted as-is.*
+steps**, whose single-undo fix was deferred to Phase 9 (a standalone `scosman/ironcalc` fork fix + the
+two FreeCell call-site swaps). **Phase 9 is now DONE** — Replace All is a single undo step (see §Phase 9).
+The other four Phase-4 calls (search.svg from the bundle, `ReplaceOne` worker-computes, select-on-open
+via `on_next_frame`, toggle glyph + non-degraded search button) are accepted as-is.*
 
 - **Replace All is N undo steps for now — its own final phase (Phase 9) delivers single-undo via a
   standalone ironcalc fork fix (verified IronCalc gap). — STILL OPEN (Phase 9 not started).** `functional_spec.md §4.4` requires Replace
@@ -273,3 +274,52 @@ pre-existing baselines moved) holds.*
   (e.g. `spill_wrap_on_no_spill`) are **not** re-grown in the harness, so they keep their committed
   (clipped) look — a deliberate containment choice (keeps the change to `autogrow_` only, per the phase
   brief) rather than a correctness gap; a follow-up could refresh them if desired.
+
+## Phase 9 — Replace All single-undo (ironcalc fork `set_user_inputs` + FreeCell swap)
+
+- **The fork `set_user_inputs` OMITS the per-cell row-height auto-grow that single-cell
+  `set_user_input` does — it follows the `paste_csv_string` precedent instead.** Single-cell
+  `set_user_input` appends a `SetRowHeight` diff when multi-line content needs a taller row; the
+  multi-cell writer `paste_csv_string` does **not**. Since the batch method is the scattered-cell
+  analogue of paste (its whole reason to exist is grouping many writes into one diff_list), I mirrored
+  paste: one `SetCellValue` diff per cell, no row auto-grow. Keeps the batch semantics predictable and
+  the diff_list minimal; row auto-grow for a find/replace is out of scope (and FreeCell's own wrap
+  auto-grow, Phase 7, is a separate cache-only path anyway). Flag if a batch write is ever expected to
+  auto-grow rows for newline-bearing replacements.
+
+- **The batch validates ALL coordinates up front (all-or-nothing) and records a spill cell's old
+  value as `None`.** Up-front validation (sheet exists + `is_valid_row`/`is_valid_column_number` for
+  every entry, before any mutation) means an out-of-range entry mid-list can't leave a partial,
+  history-less write — the method either applies the whole batch or rejects it cleanly. The spill-cell
+  `old_value == None` handling copies single-cell `set_user_input` exactly (undo re-spills from the
+  anchor), which `paste_csv_string` happens to skip. Both are conservative correctness choices for a
+  general-purpose public method. Covered by `out_of_range_batch_is_rejected_without_mutating`.
+
+- **The worker records ONE `Touch::Ranges` for the whole Replace All (not one `Touch::Cells` per
+  cell) — the `commit_paste` pattern.** The fork's batched `set_user_inputs` is a single engine undo
+  entry, so `apply_replace_all` now increments `ops_seen` by 1 and pushes a single `Touch::Ranges`
+  covering every changed cell, keeping the FreeCell undo/touch stack 1:1 with the engine history (so a
+  single Undo pops exactly one touch and reverts the entire replace). This replaces the interim's
+  per-cell `Touch::Cells` + `ops_seen += n`. Verified by `replace_all_is_a_single_undo_step`
+  (scattered cells, one `Command::Undo` restores all) and the touch-count assertion (`== 1`).
+
+- **The single-undo fix is its OWN clean fork branch `fix/batch-set-inputs` off `main`, folded into
+  `freecell-fixes` alongside sheet-reorder — NOT bundled with Phase 6's branch.** Per CLAUDE.md
+  (one fix = one branch = one focused upstream PR). `freecell-fixes` now carries both
+  `set_worksheet_index` (Phase 6a) and `set_user_inputs`. **No upstream PR opened** — owner offers
+  upstream later. FreeCell re-pinned `Cargo.lock` `a49cfd60 → 7d4b215e` (branch pin unchanged); aside
+  from the two `ironcalc`/`ironcalc_base` rev bumps the lock also moved one benign transitive edge —
+  `iana-time-zone`'s `windows-core 0.57.0 → 0.58.0`, `cfg(windows)`-only so never compiled on
+  FreeCell's macOS/Linux targets (harmless churn, same class as the Phase-6a note; left as resolved).
+  The swap is a clean, self-contained, independently-revertible change (reverting it returns to the
+  multi-undo interim without touching Find or ReplaceOne).
+
+- **Observation (not a decision): the fork repo was renamed `scosman/ironcalc` → `scosman/IronCalc`,
+  which left this container's `origin/*` remote-tracking refs stale.** A `git fetch` through the
+  redirect did not refresh them, so `git log origin/freecell-fixes` reported an old tip and
+  `git branch -r` was missing `fix/sheet-reorder`. The pushes themselves succeeded, and `git ls-remote
+  https://github.com/scosman/IronCalc.git` confirmed the authoritative state:
+  `fix/batch-set-inputs=a51cf46c`, `freecell-fixes=7d4b215e`, `fix/sheet-reorder=21cde336`,
+  `main=cedba4ea`. So Phase 6a's pushes had landed all along (the stale local refs, not a missing
+  push, caused the earlier confusion). Consider updating the fork remote URL to the new casing to
+  avoid future stale-ref surprises.

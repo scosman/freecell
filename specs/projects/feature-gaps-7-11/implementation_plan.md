@@ -76,7 +76,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       `GAPS.md` (spill/overflow F1, wrap+auto-grow) + note the shipped features; sweep
       `DECISIONS_TO_REVIEW.md`.
 
-- [ ] **Phase 9 — Replace All single-undo (ironcalc fork)** (§4.4): make Replace All ONE undo step.
+- [x] **Phase 9 — Replace All single-undo (ironcalc fork)** (§4.4): make Replace All ONE undo step.
       Phase 4 shipped `Command::ReplaceAll` working but with N engine undo entries (one per changed
       cell — the `SetFont` "K+1" precedent) because IronCalc exposes no public way to group scattered
       cell writes into one `diff_list` (`History::push`/`push_diff_list` are `pub(crate)`; the public

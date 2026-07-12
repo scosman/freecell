@@ -928,14 +928,14 @@ impl WorkbookDocument {
 
     /// Replace `query` with `replacement` in **every** matching cell of `sheet_idx`'s used range
     /// (`Command::ReplaceAll`, `functional_spec.md §4.4`) and return the cells that changed (in
-    /// row-major order) — the caller counts them and records their undo touches.
+    /// row-major order) — the caller counts them and records a single undo touch.
     ///
     /// The matches are collected first (over `sheet_data`, releasing the borrow), then written — a
-    /// cell whose replaced content equals its old content is skipped (no write). Each `set_user_input`
-    /// is one engine undo entry; grouping all writes into ONE undo step needs the crate-private
-    /// `push_diff_list` mechanism (see the ROADBLOCK in `phase_plans/phase_4.md`) — this loop is the
-    /// single place to swap for a batched fork call once that method exists. Called under the worker's
-    /// paused-eval guard (the batch's single `evaluate()` follows).
+    /// cell whose replaced content equals its old content is skipped (no write). All the writes go
+    /// through **one** `set_user_inputs` batch call, so the whole replace is a **single** engine undo
+    /// entry (one `doc.undo()` reverts every replaced cell — the fork fix from `phase_plans/phase_9.md`,
+    /// replacing the former per-cell `set_user_input` loop). Called under the worker's paused-eval
+    /// guard (the batch's single `evaluate()` follows).
     pub(crate) fn replace_all_matches(
         &mut self,
         sheet_idx: u32,
@@ -974,11 +974,21 @@ impl WorkbookDocument {
         // `sheet_data` is a `HashMap` (arbitrary order); write row-major so the returned + touched
         // cells are deterministic.
         edits.sort_by_key(|(cell, _)| (cell.row, cell.col));
+        if edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Apply every replacement as ONE batched write → a single engine undo entry (so a single
+        // Undo reverts the whole Replace All). `set_user_inputs` takes 1-based (sheet, row, col)
+        // engine coords.
+        crate::instrument::record_engine_call();
+        let mut batch: Vec<(u32, i32, i32, String)> = Vec::with_capacity(edits.len());
         let mut changed: Vec<CellRef> = Vec::with_capacity(edits.len());
         for (cell, new_input) in edits {
-            self.set_cell_input(sheet_idx, cell, &new_input)?;
+            let (row, col) = to_engine_coords(cell);
+            batch.push((sheet_idx, row, col, new_input));
             changed.push(cell);
         }
+        self.model.set_user_inputs(&batch)?;
         Ok(changed)
     }
 
@@ -1826,14 +1836,13 @@ mod tests {
         assert_eq!(doc.cell_content(0, CellRef::new(0, 1)).unwrap(), "dogs");
         assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "dog");
 
-        // ROADBLOCK interim: each replacement is one engine undo entry, so restoring all takes
-        // `changed.len()` undos (this flips to a single `doc.undo()` once the fork batch method lands
-        // — see `phase_plans/phase_4.md`). Undoing that many restores every cell.
-        for _ in 0..changed.len() {
-            doc.undo().unwrap();
-        }
+        // The whole Replace All is a SINGLE engine undo entry (the fork's batched `set_user_inputs`
+        // — `phase_plans/phase_9.md`), so ONE `doc.undo()` restores every replaced cell.
+        doc.undo().unwrap();
         assert_eq!(doc.cell_content(0, CellRef::new(0, 0)).unwrap(), "cat");
         assert_eq!(doc.cell_content(0, CellRef::new(0, 1)).unwrap(), "cats");
+        // The unmatched cell was never touched.
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "dog");
     }
 
     // ---- Range clipboard (`components/clipboard.md`) --------------------------------------

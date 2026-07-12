@@ -863,10 +863,11 @@ impl Worker {
     }
 
     /// Replace **every** match in the used range (`Command::ReplaceAll`). One guarded paused-eval,
-    /// one `evaluate()`, one publish. Records **one engine undo entry per changed cell** (the
-    /// N-undo interim — see the ROADBLOCK in `phase_plans/phase_4.md`), so it pushes one touch per
-    /// changed cell to keep the undo/touch stacks 1:1 aligned (the `SetFont` K-entry precedent).
-    /// Replies `ReplacedCount { n }`.
+    /// one `evaluate()`, one publish, and — via the fork's batched `set_user_inputs` — **one** engine
+    /// undo entry for the whole replace (`phase_plans/phase_9.md`). So it pushes a **single**
+    /// `Touch::Ranges` covering every changed cell (the `commit_paste` pattern), keeping the
+    /// undo/touch stacks 1:1 aligned so a single Undo reverts the entire replace. Replies
+    /// `ReplacedCount { n }`.
     fn apply_replace_all(
         &mut self,
         sheet: SheetId,
@@ -905,26 +906,22 @@ impl Worker {
             Ok(Ok(changed)) => {
                 let n = changed.len();
                 if n > 0 {
-                    // One engine undo entry per changed cell → one touch per cell (kept 1:1 so a
-                    // later Undo pops the matching touch), and a fresh edit clears the redo side.
+                    // The whole replace is ONE batched engine undo entry (`set_user_inputs`), so it
+                    // records a SINGLE undo touch covering every changed cell — one later Undo pops
+                    // it and reverts the entire replace. A fresh edit clears the redo side.
                     let touched: Vec<(SheetId, CellRange)> = changed
                         .iter()
                         .map(|&c| (sheet, CellRange::new(c, c)))
                         .collect();
                     self.eval_count += 1;
-                    self.ops_seen += n as u64;
+                    self.ops_seen += 1;
                     self.shared
                         .committed_ops
                         .store(self.ops_seen, Ordering::Release);
                     self.reresolve_charts(&touched, &[]);
                     self.publish();
                     self.emit(WorkerEvent::Published);
-                    for (s, range) in &touched {
-                        self.undo_touches.push(Touch::Cells {
-                            sheet: *s,
-                            range: *range,
-                        });
-                    }
+                    self.undo_touches.push(Touch::Ranges(touched.clone()));
                     self.redo_touches.clear();
                     for s in self.refresh_cache_cells(&touched) {
                         self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
@@ -952,7 +949,7 @@ impl Worker {
 
     /// Shared post-replace bookkeeping for a single-cell replace (`ReplaceOne`): count the op,
     /// re-resolve any charts the change touched, publish, push one undo touch entry, and refresh the
-    /// touched cache cell. (`ReplaceAll` inlines the multi-entry variant.)
+    /// touched cache cell. (`ReplaceAll` inlines the single-entry, multi-range variant.)
     fn commit_replacements(&mut self, touched: &[(SheetId, CellRange)]) {
         self.eval_count += 1;
         self.ops_seen += 1;
@@ -3153,11 +3150,67 @@ mod tests {
             worker.doc.formatted_value(0, CellRef::new(0, 1)).unwrap(),
             "dogs"
         );
-        // N-undo interim: one engine op per changed cell (one new touch per replaced cell).
+        // Single-undo: the whole batch is one engine undo entry → exactly one new touch, however
+        // many cells changed.
         assert_eq!(
             worker.undo_touches.len() - touches_before,
-            2,
-            "one touch per replaced cell"
+            1,
+            "the whole Replace All is a single undo entry"
+        );
+    }
+
+    #[test]
+    fn replace_all_is_a_single_undo_step() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "cat"),  // A1
+            set_input(sheet, 0, 1, "cats"), // B1
+            set_input(sheet, 2, 3, "cat"),  // D3 (scattered, non-contiguous)
+            set_input(sheet, 1, 0, "dog"),  // A2 (no match)
+        ]);
+        let _ = drain_events(&rx);
+
+        worker.process_batch(vec![Command::ReplaceAll {
+            sheet,
+            query: "cat".to_string(),
+            replacement: "dog".to_string(),
+            match_case: true,
+            whole_cell: false,
+        }]);
+        let _ = drain_events(&rx);
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "dog"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 1)).unwrap(),
+            "dogs"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(2, 3)).unwrap(),
+            "dog"
+        );
+
+        // A SINGLE Undo reverts every replaced cell (the point of Phase 9).
+        worker.process_batch(vec![Command::Undo]);
+        let _ = drain_events(&rx);
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "cat"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 1)).unwrap(),
+            "cats"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(2, 3)).unwrap(),
+            "cat"
+        );
+        // The unmatched cell is untouched throughout.
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(1, 0)).unwrap(),
+            "dog"
         );
     }
 

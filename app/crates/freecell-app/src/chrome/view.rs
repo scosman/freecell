@@ -508,6 +508,19 @@ impl ChromeView {
         names.dedup();
         let font_names = Rc::new(names);
 
+        // The data-row edit keys (Tab and — in quick-edit — the unmodified arrows) must be seen
+        // *before* the gpui-component single-line `Input` acts on them. That `Input` binds
+        // Left/Right to caret actions (`MoveLeft`/`MoveRight`) via the keymap; in this gpui build,
+        // action bindings dispatch *before* any `capture_key_down`/`on_key_down` listener and stop
+        // propagation once handled, so an ancestor capture listener can never preempt the input's
+        // Left/Right (Up/Down happen to be unbound in single-line mode, which is the only reason
+        // they used to work). A keystroke *interceptor* is the one phase that runs before the
+        // input's action bindings, and `stop_propagation` inside it prevents that action dispatch
+        // (`feature-gaps-7-11/DECISIONS_TO_REVIEW.md`). It is guarded to this view's focused
+        // data-row input, so it never touches other inputs or the in-cell overlay, and it delegates
+        // to the same [`handle_data_row_edit_key`](Self::handle_data_row_edit_key) the direct-call
+        // unit tests exercise.
+        let weak = cx.weak_entity();
         let subscriptions = vec![
             cx.subscribe_in(&content_input, window, Self::on_content_event),
             cx.subscribe_in(&in_cell_input, window, Self::on_incell_event),
@@ -524,6 +537,33 @@ impl ChromeView {
             cx.subscribe_in(&chart_val_axis_input, window, Self::on_chart_val_axis_event),
             cx.subscribe_in(&find_input, window, Self::on_find_input_event),
             cx.subscribe_in(&replace_input, window, Self::on_replace_input_event),
+            cx.intercept_keystrokes(move |event, window, cx| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    // Only when this view's data-row input is the focused editor — never the
+                    // in-cell overlay (its own input) or an unrelated field.
+                    let focused = this
+                        .content_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if !focused {
+                        return;
+                    }
+                    let keystroke = &event.keystroke;
+                    if this.handle_data_row_edit_key(
+                        keystroke.key.as_str(),
+                        keystroke.modifiers,
+                        window,
+                        cx,
+                    ) {
+                        // Suppress the input's competing caret action for this keystroke.
+                        cx.stop_propagation();
+                    }
+                });
+            }),
         ];
 
         Self {
@@ -871,10 +911,12 @@ impl ChromeView {
         self.refresh_edit_grid_state(window, cx);
     }
 
-    /// The data-row `capture_key_down` for a live edit (`functional_spec.md §5.2–5.3`), factored out
-    /// so it is unit-testable without routing a keystroke through the nested input. Returns whether
-    /// the key was **consumed** (the caller must then `stop_propagation` so the input doesn't also
-    /// act on it); `false` lets the key fall through to the input (caret op).
+    /// The data-row edit-key handler for a live edit (`functional_spec.md §5.2–5.3`), factored out
+    /// so it is unit-testable without routing a keystroke through the nested input. Driven by the
+    /// keystroke interceptor registered in [`ChromeView::new`] (which sees the key before the
+    /// gpui-component `Input`'s caret action bindings). Returns whether the key was **consumed**
+    /// (the caller must then `stop_propagation` so the input doesn't also act on it); `false` lets
+    /// the key fall through to the input (caret op).
     ///
     /// - Tab / Shift+Tab always commit + move right / left (unchanged, quick-edit or not).
     /// - In quick-edit, an **unmodified** arrow commits + moves the active cell in that direction.
@@ -3134,21 +3176,13 @@ impl ChromeView {
                 }
             }))
             // Tab / Shift+Tab commit + move right/left (`functional_spec.md §1.4`), and — in
-            // quick-edit — arrow keys commit + move the active cell while Home/End or a modified
-            // arrow leave quick-edit (`functional_spec.md §5.2–5.3`). Captured **before** the input
-            // consumes the key (the bare gpui-component Input emits no commit on Tab —
-            // `components/edit_controller.md §Tab interception`).
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let consumed = this.handle_data_row_edit_key(
-                    event.keystroke.key.as_str(),
-                    event.keystroke.modifiers,
-                    window,
-                    cx,
-                );
-                if consumed {
-                    cx.stop_propagation();
-                }
-            }))
+            // quick-edit — the unmodified arrows commit + move the active cell while Home/End or a
+            // modified arrow leave quick-edit (`functional_spec.md §5.2–5.3`). These are handled by
+            // the keystroke interceptor registered in [`ChromeView::new`], NOT a `capture_key_down`
+            // here: the gpui-component `Input` binds Left/Right to caret actions that dispatch
+            // before any key-down listener and stop propagation, so only an interceptor (which runs
+            // before action bindings) can preempt them (`components/edit_controller.md §Tab
+            // interception`; `feature-gaps-7-11/DECISIONS_TO_REVIEW.md`).
             // Ref box: read-only A1 address.
             .child(
                 div()
@@ -8592,6 +8626,161 @@ mod tests {
                 "arrow {key} must move the active cell {dir:?}"
             );
         }
+    }
+
+    /// Enters quick-edit by focusing the data-row input and typing `text` (the sole quick-edit
+    /// entry, `begin_typed`), then asserts the input actually holds focus — otherwise a
+    /// subsequent keystroke would not route to it and the reproduction would be vacuous.
+    fn enter_quick_edit_focused(h: &Harness, vcx: &mut gpui::VisualTestContext, text: &str) {
+        vcx.update(|window, cx| {
+            h.chrome.update(cx, |c, cx| c.begin_typed(text, window, cx));
+        });
+        vcx.run_until_parked();
+        let focused = vcx.update(|window, cx| {
+            h.chrome
+                .read(cx)
+                .content_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(focused, "quick-edit must focus the data-row input");
+        h.client.take_commands();
+        h.grid_requests.borrow_mut().clear();
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_arrows_commit_and_move(cx: &mut TestAppContext) {
+        // Real-keystroke reproduction of the reported bug (the direct `handle_data_row_edit_key`
+        // unit tests miss it): with the data-row input focused in quick-edit, an ACTUAL unmodified
+        // arrow keystroke must COMMIT the typed text and MOVE the active cell — not move the text
+        // caret. gpui-component's single-line `Input` binds Left/Right to caret actions that
+        // dispatch *before* any key-down listener and stop propagation, so before the keystroke-
+        // interceptor fix a real Left/Right moved the caret and never committed (Up/Down already
+        // worked, being unbound in single-line mode). This drives real keystrokes through gpui
+        // dispatch, so it fails against the pre-fix routing and passes once the interceptor preempts
+        // the input's caret action.
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        for (key, dir) in [
+            ("left", Direction::Left),
+            ("right", Direction::Right),
+            ("up", Direction::Up),
+            ("down", Direction::Down),
+        ] {
+            enter_quick_edit_focused(&h, &mut vcx, "1234");
+            vcx.simulate_keystrokes(key);
+            vcx.run_until_parked();
+            let cmds = h.client.take_commands();
+            assert!(
+                matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "1234"),
+                "a real {key} keystroke in quick-edit must commit \"1234\", got {cmds:?}"
+            );
+            assert!(
+                h.grid_requests.borrow().iter().any(|r| matches!(
+                    r,
+                    ChromeGridRequest::MoveActive(Motion::Move(d)) if *d == dir
+                )),
+                "a real {key} keystroke in quick-edit must move the active cell {dir:?}: {:?}",
+                h.grid_requests.borrow()
+            );
+            assert_eq!(
+                vcx.update(|_w, cx| h.chrome.read(cx).data_mode()),
+                FieldMode::Idle,
+                "commit via a real {key} keystroke must end the edit"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_left_commits_and_moves(cx: &mut TestAppContext) {
+        // The primary user repro, isolated: `[focus cell] type "1234" [press Left]`. Before the fix
+        // this moved the caret inside the field (the `Input`'s `MoveLeft` action won) and neither
+        // committed nor moved the cell. A real Left keystroke must now commit + move left.
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        enter_quick_edit_focused(&h, &mut vcx, "1234");
+        vcx.simulate_keystrokes("left");
+        vcx.run_until_parked();
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "1234"),
+            "a real Left keystroke in quick-edit must commit \"1234\", got {cmds:?}"
+        );
+        assert!(
+            h.grid_requests.borrow().iter().any(|r| matches!(
+                r,
+                ChromeGridRequest::MoveActive(Motion::Move(Direction::Left))
+            )),
+            "a real Left keystroke in quick-edit must move the active cell left: {:?}",
+            h.grid_requests.borrow()
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_modified_arrow_leaves_without_moving(cx: &mut TestAppContext) {
+        // A real Shift+Right in quick-edit is a caret/selection op: it must leave quick-edit and
+        // must NOT commit or move the active cell (the `Input`'s own shift-right selection runs).
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        enter_quick_edit_focused(&h, &mut vcx, "1234");
+        vcx.simulate_keystrokes("shift-right");
+        vcx.run_until_parked();
+        assert!(
+            !h.client
+                .take_commands()
+                .iter()
+                .any(|c| matches!(c, Command::SetCellInput { .. })),
+            "shift+right must not commit"
+        );
+        assert!(
+            !h.grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))),
+            "shift+right must not move the active cell"
+        );
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "a modified arrow leaves quick-edit"
+        );
+        assert_eq!(
+            vcx.update(|_w, cx| h.chrome.read(cx).data_mode()),
+            FieldMode::Editing,
+            "a modified arrow does not end the edit"
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_home_leaves(cx: &mut TestAppContext) {
+        // A real Home in quick-edit is explicit caret positioning: leaves quick-edit, does not move
+        // the active cell, and the edit stays open (the `Input` moves the caret to the start).
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        enter_quick_edit_focused(&h, &mut vcx, "1234");
+        vcx.simulate_keystrokes("home");
+        vcx.run_until_parked();
+        assert!(
+            !h.grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))),
+            "home must not move the active cell"
+        );
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "home leaves quick-edit"
+        );
+        assert_eq!(
+            vcx.update(|_w, cx| h.chrome.read(cx).data_mode()),
+            FieldMode::Editing
+        );
     }
 
     #[gpui::test]

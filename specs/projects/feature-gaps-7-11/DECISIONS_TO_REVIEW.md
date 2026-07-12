@@ -323,3 +323,53 @@ pre-existing baselines moved) holds.*
   `main=cedba4ea`. So Phase 6a's pushes had landed all along (the stale local refs, not a missing
   push, caused the earlier confusion). Consider updating the fork remote URL to the new casing to
   avoid future stale-ref surprises.
+
+## Follow-up bug fix — Quick-edit Left/Right didn't commit+move (real-dispatch routing)
+
+*User-reported after Phase 2 shipped: in quick-edit (type-to-replace), Up/Down committed + moved
+the active cell but Left/Right instead moved the text caret inside the data-row field and neither
+committed nor moved. This was a real gpui key-dispatch routing bug the Phase-2 unit tests missed
+because they call `handle_data_row_edit_key` directly instead of routing an actual keystroke.*
+
+- **Root cause: in this gpui build, key-binding *actions* dispatch BEFORE `capture_key_down` /
+  `on_key_down` listeners, and the gpui-component single-line `Input` binds Left/Right to caret
+  actions — so our ancestor capture listener could never preempt them.** `Window::dispatch_key_event`
+  runs matched action bindings first (its `for binding in match_result.bindings { dispatch_action_on_node(…) }`
+  loop) and only calls `finish_dispatch_key_event` (which fires the key-down listeners) *afterwards*,
+  and only if propagation is still alive. gpui-component's `Input` registers `on_action(InputState::left/right)`
+  unconditionally (`crates/ui/src/input/input.rs`), bound to `MoveLeft`/`MoveRight` in its `Input`
+  key-context. So a real Right: the input's `MoveRight` action fires, moves the caret, and (bubble-phase
+  actions stop propagation by default) sets `propagate_event = false` — so `finish_dispatch_key_event`
+  never runs and the data-row `capture_key_down` + its `cx.stop_propagation()` never fire. Up/Down
+  "worked" only by accident: the single-line `Input` registers its `up`/`down` `on_action`s **only in
+  multi-line mode** (`.when(state.mode.is_multi_line(), …)`), so `MoveUp`/`MoveDown` had no handler,
+  propagation survived, `finish_dispatch_key_event` ran, and our capture listener did the commit+move.
+  A capture listener is therefore structurally incapable of beating the input's Left/Right; the
+  original Phase-2 direct-call tests couldn't see this because they never went through gpui dispatch.
+
+- **Fix: route the data-row edit keys through `App::intercept_keystrokes` instead of an ancestor
+  `capture_key_down`.** A keystroke interceptor is the one phase gpui runs *before* action-binding
+  dispatch, and its docs state `cx.stop_propagation()` there prevents action dispatch. `ChromeView::new`
+  now registers one interceptor (stored in `_subscriptions`, so it lives/dies with the view), guarded to
+  fire only when *this* view's `content_input` holds focus (never the in-cell overlay's own input or an
+  unrelated field). It delegates to the same `handle_data_row_edit_key` the direct-call unit tests use;
+  when that returns "consumed" it calls `stop_propagation`, which preempts the input's `MoveLeft`/
+  `MoveRight` so Left/Right now commit+move exactly like Up/Down/Tab. Home/End and modified arrows return
+  "not consumed" → no `stop_propagation` → they still reach the input's caret/selection actions (and
+  `handle_data_row_edit_key` leaves quick-edit for them). The redundant data-row `capture_key_down` was
+  **removed** — keeping it risked a double commit on a cap-rejected edit, since after the interceptor
+  stops propagation `finish_dispatch_key_event` still fires the first capture listener once.
+
+  Alternatives rejected: binding our own action in the data-row's key-context can't win — gpui resolves
+  competing bindings by context *depth* (deepest wins), and the focused `Input`'s context is always
+  deeper than any ancestor's; a `Marker > Input` predicate only *ties* at max depth and then depends on
+  the fragile keymap registration-order tiebreak. The interceptor wins deterministically regardless of
+  depth or registration order.
+
+- **New real-keystroke tests drive actual gpui dispatch (they fail pre-fix, pass post-fix).**
+  `quick_edit_real_keystroke_arrows_commit_and_move` (all four directions), `…_left_commits_and_moves`
+  (the isolated user repro), plus `…_modified_arrow_leaves_without_moving` and `…_home_leaves` for the
+  preserved caret-intent paths — all via `VisualTestContext::simulate_keystrokes` through the focused
+  data-row input. The Left/Right cases fail against the pre-fix code (caret moved, no commit/move),
+  which is exactly the gap the direct-call tests couldn't catch. The original direct-call
+  `handle_data_row_edit_key` tests are kept unchanged.

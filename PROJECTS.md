@@ -123,3 +123,19 @@ registry: each entry is a short description plus a pointer to a design note unde
   suspends click-away, or an in-panel select-first hint. Batch 3's item 8 (default range = selection
   at creation) already mitigates the most common freshly-inserted case.
   → [`projects/chart-panel-range-pick.md`](projects/chart-panel-range-pick.md)
+
+- **Non-Adjacent (Disjoint) Cell Selection — Cmd/Ctrl+Click** — *Future (deferred from
+  `feature-gaps-7-11`, 2026-07-12).* Cmd/Ctrl+click to add scattered cells/ranges as separate
+  areas so one op (bold, clear, delete) hits all of them (Excel multi-area selection). Deferred
+  because it's a **core refactor**, not a UI tweak: FreeCell's selection is a single contiguous
+  `SelectionModel { anchor, active }` (`freecell-core/src/selection.rs:64`) and adding areas
+  ripples into render, keyboard motion, clipboard (copy must guard non-contiguous), and every
+  formatting/clear op. No IronCalc change. → [`projects/disjoint-selection.md`](projects/disjoint-selection.md)
+
+- **Freeze Panes** — *Future (deferred from `feature-gaps-7-11`, 2026-07-12).* Right-click a
+  row/col header → Freeze this-and-above/left (item flips to Unfreeze at the current boundary).
+  **Engine side is ready — no IronCalc fork change**: `UserModel::set_frozen_rows_count/set_frozen_columns_count`
+  exist, are undoable, and round-trip through xlsx `<pane>` (round-3 API audit). Deferred because
+  the render side is the hard part: splitting the custom grid's single viewport/scroll into
+  frozen + scrolling quadrants with per-quadrant geometry and scroll clamping (`GAPS.md:141`).
+  → [`projects/freeze-panes.md`](projects/freeze-panes.md)

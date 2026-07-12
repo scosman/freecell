@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Feature Gaps 7_11
@@ -60,3 +60,29 @@ These are the gaps:
 - **Freeze panes.** Should support right-clicking a row/column header and saying
   "freeze" to freeze this and all left/above. If the selected row/col is already
   the target frozen row/col, make it say "unfreeze".
+
+## Scope decisions (2026-07-12)
+
+Made during planning after mapping the codebase:
+
+- **Right-click headers → add/remove rows/cols is already built** (`header_menu_elements`,
+  shipped in `mvp-gaps` Phase 7). This batch **verifies** it rather than rebuilding it —
+  no new code beyond a smoke check.
+- **Command-click non-adjacent selection is DEFERRED** to the backlog. It's a core
+  `SelectionModel` refactor (single rect → multiple areas) that ripples across render,
+  motion, clipboard, and formatting — too large for this "small gaps" batch.
+  → [`projects/disjoint-selection.md`](../../../projects/disjoint-selection.md)
+- **Freeze panes is DEFERRED** to the backlog. IronCalc already models it (no fork change),
+  but it needs split-viewport rendering + scroll clamping in the custom grid — the single
+  biggest UI task, better as its own project.
+  → [`projects/freeze-panes.md`](../../../projects/freeze-panes.md)
+- **Sheet reorder includes an IronCalc fork change**: add an undoable, xlsx-order-preserving
+  `move_sheet` / `set_worksheet_index` to `scosman/ironcalc` (upstreamed per CLAUDE.md), then
+  wire a `Command::MoveSheet` + tab drag.
+- **Font warning** is benign gpui-core noise (Zed's hardcoded bundled-font paths, not our
+  SVGs — our icons contain no `<text>`); fix by silencing the `gpui::svg_renderer` log target.
+- **Find/replace** scope: standard find/replace (find next/prev, replace, replace-all,
+  match-case + match-entire-cell toggles), scoped to the **current sheet**.
+
+**In this batch:** font-warning fix · text spill/overflow · auto-grow cells · find/replace ·
+quick-edit mode · sheet reorder (drag + fork API) · verify right-click add/remove rows/cols.

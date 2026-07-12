@@ -32,7 +32,8 @@ use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
 
 use freecell_chart_model::{
-    Anchor, CfRange, Chart, ChartColor, ChartId, ChartInsertKind, ChartSpec, Color, Legend,
+    Anchor, CfRange, Chart, ChartColor, ChartId, ChartInsertKind, ChartKind, ChartSpec, Color,
+    Legend,
 };
 
 use crate::cache;
@@ -2518,8 +2519,28 @@ fn apply_chrome_edit(chart: &mut Chart, edit: &ChartChromeEdit) {
             ax.title = title.clone();
         }
         ChartChromeEdit::SeriesColor { series, color } => {
+            // A "series color" edit recolors the WHOLE series. Only a LINE or SCATTER series carries
+            // its visible color on the `a:ln` stroke, which the renderer prefers over `color`
+            // (line.rs / scatter.rs: `stroke.color.or(color)`). Leaving the stroke on its original
+            // color is exactly why a loaded LINE chart kept its old color on screen and through save
+            // while an authored one (no stroke) honored the edit — charts feedback item 9. FILLED
+            // kinds (bar/column/area/pie/bubble) render from the fill (`color`) and treat `a:ln` as
+            // a decorative border, so recoloring their stroke would over-reach — mutating a border
+            // the user never touched (charts feedback Batch 5). Gate the stroke recolor accordingly.
+            let recolor_stroke = matches!(
+                chart.kind,
+                ChartKind::Line { .. } | ChartKind::Scatter { .. }
+            );
             if let Some(s) = chart.series.get_mut(*series) {
-                s.color = color.map(|rgb| ChartColor::Rgb(Color::from_hex(rgb.to_hex())));
+                let new = color.map(|rgb| ChartColor::Rgb(Color::from_hex(rgb.to_hex())));
+                s.color = new;
+                // Override only the stroke's COLOR (keep its width/alpha); clearing the series color
+                // (`None`) reverts the stroke to the palette too.
+                if recolor_stroke {
+                    if let Some(stroke) = &mut s.stroke {
+                        stroke.color = new;
+                    }
+                }
             }
         }
         ChartChromeEdit::DataLabels(toggles) => {
@@ -4983,6 +5004,85 @@ mod tests {
         assert!(
             authored_chart(&worker, 0).series[0].data_labels.is_none(),
             "clearing every toggle removes the labels"
+        );
+    }
+
+    /// **Batch 5 gate — a `SeriesColor` edit recolors the `a:ln` STROKE only for LINE / SCATTER.**
+    /// Those two kinds paint their visible color on the stroke (renderer prefers `stroke.color` over
+    /// `color`), so the edit must override it. FILLED kinds (bar/column/area/pie/bubble) render from
+    /// the fill and treat `a:ln` as a decorative border, so recoloring their imported stroke would
+    /// over-reach — mutating a border the user never touched. Pins the live-side gate.
+    #[test]
+    fn series_color_recolors_stroke_only_for_line_and_scatter() {
+        use freecell_chart_model::{
+            Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartKind, Color, Grouping,
+            LineStroke, ScatterStyle, Series,
+        };
+
+        // A series carrying BOTH a fill color (4472C4) and an imported `a:ln` stroke on a DISTINCT
+        // color (203040) — the shape that distinguishes a fill recolor from a stroke recolor.
+        let stroked = || {
+            let mut s =
+                Series::category_value(Some("S"), vec![Category::Text("Q1".into())], vec![1.0])
+                    .with_color(Color::from_hex(0x4472C4));
+            s.stroke = Some(
+                LineStroke::new()
+                    .with_width_pt(1.0)
+                    .with_color(Color::from_hex(0x203040)),
+            );
+            s
+        };
+        let chart_of = |kind: ChartKind| Chart {
+            title: None,
+            kind,
+            series: vec![stroked()],
+            cat_axis: Axis::untitled(),
+            val_axis: Axis::untitled(),
+            legend: None,
+        };
+        let edit = ChartChromeEdit::SeriesColor {
+            series: 0,
+            color: Some(Rgb::from_hex(0x70AD47)),
+        };
+        let new_cc = Some(ChartColor::Rgb(Color::from_hex(0x70AD47)));
+        let orig_stroke = Some(ChartColor::Rgb(Color::from_hex(0x203040)));
+
+        // FILLED (column): the fill recolors, the imported border stroke is LEFT on its color.
+        let mut bar = chart_of(ChartKind::Bar {
+            dir: BarDir::Col,
+            grouping: Grouping::Clustered,
+            layout: BarLayout::default(),
+        });
+        apply_chrome_edit(&mut bar, &edit);
+        assert_eq!(bar.series[0].color, new_cc, "the filled fill recolors");
+        assert_eq!(
+            bar.series[0].stroke.and_then(|s| s.color),
+            orig_stroke,
+            "a filled series' imported border stroke is left untouched (Batch 5 gate)",
+        );
+
+        // LINE: both fill and stroke recolor (the stroke is the visible line — feedback item 9).
+        let mut line = chart_of(ChartKind::Line {
+            grouping: Grouping::Standard,
+            smooth: false,
+        });
+        apply_chrome_edit(&mut line, &edit);
+        assert_eq!(line.series[0].color, new_cc, "the line fill recolors");
+        assert_eq!(
+            line.series[0].stroke.and_then(|s| s.color),
+            new_cc,
+            "a line's visible stroke recolors to the new color",
+        );
+
+        // SCATTER: same as line — its color also lives on the stroke.
+        let mut scatter = chart_of(ChartKind::Scatter {
+            style: ScatterStyle::LineMarker,
+        });
+        apply_chrome_edit(&mut scatter, &edit);
+        assert_eq!(
+            scatter.series[0].stroke.and_then(|s| s.color),
+            new_cc,
+            "a scatter's visible stroke recolors to the new color",
         );
     }
 

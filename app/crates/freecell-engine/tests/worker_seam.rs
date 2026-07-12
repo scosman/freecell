@@ -2567,6 +2567,129 @@ fn loaded_chart_legend_color_and_labels_roundtrip() {
     assert!(saved.contains("<c:roundedCorners val=\"1\"/>"));
 }
 
+/// The renderer's **effective** series color: the `a:ln` stroke color wins over the series
+/// fill/theme color (line.rs / scatter.rs paint `stroke.color.or(color)`), then the palette. A test
+/// asserts THIS — what the chart actually paints — not just the raw `color` field, which a loaded
+/// line series' stroke would otherwise keep on the imported color (charts feedback item 9).
+fn effective_series_color(
+    series: &freecell_chart_model::Series,
+) -> Option<freecell_chart_model::ChartColor> {
+    series.stroke.and_then(|st| st.color).or(series.color)
+}
+
+/// The effective (stroke-first) color of series `series_idx` in the `chart_idx`-th published chart
+/// on `sheet`, from the live snapshot.
+fn snapshot_series_effective_color(
+    client: &DocumentClient,
+    sheet: SheetId,
+    chart_idx: usize,
+    series_idx: usize,
+) -> Option<freecell_chart_model::ChartColor> {
+    let snap = client.chart_snapshot();
+    let (_, specs) = snap.sheets.iter().find(|(s, _)| *s == sheet)?;
+    let chart = specs.get(chart_idx)?.chart()?;
+    chart
+        .series
+        .get(series_idx)
+        .and_then(effective_series_color)
+}
+
+/// **Charts feedback item 9 — a user-set series color must OVERRIDE an imported chart's original
+/// color** and persist through recompute AND save/reopen. Uses the real Excel-imported line-chart
+/// fixture (chart on its 2nd sheet), whose series carry their visible color on the `a:ln` stroke
+/// (which the renderer prefers over the `color` fill) — the exact reason a loaded chart kept its old
+/// color on screen while an authored one honored the edit. Asserts the full chain: (a) live, (b)
+/// through a re-resolve, (c) on save + reopen.
+#[test]
+fn loaded_line_chart_series_color_overrides_imported_stroke() {
+    const NEW: u32 = 0x112233;
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/charts/excel_line_chart_workbook.xlsx"
+    );
+    let (client, rx, sheets, _dir) =
+        spawn_over_chart_file(|path| std::fs::copy(fixture, path).map(|_| ()).unwrap());
+    let data = sheets[0].id; // "Data"
+    let charts = sheets[1].id; // "Charts" — the 2nd sheet, where the imported chart lives
+    let id = first_chart_id(&client, charts).expect("the imported line chart is discovered");
+
+    // The imported series 0 starts on its file color, carried by the `a:ln` stroke (4a7ebb).
+    assert_eq!(
+        snapshot_series_effective_color(&client, charts, 0, 0),
+        Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0x4A7EBB)
+        )),
+        "imported series 0 paints its original stroke color before any edit",
+    );
+
+    // (a) Set a NEW color through the panel command → it must take effect LIVE (override the stroke).
+    client.send(Command::SetChartChrome {
+        sheet: charts,
+        id,
+        edit: ChartChromeEdit::SeriesColor {
+            series: 0,
+            color: Some(freecell_core::Rgb::from_hex(NEW)),
+        },
+    });
+    poll_until(
+        || {
+            snapshot_series_effective_color(&client, charts, 0, 0)
+                == Some(freecell_chart_model::ChartColor::Rgb(
+                    freecell_chart_model::Color::from_hex(NEW),
+                ))
+        },
+        "the new series color paints live (overrides the imported stroke color)",
+    );
+
+    // (b) A source-cell edit dirties + re-resolves the chart → the new color must SURVIVE the recompute.
+    client.send(Command::SetCellInput {
+        sheet: data,
+        cell: CellRef::new(1, 1), // Data!B2, in series 0's value range B2:B13
+        input: "9999".into(),
+    });
+    poll_until(
+        || snapshot_series_values(&client.chart_snapshot(), charts, 0, 0).first() == Some(&9999.0),
+        "the source edit re-resolves the chart",
+    );
+    assert_eq!(
+        snapshot_series_effective_color(&client, charts, 0, 0),
+        Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(NEW)
+        )),
+        "the user color survives a re-resolve (not clobbered back to the imported color)",
+    );
+
+    // (c) Save + reopen → the reopened chart must paint the NEW color (precedence over the original).
+    let out = tempdir().unwrap();
+    let out_path = out.path().join("recolored.xlsx");
+    client.send(Command::Save {
+        path: out_path.clone(),
+        req_id: 909,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 909, .. })).is_some());
+
+    freecell_engine::WorkbookDocument::open(&out_path).expect("recolored workbook reopens");
+    let specs = freecell_engine::chart::discover_and_parse(&out_path).unwrap();
+    let chart = specs[0]
+        .chart()
+        .expect("first chart is the imported line chart");
+    assert_eq!(
+        effective_series_color(&chart.series[0]),
+        Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(NEW)
+        )),
+        "on reopen the user color REPLACES the imported original (stroke + fill both recolored)",
+    );
+    // An UNEDITED series keeps its imported color (only series 0 was recolored).
+    assert_eq!(
+        effective_series_color(&chart.series[1]),
+        Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0xBE4B48)
+        )),
+        "an unedited series keeps its imported color",
+    );
+}
+
 /// P20 (authored): an authored chart's chrome edits (title / legend / axis title / series color /
 /// data labels) survive the write-from-model save + reopen.
 #[test]

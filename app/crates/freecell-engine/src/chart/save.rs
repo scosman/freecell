@@ -1092,6 +1092,11 @@ const SER_DLBLS_FOLLOWING: &[&str] = &[
 ];
 /// After a `c:spPr` fill (a solid/gradient/… fill), i.e. inside `spPr` before the line stroke.
 const SPPR_FILL_FOLLOWING: &[&str] = &["ln", "effectLst", "effectDag", "scene3d", "sp3d", "extLst"];
+/// After an `a:ln` fill (inside a series stroke), before its dash pattern / joins / line ends —
+/// where a recolored stroke's `a:solidFill` upserts (charts feedback item 9).
+const LN_FILL_FOLLOWING: &[&str] = &[
+    "prstDash", "custDash", "round", "bevel", "miter", "headEnd", "tailEnd", "extLst",
+];
 /// The DrawingML fill variants a series `spPr` fill upsert replaces (only one may be present).
 const FILL_VARIANTS: &[&str] = &[
     "noFill",
@@ -1275,6 +1280,13 @@ fn collect_chrome_edits(
     }
 
     // --- Series colors + data labels ---------------------------------------------------------
+    // Only LINE / SCATTER show their color on the `a:ln` stroke (renderer + loader prefer stroke
+    // over the spPr fill); FILLED kinds (bar/column/area/pie/bubble) render from the fill and treat
+    // `a:ln` as a decorative border, so their imported stroke must stay byte-identical (Batch 5).
+    let recolor_stroke = matches!(
+        chart.kind,
+        ChartKind::Line { .. } | ChartKind::Scatter { .. }
+    );
     let group = child(chart_node, "plotArea").and_then(|plot| {
         plot.children()
             .find(|n| n.is_element() && load::is_chart_group(n.tag_name().name()))
@@ -1297,6 +1309,7 @@ fn collect_chrome_edits(
                     c,
                     &a,
                     series.color.as_ref(),
+                    recolor_stroke,
                     &mut replaces,
                     &mut inserts,
                 );
@@ -1413,13 +1426,16 @@ fn set_auto_title_deleted(
 
 /// Splice a series color change into its `c:spPr` (upsert the `solidFill` inside an existing `spPr`
 /// so a co-located `a:ln` stroke survives; insert a whole `spPr` when the series has none; remove the
-/// `solidFill` when cleared).
+/// `solidFill` when cleared). `recolor_stroke` also rewrites a co-located `a:ln/solidFill` (LINE /
+/// SCATTER only — their visible color lives on the stroke); FILLED kinds leave `a:ln` byte-identical.
+#[allow(clippy::too_many_arguments)]
 fn patch_series_color(
     src: &str,
     ser: &Node,
     c: &str,
     a: &str,
     new_color: Option<&ChartColor>,
+    recolor_stroke: bool,
     replaces: &mut Vec<(Range<usize>, String)>,
     inserts: &mut Vec<(usize, usize, String)>,
 ) {
@@ -1452,6 +1468,36 @@ fn patch_series_color(
                 replaces,
                 inserts,
             );
+            // A LINE / SCATTER series shows its color on the `a:ln` STROKE, which the renderer + our
+            // loader (`parse_series_stroke`) prefer over the spPr fill. Recolor the stroke's fill
+            // too so the new color takes precedence on reopen (charts feedback item 9) instead of
+            // leaving the original color on the line; keep the stroke's width / dash / joins. A
+            // clear removes the stroke's `solidFill` so it reverts to the palette. FILLED kinds
+            // (`recolor_stroke == false`) render from the spPr fill and treat `a:ln` as a decorative
+            // border, so their imported stroke is left byte-identical — recoloring it would inject a
+            // visible border the user never asked to change (e.g. replacing a borderless bar's
+            // `<a:noFill/>` with a fill-colored `solidFill`); Batch 5 gate. (A self-closing or
+            // absent spPr has no stroke, so those arms need no ln patch either.)
+            //
+            // Note: the stroke is recolored to the FILL color (`new_color` == `series.color`), not
+            // `series.stroke.color`. That is correct only because the sole mutation path (the worker
+            // `SeriesColor` edit) sets stroke.color == color; a future *independent* stroke-color
+            // edit would be silently overridden here and must thread its own color through instead.
+            if recolor_stroke {
+                if let Some(ln) = child(&sp_pr, "ln") {
+                    let new_ln_fill = new_srgb.map(|color| chrome::sppr_solid_fill(a, color));
+                    upsert_child(
+                        src,
+                        &ln,
+                        replace_names,
+                        new_ln_fill,
+                        LN_FILL_FOLLOWING,
+                        0,
+                        replaces,
+                        inserts,
+                    );
+                }
+            }
         }
         None => {
             if let Some(color) = new_srgb {
@@ -2110,10 +2156,14 @@ mod tests {
         assert!(roxmltree::Document::parse(&patched).is_ok());
     }
 
+    /// Charts feedback item 9: a series color edit recolors the WHOLE series — the shape fill AND
+    /// the co-located `a:ln` line stroke (a line chart shows its color on the stroke, which the
+    /// renderer + loader prefer over the shape fill). The stroke's **non-color** styling — its width
+    /// — must survive; only its `solidFill` color changes. (Before this fix the patch left the
+    /// `a:ln` byte-identical, which is exactly why a loaded line chart kept its old color on reopen.)
     #[test]
-    fn patch_series_color_preserves_a_co_located_line_stroke() {
-        // Give the Widgets series a line stroke alongside its shape fill — a color edit must splice
-        // only the shape solidFill and leave the `a:ln` (the visible line styling) byte-identical.
+    fn patch_series_color_recolors_a_co_located_line_stroke() {
+        // Give the Widgets series a line stroke (its own width + a distinct color) alongside its fill.
         let ln = r#"<a:ln w="19050"><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:ln>"#;
         let xml = authoring::line_chart_xml_for_test().replacen(
             r#"<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>"#,
@@ -2123,32 +2173,114 @@ mod tests {
         assert!(xml.contains(ln), "the a:ln was injected");
 
         let mut chart = parse_chart_xml(&xml).unwrap();
+        // The panel's SeriesColor edit sets both the fill color and the stroke color (worker's
+        // `apply_chrome_edit`); mirror that here so the model is what the save path serializes.
         chart.series[0].color = Some(freecell_chart_model::ChartColor::Rgb(
             freecell_chart_model::Color::from_hex(0x70AD47),
         ));
+        chart.series[0].stroke = Some(
+            freecell_chart_model::LineStroke::new()
+                .with_width_pt(1.5)
+                .with_color(freecell_chart_model::Color::from_hex(0x70AD47)),
+        );
         let patched = patch_chart_source(&xml, &chart).unwrap();
 
-        // The shape fill is the new color; the co-located line stroke is untouched.
+        // The new color is present, the stroke WIDTH survives, and both old colors (shape 4472C4 +
+        // stroke 112233) are gone — the whole series is recolored while its line width is preserved.
         assert!(
             patched.contains(r#"<a:srgbClr val="70AD47"/>"#),
-            "new shape fill"
+            "new color present"
         );
         assert!(
-            patched.contains(ln),
-            "the a:ln stroke survives the color edit byte-for-byte"
+            patched.contains(r#"<a:ln w="19050">"#),
+            "the stroke width (non-color styling) is preserved:\n{patched}"
         );
-        assert!(
-            !patched.contains(r#"<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>"#)
-                || patched.matches(r#"<a:srgbClr val="4472C4"/>"#).count() == 0,
+        assert_eq!(
+            patched.matches(r#"<a:srgbClr val="4472C4"/>"#).count(),
+            0,
             "the old shape fill color is replaced"
         );
         assert_eq!(
-            parse_chart_xml(&patched).unwrap().series[0].color,
-            Some(freecell_chart_model::ChartColor::Rgb(
-                freecell_chart_model::Color::from_hex(0x70AD47)
-            )),
+            patched.matches(r#"<a:srgbClr val="112233"/>"#).count(),
+            0,
+            "the old stroke color is replaced (feedback item 9)"
+        );
+        // On re-parse BOTH the fill color and the stroke color read back as the new color.
+        let reparsed = parse_chart_xml(&patched).unwrap();
+        let new = Some(freecell_chart_model::ChartColor::Rgb(
+            freecell_chart_model::Color::from_hex(0x70AD47),
+        ));
+        assert_eq!(reparsed.series[0].color, new, "fill color round-trips");
+        assert_eq!(
+            reparsed.series[0].stroke.and_then(|s| s.color),
+            new,
+            "stroke color round-trips (the visible line recolors)"
         );
         assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    /// **Batch 5 gate (the real defect).** A FILLED type (column/bar/area/pie/bubble) carries its
+    /// color on the spPr FILL; its `a:ln` is a decorative border the renderer + loader ignore. A
+    /// `SeriesColor` edit must recolor the fill but leave the imported `a:ln` **byte-for-byte** —
+    /// recoloring it would inject a visible border onto a bar the user never asked to reborder
+    /// (a borderless `<a:noFill/>` would even flip to a fill-colored `solidFill`, since `noFill`
+    /// is itself a `FILL_VARIANTS` member the un-gated upsert replaces). Covers BOTH a borderless
+    /// outline and a themed colored outline.
+    #[test]
+    fn patch_series_color_leaves_a_filled_bar_stroke_byte_identical() {
+        for ln in [
+            r#"<a:ln><a:noFill/></a:ln>"#,
+            r#"<a:ln w="9525"><a:solidFill><a:srgbClr val="203040"/></a:solidFill></a:ln>"#,
+        ] {
+            // Turn the line fixture into a real COLUMN chart, and give the Widgets series an
+            // imported `a:ln` outline alongside its fill.
+            let xml = authoring::line_chart_xml_for_test()
+                .replacen("<c:lineChart>", r#"<c:barChart><c:barDir val="col"/>"#, 1)
+                .replace("</c:lineChart>", "</c:barChart>")
+                .replacen(
+                    r#"<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>"#,
+                    &format!(
+                        r#"<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>{ln}</c:spPr>"#
+                    ),
+                    1,
+                );
+            assert!(xml.contains(ln), "the a:ln outline was injected");
+
+            let mut chart = parse_chart_xml(&xml).unwrap();
+            assert!(
+                matches!(chart.kind, ChartKind::Bar { .. }),
+                "the fixture parses as a filled column chart (the gate keys on this kind)",
+            );
+            // Simulate the worker's FILLED-type edit: recolor the FILL only (no stroke mutation).
+            chart.series[0].color = Some(freecell_chart_model::ChartColor::Rgb(
+                freecell_chart_model::Color::from_hex(0x70AD47),
+            ));
+            let patched = patch_chart_source(&xml, &chart).unwrap();
+
+            // (a) The outer spPr fill IS recolored (4472C4 → 70AD47, old color fully gone).
+            assert!(
+                patched.contains(r#"<a:srgbClr val="70AD47"/>"#),
+                "the fill is recolored to the new series color:\n{patched}",
+            );
+            assert_eq!(
+                patched.matches(r#"<a:srgbClr val="4472C4"/>"#).count(),
+                0,
+                "the old fill color is replaced",
+            );
+            // (b) The imported `a:ln` outline is UNTOUCHED — byte-for-byte (the gate's whole point).
+            assert!(
+                patched.contains(ln),
+                "the imported bar outline (`a:ln`) is left byte-for-byte:\n{patched}",
+            );
+            // The fill recolor round-trips on re-parse; the color still resolves from the fill.
+            assert_eq!(
+                parse_chart_xml(&patched).unwrap().series[0].color,
+                Some(freecell_chart_model::ChartColor::Rgb(
+                    freecell_chart_model::Color::from_hex(0x70AD47)
+                )),
+            );
+            assert!(roxmltree::Document::parse(&patched).is_ok());
+        }
     }
 
     /// CR regression: a series whose `spPr` is a **self-closing** `<c:spPr/>` (no fill) must get its

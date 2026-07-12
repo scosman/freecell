@@ -85,6 +85,23 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
   list orders **Line → Area → Column → Bar → …** (Excel grouping); the **legend** control is a
   row of lucide icons — `panel-top`/`panel-right`/`panel-left`/`panel-bottom` for the four
   positions, `square-x` for Off.
+- **Series color overrides the imported original (charts feedback item 9):** a color set in the
+  panel **takes precedence over — and replaces — the color a chart shipped with**, for **imported
+  (loaded) charts** exactly as for FreeCell-authored ones. This is not just the shape fill: a
+  **line/scatter** series carries its **visible** color on its `a:ln` **stroke** (and the renderer +
+  loader prefer the stroke color over the fill), so for those two kinds a series-color edit recolors
+  **both the fill and the stroke** — otherwise the imported line kept its old color on screen and on
+  reopen. **Filled kinds** (column/bar/area/pie/bubble) render from the **fill**, and treat `a:ln`
+  as a decorative border, so their edit recolors the fill **only** and leaves any imported `a:ln`
+  **byte-identical** (recoloring a filled type's stroke would inject a border the user never asked to
+  change — e.g. flip a borderless bar's `<a:noFill/>` to a colored `solidFill`). The new color holds
+  through three layers: it renders **live**, **survives a data recompute** (re-resolve keeps the
+  user's color, doesn't restore the file's), and **persists across save + reopen** (the source patch
+  rewrites the series' `spPr/solidFill`, plus — **for line/scatter only** — its `a:ln/solidFill`,
+  preserving the stroke's width/dash; clearing the color reverts both to the palette). Markers follow
+  the resolved series color, so they recolor in FreeCell too. (Engine fix, not a render-widget
+  change: the render code already reads the model's stroke-first precedence correctly — the fix makes
+  the *edit* update the stroke as well as the fill, gated to the kinds that paint on the stroke.)
 - **Live editing:** the **title** and **axis-title** fields update the chart **per keystroke**
   (not on Enter/blur), so shaping is immediate. A live worker republish never clobbers an
   in-progress edit (fields re-seed only when the *selected chart changes*, not on same-chart

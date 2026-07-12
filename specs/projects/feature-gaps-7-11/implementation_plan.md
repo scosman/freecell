@@ -42,7 +42,7 @@ render **subset** (spill/auto-grow only), code-review, commit. Record judgment c
       window handler; Escape/X close; sheet-switch re-scope. Worker unit tests + gpui view
       tests + smoke launch. *(No pixel impact — chrome not baselined.)*
 
-- [ ] **Phase 5 — Verify right-click insert/delete** (§7): Xvfb smoke — confirm header
+- [x] **Phase 5 — Verify right-click insert/delete** (§7): Xvfb smoke — confirm header
       right-click shows Insert/Delete with correct counts + applies, merge guard intact.
       File a bug only if a real gap surfaces; else close as verified. *(No code expected.)*
 

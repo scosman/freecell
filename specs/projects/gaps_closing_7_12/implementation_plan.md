@@ -41,7 +41,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       measure widest published cell (`measure_incell_text_width`) → reuse
       `SetColumnWidths`. Decides D7.1/D7.2/D7.3. Width-calc unit test + a render **subset**
       check.
-- [ ] **Phase 8 — Render-fidelity polish pair (dedicated render phase).** 8a: fill skips
+- [x] **Phase 8 — Render-fidelity polish pair (dedicated render phase).** 8a: fill skips
       interior gridlines vs. same-fill neighbors (`cell_element`). 8b: **investigate the
       `header_full_row_selected` baseline first** — the source looks symmetric, so this may
       be a baseline/ordering issue, not a code fix. Then: regenerate + **eyeball** affected

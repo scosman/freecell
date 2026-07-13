@@ -2504,10 +2504,20 @@ impl GridView {
             for c in frame.cols.clone() {
                 let (x, y, w, h) = cell_rect(r, c, frame);
                 let style = self.visible_styles.get(&(r, c)).copied();
-                let fill = style
-                    .and_then(|s| s.fill)
-                    .map(to_rgba)
-                    .unwrap_or_else(|| rgb(CELL_BG));
+                let fill_color = style.and_then(|s| s.fill);
+                let fill = fill_color.map(to_rgba).unwrap_or_else(|| rgb(CELL_BG));
+                // 8a: within a contiguous same-fill block the interior gridlines are hidden so the
+                // block reads as one solid rectangle (the Excel look). A *filled* cell drops the
+                // gridline it shares with a right / bottom neighbour that resolves to the SAME fill;
+                // unfilled cells keep every gridline, and the block's outer boundary (a different
+                // fill, an unfilled cell, or an off-viewport neighbour — which reads as absent here)
+                // still draws. Explicit cell borders are a separate later pass and are unaffected.
+                let same_fill = |nr: u32, nc: u32| {
+                    fill_color.is_some()
+                        && self.visible_styles.get(&(nr, nc)).and_then(|s| s.fill) == fill_color
+                };
+                let skip_right_gridline = same_fill(r, c + 1);
+                let skip_bottom_gridline = same_fill(r + 1, c);
                 // A pending edit mirrors its raw text here in the grid's default style, left-
                 // aligned, over the committed value (`functional_spec.md §1.2`). The cell's fill is
                 // kept (no flash), but text attributes / alignment fall back to default (`None`).
@@ -2607,6 +2617,8 @@ impl GridView {
                             kind,
                             attr_style,
                             font_family.clone(),
+                            skip_right_gridline,
+                            skip_bottom_gridline,
                         ));
                         spill_plans.push(SpillPlan {
                             row: r,
@@ -2629,6 +2641,8 @@ impl GridView {
                         kind,
                         attr_style,
                         font_family,
+                        skip_right_gridline,
+                        skip_bottom_gridline,
                     )),
                 }
             }
@@ -3912,6 +3926,8 @@ fn cell_element(
     kind: CellKind,
     style: Option<RenderStyle>,
     font_family: Option<SharedString>,
+    skip_right_gridline: bool,
+    skip_bottom_gridline: bool,
 ) -> AnyElement {
     let mut el = div()
         .absolute()
@@ -3920,9 +3936,6 @@ fn cell_element(
         .w(px(w))
         .h(px(h))
         .bg(fill)
-        // Right + bottom gridlines only — a fill paints over them (Excel look).
-        .border_r_1()
-        .border_b_1()
         .border_color(rgb(GRIDLINE))
         .flex()
         // Default vertical placement is BOTTOM — Excel-faithful (decision C): every cell
@@ -3937,6 +3950,17 @@ fn cell_element(
         // Render the grid in the bundled Inter family (an explicit per-cell family below still
         // wins, e.g. the serif case).
         .font_family(GRID_FONT_FAMILY);
+
+    // Right + bottom gridlines — a fill paints over them (Excel look). A filled cell inside a
+    // same-fill block suppresses the shared interior gridline (8a): `skip_*_gridline` is set when
+    // the right / bottom neighbour resolves to the same fill, so the block reads as one solid
+    // rectangle. Outer-boundary gridlines still draw; explicit borders are a separate later pass.
+    if !skip_right_gridline {
+        el = el.border_r_1();
+    }
+    if !skip_bottom_gridline {
+        el = el.border_b_1();
+    }
 
     // Explicit alignment wins; otherwise fall back to the cell's type-aware default
     // (numbers/dates right, booleans/errors center, text left — `architecture.md §1.3`).

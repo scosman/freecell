@@ -551,12 +551,27 @@ pub fn all() -> Vec<RenderCase> {
                 .fill(1, 1, 0x64B5F6),
         ),
         cell(
-            // A 2×2 fill block: the fill paints over the interior gridlines (Excel look).
+            // A 2×2 same-fill block (8a): the interior gridlines are hidden so the block reads as
+            // one solid rectangle (Excel look); the outer-boundary gridlines still draw.
             "cell_fill_covers_gridlines",
             Scene::new().fill_range(
                 freecell_core::CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)),
                 0xFFEB3B,
             ),
+        ),
+        RenderCase::new(
+            // Block boundaries (8a): two same-fill blocks side by side (B2:C2 yellow, D2:E2 blue).
+            // Each block's shared interior gridline is hidden, but the gridline BETWEEN the two
+            // differently-coloured blocks — and the one against the unfilled A2 to the left — still
+            // draws. Locks in that only *same-fill* neighbours merge (a different fill or an
+            // unfilled cell keeps its gridline).
+            "cell_fill_block_boundaries",
+            Scene::new()
+                .fill(1, 1, 0xFFEB3B)
+                .fill(1, 2, 0xFFEB3B)
+                .fill(1, 3, 0x64B5F6)
+                .fill(1, 4, 0x64B5F6),
+            GRID_VP,
         ),
         // ---- Values & engine-owned number formats --------------------------------------
         cell("cell_number_plain", Scene::new().input(1, 1, "42")),

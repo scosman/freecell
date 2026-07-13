@@ -66,6 +66,11 @@ impl SheetTab {
 pub enum ChromeGridRequest {
     /// Move the active cell (Enter after a commit → down; Tab → right; etc.).
     MoveActive(Motion),
+    /// Select a single cell and scroll it into view (the find bar's current match —
+    /// `functional_spec.md §4.3`). Unlike [`MoveActive`](Self::MoveActive) it targets an absolute
+    /// cell (not a relative motion) and does **not** return focus to the grid (the find field keeps
+    /// focus), so the user can keep pressing next/prev.
+    SelectAndReveal(CellRef),
     /// Return keyboard focus to the grid (after a commit / Escape).
     FocusGrid,
     /// Switch the grid to `sheet` (tab click).
@@ -81,6 +86,11 @@ pub enum ChromeGridRequest {
         in_cell: Option<CellRef>,
         /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
         cap: Option<SharedString>,
+        /// Whether the current edit is in **quick-edit** mode (type-to-replace entry): while set, an
+        /// unmodified arrow key commits + moves the active cell instead of the caret
+        /// (`functional_spec.md §5`). Only ever `true` while an edit is live; the grid consumes it in
+        /// its in-cell `capture_key_down`.
+        quick_edit: bool,
     },
 }
 

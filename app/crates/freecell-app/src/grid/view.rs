@@ -16,9 +16,10 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use gpui::{
-    canvas, deferred, div, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context, Entity,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Rgba, SharedString, Window,
+    canvas, deferred, div, font, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context,
+    Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyDownEvent, LineFragment, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, TextRun,
+    Window,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
@@ -26,7 +27,7 @@ use gpui_component::{Icon, IconName, Sizable as _};
 
 use freecell_chart_model::{ChartId, ChartSpec};
 
-use freecell_core::cache::SheetCaches;
+use freecell_core::cache::{SheetCaches, DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX};
 use freecell_core::color::Rgb;
 use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
@@ -55,6 +56,23 @@ const RESIZE_HOTSPOT_HALF: f32 = 3.0;
 /// Minimum column width / row height a resize drag clamps to (`functional_spec.md §5.1`).
 const MIN_COL_WIDTH_PX: f32 = 8.0;
 const MIN_ROW_HEIGHT_PX: f32 = 12.0;
+
+/// gpui's default text line-height multiple — the golden ratio `phi` (`gpui::geometry::phi` =
+/// `relative(1.618034)`, applied as `Style::line_height`). The wrap auto-grow measurement uses the
+/// SAME factor so a grown row fits exactly the number of lines gpui renders (a smaller factor would
+/// under-grow and clip the top line).
+const GRID_LINE_HEIGHT_FACTOR: f32 = 1.618_034;
+
+/// Whether a keystroke's modifiers signal **caret / selection intent** for quick-edit
+/// (`functional_spec.md §5.3`): Shift, Cmd/Ctrl (`platform`/`control`), or Alt/Option. Deliberately
+/// **excludes** `function` — macOS sets `Modifiers::function` on the arrow / Home / End cluster
+/// itself, so `Modifiers::modified()` would report a *plain* arrow as modified and defeat §5.2's
+/// commit-and-move on macOS. This mirrors [`command_for_key`](super::input::command_for_key), which
+/// decomposes arrows into `(secondary, shift)` and never consults `function`. Shared by the data-row
+/// and in-cell arrow arms so both apply the identical rule.
+pub(crate) fn caret_intent_modifiers(modifiers: &Modifiers) -> bool {
+    modifiers.shift || modifiers.control || modifiers.alt || modifiers.platform
+}
 
 /// The worker-written / UI-read data the grid renders from (`components/grid.md §Public
 /// interface`). In Phase 6 these are built from hand fixtures ([`super::fixtures`]); the
@@ -254,6 +272,20 @@ pub struct GridView {
     incell_input: Option<Entity<InputState>>,
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
+    /// The in-cell editor overlay's measured, viewport-clamped `(width, height)` in device px for the
+    /// current frame, or `None` when the editor is closed (or on a non-`render` build path that skips
+    /// measurement — the overlay then falls back to its base cell-rect size). Computed in
+    /// [`Render::render`] (which holds the `Window` text system) so the editor **grows** to fit the
+    /// live text: rightward over neighbours for a wrap-off cell, downward for a wrap-on one
+    /// (`DECISIONS_TO_REVIEW.md`). Only the single editing cell is measured, so it stays O(1)/frame.
+    incell_geom: Option<(f32, f32)>,
+    /// Whether the current pending edit is in **quick-edit** mode (pushed by the chrome via
+    /// [`set_edit_state`](Self::set_edit_state), `functional_spec.md §5`). Consumed by the grid-root
+    /// `capture_key_down` so an unmodified arrow in the in-cell overlay commits + moves the active
+    /// cell instead of the caret. In the current flow type-to-replace edits in the data row and
+    /// `begin_in_cell` clears quick-edit, so this is a defensive symmetric mirror of the data-row
+    /// path (only ever `true` while an edit is live).
+    quick_edit: bool,
 
     /// The charts painted on each sheet's **ChartLayer** (P8/P11, `charts/architecture.md §4.2`,
     /// §5 challenge 5), keyed by sheet. See [`SheetChartLayer`]: the per-sheet spec list is **shared**
@@ -269,6 +301,32 @@ pub struct GridView {
     chart_drag: Option<ChartDrag>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
+
+    // ---- Wrap-driven row auto-grow (`functional_spec.md §3`) ----------------------------------
+    /// Reused per-frame buffer of the visible **wrap-on, non-empty** cells (populated in
+    /// `build_grid_layers` on the render path only — the perf harness leaves it empty). The
+    /// post-layout auto-grow pass measures these to grow their rows to fit the wrapped text.
+    wrap_cells: Vec<WrapCell>,
+    /// Per active-sheet 0-based row → the last-measured **signature** of its wrap inputs
+    /// (content / font / column width — NOT the row height). A row is re-measured only when its
+    /// signature changes, so a height-only republish never re-triggers auto-grow: the feedback loop
+    /// converges in one frame (`architecture.md §3.2`). Cleared on sheet switch.
+    wrap_sig: HashMap<u32, u64>,
+}
+
+/// A visible wrap-on, non-empty cell captured during the frame build, carrying exactly what the
+/// post-layout auto-grow measurement needs (`architecture.md §3.2`): the committed text, the
+/// resolved font (size / weight / style / family), and the cell's column width. Collected instead
+/// of measured inline because measurement needs the render thread's `Window` (a text system), which
+/// `build_grid_layers` doesn't hold.
+struct WrapCell {
+    row: u32,
+    text: SharedString,
+    font_px: f32,
+    bold: bool,
+    italic: bool,
+    font_family: Option<SharedString>,
+    col_w: f32,
 }
 
 /// One sheet's installed charts (P11, `charts/architecture.md §5` challenge 5, "off-screen free").
@@ -430,6 +488,25 @@ struct FrameTiming {
     content_cells: u32,
 }
 
+/// A deferred text-spill paint (`functional_spec.md §2`): the origin row + the inclusive
+/// [`layout::SpillSpan`] of empty neighbour columns the text is painted across, plus the origin
+/// cell's resolved text attributes. Collected during the cell loop (whose origin cells suppress
+/// their own clipped text) and painted as separate positioned elements after the cell + border
+/// layers, so the spilled text sits over the neighbours' fills/gridlines/borders.
+struct SpillPlan {
+    row: u32,
+    span: layout::SpillSpan,
+    text: String,
+    text_color: Rgba,
+    /// The origin cell's effective horizontal alignment — anchors the text within the spill rect
+    /// (left → start, right → end, center → centred).
+    align: Align,
+    /// The origin cell's resolved style (bold/italic/underline/strike/size/vertical-align), or
+    /// `None` for the grid default.
+    style: Option<RenderStyle>,
+    font_family: Option<SharedString>,
+}
+
 impl GridView {
     /// Builds the grid over `sources`, delivering [`GridEvent`]s to `events`. The active
     /// sheet defaults to the publication's sheet, at origin scroll with an A1 selection.
@@ -468,10 +545,14 @@ impl GridView {
             incell_open: None,
             incell_input: None,
             incell_cap: None,
+            incell_geom: None,
+            quick_edit: false,
             charts: HashMap::new(),
             selected_chart: None,
             chart_drag: None,
             chart_menu: None,
+            wrap_cells: Vec::new(),
+            wrap_sig: HashMap::new(),
         }
     }
 
@@ -624,9 +705,11 @@ impl GridView {
         mirror: Option<(SheetId, CellRef, SharedString)>,
         incell_open: Option<CellRef>,
         incell_cap: Option<SharedString>,
+        quick_edit: bool,
         cx: &mut Context<Self>,
     ) {
         self.mirror = mirror;
+        self.quick_edit = quick_edit;
         // Opening the in-cell editor ends any grid selection drag at its root (BUG #2): a drag armed
         // before the editor opened must not survive into (or past) the editor's lifetime. The
         // overlay `.occlude()`s the follow-up mouse-up, so the grid would never clear such a drag,
@@ -657,6 +740,29 @@ impl GridView {
                 Some(text.as_ref())
             }
             _ => None,
+        }
+    }
+
+    /// Classifies a candidate spill-neighbour `(row, col)` for the text-spill scan
+    /// (`functional_spec.md §2`): [`layout::Occupancy::Empty`] only when the cell is content-free
+    /// **and** its coverage is known — a pending edit (mirror), an off-coverage cell (never treat
+    /// "beyond covered" as empty, §2.5), or a published (non-empty) cell all read `Blocked`. A
+    /// fill/border-only empty cell is `Empty` (content-only stop): it carries a resolved style but
+    /// no entry in the publication-derived `cell_index`. Called only for in-frame columns, where
+    /// `cell_index` is authoritative over the published cells.
+    fn neighbor_occupancy(
+        &self,
+        row: u32,
+        col: u32,
+        publication: &Publication,
+    ) -> layout::Occupancy {
+        if self.mirror_text_for(CellRef::new(row, col)).is_some()
+            || !publication.covers(row, col)
+            || self.cell_index.contains_key(&(row, col))
+        {
+            layout::Occupancy::Blocked
+        } else {
+            layout::Occupancy::Empty
         }
     }
 
@@ -698,6 +804,9 @@ impl GridView {
         self.resize_drag = None;
         self.resize_preview = None;
         self.header_menu = None;
+        // The wrap-measurement signatures are per-sheet; drop them so the new sheet's wrap rows are
+        // measured fresh (heights themselves live in the worker's cache, so this only re-measures).
+        self.wrap_sig.clear();
         cx.notify();
     }
 
@@ -713,6 +822,21 @@ impl GridView {
     pub fn set_selection(&mut self, selection: SelectionModel, cx: &mut Context<Self>) {
         self.selection.insert(self.active_sheet, selection);
         cx.notify();
+    }
+
+    /// Select a single cell and scroll it into view — the find bar's current-match reveal
+    /// (`functional_spec.md §4.3`). Sets the selection **without** emitting a grid
+    /// `SelectionChanged` (the chrome-grid sink mirrors it into the chrome itself, avoiding a
+    /// double fold), then reveals it (which announces the possibly-widened viewport so an
+    /// off-screen match is published). The caller keeps the find field focused.
+    pub fn select_and_reveal(
+        &mut self,
+        cell: CellRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selection(SelectionModel::single(cell), cx);
+        self.reveal_and_announce(cell.row, cell.col, window, cx);
     }
 
     /// Shows/hides the file-open loading overlay ("Opening *name*…").
@@ -2103,6 +2227,13 @@ impl GridView {
             ((frame.rows.end - frame.rows.start) * (frame.cols.end - frame.cols.start)) as usize
                 + 16,
         );
+        // Deferred text-spill paints (`functional_spec.md §2`); typically empty. Painted after
+        // the cell + border layers so spilled text sits over the neighbours' fills/gridlines.
+        let mut spill_plans: Vec<SpillPlan> = Vec::new();
+        // Reset the wrap-on-cell buffer the post-layout auto-grow pass reads (`functional_spec.md
+        // §3`). Only the real render path fills it; the perf harness (`timing` set) leaves it empty
+        // so its measurement is untouched.
+        self.wrap_cells.clear();
 
         for r in frame.rows.clone() {
             for c in frame.cols.clone() {
@@ -2144,18 +2275,97 @@ impl GridView {
                         .filter(|name| !name.is_empty())
                         .cloned()
                 });
-                content_children.push(cell_element(
-                    x,
-                    y,
-                    w,
-                    h,
-                    fill,
-                    text,
-                    text_color,
-                    kind,
-                    attr_style,
-                    font_family,
-                ));
+
+                // Auto-grow (`functional_spec.md §3`): capture each committed **wrap-on**, non-empty
+                // cell so the post-layout pass (which has the render thread's text system) can
+                // measure its wrapped height at the column width `w`. Mirrored (being-edited) cells
+                // carry `attr_style: None`, so the `.wrap` gate skips them; only the real render path
+                // collects (`timing.is_none()`) — the perf harness stays allocation-light.
+                if timing.is_none() {
+                    if let Some(s) = attr_style {
+                        if s.wrap && !text.is_empty() {
+                            self.wrap_cells.push(WrapCell {
+                                row: r,
+                                text: text.clone().into(),
+                                font_px: font_px_of(s),
+                                bold: s.bold,
+                                italic: s.italic,
+                                font_family: font_family.clone(),
+                                col_w: w,
+                            });
+                        }
+                    }
+                }
+
+                // Text spill (`functional_spec.md §2`): a committed, wrap-off TEXT cell whose text
+                // overflows its column spills over empty neighbours in its alignment direction.
+                // Numbers/dates/bools/errors and mirrored (being-edited) cells never spill; a
+                // fitting cell falls through to the unchanged render path (pixels untouched).
+                let spill = if covers_active
+                    && kind == CellKind::Text
+                    && !text.is_empty()
+                    && attr_style.is_none_or(|s| !s.wrap)
+                    && self.mirror_text_for(CellRef::new(r, c)).is_none()
+                {
+                    let align = attr_style
+                        .and_then(|s| s.h_align)
+                        .unwrap_or_else(|| kind.default_align());
+                    let font_px = attr_style.map(font_px_of).unwrap_or(CELL_FONT_PX);
+                    if layout::text_overflows_column(&text, font_px, w, CELL_H_PAD) {
+                        let span = layout::spill_span(
+                            c,
+                            layout::spill_direction(align),
+                            frame.cols.start,
+                            frame.cols.end.saturating_sub(1),
+                            |nc| self.neighbor_occupancy(r, nc, &publication),
+                        );
+                        span.spills(c).then_some((span, align))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                match spill {
+                    // A spilling cell suppresses its own clipped text (the spill element repaints
+                    // the full run — no double-paint); the origin div still draws fill + gridlines.
+                    Some((span, align)) => {
+                        content_children.push(cell_element(
+                            x,
+                            y,
+                            w,
+                            h,
+                            fill,
+                            String::new(),
+                            text_color,
+                            kind,
+                            attr_style,
+                            font_family.clone(),
+                        ));
+                        spill_plans.push(SpillPlan {
+                            row: r,
+                            span,
+                            text,
+                            text_color,
+                            align,
+                            style: attr_style,
+                            font_family,
+                        });
+                    }
+                    None => content_children.push(cell_element(
+                        x,
+                        y,
+                        w,
+                        h,
+                        fill,
+                        text,
+                        text_color,
+                        kind,
+                        attr_style,
+                        font_family,
+                    )),
+                }
             }
         }
 
@@ -2203,6 +2413,30 @@ impl GridView {
                     }
                 }
             }
+        }
+
+        // ---- Text spill (`functional_spec.md §2`): paint each overflowing text cell's content as
+        // a separate positioned element over its empty-neighbour run, ABOVE the cell fills /
+        // gridlines / borders (so the text reads continuously across gridlines) but still inside
+        // the content clip wrapper — it never escapes into the headers. The origin cell already
+        // suppressed its own clipped text, so there is no double-paint.
+        for plan in spill_plans {
+            let (sx, sy, sw, sh) = span_rect(
+                plan.row..plan.row + 1,
+                plan.span.left..plan.span.right + 1,
+                frame,
+            );
+            content_children.push(spill_element(
+                sx,
+                sy,
+                sw,
+                sh,
+                plan.text,
+                plan.text_color,
+                plan.align,
+                plan.style,
+                plan.font_family,
+            ));
         }
 
         // Selection: translucent overlay (range − active), range border, active border.
@@ -2523,6 +2757,171 @@ impl GridView {
         }
 
         root_children
+    }
+
+    /// The wrap-driven row-height a set of same-row wrap-on cells needs (`functional_spec.md §3.2`):
+    /// the **max** over the cells of each cell's own wrapped height. A cell's height is
+    /// `lines * line_height + vpad`, where `lines` is its soft-wrap line count at the column width
+    /// (from gpui's real `LineWrapper`, so the grown row fits the text the grid actually paints,
+    /// summed over its explicit-`\n` segments) and `line_height` is gpui's default **`phi`** line box
+    /// (`round(1.618 * font_px)`, matching `Style::line_height` — NOT a made-up factor, so the row
+    /// fits the rendered lines exactly). `vpad` is the slack a single default line leaves in the
+    /// default row height, so a one-line default cell measures to the default. Clamped to
+    /// `[default, MAX_AUTO_ROW_HEIGHT_PX]` (content beyond the cap clips within the cell).
+    fn measure_wrap_height(cells: &[&WrapCell], window: &mut Window) -> f32 {
+        let line_px = |font_px: f32| (GRID_LINE_HEIGHT_FACTOR * font_px).round();
+        // The vertical slack a default single line leaves (so `lines == 1` at the default size ⇒ the
+        // default row height).
+        let vpad = DEFAULT_ROW_HEIGHT_PX - line_px(CELL_FONT_PX);
+        let mut needed = DEFAULT_ROW_HEIGHT_PX;
+        for wc in cells {
+            let avail = (wc.col_w - 2.0 * CELL_H_PAD).max(1.0);
+            let family = wc
+                .font_family
+                .clone()
+                .unwrap_or_else(|| SharedString::from(GRID_FONT_FAMILY));
+            let mut cell_font = font(family);
+            if wc.bold {
+                cell_font = cell_font.bold();
+            }
+            if wc.italic {
+                cell_font = cell_font.italic();
+            }
+            let mut wrapper = window.text_system().line_wrapper(cell_font, px(wc.font_px));
+            // Each explicit-newline segment wraps independently; visual lines = boundaries + 1.
+            let lines: u32 = wc
+                .text
+                .split('\n')
+                .map(|segment| {
+                    1 + wrapper
+                        .wrap_line(&[LineFragment::text(segment)], px(avail))
+                        .count() as u32
+                })
+                .sum();
+            let cell_h = lines as f32 * line_px(wc.font_px) + vpad;
+            needed = needed.max(cell_h);
+        }
+        needed.clamp(DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX)
+    }
+
+    /// A per-row signature of the wrap inputs (content / font / column width) that drive its wrapped
+    /// height — deliberately **excluding the row height** so a height-only republish leaves it
+    /// unchanged (the convergence guard, `architecture.md §3.2`).
+    fn wrap_row_signature(cells: &[&WrapCell]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for wc in cells {
+            wc.text.hash(&mut hasher);
+            wc.font_px.to_bits().hash(&mut hasher);
+            wc.bold.hash(&mut hasher);
+            wc.italic.hash(&mut hasher);
+            wc.font_family.hash(&mut hasher);
+            wc.col_w.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// The post-layout wrap auto-grow pass (`functional_spec.md §3`, run from [`Render::render`]):
+    /// group this frame's visible wrap-on cells by row, measure the rows whose wrap **inputs**
+    /// changed since last frame (plus rows that stopped wrapping → shrink to default), and emit one
+    /// [`GridEvent::AutoGrowRows`] with the measured heights. Clearing the dirty rows by storing the
+    /// fresh signature is what makes the loop converge: after the worker applies the height and
+    /// republishes, the re-render measures the same inputs → same signature → no re-emit.
+    fn run_autogrow(&mut self, frame: &Frame, window: &mut Window, cx: &mut Context<Self>) {
+        // Zero-cost early-out for the overwhelmingly common case (no wrap-on cells anywhere in the
+        // viewport, and none previously grown): the whole pass is skipped, so a normal sheet pays
+        // nothing per frame. When wrap-on cells ARE visible the pass is O(visible wrap cells): it
+        // re-hashes each wrapped cell's text every frame to detect input changes (measurement itself
+        // is gated on that signature, so it only runs on a real change). Re-hashing short, rare wrap
+        // text on idle repaints is cheap; a coarser gate was avoided because a style-only edit
+        // (font/wrap-toggle) doesn't bump the publication generation, so it would risk missing a
+        // genuine change. Accepted tradeoff.
+        if self.wrap_cells.is_empty() && self.wrap_sig.is_empty() {
+            return;
+        }
+        // Group the frame's wrap-on cells by row (indices into `self.wrap_cells`).
+        let mut by_row: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, wc) in self.wrap_cells.iter().enumerate() {
+            by_row.entry(wc.row).or_default().push(i);
+        }
+
+        let mut heights: Vec<(u32, f32)> = Vec::new();
+        let mut fresh_sigs: HashMap<u32, u64> = HashMap::with_capacity(by_row.len());
+        for (row, idxs) in &by_row {
+            let cells: Vec<&WrapCell> = idxs.iter().map(|&i| &self.wrap_cells[i]).collect();
+            let sig = Self::wrap_row_signature(&cells);
+            fresh_sigs.insert(*row, sig);
+            if self.wrap_sig.get(row) != Some(&sig) {
+                let px = Self::measure_wrap_height(&cells, window);
+                heights.push((*row, px));
+            }
+        }
+
+        // Shrink: a row that used to wrap but has no wrap-on cell this frame (wrap toggled off,
+        // content cleared) — and is still in the visible range — is told to drop its wrap
+        // contribution (the worker floors it at the base / default). Bounded by the small
+        // `wrap_sig` set.
+        let visible = frame.rows.clone();
+        let shrunk: Vec<u32> = self
+            .wrap_sig
+            .keys()
+            .copied()
+            .filter(|row| !by_row.contains_key(row) && visible.contains(row))
+            .collect();
+        for row in shrunk {
+            heights.push((row, DEFAULT_ROW_HEIGHT_PX));
+            self.wrap_sig.remove(&row);
+        }
+
+        // Commit the fresh signatures (measured rows are no longer dirty → convergence).
+        for (row, sig) in fresh_sigs {
+            self.wrap_sig.insert(row, sig);
+        }
+
+        if !heights.is_empty() {
+            self.events
+                .emit(&GridEvent::AutoGrowRows { heights }, window, cx);
+        }
+    }
+
+    /// Render-test hook (`render.rs`): the pixel harness renders a single static frame over a
+    /// shut-down worker, so the live measure→worker→republish loop can't round-trip in-capture.
+    /// This runs the **real** wrap measurement once, up front, and applies each grown height
+    /// **directly** to the shared cache the grid reads — for rows **without** an existing non-default
+    /// override, emulating the worker's manual-skip (a file/injected custom height = manual). It
+    /// mutates only the cache (never the worker), and is never called by the app.
+    pub fn autogrow_measure_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (vw, vh) = self.viewport_wh(window);
+        let Some(frame) = self.resolve_frame(vw, vh) else {
+            return;
+        };
+        // Populate `self.wrap_cells` for the frame (discard the built layers).
+        let _ = self.build_grid_layers(&frame, None);
+
+        let mut by_row: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, wc) in self.wrap_cells.iter().enumerate() {
+            by_row.entry(wc.row).or_default().push(i);
+        }
+        let mut grown: Vec<(u32, f32)> = Vec::new();
+        for (row, idxs) in &by_row {
+            let cells: Vec<&WrapCell> = idxs.iter().map(|&i| &self.wrap_cells[i]).collect();
+            grown.push((*row, Self::measure_wrap_height(&cells, window)));
+        }
+
+        {
+            let mut caches = self.sources.caches.write();
+            if let Some(cache) = caches.get_mut(self.active_sheet) {
+                for (row, px) in grown {
+                    // A row already carrying a non-default height is treated as manual (file/injected
+                    // custom height) — auto-grow leaves it. An auto (default) row grows to fit.
+                    let has_override = (cache.row_height(row) - DEFAULT_ROW_HEIGHT_PX).abs() > 0.5;
+                    if !has_override && px > DEFAULT_ROW_HEIGHT_PX + 0.5 {
+                        cache.set_row_height(row, px);
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// The divider resize hotspots — a 6 px `col-resize` / `row-resize` zone centered on each
@@ -3122,8 +3521,10 @@ fn cell_element(
         // has a definite width. Wrap it in a full-width content box (which sets `whitespace_normal`,
         // overriding the cell's base `whitespace_nowrap`) so gpui wraps at the column width.
         // Horizontal placement moves from the flex's justify-content to the box's text-align; the
-        // outer flex's `items_*` still positions the whole block vertically, and `overflow_hidden`
-        // clips the lines that don't fit the row height (no auto-grow — GAPS F1).
+        // outer flex's `items_*` still positions the whole block vertically. The row now auto-grows
+        // to fit the wrapped lines (`functional_spec.md §3`, the render-thread measurement pass), so
+        // `overflow_hidden` only clips content beyond the auto-grow cap `MAX_AUTO_ROW_HEIGHT_PX` (or
+        // a manually-shrunk row).
         let h_align = style
             .and_then(|s| s.h_align)
             .unwrap_or_else(|| kind.default_align());
@@ -3137,6 +3538,95 @@ fn cell_element(
     } else {
         el.child(text).into_any_element()
     }
+}
+
+/// The rendered font size (px) for a resolved style, mirroring [`cell_element`]: the grid default
+/// [`CELL_FONT_PX`] unless the style pins a non-default quarter-point size (`q/4` pt → px). Shared
+/// by the spill width gate so it measures against the same size the cell paints at.
+fn font_px_of(style: RenderStyle) -> f32 {
+    if style.font_size_q != 0 {
+        style.font_size_q as f32 / 4.0 * 96.0 / 72.0
+    } else {
+        CELL_FONT_PX
+    }
+}
+
+/// Builds a text-spill overlay element (`functional_spec.md §2.4`): the origin cell's text painted
+/// across the spill rect `(x, y, w, h)` — the origin cell through its last empty neighbour — with
+/// **no** fill, border, or gridline (those belong to the underlying cells). It mirrors
+/// [`cell_element`]'s text styling exactly (padding, size, colour, family, bold/italic/underline/
+/// strike, vertical alignment) so the origin portion paints identically to a non-spilling cell;
+/// only the horizontal anchor differs, per the spill direction:
+///
+/// - **Left** (rightward spill): the box's left edge is the origin cell start → `justify_start`
+///   pins the text at the origin, flowing right.
+/// - **Right** (leftward spill): the box's right edge is the origin cell end → `justify_end` pins
+///   the text at the origin's right, flowing left.
+/// - **Center** (both): `justify_center` centres the text over the empty run.
+///
+/// `overflow_hidden` clips to the spill rect; `whitespace_nowrap` keeps it one line (wrap-on cells
+/// never reach here).
+#[allow(clippy::too_many_arguments)]
+fn spill_element(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    text: String,
+    text_color: Rgba,
+    align: Align,
+    style: Option<RenderStyle>,
+    font_family: Option<SharedString>,
+) -> AnyElement {
+    let mut el = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(h))
+        .flex()
+        // Default vertical placement is BOTTOM (decision C), matching `cell_element`; an explicit
+        // `v_align` below overrides it so spilled text sits at the origin cell's vertical position.
+        .items_end()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .px(px(CELL_H_PAD))
+        .text_size(px(CELL_FONT_PX))
+        .text_color(text_color)
+        .font_family(GRID_FONT_FAMILY);
+
+    el = match align {
+        Align::Left => el.justify_start(),
+        Align::Center => el.justify_center(),
+        Align::Right => el.justify_end(),
+    };
+    if let Some(s) = style {
+        if s.bold {
+            el = el.font_weight(FontWeight::BOLD);
+        }
+        if s.italic {
+            el = el.italic();
+        }
+        if s.underline {
+            el = el.underline();
+        }
+        if s.strikethrough {
+            el = el.line_through();
+        }
+        el = match s.v_align {
+            Some(VAlign::Top) => el.items_start(),
+            Some(VAlign::Center) => el.items_center(),
+            Some(VAlign::Bottom) => el.items_end(),
+            None => el,
+        };
+        if s.font_size_q != 0 {
+            el = el.text_size(px(font_px_of(s)));
+        }
+    }
+    if let Some(name) = font_family {
+        el = el.font_family(name);
+    }
+    el.child(text).into_any_element()
 }
 
 /// Builds one header label cell (`selected` gives the darker tint).
@@ -3195,6 +3685,11 @@ fn resize_tooltip(x: f32, y: f32, label: String) -> AnyElement {
 /// The in-cell editor overlay's minimum width (px) — grows rightward over neighbours for narrow
 /// columns (`functional_spec.md §1.3`, `ui_design.md §3`).
 const IN_CELL_MIN_W: f32 = 80.0;
+/// Horizontal slack (px) added to the measured glyph width when the wrap-off in-cell editor grows
+/// rightward: `2 × CELL_H_PAD` so the text is not flush against the accent border, plus a caret's
+/// worth of room so the last glyph + blinking caret stay visible as the user types
+/// (`DECISIONS_TO_REVIEW.md`).
+const IN_CELL_GROW_SLACK_PX: f32 = 2.0 * CELL_H_PAD + 4.0;
 /// The in-cell editor's cap-reject danger border/tooltip colour (theme danger, matching chrome).
 const IN_CELL_DANGER: u32 = 0xDC2626;
 /// Dark tooltip fill + text for the in-cell cap-error popover (`ui_design.md §4`, matching chrome).
@@ -3210,6 +3705,101 @@ const IN_CELL_BORDER_TOTAL_PX: f32 = 4.0;
 /// `ceil(font_px * 1.25) + 4`) — but that height is in IronCalc space and is scaled ×24/28 to
 /// device px before it reaches the render path, so the two do NOT cancel (see below).
 const IN_CELL_LINE_HEIGHT_FACTOR: f32 = 1.25;
+
+/// Pure sizing math for the in-cell editor overlay's grown box (`DECISIONS_TO_REVIEW.md`): given the
+/// anchored cell's geometry and the pre-measured content, returns the editor's `(width, height)` in
+/// **content-local** device px. Extracted from the render path so the growth + viewport clamp is
+/// unit-testable without a `Window`.
+///
+/// - **Wrap-off** (`wrap == false`): the WIDTH grows to `max(cell_w, min_w, measured_text_w + slack)`
+///   so a long string in a narrow column is readable, then is capped at the content viewport's right
+///   edge — the editor never draws past `content_w` (content-local), i.e. never into the row header
+///   or outside the grid. When the anchored cell is at/over the right edge (`avail < base`) or
+///   scrolled off, the box keeps its base size and the content layer's `overflow_hidden` does the
+///   clipping. Height stays the cell's own height.
+/// - **Wrap-on** (`wrap == true`): the WIDTH is left at the cell's own width (floored at `min_w`, as
+///   today) and the HEIGHT grows to the pre-measured wrapped height, floored at the cell height and
+///   capped at `max_h` (Phase 7's `MAX_AUTO_ROW_HEIGHT_PX`) — the box previews the committed wrapped
+///   footprint.
+///
+/// `cell_x` is the cell's content-local left edge (may be negative when scrolled under the gutter —
+/// the left side is then clipped by `overflow_hidden`, not by this math).
+#[allow(clippy::too_many_arguments)]
+fn incell_editor_size(
+    cell_x: f32,
+    cell_w: f32,
+    cell_h: f32,
+    content_w: f32,
+    min_w: f32,
+    wrap: bool,
+    measured_text_w: f32,
+    slack: f32,
+    wrapped_h: f32,
+    max_h: f32,
+) -> (f32, f32) {
+    let base_w = cell_w.max(min_w);
+    if wrap {
+        let h = wrapped_h.clamp(cell_h, max_h.max(cell_h));
+        (base_w, h)
+    } else {
+        let desired = (measured_text_w + slack).max(base_w);
+        // Distance from the cell's left edge to the content viewport's right edge. `avail >= base_w`
+        // exactly when the whole base box fits before the edge (always true for a fully-visible cell);
+        // there we grow up to `min(desired, avail)` so the right border lands at most at the edge.
+        // Otherwise the cell straddles / is past the edge, so keep the base box and let the content
+        // layer's `overflow_hidden` clip it.
+        let avail = content_w - cell_x;
+        let w = if avail >= base_w {
+            desired.min(avail)
+        } else {
+            base_w
+        };
+        (w, cell_h)
+    }
+}
+
+/// The shaped width (device px) of `text` at the given resolved cell font, using the render thread's
+/// text system — the exact advance the in-cell editor's hosted input paints, so the grown box fits it
+/// (`DECISIONS_TO_REVIEW.md`). Empty text is zero-width (no shaping). One shaped line per frame for
+/// the single active editor — O(text), not O(grid).
+fn measure_incell_text_width(
+    text: &str,
+    font_px: f32,
+    family: Option<SharedString>,
+    bold: bool,
+    italic: bool,
+    window: &mut Window,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let family = family.unwrap_or_else(|| SharedString::from(GRID_FONT_FAMILY));
+    let mut cell_font = font(family);
+    if bold {
+        cell_font = cell_font.bold();
+    }
+    if italic {
+        cell_font = cell_font.italic();
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: cell_font,
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(
+            SharedString::from(text.to_string()),
+            px(font_px),
+            &[run],
+            None,
+        )
+        .width()
+        .as_f32()
+}
 
 /// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
 /// clipped vertically (BUG A): `(control_height, line_height)` in **device** px.
@@ -3283,6 +3873,82 @@ fn resolve_incell_font(style: Option<RenderStyle>, families: &[SharedString]) ->
 }
 
 impl GridView {
+    /// Measures the in-cell editor overlay's grown, viewport-clamped `(width, height)` for `cell`
+    /// this frame (`DECISIONS_TO_REVIEW.md`). Reads the live edit text straight from the hosted
+    /// [`InputState`] — the exact glyphs the input paints, so the grown box fits them, and it tracks
+    /// each keystroke (the grid re-renders on the chrome's mirror push). For a **wrap-off** cell the
+    /// text is shaped once to grow the WIDTH; for a **wrap-on** cell the wrapped HEIGHT is measured
+    /// via the shared [`measure_wrap_height`](Self::measure_wrap_height) (same `LineWrapper` +
+    /// `MAX_AUTO_ROW_HEIGHT_PX` cap as Phase 7 auto-grow). Pure clamping is delegated to
+    /// [`incell_editor_size`]. Only the one editing cell is measured, so this is O(1)/frame.
+    fn measure_incell_geom(
+        &self,
+        cell: CellRef,
+        frame: &Frame,
+        window: &mut Window,
+        cx: &App,
+    ) -> Option<(f32, f32)> {
+        let (x, _y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let style = self.visible_styles.get(&(cell.row, cell.col)).copied();
+        let wrap = style.map(|s| s.wrap).unwrap_or(false);
+        let content_w = frame.content_w as f32;
+        // The editor's live text is the hosted input's own value (kept in sync with the mirror by the
+        // chrome). Empty (or a missing input) simply keeps the base box.
+        let text = self
+            .incell_input
+            .as_ref()
+            .map(|input| input.read(cx).value())
+            .unwrap_or_default();
+        let IncellFont {
+            size_px,
+            family,
+            bold,
+            italic,
+            underline: _,
+        } = resolve_incell_font(style, &self.visible_font_families);
+        if wrap {
+            // Measure the wrapped height of the live text at the cell's own width, reusing the Phase 7
+            // measurement (clamped to `[default, MAX_AUTO_ROW_HEIGHT_PX]`); `incell_editor_size` then
+            // floors it at the cell height and re-applies the cap.
+            let wc = WrapCell {
+                row: cell.row,
+                text,
+                font_px: size_px,
+                bold,
+                italic,
+                font_family: family,
+                col_w: cell_w,
+            };
+            let wrapped_h = Self::measure_wrap_height(&[&wc], window);
+            Some(incell_editor_size(
+                x,
+                cell_w,
+                cell_h,
+                content_w,
+                IN_CELL_MIN_W,
+                true,
+                0.0,
+                0.0,
+                wrapped_h,
+                MAX_AUTO_ROW_HEIGHT_PX,
+            ))
+        } else {
+            let measured = measure_incell_text_width(&text, size_px, family, bold, italic, window);
+            Some(incell_editor_size(
+                x,
+                cell_w,
+                cell_h,
+                content_w,
+                IN_CELL_MIN_W,
+                false,
+                measured,
+                IN_CELL_GROW_SLACK_PX,
+                0.0,
+                MAX_AUTO_ROW_HEIGHT_PX,
+            ))
+        }
+    }
+
     /// The in-cell editor overlay elements at `cell`: the bordered white editor box holding the
     /// reused `Input`, plus the cap-error popover below it when a cap rejection is active
     /// (`components/edit_controller.md §4.4`, `ui_design.md §3–4`). Both are `deferred()` so they
@@ -3293,8 +3959,18 @@ impl GridView {
         input: &Entity<InputState>,
         frame: &Frame,
     ) -> Vec<AnyElement> {
-        let (x, y, w, h) = cell_rect(cell.row, cell.col, frame);
-        let w = w.max(IN_CELL_MIN_W);
+        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let wrap = self
+            .visible_styles
+            .get(&(cell.row, cell.col))
+            .map(|s| s.wrap)
+            .unwrap_or(false);
+        // The grown box measured this frame (`measure_incell_geom`): rightward over neighbours for a
+        // wrap-off cell, downward for a wrap-on one. `None` on a non-`render` build path (perf/test
+        // harness) → the base cell-rect size, matching the pre-grow behaviour there.
+        let (w, h) = self
+            .incell_geom
+            .unwrap_or((cell_w.max(IN_CELL_MIN_W), cell_h));
         let danger = self.incell_cap.is_some();
         let border = if danger {
             rgb(IN_CELL_DANGER)
@@ -3322,8 +3998,11 @@ impl GridView {
         // the single-line control height via `min_h`/`max_h` (both applied after gpui-component's
         // `input_h` via `refine_style`) and override the line box. `incell_input_geometry` fills the
         // cell inner height where it can and floors at the line box otherwise (the control may then
-        // overflow the cell wrapper a few px — visible, not clipped; see its doc).
-        let (control_h, line_h) = incell_input_geometry(h, font_px);
+        // overflow the cell wrapper a few px — visible, not clipped; see its doc). Sized from the
+        // CELL height (not the grown box `h`): a wrap-on editor grows its box downward but its hosted
+        // single-line input stays a first-line control at the top, so the caret is not left floating
+        // in the middle of a tall box.
+        let (control_h, line_h) = incell_input_geometry(cell_h, font_px);
         let mut input_el = Input::new(input)
             .appearance(false)
             .text_size(px(font_px))
@@ -3358,7 +4037,10 @@ impl GridView {
             // commits (outside-commit preserved).
             .occlude()
             .flex()
-            .items_center()
+            // Wrap-off: the box is the cell height, so centre the single line. Wrap-on: the box grows
+            // downward, so pin the input to the top (first line) — see `incell_input_geometry` above.
+            .when(wrap, |d| d.items_start())
+            .when(!wrap, |d| d.items_center())
             .bg(rgb(CELL_BG))
             .border_2()
             .border_color(border)
@@ -3457,7 +4139,20 @@ impl Render for GridView {
                 );
             }
 
+            // Measure the in-cell editor's grown size (it grows to fit the live text — rightward for
+            // a wrap-off cell, downward for a wrap-on one) BEFORE the layer build reads it, because
+            // measuring needs the render thread's text system (`window`). Only the single editing
+            // cell is measured, so this is O(1)/frame. `None` closes/clears it (the base cell-rect
+            // size then applies). `visible_styles` was just populated by `resolve_frame`.
+            self.incell_geom = self
+                .incell_open
+                .and_then(|cell| self.measure_incell_geom(cell, &frame, window, cx));
             root_children.extend(self.build_grid_layers(&frame, None));
+            // Wrap-driven row auto-grow (`functional_spec.md §3`): measure the just-laid-out wrap-on
+            // cells and, for rows whose wrap inputs changed, ask the worker to grow/shrink them.
+            // Runs after the layer build (which filled `self.wrap_cells`) so it has the real column
+            // widths; the emit routes to `Command::AutoGrowRowHeights`.
+            self.run_autogrow(&frame, window, cx);
             // Divider resize hotspots paint last (over the header strips) so they win the hit-test.
             root_children.extend(self.resize_hotspots(&frame, cx));
         }
@@ -3547,10 +4242,11 @@ impl Render for GridView {
                 if this.incell_open.is_none() {
                     return;
                 }
+                let modifiers = event.keystroke.modifiers;
                 match event.keystroke.key.as_str() {
                     "tab" => {
                         cx.stop_propagation();
-                        let dir = if event.keystroke.modifiers.shift {
+                        let dir = if modifiers.shift {
                             Direction::Left
                         } else {
                             Direction::Right
@@ -3561,6 +4257,26 @@ impl Render for GridView {
                     "escape" => {
                         cx.stop_propagation();
                         this.events.emit(&GridEvent::InCellCancel, window, cx);
+                    }
+                    // Quick-edit: an unmodified arrow commits + moves the active cell
+                    // (`functional_spec.md §5.2`), reusing the Tab commit-move plumbing. Uses the
+                    // shared caret-intent predicate (excludes `function`, which macOS sets on the
+                    // arrow cluster) so a plain arrow still moves. Defensive symmetric mirror of the
+                    // data-row path — type-to-replace edits in the data row, and `begin_in_cell`
+                    // clears quick-edit, so the in-cell overlay is not open in quick-edit today; kept
+                    // in sync so a future overlay-hosted quick-edit works.
+                    key @ ("left" | "right" | "up" | "down")
+                        if this.quick_edit && !caret_intent_modifiers(&modifiers) =>
+                    {
+                        cx.stop_propagation();
+                        let dir = match key {
+                            "left" => Direction::Left,
+                            "right" => Direction::Right,
+                            "up" => Direction::Up,
+                            _ => Direction::Down,
+                        };
+                        this.events
+                            .emit(&GridEvent::InCellCommitMove(dir), window, cx);
                     }
                     _ => {}
                 }
@@ -3603,6 +4319,13 @@ impl GridView {
     #[cfg(test)]
     pub(crate) fn incell_open_for_test(&self) -> Option<CellRef> {
         self.incell_open
+    }
+
+    /// Test seam: whether the grid's copy of the chrome's quick-edit flag is set (proves
+    /// [`set_edit_state`](Self::set_edit_state) threads it, `functional_spec.md §5`).
+    #[cfg(test)]
+    pub(crate) fn quick_edit_for_test(&self) -> bool {
+        self.quick_edit
     }
 
     /// Emits [`GridEvent::InCellCommitMove`] exactly as the `capture_key_down` Tab handler does — for
@@ -4178,6 +4901,178 @@ mod tests {
         (out.expect("grid built"), window, events)
     }
 
+    /// A long single line that wraps to several visual lines at a narrow column — the auto-grow
+    /// measurement fixture.
+    const WRAP_LONG: &str = "this note wraps across several visual lines at a narrow column width";
+
+    /// Sources with a wrap-on long-text cell at B2, optionally a second wrap-on cell at B3 carrying
+    /// a manual row-height override (for the harness-hook skip test).
+    fn wrap_sources(col_w: f32, b3_override: Option<f32>) -> (GridDataSources, SheetId) {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::{CellKind, Publication, PublishedCell};
+        let sheet = SheetId(0);
+        let wrap = RenderStyle {
+            wrap: true,
+            ..RenderStyle::default()
+        };
+        let cell = |row, col, text: &str| PublishedCell {
+            row,
+            col,
+            display_text: text.to_string(),
+            kind: CellKind::Text,
+            text_color: None,
+        };
+        let mut builder = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .col_width(1, col_w)
+        .cell_style(1, 1, wrap);
+        let mut cells = vec![cell(1, 1, WRAP_LONG)];
+        if let Some(h) = b3_override {
+            builder = builder.cell_style(2, 1, wrap).row_height(2, h);
+            cells.push(cell(2, 1, WRAP_LONG));
+        }
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, builder.build());
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells,
+        };
+        (
+            GridDataSources {
+                publication: Arc::new(ArcSwap::from_pointee(publication)),
+                caches: Arc::new(RwLock::new(caches)),
+            },
+            sheet,
+        )
+    }
+
+    /// A recording `GridView` over the given sources (mirrors [`grid_recording`] but lets the caller
+    /// pick the sources — the auto-grow fixtures need a wrap-on cell).
+    #[allow(clippy::type_complexity)]
+    fn recording_over(
+        cx: &mut TestAppContext,
+        sources: GridDataSources,
+    ) -> (
+        gpui::Entity<GridView>,
+        gpui::WindowHandle<Root>,
+        Rc<RefCell<Vec<GridEvent>>>,
+    ) {
+        cx.update(gpui_component::init);
+        let events: Rc<RefCell<Vec<GridEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let ev = events.clone();
+        let mut out: Option<gpui::Entity<GridView>> = None;
+        let slot = &mut out;
+        let window = cx.open_window(size(px(1200.0), px(800.0)), |window, cx| {
+            let sink = GridEventSink::new(move |e, _w, _cx| ev.borrow_mut().push(e.clone()));
+            let g = cx.new(|cx| GridView::new(sources, sink, cx));
+            *slot = Some(g.clone());
+            Root::new(g, window, cx)
+        });
+        (out.expect("grid built"), window, events)
+    }
+
+    /// The heights carried by the single `AutoGrowRows` the recording captured, or `None`.
+    fn captured_autogrow(events: &Rc<RefCell<Vec<GridEvent>>>) -> Option<Vec<(u32, f32)>> {
+        events.borrow().iter().find_map(|e| match e {
+            GridEvent::AutoGrowRows { heights } => Some(heights.clone()),
+            _ => None,
+        })
+    }
+
+    /// Runs the real post-layout auto-grow pass once (resolve a frame, fill the wrap buffer, measure
+    /// + emit) — the render-path measurement without a full paint.
+    fn drive_autogrow(
+        cx: &mut TestAppContext,
+        g: &gpui::Entity<GridView>,
+        window: &gpui::WindowHandle<Root>,
+    ) {
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame resolves");
+                    let _ = grid.build_grid_layers(&frame, None);
+                    grid.run_autogrow(&frame, window, cx);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn autogrow_measures_wrapped_height_and_emits_once_then_converges(cx: &mut TestAppContext) {
+        // A wrap-on long-text cell at a narrow column is measured to a height > default and emitted
+        // ONCE; a second identical pass emits nothing — the wrap-input signature is unchanged, so a
+        // height-only republish never re-triggers auto-grow (convergence, no oscillation).
+        let (sources, _sheet) = wrap_sources(80.0, None);
+        let (g, window, events) = recording_over(cx, sources);
+
+        drive_autogrow(cx, &g, &window);
+        let heights = captured_autogrow(&events).expect("first pass emits AutoGrowRows");
+        assert_eq!(heights.len(), 1, "one dirty wrap row");
+        let (row, px) = heights[0];
+        assert_eq!(row, 1);
+        assert!(
+            px > DEFAULT_ROW_HEIGHT_PX + 1.0,
+            "the narrow wrap row grew beyond default (got {px})"
+        );
+
+        // Second pass over the same inputs → the dirty set is empty → NO further command.
+        events.borrow_mut().clear();
+        drive_autogrow(cx, &g, &window);
+        assert!(
+            captured_autogrow(&events).is_none(),
+            "a settled wrap row must not re-emit (converges in one step)"
+        );
+    }
+
+    #[gpui::test]
+    fn autogrow_narrower_column_grows_taller(cx: &mut TestAppContext) {
+        // Narrowing the column produces more wrapped lines → a taller measured height (§3.2).
+        let measure = |cx: &mut TestAppContext, col_w: f32| -> f32 {
+            let (sources, _s) = wrap_sources(col_w, None);
+            let (g, window, events) = recording_over(cx, sources);
+            drive_autogrow(cx, &g, &window);
+            captured_autogrow(&events).expect("emits")[0].1
+        };
+        let wide = measure(cx, 200.0);
+        let narrow = measure(cx, 60.0);
+        assert!(
+            narrow > wide + 1.0,
+            "narrower column grows the row taller (narrow {narrow} vs wide {wide})"
+        );
+    }
+
+    #[gpui::test]
+    fn autogrow_measure_now_grows_default_but_skips_overridden(cx: &mut TestAppContext) {
+        // The render-harness hook grows a default-height wrap row and leaves an already-overridden
+        // (manual) wrap row untouched.
+        let (sources, sheet) = wrap_sources(80.0, Some(30.0));
+        let (g, window, _events) = recording_over(cx, sources);
+        let (grown, manual) = window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.autogrow_measure_now(window, cx);
+                    let guard = grid.sources.caches.read();
+                    let cache = guard.get(sheet).unwrap();
+                    (cache.row_height(1), cache.row_height(2))
+                })
+            })
+            .unwrap();
+        assert!(
+            grown > DEFAULT_ROW_HEIGHT_PX + 1.0,
+            "the default wrap row grew (got {grown})"
+        );
+        assert!(
+            (manual - 30.0).abs() < 0.6,
+            "the manually-sized wrap row is unchanged (got {manual})"
+        );
+    }
+
     fn key_ev(key: &str, key_char: Option<&str>, shift: bool) -> KeyDownEvent {
         KeyDownEvent {
             keystroke: Keystroke {
@@ -4231,7 +5126,7 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
                     events.borrow_mut().clear();
                     // A printable key and an arrow both no-op while the overlay owns the keyboard.
                     grid.handle_key_down(&key_ev("x", Some("x"), false), window, cx);
@@ -4247,6 +5142,29 @@ mod tests {
             "the in-cell overlay must own the keyboard: {:?}",
             events.borrow()
         );
+    }
+
+    #[gpui::test]
+    fn set_edit_state_threads_quick_edit(cx: &mut TestAppContext) {
+        // The chrome pushes quick-edit through the edit-state; the grid stores it for its in-cell
+        // arrow branch (`functional_spec.md §5`).
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, cx);
+                    assert!(
+                        grid.quick_edit_for_test(),
+                        "quick_edit must thread through set_edit_state"
+                    );
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
+                    assert!(
+                        !grid.quick_edit_for_test(),
+                        "quick_edit clears when pushed false"
+                    );
+                });
+            })
+            .unwrap();
     }
 
     // ---- Phase 7: structure (resize, header selection, merge-menu) ------------------------
@@ -4562,7 +5480,7 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
                 });
                 input
             })
@@ -4640,7 +5558,7 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input, cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
                 });
             })
             .unwrap();
@@ -4715,7 +5633,7 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
                     grid.mouse_down_cell(
                         2,
                         2,
@@ -4764,13 +5682,13 @@ mod tests {
                     );
                     assert!(grid.has_active_drag(), "a single click arms a cell drag");
                     // Open the editor → the drag must be cleared at the root.
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
                     assert!(
                         !grid.has_active_drag(),
                         "opening the in-cell editor clears the pre-armed drag"
                     );
                     // Close the editor; the drag must stay cleared (no move-gate applies now).
-                    grid.set_edit_state(None, None, None, cx);
+                    grid.set_edit_state(None, None, None, false, cx);
                     assert!(
                         !grid.has_active_drag(),
                         "the drag stays cleared after the editor closes"
@@ -4872,6 +5790,223 @@ mod tests {
         assert!(
             dl <= dc,
             "default line box ({dl}) must fit the default control ({dc})"
+        );
+    }
+
+    #[test]
+    fn incell_editor_size_grows_and_clamps() {
+        // The pure sizing math behind the grow-right / grow-down in-cell editor
+        // (`DECISIONS_TO_REVIEW.md`). Cell at content-local x=100, 64×24 px, min box 80, viewport
+        // right edge at 800, wrap-on cap 240.
+        let (cx, cw, ch, cont_w, min_w, max_h) = (100.0, 64.0, 24.0, 800.0, 80.0, 240.0);
+
+        // Wrap-off, text that fits the base box: stays at the base (min) width, cell height.
+        let (w, h) = incell_editor_size(cx, cw, ch, cont_w, min_w, false, 20.0, 12.0, 0.0, max_h);
+        assert!(
+            (w - min_w).abs() < 1e-3,
+            "short text keeps the base width, got {w}"
+        );
+        assert!(
+            (h - ch).abs() < 1e-6,
+            "wrap-off height stays the cell height, got {h}"
+        );
+
+        // Wrap-off, long text: width grows to measured + slack, wider than the cell.
+        let (w2, _) = incell_editor_size(cx, cw, ch, cont_w, min_w, false, 300.0, 12.0, 0.0, max_h);
+        assert!(
+            (w2 - 312.0).abs() < 1e-3,
+            "grows to measured+slack, got {w2}"
+        );
+        assert!(w2 > cw, "editor wider than the cell");
+
+        // Wrap-off, text far wider than the viewport: clamped at the content viewport's right edge —
+        // never drawn past `content_w` (into the row header / outside the grid).
+        let (w3, _) =
+            incell_editor_size(cx, cw, ch, cont_w, min_w, false, 5000.0, 12.0, 0.0, max_h);
+        assert!(
+            (w3 - (cont_w - cx)).abs() < 1e-3,
+            "clamped to the viewport edge, got {w3}"
+        );
+        assert!(
+            cx + w3 <= cont_w + 1e-3,
+            "never past the content right edge"
+        );
+
+        // Anchored cell straddling / past the right edge (avail < base): keep the base box; the
+        // content layer's `overflow_hidden` does the clipping.
+        let (w4, _) = incell_editor_size(
+            cont_w - 10.0,
+            cw,
+            ch,
+            cont_w,
+            min_w,
+            false,
+            5000.0,
+            12.0,
+            0.0,
+            max_h,
+        );
+        assert!(
+            (w4 - min_w).abs() < 1e-3,
+            "edge cell keeps the base width, got {w4}"
+        );
+
+        // Wrap-on: width stays the cell width (floored at min); height grows to the wrapped height.
+        let (ww, wh) =
+            incell_editor_size(cx, 120.0, ch, cont_w, min_w, true, 0.0, 0.0, 96.0, max_h);
+        assert!(
+            (ww - 120.0).abs() < 1e-6,
+            "wrap-on keeps the cell width, got {ww}"
+        );
+        assert!(
+            (wh - 96.0).abs() < 1e-6,
+            "wrap-on grows to the wrapped height, got {wh}"
+        );
+        assert!(wh > ch, "editor taller than the cell");
+
+        // Wrap-on cap: a pathologically tall wrapped height is capped at max_h (Phase 7's cap).
+        let (_, wh2) = incell_editor_size(
+            cx, 120.0, ch, cont_w, min_w, true, 0.0, 0.0, 10_000.0, max_h,
+        );
+        assert!(
+            (wh2 - max_h).abs() < 1e-6,
+            "wrap-on height capped at max_h, got {wh2}"
+        );
+    }
+
+    #[gpui::test]
+    fn incell_editor_grows_right_for_long_text(cx: &mut TestAppContext) {
+        // Editing a long string in a wrap-off cell grows the editor box WIDER than the cell (it grows
+        // with the text); a short string keeps it at the base size. On close the overlay is gone.
+        let (g, window, _events) = grid_recording(cx);
+        let input = window
+            .update(cx, |_root, window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                g.update(cx, |grid, cx| {
+                    grid.set_incell_input(input.clone(), cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                });
+                input
+            })
+            .unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Short live text → base box.
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| i.set_value("x", window, cx));
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let base = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+
+        // Long live text → grows wider than the base.
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| {
+                i.set_value(
+                    "a really long label that overflows a narrow column and grows the editor",
+                    window,
+                    cx,
+                )
+            });
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let grown = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+        assert!(
+            grown.size.width > base.size.width,
+            "a long string must grow the wrap-off editor wider than a short one: {:?} vs {:?}",
+            grown.size.width,
+            base.size.width
+        );
+        // Height unchanged (wrap-off grows only rightward).
+        assert!(
+            (grown.size.height.as_f32() - base.size.height.as_f32()).abs() < 0.5,
+            "wrap-off editor height must not change when it grows right"
+        );
+
+        // Cancel closes the overlay — normal rendering resumes (no persistent overlay).
+        vcx.update(|_window, cx| {
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, None, None, false, cx)
+            })
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("in-cell-editor").is_none(),
+            "closing the in-cell editor must remove the overlay"
+        );
+    }
+
+    #[gpui::test]
+    fn incell_editor_grows_down_for_wrapped_text(cx: &mut TestAppContext) {
+        // Editing a wrap-ON cell grows the editor box TALLER for wrapped text (not wider) — the box
+        // previews the committed multi-line footprint. Commit closes it.
+        let (sources, _sheet) = wrap_sources(80.0, None);
+        let (g, window, _events) = recording_over(cx, sources);
+        let cell = CellRef::new(1, 1); // B2 — the wrap-on cell in `wrap_sources`.
+        let input = window
+            .update(cx, |_root, window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                g.update(cx, |grid, cx| {
+                    grid.set_incell_input(input.clone(), cx);
+                    grid.set_edit_state(None, Some(cell), None, false, cx);
+                });
+                input
+            })
+            .unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| i.set_value("x", window, cx));
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(cell), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let base = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+
+        vcx.update(|window, cx| {
+            input.update(cx, |i, cx| i.set_value(WRAP_LONG, window, cx));
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, Some(cell), None, false, cx)
+            });
+        });
+        vcx.run_until_parked();
+        let grown = vcx
+            .debug_bounds("in-cell-editor")
+            .expect("the in-cell editor overlay was painted");
+        assert!(
+            grown.size.height > base.size.height,
+            "a wrap-on cell must grow the editor taller for wrapped text: {:?} vs {:?}",
+            grown.size.height,
+            base.size.height
+        );
+        // Grows DOWN, not right: width unchanged (stays the cell width).
+        assert!(
+            (grown.size.width.as_f32() - base.size.width.as_f32()).abs() < 0.5,
+            "wrap-on editor keeps its width; only height grows"
+        );
+
+        // Commit closes the overlay.
+        vcx.update(|_window, cx| {
+            g.update(cx, |grid, cx| {
+                grid.set_edit_state(None, None, None, false, cx)
+            })
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("in-cell-editor").is_none(),
+            "committing the in-cell editor must remove the overlay"
         );
     }
 

@@ -19,14 +19,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
+    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, CursorStyle, ElementId, Entity,
+    FocusHandle, Focusable, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::spinner::Spinner;
-use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
@@ -41,6 +42,8 @@ use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
     limits, Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign,
 };
+
+use crate::grid::caret_intent_modifiers;
 
 use freecell_chart_model::{Anchor as ChartAnchor, AnchorCell, ChartId, LegendPosition};
 
@@ -159,7 +162,22 @@ const DATA_ROW_H: f32 = 32.0;
 /// (`Size::Medium` → 32 px) and fills the row edge-to-edge, which reads as cramped.
 const DATA_ROW_FIELD_H: f32 = DATA_ROW_H - 4.0;
 const TAB_BAR_H: f32 = 30.0;
+/// A tab press that moves less than this (device px) is a click (select / rename), not a drag —
+/// only past it does the lift + drop indicator appear (`ui_design.md §3`).
+const TAB_DRAG_THRESHOLD_PX: f32 = 4.0;
+/// The reorder drop indicator + dragged-tab outline accent (Office Accent 1, matching the
+/// borders popover's selected-swatch ring). `ui_design.md §3`: a 2 px accent vertical bar.
+const TAB_DROP_ACCENT: u32 = 0x4472C4;
+/// Half the inter-tab gap (`gap_1` = 4 px), used to place the drop indicator in the gap when it
+/// lands before the first / after the last tab.
+const TAB_GAP_HALF: f32 = 2.0;
 const REF_BOX_W: f32 = 72.0;
+/// The find/replace bar's two text fields' width (`ui_design.md §1`: ~220 px each).
+const FIND_FIELD_W: f32 = 220.0;
+/// The match counter's min width so "3 of 12" ↔ "No results" doesn't jitter the trailing group.
+const FIND_COUNTER_MIN_W: f32 = 72.0;
+/// Muted counter text (`ui_design.md §1`: "No results" in a muted color).
+const FIND_COUNTER_MUTED: u32 = 0x777777;
 /// The content field's left edge inside the data row = padding + ref box + gap + divider +
 /// gap (`render_data_row` layout); the cap-error popover anchors here.
 const DATA_ROW_CONTENT_LEFT: f32 = 8.0 + REF_BOX_W + 8.0 + 1.0 + 8.0;
@@ -226,6 +244,51 @@ impl ChartPanel {
     }
 }
 
+/// A potential or in-flight sheet-tab reorder drag (`functional_spec.md §6.1`, `ui_design.md §3`).
+/// Recorded on a tab mouse-down as a *potential* drag; `dragging` flips true only once the pointer
+/// crosses [`TAB_DRAG_THRESHOLD_PX`] from `start_x`, at which point the lift + drop indicator
+/// appear. Modeled off the grid's `ResizeDrag`. All coordinates are window-space device px.
+#[derive(Debug, Clone, Copy)]
+struct TabDrag {
+    /// The sheet being dragged. The active sheet follows this **id** across the move (not the
+    /// slot), so a reorder never changes which sheet is active.
+    sheet: SheetId,
+    /// Window x at mouse-down — the threshold origin.
+    start_x: f32,
+    /// Live window x, updated on every move.
+    cur_x: f32,
+    /// Whether the pointer has crossed the movement threshold (past it = a real drag, not a click).
+    dragging: bool,
+}
+
+/// One tab's captured window-space horizontal span, written by a per-tab `canvas` bounds probe
+/// during paint (the Window-free geometry the pure insertion computation reads). Keyed by
+/// [`SheetId`] and read back in `self.sheets` order, so a stale/partial capture is simply ignored.
+#[derive(Debug, Clone, Copy)]
+struct TabSpan {
+    sheet: SheetId,
+    left: f32,
+    right: f32,
+}
+
+/// The insertion gap a tab drop would land in: the count of tab centers at/left of `cursor_x`
+/// (`tab_centers` ordered left→right, in the same coordinate space as `cursor_x`). Returns an
+/// index in `0..=n` — the gap the 2 px drop indicator snaps to, already clamped so a drop cannot
+/// pass the trailing `+` button. Pure (no `Window`), so the drag geometry is unit-testable.
+fn tab_insertion_index(cursor_x: f32, tab_centers: &[f32]) -> usize {
+    tab_centers.iter().filter(|&&c| cursor_x >= c).count()
+}
+
+/// Convert an insertion `gap` (`0..=n`, from [`tab_insertion_index`]) into the fork's final
+/// `to_index` for a sheet currently at `from_slot`, or `None` when the drop is a no-op (lands back
+/// on the origin slot). Removing the dragged tab shifts every later gap left by one, so a gap past
+/// the origin maps to `gap - 1`; both gaps adjacent to the origin (`from` and `from + 1`) resolve
+/// to `from` — a no-op. Pure, so it is unit-testable alongside [`tab_insertion_index`].
+fn move_target_for_gap(gap: usize, from_slot: usize) -> Option<usize> {
+    let to = if gap <= from_slot { gap } else { gap - 1 };
+    (to != from_slot).then_some(to)
+}
+
 /// The chrome around the grid: action row + data row + sheet tab bar.
 pub struct ChromeView {
     client: Rc<dyn ChromeClient>,
@@ -271,6 +334,12 @@ pub struct ChromeView {
     /// Whether the last edit-state push to the grid was non-empty (a mirror / overlay was shown),
     /// so an idle selection move doesn't re-push an all-`None` clear on every keystroke.
     edit_state_shown: bool,
+    /// Whether the current pending edit is in **quick-edit** mode (`functional_spec.md §5`). Set by
+    /// `begin_typed` (type-to-replace entry); cleared by `begin_in_cell`, by any caret-intent signal
+    /// (mouse-down in the field, Home/End, a modified arrow — see [`leave_quick_edit`](Self::leave_quick_edit)),
+    /// and on commit/cancel. While set + editing, an unmodified arrow commits + moves the active cell
+    /// instead of the caret.
+    quick_edit: bool,
     /// The `(sheet, cell)` whose fetched content currently lives in the reducer's `committed`
     /// field. The in-cell editor seeds from `committed` **only** for this exact sheet+cell — the
     /// single shared reducer keeps a previous cell's `committed` across a single→single selection
@@ -360,6 +429,36 @@ pub struct ChromeView {
     context_menu: Option<SheetId>,
     /// The sheet pending a delete confirmation (non-empty sheet), if any.
     confirm_delete: Option<SheetId>,
+    /// A potential or in-flight tab reorder drag (`functional_spec.md §6`, `ui_design.md §3`).
+    tab_drag: Option<TabDrag>,
+    /// Each tab's captured window-space horizontal span, refreshed by a per-tab `canvas` probe on
+    /// every paint — the geometry the pure insertion-index computation reads (a `Window`-free
+    /// snapshot). Keyed by [`SheetId`]; read back in `self.sheets` order.
+    tab_spans: Vec<TabSpan>,
+
+    // ---- Find / replace bar (`functional_spec.md §4`, `ui_design.md §1`) -------------------
+    /// Whether the find/replace bar is open (rendered below the data row, pushing the grid down).
+    find_open: bool,
+    /// The Find field's text buffer.
+    find_input: Entity<InputState>,
+    /// The Replace field's text buffer.
+    replace_input: Entity<InputState>,
+    /// The **match-case** toggle (`Aa`): off = case-insensitive (default), on = exact case.
+    match_case: bool,
+    /// The **match-entire-cell** toggle: off = substring (default), on = whole-cell equality.
+    whole_cell: bool,
+    /// The current match set (row-major `CellRef`s from the worker's `FindResults`); empty = no
+    /// matches / empty find field.
+    matches: Vec<CellRef>,
+    /// The index into [`matches`](Self::matches) of the current match, or `None` when there are no
+    /// matches. Drives the "N of M" counter + which cell is selected/revealed.
+    match_idx: Option<usize>,
+    /// Set while a `ReplaceAll` reply is awaited, so its `ReplacedCount` shows the "Replaced N"
+    /// notice (a single `ReplaceOne`'s count is not surfaced — `functional_spec.md §4.4`).
+    pending_replace_all: bool,
+    /// A transient "Replaced N" notice shown in the counter after a Replace All until the user next
+    /// edits the find field / steps matches (`functional_spec.md §4.4`).
+    replaced_notice: Option<usize>,
 
     /// The grid, hosted as the chrome's body so the layout is action-row → data-row → **grid**
     /// → tab-bar (`ui_design.md §3`). `None` in the standalone Phase-9 demo/tests; the Phase-11
@@ -392,6 +491,8 @@ impl ChromeView {
         let color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
         let text_color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
         let border_color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
+        let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("Replace with"));
 
         // Installed font families for the dropdown, fetched once (`all_font_names` is verified
         // available). "Default (Inter)" is prepended as the clear-the-override entry.
@@ -407,6 +508,19 @@ impl ChromeView {
         names.dedup();
         let font_names = Rc::new(names);
 
+        // The data-row edit keys (Tab and — in quick-edit — the unmodified arrows) must be seen
+        // *before* the gpui-component single-line `Input` acts on them. That `Input` binds
+        // Left/Right to caret actions (`MoveLeft`/`MoveRight`) via the keymap; in this gpui build,
+        // action bindings dispatch *before* any `capture_key_down`/`on_key_down` listener and stop
+        // propagation once handled, so an ancestor capture listener can never preempt the input's
+        // Left/Right (Up/Down happen to be unbound in single-line mode, which is the only reason
+        // they used to work). A keystroke *interceptor* is the one phase that runs before the
+        // input's action bindings, and `stop_propagation` inside it prevents that action dispatch
+        // (`feature-gaps-7-11/DECISIONS_TO_REVIEW.md`). It is guarded to this view's focused
+        // data-row input, so it never touches other inputs or the in-cell overlay, and it delegates
+        // to the same [`handle_data_row_edit_key`](Self::handle_data_row_edit_key) the direct-call
+        // unit tests exercise.
+        let weak = cx.weak_entity();
         let subscriptions = vec![
             cx.subscribe_in(&content_input, window, Self::on_content_event),
             cx.subscribe_in(&in_cell_input, window, Self::on_incell_event),
@@ -421,6 +535,35 @@ impl ChromeView {
             cx.subscribe_in(&chart_title_input, window, Self::on_chart_title_event),
             cx.subscribe_in(&chart_cat_axis_input, window, Self::on_chart_cat_axis_event),
             cx.subscribe_in(&chart_val_axis_input, window, Self::on_chart_val_axis_event),
+            cx.subscribe_in(&find_input, window, Self::on_find_input_event),
+            cx.subscribe_in(&replace_input, window, Self::on_replace_input_event),
+            cx.intercept_keystrokes(move |event, window, cx| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    // Only when this view's data-row input is the focused editor — never the
+                    // in-cell overlay (its own input) or an unrelated field.
+                    let focused = this
+                        .content_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window);
+                    if !focused {
+                        return;
+                    }
+                    let keystroke = &event.keystroke;
+                    if this.handle_data_row_edit_key(
+                        keystroke.key.as_str(),
+                        keystroke.modifiers,
+                        window,
+                        cx,
+                    ) {
+                        // Suppress the input's competing caret action for this keystroke.
+                        cx.stop_propagation();
+                    }
+                });
+            }),
         ];
 
         Self {
@@ -439,6 +582,7 @@ impl ChromeView {
             content_input,
             edit: EditController::new(in_cell_input),
             edit_state_shown: false,
+            quick_edit: false,
             committed_cell: None,
             cap_error_external: None,
             eval: EvalIndicator::default(),
@@ -468,6 +612,17 @@ impl ChromeView {
             rename_error: false,
             context_menu: None,
             confirm_delete: None,
+            tab_drag: None,
+            tab_spans: Vec::new(),
+            find_open: false,
+            find_input,
+            replace_input,
+            match_case: false,
+            whole_cell: false,
+            matches: Vec::new(),
+            match_idx: None,
+            pending_replace_all: false,
+            replaced_notice: None,
             body: None,
             _subscriptions: subscriptions,
         }
@@ -571,9 +726,11 @@ impl ChromeView {
         self.apply_data_effects(effects, window, cx);
         let committed = self.data_row.mode() != FieldMode::Editing;
         self.note_commit(was_editing);
-        // A committed (or absent) edit closes the overlay; a cap-rejected one stays open + editing.
+        // A committed (or absent) edit closes the overlay + leaves quick-edit; a cap-rejected one
+        // stays open + editing.
         if committed {
             self.edit.close();
+            self.quick_edit = false;
         }
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
@@ -591,6 +748,7 @@ impl ChromeView {
         self.mirror_to_in_cell(window, cx);
         self.apply_data_effects(effects, window, cx);
         self.edit.close();
+        self.quick_edit = false;
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -613,6 +771,9 @@ impl ChromeView {
         self.edit.close();
         self.edit.set_origin(EditOrigin::DataRow);
         self.cap_error_external = None;
+        // Type-to-replace is the sole entry into quick-edit (`functional_spec.md §5.1`): an
+        // unmodified arrow now commits + moves the active cell instead of the caret.
+        self.quick_edit = true;
         // Force Editing with the typed char (supersedes any pending fetch / disabled multi state).
         let effects = self.data_row.reduce(DataRowEvent::Edited {
             text: text.to_string(),
@@ -640,6 +801,9 @@ impl ChromeView {
             return;
         }
         self.cap_error_external = None;
+        // The in-cell editor (double-click / F2) is never quick-edit — arrows control the caret
+        // (`functional_spec.md §5.1`), even if this promotes an in-progress type-to-replace.
+        self.quick_edit = false;
         // Enter Editing seeded with the committed raw content, unless already editing this cell
         // (F2 mid-edit keeps the pending text) or the fetch for THIS cell hasn't landed yet. The
         // reducer keeps a previous cell's `committed` across a single→single selection change, so
@@ -714,9 +878,11 @@ impl ChromeView {
         }
         self.apply_data_effects(effects, window, cx);
         self.note_commit(was_editing);
-        // A successful commit ends the edit → close the overlay; a cap-rejected one stays open.
+        // A successful commit ends the edit → close the overlay + leave quick-edit; a cap-rejected
+        // one stays open (and stays in quick-edit so a re-arrow retries the commit).
         if self.data_row.mode() != FieldMode::Editing {
             self.edit.close();
+            self.quick_edit = false;
         }
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
@@ -731,6 +897,78 @@ impl ChromeView {
     fn note_commit(&mut self, was_editing: bool) {
         if was_editing && self.data_row.mode() != FieldMode::Editing {
             self.committed_cell = Some((self.active_sheet, self.selection.active));
+        }
+    }
+
+    /// A caret-intent signal ended quick-edit (`functional_spec.md §5.3`): a mouse-down in the
+    /// field, Home/End, or a modified arrow. For the remainder of this edit, arrows control the text
+    /// caret, not the active cell. Idempotent; re-pushes the grid's edit state so its copy tracks.
+    fn leave_quick_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.quick_edit {
+            return;
+        }
+        self.quick_edit = false;
+        self.refresh_edit_grid_state(window, cx);
+    }
+
+    /// The data-row edit-key handler for a live edit (`functional_spec.md §5.2–5.3`), factored out
+    /// so it is unit-testable without routing a keystroke through the nested input. Driven by the
+    /// keystroke interceptor registered in [`ChromeView::new`] (which sees the key before the
+    /// gpui-component `Input`'s caret action bindings). Returns whether the key was **consumed**
+    /// (the caller must then `stop_propagation` so the input doesn't also act on it); `false` lets
+    /// the key fall through to the input (caret op).
+    ///
+    /// - Tab / Shift+Tab always commit + move right / left (unchanged, quick-edit or not).
+    /// - In quick-edit, an **unmodified** arrow commits + moves the active cell in that direction.
+    /// - A caret-intent modified arrow (Shift/Cmd/Ctrl/Alt — see [`caret_intent_modifiers`]) or
+    ///   Home/End signals caret intent: it leaves quick-edit and falls through to the caret, and
+    ///   (for a modified arrow) does **not** move the active cell.
+    fn handle_data_row_edit_key(
+        &mut self,
+        key: &str,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.data_mode() != FieldMode::Editing {
+            return false;
+        }
+        if key == "tab" {
+            let dir = if modifiers.shift {
+                Direction::Left
+            } else {
+                Direction::Right
+            };
+            self.commit_and_move(dir, window, cx);
+            return true;
+        }
+        if !self.quick_edit {
+            return false;
+        }
+        match key {
+            "left" | "right" | "up" | "down" => {
+                if caret_intent_modifiers(&modifiers) {
+                    // Modified arrow = caret/selection op: leave quick-edit, do NOT move the active
+                    // cell, and let the key reach the input.
+                    self.leave_quick_edit(window, cx);
+                    false
+                } else {
+                    let dir = match key {
+                        "left" => Direction::Left,
+                        "right" => Direction::Right,
+                        "up" => Direction::Up,
+                        _ => Direction::Down,
+                    };
+                    self.commit_and_move(dir, window, cx);
+                    true
+                }
+            }
+            "home" | "end" => {
+                // Explicit caret positioning: leave quick-edit; the input moves the caret.
+                self.leave_quick_edit(window, cx);
+                false
+            }
+            _ => false,
         }
     }
 
@@ -813,6 +1051,9 @@ impl ChromeView {
             .then(|| self.cap_error_message())
             .flatten()
             .map(SharedString::from);
+        // Quick-edit is meaningful only while the edit is live; gate on `editing` so the grid's copy
+        // auto-clears the instant the edit ends (`functional_spec.md §5`).
+        let quick_edit = editing && self.quick_edit;
         let nonempty = mirror.is_some() || in_cell.is_some();
         // Skip an all-`None` clear when nothing was shown (idle selection moves would otherwise
         // re-push every keystroke); always push when something is/was shown so the clear lands.
@@ -825,6 +1066,7 @@ impl ChromeView {
                 mirror,
                 in_cell,
                 cap,
+                quick_edit,
             },
             window,
             cx,
@@ -882,6 +1124,25 @@ impl ChromeView {
                 reason: EditRejectedReason::InputCap(rejection),
             } => {
                 self.cap_error_external = Some(rejection);
+                cx.notify();
+            }
+            // Only honor results while the bar is open (a late reply after close is dropped).
+            WorkerEvent::FindResults { matches } if self.find_open => {
+                self.matches = matches;
+                self.match_idx = self.first_match_from_selection();
+                self.select_current_match(window, cx);
+                cx.notify();
+            }
+            WorkerEvent::ReplacedCount { n } => {
+                if self.pending_replace_all {
+                    self.pending_replace_all = false;
+                    self.replaced_notice = Some(n);
+                }
+                // Re-scan so the match set + counter reflect the post-replace state and the cursor
+                // advances past a (now-changed) cell (`functional_spec.md §4.4`).
+                if self.find_open {
+                    self.recompute_matches(cx);
+                }
                 cx.notify();
             }
             // Published/Saved/SaveFailed/StyleCacheUpdated/other EditRejected reasons /
@@ -1838,7 +2099,15 @@ impl ChromeView {
     pub fn set_sheets(&mut self, sheets: Vec<SheetTab>, active: SheetId, cx: &mut Context<Self>) {
         self.sheets = sheets;
         self.active_sheet = active;
+        self.prune_tab_spans();
         cx.notify();
+    }
+
+    /// Drops captured tab spans for sheets that no longer exist (deleted / reloaded), so the
+    /// insertion geometry never reads a stale slot. Survivors are re-measured on the next paint.
+    fn prune_tab_spans(&mut self) {
+        self.tab_spans
+            .retain(|span| self.sheets.iter().any(|t| t.id == span.sheet));
     }
 
     /// Merges a worker sheet-meta list into the tab mirror. `has_content` is now sourced
@@ -1858,6 +2127,7 @@ impl ChromeView {
                 self.active_sheet = first.id;
             }
         }
+        self.prune_tab_spans();
     }
 
     /// Adopts `id` as the active sheet because the *window* (not a tab click) switched it — the
@@ -1877,6 +2147,8 @@ impl ChromeView {
         // sheet-qualified, so this is belt-and-braces against a cross-sheet stale seed).
         self.committed_cell = None;
         self.context_menu = None;
+        // An open find bar re-scopes to the new sheet (`functional_spec.md §4.5`).
+        self.rescope_find_if_open(cx);
         self.refresh_active_style(cx);
     }
 
@@ -1888,6 +2160,8 @@ impl ChromeView {
         self.active_sheet = id;
         self.committed_cell = None;
         self.context_menu = None;
+        // An open find bar re-scopes to the new sheet (`functional_spec.md §4.5`).
+        self.rescope_find_if_open(cx);
         self.grid
             .emit(ChromeGridRequest::SetActiveSheet(id), window, cx);
         cx.notify();
@@ -1896,6 +2170,110 @@ impl ChromeView {
     /// Adds a sheet (the worker names it and republishes; the UI switches on `SheetsChanged`).
     pub fn add_sheet(&self) {
         self.client.send(Command::AddSheet);
+    }
+
+    // ---- Sheet-tab reorder drag (`functional_spec.md §6`, `ui_design.md §3`) ---------------
+
+    /// Records a *potential* tab reorder drag on mouse-down at window `x` (no movement yet). A
+    /// plain click / double-click never crosses the threshold, so this stays a no-op until then.
+    fn tab_press(&mut self, sheet: SheetId, x: f32) {
+        self.tab_drag = Some(TabDrag {
+            sheet,
+            start_x: x,
+            cur_x: x,
+            dragging: false,
+        });
+    }
+
+    /// Advances a live tab drag to window `x`; crosses into `dragging` past the threshold, at which
+    /// point the lift + drop indicator repaint. No-op when no press is pending.
+    fn tab_drag_move(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag.as_mut() else {
+            return;
+        };
+        drag.cur_x = x;
+        if !drag.dragging && (x - drag.start_x).abs() > TAB_DRAG_THRESHOLD_PX {
+            drag.dragging = true;
+        }
+        if drag.dragging {
+            cx.notify();
+        }
+    }
+
+    /// Ends a tab drag at window `x`: a real drag to a new slot sends `MoveSheet`; a sub-threshold
+    /// press (a click) or a drop back on the origin slot sends nothing (the click-select path fires
+    /// separately). Always clears the drag state.
+    fn tab_drag_end(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag.take() else {
+            return;
+        };
+        if drag.dragging {
+            if let Some(to_index) = self.tab_move_target(drag.sheet, x) {
+                self.client.send(Command::MoveSheet {
+                    sheet: drag.sheet,
+                    to_index,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// The current tabs' captured centers (window x), in `self.sheets` slot order. Empty unless
+    /// every tab has a captured span — the caller treats an incomplete capture as "geometry not
+    /// ready" and skips the move.
+    fn ordered_tab_centers(&self) -> Vec<f32> {
+        self.sheets
+            .iter()
+            .filter_map(|t| self.tab_spans.iter().find(|s| s.sheet == t.id))
+            .map(|s| (s.left + s.right) / 2.0)
+            .collect()
+    }
+
+    /// The fork `to_index` a drop at window `cursor_x` maps to for the dragged `sheet`, or `None`
+    /// for a no-op (drop on the origin slot) or when the tab geometry is not fully captured yet.
+    fn tab_move_target(&self, sheet: SheetId, cursor_x: f32) -> Option<u32> {
+        let centers = self.ordered_tab_centers();
+        if centers.len() != self.sheets.len() {
+            return None; // some tab hasn't been measured — don't guess a reorder
+        }
+        let from_slot = self.sheets.iter().position(|t| t.id == sheet)?;
+        let gap = tab_insertion_index(cursor_x, &centers);
+        move_target_for_gap(gap, from_slot).map(|to| to as u32)
+    }
+
+    /// The window-x at which to paint the 2 px drop indicator for the live drag, or `None` when
+    /// not dragging / the geometry is not fully captured. Snaps to the midpoint of the neighboring
+    /// tab edges (outer edges offset by half the inter-tab gap).
+    fn tab_drop_indicator_x(&self) -> Option<f32> {
+        let drag = self.tab_drag?;
+        if !drag.dragging {
+            return None;
+        }
+        let spans: Vec<(f32, f32)> = self
+            .sheets
+            .iter()
+            .filter_map(|t| self.tab_spans.iter().find(|s| s.sheet == t.id))
+            .map(|s| (s.left, s.right))
+            .collect();
+        if spans.is_empty() || spans.len() != self.sheets.len() {
+            return None;
+        }
+        let centers: Vec<f32> = spans.iter().map(|(l, r)| (l + r) / 2.0).collect();
+        let gap = tab_insertion_index(drag.cur_x, &centers);
+        let n = spans.len();
+        let x = if gap == 0 {
+            spans[0].0 - TAB_GAP_HALF
+        } else if gap >= n {
+            spans[n - 1].1 + TAB_GAP_HALF
+        } else {
+            (spans[gap - 1].1 + spans[gap].0) / 2.0
+        };
+        Some(x)
+    }
+
+    /// Whether a tab reorder drag has crossed the threshold (drives the lift + cursor + indicator).
+    fn tab_drag_active(&self) -> bool {
+        self.tab_drag.is_some_and(|d| d.dragging)
     }
 
     /// Starts an inline rename of `id`, seeding + focusing the rename input.
@@ -2310,6 +2688,22 @@ fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
     icon.into_any_element()
 }
 
+/// The shared **close / dismiss** button for the chrome's overlay surfaces (the find bar, the chart
+/// edit panel — `functional_spec.md §4`, `ui_design.md §3`). A ghost, `small` icon button rendering
+/// the bundled Lucide "x" ([`IconName::Close`] → `icons/close.svg`, resolved from the gpui-component
+/// icon bundle), so every dismiss affordance is visually identical instead of an ad-hoc `×` text
+/// glyph. Returns the `Button` so each call site chains its own `tooltip` / `debug_selector`.
+fn close_button(
+    id: impl Into<ElementId>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    Button::new(id)
+        .icon(IconName::Close)
+        .ghost()
+        .small()
+        .on_click(on_click)
+}
+
 /// A borders **line-style preview** (`ui_design.md §2.3`): a short horizontal sample of the real
 /// line, vertically centered in a ~34px box. Solid weights are one dark bar (1/2/3px); dashed is a
 /// row of short dark dashes; double is two 1px dark bars with a gap.
@@ -2379,6 +2773,9 @@ impl Render for ChromeView {
             .when(self.body.is_some(), |d| d.flex_1().min_h_0())
             .child(self.render_action_row(cx))
             .child(self.render_data_row(cx))
+            // The find/replace bar sits directly below the data row and above the grid, pushing the
+            // grid down when open (`functional_spec.md §4.1`, `ui_design.md §1`).
+            .children(self.find_open.then(|| self.render_find_bar(cx)))
             // The grid body fills the space between the data row and the tab bar
             // (`ui_design.md §3`: action → data → grid → tabs).
             .when_some(self.body.clone(), |d, body| {
@@ -2737,6 +3134,23 @@ impl ChromeView {
                     cx,
                 ),
             )
+            .child(action_divider())
+            // Find & Replace trigger (`ui_design.md §2`): toggles the find bar; `selected` (accent)
+            // while it is open, so it reads as a toggle. `icons/search.svg` resolves from the
+            // gpui-component bundle (the magnifier the bundle already ships + tints).
+            .child(
+                // Find is a *read* — it stays available in degraded/read-only mode (only the bar's
+                // Replace / Replace All are gated on `degraded`).
+                Button::new("find")
+                    .icon(Icon::empty().path("icons/search.svg"))
+                    .tooltip("Find & Replace (⌘F)")
+                    .ghost()
+                    .small()
+                    .selected(self.find_open)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.toggle_find(window, cx);
+                    })),
+            )
             // Right-aligned evaluating spinner (`ui_design.md §3.1`).
             .child(div().flex_1())
             .when(self.eval.spinner(), |row| row.child(Spinner::new().small()))
@@ -2777,20 +3191,14 @@ impl ChromeView {
                     this.escape_edit(window, cx);
                 }
             }))
-            // Tab / Shift+Tab commit + move right/left (`functional_spec.md §1.4`). Captured
-            // **before** the input consumes the key (the bare gpui-component Input emits no commit
-            // on Tab — `components/edit_controller.md §Tab interception`).
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "tab" && this.data_mode() == FieldMode::Editing {
-                    cx.stop_propagation();
-                    let dir = if event.keystroke.modifiers.shift {
-                        Direction::Left
-                    } else {
-                        Direction::Right
-                    };
-                    this.commit_and_move(dir, window, cx);
-                }
-            }))
+            // Tab / Shift+Tab commit + move right/left (`functional_spec.md §1.4`), and — in
+            // quick-edit — the unmodified arrows commit + move the active cell while Home/End or a
+            // modified arrow leave quick-edit (`functional_spec.md §5.2–5.3`). These are handled by
+            // the keystroke interceptor registered in [`ChromeView::new`], NOT a `capture_key_down`
+            // here: the gpui-component `Input` binds Left/Right to caret actions that dispatch
+            // before any key-down listener and stop propagation, so only an interceptor (which runs
+            // before action bindings) can preempt them (`components/edit_controller.md §Tab
+            // interception`; `feature-gaps-7-11/DECISIONS_TO_REVIEW.md`).
             // Ref box: read-only A1 address.
             .child(
                 div()
@@ -2814,6 +3222,16 @@ impl ChromeView {
                 div()
                     .flex_1()
                     .debug_selector(|| "data-content-field".into())
+                    // Clicking to place the caret in the field ends quick-edit (`functional_spec.md
+                    // §5.3`): arrows then move the caret, not the active cell. The gpui-component
+                    // `Input` does not `stop_propagation` on mouse-down, so this bubble-phase
+                    // listener still fires on a click into the field.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.leave_quick_edit(window, cx);
+                        }),
+                    )
                     .when(cap_error, |d| {
                         d.border_1().border_color(rgb(DANGER)).rounded_md()
                     })
@@ -2821,8 +3239,410 @@ impl ChromeView {
             )
     }
 
+    /// The find/replace bar (`functional_spec.md §4.1`, `ui_design.md §1`) — rendered directly below
+    /// the data row while [`find_open`](Self::find_open). Left→right: find field · replace field ·
+    /// match-case + match-entire-cell toggles · divider · prev/next · counter · spacer · Replace +
+    /// Replace All · dismiss. Escape (on the bar) closes it (mirrors the data row's Escape).
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_matches = !self.matches.is_empty();
+        let has_current = self.match_idx.is_some();
+        let can_replace = has_current && !self.degraded;
+        let can_replace_all = has_matches && !self.degraded;
+
+        // Counter (`ui_design.md §1`): a Replace All notice wins; else empty for an empty find field,
+        // "No results" (muted) for a non-empty query with no matches, else "N of M".
+        let find_query = self.find_input.read(cx).value().to_string();
+        let (counter_text, counter_muted) = if let Some(n) = self.replaced_notice {
+            (format!("Replaced {n}"), true)
+        } else if find_query.is_empty() {
+            (String::new(), false)
+        } else if !has_matches {
+            ("No results".to_string(), true)
+        } else {
+            let pos = self.match_idx.map(|i| i + 1).unwrap_or(0);
+            (format!("{pos} of {}", self.matches.len()), false)
+        };
+
+        // A small ghost toggle (`Aa` / match-entire-cell), pressed = on.
+        let toggle =
+            |id: &'static str,
+             label: &'static str,
+             tooltip: &'static str,
+             on: bool,
+             cx: &mut Context<Self>,
+             handler: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+                Button::new(id)
+                    .label(label)
+                    .tooltip(tooltip)
+                    .ghost()
+                    .small()
+                    .selected(on)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        handler(this, window, cx);
+                    }))
+            };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .w_full()
+            .h(px(DATA_ROW_H))
+            .px_2()
+            .bg(rgb(CHROME_BG))
+            .border_b_1()
+            .border_color(rgb(HAIRLINE))
+            .debug_selector(|| "find-bar".into())
+            // Escape closes the bar and returns focus to the grid (`functional_spec.md §4.2`), the
+            // same idiom as the data row's Escape.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close_find(window, cx);
+                }
+            }))
+            .child(
+                div()
+                    .w(px(FIND_FIELD_W))
+                    .child(Input::new(&self.find_input).small()),
+            )
+            .child(
+                div()
+                    .w(px(FIND_FIELD_W))
+                    .child(Input::new(&self.replace_input).small()),
+            )
+            .child(toggle(
+                "find-match-case",
+                "Aa",
+                "Match case",
+                self.match_case,
+                cx,
+                Self::toggle_match_case,
+            ))
+            .child(toggle(
+                "find-whole-cell",
+                "Whole cell",
+                "Match entire cell",
+                self.whole_cell,
+                cx,
+                Self::toggle_whole_cell,
+            ))
+            .child(action_divider())
+            .child(
+                Button::new("find-prev")
+                    .icon(Icon::empty().path("icons/chevron-up.svg"))
+                    .tooltip("Previous match (⇧⏎)")
+                    .ghost()
+                    .small()
+                    .disabled(!has_matches)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.prev_match(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("find-next")
+                    .icon(Icon::empty().path("icons/chevron-down.svg"))
+                    .tooltip("Next match (⏎)")
+                    .ghost()
+                    .small()
+                    .disabled(!has_matches)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.next_match(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .min_w(px(FIND_COUNTER_MIN_W))
+                    .text_size(px(13.0))
+                    .text_color(rgb(if counter_muted {
+                        FIND_COUNTER_MUTED
+                    } else {
+                        TEXT
+                    }))
+                    .child(counter_text),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("find-replace")
+                    .label("Replace")
+                    .tooltip("Replace this match")
+                    .ghost()
+                    .small()
+                    .disabled(!can_replace)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.replace_current(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("find-replace-all")
+                    .label("Replace All")
+                    .tooltip("Replace every match")
+                    .ghost()
+                    .small()
+                    .disabled(!can_replace_all)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.replace_all(window, cx);
+                    })),
+            )
+            .child(
+                close_button(
+                    "find-close",
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.close_find(window, cx);
+                    }),
+                )
+                .tooltip("Close (Esc)"),
+            )
+    }
+
+    // ---- Find / replace behavior (`functional_spec.md §4`) --------------------------------
+
+    /// Toggle the find bar open/closed (⌘F, Esc, or the action-row search button).
+    pub fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_open {
+            self.close_find(window, cx);
+        } else {
+            self.open_find(window, cx);
+        }
+    }
+
+    /// Open the bar and focus the find field, retaining any prior find/replace text
+    /// (`functional_spec.md §4.2`). A recompute picks up retained text so the counter is live on open.
+    /// Existing find text is **selected** on open (`§4.2`) by dispatching gpui-component's `SelectAll`
+    /// to the field's focus handle **after the next paint** (`on_next_frame`) — the field must be in
+    /// the rendered dispatch tree for the action to reach it (a `defer` runs before the repaint, so it
+    /// would fizzle on a freshly-opened bar).
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = true;
+        self.replaced_notice = None;
+        self.find_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        if !self.find_query(cx).is_empty() {
+            let handle = self.find_input.read(cx).focus_handle(cx);
+            window.on_next_frame(move |window, cx| {
+                handle.dispatch_action(&gpui_component::input::SelectAll, window, cx);
+            });
+        }
+        self.recompute_matches(cx);
+        cx.notify();
+    }
+
+    /// Close the bar, clear the transient match state, and return focus to the grid; the
+    /// find/replace **text** is retained for the next open (`functional_spec.md §4.2`).
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        self.find_open = false;
+        self.matches.clear();
+        self.match_idx = None;
+        self.replaced_notice = None;
+        self.pending_replace_all = false;
+        self.grid.emit(ChromeGridRequest::FocusGrid, window, cx);
+        cx.notify();
+    }
+
+    /// Whether the find bar is open (window action-handler / tests).
+    pub fn find_is_open(&self) -> bool {
+        self.find_open
+    }
+
+    /// The current find-field text.
+    fn find_query(&self, cx: &Context<Self>) -> String {
+        self.find_input.read(cx).value().to_string()
+    }
+
+    /// Send a `Find` for the current query + toggles (results arrive via `FindResults`). An empty
+    /// query clears the local match state (no worker round-trip).
+    fn recompute_matches(&mut self, cx: &mut Context<Self>) {
+        let query = self.find_query(cx);
+        if query.is_empty() {
+            self.matches.clear();
+            self.match_idx = None;
+            cx.notify();
+            return;
+        }
+        self.client.send(Command::Find {
+            sheet: self.active_sheet,
+            query,
+            match_case: self.match_case,
+            whole_cell: self.whole_cell,
+        });
+    }
+
+    /// Re-scope an **open** find bar to the (already-updated) active sheet: reset the match cursor and
+    /// re-send `Find` for the new sheet (`functional_spec.md §4.5`). Called from the sheet-switch
+    /// entry points after `active_sheet` changes.
+    fn rescope_find_if_open(&mut self, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        self.match_idx = None;
+        self.matches.clear();
+        self.replaced_notice = None;
+        self.recompute_matches(cx);
+    }
+
+    /// The `CellRef` of the current match, if any.
+    fn current_match_cell(&self) -> Option<CellRef> {
+        self.match_idx.and_then(|i| self.matches.get(i).copied())
+    }
+
+    /// The index of the first match at or after the current selection (row-major), wrapping to the
+    /// first match — so opening / recomputing lands on the nearest match ahead of the cursor.
+    fn first_match_from_selection(&self) -> Option<usize> {
+        if self.matches.is_empty() {
+            return None;
+        }
+        let key = (self.selection.active.row, self.selection.active.col);
+        let idx = self
+            .matches
+            .iter()
+            .position(|c| (c.row, c.col) >= key)
+            .unwrap_or(0);
+        Some(idx)
+    }
+
+    /// Advance to the next match, wrapping around (`functional_spec.md §4.3`).
+    fn next_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.replaced_notice = None;
+        let n = self.matches.len();
+        let i = self.match_idx.map(|i| (i + 1) % n).unwrap_or(0);
+        self.match_idx = Some(i);
+        self.select_current_match(window, cx);
+        cx.notify();
+    }
+
+    /// Retreat to the previous match, wrapping around (`functional_spec.md §4.3`).
+    fn prev_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.replaced_notice = None;
+        let n = self.matches.len();
+        let i = self.match_idx.map(|i| (i + n - 1) % n).unwrap_or(n - 1);
+        self.match_idx = Some(i);
+        self.select_current_match(window, cx);
+        cx.notify();
+    }
+
+    /// Select + scroll the current match into view (the find field keeps focus).
+    fn select_current_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cell) = self.current_match_cell() {
+            self.grid
+                .emit(ChromeGridRequest::SelectAndReveal(cell), window, cx);
+        }
+    }
+
+    /// Toggle match-case and recompute matches.
+    fn toggle_match_case(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.match_case = !self.match_case;
+        self.replaced_notice = None;
+        self.recompute_matches(cx);
+        cx.notify();
+    }
+
+    /// Toggle match-entire-cell and recompute matches.
+    fn toggle_whole_cell(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.whole_cell = !self.whole_cell;
+        self.replaced_notice = None;
+        self.recompute_matches(cx);
+        cx.notify();
+    }
+
+    /// Replace the current match (`Command::ReplaceOne`, `functional_spec.md §4.4`): the worker
+    /// recomputes the replacement from fresh content and commits it; a follow-up `ReplacedCount`
+    /// re-runs `Find` so the cursor advances past the (now-changed) cell.
+    fn replace_current(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.degraded {
+            return;
+        }
+        let Some(cell) = self.current_match_cell() else {
+            return;
+        };
+        let query = self.find_query(cx);
+        if query.is_empty() {
+            return;
+        }
+        let replacement = self.replace_input.read(cx).value().to_string();
+        self.client.send(Command::ReplaceOne {
+            sheet: self.active_sheet,
+            cell,
+            query,
+            replacement,
+            match_case: self.match_case,
+            whole_cell: self.whole_cell,
+        });
+    }
+
+    /// Replace every match (`Command::ReplaceAll`, `functional_spec.md §4.4`); the `ReplacedCount`
+    /// reply shows "Replaced N" and re-runs `Find`.
+    fn replace_all(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.degraded || self.matches.is_empty() {
+            return;
+        }
+        let query = self.find_query(cx);
+        if query.is_empty() {
+            return;
+        }
+        let replacement = self.replace_input.read(cx).value().to_string();
+        self.pending_replace_all = true;
+        self.client.send(Command::ReplaceAll {
+            sheet: self.active_sheet,
+            query,
+            replacement,
+            match_case: self.match_case,
+            whole_cell: self.whole_cell,
+        });
+    }
+
+    /// The find field emitted an event: typing recomputes matches; Enter / Shift+Enter step
+    /// next / prev (`ui_design.md §1`).
+    fn on_find_input_event(
+        &mut self,
+        _input: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Change => {
+                self.replaced_notice = None;
+                self.recompute_matches(cx);
+                cx.notify();
+            }
+            InputEvent::PressEnter { shift, .. } => {
+                if *shift {
+                    self.prev_match(window, cx);
+                } else {
+                    self.next_match(window, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The replace field emitted an event: Enter replaces the current match.
+    fn on_replace_input_event(
+        &mut self,
+        _input: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputEvent::PressEnter { .. } = event {
+            self.replace_current(window, cx);
+        }
+    }
+
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dragging = self.tab_drag_active();
         let mut row = div()
+            // `relative` so the drop indicator (an absolute child, positioned in window x — the
+            // tab bar's origin x is 0) lands in the right gap.
+            .relative()
             .flex()
             .items_center()
             .gap_1()
@@ -2831,13 +3651,28 @@ impl ChromeView {
             .px_2()
             .bg(rgb(CHROME_BG))
             .border_t_1()
-            .border_color(rgb(HAIRLINE));
+            .border_color(rgb(HAIRLINE))
+            // The move / up handlers live on the full-width container, not the individual tabs: a
+            // per-tab `on_mouse_move` only fires while *that* tab is hovered, so it would go dead
+            // the instant the pointer crossed onto a neighbor mid-drag. The container spans the
+            // whole strip, so it tracks the drag across tabs and the release anywhere in the bar.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                this.tab_drag_move(f32::from(event.position.x), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.tab_drag_end(f32::from(event.position.x), cx);
+                }),
+            )
+            // `grabbing` while a reorder drag is live (`ui_design.md §6`).
+            .when(dragging, |d| d.cursor(CursorStyle::ClosedHand));
 
         for tab in &self.sheets {
             row = row.child(self.render_tab(tab, cx));
         }
 
-        row.child(
+        row = row.child(
             Button::new("add-sheet")
                 .label("+")
                 .tooltip("New sheet")
@@ -2847,7 +3682,22 @@ impl ChromeView {
                     this.add_sheet();
                     cx.notify();
                 })),
-        )
+        );
+
+        // The 2 px accent drop indicator at the insertion gap while dragging (`ui_design.md §3`).
+        if let Some(x) = self.tab_drop_indicator_x() {
+            row = row.child(
+                div()
+                    .absolute()
+                    .left(px(x - 1.0))
+                    .top_0()
+                    .h_full()
+                    .w(px(2.0))
+                    .bg(rgb(TAB_DROP_ACCENT)),
+            );
+        }
+
+        row
     }
 
     fn render_tab(&self, tab: &SheetTab, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2865,23 +3715,64 @@ impl ChromeView {
                 .into_any_element();
         }
 
+        // The dragged tab lifts while a reorder drag is live on it (`ui_design.md §3`): stronger
+        // bg, a 1 px accent outline, ~90 % opacity.
+        let lifted = self.tab_drag.is_some_and(|d| d.dragging && d.sheet == id);
+        // A per-tab zero-cost `canvas` probe records the tab's window-space span into `tab_spans`
+        // each paint — the geometry the pure insertion computation reads. No `notify` (the value
+        // is consumed on the next mouse event, not this frame), so it never render-loops.
+        let probe = cx.entity().downgrade();
+        let span_probe = canvas(
+            move |bounds, _window, app| {
+                probe
+                    .update(app, |this, _cx| {
+                        let left = f32::from(bounds.origin.x);
+                        let right = left + f32::from(bounds.size.width);
+                        if let Some(span) = this.tab_spans.iter_mut().find(|s| s.sheet == id) {
+                            span.left = left;
+                            span.right = right;
+                        } else {
+                            this.tab_spans.push(TabSpan {
+                                sheet: id,
+                                left,
+                                right,
+                            });
+                        }
+                    })
+                    .ok();
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
         div()
             .id(gpui::ElementId::Name(format!("tab-{}", id.0).into()))
+            // `relative` so the span probe (`absolute().size_full()`) fills the tab exactly.
+            .relative()
             .px_3()
             .h(px(24.0))
             .flex()
             .items_center()
             .rounded_t_md()
-            .bg(rgb(if is_active { ACTIVE_TAB_BG } else { CHROME_BG }))
+            .bg(rgb(if is_active || lifted {
+                ACTIVE_TAB_BG
+            } else {
+                CHROME_BG
+            }))
             .text_size(px(13.0))
             .text_color(rgb(if is_active { TEXT } else { MUTED_TEXT }))
-            .when(is_active, |d| {
+            .when(is_active && !lifted, |d| {
                 d.border_t_1()
                     .border_l_1()
                     .border_r_1()
                     .border_color(rgb(HAIRLINE))
             })
+            .when(lifted, |d| {
+                d.border_1().border_color(rgb(TAB_DROP_ACCENT)).opacity(0.9)
+            })
             .child(tab.name.clone())
+            .child(span_probe)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
                     this.rename_start(id, window, cx);
@@ -2889,6 +3780,16 @@ impl ChromeView {
                     this.select_sheet(id, window, cx);
                 }
             }))
+            // Record a potential drag; movement past the threshold (tracked on the container) turns
+            // it into a real drag. No `stop_propagation`, so the `on_click` above still forms for a
+            // plain click / double-click (gpui gates that click on releasing over this same tab, so
+            // a real drag — which releases over a different tab — never fires it).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, _cx| {
+                    this.tab_press(id, f32::from(event.position.x));
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -3337,14 +4238,13 @@ impl ChromeView {
                     .child("Edit chart"),
             )
             .child(
-                Button::new("chart-panel-close")
-                    .label("×")
-                    .debug_selector(|| "chart-panel-close".into())
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                close_button(
+                    "chart-panel-close",
+                    cx.listener(|this, _: &ClickEvent, _window, cx| {
                         this.close_chart_panel(cx);
-                    })),
+                    }),
+                )
+                .debug_selector(|| "chart-panel-close".into()),
             );
 
         // The scrollable body sections (the header stays pinned above them, so the × is always
@@ -4185,6 +5085,45 @@ impl ChromeView {
             .update(cx, |input, cx| input.set_value(text, window, cx));
     }
 
+    /// Test seam: simulate typing `text` into the find field (sets the widget text, then delivers
+    /// the `Change` event the subscription would).
+    fn test_find_type(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_input
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+        let handle = self.find_input.clone();
+        self.on_find_input_event(&handle, &InputEvent::Change, window, cx);
+    }
+
+    /// Test seam: set the replace field's text (no event needed — replace reads it on demand).
+    fn test_replace_type(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_input
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+    }
+
+    /// Test seam: simulate pressing Enter (optionally with Shift) in the find field.
+    fn test_find_press_enter(&mut self, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.find_input.clone();
+        self.on_find_input_event(
+            &handle,
+            &InputEvent::PressEnter {
+                secondary: false,
+                shift,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Test seam: the find field's current text.
+    fn find_field_text(&self, cx: &App) -> String {
+        self.find_input.read(cx).value().to_string()
+    }
+
+    /// Test seam: the find field's current selection range (for the select-on-open check).
+    fn find_selection(&self, cx: &App) -> std::ops::Range<usize> {
+        self.find_input.read(cx).selected_range()
+    }
+
     /// Test seam: simulate typing `text` into the in-cell editor (sets the widget text, then
     /// delivers the `Change` event the subscription would).
     fn test_incell_type(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -4253,7 +5192,7 @@ mod tests {
     use freecell_core::input_cap::MAX_INPUT_LEN;
     use freecell_core::{CellRef, SelectionModel};
     use freecell_engine::{BorderPreset, Command, SheetMeta, StyleAttr, WorkerEvent};
-    use gpui::{px, size, TestAppContext};
+    use gpui::{px, size, Modifiers, TestAppContext};
     use gpui_component::Root;
     use std::cell::RefCell;
 
@@ -6714,6 +7653,314 @@ mod tests {
         assert!(!upd(&h, cx, |c, _w, _cx| c.fetch_spinner_visible()));
     }
 
+    // ---- Find / replace bar (`functional_spec.md §4`) -------------------------------------
+
+    /// The find-bar's `Find` commands sent since the last drain.
+    fn find_cmds(client: &RecordingClient) -> Vec<Command> {
+        client
+            .take_commands()
+            .into_iter()
+            .filter(|c| matches!(c, Command::Find { .. }))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn cmd_f_opens_focuses_and_closes_find(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // ⌘F path → toggle_find opens the bar.
+        upd(&h, cx, |c, window, cx| c.toggle_find(window, cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.find_is_open()));
+        // Type retained across close/reopen (`functional_spec.md §4.2`).
+        upd(&h, cx, |c, window, cx| {
+            c.test_find_type("hello", window, cx)
+        });
+        // Close returns focus to the grid and keeps the text.
+        upd(&h, cx, |c, window, cx| c.toggle_find(window, cx));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.find_is_open()));
+        assert!(h
+            .grid_requests
+            .borrow()
+            .iter()
+            .any(|r| matches!(r, ChromeGridRequest::FocusGrid)));
+        upd(&h, cx, |c, window, cx| c.toggle_find(window, cx));
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c.find_field_text(cx)),
+            "hello",
+            "find text is retained for the next open"
+        );
+    }
+
+    #[gpui::test]
+    fn open_find_selects_existing_text(cx: &mut TestAppContext) {
+        // §4.2: opening with retained text selects it. `open_find` schedules a `SelectAll` dispatch to
+        // the focused field on the next paint (the field must be in the rendered dispatch tree first).
+        // The unit-test harness does not auto-draw on notify, so `on_next_frame` can't fire here (it
+        // does in the real event loop); this instead drives the exact same dispatch `open_find` uses
+        // — `SelectAll` on the focused field — and asserts the whole value is selected, verifying the
+        // mechanism the on-open scheduling relies on.
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("foo", window, cx); // caret ends at 3..3
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked(); // paint the open bar so the focused field is in the dispatch tree
+        vcx.dispatch_action(gpui_component::input::SelectAll);
+        let range = h
+            .window
+            .update(&mut vcx, |_root, _window, cx| {
+                h.chrome.read(cx).find_selection(cx)
+            })
+            .unwrap();
+        assert_eq!(
+            range,
+            0..3,
+            "SelectAll on the focused find field selects the whole value"
+        );
+    }
+
+    #[gpui::test]
+    fn typing_in_find_sends_find_command(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.toggle_find(window, cx));
+        h.client.take_commands(); // drop the open-time (empty-query) no-op
+        upd(&h, cx, |c, window, cx| c.test_find_type("abc", window, cx));
+        let cmds = find_cmds(&h.client);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::Find { query, match_case: false, whole_cell: false, .. }] if query == "abc"
+            ),
+            "got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn find_results_set_counter_and_reveal_first(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("x", window, cx);
+        });
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::FindResults {
+                    matches: vec![cell(0, 0), cell(2, 1)],
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.matches.len()), 2);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), Some(0));
+        // The first match (row-major, at/after A1) is selected + revealed.
+        assert!(h
+            .grid_requests
+            .borrow()
+            .iter()
+            .any(|r| matches!(r, ChromeGridRequest::SelectAndReveal(c) if *c == cell(0, 0))));
+    }
+
+    #[gpui::test]
+    fn next_prev_wrap_around(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("x", window, cx);
+            c.on_worker_event(
+                WorkerEvent::FindResults {
+                    matches: vec![cell(0, 0), cell(1, 0)],
+                },
+                window,
+                cx,
+            );
+        });
+        // idx starts at 0; next → 1; next wraps → 0; prev wraps → 1.
+        upd(&h, cx, |c, window, cx| c.next_match(window, cx));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), Some(1));
+        upd(&h, cx, |c, window, cx| c.next_match(window, cx));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), Some(0));
+        upd(&h, cx, |c, window, cx| c.prev_match(window, cx));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), Some(1));
+    }
+
+    #[gpui::test]
+    fn enter_and_shift_enter_step_matches(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("x", window, cx);
+            c.on_worker_event(
+                WorkerEvent::FindResults {
+                    matches: vec![cell(0, 0), cell(1, 0)],
+                },
+                window,
+                cx,
+            );
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.test_find_press_enter(false, window, cx)
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), Some(1));
+        upd(&h, cx, |c, window, cx| {
+            c.test_find_press_enter(true, window, cx)
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), Some(0));
+    }
+
+    #[gpui::test]
+    fn toggles_flip_and_resend_find(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("q", window, cx);
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| c.toggle_match_case(window, cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.match_case));
+        let cmds = find_cmds(&h.client);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::Find {
+                    match_case: true,
+                    ..
+                }]
+            ),
+            "toggling case re-sends Find with the new flag, got {cmds:?}"
+        );
+        upd(&h, cx, |c, window, cx| c.toggle_whole_cell(window, cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.whole_cell));
+        let cmds = find_cmds(&h.client);
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::Find {
+                whole_cell: true,
+                ..
+            }]
+        ));
+    }
+
+    #[gpui::test]
+    fn replace_current_sends_replace_one(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("foo", window, cx);
+            c.test_replace_type("bar", window, cx);
+            c.on_worker_event(
+                WorkerEvent::FindResults {
+                    matches: vec![cell(3, 2)],
+                },
+                window,
+                cx,
+            );
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| c.replace_current(window, cx));
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::ReplaceOne { cell: cc, query, replacement, .. }]
+                    if *cc == cell(3, 2) && query == "foo" && replacement == "bar"
+            ),
+            "got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn replace_all_sends_command_and_shows_count(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("foo", window, cx);
+            c.test_replace_type("bar", window, cx);
+            c.on_worker_event(
+                WorkerEvent::FindResults {
+                    matches: vec![cell(0, 0), cell(1, 0)],
+                },
+                window,
+                cx,
+            );
+        });
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| c.replace_all(window, cx));
+        assert!(
+            h.client
+                .take_commands()
+                .iter()
+                .any(|c| matches!(c, Command::ReplaceAll { query, replacement, .. } if query == "foo" && replacement == "bar")),
+            "Replace All sends a ReplaceAll command"
+        );
+        // The reply shows "Replaced N".
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(WorkerEvent::ReplacedCount { n: 5 }, window, cx)
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.replaced_notice), Some(5));
+    }
+
+    #[gpui::test]
+    fn no_matches_yields_no_current_match(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("zzz", window, cx);
+            c.on_worker_event(WorkerEvent::FindResults { matches: vec![] }, window, cx);
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), None);
+        // Replace / next / prev are inert with no matches.
+        upd(&h, cx, |c, window, cx| c.replace_current(window, cx));
+        upd(&h, cx, |c, window, cx| c.next_match(window, cx));
+        assert!(!h
+            .client
+            .take_commands()
+            .iter()
+            .any(|c| matches!(c, Command::ReplaceOne { .. })));
+    }
+
+    #[gpui::test]
+    fn sheet_switch_rescopes_open_find(cx: &mut TestAppContext) {
+        let h = build(
+            cx,
+            vec![
+                SheetTab::new(SheetId(0), "Sheet1"),
+                SheetTab::new(SheetId(1), "Sheet2"),
+            ],
+            SheetId(0),
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_find(window, cx);
+            c.test_find_type("x", window, cx);
+            c.on_worker_event(
+                WorkerEvent::FindResults {
+                    matches: vec![cell(0, 0), cell(1, 0)],
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.matches.len()), 2);
+        h.client.take_commands();
+        // Switch sheets — the open bar re-scopes: cursor resets + a fresh Find for the new sheet.
+        upd(&h, cx, |c, window, cx| {
+            c.select_sheet(SheetId(1), window, cx)
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.match_idx), None);
+        let cmds = find_cmds(&h.client);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::Find {
+                    sheet: SheetId(1),
+                    ..
+                }]
+            ),
+            "re-scopes Find to the new sheet, got {cmds:?}"
+        );
+    }
+
     // ---- Sheet tab bar --------------------------------------------------------------------
 
     fn two_sheets(cx: &mut TestAppContext) -> Harness {
@@ -6879,6 +8126,161 @@ mod tests {
         assert_eq!(names, vec!["Sheet1".to_string(), "Sheet2".to_string()]);
     }
 
+    // ---- Sheet-tab reorder drag (Phase 6b, `functional_spec.md §6`) ------------------------
+
+    /// Three tabs at slots 0/1/2 with 60 px-wide spans pre-loaded (centers 30/90/150), so the pure
+    /// insertion geometry can be exercised without a paint pass — the unit harness does not paint,
+    /// so the per-tab `canvas` span probes never run in-test.
+    fn three_sheets_with_spans(cx: &mut TestAppContext) -> Harness {
+        let h = build(
+            cx,
+            vec![
+                SheetTab::new(SheetId(0), "S0"),
+                SheetTab::new(SheetId(1), "S1"),
+                SheetTab::new(SheetId(2), "S2"),
+            ],
+            SheetId(0),
+        );
+        upd(&h, cx, |c, _w, _cx| {
+            c.tab_spans = vec![
+                TabSpan {
+                    sheet: SheetId(0),
+                    left: 0.0,
+                    right: 60.0,
+                },
+                TabSpan {
+                    sheet: SheetId(1),
+                    left: 60.0,
+                    right: 120.0,
+                },
+                TabSpan {
+                    sheet: SheetId(2),
+                    left: 120.0,
+                    right: 180.0,
+                },
+            ];
+        });
+        h.client.take_commands(); // drain any setup commands so tests assert only the drag's
+        h
+    }
+
+    #[test]
+    fn tab_insertion_index_maps_cursor_to_gap() {
+        let centers = [30.0, 90.0, 150.0];
+        assert_eq!(
+            tab_insertion_index(10.0, &centers),
+            0,
+            "before every tab → gap 0"
+        );
+        assert_eq!(
+            tab_insertion_index(30.0, &centers),
+            1,
+            "at a center counts it"
+        );
+        assert_eq!(
+            tab_insertion_index(60.0, &centers),
+            1,
+            "between slot 0 and 1 → gap 1"
+        );
+        assert_eq!(tab_insertion_index(100.0, &centers), 2);
+        assert_eq!(
+            tab_insertion_index(200.0, &centers),
+            3,
+            "after every tab → gap n"
+        );
+    }
+
+    #[test]
+    fn move_target_for_gap_handles_noop_and_shift() {
+        // Dragging slot 0: the two gaps bracketing it are no-ops; further gaps shift left by one.
+        assert_eq!(move_target_for_gap(0, 0), None);
+        assert_eq!(move_target_for_gap(1, 0), None);
+        assert_eq!(move_target_for_gap(2, 0), Some(1));
+        assert_eq!(move_target_for_gap(3, 0), Some(2));
+        // Dragging slot 2 leftward.
+        assert_eq!(move_target_for_gap(0, 2), Some(0));
+        assert_eq!(move_target_for_gap(1, 2), Some(1));
+        assert_eq!(move_target_for_gap(2, 2), None);
+        assert_eq!(move_target_for_gap(3, 2), None);
+    }
+
+    #[gpui::test]
+    fn tab_drag_reorders_sends_move(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            // Past the threshold, into the left half of slot 2 (cursor 140 < its center 150), so the
+            // drop inserts BEFORE slot 2 → gap 2 → final index 1 (removing S0 shifts the gap left).
+            c.tab_drag_move(140.0, cx);
+            c.tab_drag_end(140.0, cx);
+        });
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::MoveSheet {
+                    sheet: SheetId(0),
+                    to_index: 1
+                }]
+            ),
+            "a real drop before slot 2 moves S0 to final index 1"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_drag_below_threshold_is_no_command(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            c.tab_drag_move(32.0, cx); // 2 px < threshold → still a click
+            c.tab_drag_end(32.0, cx);
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a sub-threshold press stays a click, sends no MoveSheet"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_drag_to_origin_sends_nothing(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            c.tab_drag_move(36.0, cx); // crosses the threshold but stays over the origin tab
+            c.tab_drag_end(36.0, cx);
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "dropping back on the origin slot is a no-op"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_drag_sets_indicator(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        let (active, indicator) = upd(&h, cx, |c, _w, cx| {
+            c.tab_press(SheetId(0), 30.0);
+            c.tab_drag_move(140.0, cx);
+            (c.tab_drag_active(), c.tab_drop_indicator_x())
+        });
+        assert!(active, "past the threshold the drag is active");
+        assert_eq!(
+            indicator,
+            Some(120.0),
+            "the indicator snaps to the gap between slots 1 and 2"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_move_target_skips_without_geometry(cx: &mut TestAppContext) {
+        let h = three_sheets_with_spans(cx);
+        upd(&h, cx, |c, _w, _cx| c.tab_spans.clear());
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.tab_move_target(SheetId(0), 140.0)),
+            None,
+            "an unmeasured tab strip never guesses a reorder"
+        );
+    }
+
     #[gpui::test]
     fn worker_input_cap_reject_flags_error(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
@@ -6923,7 +8325,16 @@ mod tests {
                 mirror,
                 in_cell,
                 cap,
+                ..
             } => Some((mirror.clone(), *in_cell, cap.clone())),
+            _ => None,
+        })
+    }
+
+    /// The `quick_edit` flag on the most recent edit-state push (`functional_spec.md §5`).
+    fn last_edit_state_quick(reqs: &[ChromeGridRequest]) -> Option<bool> {
+        reqs.iter().rev().find_map(|r| match r {
+            ChromeGridRequest::EditState { quick_edit, .. } => Some(*quick_edit),
             _ => None,
         })
     }
@@ -7171,6 +8582,471 @@ mod tests {
             r,
             ChromeGridRequest::MoveActive(Motion::Move(Direction::Left))
         )));
+    }
+
+    // ---- Quick-edit mode (`functional_spec.md §5`) ----------------------------------------
+
+    /// No modifiers held (a plain keystroke).
+    fn plain() -> Modifiers {
+        Modifiers::default()
+    }
+
+    #[gpui::test]
+    fn quick_edit_arrow_commits_and_moves(cx: &mut TestAppContext) {
+        // Type-to-replace enters quick-edit; an unmodified arrow commits + moves the active cell.
+        let h = idle_on_a1(cx, "");
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("abcd", window, cx);
+            c.handle_data_row_edit_key("right", plain(), window, cx)
+        });
+        assert!(
+            consumed,
+            "an unmodified arrow in quick-edit must be consumed (commit + move)"
+        );
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "abcd"),
+            "expected SetCellInput \"abcd\", got {cmds:?}"
+        );
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+        // The edit ended — back to normal navigation.
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+    }
+
+    #[gpui::test]
+    fn quick_edit_arrows_move_each_direction(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        for (key, dir) in [
+            ("left", Direction::Left),
+            ("right", Direction::Right),
+            ("up", Direction::Up),
+            ("down", Direction::Down),
+        ] {
+            h.client.take_commands();
+            h.grid_requests.borrow_mut().clear();
+            let consumed = upd(&h, cx, |c, window, cx| {
+                c.begin_typed("v", window, cx);
+                c.handle_data_row_edit_key(key, plain(), window, cx)
+            });
+            assert!(consumed, "arrow {key} must be consumed in quick-edit");
+            assert!(
+                h.grid_requests.borrow().iter().any(|r| matches!(
+                    r,
+                    ChromeGridRequest::MoveActive(Motion::Move(d)) if *d == dir
+                )),
+                "arrow {key} must move the active cell {dir:?}"
+            );
+        }
+    }
+
+    /// Enters quick-edit by focusing the data-row input and typing `text` (the sole quick-edit
+    /// entry, `begin_typed`), then asserts the input actually holds focus — otherwise a
+    /// subsequent keystroke would not route to it and the reproduction would be vacuous.
+    fn enter_quick_edit_focused(h: &Harness, vcx: &mut gpui::VisualTestContext, text: &str) {
+        vcx.update(|window, cx| {
+            h.chrome.update(cx, |c, cx| c.begin_typed(text, window, cx));
+        });
+        vcx.run_until_parked();
+        let focused = vcx.update(|window, cx| {
+            h.chrome
+                .read(cx)
+                .content_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(focused, "quick-edit must focus the data-row input");
+        h.client.take_commands();
+        h.grid_requests.borrow_mut().clear();
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_arrows_commit_and_move(cx: &mut TestAppContext) {
+        // Real-keystroke reproduction of the reported bug (the direct `handle_data_row_edit_key`
+        // unit tests miss it): with the data-row input focused in quick-edit, an ACTUAL unmodified
+        // arrow keystroke must COMMIT the typed text and MOVE the active cell — not move the text
+        // caret. gpui-component's single-line `Input` binds Left/Right to caret actions that
+        // dispatch *before* any key-down listener and stop propagation, so before the keystroke-
+        // interceptor fix a real Left/Right moved the caret and never committed (Up/Down already
+        // worked, being unbound in single-line mode). This drives real keystrokes through gpui
+        // dispatch, so it fails against the pre-fix routing and passes once the interceptor preempts
+        // the input's caret action.
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        for (key, dir) in [
+            ("left", Direction::Left),
+            ("right", Direction::Right),
+            ("up", Direction::Up),
+            ("down", Direction::Down),
+        ] {
+            enter_quick_edit_focused(&h, &mut vcx, "1234");
+            vcx.simulate_keystrokes(key);
+            vcx.run_until_parked();
+            let cmds = h.client.take_commands();
+            assert!(
+                matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "1234"),
+                "a real {key} keystroke in quick-edit must commit \"1234\", got {cmds:?}"
+            );
+            assert!(
+                h.grid_requests.borrow().iter().any(|r| matches!(
+                    r,
+                    ChromeGridRequest::MoveActive(Motion::Move(d)) if *d == dir
+                )),
+                "a real {key} keystroke in quick-edit must move the active cell {dir:?}: {:?}",
+                h.grid_requests.borrow()
+            );
+            assert_eq!(
+                vcx.update(|_w, cx| h.chrome.read(cx).data_mode()),
+                FieldMode::Idle,
+                "commit via a real {key} keystroke must end the edit"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_left_commits_and_moves(cx: &mut TestAppContext) {
+        // The primary user repro, isolated: `[focus cell] type "1234" [press Left]`. Before the fix
+        // this moved the caret inside the field (the `Input`'s `MoveLeft` action won) and neither
+        // committed nor moved the cell. A real Left keystroke must now commit + move left.
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        enter_quick_edit_focused(&h, &mut vcx, "1234");
+        vcx.simulate_keystrokes("left");
+        vcx.run_until_parked();
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "1234"),
+            "a real Left keystroke in quick-edit must commit \"1234\", got {cmds:?}"
+        );
+        assert!(
+            h.grid_requests.borrow().iter().any(|r| matches!(
+                r,
+                ChromeGridRequest::MoveActive(Motion::Move(Direction::Left))
+            )),
+            "a real Left keystroke in quick-edit must move the active cell left: {:?}",
+            h.grid_requests.borrow()
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_modified_arrow_leaves_without_moving(cx: &mut TestAppContext) {
+        // A real Shift+Right in quick-edit is a caret/selection op: it must leave quick-edit and
+        // must NOT commit or move the active cell (the `Input`'s own shift-right selection runs).
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        enter_quick_edit_focused(&h, &mut vcx, "1234");
+        vcx.simulate_keystrokes("shift-right");
+        vcx.run_until_parked();
+        assert!(
+            !h.client
+                .take_commands()
+                .iter()
+                .any(|c| matches!(c, Command::SetCellInput { .. })),
+            "shift+right must not commit"
+        );
+        assert!(
+            !h.grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))),
+            "shift+right must not move the active cell"
+        );
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "a modified arrow leaves quick-edit"
+        );
+        assert_eq!(
+            vcx.update(|_w, cx| h.chrome.read(cx).data_mode()),
+            FieldMode::Editing,
+            "a modified arrow does not end the edit"
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_real_keystroke_home_leaves(cx: &mut TestAppContext) {
+        // A real Home in quick-edit is explicit caret positioning: leaves quick-edit, does not move
+        // the active cell, and the edit stays open (the `Input` moves the caret to the start).
+        let h = idle_on_a1(cx, "");
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        enter_quick_edit_focused(&h, &mut vcx, "1234");
+        vcx.simulate_keystrokes("home");
+        vcx.run_until_parked();
+        assert!(
+            !h.grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))),
+            "home must not move the active cell"
+        );
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "home leaves quick-edit"
+        );
+        assert_eq!(
+            vcx.update(|_w, cx| h.chrome.read(cx).data_mode()),
+            FieldMode::Editing
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_not_entered_by_in_cell(cx: &mut TestAppContext) {
+        // Double-click / F2 (in-cell) edits are NOT quick-edit: arrows control the caret.
+        let h = idle_on_a1(cx, "");
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type("z", window, cx);
+            c.handle_data_row_edit_key("right", plain(), window, cx)
+        });
+        assert!(
+            !consumed,
+            "an in-cell edit must not consume the arrow (caret op)"
+        );
+        assert!(!h
+            .client
+            .take_commands()
+            .iter()
+            .any(|cmd| matches!(cmd, Command::SetCellInput { .. })));
+        assert!(!h
+            .grid_requests
+            .borrow()
+            .iter()
+            .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn quick_edit_caret_intent_modifier_arrow_leaves_without_moving(cx: &mut TestAppContext) {
+        // Each caret-intent modifier (Shift / Ctrl / Alt / Cmd-platform) + arrow is a caret op: it
+        // leaves quick-edit and does NOT move the active cell. `function` is deliberately excluded
+        // (tested separately) so a plain macOS arrow — which carries `function` — still moves.
+        let cases: [(&str, Modifiers); 4] = [
+            (
+                "shift",
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "control",
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "alt",
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                "platform",
+                Modifiers {
+                    platform: true,
+                    ..Modifiers::default()
+                },
+            ),
+        ];
+        for (name, mods) in cases {
+            let h = idle_on_a1(cx, "");
+            let consumed = upd(&h, cx, |c, window, cx| {
+                c.begin_typed("v", window, cx);
+                c.handle_data_row_edit_key("right", mods, window, cx)
+            });
+            assert!(!consumed, "{name}+arrow must fall through to the caret");
+            assert!(
+                !h.client
+                    .take_commands()
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::SetCellInput { .. })),
+                "{name}+arrow must not commit"
+            );
+            assert!(
+                !h.grid_requests
+                    .borrow()
+                    .iter()
+                    .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))),
+                "{name}+arrow must not move the active cell"
+            );
+            assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+            // Quick-edit is now off: even a subsequent unmodified arrow does not move.
+            h.grid_requests.borrow_mut().clear();
+            let consumed2 = upd(&h, cx, |c, window, cx| {
+                c.handle_data_row_edit_key("right", plain(), window, cx)
+            });
+            assert!(
+                !consumed2,
+                "after {name}+arrow, arrows are caret ops for the rest of the edit"
+            );
+            assert!(!h
+                .grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))));
+        }
+    }
+
+    #[gpui::test]
+    fn quick_edit_plain_arrow_with_function_flag_still_moves(cx: &mut TestAppContext) {
+        // Cross-platform regression: macOS sets `Modifiers::function` on a *plain* arrow keystroke.
+        // The caret-intent predicate excludes `function`, so §5.2's commit + move must still fire —
+        // otherwise quick-edit's core feature never works on macOS.
+        let h = idle_on_a1(cx, "");
+        let fn_only = Modifiers {
+            function: true,
+            ..Modifiers::default()
+        };
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("abcd", window, cx);
+            c.handle_data_row_edit_key("right", fn_only, window, cx)
+        });
+        assert!(
+            consumed,
+            "a plain arrow carrying only the function flag (macOS) must still commit + move"
+        );
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetCellInput { input, .. }] if input == "abcd"),
+            "expected SetCellInput \"abcd\", got {cmds:?}"
+        );
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+    }
+
+    #[gpui::test]
+    fn quick_edit_home_leaves(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.handle_data_row_edit_key("home", plain(), window, cx)
+        });
+        assert!(!consumed, "Home is caret positioning — not consumed");
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "Home leaves quick-edit"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+    }
+
+    #[gpui::test]
+    fn quick_edit_mouse_down_in_field_leaves(cx: &mut TestAppContext) {
+        // The data-row field's on_mouse_down calls leave_quick_edit (placing the caret by click).
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.leave_quick_edit(window, cx);
+        });
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false)
+        );
+        h.client.take_commands();
+        h.grid_requests.borrow_mut().clear();
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.handle_data_row_edit_key("right", plain(), window, cx)
+        });
+        assert!(
+            !consumed,
+            "after a click into the field, arrows are caret ops"
+        );
+        assert!(!h
+            .grid_requests
+            .borrow()
+            .iter()
+            .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))));
+    }
+
+    #[gpui::test]
+    fn quick_edit_flag_pushed_to_grid_and_cleared(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        // Type-to-replace pushes quick_edit = true.
+        upd(&h, cx, |c, window, cx| c.begin_typed("v", window, cx));
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(true),
+            "type-to-replace pushes quick_edit=true to the grid"
+        );
+        // Opening the in-cell editor pushes quick_edit = false.
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx)
+        });
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false),
+            "the in-cell editor is never quick-edit"
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_cleared_in_grid_push_after_commit(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.handle_data_row_edit_key("down", plain(), window, cx);
+        });
+        // The commit clears the mirror and quick_edit for the grid.
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false)
+        );
+        assert_eq!(
+            last_edit_state(&h.grid_requests.borrow()).and_then(|(m, _, _)| m),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edit_preserves_tab_and_enter(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        // Tab still commits + moves right in quick-edit.
+        let consumed = upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.handle_data_row_edit_key("tab", plain(), window, cx)
+        });
+        assert!(consumed);
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Right))
+        )));
+        // Enter still commits + moves down.
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.test_press_enter(false, window, cx);
+        });
+        assert!(h.grid_requests.borrow().iter().any(|r| matches!(
+            r,
+            ChromeGridRequest::MoveActive(Motion::Move(Direction::Down))
+        )));
+    }
+
+    #[gpui::test]
+    fn quick_edit_escape_resets_flag(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "42");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("v", window, cx);
+            c.escape_edit(window, cx);
+        });
+        // Escape ends the edit; the grid's quick_edit copy is cleared.
+        assert_eq!(
+            last_edit_state_quick(&h.grid_requests.borrow()),
+            Some(false)
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
     }
 
     #[gpui::test]

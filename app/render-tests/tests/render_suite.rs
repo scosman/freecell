@@ -250,6 +250,14 @@ render_cases! {
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
     cell_wrap_multiline_clipped,
     cell_valign_top, cell_valign_middle, cell_valign_bottom, cell_wrap_valign_bottom,
+    // Auto-grow rows (Phase 7): wrap-driven growth, column-width response, manual-wins, cap clip,
+    // and the retained large-font regression.
+    autogrow_wrap_grows, autogrow_narrow_col_more_lines, autogrow_wide_col_fewer_lines,
+    autogrow_manual_row_unchanged, autogrow_cap_clip, autogrow_large_font_grows,
+    // Text spill / overflow (Phase 3): direction-aware spill, stop conditions, non-spill types
+    spill_right_over_empties, spill_left_right_aligned, spill_center_both,
+    spill_stop_at_nonempty, spill_over_fill_only_neighbor, spill_wrap_on_no_spill,
+    spill_number_no_spill, spill_stop_at_coverage_edge,
     // Whole-grid scenes
     grid_empty_origin, grid_headers_scrolled_deep, grid_selection_single, grid_selection_range,
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
@@ -273,8 +281,8 @@ render_cases! {
     grid_chart_selected,
     // Insert (P17/P21): the near-empty AUTHORED chart the insert flow produces (authored → in-grid).
     grid_chart_authored_inserted,
-    // Editing feel (Phase 2): live mirror + in-cell editor overlay
-    cell_mirror_typing, incell_editor_open,
+    // Editing feel (Phase 2): live mirror + in-cell editor overlay + its grow-right / grow-down
+    cell_mirror_typing, incell_editor_open, incell_editor_grow_right, incell_editor_grow_wrap,
     // Fonts (Phase 5): family + size + row auto-grow
     font_family_serif, font_size_24_row_grown, font_missing_family_fallback,
     // Borders (Phase 6): edge paint, presets, shared-edge precedence

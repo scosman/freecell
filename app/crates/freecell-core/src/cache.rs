@@ -19,6 +19,11 @@ use crate::style::RenderStyle;
 pub const DEFAULT_COL_WIDTH_PX: f32 = 100.0;
 /// Default row height in px when the file specifies no override (`ui_design.md §3.3`).
 pub const DEFAULT_ROW_HEIGHT_PX: f32 = 24.0;
+/// The maximum height (px) wrap-driven row auto-grow may set a row to (`functional_spec.md §3.4`,
+/// `architecture.md §3.2`): ~10 default lines. A pathological wrapped cell can't make a row fill
+/// the screen — content beyond the cap clips within the wrapped cell. Shared by the UI-thread
+/// measurement (which clamps its measured height) and the worker's defensive re-clamp.
+pub const MAX_AUTO_ROW_HEIGHT_PX: f32 = DEFAULT_ROW_HEIGHT_PX * 10.0;
 
 /// An index into a [`SheetCache`]'s resolved-style table. Interned worker-side so equal
 /// styles share one id (`components/style_cache.md`).

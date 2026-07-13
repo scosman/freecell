@@ -858,6 +858,140 @@ impl WorkbookDocument {
         )))
     }
 
+    /// Scan `sheet_idx`'s **populated** cells for those whose raw content matches `query`
+    /// (`functional_spec.md §4.3`; `Command::Find`). Iterates `sheet_data` (only populated cells,
+    /// not the whole used rectangle — O(populated), huge-sheet safe) and returns the matches sorted
+    /// **row-major** (`sheet_data` is a `HashMap`, so its iteration order is arbitrary and must be
+    /// sorted). Reads the raw content per cell (formula text for formula cells), so a match against a
+    /// formula is a match against its text. No mutation, no eval.
+    pub(crate) fn find_matches(
+        &self,
+        sheet_idx: u32,
+        query: &str,
+        match_case: bool,
+        whole_cell: bool,
+    ) -> Result<Vec<CellRef>, String> {
+        crate::instrument::record_engine_call();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ws = self.worksheet(sheet_idx)?;
+        let mut matches = Vec::new();
+        for (row_1, cols) in &ws.sheet_data {
+            let row0 = (*row_1 - 1).max(0) as u32;
+            for col_1 in cols.keys() {
+                let col0 = (*col_1 - 1).max(0) as u32;
+                let cell = CellRef::new(row0, col0);
+                // `cell_content` returns the formula text for formula cells (Excel "Look in:
+                // Formulas") — the same raw string `replace_in_cell` edits (`§4.3`).
+                let content = self.cell_content(sheet_idx, cell).unwrap_or_default();
+                if freecell_core::find::cell_matches(&content, query, match_case, whole_cell) {
+                    matches.push(cell);
+                }
+            }
+        }
+        matches.sort_unstable_by_key(|c| (c.row, c.col));
+        Ok(matches)
+    }
+
+    /// Replace `query` with `replacement` in a single cell (`Command::ReplaceOne`,
+    /// `functional_spec.md §4.4`): re-read the cell's raw content **here** (avoiding a stale-content
+    /// race with the UI) and, when it matches, write the replaced content via `set_user_input`.
+    /// Returns whether it wrote — a match whose replacement yields the **same** text is a no-op
+    /// (skipped, returns `false`), so it does not spend an undo entry or count toward "Replaced N".
+    /// Auto-evaluates unless paused; one undo step (single cell).
+    pub(crate) fn replace_one(
+        &mut self,
+        sheet_idx: u32,
+        cell: CellRef,
+        query: &str,
+        replacement: &str,
+        match_case: bool,
+        whole_cell: bool,
+    ) -> Result<bool, String> {
+        let content = self.cell_content(sheet_idx, cell).unwrap_or_default();
+        match freecell_core::find::replace_in_cell(
+            &content,
+            query,
+            replacement,
+            match_case,
+            whole_cell,
+        ) {
+            // A replacement that yields identical text is a no-op — don't spend an undo entry on it.
+            Some(new_input) if new_input != content => {
+                self.set_cell_input(sheet_idx, cell, &new_input)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Replace `query` with `replacement` in **every** matching cell of `sheet_idx`'s used range
+    /// (`Command::ReplaceAll`, `functional_spec.md §4.4`) and return the cells that changed (in
+    /// row-major order) — the caller counts them and records a single undo touch.
+    ///
+    /// The matches are collected first (over `sheet_data`, releasing the borrow), then written — a
+    /// cell whose replaced content equals its old content is skipped (no write). All the writes go
+    /// through **one** `set_user_inputs` batch call, so the whole replace is a **single** engine undo
+    /// entry (one `doc.undo()` reverts every replaced cell — the fork fix from `phase_plans/phase_9.md`,
+    /// replacing the former per-cell `set_user_input` loop). Called under the worker's paused-eval
+    /// guard (the batch's single `evaluate()` follows).
+    pub(crate) fn replace_all_matches(
+        &mut self,
+        sheet_idx: u32,
+        query: &str,
+        replacement: &str,
+        match_case: bool,
+        whole_cell: bool,
+    ) -> Result<Vec<CellRef>, String> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Collect (cell, new_content) up front so we are not mutating `sheet_data` mid-iteration.
+        let mut edits: Vec<(CellRef, String)> = Vec::new();
+        {
+            let ws = self.worksheet(sheet_idx)?;
+            for (row_1, cols) in &ws.sheet_data {
+                let row0 = (*row_1 - 1).max(0) as u32;
+                for col_1 in cols.keys() {
+                    let col0 = (*col_1 - 1).max(0) as u32;
+                    let cell = CellRef::new(row0, col0);
+                    let content = self.cell_content(sheet_idx, cell).unwrap_or_default();
+                    if let Some(new_input) = freecell_core::find::replace_in_cell(
+                        &content,
+                        query,
+                        replacement,
+                        match_case,
+                        whole_cell,
+                    ) {
+                        if new_input != content {
+                            edits.push((cell, new_input));
+                        }
+                    }
+                }
+            }
+        }
+        // `sheet_data` is a `HashMap` (arbitrary order); write row-major so the returned + touched
+        // cells are deterministic.
+        edits.sort_by_key(|(cell, _)| (cell.row, cell.col));
+        if edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Apply every replacement as ONE batched write → a single engine undo entry (so a single
+        // Undo reverts the whole Replace All). `set_user_inputs` takes 1-based (sheet, row, col)
+        // engine coords.
+        crate::instrument::record_engine_call();
+        let mut batch: Vec<(u32, i32, i32, String)> = Vec::with_capacity(edits.len());
+        let mut changed: Vec<CellRef> = Vec::with_capacity(edits.len());
+        for (cell, new_input) in edits {
+            let (row, col) = to_engine_coords(cell);
+            batch.push((sheet_idx, row, col, new_input));
+            changed.push(cell);
+        }
+        self.model.set_user_inputs(&batch)?;
+        Ok(changed)
+    }
+
     /// Appends a new sheet (`AddSheet`); IronCalc names + numbers it. Undoable.
     pub(crate) fn add_sheet(&mut self) -> Result<(), String> {
         crate::instrument::record_engine_call();
@@ -876,6 +1010,16 @@ impl WorkbookDocument {
     pub(crate) fn delete_sheet(&mut self, sheet_idx: u32) -> Result<(), String> {
         crate::instrument::record_engine_call();
         self.model.delete_sheet(sheet_idx)
+    }
+
+    /// Moves the sheet at `sheet_idx` to `to_index` (`MoveSheet`), shifting the intervening
+    /// sheets so the moved sheet lands at exactly `to_index`. Undoable (rides the fork's
+    /// history); the new order is preserved on xlsx save; cross-sheet references stay valid
+    /// (sheet order is a vector position, not an identity). Wraps the fork's index-based
+    /// `UserModel::set_worksheet_index` (Phase 6a). A same-index move is a fork-level no-op.
+    pub(crate) fn move_sheet(&mut self, sheet_idx: u32, to_index: u32) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model.set_worksheet_index(sheet_idx, to_index)
     }
 
     /// Undoes the last committed edit (engine history). Auto-evaluates unless paused.
@@ -1615,6 +1759,90 @@ mod tests {
             CellRef::new(freecell_core::limits::MAX_ROWS - 1, 9),
         );
         assert_eq!(doc.clamp_to_used(0, far_col).unwrap(), None);
+    }
+
+    // ---- Find / replace (`functional_spec.md §4`) -----------------------------------------
+
+    #[test]
+    fn find_matches_scans_populated_cells_row_major() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "apple").unwrap(); // A1
+        doc.set_cell_input(0, CellRef::new(0, 2), "grape").unwrap(); // C1 (no "app")
+        doc.set_cell_input(0, CellRef::new(1, 1), "Application")
+            .unwrap(); // B2
+        doc.set_cell_input(0, CellRef::new(2, 0), "pineapple")
+            .unwrap(); // A3
+
+        // Case-insensitive substring: A1, B2, A3 — returned in row-major (sheet_data) order.
+        assert_eq!(
+            doc.find_matches(0, "app", false, false).unwrap(),
+            vec![CellRef::new(0, 0), CellRef::new(1, 1), CellRef::new(2, 0)]
+        );
+        // Case-sensitive "App" only hits "Application".
+        assert_eq!(
+            doc.find_matches(0, "App", true, false).unwrap(),
+            vec![CellRef::new(1, 1)]
+        );
+        // Whole-cell "apple" (case-insensitive) hits only the exact A1.
+        assert_eq!(
+            doc.find_matches(0, "apple", false, true).unwrap(),
+            vec![CellRef::new(0, 0)]
+        );
+        // An empty query never matches.
+        assert!(doc.find_matches(0, "", false, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_matches_targets_formula_text() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap(); // A1
+        doc.set_cell_input(0, CellRef::new(1, 0), "=A1+1").unwrap(); // A2 (formula)
+                                                                     // "A1" matches the formula TEXT of A2 (Excel "Look in: Formulas").
+        assert_eq!(
+            doc.find_matches(0, "A1", true, false).unwrap(),
+            vec![CellRef::new(1, 0)]
+        );
+    }
+
+    #[test]
+    fn replace_one_rewrites_only_a_matching_cell() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "foobar").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "baz").unwrap();
+
+        assert!(doc
+            .replace_one(0, CellRef::new(0, 0), "foo", "qux", true, false)
+            .unwrap());
+        assert_eq!(doc.cell_content(0, CellRef::new(0, 0)).unwrap(), "quxbar");
+        // A non-matching cell is untouched (no write, returns false).
+        assert!(!doc
+            .replace_one(0, CellRef::new(0, 1), "foo", "qux", true, false)
+            .unwrap());
+        assert_eq!(doc.cell_content(0, CellRef::new(0, 1)).unwrap(), "baz");
+    }
+
+    #[test]
+    fn replace_all_replaces_every_match_and_single_undo_target() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "cat").unwrap(); // A1
+        doc.set_cell_input(0, CellRef::new(0, 1), "cats").unwrap(); // B1
+        doc.set_cell_input(0, CellRef::new(1, 0), "dog").unwrap(); // A2 (no match)
+
+        let changed = doc
+            .replace_all_matches(0, "cat", "dog", true, false)
+            .unwrap();
+        assert_eq!(changed, vec![CellRef::new(0, 0), CellRef::new(0, 1)]);
+        assert_eq!(doc.cell_content(0, CellRef::new(0, 0)).unwrap(), "dog");
+        assert_eq!(doc.cell_content(0, CellRef::new(0, 1)).unwrap(), "dogs");
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "dog");
+
+        // The whole Replace All is a SINGLE engine undo entry (the fork's batched `set_user_inputs`
+        // — `phase_plans/phase_9.md`), so ONE `doc.undo()` restores every replaced cell.
+        doc.undo().unwrap();
+        assert_eq!(doc.cell_content(0, CellRef::new(0, 0)).unwrap(), "cat");
+        assert_eq!(doc.cell_content(0, CellRef::new(0, 1)).unwrap(), "cats");
+        // The unmatched cell was never touched.
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "dog");
     }
 
     // ---- Range clipboard (`components/clipboard.md`) --------------------------------------

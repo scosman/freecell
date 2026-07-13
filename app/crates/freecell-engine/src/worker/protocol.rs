@@ -261,11 +261,26 @@ pub enum Command {
     },
     /// Set the height of an inclusive row run `[row_start, row_end]` (0-based) to `px` **device
     /// px** (`functional_spec.md §5.1`). Geometry-only (no evaluation); cf. [`Command::SetColumnWidths`].
+    /// A **user** row-resize — so the worker marks the run **manual**, exempting it from wrap-driven
+    /// auto-grow (`functional_spec.md §3.3`).
     SetRowHeights {
         sheet: SheetId,
         row_start: u32,
         row_end: u32,
         px: f64,
+    },
+    /// Wrap-driven row auto-grow (`functional_spec.md §3.2`, `architecture.md §3`): the UI measured
+    /// each 0-based `row`'s wrapped height (device px) on the render thread — the worker can't (no
+    /// gpui text system). **Distinct** from [`Command::SetRowHeights`] so the worker knows these are
+    /// **auto** (never marked manual). Applied as a **cache-only** geometry update — final row height
+    /// = `max(base IronCalc height, wrap)`, clamped to the cap — so it never shrinks below a
+    /// font/newline auto-fit, **skips manual rows**, does **not** touch IronCalc / `ops_seen` / the
+    /// undo stack (rides the causing edit — no separate undo step, §3.4), and republishes only when a
+    /// height actually changed. A per-row value `<= default` drops that row's wrap contribution
+    /// (shrink on unwrap / clear / column-widen).
+    AutoGrowRowHeights {
+        sheet: SheetId,
+        heights: Vec<(u32, f32)>,
     },
     /// Insert `count` blank rows so new rows appear at 0-based `row` (`functional_spec.md §5.3`);
     /// content at/after `row` shifts down and formulas adjust. Undoable; needs evaluation. The
@@ -300,6 +315,12 @@ pub enum Command {
     RenameSheet { sheet: SheetId, name: String },
     /// Delete a sheet.
     DeleteSheet { sheet: SheetId },
+    /// Move the sheet with stable id `sheet` so it lands at 0-based worksheet index `to_index`,
+    /// shifting the intervening sheets (`functional_spec.md §6`). Undoable (rides the fork's
+    /// history); the new order is preserved on xlsx save. The worker maps `sheet` → its current
+    /// worksheet index before calling the fork's index-based reorder API. Republishes
+    /// [`WorkerEvent::SheetsChanged`] so the tab bar rebuilds in the new engine order.
+    MoveSheet { sheet: SheetId, to_index: u32 },
     /// Undo the last committed edit.
     Undo,
     /// Redo the last undone edit.
@@ -340,6 +361,44 @@ pub enum Command {
         sheet: SheetId,
         cell: CellRef,
         req_id: u64,
+    },
+    /// Scan `sheet`'s used range for cells whose **raw content** (formula text for formula cells)
+    /// matches `query` under the case / whole-cell rules (`functional_spec.md §4.3`). A **read**: no
+    /// evaluation, no publish. Replies with [`WorkerEvent::FindResults`] (row-major matches). Runs in
+    /// the worker (which owns the model) so a huge sheet's scan never blocks the UI (`§4.5`).
+    Find {
+        sheet: SheetId,
+        query: String,
+        match_case: bool,
+        whole_cell: bool,
+    },
+    /// Replace the match in a single cell (`functional_spec.md §4.4`): the **worker** re-reads the
+    /// cell's raw content and applies the replacement (substring, or whole content if `whole_cell`),
+    /// then commits it via the normal edit path — recomputing the replacement worker-side (from fresh
+    /// `cell_content`) avoids a stale-content race with the UI. A single-cell edit is inherently one
+    /// undo step. Replies [`WorkerEvent::ReplacedCount`] (`n = 1` if it wrote, else `0`).
+    ReplaceOne {
+        sheet: SheetId,
+        cell: CellRef,
+        query: String,
+        replacement: String,
+        match_case: bool,
+        whole_cell: bool,
+    },
+    /// Replace **every** match in `sheet`'s used range (`functional_spec.md §4.4`), evaluate once,
+    /// publish, and reply [`WorkerEvent::ReplacedCount`] with the number of cells changed.
+    ///
+    /// INTENDED as one undoable batch (`§4.4`). IronCalc's atomic multi-cell undo mechanism
+    /// (`History::push`) is `pub(crate)` and the public rectangle pastes are unusable for scattered
+    /// matches, so this currently records **one engine undo entry per changed cell** (like the
+    /// accepted `SetFont` "K+1 undo steps" precedent) pending a fork `set_user_inputs` batch method —
+    /// see `phase_plans/phase_4.md` ROADBLOCK + `DECISIONS_TO_REVIEW.md`.
+    ReplaceAll {
+        sheet: SheetId,
+        query: String,
+        replacement: String,
+        match_case: bool,
+        whole_cell: bool,
     },
     /// Insert an **authored chart** of `kind` onto `sheet`, placed at `anchor` (P17,
     /// charts/ui_design §3.1). The worker builds the template chart
@@ -485,6 +544,13 @@ pub enum WorkerEvent {
     EvalFinished,
     /// Reply to `GetCellContent`: the cell's raw text.
     CellContent { req_id: u64, raw: String },
+    /// Reply to [`Command::Find`]: the matching cells in **row-major** order (empty = no matches).
+    /// The UI stores these, selects + reveals the current one, and drives the "N of M" counter
+    /// (`functional_spec.md §4.3`).
+    FindResults { matches: Vec<CellRef> },
+    /// Reply to [`Command::ReplaceOne`] / [`Command::ReplaceAll`]: how many cells were changed
+    /// (`functional_spec.md §4.4` — "Replaced 7"; `0` when nothing matched).
+    ReplacedCount { n: usize },
     /// Reply to `Save`: success, acking the op-index the file now contains.
     Saved { req_id: u64, ops_seen: u64 },
     /// Reply to `Save`: failure (typed; the original file is untouched — atomic save).

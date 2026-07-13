@@ -68,6 +68,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let titlebar = case.titlebar;
     let charts = case.charts;
     let selected_chart = case.selected_chart;
+    let auto_grow = case.auto_grow;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
@@ -123,6 +124,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             Some((sheet, CellRef::new(row, col), text.into())),
                             None,
                             None,
+                            false,
                             cx,
                         );
                     }
@@ -133,7 +135,15 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             state
                         });
                         view.set_incell_input(input, cx);
-                        view.set_edit_state(None, Some(CellRef::new(row, col)), None, cx);
+                        view.set_edit_state(None, Some(CellRef::new(row, col)), None, false, cx);
+                    }
+                    // Wrap-driven auto-grow (`functional_spec.md §3`): run the real render-thread
+                    // measurement once, up front, so the captured frame shows the grown row heights.
+                    // The live measure→worker→republish loop can't complete in-capture (single static
+                    // frame, shut-down worker), so this test hook applies the measured heights to the
+                    // shared cache directly (skipping rows with an existing override = manual).
+                    if auto_grow {
+                        view.autogrow_measure_now(window, cx);
                     }
                     view
                 });

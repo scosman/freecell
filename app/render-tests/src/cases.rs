@@ -46,6 +46,16 @@ fn all_edges_pat(weight: u8, pattern: LinePattern) -> BorderSpec {
 /// underline read clearly in a baseline.
 const SAMPLE: &str = "Sample";
 
+/// A medium sentence for the wrap auto-grow cases — long enough to wrap to a few lines at a
+/// moderate column and more/fewer as the column narrows/widens (`functional_spec.md §3.2`).
+const AUTO_GROW_TEXT: &str = "This note wraps across several lines when the column is narrow";
+
+/// A very long note for the cap case — at a narrow column it needs far more than the ~10-line cap,
+/// so the row clamps at `MAX_AUTO_ROW_HEIGHT_PX` and the overflow clips within the cell.
+const AUTO_GROW_CAP_TEXT: &str = "This is a very long wrapped note that keeps going and going \
+    well past ten lines so the row height is clamped at the cap and the remaining text is clipped \
+    inside the cell rather than filling the entire screen with one enormous row of text";
+
 /// One render case: a scene, the (tight) capture viewport, and any post-construction grid state
 /// (selection / loading overlay / forced scrollbars / a scroll-into-view reveal) that the MVP
 /// worker protocol can't express as an edit.
@@ -80,6 +90,10 @@ pub struct RenderCase {
     /// A selected chart (P18) — its stable [`ChartId`], drawn with the selection outline + resize
     /// handles. `None` (the default) draws no selection chrome, so no existing baseline moves.
     pub selected_chart: Option<ChartId>,
+    /// Opts this case into the wrap-driven row auto-grow measurement (`functional_spec.md §3`): the
+    /// harness runs `GridView::autogrow_measure_now` before first paint so the captured frame shows
+    /// the real grown row heights. `false` for every non-auto-grow case (no baseline change).
+    pub auto_grow: bool,
 }
 
 impl RenderCase {
@@ -97,7 +111,14 @@ impl RenderCase {
             titlebar: None,
             charts: Vec::new(),
             selected_chart: None,
+            auto_grow: false,
         }
+    }
+
+    /// Opts this case into the wrap-driven row auto-grow measurement (`functional_spec.md §3`).
+    fn auto_grow(mut self) -> Self {
+        self.auto_grow = true;
+        self
     }
 
     fn selection(mut self, selection: SelectionModel) -> Self {
@@ -661,6 +682,128 @@ pub fn all() -> Vec<RenderCase> {
             "cell_narrow_column_clipped_number",
             Scene::new().input(1, 1, "123456789").col_width(1, 40.0),
         ),
+        // ---- Auto-grow rows (Phase 7, `functional_spec.md §3`) ---------------------------
+        // Each opt-in case runs the REAL render-thread wrap measurement (`autogrow_measure_now`),
+        // so the captured row height is what the product computes — not a hand-injected number.
+        // A wrap-on cell with no manual row height grows to fit all its wrapped lines. The viewport
+        // is tall enough to show the whole grown row (so a clipped last line would be a real defect).
+        RenderCase::new(
+            "autogrow_wrap_grows",
+            Scene::new()
+                .input(1, 1, AUTO_GROW_TEXT)
+                .col_width(1, 96.0)
+                .wrap(1, 1),
+            (480, 220),
+        )
+        .auto_grow(),
+        // Narrowing the column produces more wrapped lines → the row grows taller still.
+        RenderCase::new(
+            "autogrow_narrow_col_more_lines",
+            Scene::new()
+                .input(1, 1, AUTO_GROW_TEXT)
+                .col_width(1, 64.0)
+                .wrap(1, 1),
+            (480, 280),
+        )
+        .auto_grow(),
+        // Widening the column produces fewer lines → the row shrinks back toward the default.
+        cell(
+            "autogrow_wide_col_fewer_lines",
+            Scene::new()
+                .input(1, 1, AUTO_GROW_TEXT)
+                .col_width(1, 220.0)
+                .wrap(1, 1),
+        )
+        .auto_grow(),
+        // A MANUAL row (its height was set — here an injected custom height, the file-loaded /
+        // user-resized case) is NOT auto-grown: it stays put and clips the overflowing wrapped
+        // text, even though auto-grow runs (`functional_spec.md §3.3`).
+        cell(
+            "autogrow_manual_row_unchanged",
+            Scene::new()
+                .input(1, 1, AUTO_GROW_TEXT)
+                .col_width(1, 96.0)
+                .row_height(1, 30.0)
+                .wrap(1, 1),
+        )
+        .auto_grow(),
+        // A pathologically long wrapped cell is capped at `MAX_AUTO_ROW_HEIGHT_PX` (~10 lines);
+        // content beyond the cap clips within the cell (a bigger viewport shows the whole capped row).
+        RenderCase::new(
+            "autogrow_cap_clip",
+            Scene::new()
+                .input(1, 1, AUTO_GROW_CAP_TEXT)
+                .col_width(1, 70.0)
+                .wrap(1, 1),
+            (440, 300),
+        )
+        .auto_grow(),
+        // ---- Text spill / overflow (Phase 3, `functional_spec.md §2`) -------------------
+        // Long general/left text spills RIGHT over the empty neighbours (B2 → C2, D2 …), reading
+        // as one continuous run crossing the gridlines (the must-have case).
+        cell(
+            "spill_right_over_empties",
+            Scene::new().input(1, 1, "This long label spills to the right"),
+        ),
+        // Right-aligned long text spills LEFT: the origin (D2) is anchored at its right edge and the
+        // text flows back over the empty C2/B2/A2.
+        cell(
+            "spill_left_right_aligned",
+            Scene::new()
+                .input(1, 3, "spilling to the left here")
+                .align(1, 3, Align::Right),
+        ),
+        // Center-aligned long text spills BOTH ways, centred over the empty run; blockers at A2/E2
+        // bound each side independently (the text spans B2–D2, centred over C2).
+        cell(
+            "spill_center_both",
+            Scene::new()
+                .input(1, 0, "L")
+                .input(1, 4, "R")
+                .input(1, 2, "centered spill across")
+                .align(1, 2, Align::Center),
+        ),
+        // Spill STOPS at the first cell with content: B2's long text spills over the empty C2 but
+        // clips at D2 ("STOP"). Content — not fill/border — is what stops a spill.
+        cell(
+            "spill_stop_at_nonempty",
+            Scene::new()
+                .input(1, 1, "long text stops at the next value")
+                .input(1, 3, "STOP"),
+        ),
+        // A fill-only (content-less) neighbour does NOT stop the spill: B2's text spills over the
+        // yellow-filled C2 (the fill still paints; the text sits on top).
+        cell(
+            "spill_over_fill_only_neighbor",
+            Scene::new()
+                .input(1, 1, "spills over a filled empty cell")
+                .fill(1, 2, 0xFFEB3B),
+        ),
+        // Wrap-on cells never spill (mutually exclusive with §3): the long text wraps within the
+        // column and clips to the row height — no overflow into C2.
+        cell(
+            "spill_wrap_on_no_spill",
+            Scene::new()
+                .input(1, 1, "wrapped long text does not spill it wraps instead")
+                .col_width(1, 80.0)
+                .row_height(1, 48.0)
+                .wrap(1, 1),
+        ),
+        // Numbers never spill — a too-wide number clips as today (the `#####` indicator is out of
+        // scope), leaving the empty neighbour blank.
+        cell(
+            "spill_number_no_spill",
+            Scene::new().input(1, 1, "123456789").col_width(1, 50.0),
+        ),
+        // Spill is bounded by the covered region: publishing only cols 0..3 makes cols ≥3 uncovered,
+        // so B2's long text spills over the covered-empty C2 but STOPS at the coverage edge — it
+        // never treats the uncovered (blank-rendered) cells to the right as reliably empty (§2.5).
+        cell(
+            "spill_stop_at_coverage_edge",
+            Scene::new()
+                .input(1, 1, "long text bounded by the coverage edge")
+                .publish(0..80, 0..3),
+        ),
         // ---- Whole-grid scenes ---------------------------------------------------------
         RenderCase::new("grid_empty_origin", Scene::new(), GRID_VP),
         RenderCase::new("grid_headers_scrolled_deep", Scene::new(), GRID_VP).reveal(500, 30),
@@ -828,13 +971,42 @@ pub fn all() -> Vec<RenderCase> {
         .mirror(1, 1, "=1+2"),
         RenderCase::new(
             // The in-cell editor overlay open over B2 (2 px accent border, raw content;
-            // `functional_spec.md §1.3`).
+            // `functional_spec.md §1.3`). The editor grows to fit its own text (here just wide enough
+            // for `=SUM(A1:A3)`), painted above the cells (`DECISIONS_TO_REVIEW.md`).
             "incell_editor_open",
             Scene::new().input(1, 1, "42"),
             CELL_VP,
         )
         .selection(sel((1, 1), (1, 1)))
         .in_cell(1, 1, "=SUM(A1:A3)"),
+        RenderCase::new(
+            // A wrap-off in-cell editor GROWS RIGHTWARD over its neighbours to fit a long string in a
+            // narrow column, painted above the cells and clamped at the content viewport's right edge
+            // (`DECISIONS_TO_REVIEW.md`).
+            "incell_editor_grow_right",
+            Scene::new().input(1, 1, "x").col_width(1, 56.0),
+            CELL_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(
+            1,
+            1,
+            "A really long label that grows the editor rightward over its neighbours",
+        ),
+        RenderCase::new(
+            // A wrap-ON in-cell editor GROWS DOWNWARD (taller) instead of rightward, previewing the
+            // committed multi-line footprint; its hosted single-line input stays a first-line control
+            // at the top (`DECISIONS_TO_REVIEW.md`).
+            "incell_editor_grow_wrap",
+            Scene::new().input(1, 1, "x").col_width(1, 96.0).wrap(1, 1),
+            (480, 220),
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(
+            1,
+            1,
+            "wrap this text onto several visual lines while editing in place",
+        ),
         // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
         cell(
             // A serif family (visibly distinct from the default sans) rendered per-cell. NOTE:
@@ -856,6 +1028,16 @@ pub fn all() -> Vec<RenderCase> {
             "font_missing_family_fallback",
             at(Scene::new()).font(1, 1, Some("NoSuchFontXYZ123"), None),
         ),
+        // Auto-grow regression (`functional_spec.md §3.1`): the pre-existing font-size auto-grow is
+        // RETAINED — a 24 pt row is grown to fit (injected height, like `font_size_24_row_grown`),
+        // and the new wrap measurement pass (opt-in here) leaves this non-wrap row untouched.
+        cell(
+            "autogrow_large_font_grows",
+            at(Scene::new())
+                .font(1, 1, None, Some(24.0))
+                .row_height(1, 38.0),
+        )
+        .auto_grow(),
         // ---- Borders (Phase 6): edge paint, presets, shared-edge precedence -------------
         cell(
             // A single cell with all four thin (1px) black edges.

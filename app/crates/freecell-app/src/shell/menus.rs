@@ -11,8 +11,8 @@ use gpui::{App, KeyBinding, Menu, MenuItem};
 use freecell_core::recent::{RecentList, MENU_LIMIT};
 
 use super::{
-    recents, About, ClearRecent, CloseWindow, NewWorkbook, OpenFile, OpenRecent, Quit, Redo, Save,
-    SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
+    recents, About, ClearRecent, CloseWindow, NewWorkbook, OpenFile, OpenFind, OpenRecent, Quit,
+    Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
 };
 
 /// The primary modifier for the current platform: `cmd` on macOS, `ctrl` elsewhere.
@@ -40,6 +40,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(&key("b"), ToggleBold, None),
         KeyBinding::new(&key("i"), ToggleItalic, None),
         KeyBinding::new(&key("u"), ToggleUnderline, None),
+        KeyBinding::new(&key("f"), OpenFind, None),
         KeyBinding::new(&key("q"), Quit, None),
     ]);
 }
@@ -76,6 +77,8 @@ pub fn build_menus(recents: &RecentList, now: i64) -> Vec<Menu> {
         Menu::new("Edit").items([
             MenuItem::action("Undo", Undo),
             MenuItem::action("Redo", Redo),
+            MenuItem::separator(),
+            MenuItem::action("Find…", OpenFind),
         ]),
     ]
 }

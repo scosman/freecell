@@ -250,6 +250,7 @@ render_cases! {
     cell_empty_styled, cell_tall_row, cell_wide_column, cell_narrow_column_clipped_number,
     cell_wrap_multiline_clipped,
     cell_valign_top, cell_valign_middle, cell_valign_bottom, cell_wrap_valign_bottom,
+    cell_valign_top_large_font, cell_valign_bottom_large_font,
     // Auto-grow rows (Phase 7): wrap-driven growth, column-width response, manual-wins, cap clip,
     // and the retained large-font regression.
     autogrow_wrap_grows, autogrow_narrow_col_more_lines, autogrow_wide_col_fewer_lines,

@@ -737,6 +737,28 @@ impl ChromeView {
         committed
     }
 
+    /// Commits any pending data-row edit (Excel click-away) and then adopts `selection` — but
+    /// only if the commit succeeded. Returns whether the selection was adopted; a cap-rejected
+    /// edit blocks it (`false`), leaving the field Editing so the caller keeps the grid on the
+    /// last accepted cell (`functional_spec.md §3.3`). This is the single choke point every
+    /// non-emitter selection-adoption path routes through, so [`on_selection_changed`] is never
+    /// reached while the field is `Editing` — the invariant its `data_row` `debug_assert` guards
+    /// (`components/grid.md`; a violation would silently discard the pending edit).
+    ///
+    /// [`on_selection_changed`]: Self::on_selection_changed
+    pub fn commit_then_adopt_selection(
+        &mut self,
+        selection: SelectionModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let committed = self.on_edit_commit_requested(window, cx);
+        if committed {
+            self.on_selection_changed(selection, window, cx);
+        }
+        committed
+    }
+
     /// Escape while editing: revert the field to the last-fetched content, close any in-cell
     /// overlay, and hand focus back to the grid.
     pub fn escape_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2157,6 +2179,14 @@ impl ChromeView {
         if id == self.active_sheet {
             return;
         }
+        // grid.md invariant: commit any pending data-row edit BEFORE the switch (Excel click-away).
+        // The commit targets the CURRENT sheet's edited cell, so it must precede the `active_sheet`
+        // change here — otherwise the deferred switch would commit against the new sheet, and its
+        // `on_selection_changed` would run while Editing. A cap-rejected edit blocks the switch
+        // (stay on this sheet, keep editing).
+        if !self.on_edit_commit_requested(window, cx) {
+            return;
+        }
         self.active_sheet = id;
         self.committed_cell = None;
         self.context_menu = None;
@@ -3531,6 +3561,12 @@ impl ChromeView {
     /// Select + scroll the current match into view (the find field keeps focus).
     fn select_current_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(cell) = self.current_match_cell() {
+            // grid.md invariant: commit any pending data-row edit BEFORE emitting the deferred
+            // reveal — otherwise the deferred `SelectAndReveal` would drive `on_selection_changed`
+            // while the field is Editing. A cap-rejected edit blocks navigation (keep editing).
+            if !self.on_edit_commit_requested(window, cx) {
+                return;
+            }
             self.grid
                 .emit(ChromeGridRequest::SelectAndReveal(cell), window, cx);
         }
@@ -5557,6 +5593,77 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, ChromeGridRequest::MoveActive(_))),
             "click-away commit does not move the active cell itself"
+        );
+    }
+
+    #[gpui::test]
+    fn commit_then_adopt_commits_pending_edit_and_adopts(cx: &mut TestAppContext) {
+        // The shared choke point (used by the paste / grid-selection / sheet-switch consumers):
+        // a pending edit is committed to the OLD cell, then the new selection is adopted — never
+        // reaching `on_selection_changed` while Editing (`components/grid.md`).
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.test_type("=9", window, cx);
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        h.client.take_commands();
+        let adopted = upd(&h, cx, |c, window, cx| {
+            c.commit_then_adopt_selection(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        assert!(
+            adopted,
+            "a valid pending edit commits, so the selection is adopted"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        let cmds = h.client.take_commands();
+        // The edit is committed to the OLD cell (A1)...
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Command::SetCellInput { cell: cc, input, .. } if *cc == cell(0, 0) && input == "=9"
+            )),
+            "pending edit must commit to the edited cell (not be lost), got {cmds:?}"
+        );
+        // ...and the NEW cell (B2) is fetched (selection adopted).
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Command::GetCellContent { cell: cc, .. } if *cc == cell(1, 1)
+            )),
+            "adopted selection must fetch the new active cell, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn commit_then_adopt_blocks_on_cap_reject(cx: &mut TestAppContext) {
+        // A cap-rejected edit blocks adoption: the field stays Editing and the new selection is
+        // NOT adopted (no fetch for it), so the caller can keep the grid on the last accepted cell.
+        let h = one_sheet(cx);
+        let huge = format!("={}", "1".repeat(MAX_INPUT_LEN));
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.test_type(&huge, window, cx);
+        });
+        h.client.take_commands();
+        let adopted = upd(&h, cx, |c, window, cx| {
+            c.commit_then_adopt_selection(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        assert!(!adopted, "a cap-rejected edit must block adoption");
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        let cmds = h.client.take_commands();
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command::SetCellInput { .. })),
+            "a cap-rejected edit must not commit, got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                Command::GetCellContent { cell: cc, .. } if *cc == cell(1, 1)
+            )),
+            "the blocked selection must not be adopted/fetched, got {cmds:?}"
         );
     }
 
@@ -7786,6 +7893,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn find_navigate_while_editing_commits_pending_edit(cx: &mut TestAppContext) {
+        // Rapid-edit crash regression (`components/grid.md`): navigating find matches while the
+        // formula bar is mid-edit must commit the pending edit first (before emitting the deferred
+        // `SelectAndReveal`), so its consumer never drives `on_selection_changed` while Editing.
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.toggle_find(window, cx);
+            c.test_find_type("x", window, cx);
+            c.on_worker_event(
+                WorkerEvent::FindResults {
+                    matches: vec![cell(0, 0), cell(1, 0)],
+                },
+                window,
+                cx,
+            );
+        });
+        // Start a pending edit AFTER results exist, then navigate to the next match.
+        upd(&h, cx, |c, window, cx| c.test_type("=1+1", window, cx));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        h.client.take_commands();
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| c.next_match(window, cx));
+        // The edit committed (not lost) and the field left Editing before the reveal was emitted.
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        let cmds = h.client.take_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Command::SetCellInput { cell: cc, input, .. } if *cc == cell(0, 0) && input == "=1+1"
+            )),
+            "find-navigate must commit the pending edit, got {cmds:?}"
+        );
+        assert!(
+            h.grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::SelectAndReveal(_))),
+            "a committed edit still navigates to the match"
+        );
+    }
+
+    #[gpui::test]
     fn enter_and_shift_enter_step_matches(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
         upd(&h, cx, |c, window, cx| {
@@ -7996,6 +8146,61 @@ mod tests {
             .borrow()
             .iter()
             .any(|r| matches!(r, ChromeGridRequest::SetActiveSheet(SheetId(1)))));
+    }
+
+    #[gpui::test]
+    fn select_sheet_while_editing_commits_pending_edit(cx: &mut TestAppContext) {
+        // Rapid-edit crash regression (`components/grid.md`): switching sheets while the formula bar
+        // is mid-edit must commit the pending edit to the CURRENT sheet's cell first — not leave the
+        // field Editing (which the deferred `switch_grid_to_sheet` would drive into
+        // `on_selection_changed` while Editing, panicking / silently discarding the edit).
+        let h = two_sheets(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.test_type("=1+1", window, cx);
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        h.client.take_commands();
+        upd(&h, cx, |c, window, cx| {
+            c.select_sheet(SheetId(1), window, cx)
+        });
+        // The pending edit committed (not lost), and the field is no longer Editing.
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Idle);
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.active_sheet()), SheetId(1));
+        let cmds = h.client.take_commands();
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Command::SetCellInput { sheet, cell: cc, input }
+                    if *sheet == SheetId(0) && *cc == cell(0, 0) && input == "=1+1"
+            )),
+            "the edit must commit to the source sheet's cell before the switch, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn select_sheet_blocked_by_cap_rejected_edit(cx: &mut TestAppContext) {
+        // A cap-rejected edit blocks the sheet switch: stay on the current sheet, keep editing.
+        let h = two_sheets(cx);
+        let huge = format!("={}", "1".repeat(MAX_INPUT_LEN));
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(0, 0)), window, cx);
+            c.test_type(&huge, window, cx);
+        });
+        h.client.take_commands();
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| {
+            c.select_sheet(SheetId(1), window, cx)
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.active_sheet()), SheetId(0));
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.data_mode()), FieldMode::Editing);
+        assert!(
+            !h.grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::SetActiveSheet(_))),
+            "a cap-rejected edit must not switch sheets"
+        );
     }
 
     #[gpui::test]

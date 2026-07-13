@@ -439,7 +439,9 @@ because they call `handle_data_row_edit_key` directly instead of routing an actu
   mirror). Z-order/clip: the overlay is already `deferred()` (above cells + selection borders) and
   lives inside the `overflow_hidden` content container (clips at the viewport edges).
 
-- **Judgment call — wrap-on box grows but the hosted input stays single-line.** The chrome's
+- **Judgment call — wrap-on box grows but the hosted input stays single-line.** *(Superseded by the
+  `cell-editor-wrapping` task — the shared input is now multi-line and a wrap-on editor truly wraps
+  its live text; the paragraph below is the original, now-historical rationale.)* The chrome's
   `in_cell_input` is a **single-line** `InputState` (Enter commits; making it multi-line would turn
   Enter into a newline and break commit-on-Enter — out of scope for a geometry fix). So a wrap-on
   editor grows its **box** downward to the wrapped height, with the single-line input pinned to the
@@ -448,6 +450,22 @@ because they call `handle_data_row_edit_key` directly instead of routing an actu
   (wrap-off grow-right) is fully functional; genuine multi-line editing of a wrap-on cell would need
   the shared input reworked into a multi-line mode with Enter-commit interception, deferred as a
   possible follow-up. See the `incell_editor_grow_wrap` baseline.
+  - **Follow-up shipped (`cell-editor-wrapping`).** `new_in_cell_input_state` builds the reused
+    in-cell input as **multi-line** (`submit_on_enter` as a belt-and-braces so Enter never becomes a
+    newline), and the grid's root **`capture_action`** intercepts the input's `Enter` action in the
+    CAPTURE phase (before the input's own handler) to commit + move — Enter → down, Shift+Enter → up
+    — so no newline is ever written. Each frame the grid flips the input's `set_soft_wrap` to the
+    edited cell's `wrap` (guarded so the notifying setter fires only on a real change): **ON** for a
+    wrap-on cell (its editor wraps + grows down, top-aligned, filling the grown box), **OFF** for a
+    wrap-off cell (unchanged — one line, grows right). The wrapped box HEIGHT is measured at the hosted
+    input's ACTUAL soft-wrap width — the box width minus `IN_CELL_WRAP_CHROME_PX` (accent border +
+    wrapper padding + gpui-component's `RIGHT_MARGIN`), i.e. `col_w − 16`, which is 16 px narrower than
+    the editor *box* width and 8 px narrower than the committed cell's *text area* (`col_w − 8`) — plus
+    the border, and the input's line box is the `round(phi·font_px)` the measurement uses;
+    measuring at the committed (wider) text-area width would under-count lines and clip the last one (guarded by
+    the `in_cell_wrap_height_measured_at_narrower_editor_width` unit test + the
+    `incell_editor_wrap_boundary` render case). Wrap-off in-cell baselines are pixel-identical; the
+    `incell_editor_grow_wrap` baseline moved (now shows every wrapped line, no truncation).
 
 - **Type-to-replace untouched.** That path edits in the data row (no in-cell overlay box), so it is
   left as-is; the overlay change only affects the double-click/F2 in-cell editor.

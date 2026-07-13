@@ -14,7 +14,6 @@ use gpui::{
     div, prelude::*, px, rgb, size, App, AsyncApp, Bounds, Context, Entity, Point, SharedString,
     Window, WindowBounds, WindowOptions,
 };
-use gpui_component::input::InputState;
 use gpui_component::Root;
 use gpui_platform::application;
 
@@ -130,7 +129,9 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     }
                     if let Some((row, col, text)) = in_cell {
                         let input = cx.new(|cx| {
-                            let mut state = InputState::new(window, cx);
+                            // Same multi-line control the chrome builds, so the captured overlay
+                            // wraps/grows exactly like the real editor.
+                            let mut state = freecell_app::grid::new_in_cell_input_state(window, cx);
                             state.set_value(text, window, cx);
                             state
                         });

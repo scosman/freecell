@@ -481,7 +481,7 @@ impl ChromeView {
         cx: &mut Context<Self>,
     ) -> Self {
         let content_input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
-        let in_cell_input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
+        let in_cell_input = cx.new(|cx| crate::grid::new_in_cell_input_state(window, cx));
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let chart_title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Chart title"));
         let chart_cat_axis_input =
@@ -974,6 +974,12 @@ impl ChromeView {
 
     /// The in-cell overlay input emitted an event: `Change` drives the shared edit (mirrored to the
     /// data row); `PressEnter` commits + moves; `Focus` makes the in-cell editor the driver.
+    ///
+    /// Note: since the multi-line in-cell input landed, the grid root's `capture_action` intercepts
+    /// Enter (and Shift+Enter) and commits via `InCellCommitMove` — so the input no longer emits
+    /// `PressEnter` in the normal path. The `PressEnter` arm below is now a **fallback** (e.g. the
+    /// `submit_on_enter` plain-Enter path if the capture ever misses); it stays because it is still
+    /// the correct commit behaviour when it does fire.
     fn on_incell_event(
         &mut self,
         _input: &Entity<InputState>,

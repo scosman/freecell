@@ -994,9 +994,9 @@ pub fn all() -> Vec<RenderCase> {
             "A really long label that grows the editor rightward over its neighbours",
         ),
         RenderCase::new(
-            // A wrap-ON in-cell editor GROWS DOWNWARD (taller) instead of rightward, previewing the
-            // committed multi-line footprint; its hosted single-line input stays a first-line control
-            // at the top (`DECISIONS_TO_REVIEW.md`).
+            // A wrap-ON in-cell editor GROWS DOWNWARD (taller) instead of rightward and its hosted
+            // multi-line input SOFT-WRAPS the live text at the cell width, so the whole string stays
+            // visible while editing (`DECISIONS_TO_REVIEW.md` → `cell-editor-wrapping`).
             "incell_editor_grow_wrap",
             Scene::new().input(1, 1, "x").col_width(1, 96.0).wrap(1, 1),
             (480, 220),
@@ -1006,6 +1006,37 @@ pub fn all() -> Vec<RenderCase> {
             1,
             1,
             "wrap this text onto several visual lines while editing in place",
+        ),
+        RenderCase::new(
+            // BUG A regression guard: a LARGE-font (24 pt) wrap-off in-cell editor must render the
+            // tall glyph (ascenders + descenders) WITHOUT vertical clipping. The multi-line input's
+            // auto-height honours the overridden font-scaled line box, replacing the removed
+            // `incell_input_geometry` control-height floor (`cell-editor-wrapping`).
+            "incell_editor_large_font",
+            Scene::new()
+                .input(1, 1, "x")
+                .font(1, 1, None, Some(24.0))
+                .row_height(1, 38.0),
+            CELL_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(1, 1, "Typography"),
+        RenderCase::new(
+            // Boundary-crossing regression guard: this string wraps to one MORE visual line at the
+            // editor's real wrap width (box − border − padding − gpui RIGHT_MARGIN = 104 px) than at
+            // the committed cell width (112 px). The wrapped-height measurement uses the editor's
+            // narrower width, so the extra last line has a row in the box and is NOT clipped
+            // (`cell-editor-wrapping`; the string is the one asserted boundary-crossing in
+            // `in_cell_wrap_height_measured_at_narrower_editor_width`).
+            "incell_editor_wrap_boundary",
+            Scene::new().input(1, 1, "x").col_width(1, 120.0).wrap(1, 1),
+            (480, 240),
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .in_cell(
+            1,
+            1,
+            "several short words that wrap onto more lines when narrower",
         ),
         // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
         cell(

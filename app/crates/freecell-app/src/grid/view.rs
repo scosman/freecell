@@ -21,7 +21,7 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, TextRun,
     Window,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Enter as InputEnter, Input, InputState};
 use gpui_component::spinner::Spinner;
 use gpui_component::{Icon, IconName, Sizable as _};
 
@@ -279,6 +279,12 @@ pub struct GridView {
     /// live text: rightward over neighbours for a wrap-off cell, downward for a wrap-on one
     /// (`DECISIONS_TO_REVIEW.md`). Only the single editing cell is measured, so it stays O(1)/frame.
     incell_geom: Option<(f32, f32)>,
+    /// The soft-wrap flag last pushed to the reused (multi-line) in-cell input, or `None` when the
+    /// editor is closed / a fresh input was installed. [`Render::render`] flips the input's soft-wrap
+    /// to the edited cell's `wrap` (ON grows the editor down + wraps; OFF keeps it one line + grows
+    /// right); this guards that flip so the notifying `set_soft_wrap` fires only on an actual change,
+    /// never every frame (which would re-render-loop).
+    incell_soft_wrap: Option<bool>,
     /// Whether the current pending edit is in **quick-edit** mode (pushed by the chrome via
     /// [`set_edit_state`](Self::set_edit_state), `functional_spec.md §5`). Consumed by the grid-root
     /// `capture_key_down` so an unmodified arrow in the in-cell overlay commits + moves the active
@@ -543,6 +549,7 @@ impl GridView {
             bounds: None,
             mirror: None,
             incell_open: None,
+            incell_soft_wrap: None,
             incell_input: None,
             incell_cap: None,
             incell_geom: None,
@@ -691,9 +698,14 @@ impl GridView {
     }
 
     /// Installs the reused in-cell editor input the chrome owns, so the grid can render the overlay
-    /// (`components/edit_controller.md §4.4`). Called once at window wiring time.
+    /// (`components/edit_controller.md §4.4`). Called once at window wiring time. The input MUST be a
+    /// **multi-line** [`InputState`] (build it with [`new_in_cell_input_state`]): the render path
+    /// drives [`InputState::set_soft_wrap`], which `debug_assert!`s multi-line, so a single-line input
+    /// would panic in debug builds.
     pub fn set_incell_input(&mut self, input: Entity<InputState>, cx: &mut Context<Self>) {
         self.incell_input = Some(input);
+        // A fresh input's soft-wrap state is unknown; force `Render::render` to re-push it.
+        self.incell_soft_wrap = None;
         cx.notify();
     }
 
@@ -2761,21 +2773,27 @@ impl GridView {
 
     /// The wrap-driven row-height a set of same-row wrap-on cells needs (`functional_spec.md §3.2`):
     /// the **max** over the cells of each cell's own wrapped height. A cell's height is
-    /// `lines * line_height + vpad`, where `lines` is its soft-wrap line count at the column width
+    /// `lines * line_height + vpad`, where `lines` is its soft-wrap line count at the text width
     /// (from gpui's real `LineWrapper`, so the grown row fits the text the grid actually paints,
     /// summed over its explicit-`\n` segments) and `line_height` is gpui's default **`phi`** line box
     /// (`round(1.618 * font_px)`, matching `Style::line_height` — NOT a made-up factor, so the row
     /// fits the rendered lines exactly). `vpad` is the slack a single default line leaves in the
     /// default row height, so a one-line default cell measures to the default. Clamped to
     /// `[default, MAX_AUTO_ROW_HEIGHT_PX]` (content beyond the cap clips within the cell).
-    fn measure_wrap_height(cells: &[&WrapCell], window: &mut Window) -> f32 {
+    ///
+    /// `h_inset` is the horizontal px to subtract from each cell's `col_w` to get the text wrap width:
+    /// the committed-cell path passes `2 × CELL_H_PAD` (the cell's own padding); the in-cell editor
+    /// passes [`IN_CELL_WRAP_CHROME_PX`] so the measurement matches the hosted input's narrower
+    /// soft-wrap width (border + wrapper padding + gpui's `RIGHT_MARGIN`), or the editor would wrap to
+    /// more lines than the box was sized for and clip the last one.
+    fn measure_wrap_height(cells: &[&WrapCell], h_inset: f32, window: &mut Window) -> f32 {
         let line_px = |font_px: f32| (GRID_LINE_HEIGHT_FACTOR * font_px).round();
         // The vertical slack a default single line leaves (so `lines == 1` at the default size ⇒ the
         // default row height).
         let vpad = DEFAULT_ROW_HEIGHT_PX - line_px(CELL_FONT_PX);
         let mut needed = DEFAULT_ROW_HEIGHT_PX;
         for wc in cells {
-            let avail = (wc.col_w - 2.0 * CELL_H_PAD).max(1.0);
+            let avail = (wc.col_w - h_inset).max(1.0);
             let family = wc
                 .font_family
                 .clone()
@@ -2852,7 +2870,7 @@ impl GridView {
             let sig = Self::wrap_row_signature(&cells);
             fresh_sigs.insert(*row, sig);
             if self.wrap_sig.get(row) != Some(&sig) {
-                let px = Self::measure_wrap_height(&cells, window);
+                let px = Self::measure_wrap_height(&cells, 2.0 * CELL_H_PAD, window);
                 heights.push((*row, px));
             }
         }
@@ -2905,7 +2923,10 @@ impl GridView {
         let mut grown: Vec<(u32, f32)> = Vec::new();
         for (row, idxs) in &by_row {
             let cells: Vec<&WrapCell> = idxs.iter().map(|&i| &self.wrap_cells[i]).collect();
-            grown.push((*row, Self::measure_wrap_height(&cells, window)));
+            grown.push((
+                *row,
+                Self::measure_wrap_height(&cells, 2.0 * CELL_H_PAD, window),
+            ));
         }
 
         {
@@ -3695,15 +3716,31 @@ const IN_CELL_DANGER: u32 = 0xDC2626;
 /// Dark tooltip fill + text for the in-cell cap-error popover (`ui_design.md §4`, matching chrome).
 const IN_CELL_TOOLTIP_BG: u32 = 0x2B2B2B;
 const IN_CELL_TOOLTIP_TEXT: u32 = 0xF5F5F5;
-/// The in-cell editor wrapper's total vertical border: `border_2` = 2 px top + 2 px bottom. The
-/// hosted input's height is the cell height minus this, floored at the line box (see
-/// [`incell_input_geometry`]).
+/// The in-cell editor wrapper's total border, both axes: `border_2` = 2 px each side (uniform), so
+/// 4 px vertically (top+bottom) and 4 px horizontally (left+right). A wrap-on editor adds this to the
+/// measured wrapped-text height so the box has room for its border around the full text area, and its
+/// hosted input fills the box height minus this (`in_cell_overlay_elements`).
 const IN_CELL_BORDER_TOTAL_PX: f32 = 4.0;
-/// Line-box factor for the in-cell editor's hosted input, applied to the font px so the line box
-/// scales with the font instead of gpui-component's fixed `Rems(1.25)` (= 20 px at the 16 px rem).
-/// Numerically the same `1.25` the engine's row auto-grow uses (`worker/run.rs`:
-/// `ceil(font_px * 1.25) + 4`) — but that height is in IronCalc space and is scaled ×24/28 to
-/// device px before it reaches the render path, so the two do NOT cancel (see below).
+/// The in-cell editor wrapper's horizontal padding, **per side** (`.px(px(1.0))`). Used both to draw
+/// the wrapper and to compute the hosted input's soft-wrap width ([`IN_CELL_WRAP_CHROME_PX`]).
+const IN_CELL_WRAP_PADDING_PX: f32 = 1.0;
+/// gpui-component's fixed right margin on a multi-line `Input`'s wrap width (`input/element.rs`:
+/// `wrap_width = bounds.width - line_number_width - RIGHT_MARGIN`, `RIGHT_MARGIN = px(10.)`; there
+/// are no line numbers here). The hosted input therefore soft-wraps this many px short of its own
+/// bounds — so the wrap-height measurement must subtract it or the input would wrap to MORE lines
+/// than the box was sized for and clip the last one.
+const IN_CELL_INPUT_RIGHT_MARGIN_PX: f32 = 10.0;
+/// The total horizontal px the wrap-on in-cell editor's soft-wrap width loses versus the overlay box
+/// width: the accent border ([`IN_CELL_BORDER_TOTAL_PX`], 4), the wrapper's padding on both sides
+/// (`2 ×` [`IN_CELL_WRAP_PADDING_PX`], 2), and gpui-component's [`IN_CELL_INPUT_RIGHT_MARGIN_PX`]
+/// (10) → 16. The input wraps at `box_w - IN_CELL_WRAP_CHROME_PX`; the wrapped height is measured at
+/// exactly that width so every line the input paints has a row in the box (no vertical truncation).
+const IN_CELL_WRAP_CHROME_PX: f32 =
+    IN_CELL_BORDER_TOTAL_PX + 2.0 * IN_CELL_WRAP_PADDING_PX + IN_CELL_INPUT_RIGHT_MARGIN_PX;
+/// Line-box factor for a **wrap-off** in-cell editor's hosted input, applied to the font px so the
+/// line box scales with the font instead of gpui-component's fixed `Rems(1.25)` (= 20 px at the
+/// 16 px rem). Kept tight (`1.25`) so a big font overflows the short single-line cell wrapper only a
+/// hair (visible, not clipped) rather than by the taller `phi` factor a wrap-on editor uses.
 const IN_CELL_LINE_HEIGHT_FACTOR: f32 = 1.25;
 
 /// Pure sizing math for the in-cell editor overlay's grown box (`DECISIONS_TO_REVIEW.md`): given the
@@ -3801,40 +3838,6 @@ fn measure_incell_text_width(
         .as_f32()
 }
 
-/// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
-/// clipped vertically (BUG A): `(control_height, line_height)` in **device** px.
-///
-/// - `line_height` = `font_px * 1.25` — font-relative, so the line box scales with the glyph.
-/// - `control_height` = `(h - 4).max(line_height)` — the wrapper's inner box (cell height `h` minus
-///   the 2 px top+bottom accent border), **floored at the line box**.
-///
-/// gpui-component's single-line `Input` otherwise pins a FIXED control height (`Size::Medium` →
-/// `h_8` = 32 px, `input.rs`) and a FIXED line height (`const LINE_HEIGHT: Rems = Rems(1.25)` =
-/// 20 px, `input.rs`), both independent of the applied `text_size`. A 24 pt (= 32 px) glyph then
-/// overflows the 20 px line box inside the 32 px control and is cut off — while the committed cell
-/// (`cell_element`, a plain `div().h(px(h)).text_size(..)` whose line height scales with the font)
-/// renders it fine.
-///
-/// Why the floor is needed (unit spaces do NOT cancel): `h` arrives in device px — it is the row
-/// auto-grow height, which the engine computes in IronCalc space (`worker/run.rs`:
-/// `ceil(font_px * 1.25) + 4`, in the 28 px-default IronCalc space) and then scales to device px by
-/// ×24/28 (`freecell-engine::cache::row_px`). But the glyph renders at pure device px
-/// (`pt * 96/72`, no 24/28). So for an auto-grown large font `h - 4` lands ~15 % *below*
-/// `line_height` (e.g. 24 pt: device `h ≈ 44 * 24/28 ≈ 37.7`, `h - 4 ≈ 33.7 < 40`). The
-/// `.max(line_height)` floor keeps the control at least as tall as its own line box, so the glyph
-/// is never clipped; when `h - 4 < line_height` the `Input` simply overflows the cell wrapper by a
-/// few px (single-line `Input` has only `overflow_x_hidden` — no vertical mask — so the overflow
-/// stays visible and vertically centered, not cut off). Pure so it is unit-testable; the on-screen
-/// result (that the `Input` honours these) is the owner's Mac check.
-fn incell_input_geometry(h: f32, font_px: f32) -> (f32, f32) {
-    let line_h = font_px * IN_CELL_LINE_HEIGHT_FACTOR;
-    // Floor at the line box so `line_h <= control_h` in ALL cases (auto-grown large fonts, default
-    // cells, and short/min-height rows). `.max(0.0)` keeps a torn/negative `h` from underflowing;
-    // `.max(line_h)` (line_h >= 0) subsumes it but the guard is kept for robustness.
-    let control_h = (h - IN_CELL_BORDER_TOTAL_PX).max(0.0).max(line_h);
-    (control_h, line_h)
-}
-
 /// The in-cell editor's resolved text attributes for a cell — the WYSIWYG font the overlay renders
 /// (BUG #4). Mirrors [`cell_element`]'s resolution so editing looks like the committed cell.
 struct IncellFont {
@@ -3872,7 +3875,54 @@ fn resolve_incell_font(style: Option<RenderStyle>, families: &[SharedString]) ->
     }
 }
 
+/// Builds the reused in-cell editor [`InputState`] — shared by the chrome (which owns it) and the
+/// render-tests harness so both render the identical control.
+///
+/// It is a **multi-line** input: a wrap-on cell's editor then soft-wraps its live text at the cell
+/// width and grows downward, showing the whole string while editing (mirroring how a wrap-off editor
+/// grows rightward). The grid flips [`InputState::set_soft_wrap`] per the edited cell's wrap each
+/// frame — OFF for a wrap-off cell (its editor stays one line and grows right, as before), ON for a
+/// wrap-on cell.
+///
+/// **Enter never writes a newline.** The grid root's `capture_action` (in [`Render::render`]'s
+/// element) intercepts the input's `Enter` action in the CAPTURE phase — before the input's own
+/// handler — for BOTH Enter and Shift+Enter, so neither reaches the input. `submit_on_enter` here is
+/// only a belt-and-braces fallback and it covers **plain Enter only**: per gpui-component's `enter()`
+/// (`insert_newline = is_multi_line && (!submit_on_enter || shift)`) a Shift+Enter would still insert
+/// a newline in the input's own handler, so Shift+Enter's no-newline guarantee rests *entirely* on
+/// the `capture_action` interception, not on this flag.
+pub fn new_in_cell_input_state(window: &mut Window, cx: &mut Context<InputState>) -> InputState {
+    InputState::new(window, cx)
+        .multi_line(true)
+        .submit_on_enter(true)
+        .placeholder("")
+}
+
 impl GridView {
+    /// Flips the reused multi-line in-cell input's soft-wrap to match the edited cell's `wrap`, so a
+    /// wrap-on cell's editor wraps its live text at the cell width (growing downward) while a wrap-off
+    /// cell's editor stays one line (growing rightward). No-op when the editor is closed. Guarded by
+    /// [`incell_soft_wrap`](Self::incell_soft_wrap): [`InputState::set_soft_wrap`] notifies, so it is
+    /// pushed only when the value actually changes — never every frame (that would re-render-loop).
+    fn sync_incell_soft_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cell) = self.incell_open else {
+            self.incell_soft_wrap = None;
+            return;
+        };
+        let wrap = self
+            .visible_styles
+            .get(&(cell.row, cell.col))
+            .map(|s| s.wrap)
+            .unwrap_or(false);
+        if self.incell_soft_wrap == Some(wrap) {
+            return;
+        }
+        if let Some(input) = self.incell_input.clone() {
+            input.update(cx, |input, cx| input.set_soft_wrap(wrap, window, cx));
+        }
+        self.incell_soft_wrap = Some(wrap);
+    }
+
     /// Measures the in-cell editor overlay's grown, viewport-clamped `(width, height)` for `cell`
     /// this frame (`DECISIONS_TO_REVIEW.md`). Reads the live edit text straight from the hosted
     /// [`InputState`] — the exact glyphs the input paints, so the grown box fits them, and it tracks
@@ -3907,9 +3957,16 @@ impl GridView {
             underline: _,
         } = resolve_incell_font(style, &self.visible_font_families);
         if wrap {
-            // Measure the wrapped height of the live text at the cell's own width, reusing the Phase 7
-            // measurement (clamped to `[default, MAX_AUTO_ROW_HEIGHT_PX]`); `incell_editor_size` then
-            // floors it at the cell height and re-applies the cap.
+            // Measure the wrapped height at the EDITOR'S box + wrap width, not the committed cell's,
+            // so every line the hosted input paints has a row in the box (no vertical truncation):
+            //   - `col_w` is the editor box width (`cell_w.max(IN_CELL_MIN_W)`, what `incell_editor_size`
+            //     returns for a wrap-on cell), not `cell_w` — a sub-min-width cell edits in an 80 px box.
+            //   - `measure_wrap_height` subtracts `IN_CELL_WRAP_CHROME_PX` (border + wrapper padding +
+            //     gpui's `RIGHT_MARGIN`) to hit the input's actual, narrower soft-wrap width.
+            //   - `+ IN_CELL_BORDER_TOTAL_PX` gives the box room for its own accent border AROUND that
+            //     measured text area (the committed-row height leaves only `vpad ≈ 3 px < 4 px` border).
+            // `incell_editor_size` then floors at the cell height and re-applies the `MAX_...` cap.
+            let box_w = cell_w.max(IN_CELL_MIN_W);
             let wc = WrapCell {
                 row: cell.row,
                 text,
@@ -3917,9 +3974,10 @@ impl GridView {
                 bold,
                 italic,
                 font_family: family,
-                col_w: cell_w,
+                col_w: box_w,
             };
-            let wrapped_h = Self::measure_wrap_height(&[&wc], window);
+            let wrapped_h = Self::measure_wrap_height(&[&wc], IN_CELL_WRAP_CHROME_PX, window)
+                + IN_CELL_BORDER_TOTAL_PX;
             Some(incell_editor_size(
                 x,
                 cell_w,
@@ -3991,26 +4049,39 @@ impl GridView {
             self.visible_styles.get(&(cell.row, cell.col)).copied(),
             &self.visible_font_families,
         );
-        // Size the hosted input to (at least) its own font-scaled line box so a large font is not
-        // clipped vertically (BUG A). gpui-component's single-line `Input` pins a fixed 32 px
-        // control height (`Size::Medium` → `h_8`) and a fixed 20 px line height (`Rems(1.25)`)
-        // regardless of `text_size`; `Input::h()`/`h_full()` only affect multi-line mode, so pin
-        // the single-line control height via `min_h`/`max_h` (both applied after gpui-component's
-        // `input_h` via `refine_style`) and override the line box. `incell_input_geometry` fills the
-        // cell inner height where it can and floors at the line box otherwise (the control may then
-        // overflow the cell wrapper a few px — visible, not clipped; see its doc). Sized from the
-        // CELL height (not the grown box `h`): a wrap-on editor grows its box downward but its hosted
-        // single-line input stays a first-line control at the top, so the caret is not left floating
-        // in the middle of a tall box.
-        let (control_h, line_h) = incell_input_geometry(cell_h, font_px);
+        // The hosted input is multi-line (`new_in_cell_input_state`) so a wrap-on cell soft-wraps.
+        // gpui-component renders a multi-line `Input` at its content height (`h_auto`) unless an
+        // explicit `Input::h()` pins it, and honours our `text_size` + overridden `line_height`
+        // (both applied after its defaults via `refine_style`) — so a large glyph is never clipped
+        // (BUG A: the input grows to its own line box instead of a fixed 20 px one). `px_0`/`py_0`
+        // strip the control's own padding so glyphs line up with the cell text.
+        //
+        // - **Wrap-off:** left at `h_auto` — a single natural-height line the wrapper centres in the
+        //   cell (`items_center`); the box grows rightward (`w`) to keep the whole string on one line
+        //   (soft-wrap is turned OFF for these cells in `Render::render`). Line box `1.25×` (kept
+        //   tight so a big font overflows the short cell wrapper only a hair — visible, not clipped).
+        // - **Wrap-on:** pinned to the grown box's inner height so every soft-wrapped line shows and
+        //   content past the `MAX_AUTO_ROW_HEIGHT_PX` cap scrolls inside the input rather than
+        //   painting past the box; top-aligned (`items_start`). Line box is the grid's `phi` factor,
+        //   ROUNDED to exactly match `measure_wrap_height`'s per-line height — so the measured box
+        //   height (`lines × round(phi·font_px) + vpad`) fits the input's rendered lines to the pixel
+        //   (no sub-pixel accumulation across many lines) and matches the committed cell (WYSIWYG).
+        let line_h = if wrap {
+            (GRID_LINE_HEIGHT_FACTOR * font_px).round()
+        } else {
+            font_px * IN_CELL_LINE_HEIGHT_FACTOR
+        };
         let mut input_el = Input::new(input)
             .appearance(false)
             .text_size(px(font_px))
             .px_0()
+            .py_0()
             .w_full()
-            .min_h(px(control_h))
-            .max_h(px(control_h))
             .line_height(px(line_h));
+        if wrap {
+            let inner_h = (h - IN_CELL_BORDER_TOTAL_PX).max(line_h);
+            input_el = input_el.h(px(inner_h));
+        }
         if let Some(name) = family {
             input_el = input_el.font_family(name);
         }
@@ -4038,13 +4109,15 @@ impl GridView {
             .occlude()
             .flex()
             // Wrap-off: the box is the cell height, so centre the single line. Wrap-on: the box grows
-            // downward, so pin the input to the top (first line) — see `incell_input_geometry` above.
+            // downward, so pin the wrapped lines to the top (the input fills the box height above).
             .when(wrap, |d| d.items_start())
             .when(!wrap, |d| d.items_center())
             .bg(rgb(CELL_BG))
             .border_2()
             .border_color(border)
-            .px(px(1.0))
+            // Horizontal padding is part of the input's wrap-width chrome (`IN_CELL_WRAP_CHROME_PX`);
+            // keep the two in lockstep via the shared constant.
+            .px(px(IN_CELL_WRAP_PADDING_PX))
             .text_size(px(font_px))
             .text_color(rgb(CELL_TEXT))
             // Strip the hosted input's own chrome (border / rounded / background / shadow) via
@@ -4147,6 +4220,11 @@ impl Render for GridView {
             self.incell_geom = self
                 .incell_open
                 .and_then(|cell| self.measure_incell_geom(cell, &frame, window, cx));
+            // Keep the reused multi-line in-cell input's soft-wrap matching the edited cell's `wrap`
+            // (ON: the editor wraps + grows down; OFF: it stays one line + grows right). Guarded by
+            // `incell_soft_wrap` so the notifying `set_soft_wrap` fires only when it actually flips —
+            // never per frame (that would re-render-loop).
+            self.sync_incell_soft_wrap(window, cx);
             root_children.extend(self.build_grid_layers(&frame, None));
             // Wrap-driven row auto-grow (`functional_spec.md §3`): measure the just-laid-out wrap-on
             // cells and, for rows whose wrap inputs changed, ask the worker to grow/shrink them.
@@ -4235,9 +4313,29 @@ impl Render for GridView {
                     this.handle_mouse_up(event, window, cx);
                 }),
             )
+            // Enter commits + moves (Excel: Enter → down, Shift+Enter → up). The in-cell input is
+            // multi-line (so a wrap-on cell soft-wraps), where the input's `Enter` action would
+            // otherwise insert a newline. gpui dispatches that action BEFORE the `capture_key_down`
+            // listeners, so intercept the action itself in the CAPTURE phase (grid ancestor runs
+            // before the input's bubble-phase handler): `stop_propagation` keeps the input from ever
+            // writing a newline into the cell value. Gated on an open overlay; the data-row editor
+            // lives outside the grid tree, so its Enter is untouched.
+            .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
+                if this.incell_open.is_none() {
+                    return;
+                }
+                cx.stop_propagation();
+                let dir = if action.shift {
+                    Direction::Up
+                } else {
+                    Direction::Down
+                };
+                this.events
+                    .emit(&GridEvent::InCellCommitMove(dir), window, cx);
+            }))
             // Tab / Escape in the in-cell overlay, captured **before** the input consumes them
             // (`components/edit_controller.md §Tab interception`); routed to the chrome's commit /
-            // cancel via the window. Everything else (typing, arrows, Enter) reaches the input.
+            // cancel via the window. Everything else (typing, arrows) reaches the input.
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if this.incell_open.is_none() {
                     return;
@@ -5452,7 +5550,7 @@ mod tests {
         let g_slot = &mut g_out;
         let in_slot = &mut in_out;
         let window = cx.open_window(size(px(1200.0), px(800.0)), |window, cx| {
-            let input = cx.new(|cx| InputState::new(window, cx));
+            let input = cx.new(|cx| new_in_cell_input_state(window, cx));
             *in_slot = Some(input.clone());
             let sink_input = input.clone();
             let sink = GridEventSink::new(move |e, window, cx| {
@@ -5477,7 +5575,7 @@ mod tests {
         let (g, window, events) = grid_recording(cx);
         let input = window
             .update(cx, |_root, window, cx| {
-                let input = cx.new(|cx| InputState::new(window, cx));
+                let input = cx.new(|cx| new_in_cell_input_state(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
                     grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
@@ -5499,6 +5597,106 @@ mod tests {
             "Escape in the focused in-cell editor must route through capture_key_down: {:?}",
             events.borrow()
         );
+    }
+
+    #[gpui::test]
+    fn enter_in_focused_in_cell_editor_commits_and_does_not_insert_newline(
+        cx: &mut TestAppContext,
+    ) {
+        // The in-cell input is multi-line (so a wrap-on cell soft-wraps), where Enter would otherwise
+        // insert a newline. The grid root's `capture_action(InputEnter)` must intercept the Enter
+        // action in the CAPTURE phase (before the input's own handler) and emit a commit-move (Enter →
+        // down, Shift+Enter → up) WITHOUT the input writing a newline into the value — the property the
+        // whole wrapping change relies on.
+        let (g, window, events) = grid_recording(cx);
+        let input = window
+            .update(cx, |_root, window, cx| {
+                let input = cx.new(|cx| new_in_cell_input_state(window, cx));
+                input.update(cx, |i, cx| i.set_value("hello", window, cx));
+                g.update(cx, |grid, cx| {
+                    grid.set_incell_input(input.clone(), cx);
+                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                });
+                input
+            })
+            .unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| input.update(cx, |i, cx| i.focus(window, cx)));
+        vcx.run_until_parked();
+
+        events.borrow_mut().clear();
+        vcx.simulate_keystrokes("enter");
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::InCellCommitMove(Direction::Down))),
+            "Enter must route through capture_action as a commit-move Down: {:?}",
+            events.borrow()
+        );
+
+        events.borrow_mut().clear();
+        vcx.simulate_keystrokes("shift-enter");
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::InCellCommitMove(Direction::Up))),
+            "Shift+Enter must route through capture_action as a commit-move Up: {:?}",
+            events.borrow()
+        );
+
+        // The interception ran BEFORE the multi-line input's own `enter` action, so no newline was
+        // written — the value is still the single line it started as.
+        assert_eq!(
+            input.read_with(cx, |i, _| i.value().to_string()),
+            "hello",
+            "Enter must not insert a newline into the in-cell value"
+        );
+    }
+
+    #[gpui::test]
+    fn in_cell_wrap_height_measured_at_narrower_editor_width(cx: &mut TestAppContext) {
+        // The hosted input soft-wraps at `box_w - IN_CELL_WRAP_CHROME_PX` (border + wrapper padding +
+        // gpui's RIGHT_MARGIN) — NARROWER than the committed cell's `col_w - 2*CELL_H_PAD`. So the
+        // box height must be measured at the editor's inset, not the committed one, or the input wraps
+        // to more lines than the box was sized for and clips the last one. This proves (a) the editor
+        // inset never under-measures vs the committed inset (monotonic: narrower ⇒ ≥ lines) and (b)
+        // for a boundary-crossing string it measures a STRICTLY taller box — the regression this fix
+        // exists to prevent (the pre-fix code measured at the committed inset for both).
+        let (_g, window, _events) = grid_recording(cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, _cx| {
+            let wc = |text: &str, col_w: f32| WrapCell {
+                row: 0,
+                text: text.into(),
+                font_px: CELL_FONT_PX,
+                bold: false,
+                italic: false,
+                font_family: None,
+                col_w,
+            };
+            let measure = |text: &str, col_w: f32, inset: f32, window: &mut Window| {
+                GridView::measure_wrap_height(&[&wc(text, col_w)], inset, window)
+            };
+            // A ~120 px box: committed text width 112 px, editor text width 104 px. This string wraps
+            // to one MORE visual line at 104 than at 112, so the editor box is strictly taller.
+            let text = "several short words that wrap onto more lines when narrower";
+            let col_w = 120.0;
+            let committed = measure(text, col_w, 2.0 * CELL_H_PAD, window);
+            let editor = measure(text, col_w, IN_CELL_WRAP_CHROME_PX, window);
+            assert!(
+                editor >= committed,
+                "narrower editor wrap must never measure SHORTER than the committed cell: \
+                 editor {editor} < committed {committed}"
+            );
+            assert!(
+                editor > committed,
+                "this boundary-crossing string must need a taller editor box than the committed \
+                 cell (else it does not guard the regression): editor {editor} vs committed {committed}"
+            );
+        });
     }
 
     #[gpui::test]
@@ -5555,7 +5753,7 @@ mod tests {
         let (g, window, events) = grid_recording(cx);
         window
             .update(cx, |_root, window, cx| {
-                let input = cx.new(|cx| InputState::new(window, cx));
+                let input = cx.new(|cx| new_in_cell_input_state(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input, cx);
                     grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
@@ -5742,58 +5940,6 @@ mod tests {
     }
 
     #[test]
-    fn incell_input_floors_control_at_line_box() {
-        // BUG A: the hosted single-line `Input` must never be shorter than its own font-scaled line
-        // box, else a large glyph is clipped. The subtlety the floor guards: `h` arrives in DEVICE
-        // px — the row auto-grow height, computed by the engine in IronCalc space
-        // (`worker/run.rs`: ceil(font_px*1.25)+4) and scaled ×24/28 to device px
-        // (`freecell-engine::cache::row_px`) — while the glyph renders at pure device px
-        // (pt*96/72, no 24/28). So for an auto-grown large font `h - 4` lands ~15 % *below*
-        // `line_h = font_px*1.25`; `.max(line_h)` is what keeps the line box inside the control.
-        // This pins the geometry the render path feeds the `Input`; the on-screen result (that the
-        // `Input` honours it) is the owner's Mac check.
-        let font_px: f32 = 24.0 * 96.0 / 72.0; // 24 pt -> 32 px, as in resolve_incell_font.
-        let line_expect = font_px * 1.25; // 40 px
-
-        // The DEVICE-px row height the app actually feeds us: the IronCalc-space auto-grow height
-        // (ceil(font_px*1.25)+4 = 44) scaled ×24/28 ≈ 37.7 px — NOT 44.
-        let needed_ic = (font_px * 1.25).ceil() + 4.0; // 44 px, IronCalc space
-        let h = needed_ic * 24.0 / 28.0; // ≈ 37.7 px device
-        assert!(
-            h - 4.0 < line_expect,
-            "precondition: without the floor control_h would be h-4 = {} px, below the line box {line_expect} px",
-            h - 4.0
-        );
-
-        let (control_h, line_h) = incell_input_geometry(h, font_px);
-        assert!((line_h - line_expect).abs() < 1e-4, "line_h = {line_h}");
-        // The floor engages: the control is lifted to the line box (≈40), NOT left at h-4 (≈33.7).
-        // Dropping `.max(line_h)` from `incell_input_geometry` makes THIS assertion fail
-        // (control_h would be ≈33.7 < 40) — it is the floor-discriminating check.
-        assert!(
-            (control_h - line_h).abs() < 1e-4,
-            "floor must lift control_h to the line box, got {control_h} (line box {line_h})"
-        );
-        assert!(line_h <= control_h + 1e-4);
-
-        // A tall/plain cell where h-4 exceeds the line box keeps the full inner height (no floor).
-        let (tall_c, tall_l) = incell_input_geometry(80.0, font_px);
-        assert!((tall_c - 76.0).abs() < 1e-6, "tall control_h = {tall_c}");
-        assert!(
-            tall_l <= tall_c,
-            "line box ({tall_l}) must fit the tall control ({tall_c})"
-        );
-
-        // A default-font cell (13 px in a 24 px row): inner height 20 > line box 16.25 → no floor.
-        let (dc, dl) = incell_input_geometry(24.0, 13.0);
-        assert!((dc - 20.0).abs() < 1e-6, "default control_h = {dc}");
-        assert!(
-            dl <= dc,
-            "default line box ({dl}) must fit the default control ({dc})"
-        );
-    }
-
-    #[test]
     fn incell_editor_size_grows_and_clamps() {
         // The pure sizing math behind the grow-right / grow-down in-cell editor
         // (`DECISIONS_TO_REVIEW.md`). Cell at content-local x=100, 64×24 px, min box 80, viewport
@@ -5881,7 +6027,7 @@ mod tests {
         let (g, window, _events) = grid_recording(cx);
         let input = window
             .update(cx, |_root, window, cx| {
-                let input = cx.new(|cx| InputState::new(window, cx));
+                let input = cx.new(|cx| new_in_cell_input_state(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
                     grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
@@ -5954,7 +6100,7 @@ mod tests {
         let cell = CellRef::new(1, 1); // B2 — the wrap-on cell in `wrap_sources`.
         let input = window
             .update(cx, |_root, window, cx| {
-                let input = cx.new(|cx| InputState::new(window, cx));
+                let input = cx.new(|cx| new_in_cell_input_state(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
                     grid.set_edit_state(None, Some(cell), None, false, cx);

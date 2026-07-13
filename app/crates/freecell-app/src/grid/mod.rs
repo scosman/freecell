@@ -27,7 +27,7 @@ use freecell_core::selection::Direction;
 use freecell_core::{CellRange, CellRef, SelectionModel};
 
 pub(crate) use view::caret_intent_modifiers;
-pub use view::{GridDataSources, GridView};
+pub use view::{new_in_cell_input_state, GridDataSources, GridView};
 
 // --- Look constants (`ui_design.md §3.3`) -------------------------------------------
 // Colours are `0xRRGGBB`, mapped onto `gpui::rgb(...)` at draw time.

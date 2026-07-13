@@ -31,9 +31,10 @@ statistics for the current selection — the hallmark "totals a selection at a g
 
 ### Behavior
 
-- **Placement:** a new full-width row at the **very bottom** of the window, below the
-  sheet-tab bar. Fixed small height. Stats render **right-aligned**; the left side is
-  reserved (empty for now — future home for mode/RxC readouts).
+- **Placement (owner-decided):** on the **right side of the existing sheet-tab bar**
+  (Google-Sheets-style) — **no** separate bottom row. The tab bar is refactored so the
+  sheet tabs stay left-aligned and the selection-stats readout sits right-aligned in the
+  same row, sharing that row's height/background.
 - **Contents (default):** `Sum`, `Average`, `Count`, shown as labeled readouts, e.g.
   `Sum: 1,234.50   Average: 246.90   Count: 5`.
 - **Min/Max toggle:** clicking anywhere on the stats readout toggles an expanded form that
@@ -82,8 +83,8 @@ statistics for the current selection — the hallmark "totals a selection at a g
 
 - **D1.1** Error cells: **count but exclude from math** (proposed) vs. propagate the error
   into Sum/Average like Excel.
-- **D1.2** Status-bar row **below the sheet tabs** (proposed) vs. integrated into the
-  sheet-tab bar's right edge.
+- **D1.2 — RESOLVED (owner, 2026-07-13):** stats live on the **right of the sheet-tab
+  bar**, no separate bottom row; the tab bar is refactored to host them.
 
 ---
 
@@ -204,9 +205,11 @@ From the active cell, moving in the arrow's direction:
 ### Correctness / responsiveness
 
 - Must be correct across the **whole sheet** (a jump can traverse up to ~1M cells), so it
-  reads occupancy beyond the viewport. It must feel **instant** (this is a muscle-memory
-  key), so selection movement stays synchronous — see `architecture.md` for the
-  UI-side occupancy structure that backs it (no per-keypress worker round-trip).
+  reads occupancy **beyond the viewport** — the published viewport (≤512×256 cells) is
+  insufficient, and there is no UI-side occupancy today. The engine holds the occupancy;
+  the resolution **mechanism** (a worker round-trip vs. a published occupancy index that
+  keeps movement synchronous) and its latency posture is **architecture decision D4.1**.
+  Target UX: a jump feels effectively instant on typical sheets.
 
 ### Out of scope
 
@@ -307,9 +310,12 @@ content. Pairs with the shipped drag-resize.
 - **Result:** the column's width becomes just wide enough to show the **widest cell's
   content** in that column, plus a small horizontal padding. The width is set as an
   **explicit** column width (undoable; identical to a manual resize; round-trips to xlsx).
-- **Measurement scope:** measured over the column's cells within the sheet's **used
-  range** (sparse — never iterate empty rows). Each cell measured at its **own** rendered
-  font (family/size/bold), so a bold or larger cell widens the fit correctly.
+- **Measurement scope:** each cell measured at its **own** rendered font
+  (family/size/bold) so a bold/larger cell widens the fit correctly. *Which* cells are
+  measured — the published/overscanned cells (render-thread-only, cheap, reuses the
+  existing measure-and-emit loop) vs. the column's full used range (needs a worker text
+  query) — is **architecture decision D7.3**; the trade-off is a wide value scrolled far
+  off-screen (beyond the overscan) not being measured.
 - **Clamps:** never smaller than a floor (the column-letter header label width /
   configured minimum); never wider than a configured maximum (very-long-content cap).
 - **Empty column:** shrinks to the minimum/floor width.
@@ -357,6 +363,14 @@ dispatches the CI `render` gate.
   selected row(s) with the selected-header background — **symmetric** with the full-column
   path, which already darkens the column-letter header.
 - No other change to the full-row selection (tint + accent border already correct).
+- **Verify-first (load-bearing).** The committed header code computes the `selected` flag
+  **identically** for the row and column strips (both off the same selection range, both
+  feeding `header_element`) — so this may already be correct in source and the GAPS
+  observation may stem from render ordering (the accent edge overpainting the tint) or a
+  **stale baseline**. Phase 8b therefore **starts by eyeballing the current
+  `header_full_row_selected` baseline**: if the row header is already darkened, 8b
+  collapses to a baseline refresh + a GAPS correction; otherwise fix the real cause found
+  there.
 
 ### Render validation (this phase)
 
@@ -375,7 +389,7 @@ dispatches the CI `render` gate.
 
 | Phase | Pixel-suite in scope? | Validation |
 |-------|----------------------|------------|
-| 1 Status bar | No (new chrome, no baseline) | gpui view tests + Xvfb smoke launch |
+| 1 Status bar (in tab bar) | No (tab-bar chrome — not a pixel-suite surface) | gpui view tests + Xvfb smoke launch |
 | 2 Context menu | No (popover chrome) | gpui view tests + smoke launch |
 | 3 Fill ⌘D/⌘R | No (data op) | engine/unit tests |
 | 4 Edge-of-data | No (selection logic; overlay position is data-driven) | unit tests for the algorithm |

@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(format_stat_value(99.99), "99.99"); // >= 10 → 3 dp
         assert_eq!(format_stat_value(100.0), "100"); // >= 100 → 2 dp, trimmed
                                                      // The owner's motivating example: a big sum no longer renders absurd precision.
-        assert_eq!(format_stat_value(1_000_000.6666), "1,000,000.67");
+        assert_eq!(format_stat_value(1_000_000.666_6), "1,000,000.67");
         // A sub-1 magnitude retains 5 decimals of resolution.
         assert_eq!(format_stat_value(0.123456), "0.12346");
         // Negatives scale by |value| identically.

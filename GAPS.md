@@ -106,6 +106,26 @@ FreeCell now builds against our fork (`scosman/ironcalc#freecell-fixes`), which 
 `open_fixups` + `open_repair` (and the `zip`/`roxmltree` prod deps) were deleted. See
 `specs/projects/ironcalc-upstreaming/`.
 
+## Engine (fork) — `.xlsx` table styles not resolved (2026-07-10)
+
+Surfaced diagnosing the "Personal Monthly Budget" template (the font-name loss fixed in
+`2b01b85` was the *smaller* half of that file's fidelity loss). Excel **table styles** — the
+formatting Excel derives from a workbook's `<tableStyles>` / `<tableStyleElement>` → dxfs, and
+from built-in theme-derived styles — are parsed as *geometry* but never resolved into per-cell
+styles, so table-styled cells render unstyled. **Full spec + design home:
+[`specs/projects/xlsx-table-styles/`](specs/projects/xlsx-table-styles/).**
+
+| Gap | Severity | Current behavior | Root cause |
+|-----|----------|------------------|------------|
+| **Excel table styles not resolved → teal section-header fills, thin data-cell borders, and bold Subtotal/total rows are lost** | Moderate–High (breaks the look of real templates and "Format as Table" files — a common case, not a corner) | Table-styled cells resolve unstyled; only *direct* cell fills/borders render (the "gray summary box renders, teal header doesn't" clue). Values, number formats, and (post-`2b01b85`) font names are correct. | Fork parses table geometry but (1) never parses `<tableStyles>` (`base` `Styles` has `dxfs` but no table-style catalog) nor overlays it in `get_style_for_cell` — that resolver is a plain style-index lookup; (2) `tableStyleInfo` parsing drops the style `name` + stripe flags (searches wrong element tag `tableInfo` vs `tableStyleInfo`) and copy-pastes `headerRowDxfId`→`dataDxfId`. Built-in theme-derived styles (`TableStyleMedium2` etc.) are a larger, separately-scoped sub-problem. |
+
+Acceptance signal: the three `#[ignore]`d tests in
+`app/crates/freecell-engine/tests/personal_monthly_budget_fixture.rs` (B12 teal+bold, C13
+borders, B23 bold) flip green. Two smaller **related** items are already tracked separately and
+are *not* duplicated here: render-time Inter fallback for unavailable *explicit* fonts (in
+"Engine defaults — cross-app fidelity" above) and text overflow / title-clipping (in "Post-MVP
+UX features … Text overflow into empty neighbors + wrap" below).
+
 ## Engine defaults — cross-app fidelity (surfaced by the IronCalc upgrade, 2026-07)
 
 Identified while migrating FreeCell onto the fork (`specs/projects/ironcalc-upstreaming`). Neither
@@ -235,12 +255,33 @@ One non-blocking Mild note from the P26 (bubble) review — an authoring-complet
 ### Charts — post-v1 rendering feedback (Batch 1, 2026-07-11)
 
 One latent (non-manifesting) note surfaced while landing the Batch-1 chart rendering fixes (gridline/
-axis clipping to the plot rect, solid value-axis line, marker size floor, chart outline). Not a defect
-— recorded so it isn't re-litigated.
+axis clipping to the plot rect, solid value-axis line, marker size floor, chart outline). Now
+**RESOLVED** by the Batch-1 marker-size reopen (2026-07-12) — recorded so it isn't re-litigated.
 
 | # | Item | Severity | Root cause / current behavior | Follow-up if needed |
 |---|---|---|---|---|
-| C-FB1-1 | **Line data-label offset uses a fixed `DOT_SIZE/2` (3px), not the marker's actual radius.** `line.rs` `paint_data_labels` (~L557) offsets an `Above`/`Below` (etc.) data label from its point by a constant `half_marker = DOT_SIZE / 2.0` (3px). Batch-1 Fix 2 now floors a marker's diameter to `max(requested, 2× line width, 6px)`, so a **heavy-line** series' marker can be ~12–16px (radius 6–8px) — larger than the 3px the label offset assumes, so a label could kiss/overlap an enlarged marker when a heavy line **and** data labels combine on the same series. | Mild — **currently NON-MANIFESTING.** No committed fixture triggers it: every data-label scene (`chart_line_value_labels`/`_percent_labels`/`_named_labels`) uses default-width (~2.7px) lines whose markers stay 6px = `DOT_SIZE`, so the 3px offset is still exactly right and no baseline moved. The offset already ignored an explicit `marker.size` (pre-existing), so Fix 2 only widened the same latent gap. | Mirror `paint_marker`'s diameter floor in the label offset: derive the same effective marker diameter (from the series `width_px` + any `marker.size`) and offset by `effective_diameter / 2` instead of the constant `DOT_SIZE / 2`. Trivial once a heavy-line + data-labels fixture needs it. |
+| C-FB1-1 | **RESOLVED (2026-07-12).** ~~Line data-label offset uses a fixed `DOT_SIZE/2` (3px), not the marker's actual radius.~~ The data-label offset now derives the **effective marker radius** from the shared `marker_diameter(s.marker, s.width_px) / 2.0` helper — the exact diameter `paint_marker` draws — instead of the old constant `half_marker = DOT_SIZE / 2.0`. So a heavy-line series' enlarged marker (now sized so the *visible colored* disc is `≥ 2× line width`) and its `Above`/`Below`/`Left`/`Right` data label stay clear of each other; the offset tracks the marker for any width or explicit `c:marker` size. `DOT_SIZE` was removed in the same refactor (both former call sites now go through `marker_diameter`). | ~~Mild~~ Resolved — the label offset and the marker painter share one diameter source, so they can no longer disagree. | Done. (The default-width data-label scenes are unchanged: a default line's marker is now an 8px total dot = the same 4px radius the label offset uses, so those baselines did not move; the reopen intentionally enlarged the *default-dot* baselines — the marker scenes — not the label geometry.) |
+
+### Charts — post-v1 undo feedback (Batch 4, 2026-07-12)
+
+One non-blocking ordering caveat surfaced landing the Batch-4 undo work (chart ops now ride the
+unified undo/redo timeline). Not a defect — recorded so it isn't re-litigated.
+
+| # | Item | Severity | Root cause / current behavior | Follow-up if needed |
+|---|---|---|---|---|
+| C-FB4-1 | **A single coalesced `process_batch` that mixes a queued `Undo`/`Redo` with forward ops can undo the wrong one of two near-simultaneous actions.** `process_batch` applies buckets in a fixed order (edits → font → chart → undo/redo → clipboard, `run.rs` ~L501/531/547/570/580). Batch 4 pulled `Undo`/`Redo` out of the in-order `edits` batch into the post-forward `undo_ops` bucket, so e.g. a coalesced `[Undo, SetCellInput]` applies the edit first (pushes a `Cell` entry) then the `Undo` pops *that just-applied edit* rather than the intended prior action; likewise `[chartOp, edit]` coalesced then Undo peels the chart before the more-recent edit. | Mild — **rare + self-correcting; never corrupts state or desyncs.** Only manifests when the worker is busy long enough to coalesce **distinct-modality** gestures (a mouse/chart op or a deliberate Ctrl+Z together with a keyboard commit) into one drain window; rapid *typing* is all `Cell` entries and stays correct regardless of order. The 1:1 IronCalc invariant always holds (no crash / phantom redo), and another undo/redo fixes the mis-pick. The bucketing was already not strictly queue-order-preserving pre-Batch-4 (`[paste, Undo]`/`[font, Undo]` also misordered); Batch 4 shifts *which* mixes are affected (it actually fixes clipboard/font-vs-undo) rather than adding a new desync class. Every real gesture arrives as its own batch — the correct path, exercised by all 12 undo tests. | Dispatch a batch in one **strict queue-order** pass (interleave undo/redo with the other buckets in arrival order) instead of the fixed per-bucket order. Larger change; deferred until a coalesced mixed-modality undo is observed to actually bite. Interim: the invariant is documented in the commit + here. |
+
+### Charts — post-v1 imported-color feedback (Batch 5, 2026-07-12)
+
+One non-blocking third-party-Excel fidelity residual remains after the Batch-5 imported-series-color
+work (a panel color now overrides an imported chart's original — feedback item 9 — with the **stroke**
+recolor **gated to line/scatter** so a filled type's imported `a:ln` border stays byte-identical).
+FreeCell itself round-trips correct; the gap shows only on reopen in third-party Excel. Recorded, not
+a defect — the symmetric counterpart to that gated-border behavior.
+
+| # | Item | Severity | Root cause / current behavior | Follow-up if needed |
+|---|---|---|---|---|
+| C-FB5-1 | **A recolored series' imported `<c:marker>/<c:spPr>` fill is left on its original color on save.** When a `SeriesColor` edit recolors an imported series, the save patch rewrites the series' `spPr/solidFill` (plus, for line/scatter, its `a:ln/solidFill`) — but **not** the per-marker fill nested in that series' `<c:marker><c:spPr>`. A third-party Excel reopen, which honors the marker's own `spPr`, then shows the data-point markers still painted the **imported** color while the line/fill shows the new one. | Mild — **third-party-Excel-only; FreeCell round-trips correct.** FreeCell's chart model carries no per-marker color, so the renderer paints markers in the **resolved series color** (`effective_series_color`): inside the app, and on any save→reopen through FreeCell's own loader, an edited series' markers recolor correctly. The residual is purely a cosmetic marker-vs-line color mismatch visible only when the saved `.xlsx` is opened in another app. Never affects FreeCell rendering or data. | In the series-color save arm (`patch_series_color` / `collect_chrome_edits`), also upsert the edited series' `<c:marker>/<c:spPr>` `solidFill` (and any marker `a:ln/solidFill`) to the new color, mirroring the shape-fill patch. Symmetric to the gated `a:ln` border fix (that one says "leave a filled type's border alone"; this says "also repaint the marker fill") — both close the same class of third-party-Excel-only imported-color drift. Deferred: cosmetic, third-party-only, and no committed fixture exercises a per-marker `spPr` on an edited series. |
 
 ### `mvp-gaps` UI review — accepted limitations (owner-approved 2026-07-06)
 

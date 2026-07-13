@@ -27,6 +27,13 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
   subtle ~1px light-grey outline around the chart's outer edge (every chart type, pie/doughnut
   included). No **selection** border / resize handles in v1 core (read-only). Off-screen charts
   aren't drawn; partially-scrolled charts are clipped.
+- **Point markers (line/scatter):** a point indicator (the round dot, and any explicit
+  `c:marker` symbol) is sized so its **visible colored disc** — the mark minus its two white
+  edges — is at least **2× the series line width** (and never below a ~6px absolute floor), so a
+  marker always reads as a clearly larger dot sitting *on* the line rather than a bump the same
+  width as the line. An explicit `c:marker` size is honored only when it is **larger** than that
+  floor. The data-label offset uses the **same** effective marker radius, so a label always clears
+  the (possibly enlarged) marker (`chart::line::marker_diameter`, shared with the scatter renderer).
 
 ### 2.2 Compatibility warning (functional_spec §5)
 - When a chart's `compatibility_warning` flag is set, show a small **inline** label in the
@@ -63,6 +70,18 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
 - **Select** a chart → selection outline + resize handles on the ChartLayer.
 - **Move** (drag body) / **resize** (drag handle) → anchor updates; **delete** via
   `Delete`/`Backspace` or a context-menu entry. (Interaction detail with 6.A.)
+- **Undo/redo (charts feedback item 4):** chart **insert, delete, move/resize, and set-range**
+  ops now ride the **same unified Ctrl+Z/Ctrl+Y timeline** as cell edits. Ctrl+Z reverses the
+  single most-recent action regardless of kind (so deleting a chart then Ctrl+Z **brings it
+  back**, and a following Ctrl+Y re-deletes it), and an interleave of cell edits + chart ops
+  undoes/redoes in exact most-recent-first order. This **reverses** the earlier P18 decision that
+  kept chart ops off the undo stack. Worker-side, an IronCalc cell edit and a chart op are two
+  entry kinds on one ordered stack; a chart entry inverts from a stashed worker snapshot and never
+  calls IronCalc's own undo/redo, so the cell entries stay 1:1 with IronCalc's stack (no desync).
+  A loaded (imported) chart's delete/move restores its save-set bookkeeping (`loaded_deletes` /
+  `loaded_anchor_edits`) on undo, so a later save writes the correct package. (Chart **type** and
+  **chrome** edits stay immediate — not individually undoable — but still invalidate a pending
+  redo.)
 
 ## 4. Editing — the Edit panel (end-phase; **detailed speccing deferred**)
 
@@ -73,6 +92,23 @@ gpui-component `Popover`/`ContextMenu`/`Modal`) and `shell/menus.rs`.
   list orders **Line → Area → Column → Bar → …** (Excel grouping); the **legend** control is a
   row of lucide icons — `panel-top`/`panel-right`/`panel-left`/`panel-bottom` for the four
   positions, `square-x` for Off.
+- **Series color overrides the imported original (charts feedback item 9):** a color set in the
+  panel **takes precedence over — and replaces — the color a chart shipped with**, for **imported
+  (loaded) charts** exactly as for FreeCell-authored ones. This is not just the shape fill: a
+  **line/scatter** series carries its **visible** color on its `a:ln` **stroke** (and the renderer +
+  loader prefer the stroke color over the fill), so for those two kinds a series-color edit recolors
+  **both the fill and the stroke** — otherwise the imported line kept its old color on screen and on
+  reopen. **Filled kinds** (column/bar/area/pie/bubble) render from the **fill**, and treat `a:ln`
+  as a decorative border, so their edit recolors the fill **only** and leaves any imported `a:ln`
+  **byte-identical** (recoloring a filled type's stroke would inject a border the user never asked to
+  change — e.g. flip a borderless bar's `<a:noFill/>` to a colored `solidFill`). The new color holds
+  through three layers: it renders **live**, **survives a data recompute** (re-resolve keeps the
+  user's color, doesn't restore the file's), and **persists across save + reopen** (the source patch
+  rewrites the series' `spPr/solidFill`, plus — **for line/scatter only** — its `a:ln/solidFill`,
+  preserving the stroke's width/dash; clearing the color reverts both to the palette). Markers follow
+  the resolved series color, so they recolor in FreeCell too. (Engine fix, not a render-widget
+  change: the render code already reads the model's stroke-first precedence correctly — the fix makes
+  the *edit* update the stroke as well as the fill, gated to the kinds that paint on the stroke.)
 - **Live editing:** the **title** and **axis-title** fields update the chart **per keystroke**
   (not on Enter/blur), so shaping is immediate. A live worker republish never clobbers an
   in-progress edit (fields re-seed only when the *selected chart changes*, not on same-chart

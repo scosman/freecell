@@ -63,14 +63,19 @@ const PT_TO_PX: f32 = 1.2;
 /// Clamp range for a resolved line width in px (a hostile `a:ln@w` can't produce a hairline or a slab).
 const MIN_LINE_PX: f32 = 1.0;
 const MAX_LINE_PX: f32 = 8.0;
-/// Default marker diameter — also the round dot drawn when a series specifies no marker.
-const DOT_SIZE: f32 = 6.0;
-/// A point marker's diameter must be at least this many times the series line width, so the marker
-/// always reads as a clearly larger dot sitting on the line rather than a bump ~= the line width.
+/// A point marker's **visible colored** disc must be at least this many times the series line width.
+/// The floor is applied to the *colored* diameter (the disc minus its two white edges), so a default
+/// dot always reads as a clearly larger circle sitting on the line — not a bump ~= the line width
+/// (Batch-1 feedback: default indicators must be ~2×+ the line, not minimally wider).
 const MARKER_MIN_LINE_MULT: f32 = 2.0;
-/// Absolute minimum marker diameter (px), regardless of line width — so a thin-line series still gets
-/// a visible dot.
-const MARKER_MIN_DIAMETER: f32 = 6.0;
+/// Absolute floor (px) on a marker's **visible colored** disc, regardless of line width — so a
+/// thin-line series still gets a clearly visible dot.
+const MARKER_MIN_COLORED: f32 = 6.0;
+/// Width (px) of the white edge drawn INSIDE a filled marker's bounds (gpui insets a border), so a
+/// disc of total diameter `D` shows a colored diameter of `D − 2×MARKER_EDGE_PX`. Used both as the
+/// disc border width AND in the diameter math, so the *colored* disc — not the total — meets the
+/// ≥2×-line floor.
+const MARKER_EDGE_PX: f32 = 1.0;
 /// Stroke width for the open-shape markers (plus / x / dash).
 const MARKER_STROKE_WIDTH: f32 = 1.6;
 /// The `dot` marker's radius as a fraction of the full marker radius — Excel's `dot` is a small
@@ -104,6 +109,27 @@ struct LineSeries {
 /// renderer ([`super::scatter`]) for its connecting-line width (P25).
 pub(super) fn line_width_px(width_pt: Option<f32>) -> f32 {
     (width_pt.unwrap_or(DEFAULT_LINE_WIDTH_PT) * PT_TO_PX).clamp(MIN_LINE_PX, MAX_LINE_PX)
+}
+
+/// The **total** diameter (px) of a point marker for a series with the given resolved `line_width`.
+///
+/// The rule is expressed on the **visible colored** disc: it is floored at
+/// `max(2 × line_width, MARKER_MIN_COLORED)`, then the two white edges (`MARKER_EDGE_PX` each) are
+/// added back — so the returned total is `colored_floor + 2×MARKER_EDGE_PX`. An explicit `c:marker`
+/// size is honored only when it is **larger** than that floor (an explicit small size is still
+/// floored up to a visible ≥2×-line dot). With **no** explicit size — the default dot — the marker
+/// follows the line-based size, which is what makes DEFAULT markers read as clearly larger than the
+/// line they sit on. Shared by the line + scatter renderers (both hand it the series `width_px`).
+///
+/// Worked numbers: a default line (`2.7px`) → colored `max(5.4, 6) = 6` → total `8px`, so the
+/// visible dot is `6px` ≈ 2.2× the line; a heavy `5px` line → colored `max(10, 6) = 10` → total
+/// `12px` (visible `10px` = 2× the line); a thin `1px` line → colored `6px` floor → total `8px`.
+pub(super) fn marker_diameter(marker: Option<Marker>, line_width: f32) -> f32 {
+    let colored = (line_width * MARKER_MIN_LINE_MULT).max(MARKER_MIN_COLORED);
+    let from_line = colored + 2.0 * MARKER_EDGE_PX;
+    marker
+        .and_then(|m| m.size)
+        .map_or(from_line, |s| s.max(from_line))
 }
 
 /// A multi-series line plot over the raw `Line` primitive with ONE shared value scale
@@ -220,15 +246,17 @@ impl LinePlot {
 }
 
 /// Paint one series' marker at `center` (absolute window coordinates). The default (`marker ==
-/// None`) is the P5 round dot — a filled circle at [`DOT_SIZE`] with a white edge — so a series
-/// that specifies no marker looks exactly as it did before P6. Filled shapes
-/// (circle/square/diamond/triangle/star/dot/auto) are painted as a filled path or quad; the open
-/// shapes (plus/x/dash) as a stroked path in the series color; `none` paints nothing.
+/// None`) is the round dot — a white-edged filled circle whose **visible colored** disc is floored
+/// at `≥ 2× the line width` (see [`marker_diameter`]) — so a series that specifies no marker reads
+/// as a clearly larger dot than its line. Filled shapes (circle/square/diamond/triangle/star/dot/
+/// auto) are painted as a filled path or quad; the open shapes (plus/x/dash) as a stroked path in
+/// the series color; `none` paints nothing.
 ///
 /// Shared with the scatter renderer ([`super::scatter`]), whose dots are the same marker mark (P25).
-/// `line_width` is the series' resolved stroke width (px): the marker diameter is floored at
-/// `2 ×` it (and at [`MARKER_MIN_DIAMETER`]), so a marker is always a clearly larger dot than the
-/// line it sits on, never a barely-visible bump ~= the line width.
+/// `line_width` is the series' resolved stroke width (px): the marker's **colored** diameter is
+/// floored at `max(2 × line_width, MARKER_MIN_COLORED)` and the white edge added back
+/// ([`marker_diameter`]), so a marker is always a clearly larger dot than the line it sits on, never
+/// a barely-visible bump ~= the line width.
 pub(super) fn paint_marker(
     window: &mut Window,
     center: Point<Pixels>,
@@ -239,13 +267,9 @@ pub(super) fn paint_marker(
     // A series with no `c:marker` defaults to the round dot (the P5 default), so absence resolves to
     // `Circle`; an explicit `none` paints nothing (handled in the match, no early return).
     let symbol = marker.map(|m| m.symbol).unwrap_or(MarkerSymbol::Circle);
-    // The requested size (explicit `c:marker` size, else the default dot), floored so the marker is
-    // at least ~2× the line width and never below the absolute minimum.
-    let diameter = marker
-        .and_then(|m| m.size)
-        .unwrap_or(DOT_SIZE)
-        .max(line_width * MARKER_MIN_LINE_MULT)
-        .max(MARKER_MIN_DIAMETER);
+    // Total diameter: the visible colored disc is floored at max(2× line width, MARKER_MIN_COLORED),
+    // plus the two white edges added back (an explicit `c:marker` size only wins when larger).
+    let diameter = marker_diameter(marker, line_width);
     let r = px(diameter / 2.0);
     let edge = hsla(0xFFFFFF);
     let cx = center.x;
@@ -292,8 +316,10 @@ pub(super) fn paint_marker(
         // Reachable: an explicit `<c:symbol val="none"/>` (the default-marker case resolves to
         // `Circle` above, so this is only hit for an authored/parsed `none`).
         MarkerSymbol::None => {}
-        // Circle / auto: a white-edged filled disc at the full radius (the P5 default dot).
-        MarkerSymbol::Circle | MarkerSymbol::Auto => disc(window, r, px(1.0)),
+        // Circle / auto: a white-edged filled disc at the full radius (the P5 default dot). The
+        // white edge is `MARKER_EDGE_PX` wide (matched in `marker_diameter`, so the COLORED disc
+        // meets the ≥2×-line floor).
+        MarkerSymbol::Circle | MarkerSymbol::Auto => disc(window, r, px(MARKER_EDGE_PX)),
         // Dot: a smaller, unbordered filled dot (Excel's `dot` is noticeably smaller).
         MarkerSymbol::Dot => disc(window, r * DOT_MARKER_SCALE, px(0.0)),
         MarkerSymbol::Square => {
@@ -302,7 +328,7 @@ pub(super) fn paint_marker(
                 gpui::bounds(top_left, size(r * 2.0, r * 2.0)),
                 px(0.0),
                 color,
-                px(1.0),
+                px(MARKER_EDGE_PX),
                 edge,
                 BorderStyle::default(),
             ));
@@ -553,8 +579,10 @@ impl LinePlot {
                 let block_width = swatch + inner_gap + text_width;
 
                 // Anchor the (swatch + text) block relative to the point, per `dLblPos`. The block's
-                // top-left is `(block_left, top)`, in plot-relative coordinates.
-                let half_marker = DOT_SIZE / 2.0;
+                // top-left is `(block_left, top)`, in plot-relative coordinates. Offset by the
+                // series' EFFECTIVE marker radius (the same `marker_diameter` the dot is painted at,
+                // C-FB1-1) so a label clears an enlarged marker on a heavy-line series.
+                let half_marker = marker_diameter(s.marker, s.width_px) / 2.0;
                 let (block_left, top) = match position {
                     DataLabelPosition::Above => (
                         xs[i] - block_width / 2.0,
@@ -781,6 +809,67 @@ mod tests {
         );
         // A series with no marker leaves it None (the renderer draws its default dot).
         assert_eq!(plot.series[1].marker, None);
+    }
+
+    #[test]
+    fn marker_diameter_floors_the_visible_colored_disc_at_twice_the_line() {
+        // The rule (Batch-1 feedback): the VISIBLE COLORED disc — the returned total minus the two
+        // white edges — is floored at max(2× line width, MARKER_MIN_COLORED). `marker_diameter`
+        // returns the TOTAL diameter (colored floor + the two edges added back).
+        let edges = 2.0 * MARKER_EDGE_PX;
+
+        // Default line (2.25pt → 2.7px): colored floor max(5.4, 6) = 6 → total 8; visible 6 ≈ 2.2×.
+        let default_line = line_width_px(None);
+        let d = marker_diameter(None, default_line);
+        assert!(
+            (d - 8.0).abs() < 1e-4,
+            "default-line total diameter should be 8px, got {d}"
+        );
+        assert!(
+            (d - edges) >= 2.0 * default_line - 1e-4,
+            "visible colored disc {} must be >= 2× the line {}",
+            d - edges,
+            2.0 * default_line
+        );
+
+        // Heavy 5px line: colored max(10, 6) = 10 → total 12; visible 10 = exactly 2× the line.
+        let d5 = marker_diameter(None, 5.0);
+        assert!(
+            (d5 - 12.0).abs() < 1e-4,
+            "5px-line total diameter should be 12px, got {d5}"
+        );
+        assert!(
+            (d5 - edges - 10.0).abs() < 1e-4,
+            "visible colored disc should be exactly 2× the 5px line (10px), got {}",
+            d5 - edges
+        );
+
+        // Thin 1px line: the absolute colored floor (6) wins → total 8.
+        let d1 = marker_diameter(None, 1.0);
+        assert!(
+            (d1 - 8.0).abs() < 1e-4,
+            "a thin line still gets an 8px total dot, got {d1}"
+        );
+    }
+
+    #[test]
+    fn explicit_marker_size_is_floored_up_but_honored_when_larger() {
+        let line = line_width_px(None); // 2.7px → line-based total 8px.
+                                        // An explicit SMALL `c:marker` size is still floored up to the visible ≥2×-line dot.
+        let tiny = marker_diameter(Some(Marker::new(MarkerSymbol::Circle).with_size(3.0)), line);
+        assert!(
+            (tiny - 8.0).abs() < 1e-4,
+            "an explicit tiny size is floored up to the line-based total, got {tiny}"
+        );
+        // A LARGER explicit size is honored verbatim.
+        let big = marker_diameter(
+            Some(Marker::new(MarkerSymbol::Circle).with_size(20.0)),
+            line,
+        );
+        assert!(
+            (big - 20.0).abs() < 1e-4,
+            "an explicit large size is honored, got {big}"
+        );
     }
 
     #[test]

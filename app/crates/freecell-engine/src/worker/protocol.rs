@@ -205,6 +205,13 @@ pub enum Command {
     },
     /// Clear a range's contents (keep styles).
     ClearCells { sheet: SheetId, range: CellRange },
+    /// Fill Down (⌘D): copy `range`'s **top row** down over the rest of `range` — a copy, not a
+    /// series (`functional_spec.md §3`). A lone single-cell `range` pulls from the cell above. One
+    /// undo step (rides IronCalc's `auto_fill_rows` history).
+    FillDown { sheet: SheetId, range: CellRange },
+    /// Fill Right (⌘R): copy `range`'s **left column** right over the rest of `range` (the column
+    /// analog of [`Command::FillDown`]). A lone single-cell `range` pulls from the cell to the left.
+    FillRight { sheet: SheetId, range: CellRange },
     /// Toggle/set a style attribute over a range.
     SetStyleAttr {
         sheet: SheetId,

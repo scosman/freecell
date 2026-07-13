@@ -529,6 +529,99 @@ impl WorkbookDocument {
             .range_clear_contents(&area_of(sheet_idx, clamped))
     }
 
+    /// Fill Down (⌘D) — copy the selection's **top row** down over the rest of the selection
+    /// (`functional_spec.md §3`). A **copy**, not a series: seeding `auto_fill_rows` from a single
+    /// row (`height == 1`) leaves the fork's `detect_progression` nothing to extrapolate (it needs
+    /// ≥2 seed values), so it falls through to `extend_to` — a value/format copy with relative
+    /// formula adjustment. One `auto_fill_rows` call ⇒ one undo step. Returns whether anything was
+    /// written (`false` = a no-op, so the caller skips recompute/republish/undo).
+    ///
+    /// A lone single-cell selection **pulls from the cell above** (Excel behavior, D3.1); at row 0
+    /// (no neighbor) it is a no-op. A single row with >1 column has nothing below to fill → no-op.
+    ///
+    /// **Full-column / select-all policy:** a header ⌘D (selection spanning all 1,048,576 rows) is
+    /// **clamped to the used rectangle** first (via [`clamp_to_used`](Self::clamp_to_used), exactly
+    /// as `clear_contents` does) — the practical Excel behavior is "fill down alongside the existing
+    /// data," so it fills only to the used-range extent, never an unbounded ~1M-cell write with a
+    /// 1M-entry undo diff-list. Bounded/explicit-range selections are passed through unchanged.
+    pub(crate) fn fill_down(&mut self, sheet_idx: u32, range: CellRange) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        // Clamp full-line targets to the used range (no-op for bounded selections); an empty
+        // intersection (full-line fill on unused rows/cols) writes nothing.
+        let range = match self.clamp_to_used(sheet_idx, range)? {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let (top, bottom) = (range.start.row, range.end.row);
+        let (left, right) = (range.start.col, range.end.col);
+
+        // Seed row (0-based) and the last row to fill down to.
+        let (seed_row, to_row) = if bottom > top {
+            // Multi-row selection: seed = its top row, fill down to its bottom row.
+            (top, bottom)
+        } else if left == right {
+            // Single cell: pull from the cell directly above; no neighbor at row 0 → no-op.
+            if top == 0 {
+                return Ok(false);
+            }
+            (top - 1, top)
+        } else {
+            // A single row wider than one cell has nothing below the seed line → no-op.
+            return Ok(false);
+        };
+
+        let source = Area {
+            sheet: sheet_idx,
+            row: seed_row as i32 + 1,
+            column: left as i32 + 1,
+            width: (right - left) as i32 + 1,
+            height: 1,
+        };
+        self.model.auto_fill_rows(&source, to_row as i32 + 1)?;
+        Ok(true)
+    }
+
+    /// Fill Right (⌘R) — copy the selection's **left column** right over the rest of the selection
+    /// (the column analog of [`fill_down`](Self::fill_down); same copy-not-series + one-undo-step +
+    /// full-line-clamp properties, mirrored on columns). A lone single-cell selection **pulls from
+    /// the cell to the left**; at column 0 it is a no-op. A single column taller than one cell →
+    /// no-op. Returns whether anything was written (`false` = a no-op).
+    pub(crate) fn fill_right(&mut self, sheet_idx: u32, range: CellRange) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        // Clamp full-line (full-row / select-all) targets to the used range; see `fill_down`.
+        let range = match self.clamp_to_used(sheet_idx, range)? {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let (top, bottom) = (range.start.row, range.end.row);
+        let (left, right) = (range.start.col, range.end.col);
+
+        // Seed column (0-based) and the last column to fill right to.
+        let (seed_col, to_col) = if right > left {
+            // Multi-column selection: seed = its left column, fill right to its right column.
+            (left, right)
+        } else if top == bottom {
+            // Single cell: pull from the cell directly to the left; no neighbor at col 0 → no-op.
+            if left == 0 {
+                return Ok(false);
+            }
+            (left - 1, left)
+        } else {
+            // A single column taller than one cell has nothing right of the seed line → no-op.
+            return Ok(false);
+        };
+
+        let source = Area {
+            sheet: sheet_idx,
+            row: top as i32 + 1,
+            column: seed_col as i32 + 1,
+            width: 1,
+            height: (bottom - top) as i32 + 1,
+        };
+        self.model.auto_fill_columns(&source, to_col as i32 + 1)?;
+        Ok(true)
+    }
+
     /// Sets the width (device px) of the inclusive column run `[col_start, col_end]` (0-based) —
     /// `SetColumnWidths`. One undoable diff-list (`set_columns_width`, `common.rs:1055`). Device px
     /// are converted to IronCalc px at this boundary (the grid speaks device px). Called only over
@@ -1504,6 +1597,200 @@ mod tests {
     fn to_engine_coords_is_one_based() {
         assert_eq!(to_engine_coords(CellRef::new(0, 0)), (1, 1)); // A1
         assert_eq!(to_engine_coords(CellRef::new(6, 1)), (7, 2)); // B7
+    }
+
+    /// A cell's evaluated display string (`""` for empty), for the fill assertions below.
+    fn value(doc: &WorkbookDocument, row: u32, col: u32) -> String {
+        doc.formatted_value(0, CellRef::new(row, col)).unwrap()
+    }
+
+    #[test]
+    fn fill_down_copies_top_row_not_series() {
+        // ⌘D over A1:A5 with A1=1 must COPY (1,1,1,1,1) — NOT extrapolate a series (2,3,4,5).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0)))
+            .unwrap();
+        for r in 0..5 {
+            assert_eq!(
+                value(&doc, r, 0),
+                "1",
+                "A{} should be a copy of the seed",
+                r + 1
+            );
+        }
+    }
+
+    #[test]
+    fn fill_down_adjusts_relative_formula() {
+        // A1="=B1"; B1..B5 = 10..50. ⌘D over A1:A5 copies the formula down with RELATIVE ref
+        // adjustment → A2="=B2" … A5="=B5", evaluating to 20 … 50.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "=B1").unwrap();
+        for (i, v) in [10, 20, 30, 40, 50].iter().enumerate() {
+            doc.set_cell_input(0, CellRef::new(i as u32, 1), &v.to_string())
+                .unwrap();
+        }
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0)))
+            .unwrap();
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "=B2");
+        assert_eq!(doc.cell_content(0, CellRef::new(4, 0)).unwrap(), "=B5");
+        assert_eq!(value(&doc, 1, 0), "20");
+        assert_eq!(value(&doc, 4, 0), "50");
+    }
+
+    #[test]
+    fn fill_down_multi_col_block_copies_each_column() {
+        // A1=1, B1=2; ⌘D over A1:B3 fills each column from its OWN top cell.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "2").unwrap();
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(2, 1)))
+            .unwrap();
+        for r in 0..3 {
+            assert_eq!(value(&doc, r, 0), "1");
+            assert_eq!(value(&doc, r, 1), "2");
+        }
+    }
+
+    #[test]
+    fn fill_right_copies_left_column_not_series() {
+        // ⌘R over A1:E1 with A1=7 copies 7 across (not a series).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "7").unwrap();
+        doc.fill_right(0, CellRange::new(CellRef::new(0, 0), CellRef::new(0, 4)))
+            .unwrap();
+        for c in 0..5 {
+            assert_eq!(value(&doc, 0, c), "7");
+        }
+    }
+
+    #[test]
+    fn fill_down_single_cell_pulls_from_above() {
+        // ⌘D on a lone A2 copies the cell directly above (A1) into it (Excel D3.1).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "9").unwrap();
+        doc.fill_down(0, CellRange::single(CellRef::new(1, 0)))
+            .unwrap();
+        assert_eq!(value(&doc, 1, 0), "9");
+    }
+
+    #[test]
+    fn fill_right_single_cell_pulls_from_left() {
+        // ⌘R on a lone B1 copies the cell directly to the left (A1) into it.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "9").unwrap();
+        doc.fill_right(0, CellRange::single(CellRef::new(0, 1)))
+            .unwrap();
+        assert_eq!(value(&doc, 0, 1), "9");
+    }
+
+    #[test]
+    fn fill_right_multi_row_block_copies_each_row() {
+        // A1=1, A2=2; ⌘R over A1:C2 fills each row from its OWN left cell (column-path parity with
+        // `fill_down_multi_col_block_copies_each_column`).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        assert!(doc
+            .fill_right(0, CellRange::new(CellRef::new(0, 0), CellRef::new(1, 2)))
+            .unwrap());
+        for c in 0..3 {
+            assert_eq!(value(&doc, 0, c), "1");
+            assert_eq!(value(&doc, 1, c), "2");
+        }
+    }
+
+    #[test]
+    fn fill_single_cell_at_edge_is_noop() {
+        // A lone cell with no neighbor in the fill direction (row 0 for ⌘D, col 0 for ⌘R) is a
+        // clean no-op — returns `false` (skips eval/publish), no engine error, no u32 underflow
+        // reading a -1 neighbor.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "5").unwrap();
+        assert!(!doc
+            .fill_down(0, CellRange::single(CellRef::new(0, 0)))
+            .unwrap());
+        assert!(!doc
+            .fill_right(0, CellRange::single(CellRef::new(0, 0)))
+            .unwrap());
+        assert_eq!(value(&doc, 0, 0), "5");
+    }
+
+    #[test]
+    fn fill_down_single_row_multi_col_is_noop() {
+        // A single row wider than one cell has nothing below the seed line → ⌘D is a no-op.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "2").unwrap();
+        assert!(!doc
+            .fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(0, 1)))
+            .unwrap());
+        assert_eq!(value(&doc, 0, 0), "1");
+        assert_eq!(value(&doc, 0, 1), "2");
+        assert_eq!(value(&doc, 1, 0), ""); // nothing filled below
+        assert_eq!(value(&doc, 1, 1), "");
+    }
+
+    #[test]
+    fn fill_right_single_col_multi_row_is_noop() {
+        // A single column taller than one cell has nothing right of the seed line → ⌘R is a no-op
+        // (column-path parity with `fill_down_single_row_multi_col_is_noop`).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        assert!(!doc
+            .fill_right(0, CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)))
+            .unwrap());
+        assert_eq!(value(&doc, 0, 0), "1");
+        assert_eq!(value(&doc, 1, 0), "2");
+        assert_eq!(value(&doc, 0, 1), ""); // nothing filled to the right
+        assert_eq!(value(&doc, 1, 1), "");
+    }
+
+    #[test]
+    fn full_column_fill_down_clamps_to_used_range() {
+        use freecell_core::limits;
+        // A1=1 with data only in A1:A3; a header ⌘D over the WHOLE column (all 1,048,576 rows)
+        // must clamp to the used-range extent (fill A2:A3), never write ~1M rows.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 0), "x").unwrap(); // used range extends to row 3
+        let full_col = CellRange::new(CellRef::new(0, 0), CellRef::new(limits::MAX_ROWS - 1, 0));
+        assert!(doc.fill_down(0, full_col).unwrap());
+        // Filled down to the used-range bottom (A2, A3 copy the seed)…
+        assert_eq!(value(&doc, 1, 0), "1");
+        assert_eq!(value(&doc, 2, 0), "1");
+        // …and NOT beyond it: the first row past the used range stays empty (no ~1M-cell write).
+        assert_eq!(value(&doc, 3, 0), "");
+        assert_eq!(value(&doc, 100, 0), "");
+    }
+
+    #[test]
+    fn full_column_fill_down_on_unused_column_is_noop() {
+        use freecell_core::limits;
+        // A header ⌘D on a column entirely outside the used range clamps to an empty intersection →
+        // a clean no-op (returns `false`), writing nothing.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap(); // used range = A1 only
+        let far_col = CellRange::new(CellRef::new(0, 9), CellRef::new(limits::MAX_ROWS - 1, 9));
+        assert!(!doc.fill_down(0, far_col).unwrap());
+        assert_eq!(value(&doc, 0, 9), "");
+    }
+
+    #[test]
+    fn fill_down_is_one_undo_step() {
+        // One ⌘D pushes exactly ONE history entry: a single undo reverts the WHOLE fill.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)))
+            .unwrap();
+        assert_eq!(value(&doc, 2, 0), "1"); // A3 filled
+        doc.undo().unwrap();
+        doc.evaluate();
+        assert_eq!(value(&doc, 1, 0), ""); // A2 reverted
+        assert_eq!(value(&doc, 2, 0), ""); // A3 reverted by the SAME undo
+        assert_eq!(value(&doc, 0, 0), "1"); // seed A1 intact
     }
 
     #[test]

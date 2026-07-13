@@ -26,7 +26,7 @@ use std::time::Instant;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use freecell_core::input_cap::validate_input;
-use freecell_core::merge_guard::{blocks_col_op, blocks_row_op};
+use freecell_core::merge_guard::{blocks_col_op, blocks_fill, blocks_row_op};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{
@@ -79,6 +79,10 @@ enum AppliedKind {
     /// An insert/delete rows/columns — content + geometry + formulas shift, so it needs a
     /// recompute **and** a full active-sheet cache rebuild (`components/grid_structure.md §5.3`).
     Structure,
+    /// An edit that resolved to a **no change** (e.g. a fill whose selection is an edge/seed-line
+    /// no-op, or whose full-line target clamped to an empty used range). It touched no cell, so the
+    /// batch must not count it, recompute, republish, or record an undo op for it.
+    NoOp,
 }
 
 /// The cache **touch-set** of one applied undoable op, recorded so `Undo`/`Redo` can re-read the
@@ -526,6 +530,8 @@ impl Worker {
                 | Command::SetChartChrome { .. }) => chart_ops.push(chart),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
+                | Command::FillDown { .. }
+                | Command::FillRight { .. }
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
@@ -781,6 +787,8 @@ impl Worker {
                             needs_eval = true;
                             applied_ops.push(op_of(edit));
                         }
+                        // A no-op edit changed nothing: don't count it, recompute, or record an op.
+                        Ok(AppliedKind::NoOp) => {}
                         Err(msg) => engine_errors.push(msg),
                     }
                 }
@@ -1873,6 +1881,12 @@ impl Worker {
             Command::InsertColumns { sheet, col, .. }
             | Command::DeleteColumns { sheet, col, .. } => {
                 self.merge_guard(*sheet, |merges| blocks_col_op(merges, *col))
+            }
+            // Fill into a merged region is rejected (merged cells aren't a supported edit target),
+            // consistently with the structural ops → the same `MergedCells` dialog
+            // (`functional_spec.md §3` edge case). The written rectangle is the selection `range`.
+            Command::FillDown { sheet, range } | Command::FillRight { sheet, range } => {
+                self.merge_guard(*sheet, |merges| blocks_fill(merges, *range))
             }
             _ => Ok(()),
         }
@@ -3027,6 +3041,25 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.clear_contents(idx, *range)?;
             Ok(AppliedKind::Cell)
         }
+        Command::FillDown { sheet, range } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            // An edge/seed-line/empty-clamp fill writes nothing → NoOp (skip eval/publish/op).
+            let applied = doc.fill_down(idx, *range)?;
+            Ok(if applied {
+                AppliedKind::Cell
+            } else {
+                AppliedKind::NoOp
+            })
+        }
+        Command::FillRight { sheet, range } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            let applied = doc.fill_right(idx, *range)?;
+            Ok(if applied {
+                AppliedKind::Cell
+            } else {
+                AppliedKind::NoOp
+            })
+        }
         Command::SetStyleAttr { sheet, range, attr } => {
             let idx = resolve_idx(doc, *sheet)?;
             apply_style(doc, idx, *range, *attr)?;
@@ -3255,6 +3288,14 @@ fn op_of(edit: &Command) -> AppliedOp {
             sheet: *sheet,
             range: *range,
         },
+        // Fill writes within the selection rectangle (the single-cell pull-from-neighbor case only
+        // reads the seed neighbor, writes the selected cell) → refresh exactly that range.
+        Command::FillDown { sheet, range } | Command::FillRight { sheet, range } => {
+            AppliedOp::Cells {
+                sheet: *sheet,
+                range: *range,
+            }
+        }
         Command::SetStyleAttr { sheet, range, .. } | Command::SetStylePath { sheet, range, .. } => {
             AppliedOp::Cells {
                 sheet: *sheet,
@@ -7013,5 +7054,102 @@ mod tests {
             )),
             "an op below all merges must not be merge-blocked"
         );
+    }
+
+    #[test]
+    fn fill_into_merge_is_rejected_disjoint_fill_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = merged_fixture(dir.path());
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        // K7:L10 → 0-based rows 6..=9, cols 10..=11.
+        let (mut worker, rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+
+        // A ⌘D whose target rectangle overlaps the merge is refused with the same typed dialog the
+        // structural ops use, and commits nothing (`functional_spec.md §3` edge case).
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::FillDown {
+            sheet,
+            range: CellRange::new(CellRef::new(6, 10), CellRef::new(9, 10)), // K7:K10, inside merge
+        }]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "a fill overlapping a merge must be refused with MergedCells"
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "a blocked fill commits nothing"
+        );
+
+        // The column path (⌘R) is guarded identically.
+        let ops_before_right = worker.ops_seen;
+        worker.process_batch(vec![Command::FillRight {
+            sheet,
+            range: CellRange::new(CellRef::new(6, 10), CellRef::new(6, 11)), // K7:L7, inside merge
+        }]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "a fill-right overlapping a merge must be refused with MergedCells"
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before_right,
+            "a blocked fill-right commits nothing"
+        );
+
+        // A ⌘D far from any merge (A1:A3) applies normally — the guard is not a blanket block.
+        worker.process_batch(vec![set_input(sheet, 0, 0, "1")]);
+        let ops_before_fill = worker.ops_seen;
+        worker.process_batch(vec![Command::FillDown {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)),
+        }]);
+        assert!(
+            worker.ops_seen > ops_before_fill,
+            "a fill disjoint from every merge must apply"
+        );
+        let events = drain_events(&rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "a fill disjoint from every merge must not be merge-blocked"
+        );
+    }
+
+    #[test]
+    fn noop_fill_skips_recompute_publish_and_ops_bump() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "5")]);
+        let _ = drain_events(&rx); // discard the setup edit's events
+        let ops_before = worker.ops_seen;
+
+        // ⌘D on a lone A1 (row 0, no neighbor above) resolves to a no-op: it must not recompute,
+        // republish, or bump ops_seen (Mild #1 — an errant fill over zero change stays free).
+        worker.process_batch(vec![Command::FillDown {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+        }]);
+        assert_eq!(worker.ops_seen, ops_before, "a no-op fill commits no op");
+        assert!(
+            !drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Published)),
+            "a no-op fill must not republish"
+        );
+        assert_eq!(value_at(&worker, 0, 0), "5"); // unchanged
     }
 }

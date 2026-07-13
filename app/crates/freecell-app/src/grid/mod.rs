@@ -128,6 +128,13 @@ pub enum GridEvent {
     Copy { cut: bool },
     /// Cmd/Ctrl+V on the focused grid — paste at the selection anchor (`functional_spec.md §2.2`).
     Paste,
+    /// Cmd/Ctrl+D on the focused grid — fill the selection's top row **down** over the rest (a
+    /// copy-fill, `functional_spec.md §3`). Carries the current selection range; the window
+    /// forwards it as `Command::FillDown` for the active sheet.
+    FillDown(CellRange),
+    /// Cmd/Ctrl+R on the focused grid — fill the selection's left column **right** over the rest
+    /// (the column analog of [`GridEvent::FillDown`]). Forwarded as `Command::FillRight`.
+    FillRight(CellRange),
     /// Wrap-driven row auto-grow (`functional_spec.md §3`): the render thread measured each
     /// `(row, px)`'s wrapped height (device px) at its column width — geometry the worker can't
     /// compute (no gpui text system). The window forwards it as `Command::AutoGrowRowHeights` for

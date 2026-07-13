@@ -2141,6 +2141,16 @@ impl GridView {
             GridKeyCommand::Cut => self.events.emit(&GridEvent::Copy { cut: true }, window, cx),
             GridKeyCommand::Paste => self.events.emit(&GridEvent::Paste, window, cx),
             GridKeyCommand::SelectAll => self.select_all(window, cx),
+            // Fill Down / Right carry the current selection range; the window forwards them to the
+            // worker (`functional_spec.md §3`).
+            GridKeyCommand::FillDown => {
+                let range = self.selection().range();
+                self.events.emit(&GridEvent::FillDown(range), window, cx);
+            }
+            GridKeyCommand::FillRight => {
+                let range = self.selection().range();
+                self.events.emit(&GridEvent::FillRight(range), window, cx);
+            }
         }
     }
 

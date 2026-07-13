@@ -1414,6 +1414,16 @@ fn make_grid_sink(
                     .paste(shared.active_sheet.get(), target, &client, cx);
             }
         }
+        // Fill Down / Right (`functional_spec.md §3`): a copy-fill of the selection's seed line,
+        // routed straight to the worker (one undo step, engine-guarded against merges).
+        GridEvent::FillDown(range) => client.send(Command::FillDown {
+            sheet: shared.active_sheet.get(),
+            range: *range,
+        }),
+        GridEvent::FillRight(range) => client.send(Command::FillRight {
+            sheet: shared.active_sheet.get(),
+            range: *range,
+        }),
         // Structure ops (`functional_spec.md §5`): resize + insert/delete route straight to the
         // worker (the worker merge-guards insert/delete authoritatively).
         GridEvent::ResizeCommitted {

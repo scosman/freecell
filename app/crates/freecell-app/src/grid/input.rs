@@ -28,6 +28,12 @@ pub enum GridKeyCommand {
     /// Cmd/Ctrl+A — select the whole sheet (`functional_spec.md §5.2`; first press, no
     /// expand-to-region subtlety).
     SelectAll,
+    /// Cmd/Ctrl+D — fill the selection's top row **down** over the rest (a copy, not a series;
+    /// `functional_spec.md §3`).
+    FillDown,
+    /// Cmd/Ctrl+R — fill the selection's left column **right** over the rest (`functional_spec.md
+    /// §3`).
+    FillRight,
 }
 
 /// Maps a platform keystroke — decomposed into plain data so this stays gpui-free — to a
@@ -70,6 +76,9 @@ pub fn command_for_key(
             "x" => return Some(GridKeyCommand::Cut),
             "v" => return Some(GridKeyCommand::Paste),
             "a" => return Some(GridKeyCommand::SelectAll),
+            // Fill Down / Right — a copy-fill of the selection's seed line (`functional_spec.md §3`).
+            "d" => return Some(GridKeyCommand::FillDown),
+            "r" => return Some(GridKeyCommand::FillRight),
             _ => {}
         }
     }
@@ -268,5 +277,24 @@ mod tests {
         assert_eq!(command_for_key("a", false, false, PAGE), None);
         // Shift+Cmd/Ctrl+A is not bound (reserved).
         assert_eq!(command_for_key("a", true, true, PAGE), None);
+    }
+
+    #[test]
+    fn fill_chords_map_on_secondary_only() {
+        // Cmd/Ctrl+D → FillDown; Cmd/Ctrl+R → FillRight.
+        assert_eq!(
+            command_for_key("d", false, true, PAGE),
+            Some(GridKeyCommand::FillDown)
+        );
+        assert_eq!(
+            command_for_key("r", false, true, PAGE),
+            Some(GridKeyCommand::FillRight)
+        );
+        // Bare `d`/`r` are ordinary printable keys (type-to-replace).
+        assert_eq!(command_for_key("d", false, false, PAGE), None);
+        assert_eq!(command_for_key("r", false, false, PAGE), None);
+        // Shift+chord is reserved (⌘⇧D / other fill variants are out of scope) → not bound.
+        assert_eq!(command_for_key("d", true, true, PAGE), None);
+        assert_eq!(command_for_key("r", true, true, PAGE), None);
     }
 }

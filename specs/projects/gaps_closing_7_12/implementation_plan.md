@@ -19,7 +19,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       (`Command::SelectionStats` → `document.rs::selection_stats`) + stats readout on the
       **right of the tab bar** (`render_tab_bar` refactor), Sum·Avg·Count with a click
       toggle for Min·Max. Decides D1.1. Non-pixel (tab-bar chrome) → gpui tests + smoke.
-- [ ] **Phase 2 — Fill down / right (⌘D / ⌘R).** Keyboard commands only (drag handle
+- [x] **Phase 2 — Fill down / right (⌘D / ⌘R).** Keyboard commands only (drag handle
       deferred); new command → fork `auto_fill_rows/columns` (copy-fill from the top
       row/left col). Decides D3.1. **Check out the fork** (`add_repo scosman/ironcalc`) to
       bind the exact `auto_fill_*` signature. Engine tests.

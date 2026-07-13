@@ -340,6 +340,40 @@ new `chrome/h_scroller.rs` (or `ui/`), `CLAUDE.md` (lucide note).
 
 ---
 
+## 10. Feedback tweaks  (owner feedback; decision **D10.1**)
+
+Built after Phase 9. Chrome-only → no pixel suite (gpui view tests + `VisualTestContext` paint
++ Xvfb smoke). Open-ended phase; 10.1 is the first tweak.
+
+**10.1 — number-format dropdown: basics-first + "More ▸" submenu.** Undo Phase 6's
+scroll-to-reach-basics regression. In `chrome/view.rs`'s `render_num_fmt_popover` (grep — Phase
+6 restructured it):
+- **Recover the original 7-preset list** from git history — the pre-Phase-6 `DROPDOWN_FORMATS`
+  const removed in commit `382f075` (`git show 382f075^:app/crates/freecell-core/src/format_ui.rs`).
+  Reintroduce it in `freecell-core/src/format_ui.rs` as the **basic set** (e.g. `BASIC_FORMATS`),
+  keeping the Phase-6 `NUM_FMT_GROUPS` intact as the full/"More" inventory (single source of
+  truth for breadth). Both feed the same reverse map (`num_fmt_category`) and the same
+  `apply_num_fmt` path.
+- **Popover** renders the basic set flat (no scroll) + a trailing **"More ▸"** row.
+- **D10.1 — submenu mechanism:** prefer a **flyout** (a second popover card anchored to the
+  "More ▸" row, reusing the existing custom-`div` popover/backdrop pattern — like the
+  chart/cell menus). **Fallback: drill-in** (clicking "More ▸" swaps the popover's content to
+  the grouped `NUM_FMT_GROUPS` list — the current Phase-6 scrollable grouped view — with a
+  "◂ Back" row restoring the basic set); use drill-in if a hover/click flyout is awkward with
+  the popover's occlude/dismiss machinery. Note the choice in the phase plan.
+- **Highlighting:** the basic menu highlights the active preset when it's a basic one; when the
+  active format is a "More"-only preset, mark "More ▸" active (and, for drill-in, have it open
+  onto the matched group) so the user can still see/reach the current format. The
+  thousands-separator action-bar button is untouched.
+- **Tests:** basic menu shows the 7 without scroll; "More ▸" opens the full grouped list;
+  selecting from either level applies the right code; reverse-map highlight for a basic vs. a
+  More-only active format; a `VisualTestContext` paint of both levels.
+
+**Files:** `freecell-core/src/format_ui.rs` (reintroduce basic set), `chrome/view.rs`
+(`render_num_fmt_popover` + More/back state).
+
+---
+
 ## Consolidated decisions
 
 | ID | Decision | Recommendation |
@@ -359,6 +393,7 @@ new `chrome/h_scroller.rs` (or `ui/`), `CLAUDE.md` (lucide note).
 | D9.1 | Stats adaptive decimals | **RESOLVED (owner):** by \|value\| — ≥100→2, ≥10→3, ≥1→4, <1→5 dp |
 | D9.2 | H-scroller chevron step | **RESOLVED (owner):** animated, 0.8 × viewport width per click, clamped |
 | D9.3 | H-scroller overflow affordance | **RESOLVED (owner):** static divider + lucide chevron-left/right (action-bar style); no visible scrollbar; unchanged when it fits |
+| D10.1 | Num-fmt "More ▸" submenu mechanism | Prefer a **flyout** off "More ▸"; **drill-in** (swap content + "◂ Back") is an acceptable fallback if a flyout is awkward in the custom-`div` popover |
 
 ## Component designs
 

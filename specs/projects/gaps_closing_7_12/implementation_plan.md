@@ -4,12 +4,12 @@ status: complete
 
 # Implementation Plan: gaps_closing_7_12
 
-Nine independent phases (see `functional_spec.md` + `architecture.md` for detail). Ordered
-so dependencies land first (paste-values before the context menu that lists it) and the
-sole pixel-suite phase (Phase 8) lands before the final chrome phase. Each phase: build
+Ten phases (see `functional_spec.md` + `architecture.md` for detail). Ordered so
+dependencies land first (paste-values before the context menu that lists it) and the sole
+pixel-suite phase (Phase 8) lands before the final chrome phases. Each phase: build
 crate-scoped, `cargo fmt --all --check`, unit/gpui tests + (where noted) a render subset,
 commit, then move on. Full render suite + CI `render` gate happen **once**, in Phase 8.
-Phase 9 (owner feedback, added 2026-07-13) is chrome-only → no pixel suite.
+Phases 9–10 (owner feedback, added 2026-07-13) are chrome-only → no pixel suite.
 
 Unresolved decisions carry a **recommended default** (architecture.md "Consolidated
 decisions"); proceed on the default unless the owner overrides at phase start.
@@ -57,3 +57,11 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       always-visible fix, 9A.4). 9C: note in `CLAUDE.md` that we use lucide for icons.
       Chrome-only → gpui view tests + `VisualTestContext` paint tests + Xvfb smoke; **no pixel
       suite.**
+- [ ] **Phase 10 — Feedback tweaks (owner feedback).** 10.1: number-format dropdown
+      basics-first — reintroduce the pre-Phase-6 7-preset `DROPDOWN_FORMATS` (recover from
+      `382f075^`) as the default `BASIC_FORMATS` set in `format_ui.rs`; keep Phase-6
+      `NUM_FMT_GROUPS` as the full inventory behind a trailing **"More ▸"** item in
+      `render_num_fmt_popover` (D10.1: flyout preferred, drill-in + "◂ Back" acceptable
+      fallback). Reverse-map highlight works across both levels; thousands-separator button
+      unchanged. Open-ended phase (owner may add tweaks). Chrome-only → gpui + `VisualTestContext`
+      paint tests + Xvfb smoke; **no pixel suite.**

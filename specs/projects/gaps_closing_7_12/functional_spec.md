@@ -454,6 +454,49 @@ adding the chevron icons).
 
 ---
 
+## 10. Feedback tweaks  *(owner feedback, 2026-07-13 — built after Phase 9)*
+
+A collection of small post-use feedback tweaks. Open-ended (the owner may add more). All
+chrome → **not** pixel-suite scope; validate with gpui view tests + `VisualTestContext` paint
+tests + an Xvfb smoke launch.
+
+### 10.1 Number-format dropdown: basics-first menu, breadth under "More ▸"
+
+**Regression fixed:** Phase 6's grouped 23-preset dropdown is too long — the common/basic
+formats now require scrolling to reach. Restore a short, basics-first menu and demote the full
+breadth behind a "More" affordance.
+
+**Behavior:**
+- The number-format dropdown's **default content is the original short list** — the ~7 common
+  presets that shipped *before* Phase 6 (the pre-Phase-6 `DROPDOWN_FORMATS` set: General,
+  Number, Currency, Percent, Date, Time, and the rest of the original seven). Flat, no
+  scrolling to see the basics.
+- The **last item is "More ▸"**, which opens the **full Phase-6 grouped list** (all 23 presets
+  across the 9 groups, with section headers) as a **submenu**. Nothing from Phase 6 is lost —
+  just relocated so it isn't in the way of the basics.
+- **Reverse-map highlighting still works** across both levels: whichever preset matches the
+  active cell's format code is highlighted. If the active format is one that lives only in the
+  "More" submenu (not in the basic set), the basic menu still indicates the active state
+  sensibly (e.g. "More ▸" is marked active / the submenu opens showing the match) — exact
+  behavior per D10.1.
+- The **thousands-separator action-bar toggle button** (Phase 6) is unchanged (separate
+  control, not in the dropdown). The `More` submenu preserves Phase-6 grouping + the same apply
+  path.
+- **When it fits:** the basic menu shows without scrolling; the "More" submenu is the only
+  place that scrolls (it's the long list).
+
+**Decision — D10.1 (submenu mechanism):** the owner asked for a **submenu under a "More ▸"
+item** (a flyout). Preferred = a flyout/side-panel off "More ▸"; **acceptable fallback** if a
+true hover-flyout is awkward in the existing custom-`div` popover = a **drill-in** (clicking
+"More ▸" swaps the popover content to the grouped list with a "◂ Back" affordance). Pick the
+cleaner fit for the existing `render_num_fmt_popover` popover; note the choice.
+
+### Out of scope (Phase 10)
+
+- A custom format-code editor (still v1.0); re-ordering/customizing which presets are "basic".
+
+---
+
 ## Render-test scope summary (informs the implementation plan)
 
 | Phase | Pixel-suite in scope? | Validation |
@@ -467,6 +510,7 @@ adding the chevron icons).
 | 7 Autofit | Lightly (column geometry, like resize) | width-calc unit test + subset render check |
 | 8 Render pair | **Yes — intentional baseline moves** | full suite + eyeball + CI `render` gate |
 | 9 Sum-section + h-scroller | No (tab-bar + action-bar chrome) | gpui view tests + `VisualTestContext` paint tests + Xvfb smoke launch |
+| 10 Feedback tweaks (num-fmt More▸) | No (dropdown chrome) | gpui view tests + `VisualTestContext` paint tests + Xvfb smoke launch |
 
 All grid/cell/sheet-pixel-affecting work is concentrated in **Phase 8**, which is the sole
 dedicated render-validation phase (Phases 1–7, 9 verify with unit/gpui/subset checks only).

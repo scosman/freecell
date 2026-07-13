@@ -19,6 +19,12 @@ use crate::style::RenderStyle;
 pub const DEFAULT_COL_WIDTH_PX: f32 = 100.0;
 /// Default row height in px when the file specifies no override (`ui_design.md §3.3`).
 pub const DEFAULT_ROW_HEIGHT_PX: f32 = 24.0;
+/// The grid's default cell font size in px (the app's `CELL_FONT_PX`). Lives here (next to
+/// [`DEFAULT_ROW_HEIGHT_PX`]) because the pair defines the row-height : font-size ratio
+/// (24 : 13 ≈ 1.85) that the engine's font-size row auto-grow keeps as fonts scale up — gpui's
+/// default line box is `phi` (≈1.618×) the font size, so a row grown by this ratio always fits the
+/// line box with proportional slack, keeping vertical alignment meaningful at any size.
+pub const DEFAULT_CELL_FONT_PX: f32 = 13.0;
 /// The maximum height (px) wrap-driven row auto-grow may set a row to (`functional_spec.md §3.4`,
 /// `architecture.md §3.2`): ~10 default lines. A pathological wrapped cell can't make a row fill
 /// the screen — content beyond the cap clips within the wrapped cell. Shared by the UI-thread

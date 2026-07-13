@@ -105,12 +105,12 @@ impl Default for SelectionModel {
 }
 
 /// Whether `range` spans every row of the sheet (a full-column / whole-sheet selection).
-fn spans_all_rows(range: &CellRange) -> bool {
+pub fn spans_all_rows(range: &CellRange) -> bool {
     range.start.row == 0 && range.end.row == limits::MAX_ROWS - 1
 }
 
 /// Whether `range` spans every column of the sheet (a full-row / whole-sheet selection).
-fn spans_all_cols(range: &CellRange) -> bool {
+pub fn spans_all_cols(range: &CellRange) -> bool {
     range.start.col == 0 && range.end.col == limits::MAX_COLS - 1
 }
 

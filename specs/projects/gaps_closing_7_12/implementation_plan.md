@@ -29,7 +29,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
 - [x] **Phase 4 — Paste values (⌘⇧V).** Bind the reserved `Shift+V`; paste the internal
       clipboard's computed-value TSV at target (values-only, one undo step; D5.1/D5.2).
       Exposes `GridEvent::PasteValues` for Phase 5. Unit tests incl. the `"=x"` edge case.
-- [ ] **Phase 5 — Cell-area right-click context menu.** Clone `chart_menu_elements` →
+- [x] **Phase 5 — Cell-area right-click context menu.** Clone `chart_menu_elements` →
       `cell_menu_elements`, open from the cell-body arm of `handle_right_mouse_down`
       (select-move-if-outside); items reuse existing Copy/Cut/Paste/Clear/Insert/Delete +
       Paste-Values (Phase 4). Decides D2.1. gpui tests.

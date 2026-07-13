@@ -135,6 +135,12 @@ pub(crate) struct CopiedRange {
     pub tsv: String,
     pub data: serde_json::Value,
     pub range: (i32, i32, i32, i32),
+    /// The copied block's **computed values** rendered as literal paste tokens, row-major over the
+    /// effective (clamped) source rectangle — the source of a later Paste Values (⌘⇧V,
+    /// `functional_spec.md §5`). Captured at copy time (a snapshot, like `data`/`tsv`) so
+    /// paste-values is values-only and never re-derives formulas. See
+    /// [`WorkbookDocument::value_token`] for the per-cell rendering.
+    pub values: Vec<Vec<String>>,
 }
 
 /// The magic-byte family of a file, used to classify open failures into typed [`LoadError`]s
@@ -1291,7 +1297,99 @@ impl WorkbookDocument {
                 serde_json::from_value::<(i32, i32, i32, i32)>(v)
                     .map_err(|e| format!("bad clipboard range: {e}"))
             })?;
-        Ok(CopiedRange { tsv, data, range })
+        // Snapshot the block's computed values as literal paste tokens for a later Paste Values
+        // (⌘⇧V) — captured here so paste-values pastes values, never re-derived formulas.
+        let values = self.copied_value_tokens(sheet_idx, range);
+        Ok(CopiedRange {
+            tsv,
+            data,
+            range,
+            values,
+        })
+    }
+
+    /// The computed values of the effective (1-based, inclusive) copied `range` as literal paste
+    /// tokens, row-major — the Paste Values (⌘⇧V, `functional_spec.md §5`) snapshot stored on the
+    /// clipboard slot. Each token is what [`value_token`](Self::value_token) renders; pasting them
+    /// via [`paste_values`](Self::paste_values) reproduces the *values only* (no formulas, no
+    /// formatting) at the target.
+    fn copied_value_tokens(&self, sheet_idx: u32, range: (i32, i32, i32, i32)) -> Vec<Vec<String>> {
+        let (r0, c0, r1, c1) = range;
+        if r1 < r0 || c1 < c0 {
+            return Vec::new(); // degenerate (inverted) clamp — nothing to copy
+        }
+        // The workbook's decimal separator, resolved once, so a fractional Number token re-parses
+        // as a number under this workbook's own locale (the write path parses with it) — not only
+        // under an `en`/`.`-decimal workbook.
+        let decimal_sep = self.workbook_decimal_separator();
+        (r0..=r1)
+            .map(|row| {
+                (c0..=c1)
+                    .map(|col| self.value_token(sheet_idx, row, col, decimal_sep))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The workbook locale's decimal separator (default `.`). Paste Values re-parses a Number
+    /// token through the write path (`set_user_input` → `parse_formatted_number`), which uses the
+    /// **workbook** locale's separators — so a fractional token must carry this separator to land
+    /// as a number rather than falling through to text under a non-`.`-decimal workbook (e.g. a
+    /// German-locale xlsx: decimal `,`, group `.`).
+    fn workbook_decimal_separator(&self) -> char {
+        crate::instrument::record_engine_call();
+        let model = self.model.get_model();
+        get_locale(&model.workbook.settings.locale)
+            .ok()
+            .and_then(|loc| loc.numbers.symbols.decimal.chars().next())
+            .unwrap_or('.')
+    }
+
+    /// One cell's evaluated value rendered as a **literal** Paste Values token (1-based coords):
+    /// re-expressed so writing it back with [`set_user_input`](UserModel::set_user_input)
+    /// reproduces the same *value* under the target's own formatting, never re-interpreting it as a
+    /// formula (`functional_spec.md §5`). `decimal_sep` is the workbook locale's decimal separator
+    /// (from [`workbook_decimal_separator`](Self::workbook_decimal_separator)).
+    ///
+    /// - `Number(n)` → the plain unformatted decimal (`f64` `Display`, never grouped or scientific,
+    ///   with the decimal point rendered as `decimal_sep`), which re-parses to the same number with
+    ///   **no** number format applied (a bare, ungrouped number infers none) under this workbook's
+    ///   locale — at full precision, not the rounded display string, so the target keeps its format.
+    /// - `Boolean` → `TRUE`/`FALSE` (re-parses to the boolean).
+    /// - An **error** cell (its value surfaces as the error string) → that string as-is, so it
+    ///   re-parses back to the same error value.
+    /// - A non-empty **string** → apostrophe-quoted so it is forced to literal text: this keeps a
+    ///   value that only *looks* like a formula (`=x`, `+x`, `-x`, `@x`) from being parsed as one
+    ///   and preserves text-vs-number typing (a text `"12"` stays text, not the number 12). The
+    ///   `'` toggles only the quote_prefix marker; number format / font / fill / borders are
+    ///   untouched.
+    /// - Empty — a blank cell **or** an empty-string value (`=""`) → `""`, which **clears** the
+    ///   target (a true blank, not a counted empty-text cell), matching a paste of a blank source.
+    fn value_token(&self, sheet_idx: u32, row: i32, col: i32, decimal_sep: char) -> String {
+        crate::instrument::record_engine_call();
+        match self
+            .model
+            .get_model()
+            .get_cell_value_by_index(sheet_idx, row, col)
+        {
+            Ok(CellValue::Number(n)) => number_token(n, decimal_sep),
+            Ok(CellValue::Boolean(b)) => if b { "TRUE" } else { "FALSE" }.to_string(),
+            // An empty-string value is written as a clear (a true blank), not a quoted empty text.
+            Ok(CellValue::String(s)) if s.is_empty() => String::new(),
+            Ok(CellValue::String(s)) => {
+                // An error cell's value is its error string — let it round-trip as the error
+                // (unquoted). Genuine text is force-quoted so it is written as a literal.
+                if matches!(
+                    self.model.get_cell_type(sheet_idx, row, col),
+                    Ok(CellType::ErrorValue)
+                ) {
+                    s
+                } else {
+                    format!("'{s}")
+                }
+            }
+            Ok(CellValue::None) | Err(_) => String::new(),
+        }
     }
 
     /// Paste a previously-copied engine payload at `anchor` on `dest_idx` (`paste_from_clipboard`,
@@ -1369,6 +1467,48 @@ impl WorkbookDocument {
         self.model.paste_csv_string(&area, text)
     }
 
+    /// Paste the copied **computed values** (Paste Values, ⌘⇧V — `functional_spec.md §5`) at
+    /// `anchor` on `dest_idx`: values only, no formulas, no formatting — the target keeps its own.
+    /// `values` is the source block's literal tokens (row-major, `src_h × src_w`, from
+    /// [`copied_value_tokens`](Self::copied_value_tokens)); it is **tiled** to fill a
+    /// `paste_w × paste_h` block (a single-cell / exact-divisor source fills the larger selection,
+    /// matching the internal-paste fill rule — `paste_w`/`paste_h` come from
+    /// [`fill_target_dims`], or equal the source dims for a straight block paste). Every target
+    /// cell is written through **one** `set_user_inputs` batch → a single undo entry (an empty
+    /// token clears its cell, so a blank source cell clears the target). The pasted rectangle is
+    /// re-selected so the caller (`run_guarded_paste`) reads it back. The caller pauses evaluation
+    /// around this (its single coalesced recompute follows).
+    pub(crate) fn paste_values(
+        &mut self,
+        dest_idx: u32,
+        anchor: CellRef,
+        values: &[Vec<String>],
+        paste_w: u32,
+        paste_h: u32,
+    ) -> Result<(), String> {
+        let src_h = values.len();
+        let src_w = values.first().map(Vec::len).unwrap_or(0);
+        if src_h == 0 || src_w == 0 {
+            return Ok(()); // nothing to paste
+        }
+        let (anchor_row, anchor_col) = to_engine_coords(anchor);
+        let mut batch: Vec<(u32, i32, i32, String)> =
+            Vec::with_capacity(paste_w as usize * paste_h as usize);
+        for dr in 0..paste_h as i32 {
+            let src_row = &values[dr as usize % src_h];
+            for dc in 0..paste_w as i32 {
+                let token = src_row[dc as usize % src_w].clone();
+                batch.push((dest_idx, anchor_row + dr, anchor_col + dc, token));
+            }
+        }
+        crate::instrument::record_engine_call();
+        self.model.set_user_inputs(&batch)?;
+        // Re-select the pasted rectangle so `selected_range_0based` mirrors it into the UI
+        // selection (both other paste APIs re-select their pasted area too).
+        let end = CellRef::new(anchor.row + paste_h - 1, anchor.col + paste_w - 1);
+        self.set_view_selection(dest_idx, CellRange::new(anchor, end))
+    }
+
     /// The engine's current view selection as a 0-based [`CellRange`] — read back right after a
     /// paste (both paste APIs re-select the pasted rectangle) to mirror it into FreeCell's
     /// `SelectionModel`.
@@ -1435,6 +1575,20 @@ fn resolve_text_color(model: &Model, sheet: u32, row: i32, col: i32, style: &Sty
 /// The Excel-max bounds (`freecell_core::limits`) fit comfortably in `i32`.
 fn to_engine_coords(cell: CellRef) -> (i32, i32) {
     (cell.row as i32 + 1, cell.col as i32 + 1)
+}
+
+/// Renders a numeric value as a Paste Values token: Rust's `f64` `Display` (full round-trip
+/// precision, never a group separator, never scientific for finite magnitudes) with its single
+/// `.` decimal point rewritten to the workbook locale's `decimal_sep`. This is the ungrouped,
+/// locale-correct form `parse_formatted_number` re-parses to the same number with **no** format
+/// inferred — so a fractional number pastes as a number (not text) under any workbook locale.
+fn number_token(n: f64, decimal_sep: char) -> String {
+    let s = n.to_string();
+    if decimal_sep == '.' {
+        s
+    } else {
+        s.replace('.', &decimal_sep.to_string())
+    }
 }
 
 /// The tiled destination dims `(width, height)` in cells when a copied `source_range` fills a
@@ -2512,6 +2666,260 @@ mod tests {
             false,
         );
         assert_eq!(doc.cell_content(0, cell(2, 1)).unwrap(), "=$A$1");
+    }
+
+    // ---- Paste Values (⌘⇧V, `functional_spec.md §5`) --------------------------------------
+
+    /// Give the single cell `c` on sheet 0 the number format `code`.
+    fn set_num_fmt(doc: &mut WorkbookDocument, c: CellRef, code: &str) {
+        doc.user_model_mut()
+            .update_range_style(&area_of(0, CellRange::single(c)), "num_fmt", code)
+            .unwrap();
+    }
+
+    #[test]
+    fn paste_values_writes_the_formula_result_not_the_formula_and_keeps_target_format() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "=1+2").unwrap(); // evaluates to 3
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(a1)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["3".to_string()]],
+            "computed value snapshot"
+        );
+
+        // The target C1 carries its own 2-decimal format, which paste-values must preserve.
+        let c1 = cell(0, 2);
+        set_num_fmt(&mut doc, c1, "0.00");
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+
+        // The literal value 3 landed (not the formula) and the target kept its own format.
+        assert_eq!(
+            doc.cell_content(0, c1).unwrap(),
+            "3",
+            "the value, not `=1+2`"
+        );
+        assert_eq!(doc.published_style(0, c1).unwrap().0, CellKind::Number);
+        assert_eq!(
+            doc.formatted_value(0, c1).unwrap(),
+            "3.00",
+            "the target's own 0.00 format is kept — paste-values applies no formatting"
+        );
+        // The source formula is untouched.
+        assert_eq!(doc.cell_content(0, a1).unwrap(), "=1+2");
+    }
+
+    #[test]
+    fn value_tokens_force_every_formula_looking_leading_char_literal() {
+        // Every leading char that a spreadsheet may treat as a formula (`=`, `+`, `-`, `@`) must be
+        // apostrophe-forced when it is a *string* value, while a real number/boolean stays bare.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        for (col, text) in ["=x", "+x", "-x", "@x"].iter().enumerate() {
+            doc.set_cell_input(0, cell(0, col as u32), &format!("'{text}"))
+                .unwrap(); // a literal text value like the string "=x"
+        }
+        doc.set_cell_input(0, cell(0, 4), "-5").unwrap(); // a real negative number
+        doc.set_cell_input(0, cell(0, 5), "=TRUE").unwrap(); // a boolean
+        doc.evaluate();
+
+        let copied = doc
+            .copy_range(0, CellRange::new(cell(0, 0), cell(0, 5)))
+            .unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec![
+                "'=x".to_string(),
+                "'+x".to_string(),
+                "'-x".to_string(),
+                "'@x".to_string(),
+                "-5".to_string(), // a real number is a bare token (no quote)
+                "TRUE".to_string(),
+            ]],
+        );
+    }
+
+    #[test]
+    fn paste_values_forces_a_formula_looking_string_to_a_literal() {
+        // A computed *string* value of `=x` must paste as literal text, never re-parsed as a
+        // formula (which would evaluate `x` to an error). The load-bearing edge case.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "=\"=x\"").unwrap(); // a formula whose *value* is the string "=x"
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, a1).unwrap(), "=x");
+        let copied = doc.copy_range(0, CellRange::single(a1)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["'=x".to_string()]],
+            "the string token is apostrophe-forced to a literal"
+        );
+
+        let c1 = cell(0, 2);
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.formatted_value(0, c1).unwrap(),
+            "=x",
+            "the literal text `=x` landed — NOT a re-interpreted formula"
+        );
+        assert_eq!(
+            doc.published_style(0, c1).unwrap().0,
+            CellKind::Text,
+            "the pasted cell is text, not a formula/error"
+        );
+    }
+
+    #[test]
+    fn paste_values_preserves_number_vs_text_typing() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let num = cell(0, 0); // a real number
+        let txt = cell(0, 1); // text that merely looks numeric
+        doc.set_cell_input(0, num, "42").unwrap();
+        doc.set_cell_input(0, txt, "'12").unwrap(); // leading apostrophe → the text "12"
+        doc.evaluate();
+
+        let copied = doc.copy_range(0, CellRange::new(num, txt)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["42".to_string(), "'12".to_string()]],
+            "a number stays a bare number token; text is force-quoted"
+        );
+
+        let dest = cell(2, 0);
+        doc.paste_values(0, dest, &copied.values, 2, 1).unwrap();
+        doc.evaluate();
+        // The numeric value pastes as a number…
+        assert_eq!(doc.published_style(0, dest).unwrap().0, CellKind::Number);
+        assert_eq!(doc.formatted_value(0, dest).unwrap(), "42");
+        // …and the numeric-looking text stays text.
+        assert_eq!(
+            doc.published_style(0, cell(2, 1)).unwrap().0,
+            CellKind::Text
+        );
+        assert_eq!(doc.formatted_value(0, cell(2, 1)).unwrap(), "12");
+    }
+
+    #[test]
+    fn paste_values_round_trips_booleans_and_errors() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let b = cell(0, 0);
+        let e = cell(0, 1);
+        doc.set_cell_input(0, b, "=TRUE").unwrap();
+        doc.set_cell_input(0, e, "=1/0").unwrap(); // #DIV/0!
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::new(b, e)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["TRUE".to_string(), "#DIV/0!".to_string()]],
+        );
+
+        let dest = cell(2, 0);
+        doc.paste_values(0, dest, &copied.values, 2, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(doc.published_style(0, dest).unwrap().0, CellKind::Bool);
+        assert_eq!(doc.formatted_value(0, dest).unwrap(), "TRUE");
+        assert_eq!(
+            doc.published_style(0, cell(2, 1)).unwrap().0,
+            CellKind::Error
+        );
+        assert_eq!(doc.formatted_value(0, cell(2, 1)).unwrap(), "#DIV/0!");
+    }
+
+    #[test]
+    fn paste_values_tiles_a_single_cell_over_a_larger_block_and_clears_blanks() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "5").unwrap();
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(cell(0, 0))).unwrap();
+
+        // Pre-seed a target cell so we can prove a blank source token would clear it (here the
+        // single-cell fill writes 5 everywhere, so all four land).
+        let target = CellRange::new(cell(0, 2), cell(1, 3)); // C1:D2, a 2×2 block
+        doc.paste_values(0, target.start, &copied.values, 2, 2)
+            .unwrap();
+        doc.evaluate();
+        for r in 0..2 {
+            for c in 2..4 {
+                assert_eq!(doc.formatted_value(0, cell(r, c)).unwrap(), "5");
+            }
+        }
+        assert_eq!(
+            doc.selected_range_0based(),
+            target,
+            "the filled block is re-selected"
+        );
+    }
+
+    #[test]
+    fn number_token_uses_the_locale_decimal_separator_without_grouping() {
+        // `.` locale: Rust's own repr, full precision.
+        assert_eq!(number_token(3.14, '.'), "3.14");
+        assert_eq!(number_token(1234567.5, '.'), "1234567.5"); // never grouped
+        assert_eq!(number_token(42.0, '.'), "42"); // an integer has no decimal point
+                                                   // `,` locale (German): the decimal point becomes `,`; still no grouping.
+        assert_eq!(number_token(3.14, ','), "3,14");
+        assert_eq!(number_token(1234567.5, ','), "1234567,5");
+        assert_eq!(number_token(42.0, ','), "42"); // integer unaffected by the separator
+    }
+
+    #[test]
+    fn paste_values_number_survives_a_non_dot_decimal_locale() {
+        // Moderate CR fix: under a German-locale workbook (decimal `,`, group `.`) a fractional
+        // computed number must still paste as a NUMBER — the token carries the workbook locale's
+        // decimal separator, so the write path parses it as a number instead of falling to text.
+        let model = ironcalc_base::Model::new_empty("de-book", "de", "UTC", "en").unwrap();
+        let mut doc = WorkbookDocument::from_test_model(model);
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "=1/4").unwrap(); // 0.25
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(a1)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["0,25".to_string()]],
+            "the number token uses the workbook locale's decimal separator"
+        );
+
+        let c1 = cell(0, 2);
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, c1).unwrap().0,
+            CellKind::Number,
+            "the fractional value pastes as a number, not text, under a non-`.`-decimal locale"
+        );
+    }
+
+    #[test]
+    fn paste_values_empty_string_value_clears_the_target_not_a_counted_blank() {
+        // Mild CR fix: an empty-string computed value (`=""`) must CLEAR the target (a true blank
+        // that the selection-stats Count ignores), not write a quoted empty text cell (which would
+        // count as non-empty).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "=\"\"").unwrap(); // a formula whose value is the string ""
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(cell(0, 0))).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec![String::new()]],
+            "an empty-string value renders as a clearing token"
+        );
+
+        // Pre-seed the target so we can prove the paste CLEARS it.
+        let c1 = cell(0, 2);
+        doc.set_cell_input(0, c1, "old").unwrap();
+        doc.evaluate();
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, c1).unwrap(), "");
+        // A cleared cell is not counted; a quoted empty-text cell would count as 1.
+        assert_eq!(
+            doc.selection_stats(0, CellRange::single(c1)).count,
+            0,
+            "the target is a true blank, not a counted empty-text cell"
+        );
     }
 
     #[test]

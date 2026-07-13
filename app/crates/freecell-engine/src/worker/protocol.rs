@@ -349,6 +349,14 @@ pub enum Command {
     /// limitation U2 in `GAPS.md`, to keep the fill one undo step). Replies with
     /// [`WorkerEvent::Pasted`] (the pasted range) or [`WorkerEvent::PasteRejected`].
     PasteInternal { sheet: SheetId, target: CellRange },
+    /// Paste the internal clipboard slot's **computed values** into `target` — the values-only
+    /// sibling of [`PasteInternal`] (⌘⇧V, `functional_spec.md §5`): each source cell pastes its
+    /// evaluated value as a **literal** (a formula collapses to its result, a leading-`=` string
+    /// stays literal text, numbers stay numbers), with **no** formulas and **no** formatting — the
+    /// target keeps its own. Sizing/overflow match `PasteInternal` (a single-cell / exact-divisor
+    /// source tiles to fill the selection; a block pastes from the anchor; oversized → Overflow).
+    /// One undo step. Replies with [`WorkerEvent::Pasted`] or [`WorkerEvent::PasteRejected`].
+    PasteValues { sheet: SheetId, target: CellRange },
     /// Paste external tab-separated `text` at `anchor` (each token as user input). Replies with
     /// [`WorkerEvent::Pasted`] or [`WorkerEvent::PasteRejected`].
     PasteTsv {

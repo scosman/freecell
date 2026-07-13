@@ -128,6 +128,12 @@ pub enum GridEvent {
     Copy { cut: bool },
     /// Cmd/Ctrl+V on the focused grid — paste at the selection anchor (`functional_spec.md §2.2`).
     Paste,
+    /// Cmd/Ctrl+Shift+V on the focused grid — **Paste Values**: paste the internal clipboard's
+    /// evaluated values only (no formulas, no formatting) at the selection anchor
+    /// (`functional_spec.md §5`). The window routes it through the `ClipboardCoordinator` (internal
+    /// payload → `Command::PasteValues`; a foreign clipboard → a normal `Command::PasteTsv`, since
+    /// external TSV is already values). Reused by the Phase 5 context-menu "Paste Values" item.
+    PasteValues,
     /// Cmd/Ctrl+D on the focused grid — fill the selection's top row **down** over the rest (a
     /// copy-fill, `functional_spec.md §3`). Carries the current selection range; the window
     /// forwards it as `Command::FillDown` for the active sheet.

@@ -26,7 +26,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
 - [x] **Phase 3 — ⌘+arrow → edge-of-data.** Pure Excel edge algorithm in `freecell-core`,
       resolved worker-side (D4.1 Option A). Route only `JumpEdge`/`ExtendEdge` to the async
       query; other motions unchanged. Exhaustive algorithm unit tests.
-- [ ] **Phase 4 — Paste values (⌘⇧V).** Bind the reserved `Shift+V`; paste the internal
+- [x] **Phase 4 — Paste values (⌘⇧V).** Bind the reserved `Shift+V`; paste the internal
       clipboard's computed-value TSV at target (values-only, one undo step; D5.1/D5.2).
       Exposes `GridEvent::PasteValues` for Phase 5. Unit tests incl. the `"=x"` edge case.
 - [ ] **Phase 5 — Cell-area right-click context menu.** Clone `chart_menu_elements` →

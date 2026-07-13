@@ -25,6 +25,9 @@ pub enum GridKeyCommand {
     Cut,
     /// Cmd/Ctrl+V — paste at the selection anchor (`functional_spec.md §2.2`).
     Paste,
+    /// Cmd/Ctrl+Shift+V — **Paste Values**: paste the internal clipboard's evaluated values only
+    /// (no formulas, no formatting) at the selection anchor (`functional_spec.md §5`).
+    PasteValues,
     /// Cmd/Ctrl+A — select the whole sheet (`functional_spec.md §5.2`; first press, no
     /// expand-to-region subtlety).
     SelectAll,
@@ -67,9 +70,15 @@ pub fn command_for_key(
         return Some(M(motion));
     }
 
+    // Cmd/Ctrl+Shift+V — Paste Values (the values-only paste-special, `functional_spec.md §5`).
+    // The only bound shift+secondary chord; every other shift+secondary combo stays reserved.
+    if secondary && shift && key == "v" {
+        return Some(GridKeyCommand::PasteValues);
+    }
+
     // Cmd/Ctrl+C/X/V — the range clipboard (grid focused only; the data-row / in-cell inputs
-    // never reach here, so they keep native text clipboard behaviour). Shift is reserved for
-    // future paste-special, so only the bare secondary chord binds (`functional_spec.md §2`).
+    // never reach here, so they keep native text clipboard behaviour). The bare secondary chord
+    // (no Shift) binds copy/cut/paste; Shift+V is Paste Values above (`functional_spec.md §2`).
     if secondary && !shift {
         match key {
             "c" => return Some(GridKeyCommand::Copy),
@@ -263,8 +272,23 @@ mod tests {
         // Without the secondary modifier, `c`/`x`/`v` are ordinary printable keys (type-to-replace).
         assert_eq!(command_for_key("c", false, false, PAGE), None);
         assert_eq!(command_for_key("v", false, false, PAGE), None);
-        // Shift is reserved (paste-special) → not bound here.
-        assert_eq!(command_for_key("v", true, true, PAGE), None);
+    }
+
+    #[test]
+    fn paste_values_chord_maps_on_secondary_shift_v() {
+        // Cmd/Ctrl+Shift+V → Paste Values (`functional_spec.md §5`).
+        assert_eq!(
+            command_for_key("v", true, true, PAGE),
+            Some(GridKeyCommand::PasteValues)
+        );
+        // Bare secondary+V is still the plain Paste; Shift is what selects values-only.
+        assert_eq!(
+            command_for_key("v", false, true, PAGE),
+            Some(GridKeyCommand::Paste)
+        );
+        // Shift is not bound for the other clipboard chords (still reserved).
+        assert_eq!(command_for_key("c", true, true, PAGE), None);
+        assert_eq!(command_for_key("x", true, true, PAGE), None);
     }
 
     #[test]

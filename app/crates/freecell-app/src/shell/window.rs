@@ -1521,6 +1521,23 @@ fn make_grid_sink(
                     .paste(shared.active_sheet.get(), target, &client, cx);
             }
         }
+        GridEvent::PasteValues => {
+            // Paste Values (⌘⇧V, `functional_spec.md §5`): commit any pending edit first (same
+            // click-away rule as Paste), then route the values-only paste through the coordinator.
+            let committed = match chrome_slot.get().and_then(|w| w.upgrade()) {
+                Some(chrome) => chrome.update(cx, |c, cx| c.on_edit_commit_requested(window, cx)),
+                None => true,
+            };
+            if committed {
+                let target = shared.last_selection.get().range();
+                shared.clipboard.borrow_mut().paste_values(
+                    shared.active_sheet.get(),
+                    target,
+                    &client,
+                    cx,
+                );
+            }
+        }
         // Fill Down / Right (`functional_spec.md §3`): a copy-fill of the selection's seed line,
         // routed straight to the worker (one undo step, engine-guarded against merges).
         GridEvent::FillDown(range) => client.send(Command::FillDown {

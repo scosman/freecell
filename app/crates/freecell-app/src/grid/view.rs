@@ -2140,6 +2140,7 @@ impl GridView {
                 .emit(&GridEvent::Copy { cut: false }, window, cx),
             GridKeyCommand::Cut => self.events.emit(&GridEvent::Copy { cut: true }, window, cx),
             GridKeyCommand::Paste => self.events.emit(&GridEvent::Paste, window, cx),
+            GridKeyCommand::PasteValues => self.events.emit(&GridEvent::PasteValues, window, cx),
             GridKeyCommand::SelectAll => self.select_all(window, cx),
             // Fill Down / Right carry the current selection range; the window forwards them to the
             // worker (`functional_spec.md §3`).

@@ -117,6 +117,10 @@ struct ClipboardSlot {
     range: (i32, i32, i32, i32),
     data: serde_json::Value,
     cut: bool,
+    /// The copied block's computed values as literal paste tokens (row-major over `range`) — the
+    /// Paste Values (⌘⇧V) source. Captured at copy time alongside `data`; see
+    /// [`WorkbookDocument::copied_value_tokens`](crate::document::WorkbookDocument).
+    values: Vec<Vec<String>>,
 }
 
 /// One **authored** chart the worker holds (P17, charts/write-path §1 mode 3). Distinct from the
@@ -530,6 +534,7 @@ impl Worker {
                 Command::Shutdown => shutdown = true,
                 clip @ (Command::CopySelection { .. }
                 | Command::PasteInternal { .. }
+                | Command::PasteValues { .. }
                 | Command::PasteTsv { .. }) => clipboard_ops.push(clip),
                 font @ Command::SetFont { .. } => font_ops.push(font),
                 chart @ (Command::InsertChart { .. }
@@ -903,12 +908,13 @@ impl Worker {
         match cmd {
             Command::CopySelection { sheet, range, cut } => self.apply_copy(sheet, range, cut),
             Command::PasteInternal { sheet, target } => self.apply_paste_internal(sheet, target),
+            Command::PasteValues { sheet, target } => self.apply_paste_values(sheet, target),
             Command::PasteTsv {
                 sheet,
                 anchor,
                 text,
             } => self.apply_paste_tsv(sheet, anchor, &text),
-            // Only the three clipboard commands are bucketed here.
+            // Only the clipboard commands are bucketed here.
             _ => {}
         }
     }
@@ -1132,6 +1138,7 @@ impl Worker {
                     range: copied.range,
                     data: copied.data,
                     cut,
+                    values: copied.values,
                 });
                 self.emit(WorkerEvent::CopyReady { tsv: copied.tsv });
             }
@@ -1247,6 +1254,90 @@ impl Worker {
                 });
             }
             // A caught panic degrades the model; the (now-suspect) slot is dropped.
+            PasteOutcome::Panicked => self.handle_caught_panic(),
+        }
+    }
+
+    /// Paste the internal clipboard slot's **computed values** into `target` — the values-only
+    /// sibling of [`apply_paste_internal`](Self::apply_paste_internal) (⌘⇧V, `functional_spec.md
+    /// §5`). Reuses that path's sizing/overflow rules (a single-cell / exact-divisor source tiles
+    /// to fill the selection; a block pastes from the anchor; oversized → Overflow) and its guarded
+    /// one-undo write, but writes each source cell's evaluated value as a **literal** (no formulas,
+    /// no formatting — the target keeps its own). A values paste is always repeatable and never
+    /// clears the source, so the slot is kept regardless of its `cut` flag.
+    fn apply_paste_values(&mut self, dest: SheetId, target: CellRange) {
+        let anchor = target.start;
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(slot) = self.clipboard.take() else {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+        // A degenerate slot (inverted range, or no captured values) has nothing to paste — reject
+        // rather than trust the UI (matches `apply_paste_internal`). Junk, so not restored.
+        let (r0, c0, r1, c1) = slot.range;
+        if r1 < r0 || c1 < c0 || slot.values.is_empty() {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        }
+        // A single-cell / exact-divisor source fills the whole (larger) selection; cap the fill at
+        // the same size guard the internal paste uses so a 1-cell fill into a full-column selection
+        // can't materialise a million cells. A values paste never "moves", so it always fills.
+        let fill = crate::document::fill_target_dims(slot.range, target);
+        if let Some((tw, th)) = fill {
+            if tw as u64 * th as u64 > MAX_REFRESH_CELLS {
+                self.clipboard = Some(slot); // still valid — the user can retry on a smaller target
+                self.emit(WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow,
+                });
+                return;
+            }
+        }
+        // Overflow pre-check against the slot's effective source dims (when filling, the source is a
+        // divisor of the valid target, so its top-left tile fits too).
+        let (width, height) = ((c1 - c0 + 1) as u32, (r1 - r0 + 1) as u32);
+        if !paste_fits(anchor, width, height) {
+            self.clipboard = Some(slot); // still valid — the user can retry at a smaller anchor
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::Overflow,
+            });
+            return;
+        }
+        let Some(dest_idx) = self.resolve(dest) else {
+            self.clipboard = Some(slot); // the destination sheet vanished — keep the copy
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+        let (paste_w, paste_h) = fill.unwrap_or((width, height));
+        // Borrow the slot's values into the guarded paste (no clone); the borrow ends when
+        // `run_guarded_paste` returns, freeing `slot` for the restore below.
+        let outcome = {
+            let values = &slot.values;
+            self.run_guarded_paste(move |doc| {
+                doc.paste_values(dest_idx, anchor, values, paste_w, paste_h)
+            })
+        };
+        match outcome {
+            PasteOutcome::Applied(pasted) => {
+                self.commit_paste(dest, pasted, vec![(dest, pasted)]);
+                self.clipboard = Some(slot); // a values paste is repeatable
+            }
+            PasteOutcome::EngineError(msg) => {
+                self.clipboard = Some(slot); // the paste didn't apply — keep the copy
+                self.emit(WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(msg),
+                });
+            }
             PasteOutcome::Panicked => self.handle_caught_panic(),
         }
     }
@@ -6358,6 +6449,7 @@ mod tests {
             range: (5, 1, 2, 1), // r1 (2) < r0 (5): degenerate
             data: serde_json::json!({ "5": { "1": { "text": "x", "style": {} } } }),
             cut: false,
+            values: vec![vec!["x".to_string()]],
         });
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
@@ -6552,6 +6644,7 @@ mod tests {
             range: (1, 1, 1, 1), // valid 1×1 — passes the degenerate + overflow guards
             data: serde_json::json!({ "not-an-i32-row": 1 }), // non-empty, but not ClipboardData
             cut: false,
+            values: vec![vec!["x".to_string()]],
         });
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
@@ -6693,6 +6786,190 @@ mod tests {
         assert!(
             worker.clipboard.is_some(),
             "the copy is preserved after a rejected fill"
+        );
+    }
+
+    // ---- Paste Values (⌘⇧V, `functional_spec.md §5`) --------------------------------------
+
+    #[test]
+    fn paste_values_writes_the_evaluated_value_and_keeps_the_slot() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "=1+2"), // a formula → 3
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        worker.process_batch(vec![Command::PasteValues {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+        // The literal value landed — not the formula.
+        assert_eq!(value_at(&worker, 0, 2), "3");
+        assert_eq!(
+            worker
+                .doc
+                .cell_content(0, CellRef::new(0, 2))
+                .unwrap_or_default(),
+            "3",
+            "the pasted cell holds the value, not `=1+2`"
+        );
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range }
+                    if *s == sheet && *range == CellRange::single(CellRef::new(0, 2))
+            )),
+            "paste-values replies with the pasted rectangle; got {events:?}"
+        );
+        // A values paste is repeatable → the slot is kept, and one undo reverts it.
+        assert!(worker.clipboard.is_some(), "the slot is kept (repeatable)");
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(value_at(&worker, 0, 2), "", "one undo reverts the paste");
+        assert_eq!(value_at(&worker, 0, 0), "3", "the source is untouched");
+    }
+
+    #[test]
+    fn paste_values_forces_a_formula_looking_string_to_a_literal() {
+        // The load-bearing edge case: a computed *string* value of `=x` must land as literal text,
+        // never re-parsed into a formula (which would evaluate to an error).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "=\"=x\""), // a formula whose *value* is the string "=x"
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        worker.process_batch(vec![Command::PasteValues {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+        assert_eq!(
+            value_at(&worker, 0, 2),
+            "=x",
+            "the literal text `=x` landed, not a re-interpreted formula"
+        );
+    }
+
+    #[test]
+    fn paste_values_single_cell_fills_the_target_in_one_undo() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "7"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        // Fill C1:E3 (a 3×3 target) from the single-cell source.
+        let target = CellRange::new(CellRef::new(0, 2), CellRef::new(2, 4));
+        worker.process_batch(vec![Command::PasteValues { sheet, target }]);
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(value_at(&worker, r, c), "7", "cell ({r},{c}) filled");
+            }
+        }
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == target
+            )),
+            "the fill reply carries the whole target; got {events:?}"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(
+                    value_at(&worker, r, c),
+                    "",
+                    "one undo clears the whole fill"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paste_values_oversized_fill_is_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "9")]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(limits::MAX_ROWS - 1, 0));
+        worker.process_batch(vec![Command::PasteValues { sheet, target }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an oversized values fill is rejected; got {events:?}"
+        );
+        assert!(
+            worker.clipboard.is_some(),
+            "the copy is preserved after a rejected fill"
+        );
+    }
+
+    #[test]
+    fn paste_values_with_empty_slot_is_nothing_to_paste() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::PasteValues {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 0)),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::NothingToPaste
+                }
+            )),
+            "paste-values with no prior copy is NothingToPaste; got {events:?}"
         );
     }
 

@@ -8,7 +8,7 @@
 - Free and OSS desktop spreadsheet app
 - Supports XLSX format and 90% of Excel formulas
 - GPU rendering: bar graphs at 240fps
-- Insanely fast and light: Rust-based, 8MB binary, launches in 60ms
+- Insanely fast and light: Rust-based, 11MB app, launches in 60 milliseconds
 - Cross platform: Mac, Windows and Linux
 
 <div align="center">

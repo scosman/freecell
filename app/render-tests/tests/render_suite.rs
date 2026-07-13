@@ -238,6 +238,7 @@ render_cases! {
     // Fill
     cell_fill_red, cell_fill_yellow, cell_fill_dark_text_contrast, cell_fill_none_explicit,
     cell_bold_fill_yellow, cell_bold_italic_underline_fill_blue, cell_fill_covers_gridlines,
+    cell_fill_block_boundaries,
     // Values & engine-owned number formats
     cell_number_plain, cell_number_thousands, cell_number_currency, cell_number_percent,
     cell_number_negative_red, cell_date_default, cell_boolean, cell_text_plain,

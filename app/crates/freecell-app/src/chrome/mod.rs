@@ -17,6 +17,7 @@
 
 pub mod client;
 mod edit;
+mod h_scroller;
 mod view;
 
 use freecell_core::selection::Motion;

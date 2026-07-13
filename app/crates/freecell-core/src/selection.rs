@@ -37,8 +37,13 @@ pub enum Direction {
 /// - [`Motion::Move`] — arrow keys (and Tab→`Right`, Enter→`Down`, Shift+Tab→`Left`,
 ///   Shift+Enter→`Up`, mapped at the keymap layer): move one step, **collapse**.
 /// - [`Motion::Extend`] — Shift+arrow: move `active` one step, **keep** the anchor.
-/// - [`Motion::JumpEdge`] — Cmd/Ctrl+arrow: jump `active` to the sheet edge, collapse.
-/// - [`Motion::ExtendEdge`] — Cmd/Ctrl+Shift+arrow: jump to the edge, keep the anchor.
+/// - [`Motion::JumpEdge`] — Cmd/Ctrl+arrow: jump `active` to the **edge of the data region**,
+///   collapse (`functional_spec.md §4`). The occupancy that resolves this lives in the engine, past
+///   the published viewport, so the grid routes this motion to an async worker query
+///   ([`resolve_edge`], D4.1 Option A) rather than [`apply_motion`]; the synchronous `apply_motion`
+///   arm keeps the sheet-edge fallback for headless/occupancy-free callers.
+/// - [`Motion::ExtendEdge`] — Cmd/Ctrl+Shift+arrow: jump to the edge-of-data target, keep the
+///   anchor (same async resolution as `JumpEdge`).
 /// - [`Motion::Page`] / [`Motion::ExtendPage`] — Page Up/Down by `rows` (the grid passes
 ///   its current page height in rows).
 /// - [`Motion::RowStart`] / [`Motion::ExtendRowStart`] — Home / Shift+Home: to column 0 of
@@ -100,12 +105,12 @@ impl Default for SelectionModel {
 }
 
 /// Whether `range` spans every row of the sheet (a full-column / whole-sheet selection).
-fn spans_all_rows(range: &CellRange) -> bool {
+pub fn spans_all_rows(range: &CellRange) -> bool {
     range.start.row == 0 && range.end.row == limits::MAX_ROWS - 1
 }
 
 /// Whether `range` spans every column of the sheet (a full-row / whole-sheet selection).
-fn spans_all_cols(range: &CellRange) -> bool {
+pub fn spans_all_cols(range: &CellRange) -> bool {
     range.start.col == 0 && range.end.col == limits::MAX_COLS - 1
 }
 
@@ -177,14 +182,137 @@ fn step_by(cell: CellRef, direction: Direction, n: u32, dims: SheetDims) -> Cell
     }
 }
 
-/// Jumps a cell to the sheet edge in `direction` (MVP: edge of sheet, not edge-of-data —
-/// `functional_spec.md §3.2`).
+/// Jumps a cell to the **sheet** edge in `direction` — the synchronous fallback for
+/// [`Motion::JumpEdge`]/[`ExtendEdge`] in [`apply_motion`]. The real ⌘+arrow uses edge-of-**data**
+/// ([`resolve_edge`]), resolved worker-side because occupancy lives in the engine past the published
+/// viewport (`functional_spec.md §4`, D4.1); this arm still applies when a caller drives `apply_motion`
+/// with those motions directly (e.g. headless).
 fn edge(cell: CellRef, direction: Direction, dims: SheetDims) -> CellRef {
     match direction {
         Direction::Up => CellRef::new(0, cell.col),
         Direction::Down => CellRef::new(dims.rows.saturating_sub(1), cell.col),
         Direction::Left => CellRef::new(cell.row, 0),
         Direction::Right => CellRef::new(cell.row, dims.cols.saturating_sub(1)),
+    }
+}
+
+/// The **edge-of-data** target index along one line of travel, applying the exact Excel Ctrl+Arrow
+/// rule (`functional_spec.md §4`). `pos` is the active cell's index on the line (its row for a
+/// vertical motion, its column for a horizontal one); `forward` is `true` for Down/Right (increasing
+/// index) and `false` for Up/Left. `len` is the number of cells on the line (the sheet's rows or
+/// cols); `occupied` is the line's populated indices **sorted ascending, distinct**. The result is
+/// always in `[0, len)`.
+///
+/// The rule, from `pos` moving one step (`+1`/`-1`) in the direction:
+/// - already at the boundary edge (no next cell) → stay on `pos`;
+/// - active cell **and** its neighbour both occupied → jump to the **last** occupied cell of the
+///   contiguous run (the cell before the first gap, or the boundary edge if the run reaches it);
+/// - otherwise (active empty, or neighbour empty) → **skip to the next** occupied cell, or the
+///   boundary edge if none exists before it.
+///
+/// **Complexity: O(log occupied)** — every step is a binary search over the sorted slice, never a
+/// per-index walk across empty space. Crucially, jumping through a gap (e.g. ⌘+Down in an empty
+/// 1M-row column) is a single lookup, not ~1M probes — the huge-sheet guarantee (`§4` "correctness /
+/// responsiveness"). The contiguous-run end is found by binary-searching the run's constant
+/// `occupied[j] - j` signature (consecutive indices share it; a gap strictly increases it), so it is
+/// also O(log occupied), not O(run length).
+fn edge_of_data_index(pos: u32, forward: bool, len: u32, occupied: &[u32]) -> u32 {
+    if len == 0 {
+        return 0;
+    }
+    let last = len - 1;
+    // Already at the sheet edge in this direction — no move (whatever the occupancy).
+    if (forward && pos >= last) || (!forward && pos == 0) {
+        return pos;
+    }
+    let is_occupied = |i: u32| occupied.binary_search(&i).is_ok();
+    let adj = if forward { pos + 1 } else { pos - 1 };
+
+    if is_occupied(pos) && is_occupied(adj) {
+        // On a contiguous run: jump to its far end. Along a run of consecutive indices the signature
+        // `d = occupied[j] - j` is constant; a gap strictly increases it, and (indices being sorted +
+        // distinct) `d` is non-decreasing — so the run's index range is the maximal equal-`d` block,
+        // found by binary search. `k` is `pos`'s slot (both `pos` and `adj` are occupied ⇒ present).
+        let k = occupied.binary_search(&pos).expect("pos is occupied");
+        let d = |j: usize| occupied[j] as i64 - j as i64;
+        let dk = d(k);
+        if forward {
+            // Far end = last slot whose `d == dk` (the equal block ends where `d` first exceeds it).
+            let mut lo = k;
+            let mut hi = occupied.len();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if d(mid) <= dk {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            occupied[lo - 1]
+        } else {
+            // Far end = first slot whose `d == dk` (the equal block starts where `d` reaches it).
+            let mut lo = 0;
+            let mut hi = k;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if d(mid) < dk {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            occupied[lo]
+        }
+    } else if forward {
+        // Active empty, or the neighbour empty: skip to the next occupied index strictly past `pos`,
+        // else the boundary edge.
+        let idx = occupied.partition_point(|&v| v <= pos);
+        if idx < occupied.len() {
+            occupied[idx]
+        } else {
+            last
+        }
+    } else {
+        let idx = occupied.partition_point(|&v| v < pos);
+        if idx > 0 {
+            occupied[idx - 1]
+        } else {
+            0
+        }
+    }
+}
+
+/// Resolves the **edge-of-data** target cell for [`Motion::JumpEdge`]/[`ExtendEdge`] — the exact
+/// Excel/Sheets ⌘+arrow behavior (`functional_spec.md §4`). `occupied_line` is the populated indices
+/// **on the active cell's line of travel** — its column's occupied rows for Up/Down, its row's
+/// occupied cols for Left/Right — **sorted ascending, distinct**. The worker builds this from the
+/// engine (occupancy lives there, past the published viewport, `architecture.md §4`, D4.1 Option A).
+/// Pure and total (O(log occupied), see [`edge_of_data_index`]): the result is clamped to a valid
+/// `[0, dims)` coordinate. The caller applies it — collapse for `JumpEdge` (`single(target)`),
+/// keep-anchor for `ExtendEdge`.
+pub fn resolve_edge(
+    from: CellRef,
+    dir: Direction,
+    dims: SheetDims,
+    occupied_line: &[u32],
+) -> CellRef {
+    match dir {
+        Direction::Up => CellRef::new(
+            edge_of_data_index(from.row, false, dims.rows, occupied_line),
+            from.col,
+        ),
+        Direction::Down => CellRef::new(
+            edge_of_data_index(from.row, true, dims.rows, occupied_line),
+            from.col,
+        ),
+        Direction::Left => CellRef::new(
+            from.row,
+            edge_of_data_index(from.col, false, dims.cols, occupied_line),
+        ),
+        Direction::Right => CellRef::new(
+            from.row,
+            edge_of_data_index(from.col, true, dims.cols, occupied_line),
+        ),
     }
 }
 
@@ -470,6 +598,137 @@ mod tests {
         assert_eq!(
             apply_motion(last, Motion::JumpEdge(Right), dims).active,
             cell(limits::MAX_ROWS - 1, limits::MAX_COLS - 1)
+        );
+    }
+
+    // ---- Edge-of-data (⌘+arrow) pure algorithm (`functional_spec.md §4`) --------------------
+    //
+    // `edge_of_data_index`/`resolve_edge` take the line's populated indices as a slice **sorted
+    // ascending, distinct** (what the worker collects from the engine); the tests pass those slices
+    // directly.
+
+    #[test]
+    fn edge_index_active_empty_jumps_to_next_occupied() {
+        // Active cell (2) empty, data at 5: land on the first non-empty ahead.
+        assert_eq!(edge_of_data_index(2, true, 10, &[5, 6]), 5);
+        // Backward: from 8 (empty), data at 3 → 3.
+        assert_eq!(edge_of_data_index(8, false, 10, &[1, 3]), 3);
+    }
+
+    #[test]
+    fn edge_index_active_empty_no_data_goes_to_boundary() {
+        // Active empty, nothing ahead → the sheet edge (len-1 forward, 0 backward).
+        assert_eq!(edge_of_data_index(2, true, 10, &[]), 9);
+        assert_eq!(edge_of_data_index(2, false, 10, &[]), 0);
+    }
+
+    #[test]
+    fn edge_index_run_stops_at_last_of_run() {
+        // Active (2) and neighbour (3) occupied; run is 2..=4, gap at 5 → last of run = 4.
+        assert_eq!(edge_of_data_index(2, true, 10, &[2, 3, 4, 7]), 4);
+        // Backward: run 6,5,4 from 6 → 4.
+        assert_eq!(edge_of_data_index(6, false, 10, &[4, 5, 6]), 4);
+    }
+
+    #[test]
+    fn edge_index_run_to_boundary_lands_on_edge() {
+        // A run reaching the sheet edge → the edge.
+        assert_eq!(
+            edge_of_data_index(6, true, 10, &[6, 7, 8, 9]),
+            9,
+            "run to the last row lands on the last row"
+        );
+        // Backward: a run reaching row 0.
+        assert_eq!(edge_of_data_index(3, false, 10, &[0, 1, 2, 3]), 0);
+    }
+
+    #[test]
+    fn edge_index_gap_crosses_to_next_block() {
+        // Active (2) occupied, neighbour (3) empty → cross the gap to the next occupied (7).
+        assert_eq!(edge_of_data_index(2, true, 10, &[2, 7, 8]), 7);
+        // Backward analog.
+        assert_eq!(edge_of_data_index(7, false, 10, &[1, 2, 7]), 2);
+    }
+
+    #[test]
+    fn edge_index_gap_with_no_further_data_goes_to_boundary() {
+        // Active occupied, neighbour empty, nothing else ahead → boundary edge.
+        assert_eq!(edge_of_data_index(2, true, 10, &[2]), 9);
+        assert_eq!(edge_of_data_index(7, false, 10, &[7]), 0);
+    }
+
+    #[test]
+    fn edge_index_at_boundary_does_not_move() {
+        // Already at the edge in the direction of travel → stay put, whatever the occupancy.
+        assert_eq!(edge_of_data_index(9, true, 10, &[9]), 9);
+        assert_eq!(edge_of_data_index(0, false, 10, &[]), 0);
+    }
+
+    #[test]
+    fn edge_index_adjacent_occupied_is_single_step_run() {
+        // Active (2) and neighbour (3) occupied but 4 empty → stop at 3 (the run is just 2,3).
+        assert_eq!(edge_of_data_index(2, true, 10, &[2, 3]), 3);
+    }
+
+    #[test]
+    fn edge_index_jumps_across_a_huge_gap_in_one_lookup() {
+        // The huge-sheet guarantee: crossing ~1M empty cells is a binary search, not a per-index walk
+        // (an O(line-length) implementation would still be *correct* here but pathologically slow).
+        let len = limits::MAX_ROWS;
+        // Empty column: ⌘+Down from the top lands on the last row.
+        assert_eq!(edge_of_data_index(0, true, len, &[]), len - 1);
+        // A single far-off cell: ⌘+Down crosses straight to it.
+        assert_eq!(edge_of_data_index(0, true, len, &[1_000_000]), 1_000_000);
+        // A long contiguous run reaching the boundary: the run-end binary search lands on the last row.
+        let run: Vec<u32> = (0..len).collect();
+        assert_eq!(edge_of_data_index(5, true, len, &run), len - 1);
+    }
+
+    #[test]
+    fn resolve_edge_maps_direction_to_the_right_axis() {
+        let dims = SheetDims::new(100, 50);
+        // A vertical run in column 5 (occupied rows 3,4,5): from (3,5) Down → last of run (5,5).
+        let col_run = [3, 4, 5];
+        assert_eq!(resolve_edge(cell(3, 5), Down, dims, &col_run), cell(5, 5));
+        // Up from (5,5) → top of run (3,5).
+        assert_eq!(resolve_edge(cell(5, 5), Up, dims, &col_run), cell(3, 5));
+        // A horizontal run in row 7 (occupied cols 2,3,4): Right from (7,2) → (7,4); Left → (7,2).
+        let row_run = [2, 3, 4];
+        assert_eq!(resolve_edge(cell(7, 2), Right, dims, &row_run), cell(7, 4));
+        assert_eq!(resolve_edge(cell(7, 4), Left, dims, &row_run), cell(7, 2));
+    }
+
+    #[test]
+    fn resolve_edge_empty_sheet_goes_to_sheet_edge() {
+        let dims = SheetDims::new(100, 50);
+        assert_eq!(resolve_edge(cell(5, 5), Down, dims, &[]), cell(99, 5));
+        assert_eq!(resolve_edge(cell(5, 5), Up, dims, &[]), cell(0, 5));
+        assert_eq!(resolve_edge(cell(5, 5), Right, dims, &[]), cell(5, 49));
+        assert_eq!(resolve_edge(cell(5, 5), Left, dims, &[]), cell(5, 0));
+    }
+
+    #[test]
+    fn resolve_edge_across_gap_and_off_the_end() {
+        let dims = SheetDims::new(100, 50);
+        // Column 0: data at rows 0 and 10 (gap 1..9). From (0,0) Down → cross the gap to (10,0).
+        let col0 = [0, 10];
+        assert_eq!(resolve_edge(cell(0, 0), Down, dims, &col0), cell(10, 0));
+        // From (10,0) Down → nothing further → the sheet's last row.
+        assert_eq!(resolve_edge(cell(10, 0), Down, dims, &col0), cell(99, 0));
+    }
+
+    #[test]
+    fn resolve_edge_at_excel_max_bounds() {
+        // At the very last cell, every forward edge motion stays put (Excel-max sheet, occupied cell).
+        let dims = SheetDims::new(limits::MAX_ROWS, limits::MAX_COLS);
+        let last = cell(limits::MAX_ROWS - 1, limits::MAX_COLS - 1);
+        assert_eq!(
+            resolve_edge(last, Down, dims, &[limits::MAX_ROWS - 1]),
+            last
+        );
+        assert_eq!(
+            resolve_edge(last, Right, dims, &[limits::MAX_COLS - 1]),
+            last
         );
     }
 }

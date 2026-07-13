@@ -32,15 +32,16 @@ use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
 use freecell_core::format_ui::{
-    adjust_decimals_cell, displayed_decimals, font_size_display, num_fmt_category, Category,
-    DROPDOWN_FORMATS,
+    adjust_decimals_cell, displayed_decimals, font_size_display, is_more_only_num_fmt,
+    num_fmt_category, toggle_thousands, Category, BASIC_FORMATS, NUM_FMT_GROUPS,
 };
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
-    limits, Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign,
+    format_stat_count, format_stat_value, limits, Align, CellKind, CellRef, RenderStyle, Rgb,
+    SelectionModel, SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -52,6 +53,7 @@ use freecell_engine::{
     DataLabelToggles, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
 };
 
+use super::h_scroller::{h_scroller, HScroller};
 use super::{
     ChromeClient, ChromeGridRequest, ChromeGridSink, EditController, EditOrigin, SheetTab,
 };
@@ -59,6 +61,10 @@ use super::{
 /// The 250 ms no-flash delay for both the content-fetch and evaluating spinners
 /// (`ui_design.md §3.1/§3.2`, mirrored from the grid's own delayed hooks).
 const SPINNER_DELAY: Duration = Duration::from_millis(250);
+
+/// Debounce before a selection-change fires a `SelectionStats` query — a drag-select emits many
+/// selection changes, so the readout waits for the drag to settle (`architecture.md §1`).
+const STATS_DEBOUNCE: Duration = Duration::from_millis(120);
 
 // --- Chrome look constants (functional POC greys; `ui_design.md §3`) -----------------
 const CHROME_BG: u32 = 0xF3F3F3;
@@ -139,17 +145,6 @@ impl Anchor {
         self as usize
     }
 }
-/// The action row's natural (uncompressed) width for the current control set — font family +
-/// size (Phase 5), B/I/U + strikethrough/wrap, text color + fill, **borders** (Phase 6),
-/// horizontal + vertical alignment, number format + decimals — with its dividers. The row never
-/// wraps (`ui_design.md §2`: raise the window's min width instead), so it holds this min width; the
-/// document window (1200 px) is far wider. Phase 6 added the borders button (~64 px) + a divider
-/// (816 → 896); the formatting-expansion project adds strikethrough + wrap toggles and the
-/// three-button vertical-align group + a divider (~180 px → 896 → 1080). Recorded in
-/// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips. P17 adds the
-/// insert-chart trigger + a divider (~65 px → 1080 → 1145); still far under the 1200 px document
-/// window.
-const ACTION_ROW_MIN_W: f32 = 1152.0;
 
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
@@ -367,6 +362,12 @@ pub struct ChromeView {
     text_color_picker: Entity<ColorPickerState>,
     /// The number-format dropdown's open state (a `ChromeView`-owned menu panel).
     num_fmt_open: bool,
+    /// The number-format dropdown's **drill-in** state (`functional_spec.md §10.1`, D10.1). `false`
+    /// = the basics-first view (the 7 [`BASIC_FORMATS`] flat + a trailing "More ▸" row); `true` =
+    /// the full grouped [`NUM_FMT_GROUPS`] view (with a "◂ Back" row). Reset to `false` at every
+    /// popover-close so the dropdown always reopens basics-first (except when it opens directly onto
+    /// a More-only active format — see [`toggle_num_fmt_popover`](Self::toggle_num_fmt_popover)).
+    num_fmt_more_open: bool,
     /// The chart-insert menu's open state (the action-bar chart-type glyph menu, P17). Like the
     /// other formatting popovers it closes on click-away / a type pick / degrade.
     chart_menu_open: bool,
@@ -459,6 +460,27 @@ pub struct ChromeView {
     /// A transient "Replaced N" notice shown in the counter after a Replace All until the user next
     /// edits the find field / steps matches (`functional_spec.md §4.4`).
     replaced_notice: Option<usize>,
+
+    // ---- Selection stats (the tab-bar status readout, `functional_spec.md §1`) --------------
+    /// The latest worker-computed aggregate for the current selection, or `None` when there is
+    /// nothing to show (a single-cell/empty selection, or no reply yet). Rendered right-aligned in
+    /// the tab bar; only shown when it has ≥1 numeric cell (`SelectionStats::has_numeric`).
+    selection_stats: Option<SelectionStats>,
+    /// Whether the readout is expanded to also show Min / Max (a **session-only** toggle, flipped by
+    /// clicking the readout — `functional_spec.md §1`).
+    stats_show_minmax: bool,
+    /// Monotonic tag for the debounced stats query: it both debounces (only the most-recently armed
+    /// timer fires the send) and stamps the request's `req_id`, so a reply for a superseded
+    /// selection is dropped.
+    stats_seq: u64,
+
+    /// Horizontal-scroller state for the **action row** — its button groups scroll (with chevrons)
+    /// when the window is too small to fit them (`functional_spec.md §9B`, call site 1).
+    action_scroller: HScroller,
+    /// Horizontal-scroller state for the **sheet-tab strip** — the tabs scroll while the
+    /// selection-stats group stays pinned static to the right (`functional_spec.md §9B`, call site 2
+    /// → §9A.4 always-visible).
+    tab_scroller: HScroller,
 
     /// The grid, hosted as the chrome's body so the layout is action-row → data-row → **grid**
     /// → tab-bar (`ui_design.md §3`). `None` in the standalone Phase-9 demo/tests; the Phase-11
@@ -591,6 +613,7 @@ impl ChromeView {
             text_color_open: false,
             text_color_picker,
             num_fmt_open: false,
+            num_fmt_more_open: false,
             chart_menu_open: false,
             chart_panel: None,
             chart_title_input,
@@ -623,6 +646,11 @@ impl ChromeView {
             match_idx: None,
             pending_replace_all: false,
             replaced_notice: None,
+            selection_stats: None,
+            stats_show_minmax: false,
+            stats_seq: 0,
+            action_scroller: HScroller::new(),
+            tab_scroller: HScroller::new(),
             body: None,
             _subscriptions: subscriptions,
         }
@@ -710,7 +738,93 @@ impl ChromeView {
         // which re-points the panel (a switch, not a close) — and the panel's own controls never
         // change the grid selection, so they can't dismiss it either.
         self.close_chart_panel(cx);
+        // Refresh the tab-bar selection-stats readout for the new selection (debounced).
+        self.request_selection_stats(cx);
         cx.notify();
+    }
+
+    /// Re-request the selection-stats readout — the window calls this on `WorkerEvent::Published`
+    /// so an edit that changes a value **inside** a still-active multi-cell selection re-aggregates
+    /// (`functional_spec.md §1` live-update). Debounced + deduped like the selection-change path.
+    pub fn refresh_selection_stats(&mut self, cx: &mut Context<Self>) {
+        self.request_selection_stats(cx);
+    }
+
+    /// Issue the debounced `SelectionStats` query for the current selection (`functional_spec.md
+    /// §1`). Bumps [`stats_seq`](Self::stats_seq) (which invalidates any in-flight reply); a
+    /// single-cell / empty selection shows nothing, so it clears the readout and sends no query.
+    /// A multi-cell selection arms a [`STATS_DEBOUNCE`] timer that fires the query only if no newer
+    /// selection change has superseded it, tagging the request with `seq` so a stale reply is
+    /// dropped on arrival.
+    fn request_selection_stats(&mut self, cx: &mut Context<Self>) {
+        self.stats_seq = self.stats_seq.wrapping_add(1);
+        let seq = self.stats_seq;
+        if self.selection.is_single() {
+            if self.selection_stats.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let sheet = self.active_sheet;
+        let range = self.selection.range();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATS_DEBOUNCE).await;
+            this.update(cx, |this, _cx| {
+                // Only the most-recently armed timer sends — an intervening selection change bumped
+                // `stats_seq`, superseding this one.
+                if this.stats_seq == seq {
+                    this.client.send(Command::SelectionStats {
+                        sheet,
+                        range,
+                        req_id: seq,
+                    });
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Flip the session-only Min / Max expansion of the stats readout (`functional_spec.md §1`).
+    pub fn toggle_stats_minmax(&mut self, cx: &mut Context<Self>) {
+        self.stats_show_minmax = !self.stats_show_minmax;
+        cx.notify();
+    }
+
+    /// The labeled parts of the selection-stats readout, or `None` when nothing should show — a
+    /// single-cell/empty selection (no stats), or a selection with no numeric cell. Default form is
+    /// `Sum · Average · Count`; the session toggle appends `Min · Max` (`functional_spec.md §1`).
+    /// Pure — the render + the tests read the same source.
+    pub fn stats_readout_parts(&self) -> Option<Vec<String>> {
+        let stats = self.selection_stats?;
+        if !stats.has_numeric() {
+            return None;
+        }
+        let mut parts = vec![
+            format!("Sum: {}", format_stat_value(stats.sum)),
+            format!(
+                "Average: {}",
+                format_stat_value(stats.average().unwrap_or_default())
+            ),
+            format!("Count: {}", format_stat_count(stats.count)),
+        ];
+        if self.stats_show_minmax {
+            parts.push(format!(
+                "Min: {}",
+                format_stat_value(stats.min.unwrap_or_default())
+            ));
+            parts.push(format!(
+                "Max: {}",
+                format_stat_value(stats.max.unwrap_or_default())
+            ));
+        }
+        Some(parts)
+    }
+
+    /// The full selection-stats readout as one string (`"Sum: … Average: … Count: …"`), or `None`
+    /// when hidden — a test accessor mirroring what the tab bar renders.
+    pub fn selection_stats_text(&self) -> Option<String> {
+        self.stats_readout_parts().map(|parts| parts.join("   "))
     }
 
     /// The grid asks the field to commit a pending edit before a click-away selection change
@@ -1167,6 +1281,13 @@ impl ChromeView {
                 }
                 cx.notify();
             }
+            // Keep only the reply for the latest request — a superseded selection bumped
+            // `stats_seq`, so an older reply (or one after a collapse to a single cell) falls
+            // through the guard to the `_` arm and is dropped.
+            WorkerEvent::SelectionStats { req_id, stats } if req_id == self.stats_seq => {
+                self.selection_stats = Some(stats);
+                cx.notify();
+            }
             // Published/Saved/SaveFailed/StyleCacheUpdated/other EditRejected reasons /
             // degraded are the window's concern (Phase 11 dirty state + modals).
             _ => {}
@@ -1447,6 +1568,7 @@ impl ChromeView {
     /// Applies a number-format code over the selection, closing the number-format dropdown.
     pub fn apply_num_fmt(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.num_fmt_open = false;
+        self.num_fmt_more_open = false;
         self.apply_style_path(StylePath::NumFmt, code.to_string(), window, cx);
     }
 
@@ -1466,6 +1588,39 @@ impl ChromeView {
         }
     }
 
+    /// Whether the thousands-separator toggle is enabled: not degraded, and the active cell's
+    /// format can be safely re-grouped (`toggle_thousands` — a single-section numeric code with an
+    /// integer `0` placeholder). General/Text/Date/Time/Scientific/multi-section customs disable it.
+    pub fn toggle_thousands_enabled(&self) -> bool {
+        if self.degraded {
+            return false;
+        }
+        self.active_num_fmt
+            .as_deref()
+            .and_then(toggle_thousands)
+            .is_some()
+    }
+
+    /// Whether the active cell's format currently carries a thousands separator (the toggle renders
+    /// pressed). Only true when the toggle is also actionable, so a disabled button never shows as
+    /// selected.
+    pub fn thousands_active(&self) -> bool {
+        self.toggle_thousands_enabled()
+            && self
+                .active_num_fmt
+                .as_deref()
+                .is_some_and(|c| c.contains("#,##0"))
+    }
+
+    /// Toggles the thousands separator on the active cell's number format, applying the rewritten
+    /// code over the selection (one undo step). A no-op when the format can't be toggled (the
+    /// button also renders disabled in that case).
+    pub fn toggle_thousands_separator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(new_code) = self.active_num_fmt.as_deref().and_then(toggle_thousands) {
+            self.apply_num_fmt(&new_code, window, cx);
+        }
+    }
+
     fn toggle_text_color_popover(&mut self, cx: &mut Context<Self>) {
         self.text_color_open = !self.text_color_open;
         cx.notify();
@@ -1473,7 +1628,23 @@ impl ChromeView {
 
     fn toggle_num_fmt_popover(&mut self, cx: &mut Context<Self>) {
         self.num_fmt_open = !self.num_fmt_open;
+        // Basics-first on open — except when the active cell's format lives only under "More ▸":
+        // then land directly on the grouped view so the current format is visible/highlighted
+        // (`architecture.md §10`, "open onto the matched group"). Always reset when closing.
+        self.num_fmt_more_open =
+            self.num_fmt_open && is_more_only_num_fmt(&self.num_fmt_active_code());
         cx.notify();
+    }
+
+    /// The active cell's number-format code, normalized so `general` (which the engine may echo as
+    /// `"General"`) compares lowercase against the preset codes. `None` → the default `"general"`.
+    fn num_fmt_active_code(&self) -> String {
+        let c = self.active_num_fmt.as_deref().unwrap_or("general");
+        if c.eq_ignore_ascii_case("general") {
+            "general".to_string()
+        } else {
+            c.to_string()
+        }
     }
 
     // ---- Action row: insert chart (P17) ---------------------------------------------------
@@ -2105,6 +2276,7 @@ impl ChromeView {
                 self.fill_open = false;
                 self.text_color_open = false;
                 self.num_fmt_open = false;
+                self.num_fmt_more_open = false;
                 self.font_family_open = false;
                 self.font_size_open = false;
                 self.borders_open = false;
@@ -2780,7 +2952,10 @@ fn format_size_pt(pt: f64) -> String {
 }
 
 /// A vertical divider between action-row control groups (`ui_design.md §2`, existing styling).
-fn action_divider() -> gpui::Div {
+/// `pub(super)` so the sibling [`super::h_scroller`] reuses the exact same divider for the
+/// horizontal scroller's chevron section (`functional_spec.md §9B`, D9.3) and the tab bar's
+/// leading stats divider (§9A.3).
+pub(super) fn action_divider() -> gpui::Div {
     div().w(px(1.0)).h(px(20.0)).mx_1().bg(rgb(DIVIDER))
 }
 
@@ -2791,7 +2966,7 @@ impl Focusable for ChromeView {
 }
 
 impl Render for ChromeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("freecell-chrome")
             .track_focus(&self.focus_handle)
@@ -2801,7 +2976,9 @@ impl Render for ChromeView {
             .w_full()
             // Fill the available height when hosting the grid, so the grid slot can flex.
             .when(self.body.is_some(), |d| d.flex_1().min_h_0())
-            .child(self.render_action_row(cx))
+            // `window` threads to the two `h_scroller` call sites (action row + tab bar) so a chevron
+            // click can drive an animated slide via `request_animation_frame` (D10.2).
+            .child(self.render_action_row(window, cx))
             .child(self.render_data_row(cx))
             // The find/replace bar sits directly below the data row and above the grid, pushing the
             // grid down when open (`functional_spec.md §4.1`, `ui_design.md §1`).
@@ -2811,7 +2988,7 @@ impl Render for ChromeView {
             .when_some(self.body.clone(), |d, body| {
                 d.child(div().flex_1().min_h_0().w_full().child(body))
             })
-            .child(self.render_tab_bar(cx))
+            .child(self.render_tab_bar(window, cx))
             .children(self.render_overlays(cx))
     }
 }
@@ -2851,7 +3028,7 @@ impl ChromeView {
         )
     }
 
-    fn render_action_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_action_row(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Every mutating control disables in degraded/read-only mode (`functional_spec.md §6`).
         let disabled = self.degraded;
 
@@ -2913,18 +3090,19 @@ impl ChromeView {
                 }))
         };
 
-        div()
+        // The button groups are the horizontal scroller's *content*: they sit at their exact
+        // natural width so a small window makes them overflow + scroll (chevrons) rather than
+        // compressing the controls (`functional_spec.md §9B`, call site 1). `flex_shrink_0` is what
+        // holds that natural width — flexbox's default shrink=1 would otherwise squish the buttons
+        // to fit; it (not a hand-estimated `min_w`) is the "scroll, don't squish" guarantee, so the
+        // chevrons appear ONLY when the controls genuinely don't fit (`functional_spec.md §10.2`).
+        let groups = div()
             .flex()
             .items_center()
             .gap_1()
-            .w_full()
-            .h(px(ACTION_ROW_H))
-            // The row's groups don't wrap; the window's min width holds them (`ui_design.md §2`).
-            .min_w(px(ACTION_ROW_MIN_W))
-            .px_2()
-            .bg(rgb(CHROME_BG))
-            .border_b_1()
-            .border_color(rgb(HAIRLINE))
+            .debug_selector(|| "action-row-groups".to_string())
+            // Never wrap or shrink; the scroller scrolls the groups when they don't fit.
+            .flex_shrink_0()
             // Font family · size (`ui_design.md §2`):
             .child(
                 self.anchored_trigger(
@@ -3146,6 +3324,21 @@ impl ChromeView {
                         this.bump_decimals(-1, window, cx);
                     })),
             )
+            // Thousands-separator toggle (Phase 6, D6.2): adds/removes the `,` grouping on the
+            // active cell's format; `selected` when grouping is on, disabled when it can't be
+            // safely toggled (General/Text/Date/Time/multi-section).
+            .child(
+                Button::new("thousands-sep")
+                    .icon(Icon::empty().path("icons/thousands-separator.svg"))
+                    .tooltip("Thousands separator")
+                    .ghost()
+                    .small()
+                    .disabled(!self.toggle_thousands_enabled())
+                    .selected(self.thousands_active())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.toggle_thousands_separator(window, cx);
+                    })),
+            )
             .child(action_divider())
             // Insert-chart menu — the action-bar chart-type glyph menu (`ui_design.md §3.1`, P17).
             .child(
@@ -3181,9 +3374,27 @@ impl ChromeView {
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.toggle_find(window, cx);
                     })),
-            )
-            // Right-aligned evaluating spinner (`ui_design.md §3.1`).
-            .child(div().flex_1())
+            );
+
+        // Frame: the fixed-height, full-width action bar hosting the scrollable groups + the
+        // right-docked evaluating spinner (`ui_design.md §3.1`). The scroller is `flex_1`, so it
+        // fills up to the spinner — the spinner stays docked right exactly as the old `flex_1`
+        // spacer did — and shows chevrons only when the groups overflow (`functional_spec.md §9B`).
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(ACTION_ROW_H))
+            .px_2()
+            .bg(rgb(CHROME_BG))
+            .border_b_1()
+            .border_color(rgb(HAIRLINE))
+            .child(h_scroller(
+                "action-row",
+                &self.action_scroller,
+                window,
+                groups,
+            ))
             .when(self.eval.spinner(), |row| row.child(Spinner::new().small()))
     }
 
@@ -3674,7 +3885,7 @@ impl ChromeView {
         }
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dragging = self.tab_drag_active();
         let mut row = div()
             // `relative` so the drop indicator (an absolute child, positioned in window x — the
@@ -3705,11 +3916,14 @@ impl ChromeView {
             // `grabbing` while a reorder drag is live (`ui_design.md §6`).
             .when(dragging, |d| d.cursor(CursorStyle::ClosedHand));
 
+        // The tabs + the "new sheet" button are the horizontal scroller's *content* — a long tab
+        // strip scrolls (chevrons) instead of pushing the stats group off-screen (`functional_spec.md
+        // §9B`, call site 2 → §9A.4). They keep their natural width and left-align.
+        let mut tabs = div().flex().items_center().gap_1();
         for tab in &self.sheets {
-            row = row.child(self.render_tab(tab, cx));
+            tabs = tabs.child(self.render_tab(tab, cx));
         }
-
-        row = row.child(
+        tabs = tabs.child(
             Button::new("add-sheet")
                 .label("+")
                 .tooltip("New sheet")
@@ -3720,6 +3934,15 @@ impl ChromeView {
                     cx.notify();
                 })),
         );
+
+        // The scroller (flex_1) fills the row up to the *static* right section: a leading divider
+        // (§9A.3 — only when the readout is shown, so it never floats alone) + the selection-stats
+        // group (§9A.4 — pinned right, outside the scroller, so a long tab strip can't push it off).
+        row = row.child(h_scroller("tab-bar", &self.tab_scroller, window, tabs));
+        if self.stats_readout_parts().is_some() {
+            row = row.child(action_divider());
+        }
+        row = row.child(self.render_selection_stats(cx));
 
         // The 2 px accent drop indicator at the insertion gap while dragging (`ui_design.md §3`).
         if let Some(x) = self.tab_drop_indicator_x() {
@@ -3735,6 +3958,36 @@ impl ChromeView {
         }
 
         row
+    }
+
+    /// The right-aligned selection-stats readout in the tab bar (`functional_spec.md §1`). Empty
+    /// when hidden (single-cell / all-text / empty selection) so the row's height stays stable;
+    /// when shown, the whole group is clickable to toggle the Min / Max expansion.
+    fn render_selection_stats(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut group = div()
+            .id("selection-stats")
+            .debug_selector(|| "selection-stats".into())
+            .flex()
+            .items_center()
+            // Fill the bar height + track the line-height to it, so the readout sits vertically
+            // centered in `TAB_BAR_H` rather than hugging the text box (`functional_spec.md §9A.2`).
+            .h_full()
+            .line_height(px(TAB_BAR_H))
+            .gap_4()
+            .pr_1()
+            .text_size(px(12.0))
+            .text_color(rgb(MUTED_TEXT));
+        if let Some(parts) = self.stats_readout_parts() {
+            group = group.cursor_pointer().on_click(cx.listener(
+                |this, _: &ClickEvent, _window, cx| {
+                    this.toggle_stats_minmax(cx);
+                },
+            ));
+            for part in parts {
+                group = group.child(div().child(part));
+            }
+        }
+        group
     }
 
     fn render_tab(&self, tab: &SheetTab, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -4115,27 +4368,28 @@ impl ChromeView {
             .into_any_element()
     }
 
-    /// The number-format dropdown: a plain scrolling menu of the seven categories, the active
-    /// cell's category highlighted (`components/action_bar.md`, `architecture.md §3.1`).
+    /// The number-format dropdown (`functional_spec.md §10.1`, D10.1). Basics-first: the default
+    /// view is the seven [`BASIC_FORMATS`] flat (no scroll) plus a trailing "More ▸" row; drilling
+    /// in ([`num_fmt_more_open`](Self::num_fmt_more_open)) swaps to the full grouped
+    /// [`NUM_FMT_GROUPS`] inventory with a "◂ Back" row. The preset matching the active cell's exact
+    /// format code is highlighted at whichever level it lives; when the active format is a More-only
+    /// preset the "More ▸" row is marked active (and the dropdown opens straight onto the grouped
+    /// view — see [`toggle_num_fmt_popover`](Self::toggle_num_fmt_popover)).
+    ///
+    /// **Drill-in over flyout (D10.1):** the popover is a single fixed-anchor occluded card over one
+    /// full-screen backdrop; a flyout would need a second card anchored to the dynamically-positioned
+    /// "More ▸" row (offset + card width unknown without measurement), so drill-in — reusing the same
+    /// card/backdrop/occlude/dismiss machinery — is the clean fit.
     fn render_num_fmt_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let active = self.num_fmt_category();
-        let mut menu = div().flex().flex_col().gap(px(2.0));
-        for (category, code) in DROPDOWN_FORMATS {
-            let code = code.to_string();
-            menu = menu.child(
-                Button::new(gpui::ElementId::Name(
-                    format!("numfmt-{}", category.label()).into(),
-                ))
-                .label(category.label())
-                .debug_selector(move || format!("numfmt-{}", category.label()))
-                .ghost()
-                .small()
-                .selected(category == active)
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.apply_num_fmt(&code, window, cx);
-                })),
-            );
-        }
+        // Highlight the preset whose code exactly matches the active cell's, normalizing `general`
+        // case (the engine may echo "General"). Presets can share a category but never a code, so an
+        // exact match selects at most one preset (at whichever level it lives).
+        let active_code = self.num_fmt_active_code();
+        let body = if self.num_fmt_more_open {
+            self.num_fmt_more_menu(&active_code, cx)
+        } else {
+            self.num_fmt_basic_menu(&active_code, cx)
+        };
 
         div()
             .absolute()
@@ -4146,6 +4400,7 @@ impl ChromeView {
                 self.backdrop(
                     |this, _w, cx| {
                         this.num_fmt_open = false;
+                        this.num_fmt_more_open = false;
                         cx.notify();
                     },
                     cx,
@@ -4154,6 +4409,7 @@ impl ChromeView {
             )
             .child(
                 div()
+                    .id("numfmt-menu")
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::NumFmt.idx()]))
@@ -4163,14 +4419,107 @@ impl ChromeView {
                     .flex()
                     .flex_col()
                     .p_1()
+                    // The grouped "More" inventory is tall — cap the height and scroll it (like the
+                    // font-family popover). The basic list is short and never scrolls.
+                    .max_h(px(320.0))
+                    .overflow_y_scroll()
                     .bg(rgb(ACTIVE_TAB_BG))
                     .border_1()
                     .border_color(rgb(HAIRLINE))
                     .rounded_md()
                     .shadow_md()
-                    .child(menu),
+                    .child(body),
             )
             .into_any_element()
+    }
+
+    /// The basics-first view: the seven [`BASIC_FORMATS`] flat, then a trailing "More ▸" row that
+    /// drills into the full grouped inventory. `active_code` is the normalized active-cell format.
+    fn num_fmt_basic_menu(&self, active_code: &str, cx: &mut Context<Self>) -> gpui::Div {
+        let mut menu = div().flex().flex_col().gap(px(1.0));
+        for preset in BASIC_FORMATS {
+            let code = preset.code.to_string();
+            let selector = preset.code;
+            menu = menu.child(
+                Button::new(gpui::ElementId::Name(
+                    format!("numfmt-{}", preset.code).into(),
+                ))
+                .label(preset.label)
+                .debug_selector(move || format!("numfmt-{selector}"))
+                .ghost()
+                .small()
+                .selected(preset.code == active_code)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_num_fmt(&code, window, cx);
+                })),
+            );
+        }
+        // "More ▸" reveals the full grouped inventory (drill-in). Marked active when the active
+        // cell's format lives only under it, so the current format stays discoverable.
+        menu.child(
+            Button::new("numfmt-more")
+                .label("More ▸")
+                .debug_selector(|| "numfmt-more".into())
+                .ghost()
+                .small()
+                .selected(is_more_only_num_fmt(active_code))
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.num_fmt_more_open = true;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// The drilled-in "More" view: a "◂ Back" row that restores the basics, then the full grouped
+    /// [`NUM_FMT_GROUPS`] inventory (section headers for multi-preset groups, each preset highlighted
+    /// by exact code). This is the verbatim Phase-6 grouped render, relocated behind "More ▸".
+    fn num_fmt_more_menu(&self, active_code: &str, cx: &mut Context<Self>) -> gpui::Div {
+        let mut menu = div().flex().flex_col().gap(px(1.0)).child(
+            Button::new("numfmt-back")
+                .label("◂ Back")
+                .debug_selector(|| "numfmt-back".into())
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.num_fmt_more_open = false;
+                    cx.notify();
+                })),
+        );
+        for group in NUM_FMT_GROUPS {
+            // A multi-preset group gets a muted section header; single-preset groups (General,
+            // Text, …) read as plain top-level items, so no redundant header.
+            if group.presets.len() > 1 {
+                menu = menu.child(
+                    div()
+                        .px_1()
+                        .pt(px(3.0))
+                        .pb(px(1.0))
+                        .text_xs()
+                        .text_color(rgb(MUTED_TEXT))
+                        .child(group.category.label()),
+                );
+            }
+            for preset in group.presets {
+                let code = preset.code.to_string();
+                let selector = preset.code;
+                menu = menu.child(
+                    Button::new(gpui::ElementId::Name(
+                        format!("numfmt-{}", preset.code).into(),
+                    ))
+                    .label(preset.label)
+                    .debug_selector(move || format!("numfmt-{selector}"))
+                    .ghost()
+                    .small()
+                    .selected(preset.code == active_code)
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, window, cx| {
+                            this.apply_num_fmt(&code, window, cx);
+                        },
+                    )),
+                );
+            }
+        }
+        menu
     }
 
     /// The chart-insert menu (P17, `ui_design.md §3.1`): a small panel of chart-type glyphs; picking
@@ -5227,7 +5576,7 @@ mod tests {
     use super::*;
     use crate::chrome::{ChromeClient, RecordingClient};
     use freecell_core::input_cap::MAX_INPUT_LEN;
-    use freecell_core::{CellRef, SelectionModel};
+    use freecell_core::{CellRange, CellRef, SelectionModel};
     use freecell_engine::{BorderPreset, Command, SheetMeta, StyleAttr, WorkerEvent};
     use gpui::{px, size, Modifiers, TestAppContext};
     use gpui_component::Root;
@@ -5250,11 +5599,25 @@ mod tests {
     }
 
     /// [`build`] with a caller-chosen window height — the popover-click tests want a tall enough
-    /// window that every dropdown item lays out on-screen and can be hit by a simulated click.
+    /// window that every dropdown item lays out on-screen and can be hit by a simulated click. The
+    /// window matches the real document width (1200 px), wider than the action row's ~1152 px
+    /// natural width, so the row fits (no scroller chevrons) and its triggers lay out on-screen.
     fn build_win(
         cx: &mut TestAppContext,
         sheets: Vec<SheetTab>,
         active: SheetId,
+        height: f32,
+    ) -> Harness {
+        build_sized(cx, sheets, active, 1200.0, height)
+    }
+
+    /// [`build_win`] with a caller-chosen window **width** too — the horizontal-scroller tests open
+    /// a narrow window so the action row / tab strip overflow and show chevrons.
+    fn build_sized(
+        cx: &mut TestAppContext,
+        sheets: Vec<SheetTab>,
+        active: SheetId,
+        width: f32,
         height: f32,
     ) -> Harness {
         let client = Rc::new(RecordingClient::new());
@@ -5267,10 +5630,7 @@ mod tests {
         let mut chrome_out: Option<Entity<ChromeView>> = None;
         let chrome_slot = &mut chrome_out;
 
-        // The test window matches the real document window width (1200 px) so the full action row
-        // — including the number-format popover trigger past the vertical-align group — is on-screen
-        // for the popover-hit tests (the row's natural width is ~1080 px, `ACTION_ROW_MIN_W`).
-        let window = cx.open_window(size(px(1200.0), px(height)), |window, cx| {
+        let window = cx.open_window(size(px(width), px(height)), |window, cx| {
             let client_dyn: Rc<dyn ChromeClient> = client_for_window;
             let reqs = reqs_for_window;
             let sink = ChromeGridSink::new(move |req, _w, _cx| reqs.borrow_mut().push(req.clone()));
@@ -5444,6 +5804,493 @@ mod tests {
             )
         });
         assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "fresh");
+    }
+
+    // ---- Selection stats (tab-bar status readout, `functional_spec.md §1`) -----------------
+
+    /// A ready-made numeric aggregate for the reply-plumbing tests.
+    fn numeric_stats() -> SelectionStats {
+        SelectionStats {
+            count: 5,
+            numeric_count: 2,
+            sum: 30.0,
+            min: Some(10.0),
+            max: Some(20.0),
+        }
+    }
+
+    /// A1:A3 (a 3-cell column selection).
+    fn multi_a1_a3() -> SelectionModel {
+        SelectionModel {
+            anchor: cell(0, 0),
+            active: cell(2, 0),
+        }
+    }
+
+    #[gpui::test]
+    fn multi_cell_selection_requests_debounced_stats(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        // Debounced: nothing is sent until the timer fires (a drag-select would otherwise spam).
+        assert!(
+            h.client.take_commands().is_empty(),
+            "the stats query is debounced, not sent synchronously"
+        );
+        tick(cx, 150);
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SelectionStats { range, req_id: 1, .. }]
+                    if *range == CellRange::new(cell(0, 0), cell(2, 0))
+            ),
+            "expected one debounced SelectionStats for A1:A3, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn single_cell_selection_issues_no_stats(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        tick(cx, 150);
+        let cmds = h.client.take_commands();
+        assert!(
+            cmds.iter()
+                .all(|c| !matches!(c, Command::SelectionStats { .. })),
+            "a single-cell selection issues no stats query, got {cmds:?}"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.selection_stats_text()), None);
+    }
+
+    #[gpui::test]
+    fn stats_reply_renders_readout_with_minmax_toggle(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        h.client.take_commands(); // drain the SelectionStats query (req_id 1)
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.selection_stats_text()),
+            Some("Sum: 30   Average: 15   Count: 5".to_string())
+        );
+        // Clicking the readout expands it to also show Min / Max (session-only toggle).
+        upd(&h, cx, |c, _w, cx| c.toggle_stats_minmax(cx));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.selection_stats_text()),
+            Some("Sum: 30   Average: 15   Count: 5   Min: 10   Max: 20".to_string())
+        );
+    }
+
+    #[gpui::test]
+    fn stale_stats_reply_dropped(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // Two multi-cell selections back-to-back → the latest request is req_id 2.
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx);
+            c.on_selection_changed(
+                SelectionModel {
+                    anchor: cell(0, 0),
+                    active: cell(3, 0),
+                },
+                window,
+                cx,
+            );
+        });
+        tick(cx, 150);
+        h.client.take_commands();
+        // A superseded (req_id 1) reply is dropped.
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.selection_stats_text()),
+            None,
+            "a stale reply for a superseded selection is ignored"
+        );
+        // The current (req_id 2) reply lands.
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 2,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(upd(&h, cx, |c, _w, _cx| c.selection_stats_text()).is_some());
+    }
+
+    #[gpui::test]
+    fn all_text_reply_hides_readout(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        h.client.take_commands();
+        // A selection with content but no numeric cell shows no readout.
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: SelectionStats {
+                        count: 3,
+                        numeric_count: 0,
+                        sum: 0.0,
+                        min: None,
+                        max: None,
+                    },
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.selection_stats_text()), None);
+    }
+
+    #[gpui::test]
+    fn tab_bar_paints_stats_readout_when_present(cx: &mut TestAppContext) {
+        // Real render coverage for the tab-bar refactor: with a numeric multi-cell selection the
+        // right-aligned readout element paints (its Sum/Average/Count text gives it real width).
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let bounds = vcx
+            .debug_bounds("selection-stats")
+            .expect("the selection-stats readout paints in the tab bar");
+        assert!(
+            f32::from(bounds.size.width) > 20.0,
+            "the readout should paint its Sum/Average/Count text, got width {}",
+            f32::from(bounds.size.width)
+        );
+    }
+
+    // ---- Horizontal scroller (action bar + tab strip, `functional_spec.md §9B`) ------------
+
+    /// A tab list long enough to overflow a narrow window.
+    fn many_sheets(n: u32) -> Vec<SheetTab> {
+        (0..n)
+            .map(|i| SheetTab::new(SheetId(i), format!("Sheet{i}")))
+            .collect()
+    }
+
+    /// Paint the window twice: the scroll handle measures overflow on the first paint, so the
+    /// chevron affordance only appears on the second (the one-frame gpui scroll-handle lag noted in
+    /// `h_scroller`).
+    fn paint_twice(vcx: &mut gpui::VisualTestContext) {
+        vcx.run_until_parked();
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    /// Advance the chevron slide by `n` animation frames. `request_animation_frame`'s `on_next_frame`
+    /// callback only fires from the platform's frame loop, which the test window stubs out — so a
+    /// test drives each frame manually with a `refresh` + `run_until_parked` (each redraw runs
+    /// `h_scroller`'s one-frame `anim_step`).
+    fn pump_frames(vcx: &mut gpui::VisualTestContext, n: usize) {
+        for _ in 0..n {
+            vcx.update(|window, _| window.refresh());
+            vcx.run_until_parked();
+        }
+    }
+
+    /// Drive a numeric multi-cell selection so the tab-bar stats readout is shown (mirrors the
+    /// Phase-1 reply plumbing).
+    fn show_stats(h: &Harness, cx: &mut TestAppContext) {
+        upd(h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        upd(h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn action_row_fits_has_no_chevrons(cx: &mut TestAppContext) {
+        // A wide window fits the whole action row → the scroller is invisible (no chevrons, no
+        // behaviour change vs. today — `functional_spec.md §9B` "fits horizontally").
+        let h = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            1400.0,
+            200.0,
+        );
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+        assert!(
+            vcx.debug_bounds("action-row-chevrons").is_none(),
+            "a window wider than the action row shows no scroll chevrons"
+        );
+    }
+
+    #[gpui::test]
+    fn action_row_overflow_shows_chevrons(cx: &mut TestAppContext) {
+        // A window narrower than the ~1152 px action row → the scroller shows its chevron section.
+        let h = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            480.0,
+            200.0,
+        );
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+        assert!(
+            vcx.debug_bounds("action-row-chevrons").is_some(),
+            "a narrow window overflows the action row → scroll chevrons appear"
+        );
+    }
+
+    #[gpui::test]
+    fn action_row_no_chevrons_when_the_controls_actually_fit(cx: &mut TestAppContext) {
+        // Regression for `functional_spec.md §10.2`: the button group's natural width is well under
+        // the old hand-estimated `ACTION_ROW_MIN_W = 1152`, so at a viewport that comfortably fits
+        // the real controls (but is narrower than 1152) the scroller must report NO overflow — the
+        // pre-fix `min_w(1152)` padded the scroll content with trailing empty space and tripped the
+        // chevrons here.
+        let h = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            1400.0,
+            200.0,
+        );
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+
+        // The painted natural width of the button group (`flex_shrink_0`, so it never compresses).
+        let natural = vcx
+            .debug_bounds("action-row-groups")
+            .expect("the action-row button group paints")
+            .size
+            .width;
+        let natural = f32::from(natural);
+        assert!(
+            natural < 1152.0,
+            "the old min_w=1152 over-estimated the controls; true natural width is {natural}"
+        );
+        // A viewport a hair above the natural width — still < 1152 — must NOT overflow.
+        let fits = natural + 40.0;
+        assert!(
+            fits < 1152.0,
+            "the fit viewport {fits} is below the old estimate"
+        );
+        let h2 = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            fits,
+            200.0,
+        );
+        let mut vcx2 = gpui::VisualTestContext::from_window(h2.window.into(), cx);
+        paint_twice(&mut vcx2);
+        assert!(
+            vcx2.debug_bounds("action-row-chevrons").is_none(),
+            "a viewport ({fits}) wide enough for the real controls shows no chevrons (§10.2 fix)"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_bar_overflow_shows_chevrons_and_keeps_stats_static(cx: &mut TestAppContext) {
+        // Many tabs in a narrow window overflow the tab strip → chevrons appear, AND the stats
+        // group stays pinned static to the RIGHT of the scroller (never pushed off — §9A.4).
+        let h = build_sized(cx, many_sheets(40), SheetId(0), 560.0, 200.0);
+        show_stats(&h, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+        let chevrons = vcx
+            .debug_bounds("tab-bar-chevrons")
+            .expect("a long tab strip overflows → tab-bar scroll chevrons appear");
+        let stats = vcx
+            .debug_bounds("selection-stats")
+            .expect("the stats group is still painted, never scrolled away");
+        assert!(
+            f32::from(stats.origin.x) > f32::from(chevrons.origin.x),
+            "the static stats group sits to the right of the (scrolling) tab chevrons"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_bar_leading_divider_gated_on_stats(cx: &mut TestAppContext) {
+        // The leading divider (§9A.3) renders only when the stats readout is shown, so it never
+        // floats alone — the render gates it on the same `stats_readout_parts().is_some()` this test
+        // exercises directly.
+        let h = one_sheet(cx);
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.stats_readout_parts().is_none()),
+            "a single-cell selection hides the readout → no leading divider"
+        );
+        show_stats(&h, cx);
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.stats_readout_parts().is_some()),
+            "a numeric multi-cell selection shows the readout → leading divider renders"
+        );
+    }
+
+    #[gpui::test]
+    fn chevron_click_animates_to_target(cx: &mut TestAppContext) {
+        // The tab strip starts scrolled to the left: the left chevron is a no-op there, and the
+        // right chevron ANIMATES the content toward the end (offset slides negative over frames —
+        // D10.2, replacing the D9.2 instant jump).
+        let h = build_sized(cx, many_sheets(40), SheetId(0), 560.0, 200.0);
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+
+        let at_start = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(
+            at_start.abs() < 1.0,
+            "a fresh scroller starts at offset 0, got {at_start}"
+        );
+
+        // Left chevron at the start is disabled → clicking it arms no slide and does not scroll.
+        let left = vcx
+            .debug_bounds("tab-bar-chevron-left")
+            .expect("left chevron painted");
+        vcx.simulate_click(left.center(), Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()),
+            "the disabled left chevron at the start arms no animation"
+        );
+        let after_left = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(
+            after_left.abs() < 1.0,
+            "the left chevron at the start is a no-op, got {after_left}"
+        );
+
+        // Right chevron arms an animated slide (`target` set, `is_animating`) rather than an instant
+        // jump: even after the first redraw it's still mid-flight (one 60%-step is not arrival), so
+        // the reader sees a slide, not a teleport to the destination.
+        let right = vcx
+            .debug_bounds("tab-bar-chevron-right")
+            .expect("right chevron painted");
+        vcx.simulate_click(right.center(), Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()),
+            "clicking the right chevron arms an in-flight slide"
+        );
+
+        // Each frame steps the offset monotonically toward the (negative) clamped target, then the
+        // slide settles and clears `target`.
+        let mut prev = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        let mut moved_negative = false;
+        for _ in 0..20 {
+            pump_frames(&mut vcx, 1);
+            let now = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+            assert!(
+                now <= prev + 0.01,
+                "the slide only moves toward the end (never backward): {now} > {prev}"
+            );
+            if now < -1.0 {
+                moved_negative = true;
+            }
+            prev = now;
+            if !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()) {
+                break;
+            }
+        }
+        assert!(
+            moved_negative,
+            "the animated slide moved the content toward the end, got final {prev}"
+        );
+        assert!(
+            !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()),
+            "the slide self-terminates once it reaches the target"
+        );
+
+        // It lands at the clamped `scroll_step` destination (0.8 × viewport from the start), within
+        // the scroll range.
+        let landed = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(landed < -1.0, "settled toward the end, got {landed}");
+    }
+
+    #[gpui::test]
+    fn chevron_animation_clamps_at_end(cx: &mut TestAppContext) {
+        // Repeated right-chevron clicks (each fully animated) drive the tab scroller to the end and
+        // no further; the right chevron then disables (`at_end`) and arms no more slides.
+        let h = build_sized(cx, many_sheets(40), SheetId(0), 560.0, 200.0);
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+
+        // Click + fully settle several times; each click resolves before the next.
+        for _ in 0..12 {
+            if let Some(right) = vcx.debug_bounds("tab-bar-chevron-right") {
+                vcx.simulate_click(right.center(), Modifiers::default());
+                vcx.run_until_parked();
+                // Settle this slide before the next click.
+                for _ in 0..20 {
+                    pump_frames(&mut vcx, 1);
+                    if !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // At the end, the right chevron is disabled: clicking it arms no further slide and the
+        // offset does not move past the limit.
+        let at_limit = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        if let Some(right) = vcx.debug_bounds("tab-bar-chevron-right") {
+            vcx.simulate_click(right.center(), Modifiers::default());
+            vcx.run_until_parked();
+            pump_frames(&mut vcx, 3);
+        }
+        let after = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(
+            (after - at_limit).abs() < 1.0,
+            "at the end the content stays pinned at the limit ({at_limit} → {after})"
+        );
+        assert!(
+            at_limit < -1.0,
+            "the strip did scroll to a non-trivial end, got {at_limit}"
+        );
     }
 
     #[gpui::test]
@@ -6798,6 +7645,106 @@ mod tests {
     }
 
     #[gpui::test]
+    fn num_fmt_category_label_reflects_new_categories(cx: &mut TestAppContext) {
+        // The grouped model added Scientific / Accounting categories; the dropdown button label must
+        // reverse-map an active cell's code to the new category names.
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00E+00");
+        select_single(&h, cx, 1, 1);
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_category_label()),
+            "Scientific"
+        );
+
+        h.client
+            .set_num_fmt(SheetId(0), cell(1, 1), "$#,##0.00;($#,##0.00)");
+        select_single(&h, cx, 1, 1);
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_category_label()),
+            "Accounting"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_preset_pick_emits_grouped_code(cx: &mut TestAppContext) {
+        // Picking a preset from a multi-preset group routes that exact code to the set-format command.
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, window, cx| {
+            c.apply_num_fmt("yyyy-mm-dd", window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "yyyy-mm-dd"
+            ),
+            "a grouped Date preset routes its exact code, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn thousands_toggle_adds_and_removes_grouping(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // An ungrouped numeric format: toggle enabled, not active → adds grouping.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00");
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.thousands_active()));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_thousands_separator(window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "#,##0.00"
+            ),
+            "toggling on adds grouping, got {cmds:?}"
+        );
+
+        // A grouped format: enabled + active → removes grouping.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "#,##0.00");
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.thousands_active()));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_thousands_separator(window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "0.00"
+            ),
+            "toggling off removes grouping, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn thousands_toggle_disabled_for_date_and_degraded(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // A date format has no integer digit placeholder → disabled + no-op.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "m/d/yyyy");
+        select_single(&h, cx, 1, 1);
+        assert!(!upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.thousands_active()));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_thousands_separator(window, cx)
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a non-toggleable format sends nothing"
+        );
+
+        // A toggleable format disables once degraded.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00");
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+    }
+
+    #[gpui::test]
     fn decimals_buttons_emit_adjusted_code(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
         h.client.set_num_fmt(SheetId(0), cell(1, 1), "#,##0.00");
@@ -7053,20 +8000,206 @@ mod tests {
     fn numfmt_currency_click_applies_and_closes(cx: &mut TestAppContext) {
         let h = tall_sheet(cx);
         select_single(&h, cx, 1, 1);
+        // Grouped presets are keyed by their exact code (`numfmt-<code>`); the `$1,234.56` Currency
+        // preset sends `$#,##0.00`.
         let cmds = press_popover_button(
             &h,
             cx,
             |c, _w, cx| c.toggle_num_fmt_popover(cx),
-            "numfmt-Currency",
+            "numfmt-$#,##0.00",
             |c| c.num_fmt_open,
         );
         assert!(
             matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "$#,##0.00"),
-            "clicking Currency must dispatch the Currency num-fmt, got {cmds:?}"
+            "clicking the Currency preset must dispatch its num-fmt, got {cmds:?}"
         );
         assert!(
             !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
             "the popover must close after applying"
+        );
+    }
+
+    // ---- Phase 10.1: number-format dropdown basics-first + "More ▸" drill-in ----------------
+
+    #[gpui::test]
+    fn num_fmt_basic_menu_paints_seven_and_more_row(cx: &mut TestAppContext) {
+        // Basics-first: opening the dropdown paints the seven basic presets flat + a "More ▸" row,
+        // and NONE of the More-only grouped inventory (`0.00` — the "1234.56" Number preset) nor a
+        // "◂ Back" row. This is the regression fix — the common formats are visible without scroll.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("numfmt-card").is_some(),
+            "the number-format card must be painted when open"
+        );
+        // The seven basic presets (`debug_bounds` needs a `'static` selector, so enumerate them).
+        for sel in [
+            "numfmt-general",
+            "numfmt-#,##0.00",
+            "numfmt-$#,##0.00",
+            "numfmt-0.00%",
+            "numfmt-m/d/yyyy",
+            "numfmt-h:mm AM/PM",
+            "numfmt-@",
+        ] {
+            assert!(
+                vcx.debug_bounds(sel).is_some(),
+                "basic preset {sel} must be painted in the basics-first view"
+            );
+        }
+        assert!(
+            vcx.debug_bounds("numfmt-more").is_some(),
+            "the 'More ▸' row must be painted"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-0.00").is_none(),
+            "a More-only preset (0.00) must NOT be painted in the basic view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-back").is_none(),
+            "the '◂ Back' row must NOT be painted in the basic view"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_more_drilldown_and_back(cx: &mut TestAppContext) {
+        // Clicking "More ▸" drills into the full grouped inventory (a More-only preset + the
+        // "◂ Back" row now paint); clicking "◂ Back" restores the basics-first view.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let more = vcx
+            .debug_bounds("numfmt-more")
+            .expect("the 'More ▸' row was painted")
+            .center();
+        vcx.simulate_click(more, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            vcx.update(|_w, cx| h.chrome.read(cx).num_fmt_more_open),
+            "clicking 'More ▸' must enter the drill-in view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-back").is_some(),
+            "the '◂ Back' row must be painted in the More view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-0.00").is_some(),
+            "a More-only preset (0.00) must be painted in the More view"
+        );
+
+        let back = vcx
+            .debug_bounds("numfmt-back")
+            .expect("the '◂ Back' row was painted")
+            .center();
+        vcx.simulate_click(back, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            !vcx.update(|_w, cx| h.chrome.read(cx).num_fmt_more_open),
+            "clicking '◂ Back' must restore the basics-first view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-more").is_some(),
+            "the 'More ▸' row must be painted again after Back"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-0.00").is_none(),
+            "the More-only preset must be gone after Back"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_basic_pick_applies_and_closes(cx: &mut TestAppContext) {
+        // Selecting a basic preset from the basics-first view routes its exact code and closes the
+        // popover (and resets the drill-in state).
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_num_fmt_popover(cx),
+            "numfmt-#,##0.00",
+            |c| c.num_fmt_open,
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "#,##0.00"),
+            "the basic Number preset must dispatch #,##0.00, got {cmds:?}"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "the popover must close after applying"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "the drill-in state must reset after applying"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_more_pick_applies_and_closes(cx: &mut TestAppContext) {
+        // Drilling into "More ▸" and selecting a More-only preset routes its exact code and closes.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let more = vcx
+            .debug_bounds("numfmt-more")
+            .expect("the 'More ▸' row was painted")
+            .center();
+        vcx.simulate_click(more, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        h.client.take_commands(); // isolate the preset click
+        let preset = vcx
+            .debug_bounds("numfmt-0.00")
+            .expect("the More-only preset (0.00) was painted")
+            .center();
+        vcx.simulate_click(preset, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "0.00"),
+            "the More-only preset must dispatch 0.00, got {cmds:?}"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "the popover must close after applying from the More view"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "the drill-in state must reset after applying"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_opens_onto_more_for_more_only_active(cx: &mut TestAppContext) {
+        // Discoverability (D10.1): when the active cell's format lives only under "More ▸", opening
+        // the dropdown lands directly on the grouped view so the current format is visible; a basic
+        // active format opens basics-first.
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00E+00"); // Scientific — More-only
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "a More-only active format must open onto the grouped view"
+        );
+        // Close, then a basic active format opens basics-first.
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "$#,##0.00"); // Currency — basic
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "the popover must be open"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "a basic active format must open basics-first"
         );
     }
 

@@ -133,6 +133,13 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
         "icons/text-wrap.svg",
         include_bytes!("../../assets/icons/text-wrap.svg"),
     ),
+    // Thousands-separator toggle glyph for the action bar (Phase 6, `functional_spec.md §6`):
+    // three `0` digit rings + a comma, hand-authored in the same tintable Lucide form (the bundle
+    // ships no thousands/comma glyph).
+    (
+        "icons/thousands-separator.svg",
+        include_bytes!("../../assets/icons/thousands-separator.svg"),
+    ),
     (
         "icons/underline.svg",
         include_bytes!("../../assets/icons/underline.svg"),

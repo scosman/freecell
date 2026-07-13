@@ -26,10 +26,13 @@ use std::time::Instant;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use freecell_core::input_cap::validate_input;
-use freecell_core::merge_guard::{blocks_col_op, blocks_row_op};
+use freecell_core::merge_guard::{blocks_col_op, blocks_fill, blocks_row_op};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
-use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
+use freecell_core::{
+    limits, CellKind, CellRange, CellRef, Direction, Publication, PublishedCell, SelectionStats,
+    SheetId,
+};
 
 use freecell_chart_model::{
     Anchor, CfRange, Chart, ChartColor, ChartId, ChartInsertKind, ChartKind, ChartSpec, Color,
@@ -77,6 +80,10 @@ enum AppliedKind {
     /// An insert/delete rows/columns — content + geometry + formulas shift, so it needs a
     /// recompute **and** a full active-sheet cache rebuild (`components/grid_structure.md §5.3`).
     Structure,
+    /// An edit that resolved to a **no change** (e.g. a fill whose selection is an edge/seed-line
+    /// no-op, or whose full-line target clamped to an empty used range). It touched no cell, so the
+    /// batch must not count it, recompute, republish, or record an undo op for it.
+    NoOp,
 }
 
 /// The cache **touch-set** of one applied undoable op, recorded so `Undo`/`Redo` can re-read the
@@ -110,6 +117,10 @@ struct ClipboardSlot {
     range: (i32, i32, i32, i32),
     data: serde_json::Value,
     cut: bool,
+    /// The copied block's computed values as literal paste tokens (row-major over `range`) — the
+    /// Paste Values (⌘⇧V) source. Captured at copy time alongside `data`; see
+    /// [`WorkbookDocument::copied_value_tokens`](crate::document::WorkbookDocument).
+    values: Vec<Vec<String>>,
 }
 
 /// One **authored** chart the worker holds (P17, charts/write-path §1 mode 3). Distinct from the
@@ -437,6 +448,12 @@ impl Worker {
     fn process_batch(&mut self, batch: Vec<Command>) -> Flow {
         let mut edits: Vec<Command> = Vec::new();
         let mut reads: Vec<(SheetId, CellRef, u64)> = Vec::new();
+        // Selection-stats queries (`Command::SelectionStats`) are pure reads (no eval/publish),
+        // computed after the edit batch so they observe every mutation in this batch.
+        let mut stats_ops: Vec<(SheetId, CellRange, u64)> = Vec::new();
+        // Edge-of-data resolves (`Command::ResolveEdge`) are pure reads too (⌘+arrow target lookup),
+        // run after the edit batch so a jump observes this batch's mutations.
+        let mut edge_ops: Vec<(SheetId, CellRef, Direction, u64)> = Vec::new();
         let mut saves: Vec<(PathBuf, u64)> = Vec::new();
         // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
         // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
@@ -490,6 +507,17 @@ impl Worker {
                     cell,
                     req_id,
                 } => reads.push((sheet, cell, req_id)),
+                Command::SelectionStats {
+                    sheet,
+                    range,
+                    req_id,
+                } => stats_ops.push((sheet, range, req_id)),
+                Command::ResolveEdge {
+                    sheet,
+                    from,
+                    dir,
+                    req_id,
+                } => edge_ops.push((sheet, from, dir, req_id)),
                 Command::Find {
                     sheet,
                     query,
@@ -506,6 +534,7 @@ impl Worker {
                 Command::Shutdown => shutdown = true,
                 clip @ (Command::CopySelection { .. }
                 | Command::PasteInternal { .. }
+                | Command::PasteValues { .. }
                 | Command::PasteTsv { .. }) => clipboard_ops.push(clip),
                 font @ Command::SetFont { .. } => font_ops.push(font),
                 chart @ (Command::InsertChart { .. }
@@ -516,6 +545,8 @@ impl Worker {
                 | Command::SetChartChrome { .. }) => chart_ops.push(chart),
                 edit @ (Command::SetCellInput { .. }
                 | Command::ClearCells { .. }
+                | Command::FillDown { .. }
+                | Command::FillRight { .. }
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
@@ -654,6 +685,27 @@ impl Worker {
             self.emit(WorkerEvent::CellContent { req_id, raw });
         }
 
+        // Selection-stats reads (pure, like `reads`): aggregate the selection's populated cells and
+        // reply. An unresolvable sheet (deleted mid-flight) replies the empty aggregate.
+        for (sheet, range, req_id) in stats_ops {
+            let stats = match self.resolve(sheet) {
+                Some(idx) => self.doc.selection_stats(idx, range),
+                None => SelectionStats::EMPTY,
+            };
+            self.emit(WorkerEvent::SelectionStats { req_id, stats });
+        }
+
+        // Edge-of-data resolves (pure, like `reads`/`stats_ops`): walk the active line's populated
+        // cells and reply the ⌘+arrow target. An unresolvable sheet (deleted mid-flight) replies the
+        // origin cell (no move).
+        for (sheet, from, dir, req_id) in edge_ops {
+            let target = match self.resolve(sheet) {
+                Some(idx) => self.doc.resolve_edge(idx, from, dir),
+                None => from,
+            };
+            self.emit(WorkerEvent::EdgeResolved { req_id, target });
+        }
+
         for (path, req_id) in saves {
             match self.save_workbook(&path) {
                 Ok(()) => self.emit(WorkerEvent::Saved {
@@ -761,6 +813,8 @@ impl Worker {
                             needs_eval = true;
                             applied_ops.push(op_of(edit));
                         }
+                        // A no-op edit changed nothing: don't count it, recompute, or record an op.
+                        Ok(AppliedKind::NoOp) => {}
                         Err(msg) => engine_errors.push(msg),
                     }
                 }
@@ -854,12 +908,13 @@ impl Worker {
         match cmd {
             Command::CopySelection { sheet, range, cut } => self.apply_copy(sheet, range, cut),
             Command::PasteInternal { sheet, target } => self.apply_paste_internal(sheet, target),
+            Command::PasteValues { sheet, target } => self.apply_paste_values(sheet, target),
             Command::PasteTsv {
                 sheet,
                 anchor,
                 text,
             } => self.apply_paste_tsv(sheet, anchor, &text),
-            // Only the three clipboard commands are bucketed here.
+            // Only the clipboard commands are bucketed here.
             _ => {}
         }
     }
@@ -1083,6 +1138,7 @@ impl Worker {
                     range: copied.range,
                     data: copied.data,
                     cut,
+                    values: copied.values,
                 });
                 self.emit(WorkerEvent::CopyReady { tsv: copied.tsv });
             }
@@ -1198,6 +1254,90 @@ impl Worker {
                 });
             }
             // A caught panic degrades the model; the (now-suspect) slot is dropped.
+            PasteOutcome::Panicked => self.handle_caught_panic(),
+        }
+    }
+
+    /// Paste the internal clipboard slot's **computed values** into `target` — the values-only
+    /// sibling of [`apply_paste_internal`](Self::apply_paste_internal) (⌘⇧V, `functional_spec.md
+    /// §5`). Reuses that path's sizing/overflow rules (a single-cell / exact-divisor source tiles
+    /// to fill the selection; a block pastes from the anchor; oversized → Overflow) and its guarded
+    /// one-undo write, but writes each source cell's evaluated value as a **literal** (no formulas,
+    /// no formatting — the target keeps its own). A values paste is always repeatable and never
+    /// clears the source, so the slot is kept regardless of its `cut` flag.
+    fn apply_paste_values(&mut self, dest: SheetId, target: CellRange) {
+        let anchor = target.start;
+        if self.degraded {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded,
+            });
+            return;
+        }
+        let Some(slot) = self.clipboard.take() else {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+        // A degenerate slot (inverted range, or no captured values) has nothing to paste — reject
+        // rather than trust the UI (matches `apply_paste_internal`). Junk, so not restored.
+        let (r0, c0, r1, c1) = slot.range;
+        if r1 < r0 || c1 < c0 || slot.values.is_empty() {
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        }
+        // A single-cell / exact-divisor source fills the whole (larger) selection; cap the fill at
+        // the same size guard the internal paste uses so a 1-cell fill into a full-column selection
+        // can't materialise a million cells. A values paste never "moves", so it always fills.
+        let fill = crate::document::fill_target_dims(slot.range, target);
+        if let Some((tw, th)) = fill {
+            if tw as u64 * th as u64 > MAX_REFRESH_CELLS {
+                self.clipboard = Some(slot); // still valid — the user can retry on a smaller target
+                self.emit(WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow,
+                });
+                return;
+            }
+        }
+        // Overflow pre-check against the slot's effective source dims (when filling, the source is a
+        // divisor of the valid target, so its top-left tile fits too).
+        let (width, height) = ((c1 - c0 + 1) as u32, (r1 - r0 + 1) as u32);
+        if !paste_fits(anchor, width, height) {
+            self.clipboard = Some(slot); // still valid — the user can retry at a smaller anchor
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::Overflow,
+            });
+            return;
+        }
+        let Some(dest_idx) = self.resolve(dest) else {
+            self.clipboard = Some(slot); // the destination sheet vanished — keep the copy
+            self.emit(WorkerEvent::PasteRejected {
+                reason: PasteError::NothingToPaste,
+            });
+            return;
+        };
+        let (paste_w, paste_h) = fill.unwrap_or((width, height));
+        // Borrow the slot's values into the guarded paste (no clone); the borrow ends when
+        // `run_guarded_paste` returns, freeing `slot` for the restore below.
+        let outcome = {
+            let values = &slot.values;
+            self.run_guarded_paste(move |doc| {
+                doc.paste_values(dest_idx, anchor, values, paste_w, paste_h)
+            })
+        };
+        match outcome {
+            PasteOutcome::Applied(pasted) => {
+                self.commit_paste(dest, pasted, vec![(dest, pasted)]);
+                self.clipboard = Some(slot); // a values paste is repeatable
+            }
+            PasteOutcome::EngineError(msg) => {
+                self.clipboard = Some(slot); // the paste didn't apply — keep the copy
+                self.emit(WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(msg),
+                });
+            }
             PasteOutcome::Panicked => self.handle_caught_panic(),
         }
     }
@@ -1853,6 +1993,12 @@ impl Worker {
             Command::InsertColumns { sheet, col, .. }
             | Command::DeleteColumns { sheet, col, .. } => {
                 self.merge_guard(*sheet, |merges| blocks_col_op(merges, *col))
+            }
+            // Fill into a merged region is rejected (merged cells aren't a supported edit target),
+            // consistently with the structural ops → the same `MergedCells` dialog
+            // (`functional_spec.md §3` edge case). The written rectangle is the selection `range`.
+            Command::FillDown { sheet, range } | Command::FillRight { sheet, range } => {
+                self.merge_guard(*sheet, |merges| blocks_fill(merges, *range))
             }
             _ => Ok(()),
         }
@@ -3007,6 +3153,25 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.clear_contents(idx, *range)?;
             Ok(AppliedKind::Cell)
         }
+        Command::FillDown { sheet, range } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            // An edge/seed-line/empty-clamp fill writes nothing → NoOp (skip eval/publish/op).
+            let applied = doc.fill_down(idx, *range)?;
+            Ok(if applied {
+                AppliedKind::Cell
+            } else {
+                AppliedKind::NoOp
+            })
+        }
+        Command::FillRight { sheet, range } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            let applied = doc.fill_right(idx, *range)?;
+            Ok(if applied {
+                AppliedKind::Cell
+            } else {
+                AppliedKind::NoOp
+            })
+        }
         Command::SetStyleAttr { sheet, range, attr } => {
             let idx = resolve_idx(doc, *sheet)?;
             apply_style(doc, idx, *range, *attr)?;
@@ -3235,6 +3400,14 @@ fn op_of(edit: &Command) -> AppliedOp {
             sheet: *sheet,
             range: *range,
         },
+        // Fill writes within the selection rectangle (the single-cell pull-from-neighbor case only
+        // reads the seed neighbor, writes the selected cell) → refresh exactly that range.
+        Command::FillDown { sheet, range } | Command::FillRight { sheet, range } => {
+            AppliedOp::Cells {
+                sheet: *sheet,
+                range: *range,
+            }
+        }
         Command::SetStyleAttr { sheet, range, .. } | Command::SetStylePath { sheet, range, .. } => {
             AppliedOp::Cells {
                 sheet: *sheet,
@@ -3505,6 +3678,75 @@ mod tests {
             .expect("a Find batch replies FindResults");
         assert_eq!(matches, vec![CellRef::new(0, 0), CellRef::new(1, 1)]);
         // A find is a read — it publishes nothing.
+        assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
+    }
+
+    #[test]
+    fn selection_stats_command_replies_aggregate() {
+        // A `SelectionStats` batch aggregates the selection's populated cells and replies — a pure
+        // read (no publish), tagged with the request's `req_id`.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "10"),   // A1 number
+            set_input(sheet, 1, 0, "text"), // A2 text
+            set_input(sheet, 2, 0, "20"),   // A3 number
+            set_input(sheet, 0, 1, "999"),  // B1 — outside the queried column
+        ]);
+        let _ = drain_events(&rx);
+
+        worker.process_batch(vec![Command::SelectionStats {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)),
+            req_id: 7,
+        }]);
+        let events = drain_events(&rx);
+        let stats = events
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::SelectionStats { req_id: 7, stats } => Some(*stats),
+                _ => None,
+            })
+            .expect("a SelectionStats batch replies SelectionStats with the same req_id");
+        assert_eq!(stats.count, 3, "A1:A3 has three non-empty cells");
+        assert_eq!(stats.numeric_count, 2);
+        assert_eq!(stats.sum, 30.0);
+        assert_eq!(stats.min, Some(10.0));
+        assert_eq!(stats.max, Some(20.0));
+        // A stats query is a read — it publishes nothing.
+        assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
+    }
+
+    #[test]
+    fn resolve_edge_command_replies_target() {
+        // A `ResolveEdge` batch resolves the ⌘+arrow edge-of-data target and replies — a pure read
+        // (no publish), tagged with the request's `req_id`.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "a"), // A1
+            set_input(sheet, 1, 0, "b"), // A2
+            set_input(sheet, 2, 0, "c"), // A3 — end of the run
+        ]);
+        let _ = drain_events(&rx);
+
+        worker.process_batch(vec![Command::ResolveEdge {
+            sheet,
+            from: CellRef::new(0, 0),
+            dir: Direction::Down,
+            req_id: 42,
+        }]);
+        let events = drain_events(&rx);
+        let target = events
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::EdgeResolved { req_id: 42, target } => Some(*target),
+                _ => None,
+            })
+            .expect("a ResolveEdge batch replies EdgeResolved with the same req_id");
+        // Down from A1 through the run A1:A3 lands on the run's last cell A3 (row 2).
+        assert_eq!(target, CellRef::new(2, 0));
+        // A resolve is a read — it publishes nothing.
         assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
     }
 
@@ -6207,6 +6449,7 @@ mod tests {
             range: (5, 1, 2, 1), // r1 (2) < r0 (5): degenerate
             data: serde_json::json!({ "5": { "1": { "text": "x", "style": {} } } }),
             cut: false,
+            values: vec![vec!["x".to_string()]],
         });
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
@@ -6401,6 +6644,7 @@ mod tests {
             range: (1, 1, 1, 1), // valid 1×1 — passes the degenerate + overflow guards
             data: serde_json::json!({ "not-an-i32-row": 1 }), // non-empty, but not ClipboardData
             cut: false,
+            values: vec![vec!["x".to_string()]],
         });
         worker.process_batch(vec![Command::PasteInternal {
             sheet,
@@ -6542,6 +6786,190 @@ mod tests {
         assert!(
             worker.clipboard.is_some(),
             "the copy is preserved after a rejected fill"
+        );
+    }
+
+    // ---- Paste Values (⌘⇧V, `functional_spec.md §5`) --------------------------------------
+
+    #[test]
+    fn paste_values_writes_the_evaluated_value_and_keeps_the_slot() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "=1+2"), // a formula → 3
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        worker.process_batch(vec![Command::PasteValues {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+        // The literal value landed — not the formula.
+        assert_eq!(value_at(&worker, 0, 2), "3");
+        assert_eq!(
+            worker
+                .doc
+                .cell_content(0, CellRef::new(0, 2))
+                .unwrap_or_default(),
+            "3",
+            "the pasted cell holds the value, not `=1+2`"
+        );
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range }
+                    if *s == sheet && *range == CellRange::single(CellRef::new(0, 2))
+            )),
+            "paste-values replies with the pasted rectangle; got {events:?}"
+        );
+        // A values paste is repeatable → the slot is kept, and one undo reverts it.
+        assert!(worker.clipboard.is_some(), "the slot is kept (repeatable)");
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(value_at(&worker, 0, 2), "", "one undo reverts the paste");
+        assert_eq!(value_at(&worker, 0, 0), "3", "the source is untouched");
+    }
+
+    #[test]
+    fn paste_values_forces_a_formula_looking_string_to_a_literal() {
+        // The load-bearing edge case: a computed *string* value of `=x` must land as literal text,
+        // never re-parsed into a formula (which would evaluate to an error).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "=\"=x\""), // a formula whose *value* is the string "=x"
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        worker.process_batch(vec![Command::PasteValues {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 2)),
+        }]);
+        assert_eq!(
+            value_at(&worker, 0, 2),
+            "=x",
+            "the literal text `=x` landed, not a re-interpreted formula"
+        );
+    }
+
+    #[test]
+    fn paste_values_single_cell_fills_the_target_in_one_undo() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "7"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        // Fill C1:E3 (a 3×3 target) from the single-cell source.
+        let target = CellRange::new(CellRef::new(0, 2), CellRef::new(2, 4));
+        worker.process_batch(vec![Command::PasteValues { sheet, target }]);
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(value_at(&worker, r, c), "7", "cell ({r},{c}) filled");
+            }
+        }
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == target
+            )),
+            "the fill reply carries the whole target; got {events:?}"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        for r in 0..3 {
+            for c in 2..5 {
+                assert_eq!(
+                    value_at(&worker, r, c),
+                    "",
+                    "one undo clears the whole fill"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paste_values_oversized_fill_is_rejected() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "9")]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(limits::MAX_ROWS - 1, 0));
+        worker.process_batch(vec![Command::PasteValues { sheet, target }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::Overflow
+                }
+            )),
+            "an oversized values fill is rejected; got {events:?}"
+        );
+        assert!(
+            worker.clipboard.is_some(),
+            "the copy is preserved after a rejected fill"
+        );
+    }
+
+    #[test]
+    fn paste_values_with_empty_slot_is_nothing_to_paste() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::PasteValues {
+            sheet,
+            target: CellRange::single(CellRef::new(0, 0)),
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::PasteRejected {
+                    reason: PasteError::NothingToPaste
+                }
+            )),
+            "paste-values with no prior copy is NothingToPaste; got {events:?}"
         );
     }
 
@@ -6957,5 +7385,102 @@ mod tests {
             )),
             "an op below all merges must not be merge-blocked"
         );
+    }
+
+    #[test]
+    fn fill_into_merge_is_rejected_disjoint_fill_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = merged_fixture(dir.path());
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        // K7:L10 → 0-based rows 6..=9, cols 10..=11.
+        let (mut worker, rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+
+        // A ⌘D whose target rectangle overlaps the merge is refused with the same typed dialog the
+        // structural ops use, and commits nothing (`functional_spec.md §3` edge case).
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::FillDown {
+            sheet,
+            range: CellRange::new(CellRef::new(6, 10), CellRef::new(9, 10)), // K7:K10, inside merge
+        }]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "a fill overlapping a merge must be refused with MergedCells"
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "a blocked fill commits nothing"
+        );
+
+        // The column path (⌘R) is guarded identically.
+        let ops_before_right = worker.ops_seen;
+        worker.process_batch(vec![Command::FillRight {
+            sheet,
+            range: CellRange::new(CellRef::new(6, 10), CellRef::new(6, 11)), // K7:L7, inside merge
+        }]);
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "a fill-right overlapping a merge must be refused with MergedCells"
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before_right,
+            "a blocked fill-right commits nothing"
+        );
+
+        // A ⌘D far from any merge (A1:A3) applies normally — the guard is not a blanket block.
+        worker.process_batch(vec![set_input(sheet, 0, 0, "1")]);
+        let ops_before_fill = worker.ops_seen;
+        worker.process_batch(vec![Command::FillDown {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)),
+        }]);
+        assert!(
+            worker.ops_seen > ops_before_fill,
+            "a fill disjoint from every merge must apply"
+        );
+        let events = drain_events(&rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::MergedCells
+                }
+            )),
+            "a fill disjoint from every merge must not be merge-blocked"
+        );
+    }
+
+    #[test]
+    fn noop_fill_skips_recompute_publish_and_ops_bump() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "5")]);
+        let _ = drain_events(&rx); // discard the setup edit's events
+        let ops_before = worker.ops_seen;
+
+        // ⌘D on a lone A1 (row 0, no neighbor above) resolves to a no-op: it must not recompute,
+        // republish, or bump ops_seen (Mild #1 — an errant fill over zero change stays free).
+        worker.process_batch(vec![Command::FillDown {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+        }]);
+        assert_eq!(worker.ops_seen, ops_before, "a no-op fill commits no op");
+        assert!(
+            !drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Published)),
+            "a no-op fill must not republish"
+        );
+        assert_eq!(value_at(&worker, 0, 0), "5"); // unchanged
     }
 }

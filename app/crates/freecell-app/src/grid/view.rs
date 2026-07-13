@@ -34,8 +34,8 @@ use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
     apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
-    is_full_row_selection, Align, Axis, BorderSpec, CellRange, CellRef, Edge, LinePattern,
-    RenderStyle, SelectionModel, SheetDims, VAlign,
+    is_full_row_selection, spans_all_cols, spans_all_rows, Align, Axis, BorderSpec, CellRange,
+    CellRef, Edge, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
 use super::chart_layer::{self, ChartPlacement, ChartRect, Handle};
@@ -56,6 +56,18 @@ const RESIZE_HOTSPOT_HALF: f32 = 3.0;
 /// Minimum column width / row height a resize drag clamps to (`functional_spec.md §5.1`).
 const MIN_COL_WIDTH_PX: f32 = 8.0;
 const MIN_ROW_HEIGHT_PX: f32 = 12.0;
+
+/// Extra width (device px) added around the widest measured cell text when autofitting a column
+/// (double-click the column divider, `functional_spec.md §7`): the cell's left+right text padding
+/// (`2 × CELL_H_PAD`) plus a small buffer so the content clears the gridline. Keeps an autofit
+/// column just wide enough that its widest published cell does not overflow/spill
+/// (`text_overflows_column` fits when `col_w >= text + 2 · CELL_H_PAD`).
+const AUTOFIT_PADDING_PX: f32 = 2.0 * CELL_H_PAD + 3.0;
+/// Floor (device px) for an autofit column — the configured minimum (D7.3), wide enough to keep the
+/// column-letter header label readable; an empty column shrinks to this.
+const AUTOFIT_MIN_WIDTH_PX: f32 = 24.0;
+/// Cap (device px) for an autofit column so a single very long value can't produce a runaway width.
+const AUTOFIT_MAX_WIDTH_PX: f32 = 800.0;
 
 /// gpui's default text line-height multiple — the golden ratio `phi` (`gpui::geometry::phi` =
 /// `relative(1.618034)`, applied as `Style::line_height`). The wrap auto-grow measurement uses the
@@ -119,6 +131,29 @@ struct HeaderMenu {
     insert_before_blocked: bool,
     insert_after_blocked: bool,
     delete_blocked: bool,
+}
+
+/// The open cell-area right-click context menu (`functional_spec.md §2`, cloned from
+/// [`HeaderMenu`]). `x`/`y` are grid-local; `range` is the selection rectangle snapshotted at
+/// open (the menu is modal via its backdrop, so the selection can't drift while it's up) — its
+/// rows/cols set the insert/delete span and it is itself the Clear-contents target. `paste_enabled`
+/// gates both Paste and Paste-values (the grid can't distinguish an internal vs foreign clipboard —
+/// that state lives in the window's `ClipboardCoordinator` — and Paste-values falls back to a TSV
+/// paste for a foreign clipboard anyway, `functional_spec.md §5`, so they share one gate). The
+/// `*_blocked` flags disable an insert/delete item when the op would displace a file-loaded merge,
+/// reusing the header menu's merge guard for each axis.
+#[derive(Debug, Clone, Copy)]
+struct CellMenu {
+    x: f32,
+    y: f32,
+    range: CellRange,
+    paste_enabled: bool,
+    insert_row_above_blocked: bool,
+    insert_row_below_blocked: bool,
+    delete_rows_blocked: bool,
+    insert_col_left_blocked: bool,
+    insert_col_right_blocked: bool,
+    delete_cols_blocked: bool,
 }
 
 /// A live row/column resize (`components/grid_structure.md §5.1`). `start_px` is the dragged
@@ -301,6 +336,8 @@ pub struct GridView {
     chart_drag: Option<ChartDrag>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
+    /// The open cell-area right-click context menu, if any (`functional_spec.md §2`).
+    cell_menu: Option<CellMenu>,
 
     // ---- Wrap-driven row auto-grow (`functional_spec.md §3`) ----------------------------------
     /// Reused per-frame buffer of the visible **wrap-on, non-empty** cells (populated in
@@ -551,6 +588,7 @@ impl GridView {
             selected_chart: None,
             chart_drag: None,
             chart_menu: None,
+            cell_menu: None,
             wrap_cells: Vec::new(),
             wrap_sig: HashMap::new(),
         }
@@ -804,6 +842,7 @@ impl GridView {
         self.resize_drag = None;
         self.resize_preview = None;
         self.header_menu = None;
+        self.cell_menu = None;
         // The wrap-measurement signatures are per-sheet; drop them so the new sheet's wrap rows are
         // measured fresh (heights themselves live in the worker's cache, so this only re-measures).
         self.wrap_sig.clear();
@@ -1595,6 +1634,15 @@ impl GridView {
     /// until the worker's rebuild republishes it) and emit `ResizeCommitted` over the run
     /// (`components/grid_structure.md §5.1`).
     fn commit_resize(&mut self, rd: ResizeDrag, window: &mut Window, cx: &mut Context<Self>) {
+        // A click on the divider with no drag (or a drag that returns to the grab point) leaves the
+        // width unchanged: freezing a preview and emitting a redundant `SetColumnWidths` would add a
+        // no-op undo step — and, on a double-click-to-autofit (`functional_spec.md §7`), a spurious
+        // step just before the autofit. Skip an unchanged resize entirely; the repaint clears the
+        // transient drag visuals.
+        if rd.current_px == rd.start_px {
+            cx.notify();
+            return;
+        }
         self.resize_preview = Some(rd);
         self.events.emit(
             &GridEvent::ResizeCommitted {
@@ -1607,6 +1655,104 @@ impl GridView {
             cx,
         );
         cx.notify();
+    }
+
+    /// Autofit the column(s) at a double-clicked column divider (`functional_spec.md §7`): size each
+    /// to fit its content. Reuses [`resize_run_for`](Self::resize_run_for) so a divider inside a
+    /// bounded multi-column header selection autofits the whole run — each column to **its own**
+    /// content (D7.1) — while a lone divider autofits just that column. Each column rides the existing
+    /// [`GridEvent::ResizeCommitted`] → `Command::SetColumnWidths` (undoable, xlsx round-trip, same
+    /// path as drag-resize; no new worker command). A single-column autofit is one undo step;
+    /// multi-column is one per column (the consequence of the per-width command carrying one width).
+    ///
+    /// **Whole-sheet guard.** `resize_run_for` classifies a select-all (or any run that spans every
+    /// column) as a full-column run `(0, MAX_COLS-1)`. Drag-resize collapses that to ONE ranged
+    /// `SetColumnWidths`, but autofit computes a **distinct** width per column, so fanning out here
+    /// would emit 16,384 commands + undo steps and mass-shrink the sheet to the empty-column floor.
+    /// A whole-sheet run therefore autofits only the divider's own column; bounded multi-column
+    /// selections (a handful of columns) still fan out.
+    fn autofit_column(&mut self, index: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let (start, end) = self.resize_run_for(RowOrCol::Col, index);
+        let spans_all_columns = start == 0 && end >= freecell_core::limits::MAX_COLS - 1;
+        let (start, end) = if spans_all_columns {
+            (index, index)
+        } else {
+            (start, end)
+        };
+        for col in start..=end {
+            let px = self.autofit_width_for_column(col, window);
+            self.events.emit(
+                &GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Col,
+                    start: col,
+                    end: col,
+                    px,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The autofit width (device px) for `col` (D7.3): the widest shaped text among the column's
+    /// currently **published/overscanned** cells, plus [`AUTOFIT_PADDING_PX`], clamped to
+    /// `[AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX]`. Render-thread only — measures the values
+    /// already materialized in the publication with the render thread's text system
+    /// ([`measure_incell_text_width`]), each at its own resolved font (family/size/bold/italic from
+    /// the resident cache), so a bold/larger cell widens the fit. A wide value scrolled beyond the
+    /// overscan is not measured — a documented limitation. An empty column resolves to the floor.
+    fn autofit_width_for_column(&self, col: u32, window: &mut Window) -> f32 {
+        let publication = self.sources.publication.load_full();
+        if publication.sheet != self.active_sheet {
+            return autofit_width(0.0);
+        }
+        // Snapshot each published cell's text + resolved font while the caches lock is held, then
+        // release it before shaping (mirrors `resolve_frame`'s "drop the lock before painting"). This
+        // scans the whole publication once, keeping only this column's non-empty cells — O(published
+        // cells) per call, the snapshot Vec holding at most one column's worth. Cheap overall now the
+        // whole-sheet fan-out is guarded above: it runs O(published) × a small selected-column count.
+        let snapshots: Vec<(String, f32, Option<SharedString>, bool, bool)> = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(self.active_sheet) else {
+                return autofit_width(0.0);
+            };
+            publication
+                .cells
+                .iter()
+                .filter(|pc| pc.col == col && !pc.display_text.is_empty())
+                .map(|pc| {
+                    let style = cache.render_style(pc.row, pc.col).copied();
+                    let font_px = style.map(font_px_of).unwrap_or(CELL_FONT_PX);
+                    let family = style.and_then(|s| {
+                        cache
+                            .font_families()
+                            .get(s.font_family as usize)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| SharedString::from(name.to_string()))
+                    });
+                    (
+                        pc.display_text.clone(),
+                        font_px,
+                        family,
+                        style.map(|s| s.bold).unwrap_or(false),
+                        style.map(|s| s.italic).unwrap_or(false),
+                    )
+                })
+                .collect()
+        };
+        let max_text_px = snapshots
+            .iter()
+            .fold(0.0_f32, |acc, (text, px, fam, b, i)| {
+                acc.max(measure_incell_text_width(
+                    text,
+                    *px,
+                    fam.clone(),
+                    *b,
+                    *i,
+                    window,
+                ))
+            });
+        autofit_width(max_text_px)
     }
 
     /// Extend a header drag: map the pointer to a track on `axis` and move the selection's active
@@ -1724,6 +1870,7 @@ impl GridView {
             };
             self.selected_chart = Some(id);
             self.header_menu = None;
+            self.cell_menu = None;
             self.chart_menu = Some(ChartMenu {
                 id,
                 x: local_x,
@@ -1739,9 +1886,26 @@ impl GridView {
         let (axis, index) = match hit {
             GridHit::ColHeader { col } => (RowOrCol::Col, col),
             GridHit::RowHeader { row } => (RowOrCol::Row, row),
-            _ => {
-                // A right-click off the headers dismisses any open menu.
-                if self.header_menu.take().is_some() {
+            GridHit::Cell { row, col } => {
+                // A right-click on the cell body opens the cell-area context menu
+                // (`functional_spec.md §2`), adjusting the selection first (move-if-outside).
+                self.open_cell_menu(
+                    CellRef::new(row, col),
+                    local_x,
+                    local_y,
+                    &merges,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            GridHit::Corner => {
+                // A right-click on the select-all corner has no menu; dismiss any open one. Take
+                // both unconditionally — a `||` would short-circuit the second `take` (fragile even
+                // though the two menus are mutually exclusive today).
+                let had_header = self.header_menu.take().is_some();
+                let had_cell = self.cell_menu.take().is_some();
+                if had_header || had_cell {
                     cx.notify();
                 }
                 return;
@@ -1769,6 +1933,7 @@ impl GridView {
         }
         let run = self.resize_run_for(axis, index);
         let (before, after, delete) = merge_block_flags(axis, run, &merges);
+        self.cell_menu = None;
         self.header_menu = Some(HeaderMenu {
             axis,
             run,
@@ -1784,6 +1949,56 @@ impl GridView {
     /// Closes the header context menu (click-away / Escape / after an item runs).
     fn close_header_menu(&mut self, cx: &mut Context<Self>) {
         if self.header_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Opens the cell-area right-click context menu over cell `(row, col)` at grid-local `(x, y)`
+    /// (`functional_spec.md §2`). Excel selection semantics: a right-click **outside** the current
+    /// selection first collapses it to the clicked cell; a click **inside** keeps the (possibly
+    /// multi-cell) selection so the menu's ops span it. The insert/delete items reuse the header
+    /// menu's per-axis merge guard over the selection's row/column span; `paste_enabled` reflects
+    /// whether the system clipboard currently holds text (gating both Paste and Paste-values).
+    fn open_cell_menu(
+        &mut self,
+        cell: CellRef,
+        x: f32,
+        y: f32,
+        merges: &[CellRange],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selection().range().contains(cell) {
+            self.set_selection_and_emit(SelectionModel::single(cell), window, cx);
+        }
+        let range = self.selection().range();
+        let (insert_row_above_blocked, insert_row_below_blocked, delete_rows_blocked) =
+            merge_block_flags(RowOrCol::Row, (range.start.row, range.end.row), merges);
+        let (insert_col_left_blocked, insert_col_right_blocked, delete_cols_blocked) =
+            merge_block_flags(RowOrCol::Col, (range.start.col, range.end.col), merges);
+        let paste_enabled = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .is_some_and(|text| !text.is_empty());
+        self.header_menu = None;
+        self.cell_menu = Some(CellMenu {
+            x,
+            y,
+            range,
+            paste_enabled,
+            insert_row_above_blocked,
+            insert_row_below_blocked,
+            delete_rows_blocked,
+            insert_col_left_blocked,
+            insert_col_right_blocked,
+            delete_cols_blocked,
+        });
+        cx.notify();
+    }
+
+    /// Closes the cell-area context menu (click-away / Escape / after an item runs).
+    fn close_cell_menu(&mut self, cx: &mut Context<Self>) {
+        if self.cell_menu.take().is_some() {
             cx.notify();
         }
     }
@@ -2093,11 +2308,13 @@ impl GridView {
         if key == "escape"
             && (self.resize_drag.is_some()
                 || self.resize_preview.is_some()
-                || self.header_menu.is_some())
+                || self.header_menu.is_some()
+                || self.cell_menu.is_some())
         {
             self.resize_drag = None;
             self.resize_preview = None;
             self.header_menu = None;
+            self.cell_menu = None;
             cx.notify();
             return;
         }
@@ -2140,7 +2357,18 @@ impl GridView {
                 .emit(&GridEvent::Copy { cut: false }, window, cx),
             GridKeyCommand::Cut => self.events.emit(&GridEvent::Copy { cut: true }, window, cx),
             GridKeyCommand::Paste => self.events.emit(&GridEvent::Paste, window, cx),
+            GridKeyCommand::PasteValues => self.events.emit(&GridEvent::PasteValues, window, cx),
             GridKeyCommand::SelectAll => self.select_all(window, cx),
+            // Fill Down / Right carry the current selection range; the window forwards them to the
+            // worker (`functional_spec.md §3`).
+            GridKeyCommand::FillDown => {
+                let range = self.selection().range();
+                self.events.emit(&GridEvent::FillDown(range), window, cx);
+            }
+            GridKeyCommand::FillRight => {
+                let range = self.selection().range();
+                self.events.emit(&GridEvent::FillRight(range), window, cx);
+            }
         }
     }
 
@@ -2180,11 +2408,48 @@ impl GridView {
         let Some(dims) = self.sheet_dims() else {
             return;
         };
-        let selection = apply_motion(*self.selection(), motion, dims);
+        // ⌘+arrow / ⌘⇧+arrow use edge-of-**data** targets, whose occupancy lives in the engine past
+        // the published viewport — route only these two to the async worker query (`functional_spec.md
+        // §4`, D4.1 Option A). The window applies the `EdgeResolved` reply. Every other motion stays
+        // synchronous through `apply_motion` below.
+        let sel = *self.selection();
+        if let Some((dir, extend)) = match motion {
+            Motion::JumpEdge(dir) => Some((dir, false)),
+            Motion::ExtendEdge(dir) => Some((dir, true)),
+            _ => None,
+        } {
+            self.events.emit(
+                &GridEvent::ResolveEdge {
+                    from: sel.active,
+                    anchor: sel.anchor,
+                    dir,
+                    extend,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        let selection = apply_motion(sel, motion, dims);
         if *self.selection() != selection {
             self.set_selection_and_emit(selection, window, cx);
             self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
         }
+    }
+
+    /// Applies a worker-resolved selection (the async ⌘+arrow edge jump, `functional_spec.md §4`) and
+    /// reveals its active cell. Like [`select_and_reveal`](Self::select_and_reveal) but keeps the range
+    /// (so ⌘⇧+arrow's extended selection survives) and does **not** emit `SelectionChanged` — the
+    /// window folds the chrome + shared state directly on the `EdgeResolved` reply, mirroring the paste
+    /// path (avoids a double fold).
+    pub fn set_selection_and_reveal(
+        &mut self,
+        selection: SelectionModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selection(selection, cx);
+        self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
     }
 
     /// Build the frame-dependent element layers (cells + selection, headers, scrollbars) from a
@@ -2239,10 +2504,20 @@ impl GridView {
             for c in frame.cols.clone() {
                 let (x, y, w, h) = cell_rect(r, c, frame);
                 let style = self.visible_styles.get(&(r, c)).copied();
-                let fill = style
-                    .and_then(|s| s.fill)
-                    .map(to_rgba)
-                    .unwrap_or_else(|| rgb(CELL_BG));
+                let fill_color = style.and_then(|s| s.fill);
+                let fill = fill_color.map(to_rgba).unwrap_or_else(|| rgb(CELL_BG));
+                // 8a: within a contiguous same-fill block the interior gridlines are hidden so the
+                // block reads as one solid rectangle (the Excel look). A *filled* cell drops the
+                // gridline it shares with a right / bottom neighbour that resolves to the SAME fill;
+                // unfilled cells keep every gridline, and the block's outer boundary (a different
+                // fill, an unfilled cell, or an off-viewport neighbour — which reads as absent here)
+                // still draws. Explicit cell borders are a separate later pass and are unaffected.
+                let same_fill = |nr: u32, nc: u32| {
+                    fill_color.is_some()
+                        && self.visible_styles.get(&(nr, nc)).and_then(|s| s.fill) == fill_color
+                };
+                let skip_right_gridline = same_fill(r, c + 1);
+                let skip_bottom_gridline = same_fill(r + 1, c);
                 // A pending edit mirrors its raw text here in the grid's default style, left-
                 // aligned, over the committed value (`functional_spec.md §1.2`). The cell's fill is
                 // kept (no flash), but text attributes / alignment fall back to default (`None`).
@@ -2342,6 +2617,8 @@ impl GridView {
                             kind,
                             attr_style,
                             font_family.clone(),
+                            skip_right_gridline,
+                            skip_bottom_gridline,
                         ));
                         spill_plans.push(SpillPlan {
                             row: r,
@@ -2364,6 +2641,8 @@ impl GridView {
                         kind,
                         attr_style,
                         font_family,
+                        skip_right_gridline,
+                        skip_bottom_gridline,
                     )),
                 }
             }
@@ -2950,7 +3229,16 @@ impl GridView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.begin_resize(RowOrCol::Col, c, event, window, cx);
+                        // A single press begins the drag-resize; the 2nd click of a double-click
+                        // autofits the column to its content (`functional_spec.md §7`) without
+                        // beginning a resize. The 3rd+ click of a rapid multi-click burst is ignored
+                        // so a triple-click neither re-autofits (a redundant same-width undo step) nor
+                        // starts a stray resize.
+                        match event.click_count {
+                            1 => this.begin_resize(RowOrCol::Col, c, event, window, cx),
+                            2 => this.autofit_column(c, window, cx),
+                            _ => {}
+                        }
                         cx.stop_propagation();
                     }),
                 )
@@ -3202,6 +3490,203 @@ impl GridView {
         ]
     }
 
+    /// The cell-area context menu's rows, top-to-bottom, as `(label, enabled, event)` — a `None`
+    /// entry is a separator (`functional_spec.md §2` / D2.1 ordering). Split out from
+    /// [`cell_menu_elements`](Self::cell_menu_elements) so the label/enable/event mapping is unit-
+    /// testable without painting. Cut/Copy/Clear are always enabled (a selection is always ≥1 cell);
+    /// Paste + Paste-values share `paste_enabled`; Insert/Delete are gated by the per-axis merge
+    /// guard and reuse the header menu's row/column commands scoped to the selection's span. Clear
+    /// Formatting is omitted (no style-clear op exists this batch).
+    ///
+    /// **Full-line suppression (data safety):** a full-**column** selection is stored literally as
+    /// `rows 0..=MAX_ROWS-1`, so its row-structural items would read "Delete 1048576 rows" and wipe
+    /// the sheet — the row items are dropped (its column items, `width == 1`, are the meaningful
+    /// ones, matching Excel). A full-**row** selection symmetrically drops the column items;
+    /// whole-sheet (spans all rows AND cols) drops both structural sets, leaving only the clipboard
+    /// group.
+    fn cell_menu_items(menu: &CellMenu) -> Vec<Option<(String, bool, GridEvent)>> {
+        let range = menu.range;
+        let (start, end) = (range.start, range.end);
+        let rows = range.height();
+        let cols = range.width();
+        let row_after = end.row.saturating_add(1);
+        let col_after = end.col.saturating_add(1);
+        let rp = if rows == 1 { "" } else { "s" };
+        let cp = if cols == 1 { "" } else { "s" };
+        // Row-structural ops are meaningless / destructive on a full-column selection (and vice
+        // versa); suppress the cross-axis set.
+        let show_rows = !spans_all_rows(&range);
+        let show_cols = !spans_all_cols(&range);
+
+        let mut items = vec![
+            Some(("Cut".to_string(), true, GridEvent::Copy { cut: true })),
+            Some(("Copy".to_string(), true, GridEvent::Copy { cut: false })),
+            Some(("Paste".to_string(), menu.paste_enabled, GridEvent::Paste)),
+            Some((
+                "Paste values".to_string(),
+                menu.paste_enabled,
+                GridEvent::PasteValues,
+            )),
+            Some((
+                "Clear contents".to_string(),
+                true,
+                GridEvent::ClearCells(range),
+            )),
+        ];
+        if show_rows || show_cols {
+            items.push(None); // separator before the structural group
+        }
+        if show_rows {
+            items.extend([
+                Some((
+                    format!("Insert {rows} row{rp} above"),
+                    !menu.insert_row_above_blocked,
+                    GridEvent::InsertRows {
+                        at: start.row,
+                        count: rows,
+                    },
+                )),
+                Some((
+                    format!("Insert {rows} row{rp} below"),
+                    !menu.insert_row_below_blocked,
+                    GridEvent::InsertRows {
+                        at: row_after,
+                        count: rows,
+                    },
+                )),
+                Some((
+                    format!("Delete {rows} row{rp}"),
+                    !menu.delete_rows_blocked,
+                    GridEvent::DeleteRows {
+                        at: start.row,
+                        count: rows,
+                    },
+                )),
+            ]);
+        }
+        if show_cols {
+            items.extend([
+                Some((
+                    format!("Insert {cols} column{cp} left"),
+                    !menu.insert_col_left_blocked,
+                    GridEvent::InsertColumns {
+                        at: start.col,
+                        count: cols,
+                    },
+                )),
+                Some((
+                    format!("Insert {cols} column{cp} right"),
+                    !menu.insert_col_right_blocked,
+                    GridEvent::InsertColumns {
+                        at: col_after,
+                        count: cols,
+                    },
+                )),
+                Some((
+                    format!("Delete {cols} column{cp}"),
+                    !menu.delete_cols_blocked,
+                    GridEvent::DeleteColumns {
+                        at: start.col,
+                        count: cols,
+                    },
+                )),
+            ]);
+        }
+        items
+    }
+
+    /// The cell-area right-click context menu overlay (`functional_spec.md §2`): a click-away
+    /// backdrop + a card of items that each emit an **existing** [`GridEvent`]. Cloned from
+    /// [`chart_menu_elements`](Self::chart_menu_elements) / the header menu; item styling +
+    /// enable/disable + the `.occlude()`d modal card + the deferred dismiss backdrop match those.
+    /// Item order follows `functional_spec.md §2` / decision D2.1; Clear Formatting is omitted (no
+    /// style-clear op exists this batch). Insert/Delete reuse the header menu's row/column
+    /// commands, scoped to the snapshotted selection's span.
+    fn cell_menu_elements(&self, menu: CellMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let items = Self::cell_menu_items(&menu);
+
+        let mut card = div()
+            .debug_selector(|| "cell-menu-card".into())
+            .absolute()
+            .left(px(menu.x))
+            .top(px(menu.y))
+            // Occlude the card so a mouse-down on its padding ring / a separator (no listener there)
+            // can't fall through to the dismiss backdrop and close the menu without acting — the same
+            // guard the header menu applies (BUG A/B).
+            .occlude()
+            .flex()
+            .flex_col()
+            .p(px(4.0))
+            .bg(rgb(CELL_BG))
+            .border_1()
+            .border_color(rgb(HEADER_HAIRLINE))
+            .rounded_md()
+            .shadow_md()
+            .text_size(px(CELL_FONT_PX))
+            .min_w(px(180.0));
+        for (i, entry) in items.into_iter().enumerate() {
+            let Some((label, enabled, event)) = entry else {
+                card = card.child(
+                    div()
+                        .my(px(4.0))
+                        .mx(px(6.0))
+                        .h(px(1.0))
+                        .bg(rgb(HEADER_HAIRLINE)),
+                );
+                continue;
+            };
+            // The row index matches `cell_menu_items` so a test can target a specific row.
+            let mut item = div()
+                .debug_selector(move || format!("cell-menu-item-{i}"))
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded_sm()
+                .whitespace_nowrap()
+                .child(label);
+            if enabled {
+                item = item
+                    .cursor_pointer()
+                    .text_color(rgb(CELL_TEXT))
+                    .hover(|s| s.bg(rgb(HEADER_SELECTED_BG)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                            this.events.emit(&event, window, cx);
+                            this.close_cell_menu(cx);
+                            cx.stop_propagation();
+                        }),
+                    );
+            } else {
+                item = item.text_color(rgb(HEADER_TEXT)).opacity(0.4);
+            }
+            card = card.child(item);
+        }
+
+        let backdrop = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
+                    this.close_cell_menu(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
+                    this.close_cell_menu(cx);
+                    cx.stop_propagation();
+                }),
+            );
+        vec![
+            deferred(backdrop).into_any_element(),
+            deferred(card).into_any_element(),
+        ]
+    }
+
     /// The resolved [`BorderSpec`] for a visible cell, from the per-frame snapshot: its
     /// `RenderStyle::border` index into `visible_border_specs`. A cell absent from the style
     /// snapshot (the common, borderless case) → [`BorderSpec::NONE`], so neighbour lookups
@@ -3441,6 +3926,8 @@ fn cell_element(
     kind: CellKind,
     style: Option<RenderStyle>,
     font_family: Option<SharedString>,
+    skip_right_gridline: bool,
+    skip_bottom_gridline: bool,
 ) -> AnyElement {
     let mut el = div()
         .absolute()
@@ -3449,9 +3936,6 @@ fn cell_element(
         .w(px(w))
         .h(px(h))
         .bg(fill)
-        // Right + bottom gridlines only — a fill paints over them (Excel look).
-        .border_r_1()
-        .border_b_1()
         .border_color(rgb(GRIDLINE))
         .flex()
         // Default vertical placement is BOTTOM — Excel-faithful (decision C): every cell
@@ -3466,6 +3950,17 @@ fn cell_element(
         // Render the grid in the bundled Inter family (an explicit per-cell family below still
         // wins, e.g. the serif case).
         .font_family(GRID_FONT_FAMILY);
+
+    // Right + bottom gridlines — a fill paints over them (Excel look). A filled cell inside a
+    // same-fill block suppresses the shared interior gridline (8a): `skip_*_gridline` is set when
+    // the right / bottom neighbour resolves to the same fill, so the block reads as one solid
+    // rectangle. Outer-boundary gridlines still draw; explicit borders are a separate later pass.
+    if !skip_right_gridline {
+        el = el.border_r_1();
+    }
+    if !skip_bottom_gridline {
+        el = el.border_b_1();
+    }
 
     // Explicit alignment wins; otherwise fall back to the cell's type-aware default
     // (numbers/dates right, booleans/errors center, text left — `architecture.md §1.3`).
@@ -3800,6 +4295,14 @@ fn measure_incell_text_width(
         )
         .width()
         .as_f32()
+}
+
+/// Pure autofit-width math (`functional_spec.md §7`, D7.3): the widest measured cell-text width
+/// (device px) plus [`AUTOFIT_PADDING_PX`], clamped to `[AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX]`.
+/// An empty column (`max_text_px == 0.0`) resolves to the floor. Extracted from
+/// [`GridView::autofit_width_for_column`] so the padding + clamp is unit-testable without a `Window`.
+fn autofit_width(max_text_px: f32) -> f32 {
+    (max_text_px + AUTOFIT_PADDING_PX).clamp(AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX)
 }
 
 /// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
@@ -4164,6 +4667,10 @@ impl Render for GridView {
         // Chart "Delete chart" context menu (P18) — same deferred overlay pattern.
         if let Some(menu) = self.chart_menu {
             root_children.extend(self.chart_menu_elements(menu, cx));
+        }
+        // Cell-area right-click context menu (`functional_spec.md §2`) — same deferred overlay.
+        if let Some(menu) = self.cell_menu {
+            root_children.extend(self.cell_menu_elements(menu, cx));
         }
 
         // ---- Loading overlay (over everything) ------------------------------------------
@@ -5405,6 +5912,210 @@ mod tests {
             .unwrap();
     }
 
+    // ---- Autofit column width (`functional_spec.md §7`) ------------------------------------
+
+    /// Sources with the given `(row, col, text)` published plain-text cells over Excel-max dims —
+    /// the fixtures for the autofit width tests.
+    fn autofit_sources(cells: &[(u32, u32, &str)]) -> (GridDataSources, SheetId) {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::{CellKind, Publication, PublishedCell};
+        let sheet = SheetId(0);
+        let published: Vec<PublishedCell> = cells
+            .iter()
+            .map(|(r, c, t)| PublishedCell {
+                row: *r,
+                col: *c,
+                display_text: t.to_string(),
+                kind: CellKind::Text,
+                text_color: None,
+            })
+            .collect();
+        let mut caches = SheetCaches::new();
+        caches.insert(
+            sheet,
+            SheetCacheBuilder::new(
+                freecell_core::limits::MAX_ROWS,
+                freecell_core::limits::MAX_COLS,
+            )
+            .build(),
+        );
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: published,
+        };
+        (
+            GridDataSources {
+                publication: Arc::new(ArcSwap::from_pointee(publication)),
+                caches: Arc::new(RwLock::new(caches)),
+            },
+            sheet,
+        )
+    }
+
+    /// The `(start, end, px)` of each column `ResizeCommitted` the recording captured, in order.
+    fn captured_resizes(events: &Rc<RefCell<Vec<GridEvent>>>) -> Vec<(u32, u32, f32)> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Col,
+                    start,
+                    end,
+                    px,
+                } => Some((*start, *end, *px)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn autofit_width_pads_and_clamps() {
+        // Empty column (no text) → the floor.
+        assert_eq!(autofit_width(0.0), AUTOFIT_MIN_WIDTH_PX);
+        // A normal measured width → text + padding.
+        assert_eq!(autofit_width(100.0), 100.0 + AUTOFIT_PADDING_PX);
+        // A tiny width still clamps up to the floor.
+        assert_eq!(autofit_width(1.0), AUTOFIT_MIN_WIDTH_PX);
+        // A very long value clamps down to the cap.
+        assert_eq!(autofit_width(100_000.0), AUTOFIT_MAX_WIDTH_PX);
+    }
+
+    #[gpui::test]
+    fn autofit_column_fits_published_cell(cx: &mut TestAppContext) {
+        // Double-click autofit sizes a column to its widest published cell + padding, over the floor.
+        let text = "a reasonably wide value";
+        let (sources, _s) = autofit_sources(&[(1, 2, text)]);
+        let (g, window, events) = recording_over(cx, sources);
+        let measured = window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let m =
+                        measure_incell_text_width(text, CELL_FONT_PX, None, false, false, window);
+                    grid.autofit_column(2, window, cx);
+                    m
+                })
+            })
+            .unwrap();
+        let resizes = captured_resizes(&events);
+        assert_eq!(resizes.len(), 1, "single-column autofit emits one resize");
+        let (start, end, px) = resizes[0];
+        assert_eq!((start, end), (2, 2), "resizes just the clicked column");
+        assert!(
+            (px - autofit_width(measured)).abs() < 0.5,
+            "px {px} vs expected {}",
+            autofit_width(measured)
+        );
+        assert!(px > AUTOFIT_MIN_WIDTH_PX, "wide content exceeds the floor");
+    }
+
+    #[gpui::test]
+    fn autofit_empty_column_shrinks_to_floor(cx: &mut TestAppContext) {
+        // A column with no published cells autofits to the configured floor (D7.3).
+        let (sources, _s) = autofit_sources(&[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.autofit_column(5, window, cx);
+                });
+            })
+            .unwrap();
+        let resizes = captured_resizes(&events);
+        assert_eq!(resizes.len(), 1);
+        assert_eq!(resizes[0], (5, 5, AUTOFIT_MIN_WIDTH_PX));
+    }
+
+    #[gpui::test]
+    fn autofit_multi_column_selection_fits_each(cx: &mut TestAppContext) {
+        // A divider double-clicked inside a full-column multi-column selection autofits every column
+        // in the run — each to its own content — one `ResizeCommitted` per column (D7.1).
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_column(1, false, window, cx);
+                    grid.select_column(3, true, window, cx);
+                    assert_eq!(grid.resize_run_for(RowOrCol::Col, 2), (1, 3));
+                    grid.autofit_column(2, window, cx);
+                });
+            })
+            .unwrap();
+        let cols: Vec<u32> = captured_resizes(&events)
+            .iter()
+            .map(|(s, e, _)| {
+                assert_eq!(s, e, "each autofit resize targets a single column");
+                *s
+            })
+            .collect();
+        assert_eq!(cols, vec![1, 2, 3], "each selected column autofit once");
+    }
+
+    #[gpui::test]
+    fn autofit_under_select_all_fits_only_the_divider_column(cx: &mut TestAppContext) {
+        // Select-all classifies as a full-column run spanning every column; autofit must NOT fan out
+        // to 16,384 per-column `SetColumnWidths` (that would mass-shrink the sheet). The whole-sheet
+        // run collapses to just the divider's own column — exactly one resize.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_all(window, cx);
+                    assert_eq!(
+                        grid.resize_run_for(RowOrCol::Col, 3),
+                        (0, freecell_core::limits::MAX_COLS - 1),
+                        "select-all resolves to the whole-sheet column run"
+                    );
+                    grid.autofit_column(3, window, cx);
+                });
+            })
+            .unwrap();
+        let resizes = captured_resizes(&events);
+        assert_eq!(
+            resizes.len(),
+            1,
+            "whole-sheet autofit emits exactly one resize, not one per column"
+        );
+        assert_eq!(resizes[0].0, 3);
+        assert_eq!(resizes[0].1, 3, "only the divider column is autofit");
+    }
+
+    #[gpui::test]
+    fn commit_resize_noop_is_skipped(cx: &mut TestAppContext) {
+        // A divider click with no drag (`current_px == start_px`) must not freeze a preview or emit a
+        // redundant `SetColumnWidths` — otherwise a double-click-to-autofit gains a spurious pre-step.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.commit_resize(
+                        ResizeDrag {
+                            axis: RowOrCol::Col,
+                            index: 2,
+                            start_px: 100.0,
+                            current_px: 100.0,
+                            run: (2, 2),
+                            origin_coord: 0.0,
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        grid.resize_preview.is_none(),
+                        "an unchanged resize freezes no preview"
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            captured_resizes(&events).is_empty(),
+            "an unchanged resize emits no ResizeCommitted"
+        );
+    }
+
     #[gpui::test]
     fn right_click_column_header_opens_menu(cx: &mut TestAppContext) {
         let (g, window, _events) = grid_recording(cx);
@@ -5430,6 +6141,448 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    // ---- Cell-area right-click context menu (`functional_spec.md §2`, Phase 5) -------------
+
+    /// A `CellMenu` over the B2:D4 (rows 1..=3, cols 1..=3) selection with nothing blocked, for the
+    /// pure item-mapping test.
+    fn cell_menu_b2_d4(paste_enabled: bool) -> CellMenu {
+        CellMenu {
+            x: 0.0,
+            y: 0.0,
+            range: CellRange::new(CellRef::new(1, 1), CellRef::new(3, 3)),
+            paste_enabled,
+            insert_row_above_blocked: false,
+            insert_row_below_blocked: false,
+            delete_rows_blocked: false,
+            insert_col_left_blocked: false,
+            insert_col_right_blocked: false,
+            delete_cols_blocked: false,
+        }
+    }
+
+    #[test]
+    fn cell_menu_items_map_to_the_right_events() {
+        let items = GridView::cell_menu_items(&cell_menu_b2_d4(false));
+        // Clipboard group (Cut/Copy always enabled; Paste + Paste-values follow `paste_enabled`).
+        assert!(matches!(
+            &items[0],
+            Some((l, true, GridEvent::Copy { cut: true })) if l == "Cut"
+        ));
+        assert!(matches!(
+            &items[1],
+            Some((l, true, GridEvent::Copy { cut: false })) if l == "Copy"
+        ));
+        assert!(matches!(&items[2], Some((_, false, GridEvent::Paste))));
+        assert!(matches!(
+            &items[3],
+            Some((_, false, GridEvent::PasteValues))
+        ));
+        assert!(matches!(
+            &items[4],
+            Some((l, true, GridEvent::ClearCells(r)))
+                if l == "Clear contents" && *r == CellRange::new(CellRef::new(1, 1), CellRef::new(3, 3))
+        ));
+        // Separator between the clipboard and structural groups.
+        assert!(items[5].is_none());
+        // Structural group: rows above/below/delete, then columns left/right/delete — scoped to the
+        // selection's span (3 rows starting at row 1; below inserts past the run at row 4).
+        assert!(matches!(
+            &items[6],
+            Some((l, true, GridEvent::InsertRows { at: 1, count: 3 })) if l == "Insert 3 rows above"
+        ));
+        assert!(matches!(
+            &items[7],
+            Some((l, true, GridEvent::InsertRows { at: 4, count: 3 })) if l == "Insert 3 rows below"
+        ));
+        assert!(matches!(
+            &items[8],
+            Some((l, true, GridEvent::DeleteRows { at: 1, count: 3 })) if l == "Delete 3 rows"
+        ));
+        assert!(matches!(
+            &items[9],
+            Some((l, true, GridEvent::InsertColumns { at: 1, count: 3 })) if l == "Insert 3 columns left"
+        ));
+        assert!(matches!(
+            &items[10],
+            Some((l, true, GridEvent::InsertColumns { at: 4, count: 3 })) if l == "Insert 3 columns right"
+        ));
+        assert!(matches!(
+            &items[11],
+            Some((l, true, GridEvent::DeleteColumns { at: 1, count: 3 })) if l == "Delete 3 columns"
+        ));
+    }
+
+    #[test]
+    fn cell_menu_items_single_cell_labels_and_paste_and_block_flags() {
+        // A single-cell A1 selection singularizes the row/column labels.
+        let single = CellMenu {
+            range: CellRange::single(CellRef::new(0, 0)),
+            paste_enabled: true,
+            // Block delete-rows + insert-column-left to prove the guard disables the right items.
+            delete_rows_blocked: true,
+            insert_col_left_blocked: true,
+            ..cell_menu_b2_d4(true)
+        };
+        let items = GridView::cell_menu_items(&single);
+        // Paste + Paste-values enabled when the clipboard has text.
+        assert!(matches!(&items[2], Some((_, true, GridEvent::Paste))));
+        assert!(matches!(&items[3], Some((_, true, GridEvent::PasteValues))));
+        assert!(matches!(
+            &items[6],
+            Some((l, _, GridEvent::InsertRows { at: 0, count: 1 })) if l == "Insert 1 row above"
+        ));
+        // Blocked ops render disabled (enabled == false).
+        assert!(matches!(
+            &items[8],
+            Some((l, false, GridEvent::DeleteRows { .. })) if l == "Delete 1 row"
+        ));
+        assert!(matches!(
+            &items[9],
+            Some((l, false, GridEvent::InsertColumns { .. })) if l == "Insert 1 column left"
+        ));
+    }
+
+    /// Whether any item emits a row-structural (Insert/Delete rows) command.
+    fn has_row_ops(items: &[Option<(String, bool, GridEvent)>]) -> bool {
+        items.iter().any(|e| {
+            matches!(
+                e,
+                Some((
+                    _,
+                    _,
+                    GridEvent::InsertRows { .. } | GridEvent::DeleteRows { .. }
+                ))
+            )
+        })
+    }
+
+    /// Whether any item emits a column-structural (Insert/Delete columns) command.
+    fn has_col_ops(items: &[Option<(String, bool, GridEvent)>]) -> bool {
+        items.iter().any(|e| {
+            matches!(
+                e,
+                Some((
+                    _,
+                    _,
+                    GridEvent::InsertColumns { .. } | GridEvent::DeleteColumns { .. }
+                ))
+            )
+        })
+    }
+
+    /// Whether the always-present clipboard group (Cut/Copy/Paste/Paste-values/Clear) is intact.
+    fn has_clipboard_group(items: &[Option<(String, bool, GridEvent)>]) -> bool {
+        items
+            .iter()
+            .any(|e| matches!(e, Some((_, _, GridEvent::Copy { cut: true }))))
+            && items
+                .iter()
+                .any(|e| matches!(e, Some((_, _, GridEvent::Paste))))
+            && items
+                .iter()
+                .any(|e| matches!(e, Some((_, _, GridEvent::PasteValues))))
+            && items
+                .iter()
+                .any(|e| matches!(e, Some((_, _, GridEvent::ClearCells(_)))))
+    }
+
+    #[test]
+    fn cell_menu_full_column_selection_suppresses_row_ops() {
+        use freecell_core::limits;
+        // A full-column selection is stored as rows 0..=MAX_ROWS-1 (col 2). Its row-structural items
+        // would be a sheet-wiping "Delete 1048576 rows" — they must be absent; the column items
+        // (width 1) survive with count 1 (Excel: a column selection's ops are column-oriented).
+        let menu = CellMenu {
+            range: CellRange::new(CellRef::new(0, 2), CellRef::new(limits::MAX_ROWS - 1, 2)),
+            ..cell_menu_b2_d4(false)
+        };
+        let items = GridView::cell_menu_items(&menu);
+        assert!(
+            !has_row_ops(&items),
+            "row-structural items dropped for a full column"
+        );
+        assert!(has_col_ops(&items), "column-structural items remain");
+        assert!(has_clipboard_group(&items));
+        // The surviving column ops are scoped to the single selected column.
+        assert!(items.iter().any(|e| matches!(
+            e,
+            Some((l, _, GridEvent::DeleteColumns { at: 2, count: 1 })) if l == "Delete 1 column"
+        )));
+    }
+
+    #[test]
+    fn cell_menu_full_row_selection_suppresses_column_ops() {
+        use freecell_core::limits;
+        // Symmetric: a full-row selection (cols 0..=MAX_COLS-1, row 3) drops the column items and
+        // keeps the row items (height 1).
+        let menu = CellMenu {
+            range: CellRange::new(CellRef::new(3, 0), CellRef::new(3, limits::MAX_COLS - 1)),
+            ..cell_menu_b2_d4(false)
+        };
+        let items = GridView::cell_menu_items(&menu);
+        assert!(
+            !has_col_ops(&items),
+            "column-structural items dropped for a full row"
+        );
+        assert!(has_row_ops(&items), "row-structural items remain");
+        assert!(has_clipboard_group(&items));
+        assert!(items.iter().any(|e| matches!(
+            e,
+            Some((l, _, GridEvent::DeleteRows { at: 3, count: 1 })) if l == "Delete 1 row"
+        )));
+    }
+
+    #[test]
+    fn cell_menu_whole_sheet_selection_suppresses_both_structural_sets() {
+        use freecell_core::limits;
+        // Select-all spans all rows AND all columns → both structural sets are destructive; only the
+        // clipboard group remains (no separator either, since there is nothing after it).
+        let menu = CellMenu {
+            range: CellRange::new(
+                CellRef::new(0, 0),
+                CellRef::new(limits::MAX_ROWS - 1, limits::MAX_COLS - 1),
+            ),
+            ..cell_menu_b2_d4(true)
+        };
+        let items = GridView::cell_menu_items(&menu);
+        assert!(
+            !has_row_ops(&items) && !has_col_ops(&items),
+            "no structural ops on the whole sheet"
+        );
+        assert!(has_clipboard_group(&items));
+        assert!(
+            items.iter().all(|e| e.is_some()),
+            "no dangling separator when both structural sets are suppressed"
+        );
+    }
+
+    #[gpui::test]
+    fn right_click_cell_outside_selection_moves_and_opens_menu(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // The default selection is A1. A right-click deep in the cell body (y > 24, x >
+                    // gutter) is outside it → the selection collapses to the clicked cell first.
+                    events.borrow_mut().clear();
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 300.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid
+                        .cell_menu
+                        .expect("a cell right-click opens the cell menu");
+                    assert!(
+                        menu.range.is_single(),
+                        "an outside click collapses to one cell"
+                    );
+                    assert_ne!(
+                        menu.range.start,
+                        CellRef::new(0, 0),
+                        "the selection moved off A1"
+                    );
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "moving the selection emits SelectionChanged"
+                    );
+                    // Only one menu is ever open.
+                    assert!(grid.header_menu.is_none() && grid.chart_menu.is_none());
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn right_click_cell_inside_selection_keeps_it(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Select the whole sheet so any cell click lands inside the (multi-cell)
+                    // selection; Excel then keeps it so the menu acts on the whole selection.
+                    grid.select_all(window, cx);
+                    let before = *grid.selection();
+                    events.borrow_mut().clear();
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 300.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.cell_menu.expect("the cell menu opened");
+                    assert_eq!(
+                        *grid.selection(),
+                        before,
+                        "an inside click keeps the selection"
+                    );
+                    assert!(
+                        !menu.range.is_single(),
+                        "the whole-sheet selection is preserved"
+                    );
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "keeping the selection emits no SelectionChanged"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn right_click_bounded_cell_inside_selection_keeps_it(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // A representative (non-degenerate) inside-click: select B2:D4, then right-click
+                    // C3 (inside) → the multi-cell selection is kept, not collapsed to C3.
+                    let b2_d4 = SelectionModel {
+                        anchor: CellRef::new(1, 1),
+                        active: CellRef::new(3, 3),
+                    };
+                    grid.set_selection(b2_d4, cx);
+                    events.borrow_mut().clear();
+                    grid.open_cell_menu(CellRef::new(2, 2), 0.0, 0.0, &[], window, cx);
+                    let menu = grid.cell_menu.expect("the cell menu opened");
+                    assert_eq!(*grid.selection(), b2_d4, "an inside click keeps B2:D4");
+                    assert_eq!(
+                        menu.range,
+                        CellRange::new(CellRef::new(1, 1), CellRef::new(3, 3)),
+                        "the menu spans the kept selection, not the clicked cell"
+                    );
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "keeping the selection emits no SelectionChanged"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn cell_menu_paste_gates_on_clipboard(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // An empty clipboard disables Paste + Paste-values.
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 300.0),
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        !grid.cell_menu.expect("menu opened").paste_enabled,
+                        "empty clipboard disables paste"
+                    );
+                    grid.close_cell_menu(cx);
+                    // Seeding the system clipboard enables both paste items on the next open.
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string("1\t2".to_string()));
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 300.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.cell_menu.expect("menu reopened");
+                    assert!(menu.paste_enabled, "a non-empty clipboard enables paste");
+                    let items = GridView::cell_menu_items(&menu);
+                    assert!(matches!(&items[2], Some((_, true, GridEvent::Paste))));
+                    assert!(matches!(&items[3], Some((_, true, GridEvent::PasteValues))));
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn cell_menu_escape_closes(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 300.0),
+                        window,
+                        cx,
+                    );
+                    assert!(grid.cell_menu.is_some());
+                    grid.handle_key_down(&key_ev("escape", None, false), window, cx);
+                    assert!(grid.cell_menu.is_none(), "Escape closes the cell menu");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn cell_menu_item_click_emits_event_and_closes(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 300.0),
+                        window,
+                        cx,
+                    );
+                    assert!(grid.cell_menu.is_some(), "the cell menu opened");
+                });
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        // "Clear contents" is row index 4 in `cell_menu_items`.
+        let row = vcx
+            .debug_bounds("cell-menu-item-4")
+            .expect("the Clear-contents row was painted");
+        events.borrow_mut().clear();
+        vcx.simulate_mouse_down(row.center(), MouseButton::Left, Modifiers::default());
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, GridEvent::ClearCells(_))),
+            "clicking Clear contents emits ClearCells: {:?}",
+            events.borrow()
+        );
+        assert!(
+            vcx.update(|_w, cx| g.read(cx).cell_menu.is_none()),
+            "choosing an item closes the menu"
+        );
+    }
+
+    #[gpui::test]
+    fn cell_menu_card_paints(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 400.0, 300.0),
+                        window,
+                        cx,
+                    );
+                    assert!(grid.cell_menu.is_some(), "the cell menu opened");
+                });
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("cell-menu-card").is_some(),
+            "the cell menu card was painted"
+        );
     }
 
     // ---- BUG D: in-cell editor focus + click capture (`functional_spec.md §1.3`) ----------

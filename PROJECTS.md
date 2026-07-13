@@ -139,3 +139,24 @@ registry: each entry is a short description plus a pointer to a design note unde
   the render side is the hard part: splitting the custom grid's single viewport/scroll into
   frozen + scrolling quadrants with per-quadrant geometry and scroll clamping (`GAPS.md:141`).
   → [`projects/freeze-panes.md`](projects/freeze-panes.md)
+
+- **Fraction number format (`# ?/?`)** — *Future (deferred from `gaps_closing_7_12` Phase 6,
+  2026-07-13).* A Fraction preset (`# ?/?`, `# ??/??`) for the number-format dropdown so a value
+  like `1.5` displays as `1 1/2`. Deferred because it needs an **IronCalc fork implementation**:
+  the engine's `?/?` fraction formatting is effectively unimplemented (`format_number(1.5, "# ?/?")`
+  → `"  /2"`, garbled for every input — not even a `#VALUE!`). Phase 6 was FreeCell-side / no-fork,
+  so the Fraction preset + `Category::Fraction` were dropped rather than shipped broken; the
+  engine-render guard test (`freecell-engine` `every_num_fmt_preset_code_renders_without_parse_error`)
+  now covers the whole inventory so a re-add can't regress. → [`projects/fraction-number-format.md`](projects/fraction-number-format.md)
+
+- **Adopt gpui-component menus app-wide (native flyout submenus)** — *Future (deferred from
+  `gaps_closing_7_12` Phase 10.4, 2026-07-13).* The whole chrome uses **seven** hand-rolled
+  `div().absolute()…occlude()` popover cards over a `backdrop()` (fill, text-color, borders,
+  font-family, font-size, chart, number-format), each with its own anchoring/dismiss. This
+  project migrates them to gpui-component's `PopupMenu`/`Popover` (`crates/ui/src/menu/`), which
+  ships real **flyout submenus** (`PopupMenu::submenu`) + consistent anchoring/dismiss/keyboard.
+  The trigger: Phase 10.1's number-format "More ▸" wants a flyout, but gpui-component's
+  `scrollable` and submenu modes are mutually exclusive and the num-fmt card must scroll — and
+  doing it for one popover would make it the app's only gpui-component menu, diverging from its
+  six siblings. So the flyout is only worth it as an app-wide unification (Phase 10 shipped a
+  drill-in instead). → [`projects/gpui-component-menus.md`](projects/gpui-component-menus.md)

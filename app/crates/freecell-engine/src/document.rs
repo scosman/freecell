@@ -16,7 +16,7 @@ use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
-use freecell_core::{CellKind, CellRange, CellRef, Rgb};
+use freecell_core::{CellKind, CellRange, CellRef, Direction, Rgb, SelectionStats, SheetDims};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
 use ironcalc_base::cell::CellValue;
@@ -135,6 +135,12 @@ pub(crate) struct CopiedRange {
     pub tsv: String,
     pub data: serde_json::Value,
     pub range: (i32, i32, i32, i32),
+    /// The copied block's **computed values** rendered as literal paste tokens, row-major over the
+    /// effective (clamped) source rectangle — the source of a later Paste Values (⌘⇧V,
+    /// `functional_spec.md §5`). Captured at copy time (a snapshot, like `data`/`tsv`) so
+    /// paste-values is values-only and never re-derives formulas. See
+    /// [`WorkbookDocument::value_token`] for the per-cell rendering.
+    pub values: Vec<Vec<String>>,
 }
 
 /// The magic-byte family of a file, used to classify open failures into typed [`LoadError`]s
@@ -529,6 +535,99 @@ impl WorkbookDocument {
             .range_clear_contents(&area_of(sheet_idx, clamped))
     }
 
+    /// Fill Down (⌘D) — copy the selection's **top row** down over the rest of the selection
+    /// (`functional_spec.md §3`). A **copy**, not a series: seeding `auto_fill_rows` from a single
+    /// row (`height == 1`) leaves the fork's `detect_progression` nothing to extrapolate (it needs
+    /// ≥2 seed values), so it falls through to `extend_to` — a value/format copy with relative
+    /// formula adjustment. One `auto_fill_rows` call ⇒ one undo step. Returns whether anything was
+    /// written (`false` = a no-op, so the caller skips recompute/republish/undo).
+    ///
+    /// A lone single-cell selection **pulls from the cell above** (Excel behavior, D3.1); at row 0
+    /// (no neighbor) it is a no-op. A single row with >1 column has nothing below to fill → no-op.
+    ///
+    /// **Full-column / select-all policy:** a header ⌘D (selection spanning all 1,048,576 rows) is
+    /// **clamped to the used rectangle** first (via [`clamp_to_used`](Self::clamp_to_used), exactly
+    /// as `clear_contents` does) — the practical Excel behavior is "fill down alongside the existing
+    /// data," so it fills only to the used-range extent, never an unbounded ~1M-cell write with a
+    /// 1M-entry undo diff-list. Bounded/explicit-range selections are passed through unchanged.
+    pub(crate) fn fill_down(&mut self, sheet_idx: u32, range: CellRange) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        // Clamp full-line targets to the used range (no-op for bounded selections); an empty
+        // intersection (full-line fill on unused rows/cols) writes nothing.
+        let range = match self.clamp_to_used(sheet_idx, range)? {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let (top, bottom) = (range.start.row, range.end.row);
+        let (left, right) = (range.start.col, range.end.col);
+
+        // Seed row (0-based) and the last row to fill down to.
+        let (seed_row, to_row) = if bottom > top {
+            // Multi-row selection: seed = its top row, fill down to its bottom row.
+            (top, bottom)
+        } else if left == right {
+            // Single cell: pull from the cell directly above; no neighbor at row 0 → no-op.
+            if top == 0 {
+                return Ok(false);
+            }
+            (top - 1, top)
+        } else {
+            // A single row wider than one cell has nothing below the seed line → no-op.
+            return Ok(false);
+        };
+
+        let source = Area {
+            sheet: sheet_idx,
+            row: seed_row as i32 + 1,
+            column: left as i32 + 1,
+            width: (right - left) as i32 + 1,
+            height: 1,
+        };
+        self.model.auto_fill_rows(&source, to_row as i32 + 1)?;
+        Ok(true)
+    }
+
+    /// Fill Right (⌘R) — copy the selection's **left column** right over the rest of the selection
+    /// (the column analog of [`fill_down`](Self::fill_down); same copy-not-series + one-undo-step +
+    /// full-line-clamp properties, mirrored on columns). A lone single-cell selection **pulls from
+    /// the cell to the left**; at column 0 it is a no-op. A single column taller than one cell →
+    /// no-op. Returns whether anything was written (`false` = a no-op).
+    pub(crate) fn fill_right(&mut self, sheet_idx: u32, range: CellRange) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        // Clamp full-line (full-row / select-all) targets to the used range; see `fill_down`.
+        let range = match self.clamp_to_used(sheet_idx, range)? {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let (top, bottom) = (range.start.row, range.end.row);
+        let (left, right) = (range.start.col, range.end.col);
+
+        // Seed column (0-based) and the last column to fill right to.
+        let (seed_col, to_col) = if right > left {
+            // Multi-column selection: seed = its left column, fill right to its right column.
+            (left, right)
+        } else if top == bottom {
+            // Single cell: pull from the cell directly to the left; no neighbor at col 0 → no-op.
+            if left == 0 {
+                return Ok(false);
+            }
+            (left - 1, left)
+        } else {
+            // A single column taller than one cell has nothing right of the seed line → no-op.
+            return Ok(false);
+        };
+
+        let source = Area {
+            sheet: sheet_idx,
+            row: top as i32 + 1,
+            column: seed_col as i32 + 1,
+            width: 1,
+            height: (bottom - top) as i32 + 1,
+        };
+        self.model.auto_fill_columns(&source, to_col as i32 + 1)?;
+        Ok(true)
+    }
+
     /// Sets the width (device px) of the inclusive column run `[col_start, col_end]` (0-based) —
     /// `SetColumnWidths`. One undoable diff-list (`set_columns_width`, `common.rs:1055`). Device px
     /// are converted to IronCalc px at this boundary (the grid speaks device px). Called only over
@@ -894,6 +993,117 @@ impl WorkbookDocument {
         Ok(matches)
     }
 
+    /// Aggregate statistics for `range ∩ the sheet's populated cells` (`Command::SelectionStats`,
+    /// `functional_spec.md §1`; the status-bar readout).
+    ///
+    /// Walks **populated** cells only (`sheet_data`, exactly like [`find_matches`](Self::find_matches))
+    /// and keeps those inside `range` — so a full-column/row selection over a mostly-empty sheet is
+    /// O(populated), never O(cells selected), and is correct **past the published viewport** (the
+    /// correctness-beyond-the-viewport guarantee, `§1` "Correctness / performance"). No
+    /// `dimension()` clamp is needed: iterating `sheet_data` already restricts to the used range, and
+    /// an empty (blank) cell contributes to neither `count` nor the math.
+    ///
+    /// Excel semantics: `count` = every non-empty cell (text + numbers + booleans + errors); the
+    /// sum / min / max / average population is the **numeric** cells only. Errors arrive from
+    /// [`cell_value`](Self::cell_value) as [`CellData::Text`] (their `#DIV/0!`-style string), so —
+    /// D1.1 — they count but are excluded from the math, identically to text. No mutation, no eval.
+    pub(crate) fn selection_stats(&self, sheet_idx: u32, range: CellRange) -> SelectionStats {
+        crate::instrument::record_engine_call();
+        let ws = match self.worksheet(sheet_idx) {
+            Ok(ws) => ws,
+            Err(_) => return SelectionStats::EMPTY,
+        };
+        let mut stats = SelectionStats::EMPTY;
+        for (row_1, cols) in &ws.sheet_data {
+            let row0 = (*row_1 - 1).max(0) as u32;
+            if row0 < range.start.row || row0 > range.end.row {
+                continue;
+            }
+            for col_1 in cols.keys() {
+                let col0 = (*col_1 - 1).max(0) as u32;
+                if col0 < range.start.col || col0 > range.end.col {
+                    continue;
+                }
+                match self.cell_value(sheet_idx, CellRef::new(row0, col0)) {
+                    CellData::Number(n) => stats.push_number(n),
+                    // Text, booleans, and errors are non-empty but non-numeric: they count, but
+                    // are excluded from Sum/Average/Min/Max (D1.1 treats errors like text).
+                    CellData::Text(_) | CellData::Bool(_) => stats.push_non_numeric(),
+                    // A blank cell present in `sheet_data` (e.g. carries only a style) is not
+                    // counted — "blanks don't" (`§1`).
+                    CellData::Empty => {}
+                }
+            }
+        }
+        stats
+    }
+
+    /// Resolve the **edge-of-data** target for a ⌘/Ctrl+arrow jump from `from` in `dir`
+    /// (`Command::ResolveEdge`, `functional_spec.md §4`; the status quo `JumpEdge`/`ExtendEdge`).
+    ///
+    /// Gathers the **populated** indices on the active cell's line (rows in `from`'s column for a
+    /// vertical motion, cols in `from`'s row for a horizontal one) from `sheet_data` — populated
+    /// cells only, like [`find_matches`](Self::find_matches)/[`selection_stats`](Self::selection_stats)
+    /// — **sorts them ascending**, and feeds the slice to the pure Excel algorithm
+    /// ([`freecell_core::resolve_edge`]) over the full sheet dims. A cell is "populated" iff its raw
+    /// content is non-empty (a style-only `sheet_data` entry is empty content → not occupied, matching
+    /// the selection-stats "blanks don't" rule).
+    ///
+    /// Cost to collect + sort the line's occupancy: O(populated cells on the line) for a row jump;
+    /// O(populated rows) for a column jump (row-major `sheet_data` is scanned per row for the column's
+    /// key). The resolve itself is then **O(log populated)** (binary searches — no per-cell walk across
+    /// empty space, so a jump through an empty 1M-cell column is a couple of lookups). Never O(cells
+    /// selected). No mutation, no eval; correct **past the published viewport** (occupancy lives here in
+    /// the model).
+    pub(crate) fn resolve_edge(&self, sheet_idx: u32, from: CellRef, dir: Direction) -> CellRef {
+        crate::instrument::record_engine_call();
+        let dims = SheetDims::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        );
+        let ws = match self.worksheet(sheet_idx) {
+            Ok(ws) => ws,
+            // An unresolvable sheet has no occupancy — no move.
+            Err(_) => return from,
+        };
+        let vertical = matches!(dir, Direction::Up | Direction::Down);
+        // The candidate indices present in `sheet_data` on the active line (1-based engine keys →
+        // 0-based). Collected up front so the `&ws` borrow ends before the per-cell content probe.
+        let candidates: Vec<u32> = if vertical {
+            let col_1 = from.col as i32 + 1;
+            ws.sheet_data
+                .iter()
+                .filter(|(_row_1, cols)| cols.contains_key(&col_1))
+                .map(|(row_1, _cols)| (*row_1 - 1).max(0) as u32)
+                .collect()
+        } else {
+            match ws.sheet_data.get(&(from.row as i32 + 1)) {
+                Some(cols) => cols
+                    .keys()
+                    .map(|col_1| (*col_1 - 1).max(0) as u32)
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        // Keep only genuinely populated cells (a `sheet_data` entry can be style-only → empty content),
+        // sorted ascending — the shape `resolve_edge`'s binary searches require.
+        let mut occupied: Vec<u32> = candidates
+            .into_iter()
+            .filter(|&idx| {
+                let cell = if vertical {
+                    CellRef::new(idx, from.col)
+                } else {
+                    CellRef::new(from.row, idx)
+                };
+                self.cell_content(sheet_idx, cell)
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect();
+        occupied.sort_unstable();
+        freecell_core::resolve_edge(from, dir, dims, &occupied)
+    }
+
     /// Replace `query` with `replacement` in a single cell (`Command::ReplaceOne`,
     /// `functional_spec.md §4.4`): re-read the cell's raw content **here** (avoiding a stale-content
     /// race with the UI) and, when it matches, write the replaced content via `set_user_input`.
@@ -1087,7 +1297,99 @@ impl WorkbookDocument {
                 serde_json::from_value::<(i32, i32, i32, i32)>(v)
                     .map_err(|e| format!("bad clipboard range: {e}"))
             })?;
-        Ok(CopiedRange { tsv, data, range })
+        // Snapshot the block's computed values as literal paste tokens for a later Paste Values
+        // (⌘⇧V) — captured here so paste-values pastes values, never re-derived formulas.
+        let values = self.copied_value_tokens(sheet_idx, range);
+        Ok(CopiedRange {
+            tsv,
+            data,
+            range,
+            values,
+        })
+    }
+
+    /// The computed values of the effective (1-based, inclusive) copied `range` as literal paste
+    /// tokens, row-major — the Paste Values (⌘⇧V, `functional_spec.md §5`) snapshot stored on the
+    /// clipboard slot. Each token is what [`value_token`](Self::value_token) renders; pasting them
+    /// via [`paste_values`](Self::paste_values) reproduces the *values only* (no formulas, no
+    /// formatting) at the target.
+    fn copied_value_tokens(&self, sheet_idx: u32, range: (i32, i32, i32, i32)) -> Vec<Vec<String>> {
+        let (r0, c0, r1, c1) = range;
+        if r1 < r0 || c1 < c0 {
+            return Vec::new(); // degenerate (inverted) clamp — nothing to copy
+        }
+        // The workbook's decimal separator, resolved once, so a fractional Number token re-parses
+        // as a number under this workbook's own locale (the write path parses with it) — not only
+        // under an `en`/`.`-decimal workbook.
+        let decimal_sep = self.workbook_decimal_separator();
+        (r0..=r1)
+            .map(|row| {
+                (c0..=c1)
+                    .map(|col| self.value_token(sheet_idx, row, col, decimal_sep))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The workbook locale's decimal separator (default `.`). Paste Values re-parses a Number
+    /// token through the write path (`set_user_input` → `parse_formatted_number`), which uses the
+    /// **workbook** locale's separators — so a fractional token must carry this separator to land
+    /// as a number rather than falling through to text under a non-`.`-decimal workbook (e.g. a
+    /// German-locale xlsx: decimal `,`, group `.`).
+    fn workbook_decimal_separator(&self) -> char {
+        crate::instrument::record_engine_call();
+        let model = self.model.get_model();
+        get_locale(&model.workbook.settings.locale)
+            .ok()
+            .and_then(|loc| loc.numbers.symbols.decimal.chars().next())
+            .unwrap_or('.')
+    }
+
+    /// One cell's evaluated value rendered as a **literal** Paste Values token (1-based coords):
+    /// re-expressed so writing it back with [`set_user_input`](UserModel::set_user_input)
+    /// reproduces the same *value* under the target's own formatting, never re-interpreting it as a
+    /// formula (`functional_spec.md §5`). `decimal_sep` is the workbook locale's decimal separator
+    /// (from [`workbook_decimal_separator`](Self::workbook_decimal_separator)).
+    ///
+    /// - `Number(n)` → the plain unformatted decimal (`f64` `Display`, never grouped or scientific,
+    ///   with the decimal point rendered as `decimal_sep`), which re-parses to the same number with
+    ///   **no** number format applied (a bare, ungrouped number infers none) under this workbook's
+    ///   locale — at full precision, not the rounded display string, so the target keeps its format.
+    /// - `Boolean` → `TRUE`/`FALSE` (re-parses to the boolean).
+    /// - An **error** cell (its value surfaces as the error string) → that string as-is, so it
+    ///   re-parses back to the same error value.
+    /// - A non-empty **string** → apostrophe-quoted so it is forced to literal text: this keeps a
+    ///   value that only *looks* like a formula (`=x`, `+x`, `-x`, `@x`) from being parsed as one
+    ///   and preserves text-vs-number typing (a text `"12"` stays text, not the number 12). The
+    ///   `'` toggles only the quote_prefix marker; number format / font / fill / borders are
+    ///   untouched.
+    /// - Empty — a blank cell **or** an empty-string value (`=""`) → `""`, which **clears** the
+    ///   target (a true blank, not a counted empty-text cell), matching a paste of a blank source.
+    fn value_token(&self, sheet_idx: u32, row: i32, col: i32, decimal_sep: char) -> String {
+        crate::instrument::record_engine_call();
+        match self
+            .model
+            .get_model()
+            .get_cell_value_by_index(sheet_idx, row, col)
+        {
+            Ok(CellValue::Number(n)) => number_token(n, decimal_sep),
+            Ok(CellValue::Boolean(b)) => if b { "TRUE" } else { "FALSE" }.to_string(),
+            // An empty-string value is written as a clear (a true blank), not a quoted empty text.
+            Ok(CellValue::String(s)) if s.is_empty() => String::new(),
+            Ok(CellValue::String(s)) => {
+                // An error cell's value is its error string — let it round-trip as the error
+                // (unquoted). Genuine text is force-quoted so it is written as a literal.
+                if matches!(
+                    self.model.get_cell_type(sheet_idx, row, col),
+                    Ok(CellType::ErrorValue)
+                ) {
+                    s
+                } else {
+                    format!("'{s}")
+                }
+            }
+            Ok(CellValue::None) | Err(_) => String::new(),
+        }
     }
 
     /// Paste a previously-copied engine payload at `anchor` on `dest_idx` (`paste_from_clipboard`,
@@ -1165,6 +1467,48 @@ impl WorkbookDocument {
         self.model.paste_csv_string(&area, text)
     }
 
+    /// Paste the copied **computed values** (Paste Values, ⌘⇧V — `functional_spec.md §5`) at
+    /// `anchor` on `dest_idx`: values only, no formulas, no formatting — the target keeps its own.
+    /// `values` is the source block's literal tokens (row-major, `src_h × src_w`, from
+    /// [`copied_value_tokens`](Self::copied_value_tokens)); it is **tiled** to fill a
+    /// `paste_w × paste_h` block (a single-cell / exact-divisor source fills the larger selection,
+    /// matching the internal-paste fill rule — `paste_w`/`paste_h` come from
+    /// [`fill_target_dims`], or equal the source dims for a straight block paste). Every target
+    /// cell is written through **one** `set_user_inputs` batch → a single undo entry (an empty
+    /// token clears its cell, so a blank source cell clears the target). The pasted rectangle is
+    /// re-selected so the caller (`run_guarded_paste`) reads it back. The caller pauses evaluation
+    /// around this (its single coalesced recompute follows).
+    pub(crate) fn paste_values(
+        &mut self,
+        dest_idx: u32,
+        anchor: CellRef,
+        values: &[Vec<String>],
+        paste_w: u32,
+        paste_h: u32,
+    ) -> Result<(), String> {
+        let src_h = values.len();
+        let src_w = values.first().map(Vec::len).unwrap_or(0);
+        if src_h == 0 || src_w == 0 {
+            return Ok(()); // nothing to paste
+        }
+        let (anchor_row, anchor_col) = to_engine_coords(anchor);
+        let mut batch: Vec<(u32, i32, i32, String)> =
+            Vec::with_capacity(paste_w as usize * paste_h as usize);
+        for dr in 0..paste_h as i32 {
+            let src_row = &values[dr as usize % src_h];
+            for dc in 0..paste_w as i32 {
+                let token = src_row[dc as usize % src_w].clone();
+                batch.push((dest_idx, anchor_row + dr, anchor_col + dc, token));
+            }
+        }
+        crate::instrument::record_engine_call();
+        self.model.set_user_inputs(&batch)?;
+        // Re-select the pasted rectangle so `selected_range_0based` mirrors it into the UI
+        // selection (both other paste APIs re-select their pasted area too).
+        let end = CellRef::new(anchor.row + paste_h - 1, anchor.col + paste_w - 1);
+        self.set_view_selection(dest_idx, CellRange::new(anchor, end))
+    }
+
     /// The engine's current view selection as a 0-based [`CellRange`] — read back right after a
     /// paste (both paste APIs re-select the pasted rectangle) to mirror it into FreeCell's
     /// `SelectionModel`.
@@ -1231,6 +1575,20 @@ fn resolve_text_color(model: &Model, sheet: u32, row: i32, col: i32, style: &Sty
 /// The Excel-max bounds (`freecell_core::limits`) fit comfortably in `i32`.
 fn to_engine_coords(cell: CellRef) -> (i32, i32) {
     (cell.row as i32 + 1, cell.col as i32 + 1)
+}
+
+/// Renders a numeric value as a Paste Values token: Rust's `f64` `Display` (full round-trip
+/// precision, never a group separator, never scientific for finite magnitudes) with its single
+/// `.` decimal point rewritten to the workbook locale's `decimal_sep`. This is the ungrouped,
+/// locale-correct form `parse_formatted_number` re-parses to the same number with **no** format
+/// inferred — so a fractional number pastes as a number (not text) under any workbook locale.
+fn number_token(n: f64, decimal_sep: char) -> String {
+    let s = n.to_string();
+    if decimal_sep == '.' {
+        s
+    } else {
+        s.replace('.', &decimal_sep.to_string())
+    }
 }
 
 /// The tiled destination dims `(width, height)` in cells when a copied `source_range` fills a
@@ -1418,6 +1776,58 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Every number-format preset code the dropdown can send must be renderable by the IronCalc
+    /// formatter — a code the lexer can't parse renders `#VALUE!` in every cell (as bare `£`/`¥`
+    /// did before they were switched to `[$£]…`/`[$¥]…`, and as the dropped `# ?/?` fraction did).
+    /// This guards the whole `NUM_FMT_GROUPS` inventory — and any future preset — against that class
+    /// of engine-incompatibility, which is otherwise invisible from FreeCell-side tests.
+    #[test]
+    fn every_num_fmt_preset_code_renders_without_parse_error() {
+        use freecell_core::format_ui::NUM_FMT_GROUPS;
+        let locale = get_locale("en").expect("en locale available");
+        // Two universally-valid positive inputs (integer part ≥ 1 so date/time serials are real, and
+        // fine for number/currency/percent/scientific). A *parse* error is value-independent — it
+        // fires before any section is chosen — so a positive value reaches it just as a negative one
+        // would, without the value-domain noise of a negative "date" (which the engine legitimately
+        // rejects). The negative section of the multi-section numeric presets is exercised below.
+        let sample_values = [1234.567_f64, 45283.75];
+        for group in NUM_FMT_GROUPS {
+            for preset in group.presets {
+                for &v in &sample_values {
+                    let out = format_number(v, preset.code, locale);
+                    assert!(
+                        out.error.is_none() && out.text != "#VALUE!",
+                        "preset {:?} ({}) failed to render {v}: text={:?} error={:?}",
+                        preset.label,
+                        preset.code,
+                        out.text,
+                        out.error
+                    );
+                }
+            }
+        }
+        // The negative section of the two multi-section *numeric* presets must also render (negatives
+        // are valid for numbers, unlike dates): red-negative Number + parens-negative Accounting.
+        for code in ["#,##0.00;[Red]-#,##0.00", "$#,##0.00;($#,##0.00)"] {
+            let out = format_number(-1234.567, code, locale);
+            assert!(
+                out.error.is_none() && out.text != "#VALUE!",
+                "negative render of {code}: text={:?} error={:?}",
+                out.text,
+                out.error
+            );
+        }
+        // Spot-check the fix's intent: the bracketed `£`/`¥` presets actually emit their symbol
+        // (not merely a non-error), and a plain currency still groups + shows two decimals.
+        assert!(format_number(1234.5, "[$£]#,##0.00", locale)
+            .text
+            .contains('£'));
+        assert!(format_number(1234.5, "[$¥]#,##0.00", locale)
+            .text
+            .contains('¥'));
+        assert_eq!(format_number(1234.5, "$#,##0.00", locale).text, "$1,234.50");
+    }
+
     #[test]
     fn destination_dir_uses_parent_or_cwd() {
         assert_eq!(
@@ -1459,6 +1869,200 @@ mod tests {
     fn to_engine_coords_is_one_based() {
         assert_eq!(to_engine_coords(CellRef::new(0, 0)), (1, 1)); // A1
         assert_eq!(to_engine_coords(CellRef::new(6, 1)), (7, 2)); // B7
+    }
+
+    /// A cell's evaluated display string (`""` for empty), for the fill assertions below.
+    fn value(doc: &WorkbookDocument, row: u32, col: u32) -> String {
+        doc.formatted_value(0, CellRef::new(row, col)).unwrap()
+    }
+
+    #[test]
+    fn fill_down_copies_top_row_not_series() {
+        // ⌘D over A1:A5 with A1=1 must COPY (1,1,1,1,1) — NOT extrapolate a series (2,3,4,5).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0)))
+            .unwrap();
+        for r in 0..5 {
+            assert_eq!(
+                value(&doc, r, 0),
+                "1",
+                "A{} should be a copy of the seed",
+                r + 1
+            );
+        }
+    }
+
+    #[test]
+    fn fill_down_adjusts_relative_formula() {
+        // A1="=B1"; B1..B5 = 10..50. ⌘D over A1:A5 copies the formula down with RELATIVE ref
+        // adjustment → A2="=B2" … A5="=B5", evaluating to 20 … 50.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "=B1").unwrap();
+        for (i, v) in [10, 20, 30, 40, 50].iter().enumerate() {
+            doc.set_cell_input(0, CellRef::new(i as u32, 1), &v.to_string())
+                .unwrap();
+        }
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0)))
+            .unwrap();
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "=B2");
+        assert_eq!(doc.cell_content(0, CellRef::new(4, 0)).unwrap(), "=B5");
+        assert_eq!(value(&doc, 1, 0), "20");
+        assert_eq!(value(&doc, 4, 0), "50");
+    }
+
+    #[test]
+    fn fill_down_multi_col_block_copies_each_column() {
+        // A1=1, B1=2; ⌘D over A1:B3 fills each column from its OWN top cell.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "2").unwrap();
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(2, 1)))
+            .unwrap();
+        for r in 0..3 {
+            assert_eq!(value(&doc, r, 0), "1");
+            assert_eq!(value(&doc, r, 1), "2");
+        }
+    }
+
+    #[test]
+    fn fill_right_copies_left_column_not_series() {
+        // ⌘R over A1:E1 with A1=7 copies 7 across (not a series).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "7").unwrap();
+        doc.fill_right(0, CellRange::new(CellRef::new(0, 0), CellRef::new(0, 4)))
+            .unwrap();
+        for c in 0..5 {
+            assert_eq!(value(&doc, 0, c), "7");
+        }
+    }
+
+    #[test]
+    fn fill_down_single_cell_pulls_from_above() {
+        // ⌘D on a lone A2 copies the cell directly above (A1) into it (Excel D3.1).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "9").unwrap();
+        doc.fill_down(0, CellRange::single(CellRef::new(1, 0)))
+            .unwrap();
+        assert_eq!(value(&doc, 1, 0), "9");
+    }
+
+    #[test]
+    fn fill_right_single_cell_pulls_from_left() {
+        // ⌘R on a lone B1 copies the cell directly to the left (A1) into it.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "9").unwrap();
+        doc.fill_right(0, CellRange::single(CellRef::new(0, 1)))
+            .unwrap();
+        assert_eq!(value(&doc, 0, 1), "9");
+    }
+
+    #[test]
+    fn fill_right_multi_row_block_copies_each_row() {
+        // A1=1, A2=2; ⌘R over A1:C2 fills each row from its OWN left cell (column-path parity with
+        // `fill_down_multi_col_block_copies_each_column`).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        assert!(doc
+            .fill_right(0, CellRange::new(CellRef::new(0, 0), CellRef::new(1, 2)))
+            .unwrap());
+        for c in 0..3 {
+            assert_eq!(value(&doc, 0, c), "1");
+            assert_eq!(value(&doc, 1, c), "2");
+        }
+    }
+
+    #[test]
+    fn fill_single_cell_at_edge_is_noop() {
+        // A lone cell with no neighbor in the fill direction (row 0 for ⌘D, col 0 for ⌘R) is a
+        // clean no-op — returns `false` (skips eval/publish), no engine error, no u32 underflow
+        // reading a -1 neighbor.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "5").unwrap();
+        assert!(!doc
+            .fill_down(0, CellRange::single(CellRef::new(0, 0)))
+            .unwrap());
+        assert!(!doc
+            .fill_right(0, CellRange::single(CellRef::new(0, 0)))
+            .unwrap());
+        assert_eq!(value(&doc, 0, 0), "5");
+    }
+
+    #[test]
+    fn fill_down_single_row_multi_col_is_noop() {
+        // A single row wider than one cell has nothing below the seed line → ⌘D is a no-op.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "2").unwrap();
+        assert!(!doc
+            .fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(0, 1)))
+            .unwrap());
+        assert_eq!(value(&doc, 0, 0), "1");
+        assert_eq!(value(&doc, 0, 1), "2");
+        assert_eq!(value(&doc, 1, 0), ""); // nothing filled below
+        assert_eq!(value(&doc, 1, 1), "");
+    }
+
+    #[test]
+    fn fill_right_single_col_multi_row_is_noop() {
+        // A single column taller than one cell has nothing right of the seed line → ⌘R is a no-op
+        // (column-path parity with `fill_down_single_row_multi_col_is_noop`).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        assert!(!doc
+            .fill_right(0, CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)))
+            .unwrap());
+        assert_eq!(value(&doc, 0, 0), "1");
+        assert_eq!(value(&doc, 1, 0), "2");
+        assert_eq!(value(&doc, 0, 1), ""); // nothing filled to the right
+        assert_eq!(value(&doc, 1, 1), "");
+    }
+
+    #[test]
+    fn full_column_fill_down_clamps_to_used_range() {
+        use freecell_core::limits;
+        // A1=1 with data only in A1:A3; a header ⌘D over the WHOLE column (all 1,048,576 rows)
+        // must clamp to the used-range extent (fill A2:A3), never write ~1M rows.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 0), "x").unwrap(); // used range extends to row 3
+        let full_col = CellRange::new(CellRef::new(0, 0), CellRef::new(limits::MAX_ROWS - 1, 0));
+        assert!(doc.fill_down(0, full_col).unwrap());
+        // Filled down to the used-range bottom (A2, A3 copy the seed)…
+        assert_eq!(value(&doc, 1, 0), "1");
+        assert_eq!(value(&doc, 2, 0), "1");
+        // …and NOT beyond it: the first row past the used range stays empty (no ~1M-cell write).
+        assert_eq!(value(&doc, 3, 0), "");
+        assert_eq!(value(&doc, 100, 0), "");
+    }
+
+    #[test]
+    fn full_column_fill_down_on_unused_column_is_noop() {
+        use freecell_core::limits;
+        // A header ⌘D on a column entirely outside the used range clamps to an empty intersection →
+        // a clean no-op (returns `false`), writing nothing.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap(); // used range = A1 only
+        let far_col = CellRange::new(CellRef::new(0, 9), CellRef::new(limits::MAX_ROWS - 1, 9));
+        assert!(!doc.fill_down(0, far_col).unwrap());
+        assert_eq!(value(&doc, 0, 9), "");
+    }
+
+    #[test]
+    fn fill_down_is_one_undo_step() {
+        // One ⌘D pushes exactly ONE history entry: a single undo reverts the WHOLE fill.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.fill_down(0, CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)))
+            .unwrap();
+        assert_eq!(value(&doc, 2, 0), "1"); // A3 filled
+        doc.undo().unwrap();
+        doc.evaluate();
+        assert_eq!(value(&doc, 1, 0), ""); // A2 reverted
+        assert_eq!(value(&doc, 2, 0), ""); // A3 reverted by the SAME undo
+        assert_eq!(value(&doc, 0, 0), "1"); // seed A1 intact
     }
 
     #[test]
@@ -1804,6 +2408,153 @@ mod tests {
         );
     }
 
+    // ---- Selection stats (`functional_spec.md §1`) ----------------------------------------
+
+    #[test]
+    fn selection_stats_aggregates_a_mixed_selection() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A1:A5 — number, text, boolean, error, blank-with-content-then-cleared.
+        doc.set_cell_input(0, CellRef::new(0, 0), "10").unwrap(); // number
+        doc.set_cell_input(0, CellRef::new(1, 0), "hello").unwrap(); // text
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap(); // boolean
+        doc.set_cell_input(0, CellRef::new(3, 0), "=1/0").unwrap(); // error
+        doc.set_cell_input(0, CellRef::new(4, 0), "20").unwrap(); // number
+        doc.evaluate();
+
+        let range = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        let stats = doc.selection_stats(0, range);
+        // Count = every non-empty cell (number, text, bool, error, number) = 5.
+        assert_eq!(stats.count, 5, "count is every non-empty cell");
+        // Only the two numbers are numeric — text/bool/error excluded from the math (D1.1).
+        assert_eq!(stats.numeric_count, 2);
+        assert_eq!(stats.sum, 30.0);
+        assert_eq!(stats.min, Some(10.0));
+        assert_eq!(stats.max, Some(20.0));
+        assert_eq!(stats.average(), Some(15.0));
+        assert!(stats.has_numeric());
+    }
+
+    #[test]
+    fn selection_stats_full_column_walks_only_populated_cells() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // Two numbers far apart in column A; the rest of the 1M-row column is empty.
+        doc.set_cell_input(0, CellRef::new(0, 0), "5").unwrap(); // A1
+        doc.set_cell_input(0, CellRef::new(500_000, 0), "7")
+            .unwrap(); // A500001
+        doc.set_cell_input(0, CellRef::new(0, 1), "999").unwrap(); // B1 — outside the column
+        doc.evaluate();
+
+        // A full-column selection of column A (every row) must aggregate only the two populated A
+        // cells, not touch column B, and not iterate the empty rows.
+        let full_col_a = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+        );
+        let stats = doc.selection_stats(0, full_col_a);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.numeric_count, 2);
+        assert_eq!(stats.sum, 12.0);
+        assert_eq!(stats.min, Some(5.0));
+        assert_eq!(stats.max, Some(7.0));
+    }
+
+    #[test]
+    fn selection_stats_all_text_has_no_numeric() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "a").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "b").unwrap();
+        doc.evaluate();
+        let stats = doc.selection_stats(0, CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)));
+        assert_eq!(stats.count, 2);
+        assert!(
+            !stats.has_numeric(),
+            "an all-text selection shows no numbers"
+        );
+        assert_eq!(stats.sum, 0.0);
+        assert_eq!(stats.min, None);
+    }
+
+    #[test]
+    fn selection_stats_empty_range_is_empty() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.evaluate();
+        // A selection over cells that are all blank aggregates to nothing.
+        let stats = doc.selection_stats(0, CellRange::new(CellRef::new(5, 5), CellRef::new(9, 9)));
+        assert_eq!(stats, SelectionStats::EMPTY);
+    }
+
+    #[test]
+    fn resolve_edge_walks_populated_cells_in_every_direction() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // Column A: a run A1:A3, a gap A4:A5, then A6; the rest of the column empty.
+        for row in [0, 1, 2, 5] {
+            doc.set_cell_input(0, CellRef::new(row, 0), "x").unwrap();
+        }
+        // Row 10 (index 9): a run at C..D (cols 2,3), then a gap, then F (col 5).
+        for col in [2, 3, 5] {
+            doc.set_cell_input(0, CellRef::new(9, col), "y").unwrap();
+        }
+        doc.evaluate();
+
+        // Down from A1 (in the run) → last of the run A3 (row 2).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(0, 0), Direction::Down),
+            CellRef::new(2, 0)
+        );
+        // Down from A3 (run's last, gap below) → cross the gap to A6 (row 5).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(2, 0), Direction::Down),
+            CellRef::new(5, 0)
+        );
+        // Down from A6 (nothing below) → the sheet's last row.
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 0), Direction::Down),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0)
+        );
+        // Up from A6 → across the gap to the top run's last cell A3 (row 2).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 0), Direction::Up),
+            CellRef::new(2, 0)
+        );
+        // Horizontal: Right from C10 (col 2, in the run) → D10 (col 3, run's last before the gap).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(9, 2), Direction::Right),
+            CellRef::new(9, 3)
+        );
+        // Right from D10 → cross the gap to F10 (col 5).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(9, 3), Direction::Right),
+            CellRef::new(9, 5)
+        );
+    }
+
+    #[test]
+    fn resolve_edge_empty_sheet_goes_to_sheet_edge() {
+        let doc = WorkbookDocument::new_empty().unwrap();
+        // No data anywhere: ⌘+Down from a middle cell lands on the last row (Excel sheet-edge fallback).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 5), Direction::Down),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 5)
+        );
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 5), Direction::Right),
+            CellRef::new(5, freecell_core::limits::MAX_COLS - 1)
+        );
+    }
+
+    #[test]
+    fn resolve_edge_from_empty_cell_jumps_to_next_data() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A single populated cell far down column A; jumping down from the empty top lands on it.
+        doc.set_cell_input(0, CellRef::new(200, 0), "here").unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(0, 0), Direction::Down),
+            CellRef::new(200, 0)
+        );
+    }
+
     #[test]
     fn replace_one_rewrites_only_a_matching_cell() {
         let mut doc = WorkbookDocument::new_empty().unwrap();
@@ -1967,6 +2718,262 @@ mod tests {
             false,
         );
         assert_eq!(doc.cell_content(0, cell(2, 1)).unwrap(), "=$A$1");
+    }
+
+    // ---- Paste Values (⌘⇧V, `functional_spec.md §5`) --------------------------------------
+
+    /// Give the single cell `c` on sheet 0 the number format `code`.
+    fn set_num_fmt(doc: &mut WorkbookDocument, c: CellRef, code: &str) {
+        doc.user_model_mut()
+            .update_range_style(&area_of(0, CellRange::single(c)), "num_fmt", code)
+            .unwrap();
+    }
+
+    #[test]
+    fn paste_values_writes_the_formula_result_not_the_formula_and_keeps_target_format() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "=1+2").unwrap(); // evaluates to 3
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(a1)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["3".to_string()]],
+            "computed value snapshot"
+        );
+
+        // The target C1 carries its own 2-decimal format, which paste-values must preserve.
+        let c1 = cell(0, 2);
+        set_num_fmt(&mut doc, c1, "0.00");
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+
+        // The literal value 3 landed (not the formula) and the target kept its own format.
+        assert_eq!(
+            doc.cell_content(0, c1).unwrap(),
+            "3",
+            "the value, not `=1+2`"
+        );
+        assert_eq!(doc.published_style(0, c1).unwrap().0, CellKind::Number);
+        assert_eq!(
+            doc.formatted_value(0, c1).unwrap(),
+            "3.00",
+            "the target's own 0.00 format is kept — paste-values applies no formatting"
+        );
+        // The source formula is untouched.
+        assert_eq!(doc.cell_content(0, a1).unwrap(), "=1+2");
+    }
+
+    #[test]
+    fn value_tokens_force_every_formula_looking_leading_char_literal() {
+        // Every leading char that a spreadsheet may treat as a formula (`=`, `+`, `-`, `@`) must be
+        // apostrophe-forced when it is a *string* value, while a real number/boolean stays bare.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        for (col, text) in ["=x", "+x", "-x", "@x"].iter().enumerate() {
+            doc.set_cell_input(0, cell(0, col as u32), &format!("'{text}"))
+                .unwrap(); // a literal text value like the string "=x"
+        }
+        doc.set_cell_input(0, cell(0, 4), "-5").unwrap(); // a real negative number
+        doc.set_cell_input(0, cell(0, 5), "=TRUE").unwrap(); // a boolean
+        doc.evaluate();
+
+        let copied = doc
+            .copy_range(0, CellRange::new(cell(0, 0), cell(0, 5)))
+            .unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec![
+                "'=x".to_string(),
+                "'+x".to_string(),
+                "'-x".to_string(),
+                "'@x".to_string(),
+                "-5".to_string(), // a real number is a bare token (no quote)
+                "TRUE".to_string(),
+            ]],
+        );
+    }
+
+    #[test]
+    fn paste_values_forces_a_formula_looking_string_to_a_literal() {
+        // A computed *string* value of `=x` must paste as literal text, never re-parsed as a
+        // formula (which would evaluate `x` to an error). The load-bearing edge case.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "=\"=x\"").unwrap(); // a formula whose *value* is the string "=x"
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, a1).unwrap(), "=x");
+        let copied = doc.copy_range(0, CellRange::single(a1)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["'=x".to_string()]],
+            "the string token is apostrophe-forced to a literal"
+        );
+
+        let c1 = cell(0, 2);
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.formatted_value(0, c1).unwrap(),
+            "=x",
+            "the literal text `=x` landed — NOT a re-interpreted formula"
+        );
+        assert_eq!(
+            doc.published_style(0, c1).unwrap().0,
+            CellKind::Text,
+            "the pasted cell is text, not a formula/error"
+        );
+    }
+
+    #[test]
+    fn paste_values_preserves_number_vs_text_typing() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let num = cell(0, 0); // a real number
+        let txt = cell(0, 1); // text that merely looks numeric
+        doc.set_cell_input(0, num, "42").unwrap();
+        doc.set_cell_input(0, txt, "'12").unwrap(); // leading apostrophe → the text "12"
+        doc.evaluate();
+
+        let copied = doc.copy_range(0, CellRange::new(num, txt)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["42".to_string(), "'12".to_string()]],
+            "a number stays a bare number token; text is force-quoted"
+        );
+
+        let dest = cell(2, 0);
+        doc.paste_values(0, dest, &copied.values, 2, 1).unwrap();
+        doc.evaluate();
+        // The numeric value pastes as a number…
+        assert_eq!(doc.published_style(0, dest).unwrap().0, CellKind::Number);
+        assert_eq!(doc.formatted_value(0, dest).unwrap(), "42");
+        // …and the numeric-looking text stays text.
+        assert_eq!(
+            doc.published_style(0, cell(2, 1)).unwrap().0,
+            CellKind::Text
+        );
+        assert_eq!(doc.formatted_value(0, cell(2, 1)).unwrap(), "12");
+    }
+
+    #[test]
+    fn paste_values_round_trips_booleans_and_errors() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let b = cell(0, 0);
+        let e = cell(0, 1);
+        doc.set_cell_input(0, b, "=TRUE").unwrap();
+        doc.set_cell_input(0, e, "=1/0").unwrap(); // #DIV/0!
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::new(b, e)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["TRUE".to_string(), "#DIV/0!".to_string()]],
+        );
+
+        let dest = cell(2, 0);
+        doc.paste_values(0, dest, &copied.values, 2, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(doc.published_style(0, dest).unwrap().0, CellKind::Bool);
+        assert_eq!(doc.formatted_value(0, dest).unwrap(), "TRUE");
+        assert_eq!(
+            doc.published_style(0, cell(2, 1)).unwrap().0,
+            CellKind::Error
+        );
+        assert_eq!(doc.formatted_value(0, cell(2, 1)).unwrap(), "#DIV/0!");
+    }
+
+    #[test]
+    fn paste_values_tiles_a_single_cell_over_a_larger_block_and_clears_blanks() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "5").unwrap();
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(cell(0, 0))).unwrap();
+
+        // Pre-seed a target cell so we can prove a blank source token would clear it (here the
+        // single-cell fill writes 5 everywhere, so all four land).
+        let target = CellRange::new(cell(0, 2), cell(1, 3)); // C1:D2, a 2×2 block
+        doc.paste_values(0, target.start, &copied.values, 2, 2)
+            .unwrap();
+        doc.evaluate();
+        for r in 0..2 {
+            for c in 2..4 {
+                assert_eq!(doc.formatted_value(0, cell(r, c)).unwrap(), "5");
+            }
+        }
+        assert_eq!(
+            doc.selected_range_0based(),
+            target,
+            "the filled block is re-selected"
+        );
+    }
+
+    #[test]
+    fn number_token_uses_the_locale_decimal_separator_without_grouping() {
+        // `.` locale: Rust's own repr, full precision. (`1.25` avoids clippy's `approx_constant`
+        // deny that a `3.14…`-shaped literal trips — any exact non-integer decimal exercises the
+        // separator swap identically.)
+        assert_eq!(number_token(1.25, '.'), "1.25");
+        assert_eq!(number_token(1234567.5, '.'), "1234567.5"); // never grouped
+        assert_eq!(number_token(42.0, '.'), "42"); // an integer has no decimal point
+                                                   // `,` locale (German): the decimal point becomes `,`; still no grouping.
+        assert_eq!(number_token(1.25, ','), "1,25");
+        assert_eq!(number_token(1234567.5, ','), "1234567,5");
+        assert_eq!(number_token(42.0, ','), "42"); // integer unaffected by the separator
+    }
+
+    #[test]
+    fn paste_values_number_survives_a_non_dot_decimal_locale() {
+        // Moderate CR fix: under a German-locale workbook (decimal `,`, group `.`) a fractional
+        // computed number must still paste as a NUMBER — the token carries the workbook locale's
+        // decimal separator, so the write path parses it as a number instead of falling to text.
+        let model = ironcalc_base::Model::new_empty("de-book", "de", "UTC", "en").unwrap();
+        let mut doc = WorkbookDocument::from_test_model(model);
+        let a1 = cell(0, 0);
+        doc.set_cell_input(0, a1, "=1/4").unwrap(); // 0.25
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(a1)).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec!["0,25".to_string()]],
+            "the number token uses the workbook locale's decimal separator"
+        );
+
+        let c1 = cell(0, 2);
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.published_style(0, c1).unwrap().0,
+            CellKind::Number,
+            "the fractional value pastes as a number, not text, under a non-`.`-decimal locale"
+        );
+    }
+
+    #[test]
+    fn paste_values_empty_string_value_clears_the_target_not_a_counted_blank() {
+        // Mild CR fix: an empty-string computed value (`=""`) must CLEAR the target (a true blank
+        // that the selection-stats Count ignores), not write a quoted empty text cell (which would
+        // count as non-empty).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "=\"\"").unwrap(); // a formula whose value is the string ""
+        doc.evaluate();
+        let copied = doc.copy_range(0, CellRange::single(cell(0, 0))).unwrap();
+        assert_eq!(
+            copied.values,
+            vec![vec![String::new()]],
+            "an empty-string value renders as a clearing token"
+        );
+
+        // Pre-seed the target so we can prove the paste CLEARS it.
+        let c1 = cell(0, 2);
+        doc.set_cell_input(0, c1, "old").unwrap();
+        doc.evaluate();
+        doc.paste_values(0, c1, &copied.values, 1, 1).unwrap();
+        doc.evaluate();
+        assert_eq!(doc.formatted_value(0, c1).unwrap(), "");
+        // A cleared cell is not counted; a quoted empty-text cell would count as 1.
+        assert_eq!(
+            doc.selection_stats(0, CellRange::single(c1)).count,
+            0,
+            "the target is a true blank, not a counted empty-text cell"
+        );
     }
 
     #[test]

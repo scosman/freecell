@@ -128,6 +128,31 @@ pub enum GridEvent {
     Copy { cut: bool },
     /// Cmd/Ctrl+V on the focused grid — paste at the selection anchor (`functional_spec.md §2.2`).
     Paste,
+    /// Cmd/Ctrl+Shift+V on the focused grid — **Paste Values**: paste the internal clipboard's
+    /// evaluated values only (no formulas, no formatting) at the selection anchor
+    /// (`functional_spec.md §5`). The window routes it through the `ClipboardCoordinator` (internal
+    /// payload → `Command::PasteValues`; a foreign clipboard → a normal `Command::PasteTsv`, since
+    /// external TSV is already values). Reused by the Phase 5 context-menu "Paste Values" item.
+    PasteValues,
+    /// Cmd/Ctrl+D on the focused grid — fill the selection's top row **down** over the rest (a
+    /// copy-fill, `functional_spec.md §3`). Carries the current selection range; the window
+    /// forwards it as `Command::FillDown` for the active sheet.
+    FillDown(CellRange),
+    /// Cmd/Ctrl+R on the focused grid — fill the selection's left column **right** over the rest
+    /// (the column analog of [`GridEvent::FillDown`]). Forwarded as `Command::FillRight`.
+    FillRight(CellRange),
+    /// Cmd/Ctrl+arrow (`extend: false`) or Cmd/Ctrl+Shift+arrow (`extend: true`) on the focused grid
+    /// — resolve the **edge-of-data** target from `from` in `dir` (`functional_spec.md §4`). Occupancy
+    /// lives in the engine past the published viewport, so the window forwards this as an async
+    /// `Command::ResolveEdge`; on the `EdgeResolved` reply it applies the target — collapsing to
+    /// `single(target)`, or (when `extend`) keeping `anchor` (D4.1 Option A). Only these edge motions
+    /// go async; all other motions apply synchronously in `move_active`.
+    ResolveEdge {
+        from: CellRef,
+        anchor: CellRef,
+        dir: Direction,
+        extend: bool,
+    },
     /// Wrap-driven row auto-grow (`functional_spec.md §3`): the render thread measured each
     /// `(row, px)`'s wrapped height (device px) at its column width — geometry the worker can't
     /// compute (no gpui text system). The window forwards it as `Command::AutoGrowRowHeights` for

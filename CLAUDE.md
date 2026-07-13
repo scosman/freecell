@@ -61,6 +61,12 @@ FreeCell. This is the standing way of working, not a one-off.
 - **Benchmarks:** run FOREGROUND with `timeout` (never `nohup`/`&`/background monitors);
   **force + assert** the measured op so it can't measure a no-op; report **p50/p99**,
   environment-stamped; **adversarially review** surprising numbers before trusting them.
+- **Icons: use lucide.** The app renders **lucide** icons via gpui-component's `Icon`
+  (`Icon::empty().path("icons/<name>.svg")`). Prefer an icon already in the gpui-component Lucide
+  bundle (it resolves for free); only when the bundle lacks one, vendor that single glyph under
+  `app/crates/freecell-app/assets/icons/` in the same tintable `stroke="currentColor"` form and
+  register it in `shell/assets.rs` (see that file's `AppAssets` composition). Don't introduce a
+  second icon set.
 - **Commit + push regularly** — the working container is ephemeral.
 - **Build/check efficiency — scope the work; don't full-workspace everything.** A full `cargo
   build`/`cargo test --workspace` on this GPUI workspace is **slow** (~15–25 min warm, worse

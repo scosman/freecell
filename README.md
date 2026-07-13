@@ -27,9 +27,9 @@ It’s a spreadsheet. It has the most of the features you’d come to expect inc
 - 100% local software: no cloud, no analytics, completely private
 - Cross platform: works on Mac, Windows and Linux
 - Native: compiled desktop app, not Electron
+- Charts: GPU rendered charting
 
 What’s not included (yet):
-- Charts
 - Pivot tables
 - Merged cells
 - Dynamic arrays (UNIQUE/FILTER/SORT)

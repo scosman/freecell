@@ -598,10 +598,20 @@ impl WorkbookWindow {
                         anchor: range.start,
                         active: range.end,
                     };
-                    self.sink_shared.last_selection.set(sel);
-                    self.grid.update(cx, |g, cx| g.set_selection(sel, cx));
-                    self.chrome
-                        .update(cx, |c, cx| c.on_selection_changed(sel, window, cx));
+                    // grid.md invariant: commit any pending data-row edit before adopting the pasted
+                    // range as the new selection (Excel click-away), so `on_selection_changed` is
+                    // never reached while Editing. A cap-rejected edit blocks adoption — keep editing
+                    // and leave the selection put. The commit-then-adopt behavior itself is covered by
+                    // the `commit_then_adopt_commits_pending_edit_and_adopts` / `..._blocks_on_cap_reject`
+                    // chrome tests; this branch only wires that result to the paste selection mirror
+                    // (deliberately not worth a bespoke WorkbookWindow/on_worker_event harness).
+                    let adopted = self
+                        .chrome
+                        .update(cx, |c, cx| c.commit_then_adopt_selection(sel, window, cx));
+                    if adopted {
+                        self.sink_shared.last_selection.set(sel);
+                        self.grid.update(cx, |g, cx| g.set_selection(sel, cx));
+                    }
                 }
             }
             WorkerEvent::PasteRejected { reason } => match reason {
@@ -700,6 +710,12 @@ impl WorkbookWindow {
 
         self.sheets = new_sheets.clone();
         self.chrome.update(cx, |c, cx| {
+            // grid.md invariant: commit any pending data-row edit while the edited cell's sheet is
+            // still active — before `SheetsChanged` merges the new list (which re-points
+            // `active_sheet` when the active sheet was deleted) and before the deferred
+            // `switch_grid_to_sheet` below. This keeps the commit on the correct source sheet and
+            // ensures that switch's `on_selection_changed` never runs while Editing.
+            c.on_edit_commit_requested(window, cx);
             c.on_worker_event(
                 WorkerEvent::SheetsChanged { sheets: new_sheets },
                 window,
@@ -1344,13 +1360,7 @@ fn route_selection_changed(
     // A genuine selection change (mouse / a non-edge motion) supersedes any in-flight ⌘+arrow jump —
     // drop its pending context so a late `EdgeResolved` reply is ignored (`functional_spec.md §4`).
     shared.pending_edge.set(None);
-    let committed = chrome.update(cx, |c, cx| {
-        let ok = c.on_edit_commit_requested(window, cx);
-        if ok {
-            c.on_selection_changed(sel, window, cx);
-        }
-        ok
-    });
+    let committed = chrome.update(cx, |c, cx| c.commit_then_adopt_selection(sel, window, cx));
     if committed {
         shared.last_selection.set(sel);
     } else {
@@ -1724,7 +1734,11 @@ fn make_chrome_grid_sink(
                     });
                     shared.last_selection.set(sel);
                     if let Some(chrome) = chrome.and_then(|w| w.upgrade()) {
-                        chrome.update(cx, |c, cx| c.on_selection_changed(sel, window, cx));
+                        // The find emitter (`select_current_match`) already committed any pending
+                        // edit, so the field is Idle here; route through the shared choke point
+                        // anyway (belt-and-braces) so this consumer upholds the grid.md invariant
+                        // on its own even if a future emitter forgets to commit first.
+                        chrome.update(cx, |c, cx| c.commit_then_adopt_selection(sel, window, cx));
                     }
                 });
             }
@@ -1801,7 +1815,21 @@ fn switch_grid_to_sheet(
             // an add (`functional_spec.md §3.7`). `adopt_active_sheet` no-ops on the tab-click path
             // (chrome already switched itself) and does not re-emit `SetActiveSheet`.
             c.adopt_active_sheet(sheet, cx);
-            c.on_selection_changed(sel, window, cx);
+            // grid.md invariant: both callers commit any pending edit at the correct source sheet
+            // before reaching here (the tab click in `select_sheet`, the reconcile in
+            // `reconcile_sheets`), so in the normal case the field is Idle and this adopts normally.
+            // Route through the shared choke point as belt-and-braces so `on_selection_changed` is
+            // never reached while Editing — a residual cap-rejected edit blocks adoption instead.
+            //
+            // The residual only arises when a cap-rejected edit couldn't commit at the caller (an
+            // over-length input during a worker-driven delete of the active sheet). `adopt_active_sheet`
+            // above has already re-pointed `active_sheet` to the new sheet, so this re-commit
+            // re-validates and fails without emitting a `SetCellInput` — no *immediate* wrong-sheet
+            // write. Caveat: the field is left Editing the old text with `active_sheet` now the new
+            // sheet, so a later trim+commit of that same edit would land on the new sheet. This is an
+            // extreme edge case and still strictly better than the pre-fix panic / silent data loss;
+            // the invariant (no `on_selection_changed` while Editing) holds either way.
+            c.commit_then_adopt_selection(sel, window, cx);
         });
     }
 }

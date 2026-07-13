@@ -8,7 +8,7 @@
 - Free and OSS desktop spreadsheet app
 - Supports XLSX format and 90% of Excel formulas
 - GPU rendering: bar graphs at 240fps
-- Insanely fast and light: Rust-based, 8MB binary, launches in 60ms
+- Insanely fast and light: Rust-based, 11MB app, launches in 60 milliseconds
 - Cross platform: Mac, Windows and Linux
 
 <div align="center">
@@ -27,9 +27,9 @@ It’s a spreadsheet. It has the most of the features you’d come to expect inc
 - 100% local software: no cloud, no analytics, completely private
 - Cross platform: works on Mac, Windows and Linux
 - Native: compiled desktop app, not Electron
+- Charts: GPU rendered charting
 
 What’s not included (yet):
-- Charts
 - Pivot tables
 - Merged cells
 - Dynamic arrays (UNIQUE/FILTER/SORT)

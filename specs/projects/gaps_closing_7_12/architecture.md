@@ -289,6 +289,57 @@ baselines.
 
 ---
 
+## 9. Sum-section refinements + horizontal scroller control  (owner feedback; decisions **D9.1–D9.3**)
+
+Built **last** (after Phase 8). Two parts; **all chrome → no pixel suite** (gpui view tests +
+`VisualTestContext` paint tests + Xvfb smoke). Phase 1 refactored `render_tab_bar`, so
+**grep for current symbols** rather than trusting pre-Phase-1 line numbers.
+
+**9A — stats readout refinements (Phase 1 code):**
+- **Adaptive decimals (D9.1).** In `freecell-core/src/stats.rs`, extend `format_stat_value`
+  (the pure formatter added in Phase 1) to pick the decimal count from `|value|`: `≥100`→2,
+  `≥10`→3, `≥1`→4, `<1`→5. Keep the existing thousands-grouping + trailing-zero trim; leave
+  `format_stat_count` (integer) unchanged. **Pure function → exhaustive unit tests** (tier
+  boundaries at 0.9999/1/9.999/10/99.99/100, negatives, zero, `1000000.6666` → `1000000.67`).
+- **Vertical centering + leading divider (D-none; styling).** In `chrome/view.rs`'s
+  refactored tab-bar renderer, give the stats readout `line_height`/`h_full` + centered items
+  so it centers in `TAB_BAR_H`, and add a divider element **before** the stats group reusing
+  the action bar's divider style (grep the action-row renderer for the existing divider
+  element; factor a shared helper if cheap).
+- **Always-visible** is delivered by 9B (stats group is the static right section).
+
+**9B — horizontal scroller control (new reusable widget):**
+- **New module**, e.g. `chrome/h_scroller.rs` (or a `ui/` sibling) exposing a reusable render
+  helper: `h_scroller(content, id, state) -> impl IntoElement` that wraps a horizontally
+  scrollable content region and, **only when it overflows**, appends the static chevron
+  section. Overflow + scroll offset use gpui's scroll-handle machinery (grep the codebase for
+  the existing vertical grid scroll / any `ScrollHandle`/`overflow_x_scroll` usage to reuse
+  the same primitive); **hide the scrollbar** (no visible track).
+- **Chevron section (D9.3):** a static (non-scrolling) trailing group = divider + two buttons
+  with lucide `chevron-left`/`chevron-right`, styled like the action-bar buttons/divider
+  (reuse those element builders). Find the existing icon API (grep for the current lucide/icon
+  usage — `IconName`/icon render in gpui-component) and use it; **add the CLAUDE.md note (9C)
+  that we use lucide**.
+- **Scroll step (D9.2):** each chevron click animates the scroll offset by **0.8 ×
+  viewport_width** in its direction, clamped to `[0, max_scroll]`; disable a chevron at its
+  limit. Use the codebase's animation/`with_animation` idiom if present, else an eased offset
+  tween; a non-animated clamp is an acceptable fallback if animation plumbing is heavy (note
+  it if so).
+- **Call site 1 — action bar:** wrap the action-row button groups in `h_scroller` so they
+  scroll on small windows. Fits → byte-identical to today.
+- **Call site 2 — sheet-tab strip:** wrap the tabs in `h_scroller`; render the **stats group +
+  its leading divider as the static right content OUTSIDE the scroller** (so it never
+  scrolls / never gets pushed off). This is what implements 9A.4.
+- **Tests:** pure/gpui tests for overflow-detection (fits → no chevron section; overflows →
+  chevron section present), chevron-click moves the offset by 0.8×width and clamps at both
+  ends, disabled-at-limit, and both call sites host their content; a `VisualTestContext` paint
+  of the overflow state. No pixel suite.
+
+**Files:** `freecell-core/src/stats.rs`, `chrome/view.rs` (tab-bar + action-row renderers),
+new `chrome/h_scroller.rs` (or `ui/`), `CLAUDE.md` (lucide note).
+
+---
+
 ## Consolidated decisions
 
 | ID | Decision | Recommendation |
@@ -305,6 +356,9 @@ baselines.
 | D7.1 | Multi-column autofit | Include |
 | D7.2 | Row-height autofit | Defer (column-only this phase) |
 | D7.3 | Autofit measurement scope | Published/overscan cells only (render-thread) |
+| D9.1 | Stats adaptive decimals | **RESOLVED (owner):** by \|value\| — ≥100→2, ≥10→3, ≥1→4, <1→5 dp |
+| D9.2 | H-scroller chevron step | **RESOLVED (owner):** animated, 0.8 × viewport width per click, clamped |
+| D9.3 | H-scroller overflow affordance | **RESOLVED (owner):** static divider + lucide chevron-left/right (action-bar style); no visible scrollbar; unchanged when it fits |
 
 ## Component designs
 

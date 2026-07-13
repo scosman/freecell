@@ -4,11 +4,12 @@ status: complete
 
 # Implementation Plan: gaps_closing_7_12
 
-Eight independent phases (see `functional_spec.md` + `architecture.md` for detail). Ordered
+Nine independent phases (see `functional_spec.md` + `architecture.md` for detail). Ordered
 so dependencies land first (paste-values before the context menu that lists it) and the
-sole pixel-suite phase is last. Each phase: build crate-scoped, `cargo fmt --all --check`,
-unit/gpui tests + (where noted) a render subset, commit, then move on. Full render suite +
-CI `render` gate happen **once**, in Phase 8.
+sole pixel-suite phase (Phase 8) lands before the final chrome phase. Each phase: build
+crate-scoped, `cargo fmt --all --check`, unit/gpui tests + (where noted) a render subset,
+commit, then move on. Full render suite + CI `render` gate happen **once**, in Phase 8.
+Phase 9 (owner feedback, added 2026-07-13) is chrome-only → no pixel suite.
 
 Unresolved decisions carry a **recommended default** (architecture.md "Consolidated
 decisions"); proceed on the default unless the owner overrides at phase start.
@@ -46,3 +47,13 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       be a baseline/ordering issue, not a code fix. Then: regenerate + **eyeball** affected
       baselines, run the **full** render suite (watchdog), commit baselines, and dispatch
       the CI `render` gate to green.
+- [ ] **Phase 9 — Sum-section refinements + horizontal scroller (owner feedback).** 9A:
+      adaptive stats decimals (`format_stat_value`: by |value|, ≥100→2/≥10→3/≥1→4/<1→5 dp;
+      D9.1), vertical-center the readout, add a leading divider. 9B: a new reusable
+      **horizontal-scroller** control (`chrome/h_scroller.rs`) — unchanged when content fits;
+      on overflow adds a static divider + lucide `chevron-left/right` buttons (action-bar
+      style, no visible scrollbar) that animate-scroll 0.8× viewport width (D9.2/D9.3). Use it
+      in the **action bar** and the **sheet-tab strip** (stats group static to its right → the
+      always-visible fix, 9A.4). 9C: note in `CLAUDE.md` that we use lucide for icons.
+      Chrome-only → gpui view tests + `VisualTestContext` paint tests + Xvfb smoke; **no pixel
+      suite.**

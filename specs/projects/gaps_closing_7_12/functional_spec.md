@@ -385,6 +385,68 @@ dispatches the CI `render` gate.
 
 ---
 
+## 9. Sum-section refinements + horizontal scroller control  *(owner feedback, 2026-07-13)*
+
+Owner feedback after using the shipped Phase 1 status bar. All of the below is **one phase**,
+built **after** Phases 1–8. Two parts: (A) polish the selection-stats readout, and (B) a new
+reusable horizontal-scroller control that makes the stats always-visible and is also reused in
+the action bar. **All chrome** (tab bar + action bar) → **out of the pixel suite**; validate
+with gpui view tests + `VisualTestContext` paint tests + an Xvfb smoke launch.
+
+### 9A. Selection-stats readout refinements (to the Phase 1 status bar)
+
+1. **Adaptive decimal precision (D9.1).** Today Sum/Average can render absurd precision (e.g.
+   `1000000.666667`). Scale the decimal count to the magnitude — by **digits left of the
+   decimal point**, using `|value|` so negatives scale the same:
+   - `|v| ≥ 100` → **2** decimals
+   - `|v| ≥ 10`  → **3** decimals
+   - `|v| ≥ 1`   → **4** decimals
+   - `|v| < 1`   → **5** decimals
+
+   Applies to Sum, Average, Min, Max (any non-integer stat value). Keep thousands separators
+   and trailing-zero trimming (so `2` shows as `2`, not `2.00`). **Count stays an integer.**
+2. **Vertical centering.** The readout is not quite vertically centered in the tab bar; make
+   line-height track the bar height (`TAB_BAR_H`) so the text is centered.
+3. **Leading divider.** Add a divider immediately **before** the stats group, matching the
+   action bar's between-group divider style.
+4. **Always visible.** The stats group must **never** be pushed off-screen by a long sheet-tab
+   strip. Achieved via 9B: the sheet-tab strip scrolls horizontally; the stats group is
+   **static**, pinned to the right of the scroller.
+
+### 9B. Horizontal scroller control (new, reusable)
+
+**Premise:** many users lack trackpads for horizontal scrolling and don't discover
+scroll-regions that show no scrollbar — so this control is **light and discoverable** while
+showing **no visible scrollbar**.
+
+- **Fits horizontally →** renders **exactly as today** — no affordance, no behavior change.
+- **Overflows horizontally →** append a **static** right-hand section (does **not** scroll)
+  containing: a **divider**, then **left** and **right** chevron buttons — divider + buttons in
+  the **same style as the action bar's** dividers/buttons, using the `chevron-left` /
+  `chevron-right` **lucide** icons (D9.3). The **content/left** section then scrolls
+  horizontally via mouse/trackpad **or** the chevron buttons, with **no visible scrollbar**.
+- **Chevron behavior (D9.2):** each click performs an **animated** horizontal scroll of **80%
+  of the scroll-viewport width** (left button ← / right button →), clamped at the ends
+  (buttons may disable at their limit).
+
+**Two call sites:**
+1. **Action bar** — its button groups scroll when the window is too small to fit them.
+2. **Sheet-tab strip (bottom row)** — the tabs scroll; the **Sum/Avg/Count group is static to
+   the right** of the scroller (this is what implements 9A.4). The leading divider (9A.3) sits
+   between the scrollable tabs and the static stats group.
+
+### 9C. Convention note
+
+Add a note to **`CLAUDE.md`** that the project uses **lucide** for icons (recorded while
+adding the chevron icons).
+
+### Out of scope (Phase 9)
+
+- Vertical scroll affordances; scrollbar visibility toggles elsewhere; touch-gesture tuning.
+- Restyling the action bar or tabs beyond hosting them in the scroller.
+
+---
+
 ## Render-test scope summary (informs the implementation plan)
 
 | Phase | Pixel-suite in scope? | Validation |
@@ -397,6 +459,7 @@ dispatches the CI `render` gate.
 | 6 Number-format breadth | No (dropdown chrome; values are engine-rendered) | gpui tests (+ subset render check only if a baseline adopts a new preset) |
 | 7 Autofit | Lightly (column geometry, like resize) | width-calc unit test + subset render check |
 | 8 Render pair | **Yes — intentional baseline moves** | full suite + eyeball + CI `render` gate |
+| 9 Sum-section + h-scroller | No (tab-bar + action-bar chrome) | gpui view tests + `VisualTestContext` paint tests + Xvfb smoke launch |
 
 All grid/cell/sheet-pixel-affecting work is concentrated in **Phase 8**, which is the sole
-dedicated render-validation phase (Phases 1–7 verify with the relevant subset only).
+dedicated render-validation phase (Phases 1–7, 9 verify with unit/gpui/subset checks only).

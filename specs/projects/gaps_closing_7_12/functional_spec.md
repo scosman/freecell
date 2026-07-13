@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: gaps_closing_7_12 (v0.5 low-hanging-fruit batch)

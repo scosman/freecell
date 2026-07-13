@@ -32,8 +32,8 @@ use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
 use freecell_core::format_ui::{
-    adjust_decimals_cell, displayed_decimals, font_size_display, num_fmt_category,
-    toggle_thousands, Category, NUM_FMT_GROUPS,
+    adjust_decimals_cell, displayed_decimals, font_size_display, is_more_only_num_fmt,
+    num_fmt_category, toggle_thousands, Category, BASIC_FORMATS, NUM_FMT_GROUPS,
 };
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
@@ -373,6 +373,12 @@ pub struct ChromeView {
     text_color_picker: Entity<ColorPickerState>,
     /// The number-format dropdown's open state (a `ChromeView`-owned menu panel).
     num_fmt_open: bool,
+    /// The number-format dropdown's **drill-in** state (`functional_spec.md §10.1`, D10.1). `false`
+    /// = the basics-first view (the 7 [`BASIC_FORMATS`] flat + a trailing "More ▸" row); `true` =
+    /// the full grouped [`NUM_FMT_GROUPS`] view (with a "◂ Back" row). Reset to `false` at every
+    /// popover-close so the dropdown always reopens basics-first (except when it opens directly onto
+    /// a More-only active format — see [`toggle_num_fmt_popover`](Self::toggle_num_fmt_popover)).
+    num_fmt_more_open: bool,
     /// The chart-insert menu's open state (the action-bar chart-type glyph menu, P17). Like the
     /// other formatting popovers it closes on click-away / a type pick / degrade.
     chart_menu_open: bool,
@@ -618,6 +624,7 @@ impl ChromeView {
             text_color_open: false,
             text_color_picker,
             num_fmt_open: false,
+            num_fmt_more_open: false,
             chart_menu_open: false,
             chart_panel: None,
             chart_title_input,
@@ -1550,6 +1557,7 @@ impl ChromeView {
     /// Applies a number-format code over the selection, closing the number-format dropdown.
     pub fn apply_num_fmt(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.num_fmt_open = false;
+        self.num_fmt_more_open = false;
         self.apply_style_path(StylePath::NumFmt, code.to_string(), window, cx);
     }
 
@@ -1609,7 +1617,23 @@ impl ChromeView {
 
     fn toggle_num_fmt_popover(&mut self, cx: &mut Context<Self>) {
         self.num_fmt_open = !self.num_fmt_open;
+        // Basics-first on open — except when the active cell's format lives only under "More ▸":
+        // then land directly on the grouped view so the current format is visible/highlighted
+        // (`architecture.md §10`, "open onto the matched group"). Always reset when closing.
+        self.num_fmt_more_open =
+            self.num_fmt_open && is_more_only_num_fmt(&self.num_fmt_active_code());
         cx.notify();
+    }
+
+    /// The active cell's number-format code, normalized so `general` (which the engine may echo as
+    /// `"General"`) compares lowercase against the preset codes. `None` → the default `"general"`.
+    fn num_fmt_active_code(&self) -> String {
+        let c = self.active_num_fmt.as_deref().unwrap_or("general");
+        if c.eq_ignore_ascii_case("general") {
+            "general".to_string()
+        } else {
+            c.to_string()
+        }
     }
 
     // ---- Action row: insert chart (P17) ---------------------------------------------------
@@ -2241,6 +2265,7 @@ impl ChromeView {
                 self.fill_open = false;
                 self.text_color_open = false;
                 self.num_fmt_open = false;
+                self.num_fmt_more_open = false;
                 self.font_family_open = false;
                 self.font_size_open = false;
                 self.borders_open = false;
@@ -4306,22 +4331,123 @@ impl ChromeView {
             .into_any_element()
     }
 
-    /// The number-format dropdown: a scrolling menu of the grouped presets (10 categories with
-    /// section headers for the multi-preset ones), the preset matching the active cell's exact
-    /// format code highlighted (`components/action_bar.md`, `architecture.md §6`).
+    /// The number-format dropdown (`functional_spec.md §10.1`, D10.1). Basics-first: the default
+    /// view is the seven [`BASIC_FORMATS`] flat (no scroll) plus a trailing "More ▸" row; drilling
+    /// in ([`num_fmt_more_open`](Self::num_fmt_more_open)) swaps to the full grouped
+    /// [`NUM_FMT_GROUPS`] inventory with a "◂ Back" row. The preset matching the active cell's exact
+    /// format code is highlighted at whichever level it lives; when the active format is a More-only
+    /// preset the "More ▸" row is marked active (and the dropdown opens straight onto the grouped
+    /// view — see [`toggle_num_fmt_popover`](Self::toggle_num_fmt_popover)).
+    ///
+    /// **Drill-in over flyout (D10.1):** the popover is a single fixed-anchor occluded card over one
+    /// full-screen backdrop; a flyout would need a second card anchored to the dynamically-positioned
+    /// "More ▸" row (offset + card width unknown without measurement), so drill-in — reusing the same
+    /// card/backdrop/occlude/dismiss machinery — is the clean fit.
     fn render_num_fmt_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // Highlight the preset whose code exactly matches the active cell's, normalizing `general`
-        // case (the engine may echo "General"). Grouped presets can share a category but never a
-        // code, so an exact match selects at most one preset.
-        let active_code = {
-            let c = self.active_num_fmt.as_deref().unwrap_or("general");
-            if c.eq_ignore_ascii_case("general") {
-                "general".to_string()
-            } else {
-                c.to_string()
-            }
+        // case (the engine may echo "General"). Presets can share a category but never a code, so an
+        // exact match selects at most one preset (at whichever level it lives).
+        let active_code = self.num_fmt_active_code();
+        let body = if self.num_fmt_more_open {
+            self.num_fmt_more_menu(&active_code, cx)
+        } else {
+            self.num_fmt_basic_menu(&active_code, cx)
         };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                self.backdrop(
+                    |this, _w, cx| {
+                        this.num_fmt_open = false;
+                        this.num_fmt_more_open = false;
+                        cx.notify();
+                    },
+                    cx,
+                )
+                .child(div()),
+            )
+            .child(
+                div()
+                    .id("numfmt-menu")
+                    .absolute()
+                    .top(px(ACTION_ROW_H))
+                    .left(px(self.anchor_x[Anchor::NumFmt.idx()]))
+                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
+                    .occlude()
+                    .debug_selector(|| "numfmt-card".into())
+                    .flex()
+                    .flex_col()
+                    .p_1()
+                    // The grouped "More" inventory is tall — cap the height and scroll it (like the
+                    // font-family popover). The basic list is short and never scrolls.
+                    .max_h(px(320.0))
+                    .overflow_y_scroll()
+                    .bg(rgb(ACTIVE_TAB_BG))
+                    .border_1()
+                    .border_color(rgb(HAIRLINE))
+                    .rounded_md()
+                    .shadow_md()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// The basics-first view: the seven [`BASIC_FORMATS`] flat, then a trailing "More ▸" row that
+    /// drills into the full grouped inventory. `active_code` is the normalized active-cell format.
+    fn num_fmt_basic_menu(&self, active_code: &str, cx: &mut Context<Self>) -> gpui::Div {
         let mut menu = div().flex().flex_col().gap(px(1.0));
+        for preset in BASIC_FORMATS {
+            let code = preset.code.to_string();
+            let selector = preset.code;
+            menu = menu.child(
+                Button::new(gpui::ElementId::Name(
+                    format!("numfmt-{}", preset.code).into(),
+                ))
+                .label(preset.label)
+                .debug_selector(move || format!("numfmt-{selector}"))
+                .ghost()
+                .small()
+                .selected(preset.code == active_code)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.apply_num_fmt(&code, window, cx);
+                })),
+            );
+        }
+        // "More ▸" reveals the full grouped inventory (drill-in). Marked active when the active
+        // cell's format lives only under it, so the current format stays discoverable.
+        menu.child(
+            Button::new("numfmt-more")
+                .label("More ▸")
+                .debug_selector(|| "numfmt-more".into())
+                .ghost()
+                .small()
+                .selected(is_more_only_num_fmt(active_code))
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.num_fmt_more_open = true;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// The drilled-in "More" view: a "◂ Back" row that restores the basics, then the full grouped
+    /// [`NUM_FMT_GROUPS`] inventory (section headers for multi-preset groups, each preset highlighted
+    /// by exact code). This is the verbatim Phase-6 grouped render, relocated behind "More ▸".
+    fn num_fmt_more_menu(&self, active_code: &str, cx: &mut Context<Self>) -> gpui::Div {
+        let mut menu = div().flex().flex_col().gap(px(1.0)).child(
+            Button::new("numfmt-back")
+                .label("◂ Back")
+                .debug_selector(|| "numfmt-back".into())
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.num_fmt_more_open = false;
+                    cx.notify();
+                })),
+        );
         for group in NUM_FMT_GROUPS {
             // A multi-preset group gets a muted section header; single-preset groups (General,
             // Text, …) read as plain top-level items, so no redundant header.
@@ -4356,46 +4482,7 @@ impl ChromeView {
                 );
             }
         }
-
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .child(
-                self.backdrop(
-                    |this, _w, cx| {
-                        this.num_fmt_open = false;
-                        cx.notify();
-                    },
-                    cx,
-                )
-                .child(div()),
-            )
-            .child(
-                div()
-                    .id("numfmt-menu")
-                    .absolute()
-                    .top(px(ACTION_ROW_H))
-                    .left(px(self.anchor_x[Anchor::NumFmt.idx()]))
-                    // Occlude the card so item clicks don't trip the backdrop dismiss (BUG A/B).
-                    .occlude()
-                    .debug_selector(|| "numfmt-card".into())
-                    .flex()
-                    .flex_col()
-                    .p_1()
-                    // The grouped inventory is tall — cap the height and scroll it (like the
-                    // font-family popover).
-                    .max_h(px(320.0))
-                    .overflow_y_scroll()
-                    .bg(rgb(ACTIVE_TAB_BG))
-                    .border_1()
-                    .border_color(rgb(HAIRLINE))
-                    .rounded_md()
-                    .shadow_md()
-                    .child(menu),
-            )
-            .into_any_element()
+        menu
     }
 
     /// The chart-insert menu (P17, `ui_design.md §3.1`): a small panel of chart-type glyphs; picking
@@ -7680,6 +7767,190 @@ mod tests {
         assert!(
             !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
             "the popover must close after applying"
+        );
+    }
+
+    // ---- Phase 10.1: number-format dropdown basics-first + "More ▸" drill-in ----------------
+
+    #[gpui::test]
+    fn num_fmt_basic_menu_paints_seven_and_more_row(cx: &mut TestAppContext) {
+        // Basics-first: opening the dropdown paints the seven basic presets flat + a "More ▸" row,
+        // and NONE of the More-only grouped inventory (`0.00` — the "1234.56" Number preset) nor a
+        // "◂ Back" row. This is the regression fix — the common formats are visible without scroll.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("numfmt-card").is_some(),
+            "the number-format card must be painted when open"
+        );
+        // The seven basic presets (`debug_bounds` needs a `'static` selector, so enumerate them).
+        for sel in [
+            "numfmt-general",
+            "numfmt-#,##0.00",
+            "numfmt-$#,##0.00",
+            "numfmt-0.00%",
+            "numfmt-m/d/yyyy",
+            "numfmt-h:mm AM/PM",
+            "numfmt-@",
+        ] {
+            assert!(
+                vcx.debug_bounds(sel).is_some(),
+                "basic preset {sel} must be painted in the basics-first view"
+            );
+        }
+        assert!(
+            vcx.debug_bounds("numfmt-more").is_some(),
+            "the 'More ▸' row must be painted"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-0.00").is_none(),
+            "a More-only preset (0.00) must NOT be painted in the basic view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-back").is_none(),
+            "the '◂ Back' row must NOT be painted in the basic view"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_more_drilldown_and_back(cx: &mut TestAppContext) {
+        // Clicking "More ▸" drills into the full grouped inventory (a More-only preset + the
+        // "◂ Back" row now paint); clicking "◂ Back" restores the basics-first view.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let more = vcx
+            .debug_bounds("numfmt-more")
+            .expect("the 'More ▸' row was painted")
+            .center();
+        vcx.simulate_click(more, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            vcx.update(|_w, cx| h.chrome.read(cx).num_fmt_more_open),
+            "clicking 'More ▸' must enter the drill-in view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-back").is_some(),
+            "the '◂ Back' row must be painted in the More view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-0.00").is_some(),
+            "a More-only preset (0.00) must be painted in the More view"
+        );
+
+        let back = vcx
+            .debug_bounds("numfmt-back")
+            .expect("the '◂ Back' row was painted")
+            .center();
+        vcx.simulate_click(back, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            !vcx.update(|_w, cx| h.chrome.read(cx).num_fmt_more_open),
+            "clicking '◂ Back' must restore the basics-first view"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-more").is_some(),
+            "the 'More ▸' row must be painted again after Back"
+        );
+        assert!(
+            vcx.debug_bounds("numfmt-0.00").is_none(),
+            "the More-only preset must be gone after Back"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_basic_pick_applies_and_closes(cx: &mut TestAppContext) {
+        // Selecting a basic preset from the basics-first view routes its exact code and closes the
+        // popover (and resets the drill-in state).
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        let cmds = press_popover_button(
+            &h,
+            cx,
+            |c, _w, cx| c.toggle_num_fmt_popover(cx),
+            "numfmt-#,##0.00",
+            |c| c.num_fmt_open,
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "#,##0.00"),
+            "the basic Number preset must dispatch #,##0.00, got {cmds:?}"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "the popover must close after applying"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "the drill-in state must reset after applying"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_more_pick_applies_and_closes(cx: &mut TestAppContext) {
+        // Drilling into "More ▸" and selecting a More-only preset routes its exact code and closes.
+        let h = tall_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let more = vcx
+            .debug_bounds("numfmt-more")
+            .expect("the 'More ▸' row was painted")
+            .center();
+        vcx.simulate_click(more, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        h.client.take_commands(); // isolate the preset click
+        let preset = vcx
+            .debug_bounds("numfmt-0.00")
+            .expect("the More-only preset (0.00) was painted")
+            .center();
+        vcx.simulate_click(preset, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "0.00"),
+            "the More-only preset must dispatch 0.00, got {cmds:?}"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "the popover must close after applying from the More view"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "the drill-in state must reset after applying"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_opens_onto_more_for_more_only_active(cx: &mut TestAppContext) {
+        // Discoverability (D10.1): when the active cell's format lives only under "More ▸", opening
+        // the dropdown lands directly on the grouped view so the current format is visible; a basic
+        // active format opens basics-first.
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00E+00"); // Scientific — More-only
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "a More-only active format must open onto the grouped view"
+        );
+        // Close, then a basic active format opens basics-first.
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "$#,##0.00"); // Currency — basic
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, _w, cx| c.toggle_num_fmt_popover(cx));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_open),
+            "the popover must be open"
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.num_fmt_more_open),
+            "a basic active format must open basics-first"
         );
     }
 

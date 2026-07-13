@@ -57,7 +57,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       always-visible fix, 9A.4). 9C: note in `CLAUDE.md` that we use lucide for icons.
       Chrome-only → gpui view tests + `VisualTestContext` paint tests + Xvfb smoke; **no pixel
       suite.**
-- [ ] **Phase 10 — Feedback tweaks (owner feedback).** 10.1: number-format dropdown
+- [x] **Phase 10 — Feedback tweaks (owner feedback).** 10.1: number-format dropdown
       basics-first — reintroduce the pre-Phase-6 7-preset `DROPDOWN_FORMATS` (recover from
       `382f075^`) as the default `BASIC_FORMATS` set in `format_ui.rs`; keep Phase-6
       `NUM_FMT_GROUPS` as the full inventory behind a trailing **"More ▸"** item in

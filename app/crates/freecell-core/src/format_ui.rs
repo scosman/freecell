@@ -202,6 +202,45 @@ pub const NUM_FMT_GROUPS: &[NumFmtGroup] = &[
     },
 ];
 
+/// The **basic** dropdown set — the original seven presets that shipped *before* Phase 6's
+/// grouped breadth (`functional_spec.md §10.1`, D10.1). These are the common formats the popover
+/// shows flat, first, without scrolling; the full [`NUM_FMT_GROUPS`] inventory lives behind the
+/// trailing "More ▸" row. Labeled by category name, exactly as the pre-Phase-6 menu displayed them.
+///
+/// Every basic code is also a member of [`NUM_FMT_GROUPS`], so [`num_fmt_category`] (the single
+/// reverse-map source of truth) stays consistent across both dropdown levels — a basic preset and
+/// its `NUM_FMT_GROUPS` twin share the same code and reverse-map to the same category.
+pub const BASIC_FORMATS: &[NumFmtPreset] = &[
+    NumFmtPreset {
+        label: "General",
+        code: "general",
+    },
+    NumFmtPreset {
+        label: "Number",
+        code: "#,##0.00",
+    },
+    NumFmtPreset {
+        label: "Currency",
+        code: "$#,##0.00",
+    },
+    NumFmtPreset {
+        label: "Percent",
+        code: "0.00%",
+    },
+    NumFmtPreset {
+        label: "Date",
+        code: "m/d/yyyy",
+    },
+    NumFmtPreset {
+        label: "Time",
+        code: "h:mm AM/PM",
+    },
+    NumFmtPreset {
+        label: "Text",
+        code: "@",
+    },
+];
+
 /// Reverse-maps a number-format `code` to its [`Category`] by exact match against the codes in
 /// [`NUM_FMT_GROUPS`] (case-insensitive only for `"general"`, which the engine stores lowercase).
 /// Any other code — including richer file-authored formats — is [`Category::Custom`].
@@ -214,6 +253,25 @@ pub fn num_fmt_category(code: &str) -> Category {
         .find(|g| g.presets.iter().any(|p| p.code == code))
         .map(|g| g.category)
         .unwrap_or(Category::Custom)
+}
+
+/// Whether `code` is one of the [`BASIC_FORMATS`] presets — the codes the basics-first dropdown
+/// shows flat (`functional_spec.md §10.1`). `general` matches case-insensitively (the engine echoes
+/// either case); every other code matches exactly.
+pub fn is_basic_num_fmt(code: &str) -> bool {
+    if code.eq_ignore_ascii_case("general") {
+        return true;
+    }
+    BASIC_FORMATS.iter().any(|p| p.code == code)
+}
+
+/// Whether `code` is a **recognized** preset that lives only behind "More ▸" (a member of
+/// [`NUM_FMT_GROUPS`] but not [`BASIC_FORMATS`]) — used to mark the "More ▸" row active and to open
+/// the dropdown directly onto the matched group when the active cell's format isn't a basic one
+/// (`architecture.md §10`, D10.1). A [`Category::Custom`] code (no preset match at all) is neither
+/// basic nor more-only, so this returns `false` for it (nothing to highlight / open onto).
+pub fn is_more_only_num_fmt(code: &str) -> bool {
+    num_fmt_category(code) != Category::Custom && !is_basic_num_fmt(code)
 }
 
 /// Adds (`delta > 0`) or removes (`delta < 0`) one decimal place from a number-format `code`,
@@ -466,6 +524,67 @@ mod tests {
         );
         assert_eq!(num_fmt_category("0.000"), Category::Custom); // 3 decimals is not a preset
         assert_eq!(num_fmt_category("mm/dd/yy"), Category::Custom);
+    }
+
+    #[test]
+    fn basic_formats_are_the_original_seven() {
+        // The pre-Phase-6 `DROPDOWN_FORMATS` set, recovered verbatim (commit 382f075^): exactly
+        // these seven codes in this order (`functional_spec.md §10.1`).
+        let codes: Vec<&str> = BASIC_FORMATS.iter().map(|p| p.code).collect();
+        assert_eq!(
+            codes,
+            [
+                "general",
+                "#,##0.00",
+                "$#,##0.00",
+                "0.00%",
+                "m/d/yyyy",
+                "h:mm AM/PM",
+                "@",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_basic_code_reverse_maps_through_num_fmt_category() {
+        // The basic set is a curated subset of `NUM_FMT_GROUPS`, so each basic preset must
+        // reverse-map to a real (non-Custom) category — the highlight is consistent across levels.
+        for preset in BASIC_FORMATS {
+            assert_ne!(
+                num_fmt_category(preset.code),
+                Category::Custom,
+                "basic preset {:?} ({}) must reverse-map to a real category",
+                preset.label,
+                preset.code
+            );
+            assert!(
+                is_basic_num_fmt(preset.code),
+                "basic preset {} must be classified basic",
+                preset.code
+            );
+            assert!(
+                !is_more_only_num_fmt(preset.code),
+                "basic preset {} must not be classified more-only",
+                preset.code
+            );
+        }
+    }
+
+    #[test]
+    fn is_basic_vs_more_only_partitions_recognized_presets() {
+        // Basic active codes → basic, not more-only (General matches either case).
+        assert!(is_basic_num_fmt("general"));
+        assert!(is_basic_num_fmt("General"));
+        assert!(is_basic_num_fmt("$#,##0.00"));
+        assert!(!is_more_only_num_fmt("$#,##0.00"));
+        // Recognized presets that live only under "More ▸" → more-only, not basic.
+        assert!(!is_basic_num_fmt("0.00E+00"));
+        assert!(is_more_only_num_fmt("0.00E+00")); // Scientific
+        assert!(is_more_only_num_fmt("yyyy-mm-dd")); // a non-basic Date preset
+        assert!(is_more_only_num_fmt("$#,##0.00;($#,##0.00)")); // Accounting
+                                                                // A Custom code (matches no preset) is neither basic nor more-only.
+        assert!(!is_basic_num_fmt("0.000"));
+        assert!(!is_more_only_num_fmt("0.000"));
     }
 
     #[test]

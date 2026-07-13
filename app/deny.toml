@@ -32,6 +32,7 @@ ignore = [
     "RUSTSEC-2024-0436", # paste unmaintained (via gpui-component, metal, rav1e). unmaintained.
     "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained (via stacksafe -> gpui). unmaintained.
     "RUSTSEC-2026-0192", # ttf-parser unmaintained (via gpui font stack: fontdb/usvg/rustybuzz).
+    "RUSTSEC-2026-0206", # rustybuzz unmaintained (via gpui font stack: usvg/resvg). No safe upgrade; successor is harfrust, needs a zed/usvg bump.
     # quick-xml 0.39.4 DoS on UNTRUSTED XML (via wayland-scanner build dep + zbus/atspi
     # accessibility). FreeCell feeds no untrusted XML through these paths; fixed in
     # quick-xml >=0.41, which needs a zed/wayland bump. Revisit on gpui bump.

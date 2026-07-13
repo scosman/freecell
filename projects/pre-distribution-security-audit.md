@@ -34,7 +34,7 @@ ironcalc rev bump and resolved before distribution.**
 - Unmaintained: `RUSTSEC-2025-0052` (async-std, via zed http_client),
   `RUSTSEC-2024-0384` (instant), `RUSTSEC-2024-0436` (paste),
   `RUSTSEC-2026-0173` (proc-macro-error2, via stacksafe→gpui),
-  `RUSTSEC-2026-0192` (ttf-parser, via the gpui font stack).
+  `RUSTSEC-2026-0192` (ttf-parser) + `RUSTSEC-2026-0206` (rustybuzz), both via the gpui font stack.
 - **quick-xml 0.39.4 DoS on untrusted XML** — `RUSTSEC-2026-0194` (quadratic
   attribute-dup check) + `RUSTSEC-2026-0195` (unbounded namespace-declaration alloc).
   **Provenance (verified against `Cargo.lock` Phase 13):** quick-xml enters the tree *only*

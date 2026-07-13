@@ -145,17 +145,6 @@ impl Anchor {
         self as usize
     }
 }
-/// The action row's natural (uncompressed) width for the current control set — font family +
-/// size (Phase 5), B/I/U + strikethrough/wrap, text color + fill, **borders** (Phase 6),
-/// horizontal + vertical alignment, number format + decimals — with its dividers. The row never
-/// wraps (`ui_design.md §2`: raise the window's min width instead), so it holds this min width; the
-/// document window (1200 px) is far wider. Phase 6 added the borders button (~64 px) + a divider
-/// (816 → 896); the formatting-expansion project adds strikethrough + wrap toggles and the
-/// three-button vertical-align group + a divider (~180 px → 896 → 1080). Recorded in
-/// DECISIONS_TO_REVIEW — regenerate the true value from a real render if it clips. P17 adds the
-/// insert-chart trigger + a divider (~65 px → 1080 → 1145); still far under the 1200 px document
-/// window.
-const ACTION_ROW_MIN_W: f32 = 1152.0;
 
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
@@ -2947,7 +2936,7 @@ impl Focusable for ChromeView {
 }
 
 impl Render for ChromeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("freecell-chrome")
             .track_focus(&self.focus_handle)
@@ -2957,7 +2946,9 @@ impl Render for ChromeView {
             .w_full()
             // Fill the available height when hosting the grid, so the grid slot can flex.
             .when(self.body.is_some(), |d| d.flex_1().min_h_0())
-            .child(self.render_action_row(cx))
+            // `window` threads to the two `h_scroller` call sites (action row + tab bar) so a chevron
+            // click can drive an animated slide via `request_animation_frame` (D10.2).
+            .child(self.render_action_row(window, cx))
             .child(self.render_data_row(cx))
             // The find/replace bar sits directly below the data row and above the grid, pushing the
             // grid down when open (`functional_spec.md §4.1`, `ui_design.md §1`).
@@ -2967,7 +2958,7 @@ impl Render for ChromeView {
             .when_some(self.body.clone(), |d, body| {
                 d.child(div().flex_1().min_h_0().w_full().child(body))
             })
-            .child(self.render_tab_bar(cx))
+            .child(self.render_tab_bar(window, cx))
             .children(self.render_overlays(cx))
     }
 }
@@ -3007,7 +2998,7 @@ impl ChromeView {
         )
     }
 
-    fn render_action_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_action_row(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Every mutating control disables in degraded/read-only mode (`functional_spec.md §6`).
         let disabled = self.degraded;
 
@@ -3069,15 +3060,19 @@ impl ChromeView {
                 }))
         };
 
-        // The button groups are the horizontal scroller's *content*: they keep their natural width
-        // (`min_w` ≈ `ACTION_ROW_MIN_W`) so a small window makes them overflow + scroll (chevrons)
-        // rather than compressing the controls (`functional_spec.md §9B`, call site 1).
+        // The button groups are the horizontal scroller's *content*: they sit at their exact
+        // natural width so a small window makes them overflow + scroll (chevrons) rather than
+        // compressing the controls (`functional_spec.md §9B`, call site 1). `flex_shrink_0` is what
+        // holds that natural width — flexbox's default shrink=1 would otherwise squish the buttons
+        // to fit; it (not a hand-estimated `min_w`) is the "scroll, don't squish" guarantee, so the
+        // chevrons appear ONLY when the controls genuinely don't fit (`functional_spec.md §10.2`).
         let groups = div()
             .flex()
             .items_center()
             .gap_1()
-            // The groups don't wrap or shrink; the scroller scrolls them when they don't fit.
-            .min_w(px(ACTION_ROW_MIN_W))
+            .debug_selector(|| "action-row-groups".to_string())
+            // Never wrap or shrink; the scroller scrolls the groups when they don't fit.
+            .flex_shrink_0()
             // Font family · size (`ui_design.md §2`):
             .child(
                 self.anchored_trigger(
@@ -3363,7 +3358,12 @@ impl ChromeView {
             .bg(rgb(CHROME_BG))
             .border_b_1()
             .border_color(rgb(HAIRLINE))
-            .child(h_scroller("action-row", &self.action_scroller, groups))
+            .child(h_scroller(
+                "action-row",
+                &self.action_scroller,
+                window,
+                groups,
+            ))
             .when(self.eval.spinner(), |row| row.child(Spinner::new().small()))
     }
 
@@ -3848,7 +3848,7 @@ impl ChromeView {
         }
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dragging = self.tab_drag_active();
         let mut row = div()
             // `relative` so the drop indicator (an absolute child, positioned in window x — the
@@ -3901,7 +3901,7 @@ impl ChromeView {
         // The scroller (flex_1) fills the row up to the *static* right section: a leading divider
         // (§9A.3 — only when the readout is shown, so it never floats alone) + the selection-stats
         // group (§9A.4 — pinned right, outside the scroller, so a long tab strip can't push it off).
-        row = row.child(h_scroller("tab-bar", &self.tab_scroller, tabs));
+        row = row.child(h_scroller("tab-bar", &self.tab_scroller, window, tabs));
         if self.stats_readout_parts().is_some() {
             row = row.child(action_divider());
         }
@@ -5983,6 +5983,17 @@ mod tests {
         vcx.run_until_parked();
     }
 
+    /// Advance the chevron slide by `n` animation frames. `request_animation_frame`'s `on_next_frame`
+    /// callback only fires from the platform's frame loop, which the test window stubs out — so a
+    /// test drives each frame manually with a `refresh` + `run_until_parked` (each redraw runs
+    /// `h_scroller`'s one-frame `anim_step`).
+    fn pump_frames(vcx: &mut gpui::VisualTestContext, n: usize) {
+        for _ in 0..n {
+            vcx.update(|window, _| window.refresh());
+            vcx.run_until_parked();
+        }
+    }
+
     /// Drive a numeric multi-cell selection so the tab-bar stats readout is shown (mirrors the
     /// Phase-1 reply plumbing).
     fn show_stats(h: &Harness, cx: &mut TestAppContext) {
@@ -6040,6 +6051,55 @@ mod tests {
     }
 
     #[gpui::test]
+    fn action_row_no_chevrons_when_the_controls_actually_fit(cx: &mut TestAppContext) {
+        // Regression for `functional_spec.md §10.2`: the button group's natural width is well under
+        // the old hand-estimated `ACTION_ROW_MIN_W = 1152`, so at a viewport that comfortably fits
+        // the real controls (but is narrower than 1152) the scroller must report NO overflow — the
+        // pre-fix `min_w(1152)` padded the scroll content with trailing empty space and tripped the
+        // chevrons here.
+        let h = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            1400.0,
+            200.0,
+        );
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+
+        // The painted natural width of the button group (`flex_shrink_0`, so it never compresses).
+        let natural = vcx
+            .debug_bounds("action-row-groups")
+            .expect("the action-row button group paints")
+            .size
+            .width;
+        let natural = f32::from(natural);
+        assert!(
+            natural < 1152.0,
+            "the old min_w=1152 over-estimated the controls; true natural width is {natural}"
+        );
+        // A viewport a hair above the natural width — still < 1152 — must NOT overflow.
+        let fits = natural + 40.0;
+        assert!(
+            fits < 1152.0,
+            "the fit viewport {fits} is below the old estimate"
+        );
+        let h2 = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            fits,
+            200.0,
+        );
+        let mut vcx2 = gpui::VisualTestContext::from_window(h2.window.into(), cx);
+        paint_twice(&mut vcx2);
+        assert!(
+            vcx2.debug_bounds("action-row-chevrons").is_none(),
+            "a viewport ({fits}) wide enough for the real controls shows no chevrons (§10.2 fix)"
+        );
+    }
+
+    #[gpui::test]
     fn tab_bar_overflow_shows_chevrons_and_keeps_stats_static(cx: &mut TestAppContext) {
         // Many tabs in a narrow window overflow the tab strip → chevrons appear, AND the stats
         // group stays pinned static to the RIGHT of the scroller (never pushed off — §9A.4).
@@ -6077,9 +6137,10 @@ mod tests {
     }
 
     #[gpui::test]
-    fn chevron_click_scrolls_and_clamps(cx: &mut TestAppContext) {
+    fn chevron_click_animates_to_target(cx: &mut TestAppContext) {
         // The tab strip starts scrolled to the left: the left chevron is a no-op there, and the
-        // right chevron scrolls the content toward the end (offset goes negative — D9.2).
+        // right chevron ANIMATES the content toward the end (offset slides negative over frames —
+        // D10.2, replacing the D9.2 instant jump).
         let h = build_sized(cx, many_sheets(40), SheetId(0), 560.0, 200.0);
         let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
         paint_twice(&mut vcx);
@@ -6090,28 +6151,108 @@ mod tests {
             "a fresh scroller starts at offset 0, got {at_start}"
         );
 
-        // Left chevron at the start is disabled → clicking it does not scroll.
+        // Left chevron at the start is disabled → clicking it arms no slide and does not scroll.
         let left = vcx
             .debug_bounds("tab-bar-chevron-left")
             .expect("left chevron painted");
         vcx.simulate_click(left.center(), Modifiers::default());
         vcx.run_until_parked();
+        assert!(
+            !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()),
+            "the disabled left chevron at the start arms no animation"
+        );
         let after_left = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
         assert!(
             after_left.abs() < 1.0,
             "the left chevron at the start is a no-op, got {after_left}"
         );
 
-        // Right chevron scrolls content left (offset more negative), clamped within range.
+        // Right chevron arms an animated slide (`target` set, `is_animating`) rather than an instant
+        // jump: even after the first redraw it's still mid-flight (one 60%-step is not arrival), so
+        // the reader sees a slide, not a teleport to the destination.
         let right = vcx
             .debug_bounds("tab-bar-chevron-right")
             .expect("right chevron painted");
         vcx.simulate_click(right.center(), Modifiers::default());
         vcx.run_until_parked();
-        let after_right = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
         assert!(
-            after_right < -1.0,
-            "the right chevron scrolls toward the end (offset negative), got {after_right}"
+            vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()),
+            "clicking the right chevron arms an in-flight slide"
+        );
+
+        // Each frame steps the offset monotonically toward the (negative) clamped target, then the
+        // slide settles and clears `target`.
+        let mut prev = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        let mut moved_negative = false;
+        for _ in 0..20 {
+            pump_frames(&mut vcx, 1);
+            let now = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+            assert!(
+                now <= prev + 0.01,
+                "the slide only moves toward the end (never backward): {now} > {prev}"
+            );
+            if now < -1.0 {
+                moved_negative = true;
+            }
+            prev = now;
+            if !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()) {
+                break;
+            }
+        }
+        assert!(
+            moved_negative,
+            "the animated slide moved the content toward the end, got final {prev}"
+        );
+        assert!(
+            !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()),
+            "the slide self-terminates once it reaches the target"
+        );
+
+        // It lands at the clamped `scroll_step` destination (0.8 × viewport from the start), within
+        // the scroll range.
+        let landed = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(landed < -1.0, "settled toward the end, got {landed}");
+    }
+
+    #[gpui::test]
+    fn chevron_animation_clamps_at_end(cx: &mut TestAppContext) {
+        // Repeated right-chevron clicks (each fully animated) drive the tab scroller to the end and
+        // no further; the right chevron then disables (`at_end`) and arms no more slides.
+        let h = build_sized(cx, many_sheets(40), SheetId(0), 560.0, 200.0);
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+
+        // Click + fully settle several times; each click resolves before the next.
+        for _ in 0..12 {
+            if let Some(right) = vcx.debug_bounds("tab-bar-chevron-right") {
+                vcx.simulate_click(right.center(), Modifiers::default());
+                vcx.run_until_parked();
+                // Settle this slide before the next click.
+                for _ in 0..20 {
+                    pump_frames(&mut vcx, 1);
+                    if !vcx.update(|_w, app| h.chrome.read(app).tab_scroller.is_animating()) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // At the end, the right chevron is disabled: clicking it arms no further slide and the
+        // offset does not move past the limit.
+        let at_limit = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        if let Some(right) = vcx.debug_bounds("tab-bar-chevron-right") {
+            vcx.simulate_click(right.center(), Modifiers::default());
+            vcx.run_until_parked();
+            pump_frames(&mut vcx, 3);
+        }
+        let after = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(
+            (after - at_limit).abs() < 1.0,
+            "at the end the content stays pinned at the limit ({at_limit} → {after})"
+        );
+        assert!(
+            at_limit < -1.0,
+            "the strip did scroll to a non-trivial end, got {at_limit}"
         );
     }
 

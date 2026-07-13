@@ -120,3 +120,151 @@ gpui (`chrome/view.rs`):
   (`false`).
 - `num_fmt_paint_both_levels` (`VisualTestContext`) — basic level paints `numfmt-card` + basics
   + `numfmt-more`; after drilling in, the card paints `numfmt-back` + grouped More items.
+
+---
+
+# Phase 10.2 + 10.3: h-scroller overflow fix + animated chevron scroll
+
+## Overview
+
+Two small post-use feedback tweaks to the Phase-9 horizontal scroller (`functional_spec.md
+§10.2/§10.3`, `architecture.md §10`, decision **D10.2**), both chrome-only (action bar +
+tab bar) → **not** pixel-suite scope; validated with the crate's gpui view tests +
+`VisualTestContext` paint tests + an Xvfb smoke launch (no render suite).
+
+- **10.2 (bug fix)** — the action-bar h-scroller shows its chevrons while every button is still
+  visible. Cause: `render_action_row`'s button-group `div` carries
+  `.min_w(px(ACTION_ROW_MIN_W))` with `ACTION_ROW_MIN_W = 1152.0`, a hand-estimated
+  (self-documented-as-drift-prone) over-estimate. When 1152 > the true natural button width, the
+  surplus is trailing empty space *inside* the scroll content, so `h_scroller`'s
+  `max_offset().x > 0` overflow check fires early (chevrons + a gap to the right of the find
+  button). Fix: drop the `min_w` + the `ACTION_ROW_MIN_W` const and put `.flex_shrink_0()` on the
+  button-group content — flexbox default shrink = 1 was the *only* reason `min_w` was there
+  (to stop the buttons compressing). The content then sits at its exact natural width (no
+  compression — Phase 9's "scroll, don't squish" intent preserved), so chevrons appear **only**
+  when the buttons genuinely don't fit.
+
+- **10.3 (D10.2)** — replace `h_scroller`'s non-animated clamped jump (Phase 9's sanctioned D9.2
+  fallback) with a fast, clearly-visible animated slide. gpui's
+  `window.request_animation_frame()` notifies the current view (`ChromeView`) each frame and needs
+  only `&mut Window` — which the chevron `on_click` already has (no view `Context`/entity
+  plumbing). A chevron click stores the clamped destination in an interior-mutable `target` on the
+  scroller and requests a frame; `h_scroller()` (now given `&mut Window`) lerps the offset toward
+  `target` each render, re-requesting frames only while animating, and snaps + clears `target` on
+  arrival. Frames are driven **only** while `target` is `Some`, so the tween never fights manual
+  wheel/trackpad scrolling.
+
+## Steps
+
+### 1. `chrome/h_scroller.rs` — animation state + pure step math
+
+- Add `use std::cell::Cell;` + `use std::rc::Rc;`.
+- Add two tuning consts + a snap epsilon:
+  - `ANIM_STEP_FRACTION: f32 = 0.6` — per-frame fraction of the remaining gap closed (a quick
+    ~7-8-frame slide for the biggest steps; fewer for smaller ones — "obviously a scroll, not a
+    teleport").
+  - `ANIM_SNAP_EPSILON: f32 = 0.5` — land exactly + end the slide within this distance (px).
+- Two **pure, unit-tested** fns (mirroring `scroll_step`/`overflows`):
+  - `pub(crate) fn anim_step(offset_x: f32, target_x: f32, max_scroll_x: f32) -> f32` —
+    `(offset_x + (target_x - offset_x) * ANIM_STEP_FRACTION).clamp(-max_scroll_x, 0.0)`. `factor <
+    1` ⇒ each frame strictly shrinks the gap (monotonic, no overshoot); always clamped to the
+    scroll range.
+  - `pub(crate) fn anim_arrived(offset_x: f32, target_x: f32) -> bool` —
+    `(target_x - offset_x).abs() <= ANIM_SNAP_EPSILON` (the snap/stop trigger).
+- Add `target: Rc<Cell<Option<f32>>>` to `HScroller` (`Default` = `None` ⇒ existing call
+  sites/`new()` unchanged; struct stays `Clone, Default`). `None` = idle; `Some(dest)` = a slide
+  toward the clamped destination is in flight.
+- Add a `#[cfg(test)] pub(crate) fn is_animating(&self) -> bool` inspection seam (asserts a click
+  armed / a finished slide cleared `target`).
+
+### 2. `chrome/h_scroller.rs` — drive the slide in `h_scroller()`
+
+- Add a `window: &mut Window` param: `h_scroller(id, scroller, window, content)`.
+- Before building the row, after snapshotting `max_scroll_x` / `offset_x` / `viewport`, drive one
+  frame of the slide when `target` is `Some`:
+
+  ```rust
+  let mut offset_x = f32::from(handle.offset().x);
+  if let Some(target) = scroller.target.get() {
+      let next = if anim_arrived(offset_x, target) {
+          scroller.target.set(None);        // within snap distance → land exactly, end the slide
+          target
+      } else {
+          window.request_animation_frame();  // still sliding → schedule the next frame
+          anim_step(offset_x, target, max_scroll_x)
+      };
+      handle.set_offset(point(px(next), handle.offset().y));
+      offset_x = next;                        // chevron disabled-state + click base track the live pos
+  }
+  ```
+
+  Frames are requested ONLY inside the `else` (while animating) → the tween self-terminates and
+  never fights wheel/trackpad scrolling.
+
+### 3. `chrome/h_scroller.rs` — chevron click arms the slide
+
+- `chevron_button` gains a `target: Rc<Cell<Option<f32>>>` param (it no longer needs the
+  `ScrollHandle` — it arms the target instead of setting the offset); `h_scroller` passes
+  `scroller.target.clone()` into each chevron.
+- `on_click`: compute the clamped destination via the existing `scroll_step`, store it, and kick
+  the first redraw:
+
+  ```rust
+  let dest = scroll_step(offset_x, max_scroll_x, viewport, dir);
+  target.set(Some(dest));
+  window.refresh();
+  ```
+
+  **Implementation note (constraint found at build time):** a click handler runs during event
+  dispatch, **not** paint, and `window.request_animation_frame()` reads `current_view()`, which is
+  paint/prepaint/layout-only — so calling it from `on_click` **panics**. The click therefore uses
+  `window.refresh()` (valid anywhere, like the Phase-9 code) to trigger the first redraw; the
+  frame-to-frame `request_animation_frame()` lives in `h_scroller`'s render (paint context), where
+  it is valid. Same D10.2 mechanism/outcome — only the *first-frame trigger* differs from the
+  architecture's sketch.
+- Re-clamp the armed target to the CURRENT `max_scroll_x` each frame (`target.clamp(-max, 0)`) so a
+  resize mid-slide (which can shrink `max_scroll_x`, even to 0 when the content now fits) still
+  terminates the slide at the reachable edge instead of requesting frames forever.
+- Update the module doc block (the "Non-animated (D9.2 fallback)" paragraph) to describe the
+  D10.2 animated slide.
+
+### 4. `chrome/view.rs` — 10.2 fix + thread `&mut Window`
+
+- Delete the `ACTION_ROW_MIN_W` const (~L158) and its running-tally comment (~L149-157).
+- In `render_action_row`, on the `groups` content `div`: replace `.min_w(px(ACTION_ROW_MIN_W))`
+  with `.flex_shrink_0()`; update the adjacent comment (drop the `min_w ≈ ACTION_ROW_MIN_W`
+  reference → "natural width, `flex_shrink_0` so it never compresses"). Fixed-width children
+  (font-family `w(140)`, font-size `w(56)`) lay out unchanged.
+- Thread `&mut Window` through the render path (its sole caller is the top-level `render`):
+  - `fn render(&mut self, window: &mut Window, cx)` — un-underscore `_window`.
+  - `fn render_action_row(&self, window: &mut Window, cx)` and
+    `fn render_tab_bar(&self, window: &mut Window, cx)` — add the param; forward it to the two
+    `h_scroller(...)` calls (`h_scroller("action-row", &self.action_scroller, window, groups)` /
+    `h_scroller("tab-bar", &self.tab_scroller, window, tabs)`). Update the `render` call sites.
+
+## Tests
+
+Pure (`h_scroller.rs`, alongside `scroll_step`/`overflows`):
+- `anim_step_converges_monotonically` — from a far offset toward a target, repeated `anim_step`
+  strictly shrinks `|target - offset|` every frame and never overshoots.
+- `anim_step_snaps_within_epsilon` (via `anim_arrived`) — `anim_arrived` is true within
+  `ANIM_SNAP_EPSILON`, false outside; a slide reaches the arrived state in a small (~4-8) number
+  of frames for a representative step.
+- `anim_step_clamps_within_range` — an intermediate step (and a target at the edge) stays within
+  `[-max, 0]`; never positive, never past `-max`.
+
+gpui (`chrome/view.rs`, alongside the existing scroller tests):
+- **10.2** `action_row_natural_width_is_under_the_old_estimate` — at a wide window, the painted
+  natural width of the action-row button group (`action-row-groups` debug_selector) is `< 1152`
+  (proves the const over-estimated); at a viewport just above that natural width (still `< 1152`)
+  the action row reports **no** chevrons (the bug: it used to show them there). A genuinely narrow
+  viewport still overflows (existing `action_row_overflow_shows_chevrons` retained).
+- **10.3** `chevron_click_animates_to_target` (rework of `chevron_click_scrolls_and_clamps`) —
+  clicking the right chevron arms the slide (`tab_scroller.is_animating()` true, offset still ~0
+  before any frame); pumping frames (`refresh` + `run_until_parked`) steps the offset
+  progressively negative and monotonically, then it settles (`is_animating()` false) at the
+  clamped `scroll_step` destination. The left chevron at the start stays a no-op (disabled → no
+  target armed). Add a small `pump_frame`/`pump_frames(n)` test helper (refresh + run_until_parked
+  per frame).
+- **10.3** `chevron_animation_clamps_at_end` — repeated right-chevron clicks + frame pumps drive
+  the tab scroller to `-max` and no further (`at_end`), and the right chevron then disables.

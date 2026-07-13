@@ -491,9 +491,49 @@ true hover-flyout is awkward in the existing custom-`div` popover = a **drill-in
 "More ▸" swaps the popover content to the grouped list with a "◂ Back" affordance). Pick the
 cleaner fit for the existing `render_num_fmt_popover` popover; note the choice.
 
+### 10.2 Action-bar horizontal scroller triggers too early
+
+**Bug:** the action-bar h-scroller (Phase 9) shows its chevrons while every button is still
+visible, with empty space to the right of the find button. **Cause:** the button-group
+container uses a hand-estimated `min_w(ACTION_ROW_MIN_W = 1152px)` — a drift-prone magic
+constant (its own comment shows the running tally 816→896→1080→1145→1152 and warns it will
+clip/drift). When 1152 over-estimates the true button width, the surplus becomes trailing
+empty space inside the scroll content, so overflow (and the chevrons) trigger before the
+controls actually stop fitting.
+
+**Fix:** replace the `min_w` magic constant with `flex_shrink_0` on the button-group content
+(flexbox default shrink is 1 — that shrink pressure was the only reason `min_w` was needed to
+stop the buttons compressing). The content then sits at its exact natural width (no
+compression — Phase 9's "scroll, don't squish" intent preserved), so the chevrons appear
+**only** when the buttons genuinely don't fit. Remove `ACTION_ROW_MIN_W`.
+
+### 10.3 Animate the h-scroller chevron scroll
+
+Replace the non-animated clamped jump (Phase 9's sanctioned D9.2 fallback) with a **fast,
+clearly-visible animated slide** (D10.2). gpui's `window.request_animation_frame()` repaints
+the current view (`ChromeView`) for free, so the tween needs only `&mut Window` (which the
+chevron `on_click` already has — no view `Context`/entity plumbing). The slide is a few frames
+(quick but obviously a scroll, not a teleport), stops cleanly at the target, and drives frames
+only while animating so it never fights manual wheel/trackpad scrolling.
+
+### 10.4 Flyout submenu for "More ▸" — deferred to a GAP (D10.3)
+
+The owner prefers a true flyout for 10.1's "More ▸". gpui-component **does** ship flyout
+submenus (`PopupMenu::submenu`), but adopting it *only* for the num-fmt popover is not cheap:
+its `scrollable` and submenu modes are mutually exclusive (our card is deliberately
+`max_h`+`overflow_y_scroll` for the long grouped list), and it would be the app's **only**
+gpui-component menu — diverging in anchoring/dismiss/animation from the **seven** hand-rolled
+`div`-popovers beside it (fill, text-color, borders, font-family, font-size, chart, num-fmt).
+Doing it well is an **app-wide** menu migration, not a one-popover tweak. So the flyout is
+**deferred** and the 10.1 drill-in stays; filed as a GAP (`PROJECTS.md` +
+`projects/gpui-component-menus.md`) to adopt gpui-component's `PopupMenu`/`Popover` app-wide
+(native flyouts everywhere + consistent anchoring/dismiss, replacing the seven cards).
+
 ### Out of scope (Phase 10)
 
 - A custom format-code editor (still v1.0); re-ordering/customizing which presets are "basic".
+- Building the flyout now (see 10.4 — deferred to a GAP); a true animated *momentum* scroll
+  (10.3 ships a simple fast lerp, not physics).
 
 ---
 
@@ -510,7 +550,7 @@ cleaner fit for the existing `render_num_fmt_popover` popover; note the choice.
 | 7 Autofit | Lightly (column geometry, like resize) | width-calc unit test + subset render check |
 | 8 Render pair | **Yes — intentional baseline moves** | full suite + eyeball + CI `render` gate |
 | 9 Sum-section + h-scroller | No (tab-bar + action-bar chrome) | gpui view tests + `VisualTestContext` paint tests + Xvfb smoke launch |
-| 10 Feedback tweaks (num-fmt More▸) | No (dropdown chrome) | gpui view tests + `VisualTestContext` paint tests + Xvfb smoke launch |
+| 10 Feedback tweaks (num-fmt More▸ · action-bar overflow · animated scroll) | No (dropdown + action-bar/tab-bar chrome) | gpui view tests + `VisualTestContext` paint tests + Xvfb smoke launch |
 
 All grid/cell/sheet-pixel-affecting work is concentrated in **Phase 8**, which is the sole
 dedicated render-validation phase (Phases 1–7, 9 verify with unit/gpui/subset checks only).

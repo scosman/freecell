@@ -372,6 +372,40 @@ scroll-to-reach-basics regression. In `chrome/view.rs`'s `render_num_fmt_popover
 **Files:** `freecell-core/src/format_ui.rs` (reintroduce basic set), `chrome/view.rs`
 (`render_num_fmt_popover` + More/back state).
 
+**10.2 — action-bar scroller triggers too early (bug fix).** Root cause: `render_action_row`'s
+button-group `div` carries `.min_w(px(ACTION_ROW_MIN_W))` with `ACTION_ROW_MIN_W = 1152.0`
+(`chrome/view.rs` — a hand-estimated, self-documented-as-drift-prone constant). When 1152 >
+the true natural button width, the slack is trailing empty space inside the scroll content, so
+`h_scroller`'s `max_offset().x > 0` overflow check fires early. **Fix:** drop the `min_w` +
+`ACTION_ROW_MIN_W` and put `.flex_shrink_0()` on the button-group content (default flex shrink
+= 1 was the only reason min_w was needed against compression). Content then sits at exact
+natural width → chevrons only when it genuinely overflows. Fixed-width children (font-family
+`w(140)`, font-size `w(56)`) lay out unchanged. Test: no overflow at a wide-enough viewport.
+
+**10.3 — animate the chevron scroll (D10.2).** `ScrollHandle::set_offset` is instantaneous;
+gpui's `window.request_animation_frame()` notifies the current view each frame and needs only
+`&mut Window` (the chevron `on_click` has it). Approach: add `target: Rc<Cell<Option<f32>>>` to
+`HScroller`; chevron click computes the clamped destination via the existing `scroll_step` and
+stores it in `target` + requests a frame; `h_scroller()` takes a `&mut Window` param and, while
+`target` is `Some`, lerps `offset` toward it each frame (e.g. `cur + (t-cur)*STEP`, snap within
+~0.5px), `set_offset`s, re-requests a frame until arrived, then clears `target` (drives frames
+only while animating → never fights wheel/trackpad). The per-frame step is a pure, unit-tested
+fn like `scroll_step`. Thread `&mut Window` into `render_action_row`/`render_tab_bar` and their
+two `h_scroller` calls — the sole caller `render()` already has `window` (currently `_window`).
+
+**10.4 — flyout for "More ▸": DEFERRED to a GAP (D10.3).** gpui-component ships flyout submenus
+(`crates/ui/src/menu/popup_menu.rs` `PopupMenu::submenu`), but (a) its `scrollable(true)` note
+says submenus "cannot be support[ed]" while scrollable — and the num-fmt card is deliberately
+scrollable; (b) the app uses **zero** gpui-component menus — all seven toolbar popovers are
+hand-rolled `div().absolute()…occlude()` cards over a `backdrop()`; a single `PopupMenu` would
+own separate anchoring/dismiss and diverge visually from its siblings. So a flyout done *well*
+is an app-wide migration. Keep the 10.1 drill-in; file a GAP (`PROJECTS.md` +
+`projects/gpui-component-menus.md`, status Future) to adopt gpui-component menus app-wide.
+
+**Files (10.2/10.3):** `chrome/h_scroller.rs`, `chrome/view.rs` (`render_action_row`,
+`render_tab_bar`, `render()` window thread). **10.4:** `PROJECTS.md`,
+`projects/gpui-component-menus.md` (no code).
+
 ---
 
 ## Consolidated decisions
@@ -393,7 +427,9 @@ scroll-to-reach-basics regression. In `chrome/view.rs`'s `render_num_fmt_popover
 | D9.1 | Stats adaptive decimals | **RESOLVED (owner):** by \|value\| — ≥100→2, ≥10→3, ≥1→4, <1→5 dp |
 | D9.2 | H-scroller chevron step | **RESOLVED (owner):** animated, 0.8 × viewport width per click, clamped |
 | D9.3 | H-scroller overflow affordance | **RESOLVED (owner):** static divider + lucide chevron-left/right (action-bar style); no visible scrollbar; unchanged when it fits |
-| D10.1 | Num-fmt "More ▸" submenu mechanism | Prefer a **flyout** off "More ▸"; **drill-in** (swap content + "◂ Back") is an acceptable fallback if a flyout is awkward in the custom-`div` popover |
+| D10.1 | Num-fmt "More ▸" submenu mechanism | **RESOLVED:** drill-in shipped (10.1); a true flyout deferred to a GAP (see D10.3) |
+| D10.2 | H-scroller animated scroll | **RESOLVED (owner):** animate — fast lerp via `request_animation_frame` (needs only `&mut Window`); replaces the D9.2 non-animated fallback |
+| D10.3 | Flyout via gpui-component menus | **RESOLVED (owner):** not cheap for one popover (scrollable⊗submenu; app's only gpui-component menu) → **GAP** to adopt gpui-component menus app-wide; keep drill-in for now |
 
 ## Component designs
 

@@ -63,5 +63,11 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       `NUM_FMT_GROUPS` as the full inventory behind a trailing **"More ▸"** item in
       `render_num_fmt_popover` (D10.1: flyout preferred, drill-in + "◂ Back" acceptable
       fallback). Reverse-map highlight works across both levels; thousands-separator button
-      unchanged. Open-ended phase (owner may add tweaks). Chrome-only → gpui + `VisualTestContext`
-      paint tests + Xvfb smoke; **no pixel suite.**
+      unchanged. Open-ended phase (owner may add tweaks). **10.2:** action-bar h-scroller
+      triggers too early — replace the drift-prone `min_w(ACTION_ROW_MIN_W=1152)` on the
+      button groups with `flex_shrink_0` so chevrons appear only on real overflow. **10.3:**
+      animate the h-scroller chevron scroll (D10.2) — fast lerp via `request_animation_frame`
+      (thread `&mut Window` into `render_action_row`/`render_tab_bar`), replacing the Phase-9
+      non-animated fallback. **10.4:** flyout for "More ▸" is **deferred to a GAP** (D10.3 —
+      needs app-wide gpui-component menu adoption; drill-in stays). Chrome-only → gpui +
+      `VisualTestContext` paint tests + Xvfb smoke; **no pixel suite.**

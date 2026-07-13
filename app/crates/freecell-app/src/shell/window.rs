@@ -444,6 +444,11 @@ impl WorkbookWindow {
                 // so a scroll-only publish is a no-op.
                 self.sync_charts(window, cx);
                 self.refresh_dirty(window, cx);
+                // Re-aggregate the tab-bar selection stats: an edit that changed a value inside a
+                // still-active multi-cell selection lands here (`functional_spec.md §1` live-update).
+                // Debounced + deduped chrome-side, so a scroll-only publish is cheap.
+                self.chrome
+                    .update(cx, |c, cx| c.refresh_selection_stats(cx));
             }
             WorkerEvent::StyleCacheUpdated { sheet } => {
                 // Styles/geometry changed — repaint the grid and refresh the action-row toggles
@@ -466,9 +471,10 @@ impl WorkbookWindow {
             | WorkerEvent::EvalStarted
             | WorkerEvent::EvalFinished
             | WorkerEvent::FindResults { .. }
-            | WorkerEvent::ReplacedCount { .. } => {
-                // Data-row content reply + evaluating-spinner drive + find/replace results live on
-                // the chrome (`functional_spec.md §4`).
+            | WorkerEvent::ReplacedCount { .. }
+            | WorkerEvent::SelectionStats { .. } => {
+                // Data-row content reply + evaluating-spinner drive + find/replace results + the
+                // tab-bar selection-stats reply all live on the chrome (`functional_spec.md §1/§4`).
                 self.chrome
                     .update(cx, |c, cx| c.on_worker_event(event, window, cx));
             }

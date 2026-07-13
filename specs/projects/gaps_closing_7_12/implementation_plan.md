@@ -15,7 +15,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
 
 ## Phases
 
-- [ ] **Phase 1 — Status bar with selection stats.** Worker aggregate
+- [x] **Phase 1 — Status bar with selection stats.** Worker aggregate
       (`Command::SelectionStats` → `document.rs::selection_stats`) + stats readout on the
       **right of the tab bar** (`render_tab_bar` refactor), Sum·Avg·Count with a click
       toggle for Min·Max. Decides D1.1. Non-pixel (tab-bar chrome) → gpui tests + smoke.

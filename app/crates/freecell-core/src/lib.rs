@@ -29,6 +29,7 @@ pub mod recent;
 pub mod refs;
 pub mod selection;
 pub mod sheet_name;
+pub mod stats;
 pub mod style;
 pub mod tsv;
 
@@ -47,6 +48,7 @@ pub use selection::{
     apply_motion, format_selection_ref, is_full_column_selection, is_full_row_selection, Direction,
     Motion, SelectionModel, SheetDims,
 };
+pub use stats::{format_stat_count, format_stat_value, SelectionStats};
 pub use style::{Align, RenderStyle, VAlign};
 
 /// The Excel-max grid dimensions FreeCell targets (`CLAUDE.md`): the engine, geometry

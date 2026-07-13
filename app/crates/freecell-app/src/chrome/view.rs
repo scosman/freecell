@@ -40,7 +40,8 @@ use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
-    limits, Align, CellKind, CellRef, RenderStyle, Rgb, SelectionModel, SheetId, VAlign,
+    format_stat_count, format_stat_value, limits, Align, CellKind, CellRef, RenderStyle, Rgb,
+    SelectionModel, SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -59,6 +60,10 @@ use super::{
 /// The 250 ms no-flash delay for both the content-fetch and evaluating spinners
 /// (`ui_design.md §3.1/§3.2`, mirrored from the grid's own delayed hooks).
 const SPINNER_DELAY: Duration = Duration::from_millis(250);
+
+/// Debounce before a selection-change fires a `SelectionStats` query — a drag-select emits many
+/// selection changes, so the readout waits for the drag to settle (`architecture.md §1`).
+const STATS_DEBOUNCE: Duration = Duration::from_millis(120);
 
 // --- Chrome look constants (functional POC greys; `ui_design.md §3`) -----------------
 const CHROME_BG: u32 = 0xF3F3F3;
@@ -460,6 +465,19 @@ pub struct ChromeView {
     /// edits the find field / steps matches (`functional_spec.md §4.4`).
     replaced_notice: Option<usize>,
 
+    // ---- Selection stats (the tab-bar status readout, `functional_spec.md §1`) --------------
+    /// The latest worker-computed aggregate for the current selection, or `None` when there is
+    /// nothing to show (a single-cell/empty selection, or no reply yet). Rendered right-aligned in
+    /// the tab bar; only shown when it has ≥1 numeric cell (`SelectionStats::has_numeric`).
+    selection_stats: Option<SelectionStats>,
+    /// Whether the readout is expanded to also show Min / Max (a **session-only** toggle, flipped by
+    /// clicking the readout — `functional_spec.md §1`).
+    stats_show_minmax: bool,
+    /// Monotonic tag for the debounced stats query: it both debounces (only the most-recently armed
+    /// timer fires the send) and stamps the request's `req_id`, so a reply for a superseded
+    /// selection is dropped.
+    stats_seq: u64,
+
     /// The grid, hosted as the chrome's body so the layout is action-row → data-row → **grid**
     /// → tab-bar (`ui_design.md §3`). `None` in the standalone Phase-9 demo/tests; the Phase-11
     /// window installs the real `GridView` via [`set_grid_body`](Self::set_grid_body).
@@ -623,6 +641,9 @@ impl ChromeView {
             match_idx: None,
             pending_replace_all: false,
             replaced_notice: None,
+            selection_stats: None,
+            stats_show_minmax: false,
+            stats_seq: 0,
             body: None,
             _subscriptions: subscriptions,
         }
@@ -710,7 +731,93 @@ impl ChromeView {
         // which re-points the panel (a switch, not a close) — and the panel's own controls never
         // change the grid selection, so they can't dismiss it either.
         self.close_chart_panel(cx);
+        // Refresh the tab-bar selection-stats readout for the new selection (debounced).
+        self.request_selection_stats(cx);
         cx.notify();
+    }
+
+    /// Re-request the selection-stats readout — the window calls this on `WorkerEvent::Published`
+    /// so an edit that changes a value **inside** a still-active multi-cell selection re-aggregates
+    /// (`functional_spec.md §1` live-update). Debounced + deduped like the selection-change path.
+    pub fn refresh_selection_stats(&mut self, cx: &mut Context<Self>) {
+        self.request_selection_stats(cx);
+    }
+
+    /// Issue the debounced `SelectionStats` query for the current selection (`functional_spec.md
+    /// §1`). Bumps [`stats_seq`](Self::stats_seq) (which invalidates any in-flight reply); a
+    /// single-cell / empty selection shows nothing, so it clears the readout and sends no query.
+    /// A multi-cell selection arms a [`STATS_DEBOUNCE`] timer that fires the query only if no newer
+    /// selection change has superseded it, tagging the request with `seq` so a stale reply is
+    /// dropped on arrival.
+    fn request_selection_stats(&mut self, cx: &mut Context<Self>) {
+        self.stats_seq = self.stats_seq.wrapping_add(1);
+        let seq = self.stats_seq;
+        if self.selection.is_single() {
+            if self.selection_stats.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let sheet = self.active_sheet;
+        let range = self.selection.range();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STATS_DEBOUNCE).await;
+            this.update(cx, |this, _cx| {
+                // Only the most-recently armed timer sends — an intervening selection change bumped
+                // `stats_seq`, superseding this one.
+                if this.stats_seq == seq {
+                    this.client.send(Command::SelectionStats {
+                        sheet,
+                        range,
+                        req_id: seq,
+                    });
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Flip the session-only Min / Max expansion of the stats readout (`functional_spec.md §1`).
+    pub fn toggle_stats_minmax(&mut self, cx: &mut Context<Self>) {
+        self.stats_show_minmax = !self.stats_show_minmax;
+        cx.notify();
+    }
+
+    /// The labeled parts of the selection-stats readout, or `None` when nothing should show — a
+    /// single-cell/empty selection (no stats), or a selection with no numeric cell. Default form is
+    /// `Sum · Average · Count`; the session toggle appends `Min · Max` (`functional_spec.md §1`).
+    /// Pure — the render + the tests read the same source.
+    pub fn stats_readout_parts(&self) -> Option<Vec<String>> {
+        let stats = self.selection_stats?;
+        if !stats.has_numeric() {
+            return None;
+        }
+        let mut parts = vec![
+            format!("Sum: {}", format_stat_value(stats.sum)),
+            format!(
+                "Average: {}",
+                format_stat_value(stats.average().unwrap_or_default())
+            ),
+            format!("Count: {}", format_stat_count(stats.count)),
+        ];
+        if self.stats_show_minmax {
+            parts.push(format!(
+                "Min: {}",
+                format_stat_value(stats.min.unwrap_or_default())
+            ));
+            parts.push(format!(
+                "Max: {}",
+                format_stat_value(stats.max.unwrap_or_default())
+            ));
+        }
+        Some(parts)
+    }
+
+    /// The full selection-stats readout as one string (`"Sum: … Average: … Count: …"`), or `None`
+    /// when hidden — a test accessor mirroring what the tab bar renders.
+    pub fn selection_stats_text(&self) -> Option<String> {
+        self.stats_readout_parts().map(|parts| parts.join("   "))
     }
 
     /// The grid asks the field to commit a pending edit before a click-away selection change
@@ -1144,6 +1251,14 @@ impl ChromeView {
                     self.recompute_matches(cx);
                 }
                 cx.notify();
+            }
+            // Keep only the reply for the latest request — a superseded selection bumped
+            // `stats_seq`, so an older reply (or one after a collapse to a single cell) is dropped.
+            WorkerEvent::SelectionStats { req_id, stats } => {
+                if req_id == self.stats_seq {
+                    self.selection_stats = Some(stats);
+                    cx.notify();
+                }
             }
             // Published/Saved/SaveFailed/StyleCacheUpdated/other EditRejected reasons /
             // degraded are the window's concern (Phase 11 dirty state + modals).
@@ -3684,6 +3799,11 @@ impl ChromeView {
                 })),
         );
 
+        // A flexible spacer pushes the selection-stats readout to the right of the same row
+        // (owner decision D1.2 — no separate bottom bar; `functional_spec.md §1`).
+        row = row.child(div().flex_1());
+        row = row.child(self.render_selection_stats(cx));
+
         // The 2 px accent drop indicator at the insertion gap while dragging (`ui_design.md §3`).
         if let Some(x) = self.tab_drop_indicator_x() {
             row = row.child(
@@ -3698,6 +3818,32 @@ impl ChromeView {
         }
 
         row
+    }
+
+    /// The right-aligned selection-stats readout in the tab bar (`functional_spec.md §1`). Empty
+    /// when hidden (single-cell / all-text / empty selection) so the row's height stays stable;
+    /// when shown, the whole group is clickable to toggle the Min / Max expansion.
+    fn render_selection_stats(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut group = div()
+            .id("selection-stats")
+            .debug_selector(|| "selection-stats".into())
+            .flex()
+            .items_center()
+            .gap_4()
+            .pr_1()
+            .text_size(px(12.0))
+            .text_color(rgb(MUTED_TEXT));
+        if let Some(parts) = self.stats_readout_parts() {
+            group = group.cursor_pointer().on_click(cx.listener(
+                |this, _: &ClickEvent, _window, cx| {
+                    this.toggle_stats_minmax(cx);
+                },
+            ));
+            for part in parts {
+                group = group.child(div().child(part));
+            }
+        }
+        group
     }
 
     fn render_tab(&self, tab: &SheetTab, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -5190,7 +5336,7 @@ mod tests {
     use super::*;
     use crate::chrome::{ChromeClient, RecordingClient};
     use freecell_core::input_cap::MAX_INPUT_LEN;
-    use freecell_core::{CellRef, SelectionModel};
+    use freecell_core::{CellRange, CellRef, SelectionModel};
     use freecell_engine::{BorderPreset, Command, SheetMeta, StyleAttr, WorkerEvent};
     use gpui::{px, size, Modifiers, TestAppContext};
     use gpui_component::Root;
@@ -5407,6 +5553,202 @@ mod tests {
             )
         });
         assert_eq!(upd(&h, cx, |c, _w, cx| c.content_text(cx)), "fresh");
+    }
+
+    // ---- Selection stats (tab-bar status readout, `functional_spec.md §1`) -----------------
+
+    /// A ready-made numeric aggregate for the reply-plumbing tests.
+    fn numeric_stats() -> SelectionStats {
+        SelectionStats {
+            count: 5,
+            numeric_count: 2,
+            sum: 30.0,
+            min: Some(10.0),
+            max: Some(20.0),
+        }
+    }
+
+    /// A1:A3 (a 3-cell column selection).
+    fn multi_a1_a3() -> SelectionModel {
+        SelectionModel {
+            anchor: cell(0, 0),
+            active: cell(2, 0),
+        }
+    }
+
+    #[gpui::test]
+    fn multi_cell_selection_requests_debounced_stats(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        // Debounced: nothing is sent until the timer fires (a drag-select would otherwise spam).
+        assert!(
+            h.client.take_commands().is_empty(),
+            "the stats query is debounced, not sent synchronously"
+        );
+        tick(cx, 150);
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SelectionStats { range, req_id: 1, .. }]
+                    if *range == CellRange::new(cell(0, 0), cell(2, 0))
+            ),
+            "expected one debounced SelectionStats for A1:A3, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn single_cell_selection_issues_no_stats(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx)
+        });
+        tick(cx, 150);
+        let cmds = h.client.take_commands();
+        assert!(
+            cmds.iter()
+                .all(|c| !matches!(c, Command::SelectionStats { .. })),
+            "a single-cell selection issues no stats query, got {cmds:?}"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.selection_stats_text()), None);
+    }
+
+    #[gpui::test]
+    fn stats_reply_renders_readout_with_minmax_toggle(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        h.client.take_commands(); // drain the SelectionStats query (req_id 1)
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.selection_stats_text()),
+            Some("Sum: 30   Average: 15   Count: 5".to_string())
+        );
+        // Clicking the readout expands it to also show Min / Max (session-only toggle).
+        upd(&h, cx, |c, _w, cx| c.toggle_stats_minmax(cx));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.selection_stats_text()),
+            Some("Sum: 30   Average: 15   Count: 5   Min: 10   Max: 20".to_string())
+        );
+    }
+
+    #[gpui::test]
+    fn stale_stats_reply_dropped(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // Two multi-cell selections back-to-back → the latest request is req_id 2.
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx);
+            c.on_selection_changed(
+                SelectionModel {
+                    anchor: cell(0, 0),
+                    active: cell(3, 0),
+                },
+                window,
+                cx,
+            );
+        });
+        tick(cx, 150);
+        h.client.take_commands();
+        // A superseded (req_id 1) reply is dropped.
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.selection_stats_text()),
+            None,
+            "a stale reply for a superseded selection is ignored"
+        );
+        // The current (req_id 2) reply lands.
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 2,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(upd(&h, cx, |c, _w, _cx| c.selection_stats_text()).is_some());
+    }
+
+    #[gpui::test]
+    fn all_text_reply_hides_readout(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        h.client.take_commands();
+        // A selection with content but no numeric cell shows no readout.
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: SelectionStats {
+                        count: 3,
+                        numeric_count: 0,
+                        sum: 0.0,
+                        min: None,
+                        max: None,
+                    },
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(upd(&h, cx, |c, _w, _cx| c.selection_stats_text()), None);
+    }
+
+    #[gpui::test]
+    fn tab_bar_paints_stats_readout_when_present(cx: &mut TestAppContext) {
+        // Real render coverage for the tab-bar refactor: with a numeric multi-cell selection the
+        // right-aligned readout element paints (its Sum/Average/Count text gives it real width).
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        upd(&h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let bounds = vcx
+            .debug_bounds("selection-stats")
+            .expect("the selection-stats readout paints in the tab bar");
+        assert!(
+            f32::from(bounds.size.width) > 20.0,
+            "the readout should paint its Sum/Average/Count text, got width {}",
+            f32::from(bounds.size.width)
+        );
     }
 
     #[gpui::test]

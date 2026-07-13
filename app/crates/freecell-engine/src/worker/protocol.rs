@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
-use freecell_core::{CellRange, CellRef, Rgb, SheetId};
+use freecell_core::{CellRange, CellRef, Rgb, SelectionStats, SheetId};
 
 use crate::document::{LoadError, SaveError};
 
@@ -362,6 +362,17 @@ pub enum Command {
         cell: CellRef,
         req_id: u64,
     },
+    /// Aggregate statistics for `range ∩ the sheet's populated cells` (the status-bar selection
+    /// readout, `functional_spec.md §1`). A **read**: no evaluation, no publish. Computed
+    /// worker-side (which owns the model) so a full-column/row selection is correct **past the
+    /// published viewport** and a huge sparse sheet is walked in O(populated), never O(cells
+    /// selected). `req_id` tags the reply so the chrome drops a stale one for a superseded
+    /// selection. Replies with [`WorkerEvent::SelectionStats`].
+    SelectionStats {
+        sheet: SheetId,
+        range: CellRange,
+        req_id: u64,
+    },
     /// Scan `sheet`'s used range for cells whose **raw content** (formula text for formula cells)
     /// matches `query` under the case / whole-cell rules (`functional_spec.md §4.3`). A **read**: no
     /// evaluation, no publish. Replies with [`WorkerEvent::FindResults`] (row-major matches). Runs in
@@ -544,6 +555,10 @@ pub enum WorkerEvent {
     EvalFinished,
     /// Reply to `GetCellContent`: the cell's raw text.
     CellContent { req_id: u64, raw: String },
+    /// Reply to [`Command::SelectionStats`]: the aggregate over the selection's populated cells.
+    /// The chrome keeps it only when `req_id` still matches its latest request (`functional_spec.md
+    /// §1`).
+    SelectionStats { req_id: u64, stats: SelectionStats },
     /// Reply to [`Command::Find`]: the matching cells in **row-major** order (empty = no matches).
     /// The UI stores these, selects + reveals the current one, and drives the "N of M" counter
     /// (`functional_spec.md §4.3`).

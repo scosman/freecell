@@ -29,7 +29,9 @@ use freecell_core::input_cap::validate_input;
 use freecell_core::merge_guard::{blocks_col_op, blocks_row_op};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
-use freecell_core::{limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SheetId};
+use freecell_core::{
+    limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SelectionStats, SheetId,
+};
 
 use freecell_chart_model::{
     Anchor, CfRange, Chart, ChartColor, ChartId, ChartInsertKind, ChartKind, ChartSpec, Color,
@@ -437,6 +439,9 @@ impl Worker {
     fn process_batch(&mut self, batch: Vec<Command>) -> Flow {
         let mut edits: Vec<Command> = Vec::new();
         let mut reads: Vec<(SheetId, CellRef, u64)> = Vec::new();
+        // Selection-stats queries (`Command::SelectionStats`) are pure reads (no eval/publish),
+        // computed after the edit batch so they observe every mutation in this batch.
+        let mut stats_ops: Vec<(SheetId, CellRange, u64)> = Vec::new();
         let mut saves: Vec<(PathBuf, u64)> = Vec::new();
         // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
         // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
@@ -490,6 +495,11 @@ impl Worker {
                     cell,
                     req_id,
                 } => reads.push((sheet, cell, req_id)),
+                Command::SelectionStats {
+                    sheet,
+                    range,
+                    req_id,
+                } => stats_ops.push((sheet, range, req_id)),
                 Command::Find {
                     sheet,
                     query,
@@ -652,6 +662,16 @@ impl Worker {
                 None => String::new(),
             };
             self.emit(WorkerEvent::CellContent { req_id, raw });
+        }
+
+        // Selection-stats reads (pure, like `reads`): aggregate the selection's populated cells and
+        // reply. An unresolvable sheet (deleted mid-flight) replies the empty aggregate.
+        for (sheet, range, req_id) in stats_ops {
+            let stats = match self.resolve(sheet) {
+                Some(idx) => self.doc.selection_stats(idx, range),
+                None => SelectionStats::EMPTY,
+            };
+            self.emit(WorkerEvent::SelectionStats { req_id, stats });
         }
 
         for (path, req_id) in saves {
@@ -3505,6 +3525,42 @@ mod tests {
             .expect("a Find batch replies FindResults");
         assert_eq!(matches, vec![CellRef::new(0, 0), CellRef::new(1, 1)]);
         // A find is a read — it publishes nothing.
+        assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
+    }
+
+    #[test]
+    fn selection_stats_command_replies_aggregate() {
+        // A `SelectionStats` batch aggregates the selection's populated cells and replies — a pure
+        // read (no publish), tagged with the request's `req_id`.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "10"),   // A1 number
+            set_input(sheet, 1, 0, "text"), // A2 text
+            set_input(sheet, 2, 0, "20"),   // A3 number
+            set_input(sheet, 0, 1, "999"),  // B1 — outside the queried column
+        ]);
+        let _ = drain_events(&rx);
+
+        worker.process_batch(vec![Command::SelectionStats {
+            sheet,
+            range: CellRange::new(CellRef::new(0, 0), CellRef::new(2, 0)),
+            req_id: 7,
+        }]);
+        let events = drain_events(&rx);
+        let stats = events
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::SelectionStats { req_id: 7, stats } => Some(*stats),
+                _ => None,
+            })
+            .expect("a SelectionStats batch replies SelectionStats with the same req_id");
+        assert_eq!(stats.count, 3, "A1:A3 has three non-empty cells");
+        assert_eq!(stats.numeric_count, 2);
+        assert_eq!(stats.sum, 30.0);
+        assert_eq!(stats.min, Some(10.0));
+        assert_eq!(stats.max, Some(20.0));
+        // A stats query is a read — it publishes nothing.
         assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
     }
 

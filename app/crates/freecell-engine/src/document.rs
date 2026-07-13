@@ -16,7 +16,7 @@ use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
-use freecell_core::{CellKind, CellRange, CellRef, Rgb};
+use freecell_core::{CellKind, CellRange, CellRef, Rgb, SelectionStats};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
 use ironcalc_base::cell::CellValue;
@@ -892,6 +892,51 @@ impl WorkbookDocument {
         }
         matches.sort_unstable_by_key(|c| (c.row, c.col));
         Ok(matches)
+    }
+
+    /// Aggregate statistics for `range ∩ the sheet's populated cells` (`Command::SelectionStats`,
+    /// `functional_spec.md §1`; the status-bar readout).
+    ///
+    /// Walks **populated** cells only (`sheet_data`, exactly like [`find_matches`](Self::find_matches))
+    /// and keeps those inside `range` — so a full-column/row selection over a mostly-empty sheet is
+    /// O(populated), never O(cells selected), and is correct **past the published viewport** (the
+    /// correctness-beyond-the-viewport guarantee, `§1` "Correctness / performance"). No
+    /// `dimension()` clamp is needed: iterating `sheet_data` already restricts to the used range, and
+    /// an empty (blank) cell contributes to neither `count` nor the math.
+    ///
+    /// Excel semantics: `count` = every non-empty cell (text + numbers + booleans + errors); the
+    /// sum / min / max / average population is the **numeric** cells only. Errors arrive from
+    /// [`cell_value`](Self::cell_value) as [`CellData::Text`] (their `#DIV/0!`-style string), so —
+    /// D1.1 — they count but are excluded from the math, identically to text. No mutation, no eval.
+    pub(crate) fn selection_stats(&self, sheet_idx: u32, range: CellRange) -> SelectionStats {
+        crate::instrument::record_engine_call();
+        let ws = match self.worksheet(sheet_idx) {
+            Ok(ws) => ws,
+            Err(_) => return SelectionStats::EMPTY,
+        };
+        let mut stats = SelectionStats::EMPTY;
+        for (row_1, cols) in &ws.sheet_data {
+            let row0 = (*row_1 - 1).max(0) as u32;
+            if row0 < range.start.row || row0 > range.end.row {
+                continue;
+            }
+            for col_1 in cols.keys() {
+                let col0 = (*col_1 - 1).max(0) as u32;
+                if col0 < range.start.col || col0 > range.end.col {
+                    continue;
+                }
+                match self.cell_value(sheet_idx, CellRef::new(row0, col0)) {
+                    CellData::Number(n) => stats.push_number(n),
+                    // Text, booleans, and errors are non-empty but non-numeric: they count, but
+                    // are excluded from Sum/Average/Min/Max (D1.1 treats errors like text).
+                    CellData::Text(_) | CellData::Bool(_) => stats.push_non_numeric(),
+                    // A blank cell present in `sheet_data` (e.g. carries only a style) is not
+                    // counted — "blanks don't" (`§1`).
+                    CellData::Empty => {}
+                }
+            }
+        }
+        stats
     }
 
     /// Replace `query` with `replacement` in a single cell (`Command::ReplaceOne`,
@@ -1802,6 +1847,82 @@ mod tests {
             doc.find_matches(0, "A1", true, false).unwrap(),
             vec![CellRef::new(1, 0)]
         );
+    }
+
+    // ---- Selection stats (`functional_spec.md §1`) ----------------------------------------
+
+    #[test]
+    fn selection_stats_aggregates_a_mixed_selection() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A1:A5 — number, text, boolean, error, blank-with-content-then-cleared.
+        doc.set_cell_input(0, CellRef::new(0, 0), "10").unwrap(); // number
+        doc.set_cell_input(0, CellRef::new(1, 0), "hello").unwrap(); // text
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap(); // boolean
+        doc.set_cell_input(0, CellRef::new(3, 0), "=1/0").unwrap(); // error
+        doc.set_cell_input(0, CellRef::new(4, 0), "20").unwrap(); // number
+        doc.evaluate();
+
+        let range = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        let stats = doc.selection_stats(0, range);
+        // Count = every non-empty cell (number, text, bool, error, number) = 5.
+        assert_eq!(stats.count, 5, "count is every non-empty cell");
+        // Only the two numbers are numeric — text/bool/error excluded from the math (D1.1).
+        assert_eq!(stats.numeric_count, 2);
+        assert_eq!(stats.sum, 30.0);
+        assert_eq!(stats.min, Some(10.0));
+        assert_eq!(stats.max, Some(20.0));
+        assert_eq!(stats.average(), Some(15.0));
+        assert!(stats.has_numeric());
+    }
+
+    #[test]
+    fn selection_stats_full_column_walks_only_populated_cells() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // Two numbers far apart in column A; the rest of the 1M-row column is empty.
+        doc.set_cell_input(0, CellRef::new(0, 0), "5").unwrap(); // A1
+        doc.set_cell_input(0, CellRef::new(500_000, 0), "7")
+            .unwrap(); // A500001
+        doc.set_cell_input(0, CellRef::new(0, 1), "999").unwrap(); // B1 — outside the column
+        doc.evaluate();
+
+        // A full-column selection of column A (every row) must aggregate only the two populated A
+        // cells, not touch column B, and not iterate the empty rows.
+        let full_col_a = CellRange::new(
+            CellRef::new(0, 0),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0),
+        );
+        let stats = doc.selection_stats(0, full_col_a);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.numeric_count, 2);
+        assert_eq!(stats.sum, 12.0);
+        assert_eq!(stats.min, Some(5.0));
+        assert_eq!(stats.max, Some(7.0));
+    }
+
+    #[test]
+    fn selection_stats_all_text_has_no_numeric() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "a").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "b").unwrap();
+        doc.evaluate();
+        let stats = doc.selection_stats(0, CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)));
+        assert_eq!(stats.count, 2);
+        assert!(
+            !stats.has_numeric(),
+            "an all-text selection shows no numbers"
+        );
+        assert_eq!(stats.sum, 0.0);
+        assert_eq!(stats.min, None);
+    }
+
+    #[test]
+    fn selection_stats_empty_range_is_empty() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.evaluate();
+        // A selection over cells that are all blank aggregates to nothing.
+        let stats = doc.selection_stats(0, CellRange::new(CellRef::new(5, 5), CellRef::new(9, 9)));
+        assert_eq!(stats, SelectionStats::EMPTY);
     }
 
     #[test]

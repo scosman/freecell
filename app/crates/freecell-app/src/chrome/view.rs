@@ -53,6 +53,7 @@ use freecell_engine::{
     DataLabelToggles, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
 };
 
+use super::h_scroller::{h_scroller, HScroller};
 use super::{
     ChromeClient, ChromeGridRequest, ChromeGridSink, EditController, EditOrigin, SheetTab,
 };
@@ -478,6 +479,14 @@ pub struct ChromeView {
     /// selection is dropped.
     stats_seq: u64,
 
+    /// Horizontal-scroller state for the **action row** — its button groups scroll (with chevrons)
+    /// when the window is too small to fit them (`functional_spec.md §9B`, call site 1).
+    action_scroller: HScroller,
+    /// Horizontal-scroller state for the **sheet-tab strip** — the tabs scroll while the
+    /// selection-stats group stays pinned static to the right (`functional_spec.md §9B`, call site 2
+    /// → §9A.4 always-visible).
+    tab_scroller: HScroller,
+
     /// The grid, hosted as the chrome's body so the layout is action-row → data-row → **grid**
     /// → tab-bar (`ui_design.md §3`). `None` in the standalone Phase-9 demo/tests; the Phase-11
     /// window installs the real `GridView` via [`set_grid_body`](Self::set_grid_body).
@@ -644,6 +653,8 @@ impl ChromeView {
             selection_stats: None,
             stats_show_minmax: false,
             stats_seq: 0,
+            action_scroller: HScroller::new(),
+            tab_scroller: HScroller::new(),
             body: None,
             _subscriptions: subscriptions,
         }
@@ -2897,7 +2908,10 @@ fn format_size_pt(pt: f64) -> String {
 }
 
 /// A vertical divider between action-row control groups (`ui_design.md §2`, existing styling).
-fn action_divider() -> gpui::Div {
+/// `pub(super)` so the sibling [`super::h_scroller`] reuses the exact same divider for the
+/// horizontal scroller's chevron section (`functional_spec.md §9B`, D9.3) and the tab bar's
+/// leading stats divider (§9A.3).
+pub(super) fn action_divider() -> gpui::Div {
     div().w(px(1.0)).h(px(20.0)).mx_1().bg(rgb(DIVIDER))
 }
 
@@ -3030,18 +3044,15 @@ impl ChromeView {
                 }))
         };
 
-        div()
+        // The button groups are the horizontal scroller's *content*: they keep their natural width
+        // (`min_w` ≈ `ACTION_ROW_MIN_W`) so a small window makes them overflow + scroll (chevrons)
+        // rather than compressing the controls (`functional_spec.md §9B`, call site 1).
+        let groups = div()
             .flex()
             .items_center()
             .gap_1()
-            .w_full()
-            .h(px(ACTION_ROW_H))
-            // The row's groups don't wrap; the window's min width holds them (`ui_design.md §2`).
+            // The groups don't wrap or shrink; the scroller scrolls them when they don't fit.
             .min_w(px(ACTION_ROW_MIN_W))
-            .px_2()
-            .bg(rgb(CHROME_BG))
-            .border_b_1()
-            .border_color(rgb(HAIRLINE))
             // Font family · size (`ui_design.md §2`):
             .child(
                 self.anchored_trigger(
@@ -3312,9 +3323,22 @@ impl ChromeView {
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.toggle_find(window, cx);
                     })),
-            )
-            // Right-aligned evaluating spinner (`ui_design.md §3.1`).
-            .child(div().flex_1())
+            );
+
+        // Frame: the fixed-height, full-width action bar hosting the scrollable groups + the
+        // right-docked evaluating spinner (`ui_design.md §3.1`). The scroller is `flex_1`, so it
+        // fills up to the spinner — the spinner stays docked right exactly as the old `flex_1`
+        // spacer did — and shows chevrons only when the groups overflow (`functional_spec.md §9B`).
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(ACTION_ROW_H))
+            .px_2()
+            .bg(rgb(CHROME_BG))
+            .border_b_1()
+            .border_color(rgb(HAIRLINE))
+            .child(h_scroller("action-row", &self.action_scroller, groups))
             .when(self.eval.spinner(), |row| row.child(Spinner::new().small()))
     }
 
@@ -3830,11 +3854,14 @@ impl ChromeView {
             // `grabbing` while a reorder drag is live (`ui_design.md §6`).
             .when(dragging, |d| d.cursor(CursorStyle::ClosedHand));
 
+        // The tabs + the "new sheet" button are the horizontal scroller's *content* — a long tab
+        // strip scrolls (chevrons) instead of pushing the stats group off-screen (`functional_spec.md
+        // §9B`, call site 2 → §9A.4). They keep their natural width and left-align.
+        let mut tabs = div().flex().items_center().gap_1();
         for tab in &self.sheets {
-            row = row.child(self.render_tab(tab, cx));
+            tabs = tabs.child(self.render_tab(tab, cx));
         }
-
-        row = row.child(
+        tabs = tabs.child(
             Button::new("add-sheet")
                 .label("+")
                 .tooltip("New sheet")
@@ -3846,9 +3873,13 @@ impl ChromeView {
                 })),
         );
 
-        // A flexible spacer pushes the selection-stats readout to the right of the same row
-        // (owner decision D1.2 — no separate bottom bar; `functional_spec.md §1`).
-        row = row.child(div().flex_1());
+        // The scroller (flex_1) fills the row up to the *static* right section: a leading divider
+        // (§9A.3 — only when the readout is shown, so it never floats alone) + the selection-stats
+        // group (§9A.4 — pinned right, outside the scroller, so a long tab strip can't push it off).
+        row = row.child(h_scroller("tab-bar", &self.tab_scroller, tabs));
+        if self.stats_readout_parts().is_some() {
+            row = row.child(action_divider());
+        }
         row = row.child(self.render_selection_stats(cx));
 
         // The 2 px accent drop indicator at the insertion gap while dragging (`ui_design.md §3`).
@@ -3876,6 +3907,10 @@ impl ChromeView {
             .debug_selector(|| "selection-stats".into())
             .flex()
             .items_center()
+            // Fill the bar height + track the line-height to it, so the readout sits vertically
+            // centered in `TAB_BAR_H` rather than hugging the text box (`functional_spec.md §9A.2`).
+            .h_full()
+            .line_height(px(TAB_BAR_H))
             .gap_4()
             .pr_1()
             .text_size(px(12.0))
@@ -5440,11 +5475,25 @@ mod tests {
     }
 
     /// [`build`] with a caller-chosen window height — the popover-click tests want a tall enough
-    /// window that every dropdown item lays out on-screen and can be hit by a simulated click.
+    /// window that every dropdown item lays out on-screen and can be hit by a simulated click. The
+    /// window matches the real document width (1200 px), wider than the action row's ~1152 px
+    /// natural width, so the row fits (no scroller chevrons) and its triggers lay out on-screen.
     fn build_win(
         cx: &mut TestAppContext,
         sheets: Vec<SheetTab>,
         active: SheetId,
+        height: f32,
+    ) -> Harness {
+        build_sized(cx, sheets, active, 1200.0, height)
+    }
+
+    /// [`build_win`] with a caller-chosen window **width** too — the horizontal-scroller tests open
+    /// a narrow window so the action row / tab strip overflow and show chevrons.
+    fn build_sized(
+        cx: &mut TestAppContext,
+        sheets: Vec<SheetTab>,
+        active: SheetId,
+        width: f32,
         height: f32,
     ) -> Harness {
         let client = Rc::new(RecordingClient::new());
@@ -5457,10 +5506,7 @@ mod tests {
         let mut chrome_out: Option<Entity<ChromeView>> = None;
         let chrome_slot = &mut chrome_out;
 
-        // The test window matches the real document window width (1200 px) so the full action row
-        // — including the number-format popover trigger past the vertical-align group — is on-screen
-        // for the popover-hit tests (the row's natural width is ~1080 px, `ACTION_ROW_MIN_W`).
-        let window = cx.open_window(size(px(1200.0), px(height)), |window, cx| {
+        let window = cx.open_window(size(px(width), px(height)), |window, cx| {
             let client_dyn: Rc<dyn ChromeClient> = client_for_window;
             let reqs = reqs_for_window;
             let sink = ChromeGridSink::new(move |req, _w, _cx| reqs.borrow_mut().push(req.clone()));
@@ -5829,6 +5875,156 @@ mod tests {
             f32::from(bounds.size.width) > 20.0,
             "the readout should paint its Sum/Average/Count text, got width {}",
             f32::from(bounds.size.width)
+        );
+    }
+
+    // ---- Horizontal scroller (action bar + tab strip, `functional_spec.md §9B`) ------------
+
+    /// A tab list long enough to overflow a narrow window.
+    fn many_sheets(n: u32) -> Vec<SheetTab> {
+        (0..n)
+            .map(|i| SheetTab::new(SheetId(i), format!("Sheet{i}")))
+            .collect()
+    }
+
+    /// Paint the window twice: the scroll handle measures overflow on the first paint, so the
+    /// chevron affordance only appears on the second (the one-frame gpui scroll-handle lag noted in
+    /// `h_scroller`).
+    fn paint_twice(vcx: &mut gpui::VisualTestContext) {
+        vcx.run_until_parked();
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    /// Drive a numeric multi-cell selection so the tab-bar stats readout is shown (mirrors the
+    /// Phase-1 reply plumbing).
+    fn show_stats(h: &Harness, cx: &mut TestAppContext) {
+        upd(h, cx, |c, window, cx| {
+            c.on_selection_changed(multi_a1_a3(), window, cx)
+        });
+        tick(cx, 150);
+        upd(h, cx, |c, window, cx| {
+            c.on_worker_event(
+                WorkerEvent::SelectionStats {
+                    req_id: 1,
+                    stats: numeric_stats(),
+                },
+                window,
+                cx,
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn action_row_fits_has_no_chevrons(cx: &mut TestAppContext) {
+        // A wide window fits the whole action row → the scroller is invisible (no chevrons, no
+        // behaviour change vs. today — `functional_spec.md §9B` "fits horizontally").
+        let h = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            1400.0,
+            200.0,
+        );
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+        assert!(
+            vcx.debug_bounds("action-row-chevrons").is_none(),
+            "a window wider than the action row shows no scroll chevrons"
+        );
+    }
+
+    #[gpui::test]
+    fn action_row_overflow_shows_chevrons(cx: &mut TestAppContext) {
+        // A window narrower than the ~1152 px action row → the scroller shows its chevron section.
+        let h = build_sized(
+            cx,
+            vec![SheetTab::new(SheetId(0), "Sheet1")],
+            SheetId(0),
+            480.0,
+            200.0,
+        );
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+        assert!(
+            vcx.debug_bounds("action-row-chevrons").is_some(),
+            "a narrow window overflows the action row → scroll chevrons appear"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_bar_overflow_shows_chevrons_and_keeps_stats_static(cx: &mut TestAppContext) {
+        // Many tabs in a narrow window overflow the tab strip → chevrons appear, AND the stats
+        // group stays pinned static to the RIGHT of the scroller (never pushed off — §9A.4).
+        let h = build_sized(cx, many_sheets(40), SheetId(0), 560.0, 200.0);
+        show_stats(&h, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+        let chevrons = vcx
+            .debug_bounds("tab-bar-chevrons")
+            .expect("a long tab strip overflows → tab-bar scroll chevrons appear");
+        let stats = vcx
+            .debug_bounds("selection-stats")
+            .expect("the stats group is still painted, never scrolled away");
+        assert!(
+            f32::from(stats.origin.x) > f32::from(chevrons.origin.x),
+            "the static stats group sits to the right of the (scrolling) tab chevrons"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_bar_leading_divider_gated_on_stats(cx: &mut TestAppContext) {
+        // The leading divider (§9A.3) renders only when the stats readout is shown, so it never
+        // floats alone — the render gates it on the same `stats_readout_parts().is_some()` this test
+        // exercises directly.
+        let h = one_sheet(cx);
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.stats_readout_parts().is_none()),
+            "a single-cell selection hides the readout → no leading divider"
+        );
+        show_stats(&h, cx);
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.stats_readout_parts().is_some()),
+            "a numeric multi-cell selection shows the readout → leading divider renders"
+        );
+    }
+
+    #[gpui::test]
+    fn chevron_click_scrolls_and_clamps(cx: &mut TestAppContext) {
+        // The tab strip starts scrolled to the left: the left chevron is a no-op there, and the
+        // right chevron scrolls the content toward the end (offset goes negative — D9.2).
+        let h = build_sized(cx, many_sheets(40), SheetId(0), 560.0, 200.0);
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        paint_twice(&mut vcx);
+
+        let at_start = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(
+            at_start.abs() < 1.0,
+            "a fresh scroller starts at offset 0, got {at_start}"
+        );
+
+        // Left chevron at the start is disabled → clicking it does not scroll.
+        let left = vcx
+            .debug_bounds("tab-bar-chevron-left")
+            .expect("left chevron painted");
+        vcx.simulate_click(left.center(), Modifiers::default());
+        vcx.run_until_parked();
+        let after_left = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(
+            after_left.abs() < 1.0,
+            "the left chevron at the start is a no-op, got {after_left}"
+        );
+
+        // Right chevron scrolls content left (offset more negative), clamped within range.
+        let right = vcx
+            .debug_bounds("tab-bar-chevron-right")
+            .expect("right chevron painted");
+        vcx.simulate_click(right.center(), Modifiers::default());
+        vcx.run_until_parked();
+        let after_right = vcx.update(|_w, app| h.chrome.read(app).tab_scroller.offset_x());
+        assert!(
+            after_right < -1.0,
+            "the right chevron scrolls toward the end (offset negative), got {after_right}"
         );
     }
 

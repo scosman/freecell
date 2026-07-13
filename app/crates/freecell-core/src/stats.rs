@@ -66,19 +66,29 @@ impl SelectionStats {
     }
 }
 
-/// Maximum significant digits the readout shows — Excel's General ceiling. Caps float noise so
-/// `0.1 + 0.2` renders `0.3`, not `0.30000000000000004`.
-const MAX_SIG_DIGITS: i32 = 11;
-
-/// Maximum decimal places for a sub-1 magnitude value, so `1/3` renders a bounded
-/// `0.3333333333` rather than the full float expansion.
-const MAX_DECIMALS: i32 = 10;
+/// Decimal places the readout shows for a value of the given magnitude (D9.1, `functional_spec.md
+/// §9A`): the larger the integer part, the fewer decimals, so a big Sum reads cleanly (`1,000,000.67`,
+/// not `1000000.666667`) while a sub-1 value keeps resolution. Scaled by `|value|`, so negatives
+/// scale identically. The fixed per-tier decimal count also caps float noise (a `.5`-decimal render
+/// of `0.1 + 0.2` trims back to `0.3`).
+fn decimals_for_magnitude(abs: f64) -> usize {
+    if abs >= 100.0 {
+        2
+    } else if abs >= 10.0 {
+        3
+    } else if abs >= 1.0 {
+        4
+    } else {
+        5
+    }
+}
 
 /// Format an aggregate value (Sum / Average / Min / Max) as a compact, General-style string,
 /// independent of any cell's own number format (`functional_spec.md §1` "Readout number
-/// formatting"): thousands separators on the integer part, trailing zeros trimmed, precision capped
-/// at [`MAX_SIG_DIGITS`] significant digits. A non-finite input (never produced by a real sum, but
-/// guarded) renders its plain form rather than a grouped one.
+/// formatting"): thousands separators on the integer part, trailing zeros trimmed, and the decimal
+/// precision scaled to the value's magnitude via [`decimals_for_magnitude`] (D9.1). A non-finite
+/// input (never produced by a real sum, but guarded) renders its plain form rather than a grouped
+/// one.
 pub fn format_stat_value(value: f64) -> String {
     if !value.is_finite() {
         return value.to_string();
@@ -88,13 +98,7 @@ pub fn format_stat_value(value: f64) -> String {
     }
     let negative = value < 0.0;
     let abs = value.abs();
-    // Integer-digit count of the magnitude, so the significant-digit budget is spent on decimals.
-    let int_digits = if abs >= 1.0 {
-        abs.log10().floor() as i32 + 1
-    } else {
-        1
-    };
-    let decimals = (MAX_SIG_DIGITS - int_digits).clamp(0, MAX_DECIMALS) as usize;
+    let decimals = decimals_for_magnitude(abs);
     let rendered = format!("{abs:.decimals$}");
     let trimmed = trim_trailing_zeros(&rendered);
     let grouped = group_thousands(trimmed);
@@ -193,9 +197,29 @@ mod tests {
         assert_eq!(format_stat_value(1234.5), "1,234.5");
         assert_eq!(format_stat_value(246.9), "246.9");
         assert_eq!(format_stat_value(1_000_000.0), "1,000,000");
-        assert_eq!(format_stat_value(1_234_567.891), "1,234,567.891");
+        // |v| >= 100 → 2 decimals (D9.1), so the fractional tail rounds to 2 places.
+        assert_eq!(format_stat_value(1_234_567.891), "1,234,567.89");
         // 1234.50 → trailing zero trimmed.
         assert_eq!(format_stat_value(1234.50), "1,234.5");
+    }
+
+    #[test]
+    fn format_value_adaptive_decimals_by_tier() {
+        // Tier boundaries (D9.1): |v| >= 100 → 2 dp, >= 10 → 3 dp, >= 1 → 4 dp, < 1 → 5 dp.
+        // Just below each boundary keeps the finer precision; at/above it drops one place.
+        assert_eq!(format_stat_value(0.9999), "0.9999"); // < 1 → 5 dp
+        assert_eq!(format_stat_value(1.0), "1"); // >= 1 → 4 dp, trimmed
+        assert_eq!(format_stat_value(9.999), "9.999"); // >= 1 → 4 dp
+        assert_eq!(format_stat_value(10.0), "10"); // >= 10 → 3 dp, trimmed
+        assert_eq!(format_stat_value(99.99), "99.99"); // >= 10 → 3 dp
+        assert_eq!(format_stat_value(100.0), "100"); // >= 100 → 2 dp, trimmed
+                                                     // The owner's motivating example: a big sum no longer renders absurd precision.
+        assert_eq!(format_stat_value(1_000_000.6666), "1,000,000.67");
+        // A sub-1 magnitude retains 5 decimals of resolution.
+        assert_eq!(format_stat_value(0.123456), "0.12346");
+        // Negatives scale by |value| identically.
+        assert_eq!(format_stat_value(-1234.567), "-1,234.57"); // |v| >= 100 → 2 dp
+        assert_eq!(format_stat_value(-0.5), "-0.5"); // < 1 → 5 dp, trimmed
     }
 
     #[test]
@@ -213,7 +237,8 @@ mod tests {
     #[test]
     fn format_value_handles_sign_and_zero() {
         assert_eq!(format_stat_value(0.0), "0");
-        assert_eq!(format_stat_value(-1234.567), "-1,234.567");
+        // |v| >= 100 → 2 decimals (D9.1).
+        assert_eq!(format_stat_value(-1234.567), "-1,234.57");
         assert_eq!(format_stat_value(-5.0), "-5");
         // A sub-ULP magnitude that rounds to zero must not render "-0".
         assert_eq!(format_stat_value(-1e-15), "0");

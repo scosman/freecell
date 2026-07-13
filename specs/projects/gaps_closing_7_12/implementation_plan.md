@@ -47,7 +47,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       be a baseline/ordering issue, not a code fix. Then: regenerate + **eyeball** affected
       baselines, run the **full** render suite (watchdog), commit baselines, and dispatch
       the CI `render` gate to green.
-- [ ] **Phase 9 — Sum-section refinements + horizontal scroller (owner feedback).** 9A:
+- [x] **Phase 9 — Sum-section refinements + horizontal scroller (owner feedback).** 9A:
       adaptive stats decimals (`format_stat_value`: by |value|, ≥100→2/≥10→3/≥1→4/<1→5 dp;
       D9.1), vertical-center the readout, add a leading divider. 9B: a new reusable
       **horizontal-scroller** control (`chrome/h_scroller.rs`) — unchanged when content fits;

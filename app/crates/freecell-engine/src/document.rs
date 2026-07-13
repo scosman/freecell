@@ -1776,6 +1776,58 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// Every number-format preset code the dropdown can send must be renderable by the IronCalc
+    /// formatter — a code the lexer can't parse renders `#VALUE!` in every cell (as bare `£`/`¥`
+    /// did before they were switched to `[$£]…`/`[$¥]…`, and as the dropped `# ?/?` fraction did).
+    /// This guards the whole `NUM_FMT_GROUPS` inventory — and any future preset — against that class
+    /// of engine-incompatibility, which is otherwise invisible from FreeCell-side tests.
+    #[test]
+    fn every_num_fmt_preset_code_renders_without_parse_error() {
+        use freecell_core::format_ui::NUM_FMT_GROUPS;
+        let locale = get_locale("en").expect("en locale available");
+        // Two universally-valid positive inputs (integer part ≥ 1 so date/time serials are real, and
+        // fine for number/currency/percent/scientific). A *parse* error is value-independent — it
+        // fires before any section is chosen — so a positive value reaches it just as a negative one
+        // would, without the value-domain noise of a negative "date" (which the engine legitimately
+        // rejects). The negative section of the multi-section numeric presets is exercised below.
+        let sample_values = [1234.567_f64, 45283.75];
+        for group in NUM_FMT_GROUPS {
+            for preset in group.presets {
+                for &v in &sample_values {
+                    let out = format_number(v, preset.code, locale);
+                    assert!(
+                        out.error.is_none() && out.text != "#VALUE!",
+                        "preset {:?} ({}) failed to render {v}: text={:?} error={:?}",
+                        preset.label,
+                        preset.code,
+                        out.text,
+                        out.error
+                    );
+                }
+            }
+        }
+        // The negative section of the two multi-section *numeric* presets must also render (negatives
+        // are valid for numbers, unlike dates): red-negative Number + parens-negative Accounting.
+        for code in ["#,##0.00;[Red]-#,##0.00", "$#,##0.00;($#,##0.00)"] {
+            let out = format_number(-1234.567, code, locale);
+            assert!(
+                out.error.is_none() && out.text != "#VALUE!",
+                "negative render of {code}: text={:?} error={:?}",
+                out.text,
+                out.error
+            );
+        }
+        // Spot-check the fix's intent: the bracketed `£`/`¥` presets actually emit their symbol
+        // (not merely a non-error), and a plain currency still groups + shows two decimals.
+        assert!(format_number(1234.5, "[$£]#,##0.00", locale)
+            .text
+            .contains('£'));
+        assert!(format_number(1234.5, "[$¥]#,##0.00", locale)
+            .text
+            .contains('¥'));
+        assert_eq!(format_number(1234.5, "$#,##0.00", locale).text, "$1,234.50");
+    }
+
     #[test]
     fn destination_dir_uses_parent_or_cwd() {
         assert_eq!(
@@ -2855,12 +2907,14 @@ mod tests {
 
     #[test]
     fn number_token_uses_the_locale_decimal_separator_without_grouping() {
-        // `.` locale: Rust's own repr, full precision.
-        assert_eq!(number_token(3.14, '.'), "3.14");
+        // `.` locale: Rust's own repr, full precision. (`1.25` avoids clippy's `approx_constant`
+        // deny that a `3.14…`-shaped literal trips — any exact non-integer decimal exercises the
+        // separator swap identically.)
+        assert_eq!(number_token(1.25, '.'), "1.25");
         assert_eq!(number_token(1234567.5, '.'), "1234567.5"); // never grouped
         assert_eq!(number_token(42.0, '.'), "42"); // an integer has no decimal point
                                                    // `,` locale (German): the decimal point becomes `,`; still no grouping.
-        assert_eq!(number_token(3.14, ','), "3,14");
+        assert_eq!(number_token(1.25, ','), "1,25");
         assert_eq!(number_token(1234567.5, ','), "1234567,5");
         assert_eq!(number_token(42.0, ','), "42"); // integer unaffected by the separator
     }

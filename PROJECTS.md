@@ -139,3 +139,12 @@ registry: each entry is a short description plus a pointer to a design note unde
   the render side is the hard part: splitting the custom grid's single viewport/scroll into
   frozen + scrolling quadrants with per-quadrant geometry and scroll clamping (`GAPS.md:141`).
   → [`projects/freeze-panes.md`](projects/freeze-panes.md)
+
+- **Fraction number format (`# ?/?`)** — *Future (deferred from `gaps_closing_7_12` Phase 6,
+  2026-07-13).* A Fraction preset (`# ?/?`, `# ??/??`) for the number-format dropdown so a value
+  like `1.5` displays as `1 1/2`. Deferred because it needs an **IronCalc fork implementation**:
+  the engine's `?/?` fraction formatting is effectively unimplemented (`format_number(1.5, "# ?/?")`
+  → `"  /2"`, garbled for every input — not even a `#VALUE!`). Phase 6 was FreeCell-side / no-fork,
+  so the Fraction preset + `Category::Fraction` were dropped rather than shipped broken; the
+  engine-render guard test (`freecell-engine` `every_num_fmt_preset_code_renders_without_parse_error`)
+  now covers the whole inventory so a re-add can't regress. → [`projects/fraction-number-format.md`](projects/fraction-number-format.md)

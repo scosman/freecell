@@ -34,7 +34,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       `cell_menu_elements`, open from the cell-body arm of `handle_right_mouse_down`
       (select-move-if-outside); items reuse existing Copy/Cut/Paste/Clear/Insert/Delete +
       Paste-Values (Phase 4). Decides D2.1. gpui tests.
-- [ ] **Phase 6 — Number-format preset breadth.** Grouped preset model + restructured
+- [x] **Phase 6 — Number-format preset breadth.** Grouped preset model + restructured
       `render_num_fmt_popover`; optional thousands-separator toggle button; extended
       reverse map. UI-only (engine renders codes). Decides D6.1/D6.2. Unit + gpui tests.
 - [ ] **Phase 7 — Autofit column width.** Double-click the column resize hotspot →

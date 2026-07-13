@@ -32,8 +32,8 @@ use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
 use freecell_core::format_ui::{
-    adjust_decimals_cell, displayed_decimals, font_size_display, num_fmt_category, Category,
-    DROPDOWN_FORMATS,
+    adjust_decimals_cell, displayed_decimals, font_size_display, num_fmt_category,
+    toggle_thousands, Category, NUM_FMT_GROUPS,
 };
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
@@ -1253,12 +1253,11 @@ impl ChromeView {
                 cx.notify();
             }
             // Keep only the reply for the latest request — a superseded selection bumped
-            // `stats_seq`, so an older reply (or one after a collapse to a single cell) is dropped.
-            WorkerEvent::SelectionStats { req_id, stats } => {
-                if req_id == self.stats_seq {
-                    self.selection_stats = Some(stats);
-                    cx.notify();
-                }
+            // `stats_seq`, so an older reply (or one after a collapse to a single cell) falls
+            // through the guard to the `_` arm and is dropped.
+            WorkerEvent::SelectionStats { req_id, stats } if req_id == self.stats_seq => {
+                self.selection_stats = Some(stats);
+                cx.notify();
             }
             // Published/Saved/SaveFailed/StyleCacheUpdated/other EditRejected reasons /
             // degraded are the window's concern (Phase 11 dirty state + modals).
@@ -1555,6 +1554,39 @@ impl ChromeView {
             .as_deref()
             .and_then(|c| adjust_decimals_cell(c, delta, numeric, displayed))
         {
+            self.apply_num_fmt(&new_code, window, cx);
+        }
+    }
+
+    /// Whether the thousands-separator toggle is enabled: not degraded, and the active cell's
+    /// format can be safely re-grouped (`toggle_thousands` — a single-section numeric code with an
+    /// integer `0` placeholder). General/Text/Date/Time/Scientific/multi-section customs disable it.
+    pub fn toggle_thousands_enabled(&self) -> bool {
+        if self.degraded {
+            return false;
+        }
+        self.active_num_fmt
+            .as_deref()
+            .and_then(toggle_thousands)
+            .is_some()
+    }
+
+    /// Whether the active cell's format currently carries a thousands separator (the toggle renders
+    /// pressed). Only true when the toggle is also actionable, so a disabled button never shows as
+    /// selected.
+    pub fn thousands_active(&self) -> bool {
+        self.toggle_thousands_enabled()
+            && self
+                .active_num_fmt
+                .as_deref()
+                .is_some_and(|c| c.contains("#,##0"))
+    }
+
+    /// Toggles the thousands separator on the active cell's number format, applying the rewritten
+    /// code over the selection (one undo step). A no-op when the format can't be toggled (the
+    /// button also renders disabled in that case).
+    pub fn toggle_thousands_separator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(new_code) = self.active_num_fmt.as_deref().and_then(toggle_thousands) {
             self.apply_num_fmt(&new_code, window, cx);
         }
     }
@@ -3230,6 +3262,21 @@ impl ChromeView {
                         this.bump_decimals(-1, window, cx);
                     })),
             )
+            // Thousands-separator toggle (Phase 6, D6.2): adds/removes the `,` grouping on the
+            // active cell's format; `selected` when grouping is on, disabled when it can't be
+            // safely toggled (General/Text/Date/Time/multi-section).
+            .child(
+                Button::new("thousands-sep")
+                    .icon(Icon::empty().path("icons/thousands-separator.svg"))
+                    .tooltip("Thousands separator")
+                    .ghost()
+                    .small()
+                    .disabled(!self.toggle_thousands_enabled())
+                    .selected(self.thousands_active())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.toggle_thousands_separator(window, cx);
+                    })),
+            )
             .child(action_divider())
             // Insert-chart menu — the action-bar chart-type glyph menu (`ui_design.md §3.1`, P17).
             .child(
@@ -4224,26 +4271,55 @@ impl ChromeView {
             .into_any_element()
     }
 
-    /// The number-format dropdown: a plain scrolling menu of the seven categories, the active
-    /// cell's category highlighted (`components/action_bar.md`, `architecture.md §3.1`).
+    /// The number-format dropdown: a scrolling menu of the grouped presets (10 categories with
+    /// section headers for the multi-preset ones), the preset matching the active cell's exact
+    /// format code highlighted (`components/action_bar.md`, `architecture.md §6`).
     fn render_num_fmt_popover(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let active = self.num_fmt_category();
-        let mut menu = div().flex().flex_col().gap(px(2.0));
-        for (category, code) in DROPDOWN_FORMATS {
-            let code = code.to_string();
-            menu = menu.child(
-                Button::new(gpui::ElementId::Name(
-                    format!("numfmt-{}", category.label()).into(),
-                ))
-                .label(category.label())
-                .debug_selector(move || format!("numfmt-{}", category.label()))
-                .ghost()
-                .small()
-                .selected(category == active)
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.apply_num_fmt(&code, window, cx);
-                })),
-            );
+        // Highlight the preset whose code exactly matches the active cell's, normalizing `general`
+        // case (the engine may echo "General"). Grouped presets can share a category but never a
+        // code, so an exact match selects at most one preset.
+        let active_code = {
+            let c = self.active_num_fmt.as_deref().unwrap_or("general");
+            if c.eq_ignore_ascii_case("general") {
+                "general".to_string()
+            } else {
+                c.to_string()
+            }
+        };
+        let mut menu = div().flex().flex_col().gap(px(1.0));
+        for group in NUM_FMT_GROUPS {
+            // A multi-preset group gets a muted section header; single-preset groups (General,
+            // Text, …) read as plain top-level items, so no redundant header.
+            if group.presets.len() > 1 {
+                menu = menu.child(
+                    div()
+                        .px_1()
+                        .pt(px(3.0))
+                        .pb(px(1.0))
+                        .text_xs()
+                        .text_color(rgb(MUTED_TEXT))
+                        .child(group.category.label()),
+                );
+            }
+            for preset in group.presets {
+                let code = preset.code.to_string();
+                let selector = preset.code;
+                menu = menu.child(
+                    Button::new(gpui::ElementId::Name(
+                        format!("numfmt-{}", preset.code).into(),
+                    ))
+                    .label(preset.label)
+                    .debug_selector(move || format!("numfmt-{selector}"))
+                    .ghost()
+                    .small()
+                    .selected(preset.code == active_code)
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, window, cx| {
+                            this.apply_num_fmt(&code, window, cx);
+                        },
+                    )),
+                );
+            }
         }
 
         div()
@@ -4263,6 +4339,7 @@ impl ChromeView {
             )
             .child(
                 div()
+                    .id("numfmt-menu")
                     .absolute()
                     .top(px(ACTION_ROW_H))
                     .left(px(self.anchor_x[Anchor::NumFmt.idx()]))
@@ -4272,6 +4349,10 @@ impl ChromeView {
                     .flex()
                     .flex_col()
                     .p_1()
+                    // The grouped inventory is tall — cap the height and scroll it (like the
+                    // font-family popover).
+                    .max_h(px(320.0))
+                    .overflow_y_scroll()
                     .bg(rgb(ACTIVE_TAB_BG))
                     .border_1()
                     .border_color(rgb(HAIRLINE))
@@ -7032,6 +7113,106 @@ mod tests {
     }
 
     #[gpui::test]
+    fn num_fmt_category_label_reflects_new_categories(cx: &mut TestAppContext) {
+        // The grouped model added Scientific / Accounting categories; the dropdown button label must
+        // reverse-map an active cell's code to the new category names.
+        let h = one_sheet(cx);
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00E+00");
+        select_single(&h, cx, 1, 1);
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_category_label()),
+            "Scientific"
+        );
+
+        h.client
+            .set_num_fmt(SheetId(0), cell(1, 1), "$#,##0.00;($#,##0.00)");
+        select_single(&h, cx, 1, 1);
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.num_fmt_category_label()),
+            "Accounting"
+        );
+    }
+
+    #[gpui::test]
+    fn num_fmt_preset_pick_emits_grouped_code(cx: &mut TestAppContext) {
+        // Picking a preset from a multi-preset group routes that exact code to the set-format command.
+        let h = one_sheet(cx);
+        select_single(&h, cx, 1, 1);
+        upd(&h, cx, |c, window, cx| {
+            c.apply_num_fmt("yyyy-mm-dd", window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "yyyy-mm-dd"
+            ),
+            "a grouped Date preset routes its exact code, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn thousands_toggle_adds_and_removes_grouping(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // An ungrouped numeric format: toggle enabled, not active → adds grouping.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00");
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.thousands_active()));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_thousands_separator(window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "#,##0.00"
+            ),
+            "toggling on adds grouping, got {cmds:?}"
+        );
+
+        // A grouped format: enabled + active → removes grouping.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "#,##0.00");
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.thousands_active()));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_thousands_separator(window, cx)
+        });
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "0.00"
+            ),
+            "toggling off removes grouping, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn thousands_toggle_disabled_for_date_and_degraded(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // A date format has no integer digit placeholder → disabled + no-op.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "m/d/yyyy");
+        select_single(&h, cx, 1, 1);
+        assert!(!upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.thousands_active()));
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_thousands_separator(window, cx)
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a non-toggleable format sends nothing"
+        );
+
+        // A toggleable format disables once degraded.
+        h.client.set_num_fmt(SheetId(0), cell(1, 1), "0.00");
+        select_single(&h, cx, 1, 1);
+        assert!(upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.toggle_thousands_enabled()));
+    }
+
+    #[gpui::test]
     fn decimals_buttons_emit_adjusted_code(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
         h.client.set_num_fmt(SheetId(0), cell(1, 1), "#,##0.00");
@@ -7287,16 +7468,18 @@ mod tests {
     fn numfmt_currency_click_applies_and_closes(cx: &mut TestAppContext) {
         let h = tall_sheet(cx);
         select_single(&h, cx, 1, 1);
+        // Grouped presets are keyed by their exact code (`numfmt-<code>`); the `$1,234.56` Currency
+        // preset sends `$#,##0.00`.
         let cmds = press_popover_button(
             &h,
             cx,
             |c, _w, cx| c.toggle_num_fmt_popover(cx),
-            "numfmt-Currency",
+            "numfmt-$#,##0.00",
             |c| c.num_fmt_open,
         );
         assert!(
             matches!(cmds.as_slice(), [Command::SetStylePath { path: StylePath::NumFmt, value, .. }] if value == "$#,##0.00"),
-            "clicking Currency must dispatch the Currency num-fmt, got {cmds:?}"
+            "clicking the Currency preset must dispatch its num-fmt, got {cmds:?}"
         );
         assert!(
             !upd(&h, cx, |c, _w, _cx| c.num_fmt_open),

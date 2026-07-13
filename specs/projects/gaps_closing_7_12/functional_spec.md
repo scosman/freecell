@@ -273,7 +273,14 @@ the existing set-format command.
     -parens accounting-ish variant).
   - **Percent:** `0.00%` (existing), `0%`.
   - **Scientific:** `0.00E+00`.
-  - **Fraction:** `# ?/?`.
+  - **Fraction:** `# ?/?`. **— DEFERRED (engine limitation, implemented-phase CR 2026-07-13):**
+    dropped from the shipped inventory (and the `Fraction` category removed) because IronCalc's
+    `?/?` fraction formatting is effectively unimplemented (`1.5` → `"  /2"`, garbled for every
+    input). Needs an IronCalc fork implementation — tracked in `PROJECTS.md` +
+    `projects/fraction-number-format.md`. Scientific ships.
+  - **Currency `£`/`¥` codes (implemented-phase CR 2026-07-13):** shipped as the engine-accepted
+    bracket form `[$£]#,##0.00` / `[$¥]#,##0.00` — IronCalc's lexer only accepts the *bare* symbols
+    `$`/`€`, so bare `£`/`¥` codes render `#VALUE!`. `$`/`€` stay bare.
   - **Date ▸:** `m/d/yyyy` (existing), `yyyy-mm-dd` (ISO), `d-mmm-yyyy`, `mmm d, yyyy`,
     `m/d/yy`.
   - **Time ▸:** `h:mm AM/PM` (existing), `h:mm:ss AM/PM`, `h:mm` (24-hour), `[h]:mm:ss`

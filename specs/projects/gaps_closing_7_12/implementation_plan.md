@@ -37,7 +37,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
 - [x] **Phase 6 — Number-format preset breadth.** Grouped preset model + restructured
       `render_num_fmt_popover`; optional thousands-separator toggle button; extended
       reverse map. UI-only (engine renders codes). Decides D6.1/D6.2. Unit + gpui tests.
-- [ ] **Phase 7 — Autofit column width.** Double-click the column resize hotspot →
+- [x] **Phase 7 — Autofit column width.** Double-click the column resize hotspot →
       measure widest published cell (`measure_incell_text_width`) → reuse
       `SetColumnWidths`. Decides D7.1/D7.2/D7.3. Width-calc unit test + a render **subset**
       check.

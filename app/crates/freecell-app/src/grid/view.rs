@@ -57,6 +57,18 @@ const RESIZE_HOTSPOT_HALF: f32 = 3.0;
 const MIN_COL_WIDTH_PX: f32 = 8.0;
 const MIN_ROW_HEIGHT_PX: f32 = 12.0;
 
+/// Extra width (device px) added around the widest measured cell text when autofitting a column
+/// (double-click the column divider, `functional_spec.md §7`): the cell's left+right text padding
+/// (`2 × CELL_H_PAD`) plus a small buffer so the content clears the gridline. Keeps an autofit
+/// column just wide enough that its widest published cell does not overflow/spill
+/// (`text_overflows_column` fits when `col_w >= text + 2 · CELL_H_PAD`).
+const AUTOFIT_PADDING_PX: f32 = 2.0 * CELL_H_PAD + 3.0;
+/// Floor (device px) for an autofit column — the configured minimum (D7.3), wide enough to keep the
+/// column-letter header label readable; an empty column shrinks to this.
+const AUTOFIT_MIN_WIDTH_PX: f32 = 24.0;
+/// Cap (device px) for an autofit column so a single very long value can't produce a runaway width.
+const AUTOFIT_MAX_WIDTH_PX: f32 = 800.0;
+
 /// gpui's default text line-height multiple — the golden ratio `phi` (`gpui::geometry::phi` =
 /// `relative(1.618034)`, applied as `Style::line_height`). The wrap auto-grow measurement uses the
 /// SAME factor so a grown row fits exactly the number of lines gpui renders (a smaller factor would
@@ -1622,6 +1634,15 @@ impl GridView {
     /// until the worker's rebuild republishes it) and emit `ResizeCommitted` over the run
     /// (`components/grid_structure.md §5.1`).
     fn commit_resize(&mut self, rd: ResizeDrag, window: &mut Window, cx: &mut Context<Self>) {
+        // A click on the divider with no drag (or a drag that returns to the grab point) leaves the
+        // width unchanged: freezing a preview and emitting a redundant `SetColumnWidths` would add a
+        // no-op undo step — and, on a double-click-to-autofit (`functional_spec.md §7`), a spurious
+        // step just before the autofit. Skip an unchanged resize entirely; the repaint clears the
+        // transient drag visuals.
+        if rd.current_px == rd.start_px {
+            cx.notify();
+            return;
+        }
         self.resize_preview = Some(rd);
         self.events.emit(
             &GridEvent::ResizeCommitted {
@@ -1634,6 +1655,104 @@ impl GridView {
             cx,
         );
         cx.notify();
+    }
+
+    /// Autofit the column(s) at a double-clicked column divider (`functional_spec.md §7`): size each
+    /// to fit its content. Reuses [`resize_run_for`](Self::resize_run_for) so a divider inside a
+    /// bounded multi-column header selection autofits the whole run — each column to **its own**
+    /// content (D7.1) — while a lone divider autofits just that column. Each column rides the existing
+    /// [`GridEvent::ResizeCommitted`] → `Command::SetColumnWidths` (undoable, xlsx round-trip, same
+    /// path as drag-resize; no new worker command). A single-column autofit is one undo step;
+    /// multi-column is one per column (the consequence of the per-width command carrying one width).
+    ///
+    /// **Whole-sheet guard.** `resize_run_for` classifies a select-all (or any run that spans every
+    /// column) as a full-column run `(0, MAX_COLS-1)`. Drag-resize collapses that to ONE ranged
+    /// `SetColumnWidths`, but autofit computes a **distinct** width per column, so fanning out here
+    /// would emit 16,384 commands + undo steps and mass-shrink the sheet to the empty-column floor.
+    /// A whole-sheet run therefore autofits only the divider's own column; bounded multi-column
+    /// selections (a handful of columns) still fan out.
+    fn autofit_column(&mut self, index: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let (start, end) = self.resize_run_for(RowOrCol::Col, index);
+        let spans_all_columns = start == 0 && end >= freecell_core::limits::MAX_COLS - 1;
+        let (start, end) = if spans_all_columns {
+            (index, index)
+        } else {
+            (start, end)
+        };
+        for col in start..=end {
+            let px = self.autofit_width_for_column(col, window);
+            self.events.emit(
+                &GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Col,
+                    start: col,
+                    end: col,
+                    px,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The autofit width (device px) for `col` (D7.3): the widest shaped text among the column's
+    /// currently **published/overscanned** cells, plus [`AUTOFIT_PADDING_PX`], clamped to
+    /// `[AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX]`. Render-thread only — measures the values
+    /// already materialized in the publication with the render thread's text system
+    /// ([`measure_incell_text_width`]), each at its own resolved font (family/size/bold/italic from
+    /// the resident cache), so a bold/larger cell widens the fit. A wide value scrolled beyond the
+    /// overscan is not measured — a documented limitation. An empty column resolves to the floor.
+    fn autofit_width_for_column(&self, col: u32, window: &mut Window) -> f32 {
+        let publication = self.sources.publication.load_full();
+        if publication.sheet != self.active_sheet {
+            return autofit_width(0.0);
+        }
+        // Snapshot each published cell's text + resolved font while the caches lock is held, then
+        // release it before shaping (mirrors `resolve_frame`'s "drop the lock before painting"). This
+        // scans the whole publication once, keeping only this column's non-empty cells — O(published
+        // cells) per call, the snapshot Vec holding at most one column's worth. Cheap overall now the
+        // whole-sheet fan-out is guarded above: it runs O(published) × a small selected-column count.
+        let snapshots: Vec<(String, f32, Option<SharedString>, bool, bool)> = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(self.active_sheet) else {
+                return autofit_width(0.0);
+            };
+            publication
+                .cells
+                .iter()
+                .filter(|pc| pc.col == col && !pc.display_text.is_empty())
+                .map(|pc| {
+                    let style = cache.render_style(pc.row, pc.col).copied();
+                    let font_px = style.map(font_px_of).unwrap_or(CELL_FONT_PX);
+                    let family = style.and_then(|s| {
+                        cache
+                            .font_families()
+                            .get(s.font_family as usize)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| SharedString::from(name.to_string()))
+                    });
+                    (
+                        pc.display_text.clone(),
+                        font_px,
+                        family,
+                        style.map(|s| s.bold).unwrap_or(false),
+                        style.map(|s| s.italic).unwrap_or(false),
+                    )
+                })
+                .collect()
+        };
+        let max_text_px = snapshots
+            .iter()
+            .fold(0.0_f32, |acc, (text, px, fam, b, i)| {
+                acc.max(measure_incell_text_width(
+                    text,
+                    *px,
+                    fam.clone(),
+                    *b,
+                    *i,
+                    window,
+                ))
+            });
+        autofit_width(max_text_px)
     }
 
     /// Extend a header drag: map the pointer to a track on `axis` and move the selection's active
@@ -3096,7 +3215,16 @@ impl GridView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.begin_resize(RowOrCol::Col, c, event, window, cx);
+                        // A single press begins the drag-resize; the 2nd click of a double-click
+                        // autofits the column to its content (`functional_spec.md §7`) without
+                        // beginning a resize. The 3rd+ click of a rapid multi-click burst is ignored
+                        // so a triple-click neither re-autofits (a redundant same-width undo step) nor
+                        // starts a stray resize.
+                        match event.click_count {
+                            1 => this.begin_resize(RowOrCol::Col, c, event, window, cx),
+                            2 => this.autofit_column(c, window, cx),
+                            _ => {}
+                        }
                         cx.stop_propagation();
                     }),
                 )
@@ -4143,6 +4271,14 @@ fn measure_incell_text_width(
         )
         .width()
         .as_f32()
+}
+
+/// Pure autofit-width math (`functional_spec.md §7`, D7.3): the widest measured cell-text width
+/// (device px) plus [`AUTOFIT_PADDING_PX`], clamped to `[AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX]`.
+/// An empty column (`max_text_px == 0.0`) resolves to the floor. Extracted from
+/// [`GridView::autofit_width_for_column`] so the padding + clamp is unit-testable without a `Window`.
+fn autofit_width(max_text_px: f32) -> f32 {
+    (max_text_px + AUTOFIT_PADDING_PX).clamp(AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX)
 }
 
 /// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
@@ -5750,6 +5886,210 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    // ---- Autofit column width (`functional_spec.md §7`) ------------------------------------
+
+    /// Sources with the given `(row, col, text)` published plain-text cells over Excel-max dims —
+    /// the fixtures for the autofit width tests.
+    fn autofit_sources(cells: &[(u32, u32, &str)]) -> (GridDataSources, SheetId) {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::{CellKind, Publication, PublishedCell};
+        let sheet = SheetId(0);
+        let published: Vec<PublishedCell> = cells
+            .iter()
+            .map(|(r, c, t)| PublishedCell {
+                row: *r,
+                col: *c,
+                display_text: t.to_string(),
+                kind: CellKind::Text,
+                text_color: None,
+            })
+            .collect();
+        let mut caches = SheetCaches::new();
+        caches.insert(
+            sheet,
+            SheetCacheBuilder::new(
+                freecell_core::limits::MAX_ROWS,
+                freecell_core::limits::MAX_COLS,
+            )
+            .build(),
+        );
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: published,
+        };
+        (
+            GridDataSources {
+                publication: Arc::new(ArcSwap::from_pointee(publication)),
+                caches: Arc::new(RwLock::new(caches)),
+            },
+            sheet,
+        )
+    }
+
+    /// The `(start, end, px)` of each column `ResizeCommitted` the recording captured, in order.
+    fn captured_resizes(events: &Rc<RefCell<Vec<GridEvent>>>) -> Vec<(u32, u32, f32)> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Col,
+                    start,
+                    end,
+                    px,
+                } => Some((*start, *end, *px)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn autofit_width_pads_and_clamps() {
+        // Empty column (no text) → the floor.
+        assert_eq!(autofit_width(0.0), AUTOFIT_MIN_WIDTH_PX);
+        // A normal measured width → text + padding.
+        assert_eq!(autofit_width(100.0), 100.0 + AUTOFIT_PADDING_PX);
+        // A tiny width still clamps up to the floor.
+        assert_eq!(autofit_width(1.0), AUTOFIT_MIN_WIDTH_PX);
+        // A very long value clamps down to the cap.
+        assert_eq!(autofit_width(100_000.0), AUTOFIT_MAX_WIDTH_PX);
+    }
+
+    #[gpui::test]
+    fn autofit_column_fits_published_cell(cx: &mut TestAppContext) {
+        // Double-click autofit sizes a column to its widest published cell + padding, over the floor.
+        let text = "a reasonably wide value";
+        let (sources, _s) = autofit_sources(&[(1, 2, text)]);
+        let (g, window, events) = recording_over(cx, sources);
+        let measured = window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let m =
+                        measure_incell_text_width(text, CELL_FONT_PX, None, false, false, window);
+                    grid.autofit_column(2, window, cx);
+                    m
+                })
+            })
+            .unwrap();
+        let resizes = captured_resizes(&events);
+        assert_eq!(resizes.len(), 1, "single-column autofit emits one resize");
+        let (start, end, px) = resizes[0];
+        assert_eq!((start, end), (2, 2), "resizes just the clicked column");
+        assert!(
+            (px - autofit_width(measured)).abs() < 0.5,
+            "px {px} vs expected {}",
+            autofit_width(measured)
+        );
+        assert!(px > AUTOFIT_MIN_WIDTH_PX, "wide content exceeds the floor");
+    }
+
+    #[gpui::test]
+    fn autofit_empty_column_shrinks_to_floor(cx: &mut TestAppContext) {
+        // A column with no published cells autofits to the configured floor (D7.3).
+        let (sources, _s) = autofit_sources(&[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.autofit_column(5, window, cx);
+                });
+            })
+            .unwrap();
+        let resizes = captured_resizes(&events);
+        assert_eq!(resizes.len(), 1);
+        assert_eq!(resizes[0], (5, 5, AUTOFIT_MIN_WIDTH_PX));
+    }
+
+    #[gpui::test]
+    fn autofit_multi_column_selection_fits_each(cx: &mut TestAppContext) {
+        // A divider double-clicked inside a full-column multi-column selection autofits every column
+        // in the run — each to its own content — one `ResizeCommitted` per column (D7.1).
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_column(1, false, window, cx);
+                    grid.select_column(3, true, window, cx);
+                    assert_eq!(grid.resize_run_for(RowOrCol::Col, 2), (1, 3));
+                    grid.autofit_column(2, window, cx);
+                });
+            })
+            .unwrap();
+        let cols: Vec<u32> = captured_resizes(&events)
+            .iter()
+            .map(|(s, e, _)| {
+                assert_eq!(s, e, "each autofit resize targets a single column");
+                *s
+            })
+            .collect();
+        assert_eq!(cols, vec![1, 2, 3], "each selected column autofit once");
+    }
+
+    #[gpui::test]
+    fn autofit_under_select_all_fits_only_the_divider_column(cx: &mut TestAppContext) {
+        // Select-all classifies as a full-column run spanning every column; autofit must NOT fan out
+        // to 16,384 per-column `SetColumnWidths` (that would mass-shrink the sheet). The whole-sheet
+        // run collapses to just the divider's own column — exactly one resize.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_all(window, cx);
+                    assert_eq!(
+                        grid.resize_run_for(RowOrCol::Col, 3),
+                        (0, freecell_core::limits::MAX_COLS - 1),
+                        "select-all resolves to the whole-sheet column run"
+                    );
+                    grid.autofit_column(3, window, cx);
+                });
+            })
+            .unwrap();
+        let resizes = captured_resizes(&events);
+        assert_eq!(
+            resizes.len(),
+            1,
+            "whole-sheet autofit emits exactly one resize, not one per column"
+        );
+        assert_eq!(resizes[0].0, 3);
+        assert_eq!(resizes[0].1, 3, "only the divider column is autofit");
+    }
+
+    #[gpui::test]
+    fn commit_resize_noop_is_skipped(cx: &mut TestAppContext) {
+        // A divider click with no drag (`current_px == start_px`) must not freeze a preview or emit a
+        // redundant `SetColumnWidths` — otherwise a double-click-to-autofit gains a spurious pre-step.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.commit_resize(
+                        ResizeDrag {
+                            axis: RowOrCol::Col,
+                            index: 2,
+                            start_px: 100.0,
+                            current_px: 100.0,
+                            run: (2, 2),
+                            origin_coord: 0.0,
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        grid.resize_preview.is_none(),
+                        "an unchanged resize freezes no preview"
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            captured_resizes(&events).is_empty(),
+            "an unchanged resize emits no ResizeCommitted"
+        );
     }
 
     #[gpui::test]

@@ -2986,7 +2986,7 @@ impl ChromeView {
                 StyleAttr::Underline,
                 cx,
             ))
-            // Strikethrough + Wrap text, appended to the B/I/U toggle group
+            // Strikethrough, appended to the B/I/U toggle group
             // (`ui_design.md §1.1`, `functional_spec.md §1`).
             .child(toggle(
                 "strikethrough",
@@ -2994,14 +2994,6 @@ impl ChromeView {
                 "Strikethrough",
                 self.strikethrough_active(),
                 StyleAttr::Strikethrough,
-                cx,
-            ))
-            .child(toggle(
-                "wrap",
-                "icons/text-wrap.svg",
-                "Wrap text",
-                self.wrap_active(),
-                StyleAttr::WrapText,
                 cx,
             ))
             .child(action_divider())
@@ -3103,6 +3095,15 @@ impl ChromeView {
                 "Align bottom",
                 VAlign::Bottom,
                 "icons/arrow-down-from-line.svg",
+                cx,
+            ))
+            // Wrap text — grouped with vertical alignment, right of Align bottom.
+            .child(toggle(
+                "wrap",
+                "icons/text-wrap.svg",
+                "Wrap text",
+                self.wrap_active(),
+                StyleAttr::WrapText,
                 cx,
             ))
             .child(action_divider())

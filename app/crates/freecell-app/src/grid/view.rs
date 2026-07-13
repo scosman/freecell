@@ -16,7 +16,8 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use gpui::{
-    canvas, deferred, div, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context, Entity,
+    canvas, deferred, div, prelude::*, px, relative, rgb, rgba, AnyElement, App, Bounds, Context,
+    Entity,
     FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Rgba, SharedString, Window,
 };
@@ -44,7 +45,8 @@ use super::layout::{
 };
 use super::{
     GridEvent, GridEventSink, RowOrCol, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX,
-    CELL_H_PAD, CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, GRIDLINE,
+    CELL_H_PAD, CELL_LINE_HEIGHT_FACTOR, CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX,
+    EDGE_AUTOSCROLL_STEP_PX, GRIDLINE,
     GRID_FONT_FAMILY, HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT,
     SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
 };
@@ -3063,6 +3065,9 @@ fn cell_element(
         .whitespace_nowrap()
         .px(px(CELL_H_PAD))
         .text_size(px(CELL_FONT_PX))
+        // Explicit line box so the v-align inset is tunable (see `CELL_LINE_HEIGHT_FACTOR`);
+        // relative, so per-cell font sizes below scale their line box with the glyph.
+        .line_height(relative(CELL_LINE_HEIGHT_FACTOR))
         .text_color(text_color)
         // Render the grid in the bundled Inter family (an explicit per-cell family below still
         // wins, e.g. the serif case).

@@ -60,6 +60,14 @@ pub const CELL_FONT_PX: f32 = 13.0;
 pub const HEADER_FONT_PX: f32 = 11.5;
 /// Horizontal text padding inside a cell (px).
 pub const CELL_H_PAD: f32 = 4.0;
+/// Cell text line-height as a multiple of the font size. This is the knob for the perceived
+/// top/bottom inset under vertical alignment: the glyph is painted centered inside a line box of
+/// `factor × font px`, so the extra leading splits above and below it, and `items_start`/
+/// `items_end` can only travel `row height − line box` px. At gpui's default (`phi()` =
+/// 1.618034 — reproduced here verbatim so introducing the constant moved no pixels) a 13 px font
+/// makes a ~21 px line box in a 24 px default row: top vs bottom alignment differs by only ~2 px
+/// and both look bottom-ish. Lower the factor to shrink the leading and let alignment bite.
+pub const CELL_LINE_HEIGHT_FACTOR: f32 = 1.618_034;
 /// Seconds the overlay scrollbars stay visible after the last scroll before fading.
 pub const SCROLLBAR_FADE_SECS: u64 = 2;
 

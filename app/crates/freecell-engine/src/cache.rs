@@ -26,7 +26,7 @@
 //! `WorkbookDocument` accessors take 0-based indices; when this module reads a raw `Worksheet`
 //! it converts the 1-based `Row.r` / `Col.min..=max` itself.
 
-use freecell_core::cache::{DEFAULT_COL_WIDTH_PX, DEFAULT_ROW_HEIGHT_PX};
+use freecell_core::cache::{DEFAULT_CELL_FONT_PX, DEFAULT_COL_WIDTH_PX, DEFAULT_ROW_HEIGHT_PX};
 use freecell_core::{
     limits, BorderSpec, CellRef, Edge, LinePattern, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
 };
@@ -65,6 +65,21 @@ pub(crate) fn col_ironcalc_px(device_px: f64) -> f64 {
 /// Converts a FreeCell device-px row height back to IronCalc pixels — the inverse of [`row_px`].
 pub(crate) fn row_ironcalc_px(device_px: f64) -> f64 {
     device_px * (IRONCALC_DEFAULT_ROW_HEIGHT_PX / DEFAULT_ROW_HEIGHT_PX as f64)
+}
+
+/// The IronCalc-space row height a cell at `font_px` (device px) auto-grows to, keeping the
+/// **default** row-height : font-size ratio ([`DEFAULT_ROW_HEIGHT_PX`] : [`DEFAULT_CELL_FONT_PX`]
+/// ≈ 1.85) at every size. The grow is proportional, not "line box + fixed padding": at the
+/// default 13 px font it yields exactly the 24 px default row, and a 20 pt (≈26.7 px) font grows
+/// the row to ≈49 px device — always enough to contain the font's line box (gpui's default
+/// ≈1.618× the glyph) with the same proportional slack the default cell has. That slack is what
+/// keeps vertical alignment (top/middle/bottom) meaningful: the old fixed-padding formula grew
+/// the row *less* than the line box for large fonts, so the overflowing line box inverted
+/// top/bottom placement. The result is returned in IronCalc px (the engine's storage space); the
+/// render path scales it back to device via [`row_px`], so we pre-divide by that factor here.
+pub(crate) fn autofit_row_ironcalc_px(font_px: f64) -> f64 {
+    let device = font_px * (DEFAULT_ROW_HEIGHT_PX as f64 / DEFAULT_CELL_FONT_PX as f64);
+    row_ironcalc_px(device)
 }
 
 /// The FreeCell-px row-height **override** for `row` (0-based): `Some(px)` when the engine reports
@@ -918,6 +933,36 @@ mod tests {
         assert!(
             (row_px(2.0 * IRONCALC_DEFAULT_ROW_HEIGHT_PX) - 2.0 * DEFAULT_ROW_HEIGHT_PX).abs()
                 < 1e-3
+        );
+    }
+
+    #[test]
+    fn autofit_row_keeps_default_ratio() {
+        // The SetFont auto-grow height is PROPORTIONAL: at the default font it is exactly the
+        // default row (no growth), and at any larger font the *device* height keeps the default
+        // row-height : font-size ratio — so alignment slack scales instead of the row falling
+        // short of the line box (the top/bottom-inversion bug).
+        //
+        // Default font (13 px) → default row (24 px device), i.e. the IronCalc default height.
+        let ic_default = autofit_row_ironcalc_px(DEFAULT_CELL_FONT_PX as f64);
+        assert!(
+            (row_px(ic_default) - DEFAULT_ROW_HEIGHT_PX).abs() < 1e-3,
+            "13 px font should not grow the default row, got {} device px",
+            row_px(ic_default)
+        );
+        // 24 pt (= 32 px device) grows the row to 32 × (24 / 13) ≈ 59.08 device px, comfortably
+        // above the font's ≈1.618× line box (≈51.8 px) — the slack the default cell also has.
+        let font_px = 24.0 * 96.0 / 72.0; // 32 px
+        let device = row_px(autofit_row_ironcalc_px(font_px)) as f64;
+        let expected = font_px * (DEFAULT_ROW_HEIGHT_PX as f64 / DEFAULT_CELL_FONT_PX as f64);
+        assert!(
+            (device - expected).abs() < 1e-2,
+            "24 pt row auto-grow = {device} device px, expected ≈ {expected}"
+        );
+        assert!(
+            device > font_px * 1.618,
+            "grown row ({device}) must contain the font's line box (~{})",
+            font_px * 1.618
         );
     }
 

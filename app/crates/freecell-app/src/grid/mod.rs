@@ -54,8 +54,10 @@ pub const SELECTION_FILL_ALPHA: f32 = 0.10;
 /// Overlay-scrollbar thumb colour (semi-transparent grey).
 pub const SCROLLBAR_RGBA: u32 = 0x8A8A8A99;
 
-/// Cell text size (px) — `ui_design.md §3.3` ("13 px bundled Inter").
-pub const CELL_FONT_PX: f32 = 13.0;
+/// Cell text size (px) — `ui_design.md §3.3` ("13 px bundled Inter"). Defined in
+/// `freecell-core` so the engine's row auto-grow can keep the default row-height : font-size
+/// ratio as fonts scale (see the constant's doc there).
+pub const CELL_FONT_PX: f32 = freecell_core::cache::DEFAULT_CELL_FONT_PX;
 /// Header text size (px) — small medium-weight labels.
 pub const HEADER_FONT_PX: f32 = 11.5;
 /// Horizontal text padding inside a cell (px).

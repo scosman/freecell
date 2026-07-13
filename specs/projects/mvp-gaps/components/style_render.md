@@ -106,12 +106,23 @@ Rule (simple, correct under overdraw): **for each visible cell whose
 ### Row auto-grow (worker, inside the SetFont command handler)
 
 After the `on_paste_styles` write (architecture §3.3): for each row in the clamped
-target area, `needed_px = ceil(max_size_pt_applied * 96/72 * 1.25) + 4`; read
-`get_row_height(row)`; collect rows where `needed_px > current`; coalesce contiguous
-runs with equal target and apply `set_rows_height(run)` per run, then the existing
-cache geometry batch update. Never shrinks; never runs on open; lands adjacent to the
-style diff in history (undo = height step + style step — two steps, recorded in
+target area the row grows **proportionally**, keeping the default row-height :
+font-size ratio (`DEFAULT_ROW_HEIGHT_PX : DEFAULT_CELL_FONT_PX` = 24 : 13) at every
+size — `needed_device = font_px * 24/13`, converted to IronCalc storage px by
+`cache::autofit_row_ironcalc_px` (`= font_px * 25/13`, ceil'd). Read
+`get_row_height(row)`; collect rows where `needed > current`; coalesce contiguous runs
+with equal target and apply `set_rows_height(run)` per run, then the existing cache
+geometry batch update. Never shrinks; never runs on open; lands adjacent to the style
+diff in history (undo = height step + style step — two steps, recorded in
 DECISIONS_TO_REVIEW as accepted).
+
+The grow is proportional rather than "line box + fixed padding" because gpui renders
+each cell at a line box ≈1.618× the glyph (its default), while the engine stores row
+heights in IronCalc px. The old `ceil(font_px*1.25)+4` formula grew a large-font row
+*less* than that line box, so the overflowing box inverted top/bottom vertical
+alignment (align-top drifted toward the bottom and vice-versa). A proportional row
+(ratio 1.85 > 1.618) always contains the line box with the same proportional slack the
+default cell has, keeping alignment meaningful at any font size.
 
 ## Dependencies
 
@@ -129,7 +140,9 @@ Unit (freecell-core):
   stripped), `h:mm`✓, `#,##0.00`✗, `yyyy\-mm`✓.
 - `format_color_index_table` — named 0–6 + `[Color 12]` classic palette.
 - `font_size_q_roundtrip_and_default_zero`; `a1_range_parse_valid_and_hostile`.
-- `auto_grow_formula_thresholds` — 11pt→no grow at 28px default; 24pt→44px; 36→64.
+- `autofit_row_keeps_default_ratio` — 13px default font → no grow (default row); larger
+  fonts grow the row proportionally (device height = font_px * 24/13), always clearing
+  the font's ≈1.618× line box.
 Engine integration (freecell-engine):
 - `cache_carries_font_border_numfmt_from_file` — fixture xlsx with fonts/borders/
   formats: resolved RenderStyle fields + side tables correct.

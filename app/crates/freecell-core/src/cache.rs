@@ -19,6 +19,12 @@ use crate::style::RenderStyle;
 pub const DEFAULT_COL_WIDTH_PX: f32 = 100.0;
 /// Default row height in px when the file specifies no override (`ui_design.md §3.3`).
 pub const DEFAULT_ROW_HEIGHT_PX: f32 = 24.0;
+/// The grid's default cell font size in px (the app's `CELL_FONT_PX`). Lives here (next to
+/// [`DEFAULT_ROW_HEIGHT_PX`]) because the pair defines the row-height : font-size ratio
+/// (24 : 13 ≈ 1.85) that the engine's row auto-grow keeps as fonts scale up — gpui's default
+/// line box is `phi` (≈1.618×) the font size, so a row grown by this ratio always fits the
+/// line box with proportional slack, keeping vertical alignment meaningful at any size.
+pub const DEFAULT_CELL_FONT_PX: f32 = 13.0;
 
 /// An index into a [`SheetCache`]'s resolved-style table. Interned worker-side so equal
 /// styles share one id (`components/style_cache.md`).

@@ -653,6 +653,30 @@ pub fn all() -> Vec<RenderCase> {
                 .wrap(1, 1)
                 .v_align(1, 1, VAlign::Bottom),
         ),
+        // Vertical alignment at a LARGE font, in a row grown to the proportional auto-grow height
+        // the worker now produces for 24 pt (≈59.52 device px, `cache::autofit_row_ironcalc_px`;
+        // the worker formula itself is guarded by `autofit_row_keeps_default_ratio`). These cases
+        // guard the RENDER half of the top/bottom inversion bug: given a row that contains the
+        // font's line box, "align top" must sit near the top and "align bottom" near the bottom —
+        // the two baselines are visibly different. If the injected height were dropped below the
+        // line box (as the old fixed-padding auto-grow produced), the overflowing box would invert
+        // both — so these baselines pin the correct, non-inverted placement.
+        cell(
+            "cell_valign_top_large_font",
+            Scene::new()
+                .input(1, 1, "Top")
+                .font(1, 1, None, Some(24.0))
+                .row_height(1, 59.52)
+                .v_align(1, 1, VAlign::Top),
+        ),
+        cell(
+            "cell_valign_bottom_large_font",
+            Scene::new()
+                .input(1, 1, "Bot")
+                .font(1, 1, None, Some(24.0))
+                .row_height(1, 59.52)
+                .v_align(1, 1, VAlign::Bottom),
+        ),
         cell(
             "cell_wide_column",
             Scene::new().input(1, 1, "Wide column").col_width(1, 220.0),
@@ -844,11 +868,15 @@ pub fn all() -> Vec<RenderCase> {
         ),
         cell(
             // 24pt text in a row grown to fit it (the worker's auto-grow, simulated by the injected
-            // row height ≈ ceil(24*96/72*1.25)+4 IronCalc px → FreeCell px).
+            // row height). The grow is PROPORTIONAL — it keeps the default row-height : font-size
+            // ratio (24 px : 13 px) so the row contains the font's line box with the same slack a
+            // default cell has, keeping vertical alignment meaningful. 24 pt = 32 px device →
+            // 32 × 24/13 ≈ 59.08 device px; the engine stores that in IronCalc px (ceil = 62) which
+            // the render path scales back to ≈59.52 device (`cache::autofit_row_ironcalc_px`).
             "font_size_24_row_grown",
             at(Scene::new())
                 .font(1, 1, None, Some(24.0))
-                .row_height(1, 38.0),
+                .row_height(1, 59.52),
         ),
         cell(
             // A family the runner does not have → gpui falls back to the default font (display-only;

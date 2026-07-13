@@ -1081,9 +1081,15 @@ impl Worker {
                 if set_res.is_ok() {
                     if let Some(pt) = size_pt {
                         // Auto-grow only on a size change (a family swap keeps the size, so the
-                        // row already fits). Work in IronCalc px (get_row_height's 28px-default
-                        // space) so the same 96/72 factor drives text size + row height.
-                        let needed = (pt * 96.0 / 72.0 * 1.25).ceil() + 4.0;
+                        // row already fits). Grow the row PROPORTIONALLY — keep the default
+                        // row-height : font-size ratio at every size (`cache::autofit_row_ironcalc_px`)
+                        // rather than "line box + fixed padding". The old fixed-padding formula grew
+                        // large fonts *less* than their line box, so the overflowing line box
+                        // inverted top/bottom vertical alignment; a proportional row always contains
+                        // the line box with the same slack the default cell has. Returned in
+                        // IronCalc px (get_row_height's storage space) to compare + write directly.
+                        let font_px = pt * 96.0 / 72.0;
+                        let needed = cache::autofit_row_ironcalc_px(font_px).ceil();
                         let mut grow_rows: Vec<u32> = Vec::new();
                         for row in clamped.rows() {
                             if let Ok(cur) = doc.row_height_px(idx, row) {

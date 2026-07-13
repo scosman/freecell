@@ -3206,9 +3206,9 @@ const IN_CELL_TOOLTIP_TEXT: u32 = 0xF5F5F5;
 const IN_CELL_BORDER_TOTAL_PX: f32 = 4.0;
 /// Line-box factor for the in-cell editor's hosted input, applied to the font px so the line box
 /// scales with the font instead of gpui-component's fixed `Rems(1.25)` (= 20 px at the 16 px rem).
-/// Numerically the same `1.25` the engine's row auto-grow uses (`worker/run.rs`:
-/// `ceil(font_px * 1.25) + 4`) — but that height is in IronCalc space and is scaled ×24/28 to
-/// device px before it reaches the render path, so the two do NOT cancel (see below).
+/// This is the editor overlay's OWN line box, independent of the engine's row auto-grow (which is
+/// proportional — `cache::autofit_row_ironcalc_px`); `1.25` is a tight single-line box that always
+/// fits inside a proportionally grown row, and the floor below covers rows that were *not* grown.
 const IN_CELL_LINE_HEIGHT_FACTOR: f32 = 1.25;
 
 /// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
@@ -3225,17 +3225,16 @@ const IN_CELL_LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// (`cell_element`, a plain `div().h(px(h)).text_size(..)` whose line height scales with the font)
 /// renders it fine.
 ///
-/// Why the floor is needed (unit spaces do NOT cancel): `h` arrives in device px — it is the row
-/// auto-grow height, which the engine computes in IronCalc space (`worker/run.rs`:
-/// `ceil(font_px * 1.25) + 4`, in the 28 px-default IronCalc space) and then scales to device px by
-/// ×24/28 (`freecell-engine::cache::row_px`). But the glyph renders at pure device px
-/// (`pt * 96/72`, no 24/28). So for an auto-grown large font `h - 4` lands ~15 % *below*
-/// `line_height` (e.g. 24 pt: device `h ≈ 44 * 24/28 ≈ 37.7`, `h - 4 ≈ 33.7 < 40`). The
-/// `.max(line_height)` floor keeps the control at least as tall as its own line box, so the glyph
-/// is never clipped; when `h - 4 < line_height` the `Input` simply overflows the cell wrapper by a
-/// few px (single-line `Input` has only `overflow_x_hidden` — no vertical mask — so the overflow
-/// stays visible and vertically centered, not cut off). Pure so it is unit-testable; the on-screen
-/// result (that the `Input` honours these) is the owner's Mac check.
+/// Why the floor is needed: `h` arrives in device px, and a cell may hold a large font in a row
+/// that was NOT grown to fit it — a user-shrunk row, or a large font applied where auto-grow did
+/// not run — so `h - 4` can land below the font's line box. (A row grown by the proportional
+/// auto-grow, `cache::autofit_row_ironcalc_px`, always clears the line box, so the floor is a
+/// no-op there; it exists for the un-grown / shrunk case.) The `.max(line_height)` floor keeps the
+/// control at least as tall as its own line box, so the glyph is never clipped; when
+/// `h - 4 < line_height` the `Input` simply overflows the cell wrapper by a few px (single-line
+/// `Input` has only `overflow_x_hidden` — no vertical mask — so the overflow stays visible and
+/// vertically centered, not cut off). Pure so it is unit-testable; the on-screen result (that the
+/// `Input` honours these) is the owner's Mac check.
 fn incell_input_geometry(h: f32, font_px: f32) -> (f32, f32) {
     let line_h = font_px * IN_CELL_LINE_HEIGHT_FACTOR;
     // Floor at the line box so `line_h <= control_h` in ALL cases (auto-grown large fonts, default
@@ -4826,21 +4825,17 @@ mod tests {
     #[test]
     fn incell_input_floors_control_at_line_box() {
         // BUG A: the hosted single-line `Input` must never be shorter than its own font-scaled line
-        // box, else a large glyph is clipped. The subtlety the floor guards: `h` arrives in DEVICE
-        // px — the row auto-grow height, computed by the engine in IronCalc space
-        // (`worker/run.rs`: ceil(font_px*1.25)+4) and scaled ×24/28 to device px
-        // (`freecell-engine::cache::row_px`) — while the glyph renders at pure device px
-        // (pt*96/72, no 24/28). So for an auto-grown large font `h - 4` lands ~15 % *below*
-        // `line_h = font_px*1.25`; `.max(line_h)` is what keeps the line box inside the control.
-        // This pins the geometry the render path feeds the `Input`; the on-screen result (that the
-        // `Input` honours it) is the owner's Mac check.
+        // box, else a large glyph is clipped. The floor guards the case where a large font sits in a
+        // row that was NOT grown to fit it — a user-shrunk row, or a large font applied where the
+        // proportional auto-grow (`cache::autofit_row_ironcalc_px`) did not run. A proportionally
+        // grown row always clears the line box, so the floor is a no-op there; here we feed a SHORT
+        // row so `h - 4` lands below the line box and the floor must engage.
         let font_px: f32 = 24.0 * 96.0 / 72.0; // 24 pt -> 32 px, as in resolve_incell_font.
         let line_expect = font_px * 1.25; // 40 px
 
-        // The DEVICE-px row height the app actually feeds us: the IronCalc-space auto-grow height
-        // (ceil(font_px*1.25)+4 = 44) scaled ×24/28 ≈ 37.7 px — NOT 44.
-        let needed_ic = (font_px * 1.25).ceil() + 4.0; // 44 px, IronCalc space
-        let h = needed_ic * 24.0 / 28.0; // ≈ 37.7 px device
+        // A 24 px row (the default) holding a 24 pt font: inner height h-4 = 20 px, well below the
+        // 40 px line box — the un-grown / shrunk case the floor exists for.
+        let h = 24.0_f32;
         assert!(
             h - 4.0 < line_expect,
             "precondition: without the floor control_h would be h-4 = {} px, below the line box {line_expect} px",
@@ -4849,9 +4844,9 @@ mod tests {
 
         let (control_h, line_h) = incell_input_geometry(h, font_px);
         assert!((line_h - line_expect).abs() < 1e-4, "line_h = {line_h}");
-        // The floor engages: the control is lifted to the line box (≈40), NOT left at h-4 (≈33.7).
+        // The floor engages: the control is lifted to the line box (40), NOT left at h-4 (20).
         // Dropping `.max(line_h)` from `incell_input_geometry` makes THIS assertion fail
-        // (control_h would be ≈33.7 < 40) — it is the floor-discriminating check.
+        // (control_h would be 20 < 40) — it is the floor-discriminating check.
         assert!(
             (control_h - line_h).abs() < 1e-4,
             "floor must lift control_h to the line box, got {control_h} (line box {line_h})"

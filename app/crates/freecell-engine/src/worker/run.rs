@@ -30,7 +30,8 @@ use freecell_core::merge_guard::{blocks_col_op, blocks_fill, blocks_row_op};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{
-    limits, CellKind, CellRange, CellRef, Publication, PublishedCell, SelectionStats, SheetId,
+    limits, CellKind, CellRange, CellRef, Direction, Publication, PublishedCell, SelectionStats,
+    SheetId,
 };
 
 use freecell_chart_model::{
@@ -446,6 +447,9 @@ impl Worker {
         // Selection-stats queries (`Command::SelectionStats`) are pure reads (no eval/publish),
         // computed after the edit batch so they observe every mutation in this batch.
         let mut stats_ops: Vec<(SheetId, CellRange, u64)> = Vec::new();
+        // Edge-of-data resolves (`Command::ResolveEdge`) are pure reads too (⌘+arrow target lookup),
+        // run after the edit batch so a jump observes this batch's mutations.
+        let mut edge_ops: Vec<(SheetId, CellRef, Direction, u64)> = Vec::new();
         let mut saves: Vec<(PathBuf, u64)> = Vec::new();
         // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
         // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
@@ -504,6 +508,12 @@ impl Worker {
                     range,
                     req_id,
                 } => stats_ops.push((sheet, range, req_id)),
+                Command::ResolveEdge {
+                    sheet,
+                    from,
+                    dir,
+                    req_id,
+                } => edge_ops.push((sheet, from, dir, req_id)),
                 Command::Find {
                     sheet,
                     query,
@@ -678,6 +688,17 @@ impl Worker {
                 None => SelectionStats::EMPTY,
             };
             self.emit(WorkerEvent::SelectionStats { req_id, stats });
+        }
+
+        // Edge-of-data resolves (pure, like `reads`/`stats_ops`): walk the active line's populated
+        // cells and reply the ⌘+arrow target. An unresolvable sheet (deleted mid-flight) replies the
+        // origin cell (no move).
+        for (sheet, from, dir, req_id) in edge_ops {
+            let target = match self.resolve(sheet) {
+                Some(idx) => self.doc.resolve_edge(idx, from, dir),
+                None => from,
+            };
+            self.emit(WorkerEvent::EdgeResolved { req_id, target });
         }
 
         for (path, req_id) in saves {
@@ -3602,6 +3623,39 @@ mod tests {
         assert_eq!(stats.min, Some(10.0));
         assert_eq!(stats.max, Some(20.0));
         // A stats query is a read — it publishes nothing.
+        assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
+    }
+
+    #[test]
+    fn resolve_edge_command_replies_target() {
+        // A `ResolveEdge` batch resolves the ⌘+arrow edge-of-data target and replies — a pure read
+        // (no publish), tagged with the request's `req_id`.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "a"), // A1
+            set_input(sheet, 1, 0, "b"), // A2
+            set_input(sheet, 2, 0, "c"), // A3 — end of the run
+        ]);
+        let _ = drain_events(&rx);
+
+        worker.process_batch(vec![Command::ResolveEdge {
+            sheet,
+            from: CellRef::new(0, 0),
+            dir: Direction::Down,
+            req_id: 42,
+        }]);
+        let events = drain_events(&rx);
+        let target = events
+            .iter()
+            .find_map(|e| match e {
+                WorkerEvent::EdgeResolved { req_id: 42, target } => Some(*target),
+                _ => None,
+            })
+            .expect("a ResolveEdge batch replies EdgeResolved with the same req_id");
+        // Down from A1 through the run A1:A3 lands on the run's last cell A3 (row 2).
+        assert_eq!(target, CellRef::new(2, 0));
+        // A resolve is a read — it publishes nothing.
         assert!(!events.iter().any(|e| matches!(e, WorkerEvent::Published)));
     }
 

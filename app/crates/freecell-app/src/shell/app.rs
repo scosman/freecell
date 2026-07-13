@@ -1536,6 +1536,197 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn edge_resolved_applies_the_worker_target(cx: &mut TestAppContext) {
+        use freecell_core::{CellRef, SelectionModel};
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+
+        // A collapsing ⌘+arrow jump (`functional_spec.md §4`): the worker's edge-of-data target
+        // lands as a single-cell selection; the pending jump is cleared.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.arm_pending_edge_for_test(0, SheetId(3), CellRef::new(2, 2), false);
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EdgeResolved {
+                            req_id: 0,
+                            target: CellRef::new(20, 2),
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| *grid.read(cx).selection()),
+            SelectionModel::single(CellRef::new(20, 2)),
+            "⌘+arrow collapses to the resolved edge-of-data target"
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).pending_edge_is_armed_for_test()),
+            "the applied jump clears its pending context"
+        );
+
+        // A ⌘⇧+arrow jump extends the range: the anchor is preserved, the active end moves to target.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.arm_pending_edge_for_test(1, SheetId(3), CellRef::new(20, 2), true);
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EdgeResolved {
+                            req_id: 1,
+                            target: CellRef::new(20, 40),
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| *grid.read(cx).selection()),
+            SelectionModel {
+                anchor: CellRef::new(20, 2),
+                active: CellRef::new(20, 40),
+            },
+            "⌘⇧+arrow extends the selection to the resolved target, keeping the anchor"
+        );
+
+        // A stale reply (a superseded jump's `req_id`) is dropped — selection unchanged, jump still
+        // armed (its own reply is still pending).
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.arm_pending_edge_for_test(2, SheetId(3), CellRef::new(0, 0), false);
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EdgeResolved {
+                            req_id: 99,
+                            target: CellRef::new(5, 5),
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| *grid.read(cx).selection()),
+            SelectionModel {
+                anchor: CellRef::new(20, 2),
+                active: CellRef::new(20, 40),
+            },
+            "a stale EdgeResolved (superseded req_id) does not move the selection"
+        );
+        assert!(
+            cx.update(|cx| entity.read(cx).pending_edge_is_armed_for_test()),
+            "a stale reply leaves the in-flight jump armed for its own reply"
+        );
+    }
+
+    #[gpui::test]
+    fn edge_resolve_is_cancelled_by_a_selection_change(cx: &mut TestAppContext) {
+        use freecell_core::{CellRef, SelectionModel};
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+
+        // Arm a jump, then a genuine selection change (mouse/non-edge motion) supersedes it: the grid
+        // sets its own selection and the window routes the change, clearing the in-flight jump so its
+        // late reply is dropped (`functional_spec.md §4`).
+        let user_pick = SelectionModel::single(CellRef::new(4, 4));
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.arm_pending_edge_for_test(0, SheetId(3), CellRef::new(2, 2), false);
+                    // The grid updates its own selection first (as on a click), then the window folds
+                    // the change through the real routing.
+                    w.grid_for_test()
+                        .update(ctx, |g, gcx| g.set_selection(user_pick, gcx));
+                    w.route_selection_changed_for_test(user_pick, window, ctx);
+                });
+            })
+            .unwrap();
+        assert!(
+            !cx.update(|cx| entity.read(cx).pending_edge_is_armed_for_test()),
+            "a selection change cancels the in-flight jump"
+        );
+
+        // The now-stale reply arrives → dropped; the user's pick stands.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EdgeResolved {
+                            req_id: 0,
+                            target: CellRef::new(99, 2),
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| *grid.read(cx).selection()),
+            user_pick,
+            "a cancelled jump's late reply does not override the user's selection"
+        );
+    }
+
+    #[gpui::test]
+    fn edge_resolve_is_dropped_after_a_sheet_switch(cx: &mut TestAppContext) {
+        use freecell_core::{CellRef, SelectionModel};
+        boot(cx);
+        let (handle, entity) = loaded_window(
+            cx,
+            vec![sheet_meta(3, "Data", false), sheet_meta(5, "More", false)],
+        );
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+
+        // Arm a jump on sheet 3, then switch to sheet 5 before the reply. The switch clears the
+        // pending jump; the late reply must NOT move sheet 5's selection (`functional_spec.md §4`).
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.arm_pending_edge_for_test(0, SheetId(3), CellRef::new(2, 2), false);
+                    w.switch_sheet_for_test(SheetId(5), window, ctx);
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).active_sheet_for_test()),
+            SheetId(5)
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).pending_edge_is_armed_for_test()),
+            "switching sheets abandons the in-flight jump"
+        );
+
+        // The stale reply (for sheet 3) arrives while sheet 5 is active → dropped.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EdgeResolved {
+                            req_id: 0,
+                            target: CellRef::new(50, 2),
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| *grid.read(cx).selection()),
+            SelectionModel::default(),
+            "a jump resolved for the old sheet does not move the new sheet's selection"
+        );
+    }
+
     /// A minimal loaded line-chart spec for the seam-install test (`<c:lineChart/>` → Faithful).
     fn chart_spec_for_test() -> freecell_chart_model::ChartSpec {
         use freecell_chart_model::{

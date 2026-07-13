@@ -2190,11 +2190,48 @@ impl GridView {
         let Some(dims) = self.sheet_dims() else {
             return;
         };
-        let selection = apply_motion(*self.selection(), motion, dims);
+        // ⌘+arrow / ⌘⇧+arrow use edge-of-**data** targets, whose occupancy lives in the engine past
+        // the published viewport — route only these two to the async worker query (`functional_spec.md
+        // §4`, D4.1 Option A). The window applies the `EdgeResolved` reply. Every other motion stays
+        // synchronous through `apply_motion` below.
+        let sel = *self.selection();
+        if let Some((dir, extend)) = match motion {
+            Motion::JumpEdge(dir) => Some((dir, false)),
+            Motion::ExtendEdge(dir) => Some((dir, true)),
+            _ => None,
+        } {
+            self.events.emit(
+                &GridEvent::ResolveEdge {
+                    from: sel.active,
+                    anchor: sel.anchor,
+                    dir,
+                    extend,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        let selection = apply_motion(sel, motion, dims);
         if *self.selection() != selection {
             self.set_selection_and_emit(selection, window, cx);
             self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
         }
+    }
+
+    /// Applies a worker-resolved selection (the async ⌘+arrow edge jump, `functional_spec.md §4`) and
+    /// reveals its active cell. Like [`select_and_reveal`](Self::select_and_reveal) but keeps the range
+    /// (so ⌘⇧+arrow's extended selection survives) and does **not** emit `SelectionChanged` — the
+    /// window folds the chrome + shared state directly on the `EdgeResolved` reply, mirroring the paste
+    /// path (avoids a double fold).
+    pub fn set_selection_and_reveal(
+        &mut self,
+        selection: SelectionModel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selection(selection, cx);
+        self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
     }
 
     /// Build the frame-dependent element layers (cells + selection, headers, scrollbars) from a

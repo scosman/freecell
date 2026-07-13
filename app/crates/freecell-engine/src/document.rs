@@ -16,7 +16,7 @@ use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
-use freecell_core::{CellKind, CellRange, CellRef, Rgb, SelectionStats};
+use freecell_core::{CellKind, CellRange, CellRef, Direction, Rgb, SelectionStats, SheetDims};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
 use ironcalc_base::cell::CellValue;
@@ -1030,6 +1030,72 @@ impl WorkbookDocument {
             }
         }
         stats
+    }
+
+    /// Resolve the **edge-of-data** target for a ⌘/Ctrl+arrow jump from `from` in `dir`
+    /// (`Command::ResolveEdge`, `functional_spec.md §4`; the status quo `JumpEdge`/`ExtendEdge`).
+    ///
+    /// Gathers the **populated** indices on the active cell's line (rows in `from`'s column for a
+    /// vertical motion, cols in `from`'s row for a horizontal one) from `sheet_data` — populated
+    /// cells only, like [`find_matches`](Self::find_matches)/[`selection_stats`](Self::selection_stats)
+    /// — **sorts them ascending**, and feeds the slice to the pure Excel algorithm
+    /// ([`freecell_core::resolve_edge`]) over the full sheet dims. A cell is "populated" iff its raw
+    /// content is non-empty (a style-only `sheet_data` entry is empty content → not occupied, matching
+    /// the selection-stats "blanks don't" rule).
+    ///
+    /// Cost to collect + sort the line's occupancy: O(populated cells on the line) for a row jump;
+    /// O(populated rows) for a column jump (row-major `sheet_data` is scanned per row for the column's
+    /// key). The resolve itself is then **O(log populated)** (binary searches — no per-cell walk across
+    /// empty space, so a jump through an empty 1M-cell column is a couple of lookups). Never O(cells
+    /// selected). No mutation, no eval; correct **past the published viewport** (occupancy lives here in
+    /// the model).
+    pub(crate) fn resolve_edge(&self, sheet_idx: u32, from: CellRef, dir: Direction) -> CellRef {
+        crate::instrument::record_engine_call();
+        let dims = SheetDims::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        );
+        let ws = match self.worksheet(sheet_idx) {
+            Ok(ws) => ws,
+            // An unresolvable sheet has no occupancy — no move.
+            Err(_) => return from,
+        };
+        let vertical = matches!(dir, Direction::Up | Direction::Down);
+        // The candidate indices present in `sheet_data` on the active line (1-based engine keys →
+        // 0-based). Collected up front so the `&ws` borrow ends before the per-cell content probe.
+        let candidates: Vec<u32> = if vertical {
+            let col_1 = from.col as i32 + 1;
+            ws.sheet_data
+                .iter()
+                .filter(|(_row_1, cols)| cols.contains_key(&col_1))
+                .map(|(row_1, _cols)| (*row_1 - 1).max(0) as u32)
+                .collect()
+        } else {
+            match ws.sheet_data.get(&(from.row as i32 + 1)) {
+                Some(cols) => cols
+                    .keys()
+                    .map(|col_1| (*col_1 - 1).max(0) as u32)
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        // Keep only genuinely populated cells (a `sheet_data` entry can be style-only → empty content),
+        // sorted ascending — the shape `resolve_edge`'s binary searches require.
+        let mut occupied: Vec<u32> = candidates
+            .into_iter()
+            .filter(|&idx| {
+                let cell = if vertical {
+                    CellRef::new(idx, from.col)
+                } else {
+                    CellRef::new(from.row, idx)
+                };
+                self.cell_content(sheet_idx, cell)
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect();
+        occupied.sort_unstable();
+        freecell_core::resolve_edge(from, dir, dims, &occupied)
     }
 
     /// Replace `query` with `replacement` in a single cell (`Command::ReplaceOne`,
@@ -2210,6 +2276,77 @@ mod tests {
         // A selection over cells that are all blank aggregates to nothing.
         let stats = doc.selection_stats(0, CellRange::new(CellRef::new(5, 5), CellRef::new(9, 9)));
         assert_eq!(stats, SelectionStats::EMPTY);
+    }
+
+    #[test]
+    fn resolve_edge_walks_populated_cells_in_every_direction() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // Column A: a run A1:A3, a gap A4:A5, then A6; the rest of the column empty.
+        for row in [0, 1, 2, 5] {
+            doc.set_cell_input(0, CellRef::new(row, 0), "x").unwrap();
+        }
+        // Row 10 (index 9): a run at C..D (cols 2,3), then a gap, then F (col 5).
+        for col in [2, 3, 5] {
+            doc.set_cell_input(0, CellRef::new(9, col), "y").unwrap();
+        }
+        doc.evaluate();
+
+        // Down from A1 (in the run) → last of the run A3 (row 2).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(0, 0), Direction::Down),
+            CellRef::new(2, 0)
+        );
+        // Down from A3 (run's last, gap below) → cross the gap to A6 (row 5).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(2, 0), Direction::Down),
+            CellRef::new(5, 0)
+        );
+        // Down from A6 (nothing below) → the sheet's last row.
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 0), Direction::Down),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 0)
+        );
+        // Up from A6 → across the gap to the top run's last cell A3 (row 2).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 0), Direction::Up),
+            CellRef::new(2, 0)
+        );
+        // Horizontal: Right from C10 (col 2, in the run) → D10 (col 3, run's last before the gap).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(9, 2), Direction::Right),
+            CellRef::new(9, 3)
+        );
+        // Right from D10 → cross the gap to F10 (col 5).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(9, 3), Direction::Right),
+            CellRef::new(9, 5)
+        );
+    }
+
+    #[test]
+    fn resolve_edge_empty_sheet_goes_to_sheet_edge() {
+        let doc = WorkbookDocument::new_empty().unwrap();
+        // No data anywhere: ⌘+Down from a middle cell lands on the last row (Excel sheet-edge fallback).
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 5), Direction::Down),
+            CellRef::new(freecell_core::limits::MAX_ROWS - 1, 5)
+        );
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(5, 5), Direction::Right),
+            CellRef::new(5, freecell_core::limits::MAX_COLS - 1)
+        );
+    }
+
+    #[test]
+    fn resolve_edge_from_empty_cell_jumps_to_next_data() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A single populated cell far down column A; jumping down from the empty top lands on it.
+        doc.set_cell_input(0, CellRef::new(200, 0), "here").unwrap();
+        doc.evaluate();
+        assert_eq!(
+            doc.resolve_edge(0, CellRef::new(0, 0), Direction::Down),
+            CellRef::new(200, 0)
+        );
     }
 
     #[test]

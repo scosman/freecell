@@ -25,7 +25,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_chart_model::{ChartColor, ChartId, ChartInsertKind};
-use freecell_core::{limits, Rgb, SelectionModel, SheetId};
+use freecell_core::{limits, CellRef, Rgb, SelectionModel, SheetId};
 use freecell_engine::{
     Command, DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, PasteError,
     SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
@@ -56,6 +56,30 @@ struct SinkShared {
     /// The range clipboard's UI state (`last_copy_text`), shared so the grid-sink copy/paste key
     /// events and the window's `CopyReady` fold both reach it (`components/clipboard.md`).
     clipboard: RefCell<ClipboardCoordinator>,
+    /// The next request id for an async ⌘+arrow edge-of-data jump (`functional_spec.md §4`), and the
+    /// in-flight jump's context. The grid sink stamps a `req_id` + records `pending_edge` when it
+    /// sends `Command::ResolveEdge`; the window applies the `EdgeResolved` reply only when the id
+    /// still matches (a superseded jump is dropped). Cleared on any genuine selection change so a
+    /// click/arrow cancels an in-flight jump.
+    edge_seq: Cell<u64>,
+    pending_edge: Cell<Option<PendingEdge>>,
+}
+
+/// The context for an in-flight async ⌘+arrow edge-of-data jump (`functional_spec.md §4`, D4.1). The
+/// worker resolves only the target cell; the collapse-vs-extend decision + anchor stay here so the
+/// window can build the resulting selection on the `EdgeResolved` reply.
+#[derive(Debug, Clone, Copy)]
+struct PendingEdge {
+    /// The `Command::ResolveEdge` request id this pending jump is waiting on.
+    req_id: u64,
+    /// The sheet the jump was issued on. The reply is dropped if it is no longer the active sheet (a
+    /// tab switch mid-flight must not clobber another sheet's selection) — mirrors the `Pasted` gate.
+    sheet: SheetId,
+    /// The selection anchor at request time — kept for ⌘⇧+arrow (`ExtendEdge`); ignored for the
+    /// collapsing ⌘+arrow (`JumpEdge`).
+    anchor: CellRef,
+    /// `true` for ⌘⇧+arrow (extend the range to the target); `false` collapses to `single(target)`.
+    extend: bool,
 }
 
 // --- Look constants (functional-POC greys, matching the chrome / grid) ---------------------
@@ -202,6 +226,8 @@ impl WorkbookWindow {
             active_sheet: Cell::new(SheetId(0)),
             last_selection: Cell::new(SelectionModel::default()),
             clipboard: RefCell::new(ClipboardCoordinator::new()),
+            edge_seq: Cell::new(0),
+            pending_edge: Cell::new(None),
         });
 
         // The grid needs the chrome handle and vice-versa; resolve both after construction via
@@ -477,6 +503,36 @@ impl WorkbookWindow {
                 // tab-bar selection-stats reply all live on the chrome (`functional_spec.md §1/§4`).
                 self.chrome
                     .update(cx, |c, cx| c.on_worker_event(event, window, cx));
+            }
+            // The async ⌘+arrow edge-of-data target (`functional_spec.md §4`, D4.1). Apply it only if it
+            // still matches the latest in-flight jump AND that jump's sheet is still active — a tab
+            // switch mid-flight (which clears `pending_edge` in `switch_grid_to_sheet`, and re-points
+            // `active_sheet` here as a backstop) must not clobber another sheet's selection, mirroring
+            // the `Pasted` gate. Then fold the chrome + shared state directly — like the paste path, so
+            // the applied selection is not re-emitted.
+            WorkerEvent::EdgeResolved { req_id, target } => {
+                if let Some(pending) = self.sink_shared.pending_edge.get() {
+                    if pending.sheet != self.sink_shared.active_sheet.get() {
+                        // The jump's sheet is no longer active — abandon it (stale).
+                        self.sink_shared.pending_edge.set(None);
+                    } else if pending.req_id == req_id {
+                        self.sink_shared.pending_edge.set(None);
+                        let sel = if pending.extend {
+                            SelectionModel {
+                                anchor: pending.anchor,
+                                active: target,
+                            }
+                        } else {
+                            SelectionModel::single(target)
+                        };
+                        self.sink_shared.last_selection.set(sel);
+                        self.grid
+                            .update(cx, |g, cx| g.set_selection_and_reveal(sel, window, cx));
+                        self.chrome
+                            .update(cx, |c, cx| c.on_selection_changed(sel, window, cx));
+                    }
+                    // else: a stale req_id on the active sheet — leave the jump armed for its own reply.
+                }
             }
             WorkerEvent::EditRejected { reason } => self.on_edit_rejected(reason, window, cx),
             // Saved / SaveFailed match unconditionally then branch on the pending-save `req_id`
@@ -935,6 +991,32 @@ impl WorkbookWindow {
         self.close_after_save
     }
 
+    /// Test seam: arm an in-flight ⌘+arrow edge jump on `sheet` (as the grid sink would on
+    /// [`GridEvent::ResolveEdge`]), so a synthesized [`WorkerEvent::EdgeResolved`] with `req_id`
+    /// exercises the real folding (collapse vs. extend, stale-`req_id` drop, cross-sheet drop).
+    #[cfg(test)]
+    pub(crate) fn arm_pending_edge_for_test(
+        &self,
+        req_id: u64,
+        sheet: SheetId,
+        anchor: CellRef,
+        extend: bool,
+    ) {
+        self.sink_shared.pending_edge.set(Some(PendingEdge {
+            req_id,
+            sheet,
+            anchor,
+            extend,
+        }));
+        self.sink_shared.edge_seq.set(req_id + 1);
+    }
+
+    /// Test seam: whether an edge jump is still awaiting its `EdgeResolved` reply.
+    #[cfg(test)]
+    pub(crate) fn pending_edge_is_armed_for_test(&self) -> bool {
+        self.sink_shared.pending_edge.get().is_some()
+    }
+
     /// Test seam: force the loading state (a `NewWorkbook` window constructs with `loading =
     /// None`, so this lets a test put it in the "Opening …" state an `OpenFile` window starts
     /// in, to prove `LoadFailed` actually clears it).
@@ -984,6 +1066,28 @@ impl WorkbookWindow {
             self.grid.downgrade(),
             &self.sink_shared,
             sel,
+            window,
+            cx,
+        );
+    }
+
+    /// Test seam: switch the active sheet through the window's *real* path
+    /// ([`switch_grid_to_sheet`], the same one the tab-click sink + `reconcile_sheets` call), so the
+    /// in-flight-edge-jump cancellation on a switch is exercised without a synthetic re-implementation.
+    #[cfg(test)]
+    pub(crate) fn switch_sheet_for_test(
+        &mut self,
+        sheet: SheetId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chrome = self.chrome.downgrade();
+        switch_grid_to_sheet(
+            &self.grid,
+            Some(&chrome),
+            &self.client,
+            &self.sink_shared,
+            sheet,
             window,
             cx,
         );
@@ -1237,6 +1341,9 @@ fn route_selection_changed(
     window: &mut Window,
     cx: &mut App,
 ) {
+    // A genuine selection change (mouse / a non-edge motion) supersedes any in-flight ⌘+arrow jump —
+    // drop its pending context so a late `EdgeResolved` reply is ignored (`functional_spec.md §4`).
+    shared.pending_edge.set(None);
     let committed = chrome.update(cx, |c, cx| {
         let ok = c.on_edit_commit_requested(window, cx);
         if ok {
@@ -1424,6 +1531,32 @@ fn make_grid_sink(
             sheet: shared.active_sheet.get(),
             range: *range,
         }),
+        // ⌘+arrow / ⌘⇧+arrow edge-of-data (`functional_spec.md §4`, D4.1): occupancy lives in the
+        // engine past the published viewport, so resolve the target asynchronously. Stamp a `req_id`,
+        // record the collapse-vs-extend context, and send the read; the window applies the
+        // `EdgeResolved` reply (matching `req_id`).
+        GridEvent::ResolveEdge {
+            from,
+            anchor,
+            dir,
+            extend,
+        } => {
+            let sheet = shared.active_sheet.get();
+            let req_id = shared.edge_seq.get();
+            shared.edge_seq.set(req_id + 1);
+            shared.pending_edge.set(Some(PendingEdge {
+                req_id,
+                sheet,
+                anchor: *anchor,
+                extend: *extend,
+            }));
+            client.send(Command::ResolveEdge {
+                sheet,
+                from: *from,
+                dir: *dir,
+                req_id,
+            });
+        }
         // Structure ops (`functional_spec.md §5`): resize + insert/delete route straight to the
         // worker (the worker merge-guards insert/delete authoritatively).
         GridEvent::ResizeCommitted {
@@ -1629,6 +1762,9 @@ fn switch_grid_to_sheet(
     cx: &mut App,
 ) {
     shared.active_sheet.set(sheet);
+    // Abandon any in-flight ⌘+arrow jump — its target is for the sheet we're leaving, so a late
+    // `EdgeResolved` must not move the new sheet's selection (`functional_spec.md §4`).
+    shared.pending_edge.set(None);
     let sel = grid.update(cx, |g, cx| {
         g.set_active_sheet(sheet, cx);
         *g.selection()

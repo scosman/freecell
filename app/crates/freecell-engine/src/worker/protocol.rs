@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
-use freecell_core::{CellRange, CellRef, Rgb, SelectionStats, SheetId};
+use freecell_core::{CellRange, CellRef, Direction, Rgb, SelectionStats, SheetId};
 
 use crate::document::{LoadError, SaveError};
 
@@ -380,6 +380,20 @@ pub enum Command {
         range: CellRange,
         req_id: u64,
     },
+    /// Resolve the **edge-of-data** target for a ⌘/Ctrl+arrow jump from `from` in `dir`
+    /// (`functional_spec.md §4`; the `JumpEdge`/`ExtendEdge` motions). A **read**: no evaluation, no
+    /// publish. Computed worker-side (which owns the model) so occupancy **past the published
+    /// viewport** feeds the exact Excel algorithm — gathering the active line's populated cells
+    /// (O(populated cells on the line) for a row jump; O(populated rows) for a column jump), not
+    /// O(sheet). The `extend`/anchor semantics stay UI-side (the grid collapses or keeps the anchor on
+    /// the reply); `req_id` tags the reply so the grid drops a stale one for a superseded jump. Replies
+    /// with [`WorkerEvent::EdgeResolved`].
+    ResolveEdge {
+        sheet: SheetId,
+        from: CellRef,
+        dir: Direction,
+        req_id: u64,
+    },
     /// Scan `sheet`'s used range for cells whose **raw content** (formula text for formula cells)
     /// matches `query` under the case / whole-cell rules (`functional_spec.md §4.3`). A **read**: no
     /// evaluation, no publish. Replies with [`WorkerEvent::FindResults`] (row-major matches). Runs in
@@ -566,6 +580,10 @@ pub enum WorkerEvent {
     /// The chrome keeps it only when `req_id` still matches its latest request (`functional_spec.md
     /// §1`).
     SelectionStats { req_id: u64, stats: SelectionStats },
+    /// Reply to [`Command::ResolveEdge`]: the edge-of-data `target` cell (`functional_spec.md §4`).
+    /// The grid applies it only when `req_id` still matches its latest jump — collapsing to
+    /// `single(target)` for `JumpEdge` or keeping the anchor for `ExtendEdge`.
+    EdgeResolved { req_id: u64, target: CellRef },
     /// Reply to [`Command::Find`]: the matching cells in **row-major** order (empty = no matches).
     /// The UI stores these, selects + reveals the current one, and drives the "N of M" counter
     /// (`functional_spec.md §4.3`).

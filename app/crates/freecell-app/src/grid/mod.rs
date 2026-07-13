@@ -135,6 +135,18 @@ pub enum GridEvent {
     /// Cmd/Ctrl+R on the focused grid — fill the selection's left column **right** over the rest
     /// (the column analog of [`GridEvent::FillDown`]). Forwarded as `Command::FillRight`.
     FillRight(CellRange),
+    /// Cmd/Ctrl+arrow (`extend: false`) or Cmd/Ctrl+Shift+arrow (`extend: true`) on the focused grid
+    /// — resolve the **edge-of-data** target from `from` in `dir` (`functional_spec.md §4`). Occupancy
+    /// lives in the engine past the published viewport, so the window forwards this as an async
+    /// `Command::ResolveEdge`; on the `EdgeResolved` reply it applies the target — collapsing to
+    /// `single(target)`, or (when `extend`) keeping `anchor` (D4.1 Option A). Only these edge motions
+    /// go async; all other motions apply synchronously in `move_active`.
+    ResolveEdge {
+        from: CellRef,
+        anchor: CellRef,
+        dir: Direction,
+        extend: bool,
+    },
     /// Wrap-driven row auto-grow (`functional_spec.md §3`): the render thread measured each
     /// `(row, px)`'s wrapped height (device px) at its column width — geometry the worker can't
     /// compute (no gpui text system). The window forwards it as `Command::AutoGrowRowHeights` for

@@ -23,7 +23,7 @@ decisions"); proceed on the default unless the owner overrides at phase start.
       deferred); new command → fork `auto_fill_rows/columns` (copy-fill from the top
       row/left col). Decides D3.1. **Check out the fork** (`add_repo scosman/ironcalc`) to
       bind the exact `auto_fill_*` signature. Engine tests.
-- [ ] **Phase 3 — ⌘+arrow → edge-of-data.** Pure Excel edge algorithm in `freecell-core`,
+- [x] **Phase 3 — ⌘+arrow → edge-of-data.** Pure Excel edge algorithm in `freecell-core`,
       resolved worker-side (D4.1 Option A). Route only `JumpEdge`/`ExtendEdge` to the async
       query; other motions unchanged. Exhaustive algorithm unit tests.
 - [ ] **Phase 4 — Paste values (⌘⇧V).** Bind the reserved `Shift+V`; paste the internal

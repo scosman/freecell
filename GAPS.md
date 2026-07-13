@@ -65,8 +65,11 @@ deferred dispatch; then map the incoming URLs through the existing `do_open_path
 
 ### Intentional MVP scope exclusions (NOT gaps — deliberate, listed for completeness)
 
-- **Silent `.xlsx` fidelity strip on save, no warning** (§5.2) — intentional MVP
-  decision; the warn-and-strip UX is [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md).
+- **Silent `.xlsx` fidelity strip on save, no warning** (§5.2) — intentional decision.
+  The accepted data-safety mitigation is the write-once `.back` backup (see *Data safety
+  & robustness*, below). A **warn-before-strip** dialog was considered for v0.5 and
+  **cut (2026-07-13)** — the backup covers the risk; full pass-through **preservation**
+  stays v1.0 ([`projects/xlsx-preservation.md`](projects/xlsx-preservation.md)).
 - **Dynamic arrays / spill absent** (§8) — accepted absent for v1; the engine surfaces
   an error. Out of MVP scope by product call.
 
@@ -361,7 +364,6 @@ Ordered roughly by how fast a new user hits the gap.
 | **Function autocomplete + signature hints** (type `=SU` → SUM, SUMIF…; show arg template) | **NEW** (checked: data row is a plain input; no completion logic anywhere) | This *is* the "don't have 80 functions memorized" bar — start it at v0.5. Needs a FreeCell-static function list (the engine's 345-variant `Function` enum is private). |
 | **Formula range highlighting + point-mode** (colored refs while editing; click/drag a range to insert it) | **NEW** (checked: no reference-insert / highlight code) | The other half of formula-entry UX; without point-mode every formula must be typed by hand. Engine's public `Lexer`/`Parser` AST can drive tokenization. |
 | **Missing everyday scalar functions + TRIM bug** (SUMPRODUCT, TRANSPOSE, PROPER, REPLACE, CHAR, CODE, CLEAN, DOLLAR, ADDRESS, HYPERLINK-fn, PERCENTILE.INC, QUARTILE.INC, XMATCH; TRIM doesn't collapse internal runs) | Partially (round-2 SP3 findings; not previously in GAPS) | ~14 independently-implementable engine functions — clean one-per-PR upstream candidates per the fork policy. SUMPRODUCT/TRANSPOSE absence bites real home sheets. |
-| **Warn-before-strip on save** | Above (listed as intentional MVP exclusion) + [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md) | Promote to v0.5: one honest dialog ("this file contains comments/validation/… FreeCell won't preserve") before a destructive save. Full **preservation** (pass-through) = v1.0. |
 | **Render-fidelity polish pair** (fill covers interior gridlines; full-row selection darkens row header) | Above (render-baseline eyeball 2026-07-06) | Both cheap, both instantly visible quality signals. |
 | **macOS Finder open-file** (double-click / drag-to-Dock) | Above (MVP #4) | Primary-platform basics; needs the gpui `on_open_urls` spike first. |
 
@@ -389,7 +391,7 @@ Ordered roughly by how fast a new user hits the gap.
 | **Print / export PDF** | **NEW** (checked: no print or PDF path) | Even home users occasionally print. Stage it: export-PDF (paginate the styled grid) first; real print dialogs later. Big; start design early. |
 | **Autosave + crash recovery** | **NEW** (checked: `.back` first-save backup exists; no periodic snapshot / reopen-after-crash) | We're alpha with a full-strip writer — periodic recovery snapshots close the data-loss window between explicit saves. |
 | **IME / international text input** (+ dead keys, decimal-comma entry) | [`projects/ime-text-input.md`](projects/ime-text-input.md) | Blocks CJK + many European users entirely; carries a cheap gpui probe first. |
-| **`.xlsx` unknown-part preservation** (zip-level pass-through) | [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md) | The v1.0 half of the save-fidelity story (v0.5 = warn). Pass-through keeps charts we don't own, pivots, images, VBA… intact instead of stripped. |
+| **`.xlsx` unknown-part preservation** (zip-level pass-through) | [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md) | The v1.0 half of the save-fidelity story (v0.5 relies on the write-once `.back` backup, not a warn dialog — the warn-before-strip idea was cut 2026-07-13). Pass-through keeps charts we don't own, pivots, images, VBA… intact instead of stripped. |
 | **Sheet management extras** (duplicate sheet, tab colors, hide/unhide sheets) | **NEW** (checked: no UI/commands; engine has `hide_sheet`/`unhide_sheet`/`set_sheet_color`; duplicate needs fork work) | Rounds out the tab bar; hide-sheets is common in template files. |
 | **Gridlines toggle** (per-sheet, persisted) | **NEW** (checked: gridlines unconditional in `grid/mod.rs`; engine models `set_show_grid_lines` + round-trips) | Small; engine-ready. |
 | **Entry shortcuts bundle** (F4 abs/rel reference cycling, Ctrl+Enter fill-selection, ⌘;/⌘⇧; date/time stamps) | **NEW** | Small individually; batch them like feature-gaps-7-11. |

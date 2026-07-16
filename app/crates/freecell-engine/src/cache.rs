@@ -338,6 +338,14 @@ pub(crate) fn build_sheet_cache(
                 builder.push_col_width((c - 1) as u32, px);
             }
         }
+        // A `Col` record's hidden flag applies uniformly across its inclusive [min, max] range
+        // (`gaps_closing_7_15 §4`). Independent of `custom_width` — a hidden default-width column
+        // still renders zero-size (its stored width is kept for unhide-restore).
+        if col.hidden {
+            for c in col.min..=col.max {
+                builder.push_hidden_col((c - 1) as u32);
+            }
+        }
         if col.style.is_some() {
             if let Some(style) = doc.col_band_style(sheet_idx, (col.min - 1) as u32)? {
                 let mut rs = render_style_from(&style, doc.workbook_theme());
@@ -364,6 +372,11 @@ pub(crate) fn build_sheet_cache(
         if r.custom_height {
             let px = row_px(doc.row_height_px(sheet_idx, r0)?);
             builder.push_row_height(r0, px);
+        }
+        // A hidden row renders zero-size (`gaps_closing_7_15 §4`); independent of `custom_height`
+        // (its stored height is kept for unhide-restore).
+        if r.hidden {
+            builder.push_hidden_row(r0);
         }
         if r.custom_format && r.s != 0 {
             if let Some(style) = doc.row_band_style(sheet_idx, r0)? {

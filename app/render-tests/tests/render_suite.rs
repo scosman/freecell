@@ -265,6 +265,11 @@ render_cases! {
     grid_selection_range_spans_edge, grid_selection_shift_extended, grid_selection_drag_extended,
     grid_selection_scrolled, grid_variable_geometry, grid_loading_overlay,
     grid_scrollbars_visible, grid_mixed_content,
+    // Fill handle + drag preview (gaps_closing_7_15 §3): the handle square on a range + the live
+    // drag's target-region preview rectangle.
+    fill_handle_multicell, fill_drag_preview,
+    // Hidden rows & columns (gaps_closing_7_15 §4): a hidden row + hidden col collapse to zero size.
+    hidden_row_and_col,
     // In-grid charts (P8): the ChartLayer painted over cells — a line chart in place, the Degraded
     // corner badge, the Unsupported placeholder, and a scrolled/clipped chart.
     grid_chart_line, grid_chart_degraded_badge, grid_chart_unsupported_placeholder,

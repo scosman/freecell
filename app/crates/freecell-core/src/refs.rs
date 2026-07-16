@@ -14,6 +14,16 @@ use crate::limits;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SheetId(pub u32);
 
+/// The dominant axis of a drag-fill (`gaps_closing_7_15 §3`, D3.1: one axis per drag).
+/// `Vertical` fills up/down over rows (`auto_fill_rows`); `Horizontal` fills left/right over
+/// columns (`auto_fill_columns`). Shared by the grid's `GridEvent`, the window→worker mapping,
+/// and the engine `Command`/`document.fill_drag` (the engine crate can't see app types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillAxis {
+    Vertical,
+    Horizontal,
+}
+
 /// A zero-based `(row, col)` cell coordinate (`(0, 0)` is `A1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellRef {

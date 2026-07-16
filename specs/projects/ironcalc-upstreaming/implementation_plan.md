@@ -70,6 +70,32 @@ open upstream PRs). FreeCell builds against the fork via `[patch.crates-io]` (gi
 committed/reproducible build; a `path = "/workspace/ironcalc/{xlsx,base}"` patch is equivalent for
 fast in-container iteration).
 
+**Agent operating notes (autonomous runs) — learned `gaps_closing_7_15`, 2026-07-16:**
+- **Provision repos UPFRONT.** `add_repo scosman/ironcalc` needs an **interactive permission
+  approval**. If a long autonomous run needs the fork, call `add_repo` **while the user is still
+  present** to approve it — calling it mid-run after they've left **fails** with
+  `AbortError: Tool permission stream closed` (the approval channel is gone). Add every repo you
+  might touch at the start.
+- **Proxy fallback (no `add_repo` needed).** The container's agent git-proxy already routes
+  `scosman/ironcalc`, so you can **clone/branch/push the fork through the proxy URL** even when
+  `add_repo` is unavailable: `git clone http://local_proxy@127.0.0.1:<port>/git/scosman/ironcalc`
+  (get `<port>` from FreeCell's own `git remote -v` — same `local_proxy@` credential as the
+  FreeCell origin). This reaches **`scosman/ironcalc` only**. (The `[patch]` in `app/Cargo.toml`
+  pins the fork by a **direct** `github.com/scosman/ironcalc` URL fetched via the outbound HTTPS
+  proxy; after pushing `freecell-fixes` through the git-proxy URL, `cargo update -p ironcalc_base
+  -p ironcalc` moves the lock to the new rev.)
+- **Pushes go to `scosman` only.** The agent **cannot open upstream `ironcalc/IronCalc` PRs**
+  (not in session repo scope, no push creds there). Instead, when a `fix/<slug>` is ready, the
+  agent **prepares** the PR for the owner to open in one click: a **compare link**
+  `https://github.com/ironcalc/IronCalc/compare/main...scosman:ironcalc:fix/<slug>` plus a
+  suggested **title** and **description** (minimal repro + the tests). This is exactly step 4's
+  "PR-first on owner sign-off" — the agent preps, the owner clicks.
+- **Check before you branch.** Before creating a `fix/*`, confirm the capability isn't **already
+  in** `freecell-fixes` (upstream may have landed it): `git merge-base --is-ancestor <upstream-sha>
+  origin/freecell-fixes` + a `git grep` for the API at the pinned rev. In `gaps_closing_7_15` the
+  planned row/column-hidden fixes were **already present** (upstream `a520f48f`), so no branches
+  were needed — a stale GAPS.md audit note had claimed otherwise.
+
 **Branch strategy (fork `scosman/ironcalc`):**
 - **`main`** — a clean mirror of upstream `ironcalc/IronCalc:main`. Never commit fixes here.
 - **`fix/<slug>`** — one branch per fix, off `main`, with upstream-style tests. Each is a single

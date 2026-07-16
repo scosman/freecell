@@ -28,6 +28,27 @@ pub use client::{ChromeClient, RecordingClient};
 pub use edit::{EditController, EditOrigin};
 pub use view::{ChartPanel, ChartPanelSeries, ChromeView};
 
+/// One row of the function-autocomplete list, in a grid-renderable (`InputState`-free) form
+/// (`gaps_closing_7_15 §1`). The grid renders the in-cell overlay's list from these; the
+/// data-row list is rendered directly by [`ChromeView`].
+#[derive(Debug, Clone)]
+pub struct AutocompleteRow {
+    /// The function name (e.g. `"SUMIF"`).
+    pub name: SharedString,
+    /// The argument template shown after the name (e.g. `"SUMIF(range, criteria, [sum_range])"`).
+    pub template: SharedString,
+}
+
+/// The function-autocomplete list's display state pushed to the grid for the in-cell overlay
+/// (`gaps_closing_7_15 §1`): the visible rows (already capped) and which one is highlighted.
+#[derive(Debug, Clone)]
+pub struct AutocompleteDisplay {
+    /// The visible completion rows (capped to the display maximum).
+    pub rows: Vec<AutocompleteRow>,
+    /// The highlighted row index into [`rows`](Self::rows).
+    pub highlight: usize,
+}
+
 /// One sheet as the tab bar mirrors it. The chrome's own view-model of the worker's
 /// `SheetMeta`, extended with `has_content` (which the worker's `SheetMeta` does not carry
 /// yet) so the delete-confirm rule (`components/app_shell.md §Sheet tab bar`: confirm only a
@@ -92,6 +113,15 @@ pub enum ChromeGridRequest {
         /// (`functional_spec.md §5`). Only ever `true` while an edit is live; the grid consumes it in
         /// its in-cell `capture_key_down`.
         quick_edit: bool,
+        /// The function-autocomplete list to render under the **in-cell** overlay, or `None`
+        /// when closed / the data row is driving (the data row renders its own list). The grid
+        /// also reads `is_some()` in its `capture_key_down` to intercept nav/accept/dismiss keys
+        /// (`gaps_closing_7_15 §1`).
+        autocomplete: Option<AutocompleteDisplay>,
+        /// The passive one-line signature-hint template to show under the **in-cell** overlay,
+        /// or `None`. Shown when the caret sits inside a recognized call and the list is not
+        /// covering the same anchor.
+        sig_hint: Option<SharedString>,
     },
 }
 

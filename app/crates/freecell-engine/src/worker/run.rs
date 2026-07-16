@@ -383,12 +383,16 @@ impl Worker {
             chart_version: 0,
             chart_source_path: match &source {
                 DocumentSource::OpenFile(path) => Some(path.clone()),
-                DocumentSource::NewWorkbook => None,
+                // A CSV import builds a fresh workbook — no source file carries charts.
+                DocumentSource::NewWorkbook | DocumentSource::ImportCsv(_) => None,
             },
             discovered_chart_sheets: HashSet::new(),
-            // A workbook never opened from a file has no charts to discover — start "fully
-            // discovered" so save takes the plain path without a wasted walk.
-            charts_fully_discovered: matches!(source, DocumentSource::NewWorkbook),
+            // A workbook not opened from an `.xlsx` (new, or CSV-imported) has no charts to
+            // discover — start "fully discovered" so save takes the plain path without a wasted walk.
+            charts_fully_discovered: matches!(
+                source,
+                DocumentSource::NewWorkbook | DocumentSource::ImportCsv(_)
+            ),
             chart_sheet_parts: HashMap::new(),
             manual_rows: HashMap::new(),
             wrap_heights: HashMap::new(),
@@ -455,6 +459,9 @@ impl Worker {
         // run after the edit batch so a jump observes this batch's mutations.
         let mut edge_ops: Vec<(SheetId, CellRef, Direction, u64)> = Vec::new();
         let mut saves: Vec<(PathBuf, u64)> = Vec::new();
+        // CSV exports (`Command::ExportCsv`) are pure reads (used-range → raw values → file); run
+        // after the edit batch so an export observes this batch's mutations, and never touch dirty.
+        let mut exports: Vec<(SheetId, PathBuf, u64)> = Vec::new();
         // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
         // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
         let mut clipboard_ops: Vec<Command> = Vec::new();
@@ -531,6 +538,11 @@ impl Worker {
                     autogrow_ops.push((sheet, heights))
                 }
                 Command::Save { path, req_id } => saves.push((path, req_id)),
+                Command::ExportCsv {
+                    sheet,
+                    path,
+                    req_id,
+                } => exports.push((sheet, path, req_id)),
                 Command::Shutdown => shutdown = true,
                 clip @ (Command::CopySelection { .. }
                 | Command::PasteInternal { .. }
@@ -547,11 +559,14 @@ impl Worker {
                 | Command::ClearCells { .. }
                 | Command::FillDown { .. }
                 | Command::FillRight { .. }
+                | Command::FillDrag { .. }
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
                 | Command::SetColumnWidths { .. }
                 | Command::SetRowHeights { .. }
+                | Command::SetRowsHidden { .. }
+                | Command::SetColumnsHidden { .. }
                 | Command::InsertRows { .. }
                 | Command::InsertColumns { .. }
                 | Command::DeleteRows { .. }
@@ -713,6 +728,21 @@ impl Worker {
                     ops_seen: self.ops_seen,
                 }),
                 Err(error) => self.emit(WorkerEvent::SaveFailed { req_id, error }),
+            }
+        }
+
+        // CSV exports (pure reads — no dirty change). An unresolvable sheet (deleted mid-flight)
+        // fails cleanly rather than writing a wrong sheet.
+        for (sheet, path, req_id) in exports {
+            let result = match self.resolve(sheet) {
+                Some(idx) => self.doc.export_csv(idx, &path),
+                None => Err(crate::document::SaveError::Io(
+                    "the sheet no longer exists".to_string(),
+                )),
+            };
+            match result {
+                Ok(()) => self.emit(WorkerEvent::CsvExported { req_id }),
+                Err(error) => self.emit(WorkerEvent::CsvExportFailed { req_id, error }),
             }
         }
 
@@ -2000,6 +2030,10 @@ impl Worker {
             Command::FillDown { sheet, range } | Command::FillRight { sheet, range } => {
                 self.merge_guard(*sheet, |merges| blocks_fill(merges, *range))
             }
+            // A drag-fill writes over `target` (⊇ seed); a fill into a merged region is rejected.
+            Command::FillDrag { sheet, target, .. } => {
+                self.merge_guard(*sheet, |merges| blocks_fill(merges, *target))
+            }
             _ => Ok(()),
         }
     }
@@ -3172,6 +3206,25 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
                 AppliedKind::NoOp
             })
         }
+        Command::FillDrag {
+            sheet,
+            seed,
+            target,
+            axis,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            // Overflow guard: reject a drag-fill whose target exceeds the same cell-count cap
+            // paste/fill use (`architecture.md §3.3`) → the standard large-op dialog.
+            if range_area(target) > MAX_REFRESH_CELLS {
+                return Err("Fill target is too large".to_string());
+            }
+            let applied = doc.fill_drag(idx, *seed, *target, *axis)?;
+            Ok(if applied {
+                AppliedKind::Cell
+            } else {
+                AppliedKind::NoOp
+            })
+        }
         Command::SetStyleAttr { sheet, range, attr } => {
             let idx = resolve_idx(doc, *sheet)?;
             apply_style(doc, idx, *range, *attr)?;
@@ -3229,6 +3282,26 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
         } => {
             let idx = resolve_idx(doc, *sheet)?;
             doc.set_row_heights_px(idx, *row_start, *row_end, *px)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
+        Command::SetRowsHidden {
+            sheet,
+            start,
+            end,
+            hidden,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_rows_hidden(idx, *start, *end, *hidden)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
+        Command::SetColumnsHidden {
+            sheet,
+            start,
+            end,
+            hidden,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_columns_hidden(idx, *start, *end, *hidden)?;
             Ok(AppliedKind::GeometryOnly)
         }
         Command::InsertRows { sheet, row, count } => {
@@ -3408,6 +3481,11 @@ fn op_of(edit: &Command) -> AppliedOp {
                 range: *range,
             }
         }
+        // Drag-fill writes over the whole `target` rectangle (⊇ seed) → refresh exactly that range.
+        Command::FillDrag { sheet, target, .. } => AppliedOp::Cells {
+            sheet: *sheet,
+            range: *target,
+        },
         Command::SetStyleAttr { sheet, range, .. } | Command::SetStylePath { sheet, range, .. } => {
             AppliedOp::Cells {
                 sheet: *sheet,
@@ -3426,6 +3504,8 @@ fn op_of(edit: &Command) -> AppliedOp {
         // so the whole sheet cache is rebuilt on apply and on undo/redo.
         Command::SetColumnWidths { sheet, .. }
         | Command::SetRowHeights { sheet, .. }
+        | Command::SetRowsHidden { sheet, .. }
+        | Command::SetColumnsHidden { sheet, .. }
         | Command::InsertRows { sheet, .. }
         | Command::InsertColumns { sheet, .. }
         | Command::DeleteRows { sheet, .. }
@@ -7050,6 +7130,86 @@ mod tests {
         assert!(
             (row_h(&worker, sheet, 3) - 24.0).abs() < 1.0,
             "after undo row 3 default"
+        );
+    }
+
+    /// Whether the resident cache flags `row` hidden.
+    fn row_hidden(worker: &Worker, sheet: SheetId, row: u32) -> bool {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .is_row_hidden(row)
+    }
+    /// Whether the resident cache flags `col` hidden.
+    fn col_hidden(worker: &Worker, sheet: SheetId, col: u32) -> bool {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .is_col_hidden(col)
+    }
+
+    #[test]
+    fn set_rows_hidden_renders_zero_size_and_undo_restores() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Hide rows 2..=4.
+        worker.process_batch(vec![Command::SetRowsHidden {
+            sheet,
+            start: 2,
+            end: 4,
+            hidden: true,
+        }]);
+        assert!(row_hidden(&worker, sheet, 3), "row 3 flagged hidden");
+        // A hidden row renders zero-size; its neighbor keeps the default.
+        assert_eq!(row_h(&worker, sheet, 3), 0.0, "hidden row is zero-size");
+        assert!(
+            (row_h(&worker, sheet, 1) - 24.0).abs() < 1.0,
+            "row 1 default"
+        );
+        // Geometry-only: the batch published (StyleCacheUpdated) but ran no eval.
+        let events = drain_events(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+
+        // One undo step restores full visibility + size.
+        worker.process_batch(vec![Command::Undo]);
+        assert!(!row_hidden(&worker, sheet, 3), "undo unhides row 3");
+        assert!(
+            (row_h(&worker, sheet, 3) - 24.0).abs() < 1.0,
+            "undo restores row 3 size"
+        );
+    }
+
+    #[test]
+    fn set_columns_hidden_toggle_and_unhide() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetColumnsHidden {
+            sheet,
+            start: 1,
+            end: 1,
+            hidden: true,
+        }]);
+        assert!(col_hidden(&worker, sheet, 1));
+        assert_eq!(col_w(&worker, sheet, 1), 0.0, "hidden col is zero-size");
+        // Unhide (hidden: false) over the same run restores it — one undo-independent op.
+        worker.process_batch(vec![Command::SetColumnsHidden {
+            sheet,
+            start: 1,
+            end: 1,
+            hidden: false,
+        }]);
+        assert!(!col_hidden(&worker, sheet, 1));
+        assert!(
+            (col_w(&worker, sheet, 1) - 100.0).abs() < 1.0,
+            "col restored"
         );
     }
 

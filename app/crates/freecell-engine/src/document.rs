@@ -16,7 +16,9 @@ use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
-use freecell_core::{CellKind, CellRange, CellRef, Direction, Rgb, SelectionStats, SheetDims};
+use freecell_core::{
+    CellKind, CellRange, CellRef, Direction, FillAxis, Rgb, SelectionStats, SheetDims,
+};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
 use ironcalc_base::cell::CellValue;
@@ -56,6 +58,10 @@ pub enum DocumentSource {
     NewWorkbook,
     /// An existing `.xlsx` file on disk.
     OpenFile(PathBuf),
+    /// A `.csv` file on disk, imported into a fresh untitled single-sheet workbook
+    /// (`functional_spec.md §2`, D2.1): parsed comma-delimited, each field applied as user
+    /// input, opened with `path: None` so Save → Save-As-to-`.xlsx` and no `.back` backup.
+    ImportCsv(PathBuf),
 }
 
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
@@ -82,6 +88,10 @@ pub enum LoadError {
     /// The file couldn't be read from disk (missing, no permission, …).
     #[error("The file couldn't be read: {0}")]
     Io(String),
+    /// A `.csv` import failed: not valid UTF-8, larger than the maximum sheet size, or a
+    /// malformed record (`functional_spec.md §2`, D2.5). The message is the dialog detail.
+    #[error("This CSV can't be imported: {0}")]
+    BadCsv(String),
 }
 
 /// A typed save failure. Because saves are atomic (temp file + rename), any failure leaves
@@ -237,7 +247,80 @@ impl WorkbookDocument {
         match source {
             DocumentSource::NewWorkbook => Self::new_empty(),
             DocumentSource::OpenFile(path) => Self::open(path),
+            DocumentSource::ImportCsv(path) => Self::import_csv(path),
         }
+    }
+
+    /// Imports a `.csv` file into a fresh untitled single-sheet workbook (`functional_spec.md
+    /// §2`, D2.1/D2.4/D2.5). Comma-delimited RFC-4180 parse (quoted fields may contain commas,
+    /// embedded newlines, and doubled `""`); each **non-empty** field is applied as user input at
+    /// its `A1`-origin cell — so a number becomes a number, `TRUE`/`FALSE` a boolean, a leading
+    /// `=` a formula, everything else text (the same "apply as user input" typing as TSV paste).
+    /// Empty fields are skipped (the fresh sheet is already blank). Ragged rows are accepted.
+    ///
+    /// The document is built on a **raw** [`Model`] and wrapped with [`UserModel::from_model`], so
+    /// its undo history starts empty (the import is not an undoable edit — cross-cutting §Undo).
+    ///
+    /// Errors ([`LoadError::BadCsv`]): non-UTF-8 bytes (BOM tolerated), a CSV exceeding the
+    /// Excel-max grid (1,048,576 rows / 16,384 cols — rejected, never truncated), or a malformed
+    /// record.
+    pub fn import_csv(path: &Path) -> Result<Self, LoadError> {
+        crate::instrument::record_engine_call();
+        let mut bytes = std::fs::read(path).map_err(|e| LoadError::Io(e.to_string()))?;
+        // Tolerate a leading UTF-8 BOM (D2.5): strip it before decoding so A1 isn't polluted.
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            bytes.drain(0..3);
+        }
+        // Validate UTF-8 up front so invalid bytes surface a readable dialog rather than mojibake
+        // (D2.5) — the csv reader below then yields guaranteed-valid `StringRecord`s.
+        let text = String::from_utf8(bytes).map_err(|_| {
+            LoadError::BadCsv(
+                "the file isn't valid UTF-8 text and can't be read as CSV".to_string(),
+            )
+        })?;
+
+        let mut model = Model::new_empty(
+            NEW_WORKBOOK_NAME,
+            DEFAULT_LOCALE,
+            DEFAULT_TIMEZONE,
+            DEFAULT_LANGUAGE,
+        )
+        .map_err(LoadError::Corrupt)?;
+
+        let max_rows = freecell_core::limits::MAX_ROWS as usize;
+        let max_cols = freecell_core::limits::MAX_COLS as usize;
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(text.as_bytes());
+        for (r, record) in reader.records().enumerate() {
+            // A 0-based record index that reaches the row count means its 1-based row exceeds the
+            // Excel-max — reject (never truncate). Checked as we stream (no full materialization).
+            if r >= max_rows {
+                return Err(LoadError::BadCsv(
+                    "this CSV is larger than the maximum sheet size".to_string(),
+                ));
+            }
+            let record = record.map_err(|e| LoadError::BadCsv(e.to_string()))?;
+            for (c, field) in record.iter().enumerate() {
+                if c >= max_cols {
+                    return Err(LoadError::BadCsv(
+                        "this CSV is larger than the maximum sheet size".to_string(),
+                    ));
+                }
+                if !field.is_empty() {
+                    model
+                        .set_user_input(0, (r + 1) as i32, (c + 1) as i32, field.to_string())
+                        .map_err(LoadError::Corrupt)?;
+                }
+            }
+        }
+        // A fresh import carries no cached values (unlike an opened `.xlsx`), so evaluate once so
+        // formula cells paint their computed value on first frame.
+        model.evaluate();
+        Ok(Self {
+            model: UserModel::from_model(model),
+        })
     }
 
     /// Saves the workbook to `path` **atomically**: serialize into a temp file in the
@@ -628,6 +711,63 @@ impl WorkbookDocument {
         Ok(true)
     }
 
+    /// Drag-fill (`gaps_closing_7_15 §3`) — the general fill-handle path. Unlike ⌘D/⌘R
+    /// ([`fill_down`](Self::fill_down)/[`fill_right`](Self::fill_right)), the source `Area` is the
+    /// **full `seed` block** (its real width×height, NOT clamped to a 1-tall/1-wide line), so a
+    /// multi-cell seed gives the fork's `detect_progression` a ≥2-value series to extrapolate
+    /// (`1,2 → 3,4,5`; `Jan,Feb → Mar…`). A single-cell seed (`width == height == 1`) has no
+    /// progression → the fork falls through to `extend_to`, i.e. a value/format **copy** with
+    /// relative-formula adjustment (same as ⌘D/⌘R).
+    ///
+    /// `target` is the previewed fill region (⊇ `seed`); `axis` is the dominant drag axis. The far
+    /// edge of `target` along `axis` is passed to `auto_fill_rows`/`auto_fill_columns` as the `to`
+    /// bound — the fork natively supports **both** directions: a `to` past the seed fills
+    /// down/right, a `to` before the seed fills up/left (it reverses the seed values and re-runs
+    /// `detect_progression`, so an up/left series counts the sequence down — no reversal needed
+    /// here). One `auto_fill_*` call ⇒ one undo step. Returns whether anything was written
+    /// (`false` = `target` doesn't extend past `seed` → a no-op the caller skips).
+    pub(crate) fn fill_drag(
+        &mut self,
+        sheet_idx: u32,
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+    ) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        let source = Area {
+            sheet: sheet_idx,
+            row: seed.start.row as i32 + 1,
+            column: seed.start.col as i32 + 1,
+            width: seed.width() as i32,
+            height: seed.height() as i32,
+        };
+        match axis {
+            FillAxis::Vertical => {
+                // Far row edge of the target along the fill direction: below the seed (down) or
+                // above it (up). No extension past the seed → nothing to fill.
+                let to_row = if target.end.row > seed.end.row {
+                    target.end.row
+                } else if target.start.row < seed.start.row {
+                    target.start.row
+                } else {
+                    return Ok(false);
+                };
+                self.model.auto_fill_rows(&source, to_row as i32 + 1)?;
+            }
+            FillAxis::Horizontal => {
+                let to_col = if target.end.col > seed.end.col {
+                    target.end.col
+                } else if target.start.col < seed.start.col {
+                    target.start.col
+                } else {
+                    return Ok(false);
+                };
+                self.model.auto_fill_columns(&source, to_col as i32 + 1)?;
+            }
+        }
+        Ok(true)
+    }
+
     /// Sets the width (device px) of the inclusive column run `[col_start, col_end]` (0-based) —
     /// `SetColumnWidths`. One undoable diff-list (`set_columns_width`, `common.rs:1055`). Device px
     /// are converted to IronCalc px at this boundary (the grid speaks device px). Called only over
@@ -659,6 +799,38 @@ impl WorkbookDocument {
         let px = crate::cache::row_ironcalc_px(device_px);
         self.model
             .set_rows_height(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, px)
+    }
+
+    /// Sets (or clears) the **hidden** flag on the inclusive 0-based row run `[row_start, row_end]`
+    /// (`gaps_closing_7_15 §4` Hide/Unhide). One undoable diff-list (the fork's `set_rows_hidden`,
+    /// `common.rs:1408`); a hidden row keeps its height (unhide restores it). The fork also moves its
+    /// internal view selection to the next visible track when hiding — harmless here, since
+    /// FreeCell's grid owns its own selection.
+    pub(crate) fn set_rows_hidden(
+        &mut self,
+        sheet_idx: u32,
+        row_start: u32,
+        row_end: u32,
+        hidden: bool,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .set_rows_hidden(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, hidden)
+    }
+
+    /// Sets (or clears) the **hidden** flag on the inclusive 0-based column run `[col_start, col_end]`
+    /// (the column analog of [`set_rows_hidden`](Self::set_rows_hidden); the fork's
+    /// `set_columns_hidden`, `common.rs:1340`).
+    pub(crate) fn set_columns_hidden(
+        &mut self,
+        sheet_idx: u32,
+        col_start: u32,
+        col_end: u32,
+        hidden: bool,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .set_columns_hidden(sheet_idx, col_start as i32 + 1, col_end as i32 + 1, hidden)
     }
 
     /// Inserts `count` blank rows so new rows appear at 0-based `row` (`InsertRows`); everything at/
@@ -1392,6 +1564,81 @@ impl WorkbookDocument {
         }
     }
 
+    /// One cell's **raw stored value** rendered for CSV export (`functional_spec.md §2`, D2.2 —
+    /// computed underlying values, *not* the formatted display string and *not* the formula
+    /// source). Like [`value_token`](Self::value_token) but text is written **verbatim** (no
+    /// leading-apostrophe quote-prefix — the csv writer handles RFC-4180 quoting), so a cell whose
+    /// display would be `50%` writes `0.5`, a date serial writes its serial number, a boolean
+    /// writes `TRUE`/`FALSE`, an error writes its error string, a formula writes its computed
+    /// value, and an empty cell writes `""`.
+    fn export_cell_value(&self, sheet_idx: u32, row: i32, col: i32, decimal_sep: char) -> String {
+        crate::instrument::record_engine_call();
+        match self
+            .model
+            .get_model()
+            .get_cell_value_by_index(sheet_idx, row, col)
+        {
+            // FOLLOW-ON (tracked in GAPS.md, localization): `number_token` renders the decimal point
+            // as the **workbook locale's** separator. For a comma-decimal locale (e.g. `de`) that
+            // collides with the comma CSV delimiter — `0.5 → "0,5"`, which the csv writer then quotes
+            // and a re-import reads as text. Latent only today: the app is en-locale-only
+            // (`DEFAULT_LOCALE = "en"` → `.`), and D2.4 keeps this round comma-only. The localization
+            // pass should switch the delimiter to `;` for comma-decimal locales.
+            Ok(CellValue::Number(n)) => number_token(n, decimal_sep),
+            Ok(CellValue::Boolean(b)) => if b { "TRUE" } else { "FALSE" }.to_string(),
+            // Both genuine text and an error cell surface as `String(s)`; write either verbatim
+            // (the error string is its value; text is its value).
+            Ok(CellValue::String(s)) => s,
+            Ok(CellValue::None) | Err(_) => String::new(),
+        }
+    }
+
+    /// Exports the active sheet's **used range** to `path` as a `.csv` (`functional_spec.md §2`,
+    /// D2.2). Each cell renders its raw stored value via [`export_cell_value`](Self::export_cell_value);
+    /// trailing empty fields in a row are trimmed (no trailing commas past the used range); the
+    /// `csv` writer serializes RFC-4180 with `CRLF` line endings, quoting any field containing a
+    /// comma, double-quote, or newline. Written atomically (temp-file + fsync + rename), so a
+    /// failure leaves any existing file intact. An empty sheet writes a 0-byte file. `pub(crate)`:
+    /// the walk reads the IronCalc `Worksheet`, which never leaves this crate.
+    pub(crate) fn export_csv(&self, sheet_idx: u32, path: &Path) -> Result<(), SaveError> {
+        crate::instrument::record_engine_call();
+        let ws = self.worksheet(sheet_idx).map_err(SaveError::Serialize)?;
+
+        // A sheet with no populated cells → a clean empty file (edge case: no error).
+        if ws.sheet_data.is_empty() {
+            let temp = new_temp_beside(path)?;
+            return persist_atomically(temp, path);
+        }
+
+        let dim = ws.dimension();
+        let (min_row, max_row) = (dim.min_row, dim.max_row);
+        let (min_col, max_col) = (dim.min_column, dim.max_column);
+        let decimal_sep = self.workbook_decimal_separator();
+
+        let temp = new_temp_beside(path)?;
+        {
+            // `flexible(true)` is required: trailing-empty trimming yields ragged records, which a
+            // strict writer would reject with an unequal-lengths error.
+            let mut writer = csv::WriterBuilder::new()
+                .terminator(csv::Terminator::CRLF)
+                .flexible(true)
+                .from_writer(BufWriter::new(temp.as_file()));
+            for row in min_row..=max_row {
+                let mut fields: Vec<String> = (min_col..=max_col)
+                    .map(|col| self.export_cell_value(sheet_idx, row, col, decimal_sep))
+                    .collect();
+                while fields.last().is_some_and(|f| f.is_empty()) {
+                    fields.pop();
+                }
+                writer
+                    .write_record(&fields)
+                    .map_err(|e| SaveError::Serialize(e.to_string()))?;
+            }
+            writer.flush().map_err(|e| SaveError::Io(e.to_string()))?;
+        }
+        persist_atomically(temp, path)
+    }
+
     /// Paste a previously-copied engine payload at `anchor` on `dest_idx` (`paste_from_clipboard`,
     /// `common.rs:1811`): Excel relative-reference adjustment on copy, move semantics + source
     /// clear on cut, one undoable diff list, then the pasted area is re-selected. `source_idx` /
@@ -1871,6 +2118,202 @@ mod tests {
         assert_eq!(to_engine_coords(CellRef::new(6, 1)), (7, 2)); // B7
     }
 
+    // ---- CSV import / export (`functional_spec.md §2`, D2.2) -------------------------------
+
+    /// Writes `content` to a fresh `.csv` in a temp dir and imports it, returning the doc and the
+    /// dir (kept alive so the file isn't cleaned up mid-test).
+    fn import_csv_str(content: &[u8]) -> (WorkbookDocument, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("in.csv");
+        fs::write(&path, content).unwrap();
+        let doc = WorkbookDocument::import_csv(&path).expect("import should succeed");
+        (doc, dir)
+    }
+
+    fn cell_val(doc: &WorkbookDocument, row: u32, col: u32) -> CellData {
+        doc.cell_value(0, CellRef::new(row, col))
+    }
+
+    #[test]
+    fn import_csv_applies_fields_as_user_input() {
+        // Numbers, booleans, formulas, and text each auto-type via `set_user_input`; a quoted field
+        // carries an embedded comma and newline as ONE field; a ragged short row leaves trailing
+        // cells empty.
+        let csv = b"42,hello,TRUE\r\n=1+2,\"a, b\",\"line1\nline2\"\r\nx\r\n";
+        let (doc, _dir) = import_csv_str(csv);
+
+        assert_eq!(cell_val(&doc, 0, 0), CellData::Number(42.0));
+        assert_eq!(cell_val(&doc, 0, 1), CellData::Text("hello".into()));
+        assert_eq!(cell_val(&doc, 0, 2), CellData::Bool(true));
+        // A leading `=` is a formula: its source is preserved and it computes.
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "=1+2");
+        assert_eq!(cell_val(&doc, 1, 0), CellData::Number(3.0));
+        assert_eq!(cell_val(&doc, 1, 1), CellData::Text("a, b".into()));
+        assert_eq!(cell_val(&doc, 1, 2), CellData::Text("line1\nline2".into()));
+        // Ragged row: A3 populated, B3/C3 empty.
+        assert_eq!(cell_val(&doc, 2, 0), CellData::Text("x".into()));
+        assert_eq!(cell_val(&doc, 2, 1), CellData::Empty);
+        assert_eq!(doc.sheet_count(), 1);
+    }
+
+    #[test]
+    fn import_csv_leaves_undo_history_empty() {
+        // The import builds a raw `Model` wrapped with `UserModel::from_model`, so nothing lands on
+        // the undo stack — the imported document is fresh (cross-cutting §Undo; guards against a
+        // regression to applying inputs through `UserModel::set_user_input`, which would be undoable).
+        let (doc, _dir) = import_csv_str(b"1,2\r\n=A1+B1,text\r\n");
+        assert!(
+            !doc.model.can_undo(),
+            "an imported document's undo history starts empty (not dirty)"
+        );
+    }
+
+    #[test]
+    fn import_csv_strips_leading_bom() {
+        // A UTF-8 BOM must not pollute A1.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"hi,42\r\n");
+        let (doc, _dir) = import_csv_str(&bytes);
+        assert_eq!(cell_val(&doc, 0, 0), CellData::Text("hi".into()));
+        assert_eq!(cell_val(&doc, 0, 1), CellData::Number(42.0));
+    }
+
+    #[test]
+    fn import_csv_empty_file_yields_one_empty_sheet() {
+        let (doc, _dir) = import_csv_str(b"");
+        assert_eq!(doc.sheet_count(), 1);
+        assert_eq!(cell_val(&doc, 0, 0), CellData::Empty);
+    }
+
+    #[test]
+    fn import_csv_rejects_more_columns_than_max() {
+        // One row with MAX_COLS + 1 fields (16,384 commas ⇒ 16,385 fields) → the col guard fires.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wide.csv");
+        let line = ",".repeat(freecell_core::limits::MAX_COLS as usize);
+        fs::write(&path, line.as_bytes()).unwrap();
+        assert!(matches!(
+            WorkbookDocument::import_csv(&path),
+            Err(LoadError::BadCsv(_))
+        ));
+    }
+
+    #[test]
+    fn import_csv_rejects_invalid_utf8() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.csv");
+        // `0xFF` is never valid UTF-8.
+        fs::write(&path, [0x41, 0xFF, 0x42]).unwrap();
+        assert!(matches!(
+            WorkbookDocument::import_csv(&path),
+            Err(LoadError::BadCsv(_))
+        ));
+    }
+
+    /// Exports sheet 0 of `doc` to a temp `.csv` and returns its raw bytes.
+    fn export_csv_bytes(doc: &WorkbookDocument) -> Vec<u8> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        doc.export_csv(0, &path).expect("export should succeed");
+        fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn export_csv_writes_raw_stored_values() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "0.5").unwrap(); // number (not 50%)
+        doc.set_cell_input(0, CellRef::new(1, 0), "=1+2").unwrap(); // formula → computed value 3
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap(); // boolean
+        doc.set_cell_input(0, CellRef::new(3, 0), "hello, world")
+            .unwrap(); // text with a comma → quoted
+        doc.set_cell_input(0, CellRef::new(4, 0), "=1/0").unwrap(); // error string
+        doc.set_cell_input(0, CellRef::new(5, 0), "2024-01-15")
+            .unwrap(); // a date → serial number, not the formatted date
+        doc.evaluate();
+
+        let bytes = export_csv_bytes(&doc);
+        let text = String::from_utf8(bytes).unwrap();
+        // CRLF line endings (RFC 4180).
+        assert!(text.contains("\r\n"), "CRLF terminators: {text:?}");
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        assert_eq!(lines[0], "0.5", "raw number, not the 50% display");
+        assert_eq!(lines[1], "3", "formula writes its computed value");
+        assert_eq!(lines[2], "TRUE");
+        assert_eq!(lines[3], "\"hello, world\"", "comma cell is quoted");
+        assert_eq!(lines[4], "#DIV/0!", "error string verbatim");
+        // The date exports as its serial number (a plain decimal), NOT the formatted date.
+        assert_ne!(lines[5], "2024-01-15");
+        assert!(
+            lines[5].parse::<f64>().is_ok(),
+            "date serial is a plain number, got {:?}",
+            lines[5]
+        );
+    }
+
+    #[test]
+    fn export_csv_writes_text_that_looks_like_formula_verbatim() {
+        // A genuine TEXT cell whose content looks like a formula/number (`'=1+1` — the apostrophe
+        // forces literal text) exports as `=1+1` with NO leading apostrophe and NO re-interpretation.
+        // Locks in the `String(s) => s` export path (unlike the paste-values `value_token`, which
+        // apostrophe-quotes text).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "'=1+1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "'0123").unwrap(); // text that looks like a number
+        doc.evaluate();
+
+        let text = String::from_utf8(export_csv_bytes(&doc)).unwrap();
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        assert_eq!(
+            lines[0], "=1+1",
+            "text-as-formula exports verbatim, no apostrophe"
+        );
+        assert_eq!(
+            lines[1], "0123",
+            "text-as-number exports verbatim, no apostrophe"
+        );
+    }
+
+    #[test]
+    fn export_csv_trims_trailing_empty_fields() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A1 and C1 populated (B1 empty); the used range is A1:C1, but B1 stays as an empty field
+        // and no trailing comma follows C1.
+        doc.set_cell_input(0, CellRef::new(0, 0), "a").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 2), "c").unwrap();
+        doc.evaluate();
+        let text = String::from_utf8(export_csv_bytes(&doc)).unwrap();
+        assert_eq!(text, "a,,c\r\n");
+    }
+
+    #[test]
+    fn export_csv_empty_sheet_writes_empty_file() {
+        let doc = WorkbookDocument::new_empty().unwrap();
+        assert!(
+            export_csv_bytes(&doc).is_empty(),
+            "an empty sheet exports a 0-byte file"
+        );
+    }
+
+    #[test]
+    fn export_then_import_round_trips_values() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2.5").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "hello").unwrap();
+        doc.evaluate();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("round.csv");
+        doc.export_csv(0, &path).unwrap();
+        let reimported = WorkbookDocument::import_csv(&path).unwrap();
+
+        assert_eq!(cell_val(&reimported, 0, 0), CellData::Number(1.0));
+        assert_eq!(cell_val(&reimported, 1, 0), CellData::Number(2.5));
+        assert_eq!(cell_val(&reimported, 2, 0), CellData::Bool(true));
+        assert_eq!(cell_val(&reimported, 0, 1), CellData::Text("hello".into()));
+    }
+
     /// A cell's evaluated display string (`""` for empty), for the fill assertions below.
     fn value(doc: &WorkbookDocument, row: u32, col: u32) -> String {
         doc.formatted_value(0, CellRef::new(row, col)).unwrap()
@@ -2063,6 +2506,130 @@ mod tests {
         assert_eq!(value(&doc, 1, 0), ""); // A2 reverted
         assert_eq!(value(&doc, 2, 0), ""); // A3 reverted by the SAME undo
         assert_eq!(value(&doc, 0, 0), "1"); // seed A1 intact
+    }
+
+    // ---- Drag-fill (`gaps_closing_7_15 §3`) — the full-seed series/copy path ----------------
+
+    #[test]
+    fn fill_drag_two_cell_numeric_seed_extrapolates_series_down() {
+        // A1=1, A2=2. Drag the A1:A2 seed down to A5 → the fork's `detect_progression` extends
+        // the arithmetic series (3, 4, 5) — the multi-cell-seed behavior ⌘D can't reach.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(value(&doc, 2, 0), "3");
+        assert_eq!(value(&doc, 3, 0), "4");
+        assert_eq!(value(&doc, 4, 0), "5");
+    }
+
+    #[test]
+    fn fill_drag_single_cell_seed_copies_down() {
+        // A single-cell seed has no progression → the fork copies (not a 7,8,9… series).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "7").unwrap();
+        let seed = CellRange::single(CellRef::new(0, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(3, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        for r in 0..4 {
+            assert_eq!(value(&doc, r, 0), "7");
+        }
+    }
+
+    #[test]
+    fn fill_drag_single_cell_copies_relative_formula() {
+        // A1="=B1"; B1..B4 = 10,20,30,40. A single-cell drag-fill copies the formula down with
+        // RELATIVE adjustment → A2="=B2" … A4="=B4" (consistent with ⌘D).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "=B1").unwrap();
+        for (i, v) in [10, 20, 30, 40].iter().enumerate() {
+            doc.set_cell_input(0, CellRef::new(i as u32, 1), &v.to_string())
+                .unwrap();
+        }
+        let seed = CellRange::single(CellRef::new(0, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(3, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "=B2");
+        assert_eq!(doc.cell_content(0, CellRef::new(3, 0)).unwrap(), "=B4");
+        assert_eq!(value(&doc, 3, 0), "40");
+    }
+
+    #[test]
+    fn fill_drag_month_seed_extrapolates() {
+        // A1="Jan", A2="Feb". Dragging the seed down extends the month sequence (Mar, Apr) via the
+        // fork's text-sequence detection.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "Jan").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "Feb").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(3, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(value(&doc, 2, 0), "Mar");
+        assert_eq!(value(&doc, 3, 0), "Apr");
+    }
+
+    #[test]
+    fn fill_drag_up_reverses_series() {
+        // Seed A4=3, A5=4. Dragging the A4:A5 seed UP to A1 counts the series DOWN (native fork
+        // up-fill: A3=2, A2=1, A1=0) — the document method passes the target's top edge as `to_row`
+        // (< the seed's first row) and the fork reverses.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(3, 0), "3").unwrap();
+        doc.set_cell_input(0, CellRef::new(4, 0), "4").unwrap();
+        let seed = CellRange::new(CellRef::new(3, 0), CellRef::new(4, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(value(&doc, 2, 0), "2");
+        assert_eq!(value(&doc, 1, 0), "1");
+        assert_eq!(value(&doc, 0, 0), "0");
+    }
+
+    #[test]
+    fn fill_drag_horizontal_series_right() {
+        // A1=1, B1=2. Dragging the A1:B1 seed right to E1 extends the series (3, 4, 5) along the
+        // Horizontal axis (`auto_fill_columns`).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(0, 1));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(0, 4));
+        assert!(doc
+            .fill_drag(0, seed, target, FillAxis::Horizontal)
+            .unwrap());
+        assert_eq!(value(&doc, 0, 2), "3");
+        assert_eq!(value(&doc, 0, 3), "4");
+        assert_eq!(value(&doc, 0, 4), "5");
+    }
+
+    #[test]
+    fn fill_drag_is_one_undo_step() {
+        // A series drag-fill pushes exactly ONE history entry: one undo reverts the whole fill.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap();
+        assert_eq!(value(&doc, 4, 0), "5"); // A5 filled
+        doc.undo().unwrap();
+        doc.evaluate();
+        assert_eq!(value(&doc, 2, 0), ""); // A3 reverted
+        assert_eq!(value(&doc, 4, 0), ""); // A5 reverted by the SAME undo
+        assert_eq!(value(&doc, 0, 0), "1"); // seed intact
+        assert_eq!(value(&doc, 1, 0), "2");
+    }
+
+    #[test]
+    fn fill_drag_no_extension_is_noop() {
+        // A target that doesn't extend past the seed writes nothing → `false` (the caller skips
+        // eval/publish/undo), matching a release back onto the seed.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        assert!(!doc.fill_drag(0, seed, seed, FillAxis::Vertical).unwrap());
     }
 
     #[test]

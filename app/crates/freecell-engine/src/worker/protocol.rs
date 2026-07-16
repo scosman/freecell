@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
-use freecell_core::{CellRange, CellRef, Direction, Rgb, SelectionStats, SheetId};
+use freecell_core::{CellRange, CellRef, Direction, FillAxis, Rgb, SelectionStats, SheetId};
 
 use crate::document::{LoadError, SaveError};
 
@@ -212,6 +212,15 @@ pub enum Command {
     /// Fill Right (⌘R): copy `range`'s **left column** right over the rest of `range` (the column
     /// analog of [`Command::FillDown`]). A lone single-cell `range` pulls from the cell to the left.
     FillRight { sheet: SheetId, range: CellRange },
+    /// Drag-fill (`gaps_closing_7_15 §3`): extend `seed`'s content into `target` (⊇ `seed`) along
+    /// the dominant `axis`. Unlike ⌘D/⌘R this seeds `auto_fill_*` with the **full** `seed` block, so
+    /// a multi-cell seed extrapolates a series (a single-cell seed copies). One undo step.
+    FillDrag {
+        sheet: SheetId,
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+    },
     /// Toggle/set a style attribute over a range.
     SetStyleAttr {
         sheet: SheetId,
@@ -288,6 +297,24 @@ pub enum Command {
     AutoGrowRowHeights {
         sheet: SheetId,
         heights: Vec<(u32, f32)>,
+    },
+    /// Set (or clear) the **hidden** flag on the inclusive 0-based row run `[start, end]`
+    /// (`gaps_closing_7_15 §4`). Geometry-only (no evaluation — hiding never changes values), one
+    /// undoable diff-list (`set_rows_hidden`); the active sheet's cache is rebuilt (it re-reads the
+    /// hidden flags → zero-size geometry). `hidden: true` = Hide, `false` = Unhide (restore).
+    SetRowsHidden {
+        sheet: SheetId,
+        start: u32,
+        end: u32,
+        hidden: bool,
+    },
+    /// Set (or clear) the **hidden** flag on the inclusive 0-based column run `[start, end]` (the
+    /// column analog of [`Command::SetRowsHidden`]).
+    SetColumnsHidden {
+        sheet: SheetId,
+        start: u32,
+        end: u32,
+        hidden: bool,
     },
     /// Insert `count` blank rows so new rows appear at 0-based `row` (`functional_spec.md §5.3`);
     /// content at/after `row` shifts down and formulas adjust. Undoable; needs evaluation. The
@@ -514,6 +541,14 @@ pub enum Command {
     },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },
+    /// Export `sheet`'s used range to `path` as a `.csv` (`functional_spec.md §2`, D2.2 — raw
+    /// stored values). A **pure read**: it never touches the model, `ops_seen`, or the undo stack,
+    /// so it can't change the document's dirty flag. Replied via `CsvExported` / `CsvExportFailed`.
+    ExportCsv {
+        sheet: SheetId,
+        path: PathBuf,
+        req_id: u64,
+    },
     /// Drop the model and exit the loop.
     Shutdown,
     /// Test-only: panic inside the `catch_unwind`-guarded apply, to exercise the recovery +
@@ -603,6 +638,12 @@ pub enum WorkerEvent {
     Saved { req_id: u64, ops_seen: u64 },
     /// Reply to `Save`: failure (typed; the original file is untouched — atomic save).
     SaveFailed { req_id: u64, error: SaveError },
+    /// Reply to [`Command::ExportCsv`]: the `.csv` was written. Carries no state — export is a side
+    /// output (the document's dirty flag / path / title are unchanged, `functional_spec.md §2`).
+    CsvExported { req_id: u64 },
+    /// Reply to [`Command::ExportCsv`]: the export failed (typed; any existing file is untouched —
+    /// atomic write). Surfaced by the standard save-error dialog.
+    CsvExportFailed { req_id: u64, error: SaveError },
     /// An edit was refused (cap re-check, name validation, caught panic, or degraded).
     EditRejected { reason: EditRejectedReason },
     /// The style/geometry cache for `sheet` changed (deltas shipped via the shared cache).

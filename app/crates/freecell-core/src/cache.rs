@@ -7,7 +7,7 @@
 //! read model in `freecell-core` lets the grid and render-test fixtures build against it
 //! without the engine — [`SheetCacheBuilder`] is the fixture/engine-facing constructor.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::axis::Axis;
@@ -52,6 +52,14 @@ pub struct SheetCache {
     col_default_px: f32,
     row_overrides: BTreeMap<u32, f32>,
     col_overrides: BTreeMap<u32, f32>,
+    /// Rows/columns flagged **hidden** (`gaps_closing_7_15 §4`). A hidden track renders at **zero**
+    /// size — the axes below are built with every hidden index forced to `0.0` — but its real
+    /// (non-hidden) size is preserved in `*_overrides` for unhide-restore, and hidden is kept
+    /// **distinct** from a 0px manual resize (D4.3): unhide clears membership here, a resize never
+    /// touches it. Populated from the file's `Row.hidden` / `Col.hidden` at cache build and rebuilt
+    /// on every hide/unhide (which republishes the whole cache).
+    hidden_rows: BTreeSet<u32>,
+    hidden_cols: BTreeSet<u32>,
     row_axis: Arc<Axis>,
     col_axis: Arc<Axis>,
     cell_styles: BTreeMap<(u32, u32), StyleId>,
@@ -97,6 +105,28 @@ pub struct SheetCache {
     /// delete **merge guard**: the UI disables a menu item whose op would displace a merge. Merged
     /// cells are otherwise unsupported (a deferred project), so the grid does not render them.
     merges: Vec<CellRange>,
+}
+
+/// Builds an axis from `count` tracks at `default_px`, the sparse real-size `overrides`, and the
+/// `hidden` set — every hidden index is forced to `0.0` (overriding any stored override/default),
+/// so a hidden row/column occupies no pixels (`gaps_closing_7_15 §4`). The single chokepoint every
+/// axis (build + rebuild) routes through, so hidden→0 is applied uniformly and `*_overrides` can
+/// keep the real size for unhide-restore. `Axis` tolerates 0.0 safely — `index_at` never lands on a
+/// zero-size track, and offsets/totals sum correctly (research (B)).
+fn axis_from(
+    count: u32,
+    default_px: f32,
+    overrides: &BTreeMap<u32, f32>,
+    hidden: &BTreeSet<u32>,
+) -> Arc<Axis> {
+    if hidden.is_empty() {
+        return Arc::new(Axis::from_overrides(count, default_px, overrides.clone()));
+    }
+    let mut effective = overrides.clone();
+    for &i in hidden {
+        effective.insert(i, 0.0);
+    }
+    Arc::new(Axis::from_overrides(count, default_px, effective))
 }
 
 /// The canonical default number-format code (IronCalc's `Style::default().num_fmt`, lowercase).
@@ -440,19 +470,43 @@ impl SheetCache {
     }
 
     fn rebuild_row_axis(&mut self) {
-        self.row_axis = Arc::new(Axis::from_overrides(
+        self.row_axis = axis_from(
             self.row_count,
             self.row_default_px,
-            self.row_overrides.clone(),
-        ));
+            &self.row_overrides,
+            &self.hidden_rows,
+        );
     }
 
     fn rebuild_col_axis(&mut self) {
-        self.col_axis = Arc::new(Axis::from_overrides(
+        self.col_axis = axis_from(
             self.col_count,
             self.col_default_px,
-            self.col_overrides.clone(),
-        ));
+            &self.col_overrides,
+            &self.hidden_cols,
+        );
+    }
+
+    /// The rows flagged hidden (rendered at zero size). The grid reads this to gate the header
+    /// menu's Hide (would it hide every visible track?) / Unhide (does the run contain a hidden
+    /// track?) items (`gaps_closing_7_15 §4`).
+    pub fn hidden_rows(&self) -> &BTreeSet<u32> {
+        &self.hidden_rows
+    }
+
+    /// The columns flagged hidden (rendered at zero size). See [`SheetCache::hidden_rows`].
+    pub fn hidden_cols(&self) -> &BTreeSet<u32> {
+        &self.hidden_cols
+    }
+
+    /// Whether `row` is hidden.
+    pub fn is_row_hidden(&self, row: u32) -> bool {
+        self.hidden_rows.contains(&row)
+    }
+
+    /// Whether `col` is hidden.
+    pub fn is_col_hidden(&self, col: u32) -> bool {
+        self.hidden_cols.contains(&col)
     }
 }
 
@@ -467,6 +521,8 @@ pub struct SheetCacheBuilder {
     col_default_px: f32,
     row_overrides: BTreeMap<u32, f32>,
     col_overrides: BTreeMap<u32, f32>,
+    hidden_rows: BTreeSet<u32>,
+    hidden_cols: BTreeSet<u32>,
     cell_styles: BTreeMap<(u32, u32), StyleId>,
     row_styles: BTreeMap<u32, StyleId>,
     col_styles: BTreeMap<u32, StyleId>,
@@ -489,6 +545,8 @@ impl SheetCacheBuilder {
             col_default_px: DEFAULT_COL_WIDTH_PX,
             row_overrides: BTreeMap::new(),
             col_overrides: BTreeMap::new(),
+            hidden_rows: BTreeSet::new(),
+            hidden_cols: BTreeSet::new(),
             cell_styles: BTreeMap::new(),
             row_styles: BTreeMap::new(),
             col_styles: BTreeMap::new(),
@@ -573,6 +631,18 @@ impl SheetCacheBuilder {
         self.col_overrides.insert(col, px);
     }
 
+    /// Flags `row` hidden (rendered at zero size). The engine's build loop calls this for each
+    /// `Row.hidden` track.
+    pub fn push_hidden_row(&mut self, row: u32) {
+        self.hidden_rows.insert(row);
+    }
+
+    /// Flags `col` hidden (rendered at zero size). The engine's build loop calls this for each
+    /// `Col.hidden` track.
+    pub fn push_hidden_col(&mut self, col: u32) {
+        self.hidden_cols.insert(col);
+    }
+
     /// Interns + sets the style of a single cell.
     pub fn push_cell_style(&mut self, row: u32, col: u32, style: RenderStyle) {
         let id = self.intern(style);
@@ -605,6 +675,18 @@ impl SheetCacheBuilder {
         self
     }
 
+    /// Flags `row` hidden (fluent; rendered at zero size).
+    pub fn hidden_row(mut self, row: u32) -> Self {
+        self.push_hidden_row(row);
+        self
+    }
+
+    /// Flags `col` hidden (fluent; rendered at zero size).
+    pub fn hidden_col(mut self, col: u32) -> Self {
+        self.push_hidden_col(col);
+        self
+    }
+
     /// Sets the style of a single cell.
     pub fn cell_style(mut self, row: u32, col: u32, style: RenderStyle) -> Self {
         self.push_cell_style(row, col, style);
@@ -623,18 +705,21 @@ impl SheetCacheBuilder {
         self
     }
 
-    /// Builds the immutable-shell cache, constructing the prefix-sum axes from the geometry.
+    /// Builds the immutable-shell cache, constructing the prefix-sum axes from the geometry
+    /// (hidden tracks forced to zero size via [`axis_from`]).
     pub fn build(self) -> SheetCache {
-        let row_axis = Arc::new(Axis::from_overrides(
+        let row_axis = axis_from(
             self.row_count,
             self.row_default_px,
-            self.row_overrides.clone(),
-        ));
-        let col_axis = Arc::new(Axis::from_overrides(
+            &self.row_overrides,
+            &self.hidden_rows,
+        );
+        let col_axis = axis_from(
             self.col_count,
             self.col_default_px,
-            self.col_overrides.clone(),
-        ));
+            &self.col_overrides,
+            &self.hidden_cols,
+        );
         SheetCache {
             row_count: self.row_count,
             col_count: self.col_count,
@@ -642,6 +727,8 @@ impl SheetCacheBuilder {
             col_default_px: self.col_default_px,
             row_overrides: self.row_overrides,
             col_overrides: self.col_overrides,
+            hidden_rows: self.hidden_rows,
+            hidden_cols: self.hidden_cols,
             row_axis,
             col_axis,
             cell_styles: self.cell_styles,
@@ -1072,6 +1159,41 @@ mod tests {
         // A reset removes the override.
         cache.set_row_heights(&[(0, None)]);
         assert_eq!(cache.row_height(0), 20.0);
+    }
+
+    #[test]
+    fn hidden_tracks_render_zero_size_but_keep_their_override() {
+        // A hidden row/col occupies no pixels, is excluded from the totals, and `index_at` never
+        // lands on it — yet its real (custom) size is preserved in the overrides for unhide-restore
+        // (D4.3: hidden is distinct from a 0px resize).
+        let cache = SheetCacheBuilder::new(5, 5)
+            .defaults(20.0, 100.0)
+            .row_height(2, 60.0) // row 2 has a custom 60px height…
+            .hidden_row(2) // …but is hidden → renders 0.
+            .hidden_col(1)
+            .build();
+
+        assert_eq!(cache.row_height(2), 0.0, "a hidden row renders zero-size");
+        assert_eq!(cache.col_width(1), 0.0, "a hidden col renders zero-size");
+        // Non-hidden neighbors keep their sizes.
+        assert_eq!(cache.row_height(0), 20.0);
+        assert_eq!(cache.col_width(0), 100.0);
+        // Totals exclude the hidden tracks: rows = 4×20 (row 2 gone) = 80; cols = 4×100 = 400.
+        assert!((cache.total_height() - 80.0).abs() < 1e-6);
+        assert!((cache.total_width() - 400.0).abs() < 1e-6);
+        // The custom override survives for restore (unhide re-reads it from the engine on rebuild,
+        // but the cache never loses it here).
+        assert_eq!(cache.row_overrides().get(&2), Some(&60.0));
+        // Hidden membership is queryable for the header menu.
+        assert!(cache.is_row_hidden(2) && cache.hidden_rows().contains(&2));
+        assert!(cache.is_col_hidden(1) && cache.hidden_cols().contains(&1));
+        assert!(!cache.is_row_hidden(0) && !cache.is_col_hidden(0));
+        // `index_at` at the hidden row's offset skips to the next visible row (can't click into it).
+        let (row_axis, col_axis) = cache.axes();
+        let off = row_axis.offset_of(2);
+        assert_eq!(row_axis.index_at(off), 3, "index_at skips the hidden row");
+        let coff = col_axis.offset_of(1);
+        assert_eq!(col_axis.index_at(coff), 2, "index_at skips the hidden col");
     }
 
     #[test]

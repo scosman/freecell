@@ -53,6 +53,12 @@ pub struct Scene {
     inputs: Vec<(u32, u32, String)>,
     styles: Vec<(CellRange, StyleAttr)>,
     injects: Vec<Inject>,
+    /// Inclusive 0-based row runs to hide via a real `Command::SetRowsHidden` (`gaps_closing_7_15
+    /// §4`) — the same worker path the header-menu Hide drives, so the published cache carries the
+    /// zero-size hidden geometry.
+    hidden_rows: Vec<(u32, u32)>,
+    /// Inclusive 0-based column runs to hide via a real `Command::SetColumnsHidden`.
+    hidden_cols: Vec<(u32, u32)>,
     publish_rows: Range<u32>,
     publish_cols: Range<u32>,
 }
@@ -72,6 +78,8 @@ impl Scene {
             inputs: Vec::new(),
             styles: Vec::new(),
             injects: Vec::new(),
+            hidden_rows: Vec::new(),
+            hidden_cols: Vec::new(),
             publish_rows: 0..80,
             publish_cols: 0..48,
         }
@@ -183,6 +191,21 @@ impl Scene {
         self
     }
 
+    /// Hides the inclusive 0-based row run `[start, end]` via a **real** `Command::SetRowsHidden`
+    /// (`gaps_closing_7_15 §4`) — the same worker path the header-menu Hide drives — so the
+    /// published cache renders those rows at zero size (neighbours abut, no header/gridline).
+    pub fn hide_row(mut self, start: u32, end: u32) -> Self {
+        self.hidden_rows.push((start, end));
+        self
+    }
+
+    /// Hides the inclusive 0-based column run `[start, end]` via a real `Command::SetColumnsHidden`
+    /// (the column analogue of [`Scene::hide_row`]).
+    pub fn hide_col(mut self, start: u32, end: u32) -> Self {
+        self.hidden_cols.push((start, end));
+        self
+    }
+
     /// Overrides the published viewport window (for cases whose values sit deeper than the
     /// default 80×48 window).
     pub fn publish(mut self, rows: Range<u32>, cols: Range<u32>) -> Self {
@@ -233,6 +256,24 @@ pub fn build_sources(scene: &Scene) -> Result<GridDataSources> {
             sheet,
             range: *range,
             attr: *attr,
+        });
+    }
+    // Hide row/column runs through the real worker path (`gaps_closing_7_15 §4`), so the rebuilt
+    // cache carries the zero-size hidden geometry the grid renders.
+    for (start, end) in &scene.hidden_rows {
+        client.send(Command::SetRowsHidden {
+            sheet,
+            start: *start,
+            end: *end,
+            hidden: true,
+        });
+    }
+    for (start, end) in &scene.hidden_cols {
+        client.send(Command::SetColumnsHidden {
+            sheet,
+            start: *start,
+            end: *end,
+            hidden: true,
         });
     }
     client.send(Command::SetViewport {

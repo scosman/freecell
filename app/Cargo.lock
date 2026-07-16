@@ -2078,6 +2078,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-channel 2.5.0",
+ "csv",
  "freecell-chart-model",
  "freecell-core",
  "ironcalc",

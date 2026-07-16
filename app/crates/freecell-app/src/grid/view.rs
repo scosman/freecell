@@ -35,10 +35,12 @@ use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
     apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
     is_full_row_selection, spans_all_cols, spans_all_rows, Align, Axis, BorderSpec, CellRange,
-    CellRef, Edge, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
+    CellRef, Edge, FillAxis, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
-use super::chart_layer::{self, ChartPlacement, ChartRect, Handle};
+use crate::chrome::AutocompleteDisplay;
+
+use super::chart_layer::{self, ChartPlacement, ChartRect, Handle, HANDLE_HIT_HALF, HANDLE_PX};
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
     self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
@@ -131,6 +133,18 @@ struct HeaderMenu {
     insert_before_blocked: bool,
     insert_after_blocked: bool,
     delete_blocked: bool,
+    /// Hide is disabled when hiding the run would leave **zero** visible tracks on the axis
+    /// (reachable only via Select-All → Hide, since the axis is Excel-max; `gaps_closing_7_15 §4`).
+    hide_blocked: bool,
+    /// The minimal `[first_hidden, last_hidden]` span of hidden tracks **within** the run, or
+    /// `None` when the run contains no hidden track (Unhide disabled). Unhide targets this span (not
+    /// the whole run) so Select-All → Unhide reveals the hidden cluster in one undo step without
+    /// touching the whole 1M-row axis.
+    unhide_run: Option<(u32, u32)>,
+    /// How many tracks in the run are already hidden — drives the accurate menu-item counts
+    /// (Unhide N; Hide counts the newly-hidden `run_len − hidden_in_run`), independent of the
+    /// span width (`unhide_run` may be wider than the count when the hidden tracks are sparse).
+    hidden_in_run: u32,
 }
 
 /// The open cell-area right-click context menu (`functional_spec.md §2`, cloned from
@@ -190,6 +204,18 @@ struct ChartDrag {
     grab: (f32, f32),
     start_rect: ChartRect,
     current_rect: ChartRect,
+}
+
+/// An in-flight drag of the selection's fill handle (`gaps_closing_7_15 §3`), mirroring
+/// [`ChartDrag`]. `seed` is the selection at mouse-down; `target` (⊇ seed) is the live previewed
+/// fill region, recomputed each move; `axis` is the dominant fill direction — `None` until the
+/// pointer first leaves the seed, then **sticky** (kept until the pointer returns inside the seed),
+/// so a drag doesn't flip axis mid-gesture (Excel behavior, D3.1).
+#[derive(Debug, Clone, Copy)]
+struct FillDrag {
+    seed: CellRange,
+    target: CellRange,
+    axis: Option<FillAxis>,
 }
 
 /// A right-click "Delete chart" context menu over a chart (P18, `ui_design §3.2` — the alternate
@@ -307,6 +333,12 @@ pub struct GridView {
     incell_input: Option<Entity<InputState>>,
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
+    /// The function-completion list to render under the in-cell overlay, or `None`
+    /// (`gaps_closing_7_15 §1`). Pushed by the chrome via `set_edit_state`; also read in
+    /// `capture_key_down` to intercept nav/accept/dismiss keys while it is open.
+    incell_autocomplete: Option<AutocompleteDisplay>,
+    /// The passive signature-hint template to render under the in-cell overlay, or `None`.
+    incell_sig_hint: Option<SharedString>,
     /// The in-cell editor overlay's measured, viewport-clamped `(width, height)` in device px for the
     /// current frame, or `None` when the editor is closed (or on a non-`render` build path that skips
     /// measurement — the overlay then falls back to its base cell-rect size). Computed in
@@ -334,6 +366,9 @@ pub struct GridView {
     selected_chart: Option<ChartId>,
     /// The in-flight chart move/resize drag, if any (`None` = not dragging a chart).
     chart_drag: Option<ChartDrag>,
+    /// The in-flight drag of the selection's fill handle, if any (`gaps_closing_7_15 §3`;
+    /// `None` = not fill-dragging). Drives the live preview rect + the committed fill on release.
+    fill_drag: Option<FillDrag>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
     /// The open cell-area right-click context menu, if any (`functional_spec.md §2`).
@@ -364,6 +399,21 @@ struct WrapCell {
     italic: bool,
     font_family: Option<SharedString>,
     col_w: f32,
+}
+
+/// A populated cell snapshotted for a **row-autofit** measurement (`functional_spec.md §5`): the
+/// committed text, its resolved font (size / weight / style / family), its own column width, and
+/// whether it wraps — everything [`GridView::measure_row_height`] needs to compute the cell's line
+/// box. Captured under the caches lock (like [`WrapCell`]) so measuring can drop the lock first. A
+/// wrap-on cell soft-wraps at `col_w`; a wrap-off cell counts only its explicit `\n` segments.
+struct AutofitRowCell {
+    text: SharedString,
+    col_w: f32,
+    font_px: f32,
+    bold: bool,
+    italic: bool,
+    font_family: Option<SharedString>,
+    wrap: bool,
 }
 
 /// One sheet's installed charts (P11, `charts/architecture.md §5` challenge 5, "off-screen free").
@@ -582,11 +632,14 @@ impl GridView {
             incell_open: None,
             incell_input: None,
             incell_cap: None,
+            incell_autocomplete: None,
+            incell_sig_hint: None,
             incell_geom: None,
             quick_edit: false,
             charts: HashMap::new(),
             selected_chart: None,
             chart_drag: None,
+            fill_drag: None,
             chart_menu: None,
             cell_menu: None,
             wrap_cells: Vec::new(),
@@ -738,16 +791,21 @@ impl GridView {
     /// Pushes the chrome's current edit state onto the grid (live mirror, in-cell overlay cell,
     /// in-cell cap message). `None`s clear the corresponding overlay. Repaints so the mirror tracks
     /// each keystroke (`components/edit_controller.md §4.3–4.4`).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_edit_state(
         &mut self,
         mirror: Option<(SheetId, CellRef, SharedString)>,
         incell_open: Option<CellRef>,
         incell_cap: Option<SharedString>,
         quick_edit: bool,
+        autocomplete: Option<AutocompleteDisplay>,
+        sig_hint: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
         self.mirror = mirror;
         self.quick_edit = quick_edit;
+        self.incell_autocomplete = autocomplete;
+        self.incell_sig_hint = sig_hint;
         // Opening the in-cell editor ends any grid selection drag at its root (BUG #2): a drag armed
         // before the editor opened must not survive into (or past) the editor's lifetime. The
         // overlay `.occlude()`s the follow-up mouse-up, so the grid would never clear such a drag,
@@ -838,6 +896,8 @@ impl GridView {
         self.mirror = None;
         self.incell_open = None;
         self.incell_cap = None;
+        self.incell_autocomplete = None;
+        self.incell_sig_hint = None;
         // Structural interactions are anchored to the previous sheet's geometry — drop them.
         self.resize_drag = None;
         self.resize_preview = None;
@@ -887,6 +947,27 @@ impl GridView {
     /// Forces the overlay scrollbars visible (render-test / debug hook).
     pub fn set_force_scrollbars(&mut self, force: bool, cx: &mut Context<Self>) {
         self.force_scrollbars = force;
+        cx.notify();
+    }
+
+    /// Arms a fill-drag preview state directly (render-test / debug hook), so a static capture can
+    /// show the drag preview rectangle without synthesizing a live mouse gesture. `seed` is the
+    /// origin selection, `target` (⊇ seed) the previewed fill region, `axis` the decided dominant
+    /// direction — exactly the state the live [`handle_mouse_move`](Self::handle_mouse_move) drag
+    /// builds (`gaps_closing_7_15 §3`). The normal app never calls this (the drag machine owns the
+    /// state); it exists so the pixel suite can baseline the preview overlay.
+    pub fn set_fill_drag_preview(
+        &mut self,
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+        cx: &mut Context<Self>,
+    ) {
+        self.fill_drag = Some(FillDrag {
+            seed,
+            target,
+            axis: Some(axis),
+        });
         cx.notify();
     }
 
@@ -1187,8 +1268,8 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         // A hotspot already started a resize (and stopped propagation); defensively, never treat
-        // this as a selection click.
-        if self.resize_drag.is_some() {
+        // this as a selection click. Likewise a live fill drag owns the pointer.
+        if self.resize_drag.is_some() || self.fill_drag.is_some() {
             return;
         }
         // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op) and
@@ -1206,19 +1287,19 @@ impl GridView {
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
-        let (hit, chart_hit) = {
+        let (hit, chart_hit, fill_hit) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
             let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
             // A chart floats above the cells, so hit-test the ChartLayer first — but only in the
             // content area (a point over a header can't be over a clipped chart).
             let content_x = local_x - row_header_w;
             let content_y = local_y - COL_HEADER_H;
             let chart_hit = if content_x >= 0.0 && content_y >= 0.0 {
-                let content_w = (viewport_w - row_header_w as f64).max(0.0);
                 let geom = AxisGeometry {
                     col_axis: &col_axis,
                     row_axis: &row_axis,
@@ -1232,6 +1313,29 @@ impl GridView {
             } else {
                 None
             };
+            // The fill handle sits at the selection's bottom-right corner, shown only when not
+            // editing and no other drag is active (`gaps_closing_7_15 §3`) — mirror the overlay's
+            // suppression guard for symmetry/defensiveness. Hit-test the same clamped square the
+            // overlay draws, within ± `HANDLE_HIT_HALF` of its center.
+            let fill_hit = if self.incell_open.is_none()
+                && self.drag.is_none()
+                && self.resize_drag.is_none()
+                && self.chart_drag.is_none()
+                && content_x >= 0.0
+                && content_y >= 0.0
+            {
+                let sel_range = self.selection().range();
+                let right_x = col_axis.offset_of(sel_range.end.col + 1);
+                let bottom_y = row_axis.offset_of(sel_range.end.row + 1);
+                let (hx, hy, _, _) =
+                    fill_handle_square(right_x, bottom_y, scroll_x, scroll_y, content_w, content_h);
+                let hcx = hx + HANDLE_PX / 2.0;
+                let hcy = hy + HANDLE_PX / 2.0;
+                (content_x - hcx).abs() <= HANDLE_HIT_HALF
+                    && (content_y - hcy).abs() <= HANDLE_HIT_HALF
+            } else {
+                false
+            };
             let hit = layout::hit_test(
                 local_x,
                 local_y,
@@ -1241,7 +1345,7 @@ impl GridView {
                 &row_axis,
                 &col_axis,
             );
-            (hit, chart_hit)
+            (hit, chart_hit, fill_hit)
         };
         // A chart under the pointer wins over the cell beneath it (this is the left-button handler:
         // a chart click = select + begin a move/resize drag).
@@ -1258,6 +1362,18 @@ impl GridView {
         // A click that missed every chart deselects the current chart.
         if self.selected_chart.take().is_some() {
             cx.notify();
+        }
+        // A grab on the fill handle begins a fill drag (before the cell/header arms) — the seed is
+        // the current selection, the axis undecided until the first move outside the seed.
+        if fill_hit {
+            let seed = self.selection().range();
+            self.fill_drag = Some(FillDrag {
+                seed,
+                target: seed,
+                axis: None,
+            });
+            cx.notify();
+            return;
         }
         match hit {
             GridHit::Cell { row, col } => self.mouse_down_cell(row, col, event, window, cx),
@@ -1479,6 +1595,11 @@ impl GridView {
             self.update_resize(local_x, local_y, cx);
             return;
         }
+        // A live fill drag updates its previewed target region (and kicks auto-scroll near an edge).
+        if self.fill_drag.is_some() {
+            self.update_fill_drag(local_x, local_y, window, cx);
+            return;
+        }
         // While the in-cell editor owns the pointer, the grid must not extend a selection drag: a
         // press+drag inside the editor is text selection, not a cell-range drag (BUG #2). This
         // guards any drag still live from before the editor opened; `mouse_down_cell` also refuses
@@ -1517,6 +1638,10 @@ impl GridView {
         }
         if let Some(rd) = self.resize_drag.take() {
             self.commit_resize(rd, window, cx);
+            return;
+        }
+        if let Some(fd) = self.fill_drag.take() {
+            self.commit_fill_drag(fd, window, cx);
             return;
         }
         if self.drag.take().is_some() {
@@ -1755,6 +1880,135 @@ impl GridView {
         autofit_width(max_text_px)
     }
 
+    /// Autofit the row(s) at a double-clicked row divider (`functional_spec.md §5`): size each to fit
+    /// its tallest populated cell — the row-height twin of [`autofit_column`](Self::autofit_column).
+    /// Reuses [`resize_run_for`](Self::resize_run_for) so a divider inside a bounded multi-row header
+    /// selection autofits the whole run (each row to **its own** content) while a lone divider
+    /// autofits just that row. Each row rides the existing [`GridEvent::ResizeCommitted`] →
+    /// `Command::SetRowHeights` (undoable, xlsx round-trip, same path as drag-resize; no new worker
+    /// command), which **marks the row manual** (D5.1) so it is thereafter exempt from live wrap
+    /// auto-grow — consistent with the column autofit and the manual-resize model. One undo step per
+    /// row (the per-height command carries one height).
+    ///
+    /// **Whole-sheet guard.** A select-all is not classified as a full-**row** selection (see
+    /// `resize_run_for`), so it already resolves to `(index, index)`; the explicit guard here mirrors
+    /// [`autofit_column`](Self::autofit_column) and defends against any run that spans every row, so
+    /// autofit never fans out to 1,048,576 per-row `SetRowHeights`. Bounded multi-row selections (a
+    /// handful of rows) still fan out.
+    fn autofit_row(&mut self, index: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let (start, end) = self.resize_run_for(RowOrCol::Row, index);
+        let spans_all_rows = start == 0 && end >= freecell_core::limits::MAX_ROWS - 1;
+        let (start, end) = if spans_all_rows {
+            (index, index)
+        } else {
+            (start, end)
+        };
+        for row in start..=end {
+            let px = self.autofit_height_for_row(row, window);
+            self.events.emit(
+                &GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Row,
+                    start: row,
+                    end: row,
+                    px,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The autofit height (device px) for `row` (D5.2): the tallest line box among the row's currently
+    /// **published/overscanned** populated cells, clamped to `[DEFAULT_ROW_HEIGHT_PX,
+    /// MAX_AUTO_ROW_HEIGHT_PX]`. Render-thread only — measures the values already materialized in the
+    /// publication with the render thread's text system, each at its own resolved font and **own
+    /// column width** (a wrap-on cell soft-wraps; a wrap-off cell counts explicit `\n` segments). A
+    /// value scrolled beyond the overscan is not measured — a documented limitation mirroring
+    /// [`autofit_width_for_column`](Self::autofit_width_for_column). An empty row resolves to the
+    /// default height.
+    fn autofit_height_for_row(&self, row: u32, window: &mut Window) -> f32 {
+        let publication = self.sources.publication.load_full();
+        if publication.sheet != self.active_sheet {
+            return DEFAULT_ROW_HEIGHT_PX;
+        }
+        // Snapshot each published cell's text + resolved font + column width while the caches lock is
+        // held, then release it before shaping (mirrors `autofit_width_for_column`). Keeps only this
+        // row's non-empty cells — O(published cells) per call, the snapshot Vec holding at most one
+        // row's worth.
+        let snapshots: Vec<AutofitRowCell> = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(self.active_sheet) else {
+                return DEFAULT_ROW_HEIGHT_PX;
+            };
+            publication
+                .cells
+                .iter()
+                .filter(|pc| pc.row == row && !pc.display_text.is_empty())
+                .map(|pc| {
+                    let style = cache.render_style(pc.row, pc.col).copied();
+                    let font_px = style.map(font_px_of).unwrap_or(CELL_FONT_PX);
+                    let font_family = style.and_then(|s| {
+                        cache
+                            .font_families()
+                            .get(s.font_family as usize)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| SharedString::from(name.to_string()))
+                    });
+                    AutofitRowCell {
+                        text: SharedString::from(pc.display_text.clone()),
+                        col_w: cache.col_width(pc.col),
+                        font_px,
+                        bold: style.map(|s| s.bold).unwrap_or(false),
+                        italic: style.map(|s| s.italic).unwrap_or(false),
+                        font_family,
+                        wrap: style.map(|s| s.wrap).unwrap_or(false),
+                    }
+                })
+                .collect()
+        };
+        Self::measure_row_height(&snapshots, window)
+    }
+
+    /// The autofit height a set of a row's populated cells needs (`functional_spec.md §5.2`): the
+    /// **max** over the cells of each cell's own line box ([`cell_line_box_height`]), clamped to
+    /// `[DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX]`. A **wrap-on** cell soft-wraps at its column
+    /// width (gpui's real `LineWrapper`, summed over explicit-`\n` segments — same as
+    /// [`measure_wrap_height`](Self::measure_wrap_height)); a **wrap-off** cell counts only its
+    /// explicit `\n` segments (one visual line each, no soft-wrap). An empty row (no cells) resolves
+    /// to the default.
+    fn measure_row_height(cells: &[AutofitRowCell], window: &mut Window) -> f32 {
+        let mut needed = DEFAULT_ROW_HEIGHT_PX;
+        for c in cells {
+            let lines: u32 = if c.wrap {
+                let avail = (c.col_w - 2.0 * CELL_H_PAD).max(1.0);
+                let family = c
+                    .font_family
+                    .clone()
+                    .unwrap_or_else(|| SharedString::from(GRID_FONT_FAMILY));
+                let mut cell_font = font(family);
+                if c.bold {
+                    cell_font = cell_font.bold();
+                }
+                if c.italic {
+                    cell_font = cell_font.italic();
+                }
+                let mut wrapper = window.text_system().line_wrapper(cell_font, px(c.font_px));
+                c.text
+                    .split('\n')
+                    .map(|segment| {
+                        1 + wrapper
+                            .wrap_line(&[LineFragment::text(segment)], px(avail))
+                            .count() as u32
+                    })
+                    .sum()
+            } else {
+                c.text.split('\n').count() as u32
+            };
+            needed = needed.max(cell_line_box_height(lines, c.font_px));
+        }
+        needed.clamp(DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX)
+    }
+
     /// Extend a header drag: map the pointer to a track on `axis` and move the selection's active
     /// track there, keeping the full extent (`components/grid_structure.md §5.2`).
     fn extend_header_drag(
@@ -1825,8 +2079,8 @@ impl GridView {
         let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
-        // Hit-test the ChartLayer + headers + read the merge list under one lock.
-        let (hit, chart_hit, merges) = {
+        // Hit-test the ChartLayer + headers + read the merge list + hidden sets under one lock.
+        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
@@ -1859,7 +2113,14 @@ impl GridView {
                 &row_axis,
                 &col_axis,
             );
-            (hit, chart_hit, cache.merges().to_vec())
+            (
+                hit,
+                chart_hit,
+                cache.merges().to_vec(),
+                cache.hidden_rows().clone(),
+                cache.hidden_cols().clone(),
+                cache.dims(),
+            )
         };
         // A right-click on a chart selects it and opens the "Delete chart" context menu (P18) — the
         // alternate delete affordance. Any chart hit (body or a handle of the already-selected
@@ -1933,6 +2194,11 @@ impl GridView {
         }
         let run = self.resize_run_for(axis, index);
         let (before, after, delete) = merge_block_flags(axis, run, &merges);
+        let (hidden_set, total) = match axis {
+            RowOrCol::Row => (&hidden_rows, dims.0),
+            RowOrCol::Col => (&hidden_cols, dims.1),
+        };
+        let (hide_blocked, unhide_run, hidden_in_run) = hide_unhide_flags(run, hidden_set, total);
         self.cell_menu = None;
         self.header_menu = Some(HeaderMenu {
             axis,
@@ -1942,6 +2208,9 @@ impl GridView {
             insert_before_blocked: before,
             insert_after_blocked: after,
             delete_blocked: delete,
+            hide_blocked,
+            unhide_run,
+            hidden_in_run,
         });
         cx.notify();
     }
@@ -2048,6 +2317,131 @@ impl GridView {
         }
     }
 
+    /// Advance a live fill drag (`gaps_closing_7_15 §3`): map the pointer to a cell, recompute the
+    /// previewed target region, and kick edge auto-scroll so a fill can run past the visible area.
+    fn update_fill_drag(
+        &mut self,
+        local_x: f32,
+        local_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let cell = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            layout::cell_at_point(
+                local_x,
+                local_y,
+                row_header_w,
+                scroll_x,
+                scroll_y,
+                &row_axis,
+                &col_axis,
+                content_w,
+                content_h,
+            )
+        };
+        self.set_fill_target_from_cell(cell);
+        self.maybe_start_autoscroll(window, cx);
+        cx.notify();
+    }
+
+    /// Recompute the fill drag's `target` + dominant `axis` for a pointer over `cell` (pure; no
+    /// window/cx — shared by the mouse-move and the auto-scroll tick). The axis is the direction the
+    /// pointer has left the seed **farther** along, and is **sticky** once set (kept until the
+    /// pointer returns inside the seed) so a gesture never flips axis mid-drag (D3.1). Inside the
+    /// seed → axis cleared, target collapses back to the seed.
+    fn set_fill_target_from_cell(&mut self, cell: CellRef) {
+        let Some(drag) = self.fill_drag.as_mut() else {
+            return;
+        };
+        let seed = drag.seed;
+        // How far `cell` lies outside the seed along each axis (0 = within the seed's span).
+        let vext = if cell.row > seed.end.row {
+            cell.row - seed.end.row
+        } else {
+            seed.start.row.saturating_sub(cell.row)
+        };
+        let hext = if cell.col > seed.end.col {
+            cell.col - seed.end.col
+        } else {
+            seed.start.col.saturating_sub(cell.col)
+        };
+        if vext == 0 && hext == 0 {
+            drag.axis = None;
+            drag.target = seed;
+            return;
+        }
+        let axis = drag.axis.unwrap_or(if vext >= hext {
+            FillAxis::Vertical
+        } else {
+            FillAxis::Horizontal
+        });
+        drag.axis = Some(axis);
+        drag.target = match axis {
+            // Vertical: columns pinned to the seed, rows extended to include `cell` (down or up).
+            FillAxis::Vertical => {
+                let top = seed.start.row.min(cell.row);
+                let bottom = seed.end.row.max(cell.row);
+                CellRange::new(
+                    CellRef::new(top, seed.start.col),
+                    CellRef::new(bottom, seed.end.col),
+                )
+            }
+            // Horizontal: rows pinned to the seed, columns extended to include `cell` (right/left).
+            FillAxis::Horizontal => {
+                let left = seed.start.col.min(cell.col);
+                let right = seed.end.col.max(cell.col);
+                CellRange::new(
+                    CellRef::new(seed.start.row, left),
+                    CellRef::new(seed.end.row, right),
+                )
+            }
+        };
+    }
+
+    /// Commit a fill drag on release (`gaps_closing_7_15 §3`): stop any auto-scroll loop, then — if
+    /// the target actually extended past the seed along a decided axis — emit
+    /// [`GridEvent::FillDrag`] and expand the selection to the filled region (Excel behavior). A
+    /// release onto the seed, or with no axis, or an inward target (D3.3) is a no-op (no event, no
+    /// selection change).
+    fn commit_fill_drag(&mut self, drag: FillDrag, window: &mut Window, cx: &mut Context<Self>) {
+        // Stop the auto-scroll loop the same way the selection drag does (epoch bump).
+        self.autoscroll_epoch = self.autoscroll_epoch.wrapping_add(1);
+        let FillDrag { seed, target, axis } = drag;
+        // A superset target that differs from the seed is a real outward fill; anything else (no
+        // axis, unchanged, or — defensively — a non-superset inward target) does nothing.
+        let is_outward = target != seed
+            && target.start.row <= seed.start.row
+            && target.start.col <= seed.start.col
+            && target.end.row >= seed.end.row
+            && target.end.col >= seed.end.col;
+        let Some(axis) = axis.filter(|_| is_outward) else {
+            cx.notify();
+            return;
+        };
+        self.events
+            .emit(&GridEvent::FillDrag { seed, target, axis }, window, cx);
+        // Expand the selection to seed∪target (= target, since target ⊇ seed).
+        self.set_selection(
+            SelectionModel {
+                anchor: target.start,
+                active: target.end,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
     /// The current per-axis edge auto-scroll delta for the live pointer (`0` inside the content).
     fn current_edge_delta(&self, window: &Window) -> (f64, f64) {
         let pos = window.mouse_position();
@@ -2078,7 +2472,8 @@ impl GridView {
     /// (a `spawn_in` timer, so it advances even while the pointer is held still with no
     /// mouse-move events — the "drag to the edge and wait" case).
     fn maybe_start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.autoscrolling || self.drag.is_none() {
+        // Fires for a selection drag OR a fill drag (`gaps_closing_7_15 §3`) past a viewport edge.
+        if self.autoscrolling || (self.drag.is_none() && self.fill_drag.is_none()) {
             return;
         }
         let (dx, dy) = self.current_edge_delta(window);
@@ -2095,7 +2490,9 @@ impl GridView {
                 .await;
             let keep = this
                 .update_in(cx, |this, window, cx| {
-                    if this.autoscroll_epoch != epoch || this.drag.is_none() {
+                    if this.autoscroll_epoch != epoch
+                        || (this.drag.is_none() && this.fill_drag.is_none())
+                    {
                         this.autoscrolling = false;
                         return false;
                     }
@@ -2109,14 +2506,14 @@ impl GridView {
         .detach();
     }
 
-    /// One auto-scroll frame: apply the fixed edge step (clamped), re-extend the selection to the
-    /// hovered cell, and announce a debounced `ViewportChanged`. Returns whether to keep looping
-    /// (`false` once the pointer returns inside the content, stopping the loop).
+    /// One auto-scroll frame: apply the fixed edge step (clamped), re-extend the selection (or the
+    /// fill-drag target) to the hovered cell, and announce a debounced `ViewportChanged`. Returns
+    /// whether to keep looping (`false` once the pointer returns inside the content).
     fn autoscroll_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(drag) = self.drag else {
+        if self.drag.is_none() && self.fill_drag.is_none() {
             self.autoscrolling = false;
             return false;
-        };
+        }
         let pos = window.mouse_position();
         let (local_x, local_y) = self.event_local(pos);
         let active = self.active_sheet;
@@ -2182,12 +2579,18 @@ impl GridView {
             self.scrollbars_visible = true;
             changed = true;
         }
-        let selection = SelectionModel {
-            anchor: drag.anchor,
-            active: cell,
-        };
-        if *self.selection() != selection {
-            self.set_selection_and_emit(selection, window, cx);
+        if let Some(drag) = self.drag {
+            let selection = SelectionModel {
+                anchor: drag.anchor,
+                active: cell,
+            };
+            if *self.selection() != selection {
+                self.set_selection_and_emit(selection, window, cx);
+                changed = true;
+            }
+        } else if self.fill_drag.is_some() {
+            // A fill drag auto-scrolls too: re-extend its previewed target to the hovered cell.
+            self.set_fill_target_from_cell(cell);
             changed = true;
         }
         let ranges = (rows, cols);
@@ -2757,6 +3160,49 @@ impl GridView {
             );
         }
 
+        // Fill handle + drag preview (`gaps_closing_7_15 §3`). While a fill drag is live, draw its
+        // previewed target region (a 2px accent border, like the range border); otherwise — when not
+        // editing and no other drag is active — draw the grabbable handle square at the selection's
+        // bottom-right corner, clamped into the viewport (D3.4).
+        if let Some(fd) = self.fill_drag {
+            if fd.axis.is_some() {
+                let t = fd.target;
+                let (x, y, w, h) = span_rect(
+                    t.start.row..t.end.row + 1,
+                    t.start.col..t.end.col + 1,
+                    frame,
+                );
+                content_children.push(
+                    rect_div(x, y, w, h)
+                        .border_2()
+                        .border_color(rgb(ACCENT))
+                        .into_any_element(),
+                );
+            }
+        } else if self.incell_open.is_none()
+            && self.drag.is_none()
+            && self.resize_drag.is_none()
+            && self.chart_drag.is_none()
+        {
+            let right_x = frame.col_offset(range.end.col + 1);
+            let bottom_y = frame.row_offset(range.end.row + 1);
+            let (hx, hy, hw, hh) = fill_handle_square(
+                right_x,
+                bottom_y,
+                frame.scroll_x,
+                frame.scroll_y,
+                frame.content_w,
+                frame.content_h,
+            );
+            content_children.push(
+                rect_div(hx, hy, hw, hh)
+                    .bg(rgb(CELL_BG))
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+                    .into_any_element(),
+            );
+        }
+
         // In-cell editor overlay (deferred → painted above the cells; `functional_spec.md §1.3`).
         // Rendered even when the anchored cell is scrolled out of view — the content layer's
         // `overflow_hidden` clips it, and keeping it in the tree preserves the input's focus.
@@ -3048,10 +3494,6 @@ impl GridView {
     /// default row height, so a one-line default cell measures to the default. Clamped to
     /// `[default, MAX_AUTO_ROW_HEIGHT_PX]` (content beyond the cap clips within the cell).
     fn measure_wrap_height(cells: &[&WrapCell], window: &mut Window) -> f32 {
-        let line_px = |font_px: f32| (GRID_LINE_HEIGHT_FACTOR * font_px).round();
-        // The vertical slack a default single line leaves (so `lines == 1` at the default size ⇒ the
-        // default row height).
-        let vpad = DEFAULT_ROW_HEIGHT_PX - line_px(CELL_FONT_PX);
         let mut needed = DEFAULT_ROW_HEIGHT_PX;
         for wc in cells {
             let avail = (wc.col_w - 2.0 * CELL_H_PAD).max(1.0);
@@ -3077,8 +3519,7 @@ impl GridView {
                         .count() as u32
                 })
                 .sum();
-            let cell_h = lines as f32 * line_px(wc.font_px) + vpad;
-            needed = needed.max(cell_h);
+            needed = needed.max(cell_line_box_height(lines, wc.font_px));
         }
         needed.clamp(DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX)
     }
@@ -3263,7 +3704,16 @@ impl GridView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.begin_resize(RowOrCol::Row, r, event, window, cx);
+                        // A single press begins the drag-resize; the 2nd click of a double-click
+                        // autofits the row to its content (`functional_spec.md §5`) without beginning a
+                        // resize. The 3rd+ click of a rapid multi-click burst is ignored so a
+                        // triple-click neither re-autofits (a redundant same-height undo step) nor
+                        // starts a stray resize. Mirrors the column hotspot above.
+                        match event.click_count {
+                            1 => this.begin_resize(RowOrCol::Row, r, event, window, cx),
+                            2 => this.autofit_row(r, window, cx),
+                            _ => {}
+                        }
                         cx.stop_propagation();
                     }),
                 )
@@ -3276,61 +3726,96 @@ impl GridView {
     /// The header insert/delete context menu overlay: a click-away backdrop + a small card of items
     /// (`functional_spec.md §5.3`). Items whose op would displace a merge are disabled + a footnote
     /// explains why. Built in `render` (needs `cx` for the item listeners).
-    fn header_menu_elements(&self, menu: HeaderMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The header context-menu item list — `(label, enabled, event)` — for the axis + run in `menu`
+    /// (`functional_spec.md §2`, `gaps_closing_7_15 §4`): Insert before / Insert after / Delete, then
+    /// **Hide** / **Unhide**. Pure (no gpui) so the mapping is unit-testable, mirroring
+    /// [`cell_menu_items`](Self::cell_menu_items). Note `enabled` (not `blocked`) — the render loop
+    /// draws a disabled item when `!enabled`.
+    fn header_menu_items(menu: &HeaderMenu) -> Vec<(String, bool, GridEvent)> {
         let count = menu.run.1 - menu.run.0 + 1;
         let (unit, before_word, after_word) = match menu.axis {
             RowOrCol::Row => ("row", "above", "below"),
             RowOrCol::Col => ("column", "left", "right"),
         };
-        let plural = if count == 1 { "" } else { "s" };
-        let n = |verb: &str, side: &str| format!("{verb} {count} {unit}{plural} {side}");
-
-        // The three items: (label, disabled, event).
+        let plural = |n: u32| if n == 1 { "" } else { "s" };
+        let p = plural(count);
         let (start, end) = (menu.run.0, menu.run.1);
         let after_at = end.saturating_add(1);
-        let items: [(String, bool, GridEvent); 3] = match menu.axis {
-            RowOrCol::Row => [
-                (
-                    n("Insert", before_word),
-                    menu.insert_before_blocked,
-                    GridEvent::InsertRows { at: start, count },
-                ),
-                (
-                    n("Insert", after_word),
-                    menu.insert_after_blocked,
-                    GridEvent::InsertRows {
-                        at: after_at,
-                        count,
-                    },
-                ),
-                (
-                    format!("Delete {count} {unit}{plural}"),
-                    menu.delete_blocked,
-                    GridEvent::DeleteRows { at: start, count },
-                ),
-            ],
-            RowOrCol::Col => [
-                (
-                    n("Insert", before_word),
-                    menu.insert_before_blocked,
-                    GridEvent::InsertColumns { at: start, count },
-                ),
-                (
-                    n("Insert", after_word),
-                    menu.insert_after_blocked,
-                    GridEvent::InsertColumns {
-                        at: after_at,
-                        count,
-                    },
-                ),
-                (
-                    format!("Delete {count} {unit}{plural}"),
-                    menu.delete_blocked,
-                    GridEvent::DeleteColumns { at: start, count },
-                ),
-            ],
+        // Axis-specific event constructors keep the labels/flags below axis-agnostic.
+        // Alias the constructor type so the 4-tuple annotation stays under clippy's
+        // type-complexity threshold.
+        type HeaderMenuEvent = fn(u32, u32) -> GridEvent;
+        let (insert_ev, delete_ev, hide_ev, unhide_ev): (
+            HeaderMenuEvent,
+            HeaderMenuEvent,
+            HeaderMenuEvent,
+            HeaderMenuEvent,
+        ) = match menu.axis {
+            RowOrCol::Row => (
+                |at, count| GridEvent::InsertRows { at, count },
+                |at, count| GridEvent::DeleteRows { at, count },
+                |at, count| GridEvent::HideRows { at, count },
+                |at, count| GridEvent::UnhideRows { at, count },
+            ),
+            RowOrCol::Col => (
+                |at, count| GridEvent::InsertColumns { at, count },
+                |at, count| GridEvent::DeleteColumns { at, count },
+                |at, count| GridEvent::HideColumns { at, count },
+                |at, count| GridEvent::UnhideColumns { at, count },
+            ),
         };
-        let any_blocked = items.iter().any(|(_, blocked, _)| *blocked);
+        let mut items = vec![
+            (
+                format!("Insert {count} {unit}{p} {before_word}"),
+                !menu.insert_before_blocked,
+                insert_ev(start, count),
+            ),
+            (
+                format!("Insert {count} {unit}{p} {after_word}"),
+                !menu.insert_after_blocked,
+                insert_ev(after_at, count),
+            ),
+            (
+                format!("Delete {count} {unit}{p}"),
+                !menu.delete_blocked,
+                delete_ev(start, count),
+            ),
+            {
+                // The label counts the tracks Hide will actually collapse (visible ones in the run),
+                // not the run width — already-hidden tracks in the run stay hidden (a no-op). The
+                // EVENT still targets the whole run (one undo step; re-hiding a hidden track is inert).
+                let newly = count - menu.hidden_in_run;
+                (
+                    format!("Hide {newly} {unit}{}", plural(newly)),
+                    !menu.hide_blocked,
+                    hide_ev(start, count),
+                )
+            },
+        ];
+        // Unhide targets the minimal hidden SPAN in the run (bounded, one undo step), but the label
+        // counts the ACTUAL hidden tracks in it (`hidden_in_run`) — which is < the span width when the
+        // hidden tracks are sparse. Disabled (with the axis label) when the run holds no hidden track.
+        match menu.unhide_run {
+            Some((first, last)) => {
+                let span = last - first + 1;
+                let uc = menu.hidden_in_run;
+                items.push((
+                    format!("Unhide {uc} {unit}{}", plural(uc)),
+                    true,
+                    unhide_ev(first, span),
+                ));
+            }
+            None => items.push((format!("Unhide {unit}s"), false, unhide_ev(start, count))),
+        }
+        items
+    }
+
+    fn header_menu_elements(&self, menu: HeaderMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let items = Self::header_menu_items(&menu);
+        // The "merged cells" footnote is about the insert/delete merge guard only — Hide/Unhide are
+        // never merge-blocked, so gate the note on the merge-guard flags, not every disabled item.
+        let any_blocked =
+            menu.insert_before_blocked || menu.insert_after_blocked || menu.delete_blocked;
 
         let mut card = div()
             .debug_selector(|| "header-menu-card".into())
@@ -3353,14 +3838,14 @@ impl GridView {
             .shadow_md()
             .text_size(px(CELL_FONT_PX))
             .min_w(px(180.0));
-        for (label, blocked, event) in items {
+        for (label, enabled, event) in items {
             let mut item = div()
                 .px(px(10.0))
                 .py(px(4.0))
                 .rounded_sm()
                 .whitespace_nowrap()
                 .child(label);
-            if blocked {
+            if !enabled {
                 item = item.text_color(rgb(HEADER_TEXT)).opacity(0.4);
             } else {
                 item = item
@@ -3827,6 +4312,47 @@ fn merge_block_flags(axis: RowOrCol, run: (u32, u32), merges: &[CellRange]) -> (
     }
 }
 
+/// The `(hide_blocked, unhide_run, hidden_in_run)` header-menu flags for a run over an axis of
+/// `total` tracks with the given `hidden` set (`gaps_closing_7_15 §4`).
+///
+/// - **Hide** is blocked when hiding the run would leave zero visible tracks:
+///   `total − |hidden ∪ run| == 0` (where `|hidden ∪ run| = |hidden| + run_len − hidden_in_run`).
+///   Usually this means Select-All → Hide, but it also (correctly) blocks a *smaller* run that
+///   happens to cover every remaining visible track — e.g. when most of the axis is already hidden.
+/// - **Unhide** targets the minimal `[first_hidden, last_hidden]` span **within** the run (so
+///   Select-All → Unhide reveals the hidden cluster without spanning the whole axis); `None` when
+///   the run contains no hidden track.
+/// - **`hidden_in_run`** = how many tracks in the run are already hidden — the accurate count for
+///   the menu labels (Unhide N; Hide counts the *newly*-hidden `run_len − hidden_in_run`).
+fn hide_unhide_flags(
+    run: (u32, u32),
+    hidden: &std::collections::BTreeSet<u32>,
+    total: u32,
+) -> (bool, Option<(u32, u32)>, u32) {
+    let (start, end) = run;
+    // One pass over the hidden tracks within the run: first, last, and count.
+    let mut first_hidden = None;
+    let mut last_hidden = 0u32;
+    let mut hidden_in_run = 0u32;
+    for &i in hidden.range(start..=end) {
+        if first_hidden.is_none() {
+            first_hidden = Some(i);
+        }
+        last_hidden = i;
+        hidden_in_run += 1;
+    }
+    let unhide_run = first_hidden.map(|f| (f, last_hidden));
+
+    let run_len = (end - start + 1) as u64;
+    let hidden_count = hidden.len() as u64;
+    // Tracks hidden after the op = |hidden ∪ run| = run_len + (already-hidden outside the run).
+    // Computed as a union size (not a running subtraction) so it can't underflow when run_len == total.
+    // `hidden_in_run <= hidden_count`, so the inner subtraction is safe.
+    let hidden_after = run_len + (hidden_count - hidden_in_run as u64);
+    let visible_after = (total as u64).saturating_sub(hidden_after);
+    (visible_after == 0, unhide_run, hidden_in_run)
+}
+
 /// A cell's px rectangle in **content-local** coordinates (origin at the content area's
 /// top-left, before the scroll offset is applied via the axis offsets). Reads through the frame's
 /// preview accessors, so a live resize reflows it with no axis rebuild.
@@ -3845,6 +4371,30 @@ fn span_rect(rows: Range<u32>, cols: Range<u32>, frame: &Frame) -> (f32, f32, f3
     let y0 = frame.row_offset(rows.start) - frame.scroll_y;
     let y1 = frame.row_offset(rows.end) - frame.scroll_y;
     (x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
+}
+
+/// The content-local px rect of the fill handle (`gaps_closing_7_15 §3`): a [`HANDLE_PX`] square
+/// centered on the selection's bottom-right corner `(right_x, bottom_y)` (pre-scroll content
+/// offsets). The center is clamped into the visible `[0, content_w] × [0, content_h]` box so a
+/// whole-row / whole-column selection whose true corner is off-viewport still shows a grabbable
+/// handle at the visible edge (D3.4). The same rect drives the render overlay and the mouse-down
+/// hit-test, so they can never disagree.
+fn fill_handle_square(
+    right_x: f64,
+    bottom_y: f64,
+    scroll_x: f64,
+    scroll_y: f64,
+    content_w: f64,
+    content_h: f64,
+) -> (f32, f32, f32, f32) {
+    let cx = (right_x - scroll_x).clamp(0.0, content_w) as f32;
+    let cy = (bottom_y - scroll_y).clamp(0.0, content_h) as f32;
+    (
+        cx - HANDLE_PX / 2.0,
+        cy - HANDLE_PX / 2.0,
+        HANDLE_PX,
+        HANDLE_PX,
+    )
 }
 
 /// One dash's length (px) and the gap after it, for [`LinePattern::Dashed`] edges. Chosen so a
@@ -4305,6 +4855,19 @@ fn autofit_width(max_text_px: f32) -> f32 {
     (max_text_px + AUTOFIT_PADDING_PX).clamp(AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX)
 }
 
+/// The device-px height a cell of `lines` visual lines at `font_px` occupies (`functional_spec.md
+/// §5`): `lines * line_height + vpad`, where `line_height` is gpui's default **`phi`** line box
+/// (`round(1.618 * font_px)`, matching `Style::line_height`) and `vpad` is the vertical slack a
+/// single default line leaves in [`DEFAULT_ROW_HEIGHT_PX`] (so `lines == 1` at the default size ⇒
+/// the default row height). Shared by wrap auto-grow ([`GridView::measure_wrap_height`]) and row
+/// autofit ([`GridView::measure_row_height`]) so the two never diverge. Pure — unit-testable
+/// without a `Window`.
+fn cell_line_box_height(lines: u32, font_px: f32) -> f32 {
+    let line_px = |px: f32| (GRID_LINE_HEIGHT_FACTOR * px).round();
+    let vpad = DEFAULT_ROW_HEIGHT_PX - line_px(CELL_FONT_PX);
+    lines as f32 * line_px(font_px) + vpad
+}
+
 /// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
 /// clipped vertically (BUG A): `(control_height, line_height)` in **device** px.
 ///
@@ -4580,6 +5143,105 @@ impl GridView {
 
         elements
     }
+
+    /// The in-cell overlay's function-completion list + signature hint (`gaps_closing_7_15 §1`),
+    /// anchored below the measured editor box (like the in-cell cap popover). Interactive (row
+    /// clicks accept), so it is built at the root render level where `cx` is available. The cap
+    /// error takes precedence at the shared anchor; the list takes precedence over the hint.
+    fn incell_autocomplete_elements(
+        &self,
+        frame: &Frame,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        if self.incell_cap.is_some() {
+            return Vec::new();
+        }
+        let Some(cell) = self.incell_open else {
+            return Vec::new();
+        };
+        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let (_, h) = self
+            .incell_geom
+            .unwrap_or((cell_w.max(IN_CELL_MIN_W), cell_h));
+        let top = y + h + 2.0;
+
+        if let Some(list) = &self.incell_autocomplete {
+            let card = div()
+                .id("incell-autocomplete")
+                .absolute()
+                .left(px(x))
+                .top(px(top))
+                .occlude()
+                .flex()
+                .flex_col()
+                .min_w(px(300.0))
+                .max_h(px(320.0))
+                .overflow_y_scroll()
+                .bg(rgb(CELL_BG))
+                .border_1()
+                .border_color(rgb(HEADER_HAIRLINE))
+                .rounded_md()
+                .shadow_md()
+                .children(list.rows.iter().enumerate().map(|(i, row)| {
+                    let highlighted = i == list.highlight;
+                    div()
+                        .id(gpui::ElementId::Name(
+                            format!("incell-autocomplete-row-{i}").into(),
+                        ))
+                        .flex()
+                        .items_baseline()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.0))
+                        .when(highlighted, |d| d.bg(rgb(HEADER_SELECTED_BG)))
+                        // Hover highlights a row too (`functional_spec.md §1`, Mouse).
+                        .hover(|s| s.bg(rgb(HEADER_SELECTED_BG)))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(CELL_TEXT))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(row.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(HEADER_TEXT))
+                                .whitespace_nowrap()
+                                .child(row.template.clone()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                                this.events
+                                    .emit(&GridEvent::AutocompleteAcceptAt(i), window, cx);
+                            }),
+                        )
+                }));
+            return vec![deferred(card).into_any_element()];
+        }
+
+        if let Some(template) = &self.incell_sig_hint {
+            let hint = div()
+                .absolute()
+                .left(px(x))
+                .top(px(top))
+                .px_2()
+                .py_1()
+                .bg(rgb(CELL_BG))
+                .text_color(rgb(HEADER_TEXT))
+                .text_size(px(11.0))
+                .border_1()
+                .border_color(rgb(HEADER_HAIRLINE))
+                .rounded_md()
+                .shadow_md()
+                .whitespace_nowrap()
+                .child(template.clone());
+            return vec![deferred(hint).into_any_element()];
+        }
+
+        Vec::new()
+    }
 }
 
 impl Focusable for GridView {
@@ -4658,6 +5320,12 @@ impl Render for GridView {
             self.run_autogrow(&frame, window, cx);
             // Divider resize hotspots paint last (over the header strips) so they win the hit-test.
             root_children.extend(self.resize_hotspots(&frame, cx));
+            // The in-cell completion list / signature hint (`gaps_closing_7_15 §1`) — rendered at
+            // the root (not in `build_grid_layers`) so its rows can carry `cx.listener` click
+            // handlers, like the header/cell context menus.
+            if self.incell_open.is_some() {
+                root_children.extend(self.incell_autocomplete_elements(&frame, cx));
+            }
         }
 
         // Header insert/delete context menu (deferred → above everything but the loading overlay).
@@ -4749,6 +5417,43 @@ impl Render for GridView {
                 if this.incell_open.is_none() {
                     return;
                 }
+                // The in-cell completion list preempts navigation/accept/dismiss keys before the
+                // Tab/Esc/quick-edit arms below (`gaps_closing_7_15 §1`), routed to the chrome
+                // (the list-state owner) via the window like the other in-cell events.
+                if this.incell_autocomplete.is_some() {
+                    match event.keystroke.key.as_str() {
+                        "down" => {
+                            cx.stop_propagation();
+                            this.events.emit(
+                                &GridEvent::AutocompleteNav { down: true },
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
+                        "up" => {
+                            cx.stop_propagation();
+                            this.events.emit(
+                                &GridEvent::AutocompleteNav { down: false },
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
+                        "enter" | "tab" => {
+                            cx.stop_propagation();
+                            this.events.emit(&GridEvent::AutocompleteAccept, window, cx);
+                            return;
+                        }
+                        "escape" => {
+                            cx.stop_propagation();
+                            this.events
+                                .emit(&GridEvent::AutocompleteDismiss, window, cx);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 let modifiers = event.keystroke.modifiers;
                 match event.keystroke.key.as_str() {
                     "tab" => {
@@ -4784,6 +5489,13 @@ impl Render for GridView {
                         };
                         this.events
                             .emit(&GridEvent::InCellCommitMove(dir), window, cx);
+                    }
+                    // A caret-only key falls through to the input (no `stop_propagation`); ask the
+                    // chrome to recompute the list/hint once the caret has moved, since the input
+                    // fires no event on a pure caret move (`gaps_closing_7_15 §1`).
+                    "left" | "right" | "home" | "end" => {
+                        this.events
+                            .emit(&GridEvent::AutocompleteCaretMoved, window, cx);
                     }
                     _ => {}
                 }
@@ -4833,6 +5545,39 @@ impl GridView {
     #[cfg(test)]
     pub(crate) fn quick_edit_for_test(&self) -> bool {
         self.quick_edit
+    }
+
+    /// The grid-local center of the current selection's fill handle for `window` — computed exactly
+    /// as the render overlay + `handle_mouse_down` hit-test do (`gaps_closing_7_15 §3`), so a test
+    /// can synthesize a mouse-down on the handle without hard-coding pixel geometry.
+    #[cfg(test)]
+    pub(crate) fn fill_handle_center_for_test(&self, window: &Window) -> Option<(f32, f32)> {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let caches = self.sources.caches.read();
+        let cache = caches.get(active)?;
+        let (row_axis, col_axis) = cache.axes();
+        let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+        let content_w = (viewport_w - row_header_w as f64).max(0.0);
+        let sel = self.selection().range();
+        let right_x = col_axis.offset_of(sel.end.col + 1);
+        let bottom_y = row_axis.offset_of(sel.end.row + 1);
+        let (hx, hy, _, _) =
+            fill_handle_square(right_x, bottom_y, scroll_x, scroll_y, content_w, content_h);
+        // Content-local center → grid-local by adding the gutter/header offsets.
+        Some((
+            hx + HANDLE_PX / 2.0 + row_header_w,
+            hy + HANDLE_PX / 2.0 + COL_HEADER_H,
+        ))
+    }
+
+    /// Whether a fill drag is currently armed, and its current `(seed, target, axis)` if so — test
+    /// introspection for the fill-handle drag state machine (`gaps_closing_7_15 §3`).
+    #[cfg(test)]
+    pub(crate) fn fill_drag_for_test(&self) -> Option<(CellRange, CellRange, Option<FillAxis>)> {
+        self.fill_drag.map(|d| (d.seed, d.target, d.axis))
     }
 
     /// Emits [`GridEvent::InCellCommitMove`] exactly as the `capture_key_down` Tab handler does — for
@@ -5633,7 +6378,15 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     events.borrow_mut().clear();
                     // A printable key and an arrow both no-op while the overlay owns the keyboard.
                     grid.handle_key_down(&key_ev("x", Some("x"), false), window, cx);
@@ -5659,12 +6412,20 @@ mod tests {
         window
             .update(cx, |_root, _window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, None, None, cx);
                     assert!(
                         grid.quick_edit_for_test(),
                         "quick_edit must thread through set_edit_state"
                     );
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     assert!(
                         !grid.quick_edit_for_test(),
                         "quick_edit clears when pushed false"
@@ -5704,6 +6465,187 @@ mod tests {
             modifiers: Modifiers::default(),
             click_count: 1,
         }
+    }
+
+    // ---- Drag fill handle (`gaps_closing_7_15 §3`) ------------------------------------------
+
+    /// A mouse-down on the selection's fill handle arms a fill drag (seed = the selection); the same
+    /// grab while the in-cell editor is open does NOT (the handle is suppressed during editing).
+    #[gpui::test]
+    fn fill_handle_grab_arms_fill_drag_and_hides_while_editing(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let seed = CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)); // B2:C3
+                    grid.set_selection(
+                        SelectionModel {
+                            anchor: seed.start,
+                            active: seed.end,
+                        },
+                        cx,
+                    );
+                    let (hx, hy) = grid
+                        .fill_handle_center_for_test(window)
+                        .expect("handle center resolves");
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, hx, hy), window, cx);
+                    let (armed_seed, armed_target, axis) = grid
+                        .fill_drag_for_test()
+                        .expect("grabbing the handle arms a fill drag");
+                    assert_eq!(armed_seed, seed, "seed = the selection at grab");
+                    assert_eq!(armed_target, seed, "target starts equal to the seed");
+                    assert!(
+                        axis.is_none(),
+                        "axis undecided until the pointer leaves the seed"
+                    );
+
+                    // Release, then re-grab while editing → no fill drag (handle suppressed).
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    grid.incell_open = Some(seed.start);
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, hx, hy), window, cx);
+                    assert!(
+                        grid.fill_drag_for_test().is_none(),
+                        "the fill handle is not grabbable while the in-cell editor is open"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// A downward handle drag sets a Vertical preview extending past the seed, and on release emits
+    /// `GridEvent::FillDrag` and expands the selection to the filled region.
+    #[gpui::test]
+    fn fill_drag_down_previews_emits_and_expands_selection(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Default selection is A1 (single-cell seed).
+                    let (hx, hy) = grid
+                        .fill_handle_center_for_test(window)
+                        .expect("handle center resolves");
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, hx, hy), window, cx);
+                    events.borrow_mut().clear();
+                    // Drag straight down ~100 px (staying in column A) → a multi-row target.
+                    grid.handle_mouse_move(&move_ev(hx - 5.0, hy + 100.0), window, cx);
+                    let (_, target, axis) = grid.fill_drag_for_test().expect("still fill-dragging");
+                    assert_eq!(axis, Some(FillAxis::Vertical), "dominant axis is vertical");
+                    assert_eq!(
+                        target.start,
+                        CellRef::new(0, 0),
+                        "target still anchored at A1"
+                    );
+                    assert!(target.end.row > 0, "target extended below the seed");
+                    assert_eq!(target.start.col, target.end.col, "single column preserved");
+
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    assert!(
+                        grid.fill_drag_for_test().is_none(),
+                        "drag cleared on release"
+                    );
+                    let (ev_seed, ev_target, ev_axis) = events
+                        .borrow()
+                        .iter()
+                        .find_map(|e| match e {
+                            GridEvent::FillDrag { seed, target, axis } => {
+                                Some((*seed, *target, *axis))
+                            }
+                            _ => None,
+                        })
+                        .expect("release emits FillDrag");
+                    assert_eq!(ev_seed, CellRange::single(CellRef::new(0, 0)));
+                    assert_eq!(ev_axis, FillAxis::Vertical);
+                    assert_eq!(
+                        ev_target, target,
+                        "the emitted target = the previewed target"
+                    );
+                    // The selection now covers the whole filled region.
+                    assert_eq!(
+                        grid.selection().range(),
+                        target,
+                        "selection expands to the fill"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The sticky axis: once a drag has committed to Vertical, a subsequent larger horizontal
+    /// excursion keeps it Vertical (Excel D3.1), and a return inside the seed resets it.
+    #[gpui::test]
+    fn fill_drag_axis_is_sticky_then_resets_inside_seed(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    let seed = CellRange::new(CellRef::new(2, 2), CellRef::new(2, 2)); // C3
+                    grid.set_selection(SelectionModel::single(seed.start), cx);
+                    grid.fill_drag = Some(FillDrag {
+                        seed,
+                        target: seed,
+                        axis: None,
+                    });
+                    // First move: 3 rows down, 0 cols → Vertical.
+                    grid.set_fill_target_from_cell(CellRef::new(5, 2));
+                    assert_eq!(
+                        grid.fill_drag_for_test().unwrap().2,
+                        Some(FillAxis::Vertical)
+                    );
+                    // Now a bigger horizontal excursion — axis stays Vertical (sticky), so the
+                    // target keeps the seed's single column.
+                    grid.set_fill_target_from_cell(CellRef::new(3, 9));
+                    let (_, target, axis) = grid.fill_drag_for_test().unwrap();
+                    assert_eq!(
+                        axis,
+                        Some(FillAxis::Vertical),
+                        "axis stays vertical mid-drag"
+                    );
+                    assert_eq!(target.start.col, 2, "still pinned to the seed column");
+                    assert_eq!(target.end.col, 2);
+                    // Returning inside the seed clears the axis.
+                    grid.set_fill_target_from_cell(seed.start);
+                    let (_, target, axis) = grid.fill_drag_for_test().unwrap();
+                    assert!(axis.is_none(), "axis resets inside the seed");
+                    assert_eq!(target, seed, "target collapses to the seed");
+                });
+            })
+            .unwrap();
+    }
+
+    /// A drag released without leaving the seed (target == seed) is a no-op: no `FillDrag`, and the
+    /// selection is unchanged (D3.3 — inward is not a clear).
+    #[gpui::test]
+    fn fill_drag_onto_seed_is_a_noop(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let seed = CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)); // B2:C3
+                    grid.set_selection(
+                        SelectionModel {
+                            anchor: seed.start,
+                            active: seed.end,
+                        },
+                        cx,
+                    );
+                    grid.fill_drag = Some(FillDrag {
+                        seed,
+                        target: seed,
+                        axis: None,
+                    });
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::FillDrag { .. })),
+                        "a release onto the seed emits no fill"
+                    );
+                    assert_eq!(grid.selection().range(), seed, "selection unchanged");
+                });
+            })
+            .unwrap();
     }
 
     #[test]
@@ -6083,6 +7025,239 @@ mod tests {
         assert_eq!(resizes[0].1, 3, "only the divider column is autofit");
     }
 
+    // ---- Autofit row height (`functional_spec.md §5`) ------------------------------------
+
+    #[test]
+    fn cell_line_box_height_matches_default_and_scales() {
+        // One line at the default font is exactly the default row height (the vpad slack absorbs it).
+        assert!((cell_line_box_height(1, CELL_FONT_PX) - DEFAULT_ROW_HEIGHT_PX).abs() < 0.001);
+        // Each extra visual line adds one phi line box.
+        let one = cell_line_box_height(1, CELL_FONT_PX);
+        let three = cell_line_box_height(3, CELL_FONT_PX);
+        let step = (GRID_LINE_HEIGHT_FACTOR * CELL_FONT_PX).round();
+        assert!(
+            (three - one - 2.0 * step).abs() < 0.001,
+            "lines grow by phi·font"
+        );
+        assert!(three > one);
+        // A larger font makes a single line taller than the default.
+        assert!(
+            cell_line_box_height(1, CELL_FONT_PX * 3.0) > cell_line_box_height(1, CELL_FONT_PX)
+        );
+    }
+
+    /// Sources for the row-autofit tests: `(row, col, text, wrap)` published plain-text cells (a
+    /// `wrap` cell gets a wrap-on cell style), plus optional per-column width overrides so a wrap-on
+    /// cell can be forced to soft-wrap in a narrow column.
+    fn autofit_row_sources(
+        cells: &[(u32, u32, &str, bool)],
+        col_widths: &[(u32, f32)],
+    ) -> (GridDataSources, SheetId) {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::{CellKind, Publication, PublishedCell};
+        use freecell_core::style::RenderStyle;
+        let sheet = SheetId(0);
+        let published: Vec<PublishedCell> = cells
+            .iter()
+            .map(|(r, c, t, _)| PublishedCell {
+                row: *r,
+                col: *c,
+                display_text: t.to_string(),
+                kind: CellKind::Text,
+                text_color: None,
+            })
+            .collect();
+        let mut builder = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        );
+        for (col, px) in col_widths {
+            builder.push_col_width(*col, *px);
+        }
+        for (r, c, _, wrap) in cells {
+            if *wrap {
+                builder.push_cell_style(
+                    *r,
+                    *c,
+                    RenderStyle {
+                        wrap: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, builder.build());
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: published,
+        };
+        (
+            GridDataSources {
+                publication: Arc::new(ArcSwap::from_pointee(publication)),
+                caches: Arc::new(RwLock::new(caches)),
+            },
+            sheet,
+        )
+    }
+
+    /// The `(start, end, px)` of each **row** `ResizeCommitted` the recording captured, in order.
+    fn captured_row_resizes(events: &Rc<RefCell<Vec<GridEvent>>>) -> Vec<(u32, u32, f32)> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Row,
+                    start,
+                    end,
+                    px,
+                } => Some((*start, *end, *px)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn autofit_row_single_line_is_default(cx: &mut TestAppContext) {
+        // A row of one-line populated cells autofits to the default height — one resize for that row.
+        let (sources, _s) = autofit_row_sources(&[(2, 1, "hello", false)], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(2, window, cx));
+            })
+            .unwrap();
+        let resizes = captured_row_resizes(&events);
+        assert_eq!(resizes.len(), 1);
+        assert_eq!(resizes[0].0, 2);
+        assert_eq!(resizes[0].1, 2, "only the divider row is autofit");
+        assert!(
+            (resizes[0].2 - DEFAULT_ROW_HEIGHT_PX).abs() < 0.5,
+            "single-line row fits the default, got {}",
+            resizes[0].2
+        );
+    }
+
+    #[gpui::test]
+    fn autofit_row_explicit_newlines_grow(cx: &mut TestAppContext) {
+        // A wrap-off cell with two explicit newlines is three visual lines → three line boxes.
+        let (sources, _s) = autofit_row_sources(&[(3, 1, "a\nb\nc", false)], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(3, window, cx));
+            })
+            .unwrap();
+        let px = captured_row_resizes(&events)[0].2;
+        let expected = cell_line_box_height(3, CELL_FONT_PX);
+        assert!(
+            (px - expected).abs() < 0.5,
+            "px {px} vs expected {expected}"
+        );
+        assert!(px > DEFAULT_ROW_HEIGHT_PX, "three lines exceed the default");
+        assert!(px < MAX_AUTO_ROW_HEIGHT_PX, "well below the cap");
+    }
+
+    #[gpui::test]
+    fn autofit_row_wrap_on_counts_wrapped_lines(cx: &mut TestAppContext) {
+        // A wrap-on cell whose text far exceeds a narrow column soft-wraps to multiple lines, so the
+        // fitted height exceeds a single line (the wrap-off single-line default).
+        let long = "the quick brown fox jumps over the lazy dog again and again and again";
+        let (sources, _s) = autofit_row_sources(&[(4, 1, long, true)], &[(1, 40.0)]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(4, window, cx));
+            })
+            .unwrap();
+        let px = captured_row_resizes(&events)[0].2;
+        assert!(
+            px > cell_line_box_height(1, CELL_FONT_PX) + 0.5,
+            "wrapped text grows past a single line, got {px}"
+        );
+    }
+
+    #[gpui::test]
+    fn autofit_row_clamps_at_max(cx: &mut TestAppContext) {
+        // A pathologically tall cell (many explicit lines) is clamped at `MAX_AUTO_ROW_HEIGHT_PX`.
+        let many = "x\n".repeat(60);
+        let (sources, _s) = autofit_row_sources(&[(5, 1, &many, false)], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(5, window, cx));
+            })
+            .unwrap();
+        assert_eq!(captured_row_resizes(&events)[0].2, MAX_AUTO_ROW_HEIGHT_PX);
+    }
+
+    #[gpui::test]
+    fn autofit_empty_row_is_default(cx: &mut TestAppContext) {
+        // A row with no published cells autofits to the default height (no shrink below default).
+        let (sources, _s) = autofit_row_sources(&[], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(7, window, cx));
+            })
+            .unwrap();
+        let resizes = captured_row_resizes(&events);
+        assert_eq!(resizes.len(), 1);
+        assert_eq!(resizes[0], (7, 7, DEFAULT_ROW_HEIGHT_PX));
+    }
+
+    #[gpui::test]
+    fn autofit_multi_row_selection_fits_each(cx: &mut TestAppContext) {
+        // A divider double-clicked inside a full-row multi-row selection autofits every row in the run
+        // — one `ResizeCommitted{Row}` per row.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_row(1, false, window, cx);
+                    grid.select_row(3, true, window, cx);
+                    assert_eq!(grid.resize_run_for(RowOrCol::Row, 2), (1, 3));
+                    grid.autofit_row(2, window, cx);
+                });
+            })
+            .unwrap();
+        let rows: Vec<u32> = captured_row_resizes(&events)
+            .iter()
+            .map(|(s, e, _)| {
+                assert_eq!(s, e, "each autofit resize targets a single row");
+                *s
+            })
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3], "each selected row autofit once");
+    }
+
+    #[gpui::test]
+    fn autofit_row_under_select_all_fits_only_the_divider_row(cx: &mut TestAppContext) {
+        // Select-all is not a full-row selection, so a row divider resolves to just its own row; the
+        // whole-sheet guard mirrors the column autofit. Exactly one resize, for the divider's row.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_all(window, cx);
+                    grid.autofit_row(4, window, cx);
+                });
+            })
+            .unwrap();
+        let resizes = captured_row_resizes(&events);
+        assert_eq!(
+            resizes.len(),
+            1,
+            "whole-sheet autofit emits exactly one row resize"
+        );
+        assert_eq!(resizes[0].0, 4);
+        assert_eq!(resizes[0].1, 4, "only the divider row is autofit");
+    }
+
     #[gpui::test]
     fn commit_resize_noop_is_skipped(cx: &mut TestAppContext) {
         // A divider click with no drag (`current_px == start_px`) must not freeze a preview or emit a
@@ -6242,6 +7417,126 @@ mod tests {
             &items[9],
             Some((l, false, GridEvent::InsertColumns { .. })) if l == "Insert 1 column left"
         ));
+    }
+
+    fn header_menu_fixture(
+        axis: RowOrCol,
+        run: (u32, u32),
+        hide_blocked: bool,
+        unhide_run: Option<(u32, u32)>,
+        hidden_in_run: u32,
+    ) -> HeaderMenu {
+        HeaderMenu {
+            axis,
+            run,
+            x: 0.0,
+            y: 0.0,
+            insert_before_blocked: false,
+            insert_after_blocked: false,
+            delete_blocked: false,
+            hide_blocked,
+            unhide_run,
+            hidden_in_run,
+        }
+    }
+
+    #[test]
+    fn header_menu_items_include_hide_and_unhide() {
+        use freecell_core::limits;
+        // A 3-column run C:E with nothing hidden → Hide (all 3 newly-hidden) enabled, Unhide disabled.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Col,
+            (2, 4),
+            false,
+            None,
+            0,
+        ));
+        assert!(matches!(
+            &items[3],
+            (l, true, GridEvent::HideColumns { at: 2, count: 3 }) if l == "Hide 3 columns"
+        ));
+        assert!(matches!(
+            &items[4],
+            (l, false, GridEvent::UnhideColumns { .. }) if l == "Unhide columns"
+        ));
+
+        // Same run but D (3) hidden → Unhide enabled (1 hidden), scoped to the hidden span; Hide now
+        // counts only the 2 newly-hidden (C, E), while its event still targets the whole run.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Col,
+            (2, 4),
+            false,
+            Some((3, 3)),
+            1,
+        ));
+        assert!(matches!(
+            &items[3],
+            (l, true, GridEvent::HideColumns { at: 2, count: 3 }) if l == "Hide 2 columns"
+        ));
+        assert!(matches!(
+            &items[4],
+            (l, true, GridEvent::UnhideColumns { at: 3, count: 1 }) if l == "Unhide 1 column"
+        ));
+
+        // SPARSE case (the reviewer's fix): a run C:G where only D and F are hidden → the span is
+        // [3, 5] (width 3) but the label counts the ACTUAL 2 hidden ("Unhide 2 columns"); the event
+        // still clears the whole span.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Col,
+            (2, 6),
+            false,
+            Some((3, 5)),
+            2,
+        ));
+        assert!(matches!(
+            &items[4],
+            (l, true, GridEvent::UnhideColumns { at: 3, count: 3 }) if l == "Unhide 2 columns"
+        ));
+
+        // Select-All → Hide is blocked (would hide every visible row) → the Hide item is disabled.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Row,
+            (0, limits::MAX_ROWS - 1),
+            true,
+            None,
+            0,
+        ));
+        assert!(matches!(
+            &items[3],
+            (l, false, GridEvent::HideRows { at: 0, .. }) if l == "Hide 1048576 rows"
+        ));
+    }
+
+    #[test]
+    fn hide_unhide_flags_compute_span_count_and_hide_all_guard() {
+        use freecell_core::limits;
+        use std::collections::BTreeSet;
+        let total = limits::MAX_ROWS;
+        // Nothing hidden in the run → Hide allowed, Unhide None, count 0.
+        let (hb, ur, n) = hide_unhide_flags((2, 4), &BTreeSet::new(), total);
+        assert!(!hb && ur.is_none() && n == 0);
+        // Hidden 3 and 7 within run 2..=9 → the unhide span is the minimal [3, 7] but the count is 2
+        // (the sparse case: span width 5, only 2 actually hidden).
+        let hidden: BTreeSet<u32> = [3u32, 7].into_iter().collect();
+        let (_, ur, n) = hide_unhide_flags((2, 9), &hidden, total);
+        assert_eq!(ur, Some((3, 7)));
+        assert_eq!(n, 2);
+        // Select-All over the whole axis with nothing hidden → hiding all → blocked.
+        let (hb, _, _) = hide_unhide_flags((0, total - 1), &BTreeSet::new(), total);
+        assert!(hb);
+        // Select-All with some already hidden → still hides every remaining visible → blocked.
+        let (hb, _, _) = hide_unhide_flags((0, total - 1), &hidden, total);
+        assert!(hb);
+        // A partial run that leaves visible tracks is never hide-blocked.
+        let (hb, _, _) = hide_unhide_flags((0, 4), &BTreeSet::new(), total);
+        assert!(!hb);
+        // A smaller-than-select-all run that still covers every remaining visible track is blocked
+        // too (most of the axis already hidden) — the softened-doc case.
+        let mut almost_all: BTreeSet<u32> = (0..total).collect();
+        almost_all.remove(&5);
+        almost_all.remove(&6);
+        let (hb, _, _) = hide_unhide_flags((5, 6), &almost_all, total);
+        assert!(hb, "hiding the last 2 visible tracks is blocked");
     }
 
     /// Whether any item emits a row-structural (Insert/Delete rows) command.
@@ -6633,7 +7928,15 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(3, 3)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                 });
                 input
             })
@@ -6711,7 +8014,15 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input, cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(3, 3)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                 });
             })
             .unwrap();
@@ -6786,7 +8097,15 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(2, 2)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     grid.mouse_down_cell(
                         2,
                         2,
@@ -6835,13 +8154,21 @@ mod tests {
                     );
                     assert!(grid.has_active_drag(), "a single click arms a cell drag");
                     // Open the editor → the drag must be cleared at the root.
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(2, 2)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     assert!(
                         !grid.has_active_drag(),
                         "opening the in-cell editor clears the pre-armed drag"
                     );
                     // Close the editor; the drag must stay cleared (no move-gate applies now).
-                    grid.set_edit_state(None, None, None, false, cx);
+                    grid.set_edit_state(None, None, None, false, None, None, cx);
                     assert!(
                         !grid.has_active_drag(),
                         "the drag stays cleared after the editor closes"
@@ -7033,7 +8360,15 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(3, 3)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                 });
                 input
             })
@@ -7044,7 +8379,7 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7062,7 +8397,7 @@ mod tests {
                 )
             });
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7084,7 +8419,7 @@ mod tests {
         // Cancel closes the overlay — normal rendering resumes (no persistent overlay).
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, cx)
+                grid.set_edit_state(None, None, None, false, None, None, cx)
             })
         });
         vcx.run_until_parked();
@@ -7106,7 +8441,7 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(cell), None, false, cx);
+                    grid.set_edit_state(None, Some(cell), None, false, None, None, cx);
                 });
                 input
             })
@@ -7116,7 +8451,7 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, cx)
+                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7127,7 +8462,7 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value(WRAP_LONG, window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, cx)
+                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7149,7 +8484,7 @@ mod tests {
         // Commit closes the overlay.
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, cx)
+                grid.set_edit_state(None, None, None, false, None, None, cx)
             })
         });
         vcx.run_until_parked();

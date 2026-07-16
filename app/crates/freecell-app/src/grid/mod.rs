@@ -24,7 +24,7 @@ use gpui::{App, Window};
 
 use freecell_chart_model::{Anchor, ChartId};
 use freecell_core::selection::Direction;
-use freecell_core::{CellRange, CellRef, SelectionModel};
+use freecell_core::{CellRange, CellRef, FillAxis, SelectionModel};
 
 pub(crate) use view::caret_intent_modifiers;
 pub use view::{GridDataSources, GridView};
@@ -122,6 +122,22 @@ pub enum GridEvent {
     InCellCommitMove(Direction),
     /// Escape captured in the in-cell overlay — cancel the pending edit.
     InCellCancel,
+    /// Arrow up/down captured in the in-cell overlay while the completion list is open — move the
+    /// highlighted completion row (`gaps_closing_7_15 §1`). Routed to `ChromeView`.
+    AutocompleteNav { down: bool },
+    /// Tab/Enter captured in the in-cell overlay while the completion list is open — accept the
+    /// highlighted completion. Routed to `ChromeView::autocomplete_accept`.
+    AutocompleteAccept,
+    /// A mouse click on in-cell completion row `index` — accept that completion. Routed to
+    /// `ChromeView::autocomplete_accept_at`.
+    AutocompleteAcceptAt(usize),
+    /// Escape captured in the in-cell overlay while the completion list is open — close the list
+    /// only (the edit continues). Routed to `ChromeView::autocomplete_dismiss`.
+    AutocompleteDismiss,
+    /// A caret-only key (←/→/Home/End) in the in-cell overlay — recompute the list/hint after the
+    /// caret moves (the pinned input fires no event on a pure caret move). Routed to
+    /// `ChromeView::autocomplete_caret_moved`.
+    AutocompleteCaretMoved,
     /// Cmd/Ctrl+C (`cut: false`) / Cmd/Ctrl+X (`cut: true`) on the focused grid — copy/cut the
     /// selection to the range clipboard (`functional_spec.md §2.1`). The window routes this to
     /// the `ClipboardCoordinator`.
@@ -141,6 +157,15 @@ pub enum GridEvent {
     /// Cmd/Ctrl+R on the focused grid — fill the selection's left column **right** over the rest
     /// (the column analog of [`GridEvent::FillDown`]). Forwarded as `Command::FillRight`.
     FillRight(CellRange),
+    /// A drag of the selection's fill handle released past the seed (`gaps_closing_7_15 §3`):
+    /// extend `seed`'s content into `target` (⊇ seed) along the dominant `axis`. The window
+    /// forwards it as `Command::FillDrag` for the active sheet — a multi-cell seed extrapolates a
+    /// series, a single-cell seed copies.
+    FillDrag {
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+    },
     /// Cmd/Ctrl+arrow (`extend: false`) or Cmd/Ctrl+Shift+arrow (`extend: true`) on the focused grid
     /// — resolve the **edge-of-data** target from `from` in `dir` (`functional_spec.md §4`). Occupancy
     /// lives in the engine past the published viewport, so the window forwards this as an async
@@ -178,6 +203,18 @@ pub enum GridEvent {
     DeleteRows { at: u32, count: u32 },
     /// Delete `count` columns starting at 0-based `at`.
     DeleteColumns { at: u32, count: u32 },
+    /// Hide the inclusive 0-based row run `[at, at+count-1]` (`gaps_closing_7_15 §4`, header menu).
+    /// The window forwards it as `Command::SetRowsHidden { hidden: true }` for the active sheet.
+    HideRows { at: u32, count: u32 },
+    /// Hide the inclusive 0-based column run (the column analog of [`GridEvent::HideRows`]).
+    HideColumns { at: u32, count: u32 },
+    /// Unhide (restore) every hidden row in the inclusive 0-based run `[at, at+count-1]` — the
+    /// minimal `[first_hidden, last_hidden]` span within the selected header run, so Select-All →
+    /// Unhide bounds the op to the hidden span, not the whole axis. Forwarded as
+    /// `Command::SetRowsHidden { hidden: false }`.
+    UnhideRows { at: u32, count: u32 },
+    /// Unhide (restore) every hidden column in the run (the column analog of [`GridEvent::UnhideRows`]).
+    UnhideColumns { at: u32, count: u32 },
     /// A chart was **moved or resized** on the ChartLayer (P18, `ui_design §3.2`) — both produce a
     /// new [`Anchor`]. The window forwards it as `Command::SetChartAnchor` for the active sheet.
     ChartAnchorChanged { id: ChartId, anchor: Anchor },

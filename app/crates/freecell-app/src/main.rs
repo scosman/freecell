@@ -28,13 +28,17 @@ fn exit_after_ms() -> Option<u64> {
         .and_then(|s| s.parse().ok())
 }
 
-/// The first non-flag `.xlsx` path argument, if any (best-effort CLI open — Finder open-file
-/// events are a separate, deferred path; see DECISIONS_TO_REVIEW Phase 10).
-fn xlsx_arg() -> Option<PathBuf> {
-    std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with('-') && a.to_ascii_lowercase().ends_with(".xlsx"))
-        .map(PathBuf::from)
+/// The first non-flag `.xlsx` / `.csv` path argument, if any (best-effort CLI open — Finder
+/// open-file events are a separate, deferred path; see DECISIONS_TO_REVIEW Phase 10). A `.csv`
+/// routes to CSV import (`open_path` branches on the extension, `functional_spec.md §2`).
+fn open_arg() -> Option<PathBuf> {
+    std::env::args().skip(1).find_map(|a| {
+        if a.starts_with('-') {
+            return None;
+        }
+        let lower = a.to_ascii_lowercase();
+        (lower.ends_with(".xlsx") || lower.ends_with(".csv")).then(|| PathBuf::from(a))
+    })
 }
 
 /// Default `tracing` filter, used only when `RUST_LOG` is unset.
@@ -59,7 +63,7 @@ fn main() {
         .try_init();
 
     let exit_after = exit_after_ms();
-    let open_path = xlsx_arg();
+    let open_path = open_arg();
 
     // The combined asset source: FreeCell's vendored action-bar icons composed over the
     // gpui-component bundle (`shell::assets`). The bundle still resolves `IconName::Loader`,

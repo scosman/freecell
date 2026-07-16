@@ -8,7 +8,9 @@ use freecell_chart_model::{
     ChartInsertKind, ChartKind, ChartSpec, Color, Grouping, Legend, Marker, MarkerSymbol,
     ScatterStyle, Series, SizeRepresentation, SourceXml, ThemeSlot,
 };
-use freecell_core::{Align, BorderSpec, CellRef, Edge, LinePattern, Rgb, SelectionModel, VAlign};
+use freecell_core::{
+    Align, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern, Rgb, SelectionModel, VAlign,
+};
 
 use crate::scene::Scene;
 
@@ -94,6 +96,10 @@ pub struct RenderCase {
     /// harness runs `GridView::autogrow_measure_now` before first paint so the captured frame shows
     /// the real grown row heights. `false` for every non-auto-grow case (no baseline change).
     pub auto_grow: bool,
+    /// An armed fill-drag preview `(seed, target, axis)` (`gaps_closing_7_15 §3`) — the harness
+    /// calls `GridView::set_fill_drag_preview` so the captured frame shows the drag's target-region
+    /// preview rectangle. `None` (the default) for every other case (no baseline change).
+    pub fill_drag: Option<(CellRange, CellRange, FillAxis)>,
 }
 
 impl RenderCase {
@@ -112,7 +118,14 @@ impl RenderCase {
             charts: Vec::new(),
             selected_chart: None,
             auto_grow: false,
+            fill_drag: None,
         }
+    }
+
+    /// Arms a fill-drag preview `(seed, target, axis)` on this case (`gaps_closing_7_15 §3`).
+    fn fill_drag(mut self, seed: CellRange, target: CellRange, axis: FillAxis) -> Self {
+        self.fill_drag = Some((seed, target, axis));
+        self
     }
 
     /// Opts this case into the wrap-driven row auto-grow measurement (`functional_spec.md §3`).
@@ -918,6 +931,62 @@ pub fn all() -> Vec<RenderCase> {
         .force_scrollbars(),
         RenderCase::new("grid_mixed_content", mixed_content_scene(), (720, 400))
             .selection(sel((2, 1), (4, 3))),
+        // ---- Fill handle + drag preview (gaps_closing_7_15 §3) --------------------------
+        // The always-visible fill handle at the bottom-right corner of a multi-cell selection
+        // (B2:C3). Every grid scene now shows the handle at its selection's corner; this case is
+        // the dedicated proof of the handle square on a range (`gaps_closing_7_15 §3`).
+        RenderCase::new(
+            "fill_handle_multicell",
+            Scene::new()
+                .input(1, 1, "1")
+                .input(1, 2, "2")
+                .input(2, 1, "3")
+                .input(2, 2, "4"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (2, 2))),
+        // A LIVE fill drag: a two-cell vertical seed (B2:B3) dragged down to B2:B6, so the grid
+        // paints the 2px accent target-region preview rectangle over the fill span (replacing the
+        // handle for the duration of the drag). Pixel proof of the drag-preview overlay.
+        RenderCase::new(
+            "fill_drag_preview",
+            Scene::new().input(1, 1, "1").input(2, 1, "2"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (2, 1)))
+        .fill_drag(
+            CellRange::new(CellRef::new(1, 1), CellRef::new(2, 1)),
+            CellRange::new(CellRef::new(1, 1), CellRef::new(6, 1)),
+            FillAxis::Vertical,
+        ),
+        // ---- Hidden rows & columns (gaps_closing_7_15 §4) -------------------------------
+        // A 4×4 labelled block with row index 2 (the "*3" row) AND column index 1 (column B)
+        // hidden: the hidden tracks collapse to zero size, so their neighbours abut with no
+        // cell/header/gridline (columns A,C,D adjacent; rows *1,*2,*4 adjacent). Driven through
+        // the real `SetRowsHidden`/`SetColumnsHidden` worker path.
+        RenderCase::new(
+            "hidden_row_and_col",
+            Scene::new()
+                .input(0, 0, "A1")
+                .input(0, 1, "B1")
+                .input(0, 2, "C1")
+                .input(0, 3, "D1")
+                .input(1, 0, "A2")
+                .input(1, 1, "B2")
+                .input(1, 2, "C2")
+                .input(1, 3, "D2")
+                .input(2, 0, "A3")
+                .input(2, 1, "B3")
+                .input(2, 2, "C3")
+                .input(2, 3, "D3")
+                .input(3, 0, "A4")
+                .input(3, 1, "B4")
+                .input(3, 2, "C4")
+                .input(3, 3, "D4")
+                .hide_row(2, 2)
+                .hide_col(1, 1),
+            GRID_VP,
+        ),
         // ---- In-grid charts (P8): the ChartLayer painted over cells at the anchor rect --------
         // A Faithful line chart floating over the data table (`charts/functional_spec.md §1`).
         RenderCase::new("grid_chart_line", chart_backing_scene(), CHART_GRID_VP)

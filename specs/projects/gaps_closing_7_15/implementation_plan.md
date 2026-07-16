@@ -52,10 +52,12 @@ architecture.
       Engine + gpui tests green; render **subset** deferred (no existing baseline moves — see
       phase plan). **Turned out far lighter than planned** (the "heaviest phase" framing assumed
       fork work that was already upstream).
-- [ ] **Phase 6 — Render validation (§6, dedicated late phase).** Regenerate + **eyeball**
+- [x] **Phase 6 — Render validation (§6, dedicated late phase).** Regenerated + **eyeballed**
       baselines for the fill handle + drag preview (P4), hidden-track zero-size (P5), and any
-      row-height shifts (P3); add new cases; run the **full** pixel suite (timeout +
-      ~10-min watchdog); commit refreshed baselines; dispatch the CI `render` gate to green.
+      row-height shifts (P3); added 3 new cases (`fill_handle_multicell`, `fill_drag_preview`,
+      `hidden_row_and_col`); ran the **full** pixel suite (timeout + ~10-min watchdog) green;
+      committed refreshed baselines. CI `render` gate dispatch is the manager's follow-up. See
+      `phase_plans/phase_6.md`.
 
 ## Notes for the build
 

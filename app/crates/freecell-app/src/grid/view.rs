@@ -950,6 +950,27 @@ impl GridView {
         cx.notify();
     }
 
+    /// Arms a fill-drag preview state directly (render-test / debug hook), so a static capture can
+    /// show the drag preview rectangle without synthesizing a live mouse gesture. `seed` is the
+    /// origin selection, `target` (⊇ seed) the previewed fill region, `axis` the decided dominant
+    /// direction — exactly the state the live [`handle_mouse_move`](Self::handle_mouse_move) drag
+    /// builds (`gaps_closing_7_15 §3`). The normal app never calls this (the drag machine owns the
+    /// state); it exists so the pixel suite can baseline the preview overlay.
+    pub fn set_fill_drag_preview(
+        &mut self,
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+        cx: &mut Context<Self>,
+    ) {
+        self.fill_drag = Some(FillDrag {
+            seed,
+            target,
+            axis: Some(axis),
+        });
+        cx.notify();
+    }
+
     /// Freezes the loading spinner to a static loader icon (render-test / debug hook). The
     /// animated `Spinner` rotates by wall-clock elapsed time, so a capture taken at an
     /// arbitrary moment (after `xrefresh`) would be non-deterministic; freezing makes the

@@ -69,6 +69,7 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let charts = case.charts;
     let selected_chart = case.selected_chart;
     let auto_grow = case.auto_grow;
+    let fill_drag = case.fill_drag;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
@@ -125,6 +126,8 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             None,
                             None,
                             false,
+                            None,
+                            None,
                             cx,
                         );
                     }
@@ -135,7 +138,15 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             state
                         });
                         view.set_incell_input(input, cx);
-                        view.set_edit_state(None, Some(CellRef::new(row, col)), None, false, cx);
+                        view.set_edit_state(
+                            None,
+                            Some(CellRef::new(row, col)),
+                            None,
+                            false,
+                            None,
+                            None,
+                            cx,
+                        );
                     }
                     // Wrap-driven auto-grow (`functional_spec.md §3`): run the real render-thread
                     // measurement once, up front, so the captured frame shows the grown row heights.
@@ -144,6 +155,11 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     // shared cache directly (skipping rows with an existing override = manual).
                     if auto_grow {
                         view.autogrow_measure_now(window, cx);
+                    }
+                    // A live fill-drag preview (`gaps_closing_7_15 §3`): arm the drag state so the
+                    // captured frame shows the target-region preview rectangle.
+                    if let Some((seed, target, axis)) = fill_drag {
+                        view.set_fill_drag_preview(seed, target, axis, cx);
                     }
                     view
                 });

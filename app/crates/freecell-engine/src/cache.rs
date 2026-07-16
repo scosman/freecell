@@ -83,13 +83,33 @@ pub(crate) fn autofit_row_ironcalc_px(font_px: f64) -> f64 {
     row_ironcalc_px(device)
 }
 
-/// The FreeCell-px row-height **override** for `row` (0-based): `Some(px)` when the engine reports
-/// a non-default height (a custom or auto-fit row), `None` when it is at the IronCalc default (so
-/// the cache uses its own default). The worker's mirror path uses this to reflect IronCalc's
-/// row-height auto-fit — a `set_user_input` grows a row when its content is taller than the
-/// current height (`ironcalc_base/src/user_model/common.rs`, `set_user_input`) — after a value
-/// edit, keeping the cache geometry in agreement across the edit and its undo.
+/// The FreeCell-px row-height **override** for `row` (0-based): `Some(px)` when the engine carries
+/// an intentional non-default height (a custom or auto-fit row), `None` otherwise (so the cache
+/// uses its own default). The worker's mirror path uses this to reflect IronCalc's row-height
+/// auto-fit — a `set_user_input` grows a row when its content is taller than the current height
+/// (`ironcalc_base/src/user_model/common.rs`, `set_user_input`) — after a value edit, keeping the
+/// cache geometry in agreement across the edit and its undo.
+///
+/// Gated on the row record's `custom_height` flag, mirroring [`build_sheet_cache`]'s gate exactly.
+/// Files routinely store the writer's own *calculated* height on auto rows (`ht="15"
+/// customHeight="false"` — Excel/LibreOffice write it for every populated row): that height
+/// reflects the writer's fonts/metrics, not user intent, and the build ignores it (the row renders
+/// at the grid default). Reading the raw `row_height()` here instead used to "discover" such rows
+/// as overrides on the first edit of ANY cell in the row, visibly shrinking the row (24 → 22.5 px
+/// for a 15 pt `ht`). Every height the engine writes itself (`set_row_height`, `set_rows_height` —
+/// user resizes, font auto-grow, `set_user_input`'s newline auto-fit) sets `custom_height: true`,
+/// so the gate never hides a real engine-driven height change.
 pub(crate) fn row_override_px(doc: &WorkbookDocument, sheet_idx: u32, row: u32) -> Option<f32> {
+    let r1 = row as i32 + 1;
+    let custom = doc
+        .worksheet(sheet_idx)
+        .ok()?
+        .rows
+        .iter()
+        .any(|r| r.r == r1 && r.custom_height);
+    if !custom {
+        return None;
+    }
     let ic = doc
         .row_height_px(sheet_idx, row)
         .unwrap_or(IRONCALC_DEFAULT_ROW_HEIGHT_PX);

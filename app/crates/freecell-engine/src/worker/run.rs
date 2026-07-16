@@ -7178,6 +7178,93 @@ mod tests {
         );
     }
 
+    /// Builds a fixture xlsx whose row 7 carries `ht="15" customHeight="false"` plus two number
+    /// cells — the shape Excel/LibreOffice write for an **auto-height** row (the `ht` is the
+    /// writer's own calculated height, not a user intent). IronCalc imports it as a `Row` record
+    /// with `custom_height: false`, so its `row_height()` (15 pt × 1.5625 = 23.4375 IC px) differs
+    /// from the 25 IC px default even though no one ever set a height.
+    fn auto_height_row_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::{Read, Write};
+        let base = dir.join("base.xlsx");
+        WorkbookDocument::new_empty().unwrap().save(&base).unwrap();
+        let bytes = std::fs::read(&base).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let out = dir.join("auto_height_row.xlsx");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&out).unwrap());
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut content = Vec::new();
+            f.read_to_end(&mut content).unwrap();
+            if name.contains("worksheets/sheet1.xml") {
+                let s = String::from_utf8(content).unwrap().replace(
+                    "</sheetData>",
+                    "<row r=\"7\" customFormat=\"false\" ht=\"15\" hidden=\"false\" \
+                     customHeight=\"false\" outlineLevel=\"0\" collapsed=\"false\">\
+                     <c r=\"B7\" t=\"n\"><v>44000</v></c>\
+                     <c r=\"C7\" t=\"n\"><v>29000</v></c></row></sheetData>",
+                );
+                content = s.into_bytes();
+            }
+            writer.start_file(name, opts).unwrap();
+            writer.write_all(&content).unwrap();
+        }
+        writer.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn value_edit_keeps_auto_height_row_at_default() {
+        // Regression (user bug): editing any cell in a file row that carries an Excel-calculated
+        // `ht` with `customHeight="false"` shrank the row. The cache build correctly ignores such
+        // heights (only `custom_height` rows get an override, so the row renders at the 24 px grid
+        // default), but the per-cell edit mirror read the raw engine height (23.4375 IC px → 22.5
+        // device px) and "discovered" it as an override, snapping the row from 24 → 22.5 px on the
+        // first edit. The mirror must apply the same `custom_height` gate as the build.
+        let dir = tempfile::tempdir().unwrap();
+        let path = auto_height_row_fixture(dir.path());
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (mut worker, _rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+        assert!(
+            (row_h(&worker, sheet, 6) - 24.0).abs() < 0.01,
+            "an auto-height file row renders at the grid default (got {})",
+            row_h(&worker, sheet, 6)
+        );
+
+        // Edit a cell in the row (a value-only edit — no font/size change).
+        worker.process_batch(vec![set_input(sheet, 6, 2, "123")]);
+        assert!(
+            (row_h(&worker, sheet, 6) - 24.0).abs() < 0.01,
+            "a value edit must not move an auto-height row off the default (got {})",
+            row_h(&worker, sheet, 6)
+        );
+    }
+
+    #[test]
+    fn auto_grow_settle_keeps_auto_height_row_at_default() {
+        // The same stale-base flaw via the OTHER `row_override_px` consumer: when a wrap
+        // contribution on an auto-height file row (`ht` + `customHeight="false"`) is dropped, the
+        // row must settle back to the 24 px grid default the build renders — not to the raw engine
+        // height (22.5 device px).
+        let dir = tempfile::tempdir().unwrap();
+        let path = auto_height_row_fixture(dir.path());
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (mut worker, _rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![auto_grow(sheet, vec![(6, 130.0)])]);
+        assert!((row_h(&worker, sheet, 6) - 130.0).abs() < 1.0);
+        // The wrap need goes away (e.g. wrap toggled off) → the row settles at the default.
+        worker.process_batch(vec![auto_grow(sheet, vec![(6, 24.0)])]);
+        assert!(
+            (row_h(&worker, sheet, 6) - 24.0).abs() < 0.01,
+            "dropping the wrap contribution must settle the row at the grid default (got {})",
+            row_h(&worker, sheet, 6)
+        );
+    }
+
     #[test]
     fn insert_rows_shifts_and_undo() {
         let (mut worker, _rx) = test_worker();

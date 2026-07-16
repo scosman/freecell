@@ -374,6 +374,21 @@ struct WrapCell {
     col_w: f32,
 }
 
+/// A populated cell snapshotted for a **row-autofit** measurement (`functional_spec.md §5`): the
+/// committed text, its resolved font (size / weight / style / family), its own column width, and
+/// whether it wraps — everything [`GridView::measure_row_height`] needs to compute the cell's line
+/// box. Captured under the caches lock (like [`WrapCell`]) so measuring can drop the lock first. A
+/// wrap-on cell soft-wraps at `col_w`; a wrap-off cell counts only its explicit `\n` segments.
+struct AutofitRowCell {
+    text: SharedString,
+    col_w: f32,
+    font_px: f32,
+    bold: bool,
+    italic: bool,
+    font_family: Option<SharedString>,
+    wrap: bool,
+}
+
 /// One sheet's installed charts (P11, `charts/architecture.md §5` challenge 5, "off-screen free").
 ///
 /// `specs` is the **shared** `Arc<[ChartSpec]>` the engine published — the grid holds a refcount, not
@@ -1772,6 +1787,135 @@ impl GridView {
         autofit_width(max_text_px)
     }
 
+    /// Autofit the row(s) at a double-clicked row divider (`functional_spec.md §5`): size each to fit
+    /// its tallest populated cell — the row-height twin of [`autofit_column`](Self::autofit_column).
+    /// Reuses [`resize_run_for`](Self::resize_run_for) so a divider inside a bounded multi-row header
+    /// selection autofits the whole run (each row to **its own** content) while a lone divider
+    /// autofits just that row. Each row rides the existing [`GridEvent::ResizeCommitted`] →
+    /// `Command::SetRowHeights` (undoable, xlsx round-trip, same path as drag-resize; no new worker
+    /// command), which **marks the row manual** (D5.1) so it is thereafter exempt from live wrap
+    /// auto-grow — consistent with the column autofit and the manual-resize model. One undo step per
+    /// row (the per-height command carries one height).
+    ///
+    /// **Whole-sheet guard.** A select-all is not classified as a full-**row** selection (see
+    /// `resize_run_for`), so it already resolves to `(index, index)`; the explicit guard here mirrors
+    /// [`autofit_column`](Self::autofit_column) and defends against any run that spans every row, so
+    /// autofit never fans out to 1,048,576 per-row `SetRowHeights`. Bounded multi-row selections (a
+    /// handful of rows) still fan out.
+    fn autofit_row(&mut self, index: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let (start, end) = self.resize_run_for(RowOrCol::Row, index);
+        let spans_all_rows = start == 0 && end >= freecell_core::limits::MAX_ROWS - 1;
+        let (start, end) = if spans_all_rows {
+            (index, index)
+        } else {
+            (start, end)
+        };
+        for row in start..=end {
+            let px = self.autofit_height_for_row(row, window);
+            self.events.emit(
+                &GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Row,
+                    start: row,
+                    end: row,
+                    px,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The autofit height (device px) for `row` (D5.2): the tallest line box among the row's currently
+    /// **published/overscanned** populated cells, clamped to `[DEFAULT_ROW_HEIGHT_PX,
+    /// MAX_AUTO_ROW_HEIGHT_PX]`. Render-thread only — measures the values already materialized in the
+    /// publication with the render thread's text system, each at its own resolved font and **own
+    /// column width** (a wrap-on cell soft-wraps; a wrap-off cell counts explicit `\n` segments). A
+    /// value scrolled beyond the overscan is not measured — a documented limitation mirroring
+    /// [`autofit_width_for_column`](Self::autofit_width_for_column). An empty row resolves to the
+    /// default height.
+    fn autofit_height_for_row(&self, row: u32, window: &mut Window) -> f32 {
+        let publication = self.sources.publication.load_full();
+        if publication.sheet != self.active_sheet {
+            return DEFAULT_ROW_HEIGHT_PX;
+        }
+        // Snapshot each published cell's text + resolved font + column width while the caches lock is
+        // held, then release it before shaping (mirrors `autofit_width_for_column`). Keeps only this
+        // row's non-empty cells — O(published cells) per call, the snapshot Vec holding at most one
+        // row's worth.
+        let snapshots: Vec<AutofitRowCell> = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(self.active_sheet) else {
+                return DEFAULT_ROW_HEIGHT_PX;
+            };
+            publication
+                .cells
+                .iter()
+                .filter(|pc| pc.row == row && !pc.display_text.is_empty())
+                .map(|pc| {
+                    let style = cache.render_style(pc.row, pc.col).copied();
+                    let font_px = style.map(font_px_of).unwrap_or(CELL_FONT_PX);
+                    let font_family = style.and_then(|s| {
+                        cache
+                            .font_families()
+                            .get(s.font_family as usize)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| SharedString::from(name.to_string()))
+                    });
+                    AutofitRowCell {
+                        text: SharedString::from(pc.display_text.clone()),
+                        col_w: cache.col_width(pc.col),
+                        font_px,
+                        bold: style.map(|s| s.bold).unwrap_or(false),
+                        italic: style.map(|s| s.italic).unwrap_or(false),
+                        font_family,
+                        wrap: style.map(|s| s.wrap).unwrap_or(false),
+                    }
+                })
+                .collect()
+        };
+        Self::measure_row_height(&snapshots, window)
+    }
+
+    /// The autofit height a set of a row's populated cells needs (`functional_spec.md §5.2`): the
+    /// **max** over the cells of each cell's own line box ([`cell_line_box_height`]), clamped to
+    /// `[DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX]`. A **wrap-on** cell soft-wraps at its column
+    /// width (gpui's real `LineWrapper`, summed over explicit-`\n` segments — same as
+    /// [`measure_wrap_height`](Self::measure_wrap_height)); a **wrap-off** cell counts only its
+    /// explicit `\n` segments (one visual line each, no soft-wrap). An empty row (no cells) resolves
+    /// to the default.
+    fn measure_row_height(cells: &[AutofitRowCell], window: &mut Window) -> f32 {
+        let mut needed = DEFAULT_ROW_HEIGHT_PX;
+        for c in cells {
+            let lines: u32 = if c.wrap {
+                let avail = (c.col_w - 2.0 * CELL_H_PAD).max(1.0);
+                let family = c
+                    .font_family
+                    .clone()
+                    .unwrap_or_else(|| SharedString::from(GRID_FONT_FAMILY));
+                let mut cell_font = font(family);
+                if c.bold {
+                    cell_font = cell_font.bold();
+                }
+                if c.italic {
+                    cell_font = cell_font.italic();
+                }
+                let mut wrapper = window.text_system().line_wrapper(cell_font, px(c.font_px));
+                c.text
+                    .split('\n')
+                    .map(|segment| {
+                        1 + wrapper
+                            .wrap_line(&[LineFragment::text(segment)], px(avail))
+                            .count() as u32
+                    })
+                    .sum()
+            } else {
+                c.text.split('\n').count() as u32
+            };
+            needed = needed.max(cell_line_box_height(lines, c.font_px));
+        }
+        needed.clamp(DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX)
+    }
+
     /// Extend a header drag: map the pointer to a track on `axis` and move the selection's active
     /// track there, keeping the full extent (`components/grid_structure.md §5.2`).
     fn extend_header_drag(
@@ -3065,10 +3209,6 @@ impl GridView {
     /// default row height, so a one-line default cell measures to the default. Clamped to
     /// `[default, MAX_AUTO_ROW_HEIGHT_PX]` (content beyond the cap clips within the cell).
     fn measure_wrap_height(cells: &[&WrapCell], window: &mut Window) -> f32 {
-        let line_px = |font_px: f32| (GRID_LINE_HEIGHT_FACTOR * font_px).round();
-        // The vertical slack a default single line leaves (so `lines == 1` at the default size ⇒ the
-        // default row height).
-        let vpad = DEFAULT_ROW_HEIGHT_PX - line_px(CELL_FONT_PX);
         let mut needed = DEFAULT_ROW_HEIGHT_PX;
         for wc in cells {
             let avail = (wc.col_w - 2.0 * CELL_H_PAD).max(1.0);
@@ -3094,8 +3234,7 @@ impl GridView {
                         .count() as u32
                 })
                 .sum();
-            let cell_h = lines as f32 * line_px(wc.font_px) + vpad;
-            needed = needed.max(cell_h);
+            needed = needed.max(cell_line_box_height(lines, wc.font_px));
         }
         needed.clamp(DEFAULT_ROW_HEIGHT_PX, MAX_AUTO_ROW_HEIGHT_PX)
     }
@@ -3280,7 +3419,16 @@ impl GridView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.begin_resize(RowOrCol::Row, r, event, window, cx);
+                        // A single press begins the drag-resize; the 2nd click of a double-click
+                        // autofits the row to its content (`functional_spec.md §5`) without beginning a
+                        // resize. The 3rd+ click of a rapid multi-click burst is ignored so a
+                        // triple-click neither re-autofits (a redundant same-height undo step) nor
+                        // starts a stray resize. Mirrors the column hotspot above.
+                        match event.click_count {
+                            1 => this.begin_resize(RowOrCol::Row, r, event, window, cx),
+                            2 => this.autofit_row(r, window, cx),
+                            _ => {}
+                        }
                         cx.stop_propagation();
                     }),
                 )
@@ -4320,6 +4468,19 @@ fn measure_incell_text_width(
 /// [`GridView::autofit_width_for_column`] so the padding + clamp is unit-testable without a `Window`.
 fn autofit_width(max_text_px: f32) -> f32 {
     (max_text_px + AUTOFIT_PADDING_PX).clamp(AUTOFIT_MIN_WIDTH_PX, AUTOFIT_MAX_WIDTH_PX)
+}
+
+/// The device-px height a cell of `lines` visual lines at `font_px` occupies (`functional_spec.md
+/// §5`): `lines * line_height + vpad`, where `line_height` is gpui's default **`phi`** line box
+/// (`round(1.618 * font_px)`, matching `Style::line_height`) and `vpad` is the vertical slack a
+/// single default line leaves in [`DEFAULT_ROW_HEIGHT_PX`] (so `lines == 1` at the default size ⇒
+/// the default row height). Shared by wrap auto-grow ([`GridView::measure_wrap_height`]) and row
+/// autofit ([`GridView::measure_row_height`]) so the two never diverge. Pure — unit-testable
+/// without a `Window`.
+fn cell_line_box_height(lines: u32, font_px: f32) -> f32 {
+    let line_px = |px: f32| (GRID_LINE_HEIGHT_FACTOR * px).round();
+    let vpad = DEFAULT_ROW_HEIGHT_PX - line_px(CELL_FONT_PX);
+    lines as f32 * line_px(font_px) + vpad
 }
 
 /// Geometry the in-cell editor feeds its hosted single-line [`Input`] so a large font is not
@@ -6263,6 +6424,239 @@ mod tests {
         );
         assert_eq!(resizes[0].0, 3);
         assert_eq!(resizes[0].1, 3, "only the divider column is autofit");
+    }
+
+    // ---- Autofit row height (`functional_spec.md §5`) ------------------------------------
+
+    #[test]
+    fn cell_line_box_height_matches_default_and_scales() {
+        // One line at the default font is exactly the default row height (the vpad slack absorbs it).
+        assert!((cell_line_box_height(1, CELL_FONT_PX) - DEFAULT_ROW_HEIGHT_PX).abs() < 0.001);
+        // Each extra visual line adds one phi line box.
+        let one = cell_line_box_height(1, CELL_FONT_PX);
+        let three = cell_line_box_height(3, CELL_FONT_PX);
+        let step = (GRID_LINE_HEIGHT_FACTOR * CELL_FONT_PX).round();
+        assert!(
+            (three - one - 2.0 * step).abs() < 0.001,
+            "lines grow by phi·font"
+        );
+        assert!(three > one);
+        // A larger font makes a single line taller than the default.
+        assert!(
+            cell_line_box_height(1, CELL_FONT_PX * 3.0) > cell_line_box_height(1, CELL_FONT_PX)
+        );
+    }
+
+    /// Sources for the row-autofit tests: `(row, col, text, wrap)` published plain-text cells (a
+    /// `wrap` cell gets a wrap-on cell style), plus optional per-column width overrides so a wrap-on
+    /// cell can be forced to soft-wrap in a narrow column.
+    fn autofit_row_sources(
+        cells: &[(u32, u32, &str, bool)],
+        col_widths: &[(u32, f32)],
+    ) -> (GridDataSources, SheetId) {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::{CellKind, Publication, PublishedCell};
+        use freecell_core::style::RenderStyle;
+        let sheet = SheetId(0);
+        let published: Vec<PublishedCell> = cells
+            .iter()
+            .map(|(r, c, t, _)| PublishedCell {
+                row: *r,
+                col: *c,
+                display_text: t.to_string(),
+                kind: CellKind::Text,
+                text_color: None,
+            })
+            .collect();
+        let mut builder = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        );
+        for (col, px) in col_widths {
+            builder.push_col_width(*col, *px);
+        }
+        for (r, c, _, wrap) in cells {
+            if *wrap {
+                builder.push_cell_style(
+                    *r,
+                    *c,
+                    RenderStyle {
+                        wrap: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, builder.build());
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: published,
+        };
+        (
+            GridDataSources {
+                publication: Arc::new(ArcSwap::from_pointee(publication)),
+                caches: Arc::new(RwLock::new(caches)),
+            },
+            sheet,
+        )
+    }
+
+    /// The `(start, end, px)` of each **row** `ResizeCommitted` the recording captured, in order.
+    fn captured_row_resizes(events: &Rc<RefCell<Vec<GridEvent>>>) -> Vec<(u32, u32, f32)> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GridEvent::ResizeCommitted {
+                    axis: RowOrCol::Row,
+                    start,
+                    end,
+                    px,
+                } => Some((*start, *end, *px)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn autofit_row_single_line_is_default(cx: &mut TestAppContext) {
+        // A row of one-line populated cells autofits to the default height — one resize for that row.
+        let (sources, _s) = autofit_row_sources(&[(2, 1, "hello", false)], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(2, window, cx));
+            })
+            .unwrap();
+        let resizes = captured_row_resizes(&events);
+        assert_eq!(resizes.len(), 1);
+        assert_eq!(resizes[0].0, 2);
+        assert_eq!(resizes[0].1, 2, "only the divider row is autofit");
+        assert!(
+            (resizes[0].2 - DEFAULT_ROW_HEIGHT_PX).abs() < 0.5,
+            "single-line row fits the default, got {}",
+            resizes[0].2
+        );
+    }
+
+    #[gpui::test]
+    fn autofit_row_explicit_newlines_grow(cx: &mut TestAppContext) {
+        // A wrap-off cell with two explicit newlines is three visual lines → three line boxes.
+        let (sources, _s) = autofit_row_sources(&[(3, 1, "a\nb\nc", false)], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(3, window, cx));
+            })
+            .unwrap();
+        let px = captured_row_resizes(&events)[0].2;
+        let expected = cell_line_box_height(3, CELL_FONT_PX);
+        assert!(
+            (px - expected).abs() < 0.5,
+            "px {px} vs expected {expected}"
+        );
+        assert!(px > DEFAULT_ROW_HEIGHT_PX, "three lines exceed the default");
+        assert!(px < MAX_AUTO_ROW_HEIGHT_PX, "well below the cap");
+    }
+
+    #[gpui::test]
+    fn autofit_row_wrap_on_counts_wrapped_lines(cx: &mut TestAppContext) {
+        // A wrap-on cell whose text far exceeds a narrow column soft-wraps to multiple lines, so the
+        // fitted height exceeds a single line (the wrap-off single-line default).
+        let long = "the quick brown fox jumps over the lazy dog again and again and again";
+        let (sources, _s) = autofit_row_sources(&[(4, 1, long, true)], &[(1, 40.0)]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(4, window, cx));
+            })
+            .unwrap();
+        let px = captured_row_resizes(&events)[0].2;
+        assert!(
+            px > cell_line_box_height(1, CELL_FONT_PX) + 0.5,
+            "wrapped text grows past a single line, got {px}"
+        );
+    }
+
+    #[gpui::test]
+    fn autofit_row_clamps_at_max(cx: &mut TestAppContext) {
+        // A pathologically tall cell (many explicit lines) is clamped at `MAX_AUTO_ROW_HEIGHT_PX`.
+        let many = "x\n".repeat(60);
+        let (sources, _s) = autofit_row_sources(&[(5, 1, &many, false)], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(5, window, cx));
+            })
+            .unwrap();
+        assert_eq!(captured_row_resizes(&events)[0].2, MAX_AUTO_ROW_HEIGHT_PX);
+    }
+
+    #[gpui::test]
+    fn autofit_empty_row_is_default(cx: &mut TestAppContext) {
+        // A row with no published cells autofits to the default height (no shrink below default).
+        let (sources, _s) = autofit_row_sources(&[], &[]);
+        let (g, window, events) = recording_over(cx, sources);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| grid.autofit_row(7, window, cx));
+            })
+            .unwrap();
+        let resizes = captured_row_resizes(&events);
+        assert_eq!(resizes.len(), 1);
+        assert_eq!(resizes[0], (7, 7, DEFAULT_ROW_HEIGHT_PX));
+    }
+
+    #[gpui::test]
+    fn autofit_multi_row_selection_fits_each(cx: &mut TestAppContext) {
+        // A divider double-clicked inside a full-row multi-row selection autofits every row in the run
+        // — one `ResizeCommitted{Row}` per row.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_row(1, false, window, cx);
+                    grid.select_row(3, true, window, cx);
+                    assert_eq!(grid.resize_run_for(RowOrCol::Row, 2), (1, 3));
+                    grid.autofit_row(2, window, cx);
+                });
+            })
+            .unwrap();
+        let rows: Vec<u32> = captured_row_resizes(&events)
+            .iter()
+            .map(|(s, e, _)| {
+                assert_eq!(s, e, "each autofit resize targets a single row");
+                *s
+            })
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3], "each selected row autofit once");
+    }
+
+    #[gpui::test]
+    fn autofit_row_under_select_all_fits_only_the_divider_row(cx: &mut TestAppContext) {
+        // Select-all is not a full-row selection, so a row divider resolves to just its own row; the
+        // whole-sheet guard mirrors the column autofit. Exactly one resize, for the divider's row.
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.select_all(window, cx);
+                    grid.autofit_row(4, window, cx);
+                });
+            })
+            .unwrap();
+        let resizes = captured_row_resizes(&events);
+        assert_eq!(
+            resizes.len(),
+            1,
+            "whole-sheet autofit emits exactly one row resize"
+        );
+        assert_eq!(resizes[0].0, 4);
+        assert_eq!(resizes[0].1, 4, "only the divider row is autofit");
     }
 
     #[gpui::test]

@@ -30,7 +30,7 @@ architecture.
       → raw `value_token` values, atomic write). `freecell-app`: widen argv/open branch on
       `.csv`, `ImportCsv`/`ExportCsv` actions + File-menu items. No fork, no pixel suite.
       Engine + shell tests.
-- [ ] **Phase 3 — Autofit row height (§5).** `grid/view.rs`: add the double-click branch to
+- [x] **Phase 3 — Autofit row height (§5).** `grid/view.rs`: add the double-click branch to
       the row-resize hotspot; `autofit_row` + `autofit_height_for_row` (measure all populated
       cells, wrap-aware, clamp 24…240); reuse `SetRowHeights` (one undo/row, marks manual per
       D5.1). No fork. Unit + gpui tests + render **subset**.

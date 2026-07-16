@@ -11,9 +11,8 @@ use gpui::{App, KeyBinding, Menu, MenuItem};
 use freecell_core::recent::{RecentList, MENU_LIMIT};
 
 use super::{
-    recents, About, ClearRecent, CloseWindow, ExportCsv, ImportCsv, NewWorkbook, OpenFile,
-    OpenFind, OpenRecent, Quit, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline,
-    Undo,
+    recents, About, ClearRecent, CloseWindow, ExportCsv, NewWorkbook, OpenFile, OpenFind,
+    OpenRecent, Quit, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
 };
 
 /// The primary modifier for the current platform: `cmd` on macOS, `ctrl` elsewhere.
@@ -69,7 +68,6 @@ pub fn build_menus(recents: &RecentList, now: i64) -> Vec<Menu> {
             MenuItem::action("New", NewWorkbook),
             MenuItem::action("Open…", OpenFile),
             MenuItem::submenu(open_recent_submenu(recents, now)),
-            MenuItem::action("Import CSV…", ImportCsv),
             MenuItem::separator(),
             MenuItem::action("Save", Save),
             MenuItem::action("Save As…", SaveAs),
@@ -198,16 +196,19 @@ mod tests {
     }
 
     #[test]
-    fn file_menu_has_csv_import_and_export_items() {
+    fn file_menu_has_csv_export_but_no_dedicated_import_item() {
+        // CSV *import* has no dedicated menu item — the "Open…" panel already accepts a `.csv`
+        // (routed to an untitled import by extension), so a separate "Import CSV…" item is
+        // redundant. Export keeps its own item (window-scoped, like Save As).
         let menus = build_menus(&RecentList::default(), NOW);
         let labels = action_labels(menu_named(&menus, "File"));
         assert!(
-            labels.contains(&"Import CSV…".to_string()),
-            "File menu offers Import CSV…: {labels:?}"
-        );
-        assert!(
             labels.contains(&"Export as CSV…".to_string()),
             "File menu offers Export as CSV…: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Import CSV…".to_string()),
+            "File menu should NOT offer a dedicated Import CSV… item (Open handles .csv): {labels:?}"
         );
     }
 

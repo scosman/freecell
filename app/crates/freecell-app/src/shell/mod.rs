@@ -39,7 +39,7 @@ pub use window::WorkbookWindow;
 
 // The single source of truth for the app's actions (`components/app_shell.md §Menus &
 // actions`). The macOS menu bar and the per-platform key bindings both dispatch these exact
-// names; New/Open/ImportCsv/About/Quit are handled globally (available from any window, incl.
+// names; New/Open/About/Quit are handled globally (available from any window, incl.
 // Welcome), while Save/SaveAs/ExportCsv/CloseWindow/Undo/Redo/ToggleBold/Italic/Underline are
 // handled on the `WorkbookWindow` (so they are naturally disabled when Welcome is frontmost — no
 // handler in scope = disabled menu item).
@@ -48,10 +48,9 @@ actions!(
     [
         /// Create a new empty workbook in a new window.
         NewWorkbook,
-        /// Open an `.xlsx` file (native panel).
+        /// Open an `.xlsx` or `.csv` file (native panel). A `.csv` pick is imported as a new
+        /// untitled workbook by extension (`functional_spec.md §2`) — no dedicated import action.
         OpenFile,
-        /// Import a `.csv` file as a new untitled workbook (native panel, `functional_spec.md §2`).
-        ImportCsv,
         /// Save the focused workbook (Save As if it has no path).
         Save,
         /// Save the focused workbook to a new path (native panel).

@@ -1997,18 +1997,6 @@ pub(super) fn open_panel_options() -> PathPromptOptions {
     }
 }
 
-/// Options for the **Import CSV…** file panel (`functional_spec.md §2`): files-only, single
-/// selection, an "Import" prompt. `PathPromptOptions` has no extension filter at the pinned rev,
-/// so the `.csv` routing is decided post-selection by `open_path` (a non-csv pick opens normally).
-pub(super) fn import_panel_options() -> PathPromptOptions {
-    PathPromptOptions {
-        files: true,
-        directories: false,
-        multiple: false,
-        prompt: Some("Import".into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

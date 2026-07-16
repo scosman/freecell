@@ -23,10 +23,8 @@ use super::about::AboutView;
 use super::lifecycle::{QuitPlan, QuitStep};
 use super::registry::{OpenOutcome, WindowKey, WindowRegistry};
 use super::welcome::WelcomeView;
-use super::window::{import_panel_options, open_panel_options, WorkbookWindow};
-use super::{
-    menus, recents, About, ClearRecent, ImportCsv, NewWorkbook, OpenFile, OpenRecent, Quit,
-};
+use super::window::{open_panel_options, WorkbookWindow};
+use super::{menus, recents, About, ClearRecent, NewWorkbook, OpenFile, OpenRecent, Quit};
 
 /// A document window as the app tracks it: its registry key, gpui identity, and the root
 /// entity (so the app can drive its modals during the quit flow).
@@ -87,7 +85,6 @@ impl FreeCellApp {
 
         cx.on_action(|_: &NewWorkbook, cx| FreeCellApp::new_workbook(cx));
         cx.on_action(|_: &OpenFile, cx| FreeCellApp::open_via_panel(cx));
-        cx.on_action(|_: &ImportCsv, cx| FreeCellApp::import_csv_via_panel(cx));
         cx.on_action(|_: &About, cx| FreeCellApp::show_about(cx));
         cx.on_action(|_: &Quit, cx| FreeCellApp::request_quit(cx));
         // Open Recent carries the exact file path (not an install-time snapshot index), so it
@@ -153,26 +150,6 @@ impl FreeCellApp {
     /// Opens the native file panel, then opens the chosen `.xlsx` (`functional_spec.md §5.1`).
     pub fn open_via_panel(cx: &mut App) {
         let receiver = cx.prompt_for_paths(open_panel_options());
-        cx.spawn(async move |cx| {
-            let picked = receiver
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten()
-                .and_then(|paths| paths.into_iter().next());
-            if let Some(path) = picked {
-                cx.update(|cx| FreeCellApp::open_path(&path, cx));
-            }
-        })
-        .detach();
-    }
-
-    /// Opens the native file panel scoped to CSV import, then routes the pick through
-    /// [`open_path`](Self::open_path) — which imports a `.csv` as a new untitled workbook
-    /// (`functional_spec.md §2`). Picking a non-`.csv` opens it via the normal loader (the pinned
-    /// `PathPromptOptions` has no post-selection extension filter — see [`open_via_panel`]).
-    pub fn import_csv_via_panel(cx: &mut App) {
-        let receiver = cx.prompt_for_paths(import_panel_options());
         cx.spawn(async move |cx| {
             let picked = receiver
                 .await

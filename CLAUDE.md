@@ -55,6 +55,14 @@ FreeCell. This is the standing way of working, not a one-off.
   `add_repo scosman/ironcalc`). **Full process + the per-issue loop:**
   [`specs/projects/ironcalc-upstreaming/implementation_plan.md`](specs/projects/ironcalc-upstreaming/implementation_plan.md)
   §Operating model.
+- **Autonomous-run gotchas** (detail in §Operating model → "Agent operating notes"): call
+  `add_repo` **upfront while the user is present** — it needs interactive approval and fails
+  mid-run once they leave; if it's unavailable, the container's git-proxy already routes
+  `scosman/ironcalc`, so clone/push via `http://local_proxy@127.0.0.1:<port>/git/scosman/ironcalc`
+  (port from FreeCell's `git remote -v`). The agent **can't open upstream `ironcalc/IronCalc`
+  PRs** — it prepares a compare link (`.../compare/main...scosman:ironcalc:fix/<slug>`) + title +
+  description for the owner to open. Before branching a `fix/*`, check the capability isn't
+  **already in** `freecell-fixes` (`git merge-base --is-ancestor <sha> origin/freecell-fixes`).
 
 ## Conventions
 

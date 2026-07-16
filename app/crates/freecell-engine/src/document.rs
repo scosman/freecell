@@ -16,7 +16,9 @@ use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
-use freecell_core::{CellKind, CellRange, CellRef, Direction, Rgb, SelectionStats, SheetDims};
+use freecell_core::{
+    CellKind, CellRange, CellRef, Direction, FillAxis, Rgb, SelectionStats, SheetDims,
+};
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
 use ironcalc_base::cell::CellValue;
@@ -706,6 +708,63 @@ impl WorkbookDocument {
             height: (bottom - top) as i32 + 1,
         };
         self.model.auto_fill_columns(&source, to_col as i32 + 1)?;
+        Ok(true)
+    }
+
+    /// Drag-fill (`gaps_closing_7_15 §3`) — the general fill-handle path. Unlike ⌘D/⌘R
+    /// ([`fill_down`](Self::fill_down)/[`fill_right`](Self::fill_right)), the source `Area` is the
+    /// **full `seed` block** (its real width×height, NOT clamped to a 1-tall/1-wide line), so a
+    /// multi-cell seed gives the fork's `detect_progression` a ≥2-value series to extrapolate
+    /// (`1,2 → 3,4,5`; `Jan,Feb → Mar…`). A single-cell seed (`width == height == 1`) has no
+    /// progression → the fork falls through to `extend_to`, i.e. a value/format **copy** with
+    /// relative-formula adjustment (same as ⌘D/⌘R).
+    ///
+    /// `target` is the previewed fill region (⊇ `seed`); `axis` is the dominant drag axis. The far
+    /// edge of `target` along `axis` is passed to `auto_fill_rows`/`auto_fill_columns` as the `to`
+    /// bound — the fork natively supports **both** directions: a `to` past the seed fills
+    /// down/right, a `to` before the seed fills up/left (it reverses the seed values and re-runs
+    /// `detect_progression`, so an up/left series counts the sequence down — no reversal needed
+    /// here). One `auto_fill_*` call ⇒ one undo step. Returns whether anything was written
+    /// (`false` = `target` doesn't extend past `seed` → a no-op the caller skips).
+    pub(crate) fn fill_drag(
+        &mut self,
+        sheet_idx: u32,
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+    ) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        let source = Area {
+            sheet: sheet_idx,
+            row: seed.start.row as i32 + 1,
+            column: seed.start.col as i32 + 1,
+            width: seed.width() as i32,
+            height: seed.height() as i32,
+        };
+        match axis {
+            FillAxis::Vertical => {
+                // Far row edge of the target along the fill direction: below the seed (down) or
+                // above it (up). No extension past the seed → nothing to fill.
+                let to_row = if target.end.row > seed.end.row {
+                    target.end.row
+                } else if target.start.row < seed.start.row {
+                    target.start.row
+                } else {
+                    return Ok(false);
+                };
+                self.model.auto_fill_rows(&source, to_row as i32 + 1)?;
+            }
+            FillAxis::Horizontal => {
+                let to_col = if target.end.col > seed.end.col {
+                    target.end.col
+                } else if target.start.col < seed.start.col {
+                    target.start.col
+                } else {
+                    return Ok(false);
+                };
+                self.model.auto_fill_columns(&source, to_col as i32 + 1)?;
+            }
+        }
         Ok(true)
     }
 
@@ -2415,6 +2474,130 @@ mod tests {
         assert_eq!(value(&doc, 1, 0), ""); // A2 reverted
         assert_eq!(value(&doc, 2, 0), ""); // A3 reverted by the SAME undo
         assert_eq!(value(&doc, 0, 0), "1"); // seed A1 intact
+    }
+
+    // ---- Drag-fill (`gaps_closing_7_15 §3`) — the full-seed series/copy path ----------------
+
+    #[test]
+    fn fill_drag_two_cell_numeric_seed_extrapolates_series_down() {
+        // A1=1, A2=2. Drag the A1:A2 seed down to A5 → the fork's `detect_progression` extends
+        // the arithmetic series (3, 4, 5) — the multi-cell-seed behavior ⌘D can't reach.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(value(&doc, 2, 0), "3");
+        assert_eq!(value(&doc, 3, 0), "4");
+        assert_eq!(value(&doc, 4, 0), "5");
+    }
+
+    #[test]
+    fn fill_drag_single_cell_seed_copies_down() {
+        // A single-cell seed has no progression → the fork copies (not a 7,8,9… series).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "7").unwrap();
+        let seed = CellRange::single(CellRef::new(0, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(3, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        for r in 0..4 {
+            assert_eq!(value(&doc, r, 0), "7");
+        }
+    }
+
+    #[test]
+    fn fill_drag_single_cell_copies_relative_formula() {
+        // A1="=B1"; B1..B4 = 10,20,30,40. A single-cell drag-fill copies the formula down with
+        // RELATIVE adjustment → A2="=B2" … A4="=B4" (consistent with ⌘D).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "=B1").unwrap();
+        for (i, v) in [10, 20, 30, 40].iter().enumerate() {
+            doc.set_cell_input(0, CellRef::new(i as u32, 1), &v.to_string())
+                .unwrap();
+        }
+        let seed = CellRange::single(CellRef::new(0, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(3, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "=B2");
+        assert_eq!(doc.cell_content(0, CellRef::new(3, 0)).unwrap(), "=B4");
+        assert_eq!(value(&doc, 3, 0), "40");
+    }
+
+    #[test]
+    fn fill_drag_month_seed_extrapolates() {
+        // A1="Jan", A2="Feb". Dragging the seed down extends the month sequence (Mar, Apr) via the
+        // fork's text-sequence detection.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "Jan").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "Feb").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(3, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(value(&doc, 2, 0), "Mar");
+        assert_eq!(value(&doc, 3, 0), "Apr");
+    }
+
+    #[test]
+    fn fill_drag_up_reverses_series() {
+        // Seed A4=3, A5=4. Dragging the A4:A5 seed UP to A1 counts the series DOWN (native fork
+        // up-fill: A3=2, A2=1, A1=0) — the document method passes the target's top edge as `to_row`
+        // (< the seed's first row) and the fork reverses.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(3, 0), "3").unwrap();
+        doc.set_cell_input(0, CellRef::new(4, 0), "4").unwrap();
+        let seed = CellRange::new(CellRef::new(3, 0), CellRef::new(4, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        assert!(doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap());
+        assert_eq!(value(&doc, 2, 0), "2");
+        assert_eq!(value(&doc, 1, 0), "1");
+        assert_eq!(value(&doc, 0, 0), "0");
+    }
+
+    #[test]
+    fn fill_drag_horizontal_series_right() {
+        // A1=1, B1=2. Dragging the A1:B1 seed right to E1 extends the series (3, 4, 5) along the
+        // Horizontal axis (`auto_fill_columns`).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(0, 1));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(0, 4));
+        assert!(doc
+            .fill_drag(0, seed, target, FillAxis::Horizontal)
+            .unwrap());
+        assert_eq!(value(&doc, 0, 2), "3");
+        assert_eq!(value(&doc, 0, 3), "4");
+        assert_eq!(value(&doc, 0, 4), "5");
+    }
+
+    #[test]
+    fn fill_drag_is_one_undo_step() {
+        // A series drag-fill pushes exactly ONE history entry: one undo reverts the whole fill.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        let target = CellRange::new(CellRef::new(0, 0), CellRef::new(4, 0));
+        doc.fill_drag(0, seed, target, FillAxis::Vertical).unwrap();
+        assert_eq!(value(&doc, 4, 0), "5"); // A5 filled
+        doc.undo().unwrap();
+        doc.evaluate();
+        assert_eq!(value(&doc, 2, 0), ""); // A3 reverted
+        assert_eq!(value(&doc, 4, 0), ""); // A5 reverted by the SAME undo
+        assert_eq!(value(&doc, 0, 0), "1"); // seed intact
+        assert_eq!(value(&doc, 1, 0), "2");
+    }
+
+    #[test]
+    fn fill_drag_no_extension_is_noop() {
+        // A target that doesn't extend past the seed writes nothing → `false` (the caller skips
+        // eval/publish/undo), matching a release back onto the seed.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2").unwrap();
+        let seed = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0));
+        assert!(!doc.fill_drag(0, seed, seed, FillAxis::Vertical).unwrap());
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Catego
 pub use merge_guard::{blocks_col_op, blocks_row_op};
 pub use publication::{CellKind, Publication, PublishedCell};
 pub use recent::{DisplayEntry, RecentEntry, RecentList};
-pub use refs::{CellRange, CellRef, SheetId};
+pub use refs::{CellRange, CellRef, FillAxis, SheetId};
 pub use selection::{
     apply_motion, format_selection_ref, is_full_column_selection, is_full_row_selection,
     resolve_edge, spans_all_cols, spans_all_rows, Direction, Motion, SelectionModel, SheetDims,

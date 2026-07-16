@@ -1670,6 +1670,14 @@ fn make_grid_sink(
             sheet: shared.active_sheet.get(),
             range: *range,
         }),
+        // Drag-fill (`gaps_closing_7_15 §3`): the full-seed series/copy path. One undo step,
+        // engine-guarded against merges + oversize targets.
+        GridEvent::FillDrag { seed, target, axis } => client.send(Command::FillDrag {
+            sheet: shared.active_sheet.get(),
+            seed: *seed,
+            target: *target,
+            axis: *axis,
+        }),
         // ⌘+arrow / ⌘⇧+arrow edge-of-data (`functional_spec.md §4`, D4.1): occupancy lives in the
         // engine past the published viewport, so resolve the target asynchronously. Stamp a `req_id`,
         // record the collapse-vs-extend context, and send the read; the window applies the

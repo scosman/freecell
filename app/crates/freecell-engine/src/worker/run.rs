@@ -559,6 +559,7 @@ impl Worker {
                 | Command::ClearCells { .. }
                 | Command::FillDown { .. }
                 | Command::FillRight { .. }
+                | Command::FillDrag { .. }
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
@@ -2027,6 +2028,10 @@ impl Worker {
             Command::FillDown { sheet, range } | Command::FillRight { sheet, range } => {
                 self.merge_guard(*sheet, |merges| blocks_fill(merges, *range))
             }
+            // A drag-fill writes over `target` (⊇ seed); a fill into a merged region is rejected.
+            Command::FillDrag { sheet, target, .. } => {
+                self.merge_guard(*sheet, |merges| blocks_fill(merges, *target))
+            }
             _ => Ok(()),
         }
     }
@@ -3199,6 +3204,25 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
                 AppliedKind::NoOp
             })
         }
+        Command::FillDrag {
+            sheet,
+            seed,
+            target,
+            axis,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            // Overflow guard: reject a drag-fill whose target exceeds the same cell-count cap
+            // paste/fill use (`architecture.md §3.3`) → the standard large-op dialog.
+            if range_area(target) > MAX_REFRESH_CELLS {
+                return Err("Fill target is too large".to_string());
+            }
+            let applied = doc.fill_drag(idx, *seed, *target, *axis)?;
+            Ok(if applied {
+                AppliedKind::Cell
+            } else {
+                AppliedKind::NoOp
+            })
+        }
         Command::SetStyleAttr { sheet, range, attr } => {
             let idx = resolve_idx(doc, *sheet)?;
             apply_style(doc, idx, *range, *attr)?;
@@ -3435,6 +3459,11 @@ fn op_of(edit: &Command) -> AppliedOp {
                 range: *range,
             }
         }
+        // Drag-fill writes over the whole `target` rectangle (⊇ seed) → refresh exactly that range.
+        Command::FillDrag { sheet, target, .. } => AppliedOp::Cells {
+            sheet: *sheet,
+            range: *target,
+        },
         Command::SetStyleAttr { sheet, range, .. } | Command::SetStylePath { sheet, range, .. } => {
             AppliedOp::Cells {
                 sheet: *sheet,

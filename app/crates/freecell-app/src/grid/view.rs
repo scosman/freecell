@@ -35,12 +35,12 @@ use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
     apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
     is_full_row_selection, spans_all_cols, spans_all_rows, Align, Axis, BorderSpec, CellRange,
-    CellRef, Edge, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
+    CellRef, Edge, FillAxis, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
 use crate::chrome::AutocompleteDisplay;
 
-use super::chart_layer::{self, ChartPlacement, ChartRect, Handle};
+use super::chart_layer::{self, ChartPlacement, ChartRect, Handle, HANDLE_HIT_HALF, HANDLE_PX};
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
     self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
@@ -194,6 +194,18 @@ struct ChartDrag {
     current_rect: ChartRect,
 }
 
+/// An in-flight drag of the selection's fill handle (`gaps_closing_7_15 §3`), mirroring
+/// [`ChartDrag`]. `seed` is the selection at mouse-down; `target` (⊇ seed) is the live previewed
+/// fill region, recomputed each move; `axis` is the dominant fill direction — `None` until the
+/// pointer first leaves the seed, then **sticky** (kept until the pointer returns inside the seed),
+/// so a drag doesn't flip axis mid-gesture (Excel behavior, D3.1).
+#[derive(Debug, Clone, Copy)]
+struct FillDrag {
+    seed: CellRange,
+    target: CellRange,
+    axis: Option<FillAxis>,
+}
+
 /// A right-click "Delete chart" context menu over a chart (P18, `ui_design §3.2` — the alternate
 /// delete affordance to Delete/Backspace). `x`/`y` are grid-local.
 #[derive(Debug, Clone, Copy)]
@@ -342,6 +354,9 @@ pub struct GridView {
     selected_chart: Option<ChartId>,
     /// The in-flight chart move/resize drag, if any (`None` = not dragging a chart).
     chart_drag: Option<ChartDrag>,
+    /// The in-flight drag of the selection's fill handle, if any (`gaps_closing_7_15 §3`;
+    /// `None` = not fill-dragging). Drives the live preview rect + the committed fill on release.
+    fill_drag: Option<FillDrag>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
     /// The open cell-area right-click context menu, if any (`functional_spec.md §2`).
@@ -612,6 +627,7 @@ impl GridView {
             charts: HashMap::new(),
             selected_chart: None,
             chart_drag: None,
+            fill_drag: None,
             chart_menu: None,
             cell_menu: None,
             wrap_cells: Vec::new(),
@@ -1219,8 +1235,8 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         // A hotspot already started a resize (and stopped propagation); defensively, never treat
-        // this as a selection click.
-        if self.resize_drag.is_some() {
+        // this as a selection click. Likewise a live fill drag owns the pointer.
+        if self.resize_drag.is_some() || self.fill_drag.is_some() {
             return;
         }
         // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op) and
@@ -1238,19 +1254,19 @@ impl GridView {
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
-        let (hit, chart_hit) = {
+        let (hit, chart_hit, fill_hit) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
             let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
             // A chart floats above the cells, so hit-test the ChartLayer first — but only in the
             // content area (a point over a header can't be over a clipped chart).
             let content_x = local_x - row_header_w;
             let content_y = local_y - COL_HEADER_H;
             let chart_hit = if content_x >= 0.0 && content_y >= 0.0 {
-                let content_w = (viewport_w - row_header_w as f64).max(0.0);
                 let geom = AxisGeometry {
                     col_axis: &col_axis,
                     row_axis: &row_axis,
@@ -1264,6 +1280,29 @@ impl GridView {
             } else {
                 None
             };
+            // The fill handle sits at the selection's bottom-right corner, shown only when not
+            // editing and no other drag is active (`gaps_closing_7_15 §3`) — mirror the overlay's
+            // suppression guard for symmetry/defensiveness. Hit-test the same clamped square the
+            // overlay draws, within ± `HANDLE_HIT_HALF` of its center.
+            let fill_hit = if self.incell_open.is_none()
+                && self.drag.is_none()
+                && self.resize_drag.is_none()
+                && self.chart_drag.is_none()
+                && content_x >= 0.0
+                && content_y >= 0.0
+            {
+                let sel_range = self.selection().range();
+                let right_x = col_axis.offset_of(sel_range.end.col + 1);
+                let bottom_y = row_axis.offset_of(sel_range.end.row + 1);
+                let (hx, hy, _, _) =
+                    fill_handle_square(right_x, bottom_y, scroll_x, scroll_y, content_w, content_h);
+                let hcx = hx + HANDLE_PX / 2.0;
+                let hcy = hy + HANDLE_PX / 2.0;
+                (content_x - hcx).abs() <= HANDLE_HIT_HALF
+                    && (content_y - hcy).abs() <= HANDLE_HIT_HALF
+            } else {
+                false
+            };
             let hit = layout::hit_test(
                 local_x,
                 local_y,
@@ -1273,7 +1312,7 @@ impl GridView {
                 &row_axis,
                 &col_axis,
             );
-            (hit, chart_hit)
+            (hit, chart_hit, fill_hit)
         };
         // A chart under the pointer wins over the cell beneath it (this is the left-button handler:
         // a chart click = select + begin a move/resize drag).
@@ -1290,6 +1329,18 @@ impl GridView {
         // A click that missed every chart deselects the current chart.
         if self.selected_chart.take().is_some() {
             cx.notify();
+        }
+        // A grab on the fill handle begins a fill drag (before the cell/header arms) — the seed is
+        // the current selection, the axis undecided until the first move outside the seed.
+        if fill_hit {
+            let seed = self.selection().range();
+            self.fill_drag = Some(FillDrag {
+                seed,
+                target: seed,
+                axis: None,
+            });
+            cx.notify();
+            return;
         }
         match hit {
             GridHit::Cell { row, col } => self.mouse_down_cell(row, col, event, window, cx),
@@ -1511,6 +1562,11 @@ impl GridView {
             self.update_resize(local_x, local_y, cx);
             return;
         }
+        // A live fill drag updates its previewed target region (and kicks auto-scroll near an edge).
+        if self.fill_drag.is_some() {
+            self.update_fill_drag(local_x, local_y, window, cx);
+            return;
+        }
         // While the in-cell editor owns the pointer, the grid must not extend a selection drag: a
         // press+drag inside the editor is text selection, not a cell-range drag (BUG #2). This
         // guards any drag still live from before the editor opened; `mouse_down_cell` also refuses
@@ -1549,6 +1605,10 @@ impl GridView {
         }
         if let Some(rd) = self.resize_drag.take() {
             self.commit_resize(rd, window, cx);
+            return;
+        }
+        if let Some(fd) = self.fill_drag.take() {
+            self.commit_fill_drag(fd, window, cx);
             return;
         }
         if self.drag.take().is_some() {
@@ -2209,6 +2269,131 @@ impl GridView {
         }
     }
 
+    /// Advance a live fill drag (`gaps_closing_7_15 §3`): map the pointer to a cell, recompute the
+    /// previewed target region, and kick edge auto-scroll so a fill can run past the visible area.
+    fn update_fill_drag(
+        &mut self,
+        local_x: f32,
+        local_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let cell = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            layout::cell_at_point(
+                local_x,
+                local_y,
+                row_header_w,
+                scroll_x,
+                scroll_y,
+                &row_axis,
+                &col_axis,
+                content_w,
+                content_h,
+            )
+        };
+        self.set_fill_target_from_cell(cell);
+        self.maybe_start_autoscroll(window, cx);
+        cx.notify();
+    }
+
+    /// Recompute the fill drag's `target` + dominant `axis` for a pointer over `cell` (pure; no
+    /// window/cx — shared by the mouse-move and the auto-scroll tick). The axis is the direction the
+    /// pointer has left the seed **farther** along, and is **sticky** once set (kept until the
+    /// pointer returns inside the seed) so a gesture never flips axis mid-drag (D3.1). Inside the
+    /// seed → axis cleared, target collapses back to the seed.
+    fn set_fill_target_from_cell(&mut self, cell: CellRef) {
+        let Some(drag) = self.fill_drag.as_mut() else {
+            return;
+        };
+        let seed = drag.seed;
+        // How far `cell` lies outside the seed along each axis (0 = within the seed's span).
+        let vext = if cell.row > seed.end.row {
+            cell.row - seed.end.row
+        } else {
+            seed.start.row.saturating_sub(cell.row)
+        };
+        let hext = if cell.col > seed.end.col {
+            cell.col - seed.end.col
+        } else {
+            seed.start.col.saturating_sub(cell.col)
+        };
+        if vext == 0 && hext == 0 {
+            drag.axis = None;
+            drag.target = seed;
+            return;
+        }
+        let axis = drag.axis.unwrap_or(if vext >= hext {
+            FillAxis::Vertical
+        } else {
+            FillAxis::Horizontal
+        });
+        drag.axis = Some(axis);
+        drag.target = match axis {
+            // Vertical: columns pinned to the seed, rows extended to include `cell` (down or up).
+            FillAxis::Vertical => {
+                let top = seed.start.row.min(cell.row);
+                let bottom = seed.end.row.max(cell.row);
+                CellRange::new(
+                    CellRef::new(top, seed.start.col),
+                    CellRef::new(bottom, seed.end.col),
+                )
+            }
+            // Horizontal: rows pinned to the seed, columns extended to include `cell` (right/left).
+            FillAxis::Horizontal => {
+                let left = seed.start.col.min(cell.col);
+                let right = seed.end.col.max(cell.col);
+                CellRange::new(
+                    CellRef::new(seed.start.row, left),
+                    CellRef::new(seed.end.row, right),
+                )
+            }
+        };
+    }
+
+    /// Commit a fill drag on release (`gaps_closing_7_15 §3`): stop any auto-scroll loop, then — if
+    /// the target actually extended past the seed along a decided axis — emit
+    /// [`GridEvent::FillDrag`] and expand the selection to the filled region (Excel behavior). A
+    /// release onto the seed, or with no axis, or an inward target (D3.3) is a no-op (no event, no
+    /// selection change).
+    fn commit_fill_drag(&mut self, drag: FillDrag, window: &mut Window, cx: &mut Context<Self>) {
+        // Stop the auto-scroll loop the same way the selection drag does (epoch bump).
+        self.autoscroll_epoch = self.autoscroll_epoch.wrapping_add(1);
+        let FillDrag { seed, target, axis } = drag;
+        // A superset target that differs from the seed is a real outward fill; anything else (no
+        // axis, unchanged, or — defensively — a non-superset inward target) does nothing.
+        let is_outward = target != seed
+            && target.start.row <= seed.start.row
+            && target.start.col <= seed.start.col
+            && target.end.row >= seed.end.row
+            && target.end.col >= seed.end.col;
+        let Some(axis) = axis.filter(|_| is_outward) else {
+            cx.notify();
+            return;
+        };
+        self.events
+            .emit(&GridEvent::FillDrag { seed, target, axis }, window, cx);
+        // Expand the selection to seed∪target (= target, since target ⊇ seed).
+        self.set_selection(
+            SelectionModel {
+                anchor: target.start,
+                active: target.end,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
     /// The current per-axis edge auto-scroll delta for the live pointer (`0` inside the content).
     fn current_edge_delta(&self, window: &Window) -> (f64, f64) {
         let pos = window.mouse_position();
@@ -2239,7 +2424,8 @@ impl GridView {
     /// (a `spawn_in` timer, so it advances even while the pointer is held still with no
     /// mouse-move events — the "drag to the edge and wait" case).
     fn maybe_start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.autoscrolling || self.drag.is_none() {
+        // Fires for a selection drag OR a fill drag (`gaps_closing_7_15 §3`) past a viewport edge.
+        if self.autoscrolling || (self.drag.is_none() && self.fill_drag.is_none()) {
             return;
         }
         let (dx, dy) = self.current_edge_delta(window);
@@ -2256,7 +2442,9 @@ impl GridView {
                 .await;
             let keep = this
                 .update_in(cx, |this, window, cx| {
-                    if this.autoscroll_epoch != epoch || this.drag.is_none() {
+                    if this.autoscroll_epoch != epoch
+                        || (this.drag.is_none() && this.fill_drag.is_none())
+                    {
                         this.autoscrolling = false;
                         return false;
                     }
@@ -2270,14 +2458,14 @@ impl GridView {
         .detach();
     }
 
-    /// One auto-scroll frame: apply the fixed edge step (clamped), re-extend the selection to the
-    /// hovered cell, and announce a debounced `ViewportChanged`. Returns whether to keep looping
-    /// (`false` once the pointer returns inside the content, stopping the loop).
+    /// One auto-scroll frame: apply the fixed edge step (clamped), re-extend the selection (or the
+    /// fill-drag target) to the hovered cell, and announce a debounced `ViewportChanged`. Returns
+    /// whether to keep looping (`false` once the pointer returns inside the content).
     fn autoscroll_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(drag) = self.drag else {
+        if self.drag.is_none() && self.fill_drag.is_none() {
             self.autoscrolling = false;
             return false;
-        };
+        }
         let pos = window.mouse_position();
         let (local_x, local_y) = self.event_local(pos);
         let active = self.active_sheet;
@@ -2343,12 +2531,18 @@ impl GridView {
             self.scrollbars_visible = true;
             changed = true;
         }
-        let selection = SelectionModel {
-            anchor: drag.anchor,
-            active: cell,
-        };
-        if *self.selection() != selection {
-            self.set_selection_and_emit(selection, window, cx);
+        if let Some(drag) = self.drag {
+            let selection = SelectionModel {
+                anchor: drag.anchor,
+                active: cell,
+            };
+            if *self.selection() != selection {
+                self.set_selection_and_emit(selection, window, cx);
+                changed = true;
+            }
+        } else if self.fill_drag.is_some() {
+            // A fill drag auto-scrolls too: re-extend its previewed target to the hovered cell.
+            self.set_fill_target_from_cell(cell);
             changed = true;
         }
         let ranges = (rows, cols);
@@ -2913,6 +3107,49 @@ impl GridView {
             content_children.push(
                 rect_div(x, y, w, h)
                     .border_2()
+                    .border_color(rgb(ACCENT))
+                    .into_any_element(),
+            );
+        }
+
+        // Fill handle + drag preview (`gaps_closing_7_15 §3`). While a fill drag is live, draw its
+        // previewed target region (a 2px accent border, like the range border); otherwise — when not
+        // editing and no other drag is active — draw the grabbable handle square at the selection's
+        // bottom-right corner, clamped into the viewport (D3.4).
+        if let Some(fd) = self.fill_drag {
+            if fd.axis.is_some() {
+                let t = fd.target;
+                let (x, y, w, h) = span_rect(
+                    t.start.row..t.end.row + 1,
+                    t.start.col..t.end.col + 1,
+                    frame,
+                );
+                content_children.push(
+                    rect_div(x, y, w, h)
+                        .border_2()
+                        .border_color(rgb(ACCENT))
+                        .into_any_element(),
+                );
+            }
+        } else if self.incell_open.is_none()
+            && self.drag.is_none()
+            && self.resize_drag.is_none()
+            && self.chart_drag.is_none()
+        {
+            let right_x = frame.col_offset(range.end.col + 1);
+            let bottom_y = frame.row_offset(range.end.row + 1);
+            let (hx, hy, hw, hh) = fill_handle_square(
+                right_x,
+                bottom_y,
+                frame.scroll_x,
+                frame.scroll_y,
+                frame.content_w,
+                frame.content_h,
+            );
+            content_children.push(
+                rect_div(hx, hy, hw, hh)
+                    .bg(rgb(CELL_BG))
+                    .border_1()
                     .border_color(rgb(ACCENT))
                     .into_any_element(),
             );
@@ -4010,6 +4247,30 @@ fn span_rect(rows: Range<u32>, cols: Range<u32>, frame: &Frame) -> (f32, f32, f3
     let y0 = frame.row_offset(rows.start) - frame.scroll_y;
     let y1 = frame.row_offset(rows.end) - frame.scroll_y;
     (x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
+}
+
+/// The content-local px rect of the fill handle (`gaps_closing_7_15 §3`): a [`HANDLE_PX`] square
+/// centered on the selection's bottom-right corner `(right_x, bottom_y)` (pre-scroll content
+/// offsets). The center is clamped into the visible `[0, content_w] × [0, content_h]` box so a
+/// whole-row / whole-column selection whose true corner is off-viewport still shows a grabbable
+/// handle at the visible edge (D3.4). The same rect drives the render overlay and the mouse-down
+/// hit-test, so they can never disagree.
+fn fill_handle_square(
+    right_x: f64,
+    bottom_y: f64,
+    scroll_x: f64,
+    scroll_y: f64,
+    content_w: f64,
+    content_h: f64,
+) -> (f32, f32, f32, f32) {
+    let cx = (right_x - scroll_x).clamp(0.0, content_w) as f32;
+    let cy = (bottom_y - scroll_y).clamp(0.0, content_h) as f32;
+    (
+        cx - HANDLE_PX / 2.0,
+        cy - HANDLE_PX / 2.0,
+        HANDLE_PX,
+        HANDLE_PX,
+    )
 }
 
 /// One dash's length (px) and the gap after it, for [`LinePattern::Dashed`] edges. Chosen so a
@@ -5162,6 +5423,39 @@ impl GridView {
         self.quick_edit
     }
 
+    /// The grid-local center of the current selection's fill handle for `window` — computed exactly
+    /// as the render overlay + `handle_mouse_down` hit-test do (`gaps_closing_7_15 §3`), so a test
+    /// can synthesize a mouse-down on the handle without hard-coding pixel geometry.
+    #[cfg(test)]
+    pub(crate) fn fill_handle_center_for_test(&self, window: &Window) -> Option<(f32, f32)> {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let caches = self.sources.caches.read();
+        let cache = caches.get(active)?;
+        let (row_axis, col_axis) = cache.axes();
+        let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+        let content_w = (viewport_w - row_header_w as f64).max(0.0);
+        let sel = self.selection().range();
+        let right_x = col_axis.offset_of(sel.end.col + 1);
+        let bottom_y = row_axis.offset_of(sel.end.row + 1);
+        let (hx, hy, _, _) =
+            fill_handle_square(right_x, bottom_y, scroll_x, scroll_y, content_w, content_h);
+        // Content-local center → grid-local by adding the gutter/header offsets.
+        Some((
+            hx + HANDLE_PX / 2.0 + row_header_w,
+            hy + HANDLE_PX / 2.0 + COL_HEADER_H,
+        ))
+    }
+
+    /// Whether a fill drag is currently armed, and its current `(seed, target, axis)` if so — test
+    /// introspection for the fill-handle drag state machine (`gaps_closing_7_15 §3`).
+    #[cfg(test)]
+    pub(crate) fn fill_drag_for_test(&self) -> Option<(CellRange, CellRange, Option<FillAxis>)> {
+        self.fill_drag.map(|d| (d.seed, d.target, d.axis))
+    }
+
     /// Emits [`GridEvent::InCellCommitMove`] exactly as the `capture_key_down` Tab handler does — for
     /// a BUG #5 test that must reproduce the emit happening **while the grid entity is leased**
     /// (`cx.listener` == `grid.update`). The headless key-dispatch path cannot route a keystroke
@@ -6047,6 +6341,187 @@ mod tests {
             modifiers: Modifiers::default(),
             click_count: 1,
         }
+    }
+
+    // ---- Drag fill handle (`gaps_closing_7_15 §3`) ------------------------------------------
+
+    /// A mouse-down on the selection's fill handle arms a fill drag (seed = the selection); the same
+    /// grab while the in-cell editor is open does NOT (the handle is suppressed during editing).
+    #[gpui::test]
+    fn fill_handle_grab_arms_fill_drag_and_hides_while_editing(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let seed = CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)); // B2:C3
+                    grid.set_selection(
+                        SelectionModel {
+                            anchor: seed.start,
+                            active: seed.end,
+                        },
+                        cx,
+                    );
+                    let (hx, hy) = grid
+                        .fill_handle_center_for_test(window)
+                        .expect("handle center resolves");
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, hx, hy), window, cx);
+                    let (armed_seed, armed_target, axis) = grid
+                        .fill_drag_for_test()
+                        .expect("grabbing the handle arms a fill drag");
+                    assert_eq!(armed_seed, seed, "seed = the selection at grab");
+                    assert_eq!(armed_target, seed, "target starts equal to the seed");
+                    assert!(
+                        axis.is_none(),
+                        "axis undecided until the pointer leaves the seed"
+                    );
+
+                    // Release, then re-grab while editing → no fill drag (handle suppressed).
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    grid.incell_open = Some(seed.start);
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, hx, hy), window, cx);
+                    assert!(
+                        grid.fill_drag_for_test().is_none(),
+                        "the fill handle is not grabbable while the in-cell editor is open"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// A downward handle drag sets a Vertical preview extending past the seed, and on release emits
+    /// `GridEvent::FillDrag` and expands the selection to the filled region.
+    #[gpui::test]
+    fn fill_drag_down_previews_emits_and_expands_selection(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Default selection is A1 (single-cell seed).
+                    let (hx, hy) = grid
+                        .fill_handle_center_for_test(window)
+                        .expect("handle center resolves");
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, hx, hy), window, cx);
+                    events.borrow_mut().clear();
+                    // Drag straight down ~100 px (staying in column A) → a multi-row target.
+                    grid.handle_mouse_move(&move_ev(hx - 5.0, hy + 100.0), window, cx);
+                    let (_, target, axis) = grid.fill_drag_for_test().expect("still fill-dragging");
+                    assert_eq!(axis, Some(FillAxis::Vertical), "dominant axis is vertical");
+                    assert_eq!(
+                        target.start,
+                        CellRef::new(0, 0),
+                        "target still anchored at A1"
+                    );
+                    assert!(target.end.row > 0, "target extended below the seed");
+                    assert_eq!(target.start.col, target.end.col, "single column preserved");
+
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    assert!(
+                        grid.fill_drag_for_test().is_none(),
+                        "drag cleared on release"
+                    );
+                    let (ev_seed, ev_target, ev_axis) = events
+                        .borrow()
+                        .iter()
+                        .find_map(|e| match e {
+                            GridEvent::FillDrag { seed, target, axis } => {
+                                Some((*seed, *target, *axis))
+                            }
+                            _ => None,
+                        })
+                        .expect("release emits FillDrag");
+                    assert_eq!(ev_seed, CellRange::single(CellRef::new(0, 0)));
+                    assert_eq!(ev_axis, FillAxis::Vertical);
+                    assert_eq!(
+                        ev_target, target,
+                        "the emitted target = the previewed target"
+                    );
+                    // The selection now covers the whole filled region.
+                    assert_eq!(
+                        grid.selection().range(),
+                        target,
+                        "selection expands to the fill"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The sticky axis: once a drag has committed to Vertical, a subsequent larger horizontal
+    /// excursion keeps it Vertical (Excel D3.1), and a return inside the seed resets it.
+    #[gpui::test]
+    fn fill_drag_axis_is_sticky_then_resets_inside_seed(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    let seed = CellRange::new(CellRef::new(2, 2), CellRef::new(2, 2)); // C3
+                    grid.set_selection(SelectionModel::single(seed.start), cx);
+                    grid.fill_drag = Some(FillDrag {
+                        seed,
+                        target: seed,
+                        axis: None,
+                    });
+                    // First move: 3 rows down, 0 cols → Vertical.
+                    grid.set_fill_target_from_cell(CellRef::new(5, 2));
+                    assert_eq!(
+                        grid.fill_drag_for_test().unwrap().2,
+                        Some(FillAxis::Vertical)
+                    );
+                    // Now a bigger horizontal excursion — axis stays Vertical (sticky), so the
+                    // target keeps the seed's single column.
+                    grid.set_fill_target_from_cell(CellRef::new(3, 9));
+                    let (_, target, axis) = grid.fill_drag_for_test().unwrap();
+                    assert_eq!(
+                        axis,
+                        Some(FillAxis::Vertical),
+                        "axis stays vertical mid-drag"
+                    );
+                    assert_eq!(target.start.col, 2, "still pinned to the seed column");
+                    assert_eq!(target.end.col, 2);
+                    // Returning inside the seed clears the axis.
+                    grid.set_fill_target_from_cell(seed.start);
+                    let (_, target, axis) = grid.fill_drag_for_test().unwrap();
+                    assert!(axis.is_none(), "axis resets inside the seed");
+                    assert_eq!(target, seed, "target collapses to the seed");
+                });
+            })
+            .unwrap();
+    }
+
+    /// A drag released without leaving the seed (target == seed) is a no-op: no `FillDrag`, and the
+    /// selection is unchanged (D3.3 — inward is not a clear).
+    #[gpui::test]
+    fn fill_drag_onto_seed_is_a_noop(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let seed = CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)); // B2:C3
+                    grid.set_selection(
+                        SelectionModel {
+                            anchor: seed.start,
+                            active: seed.end,
+                        },
+                        cx,
+                    );
+                    grid.fill_drag = Some(FillDrag {
+                        seed,
+                        target: seed,
+                        axis: None,
+                    });
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::FillDrag { .. })),
+                        "a release onto the seed emits no fill"
+                    );
+                    assert_eq!(grid.selection().range(), seed, "selection unchanged");
+                });
+            })
+            .unwrap();
     }
 
     #[test]

@@ -34,7 +34,7 @@ architecture.
       the row-resize hotspot; `autofit_row` + `autofit_height_for_row` (measure all populated
       cells, wrap-aware, clamp 24…240); reuse `SetRowHeights` (one undo/row, marks manual per
       D5.1). No fork. Unit + gpui tests + render **subset**.
-- [ ] **Phase 4 — Drag fill handle + series autofill (§3).** `grid/view.rs`: fill-handle
+- [x] **Phase 4 — Drag fill handle + series autofill (§3).** `grid/view.rs`: fill-handle
       square in the selection overlay; `fill_drag` state machine (hit-test, dominant-axis
       preview, auto-scroll reuse, up/left support); `GridEvent::FillDrag` →
       `Command::FillDrag` → new `document.fill_drag` seeding `auto_fill_*` with the **full

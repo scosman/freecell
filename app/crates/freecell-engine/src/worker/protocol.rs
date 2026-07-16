@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
-use freecell_core::{CellRange, CellRef, Direction, Rgb, SelectionStats, SheetId};
+use freecell_core::{CellRange, CellRef, Direction, FillAxis, Rgb, SelectionStats, SheetId};
 
 use crate::document::{LoadError, SaveError};
 
@@ -212,6 +212,15 @@ pub enum Command {
     /// Fill Right (⌘R): copy `range`'s **left column** right over the rest of `range` (the column
     /// analog of [`Command::FillDown`]). A lone single-cell `range` pulls from the cell to the left.
     FillRight { sheet: SheetId, range: CellRange },
+    /// Drag-fill (`gaps_closing_7_15 §3`): extend `seed`'s content into `target` (⊇ `seed`) along
+    /// the dominant `axis`. Unlike ⌘D/⌘R this seeds `auto_fill_*` with the **full** `seed` block, so
+    /// a multi-cell seed extrapolates a series (a single-cell seed copies). One undo step.
+    FillDrag {
+        sheet: SheetId,
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+    },
     /// Toggle/set a style attribute over a range.
     SetStyleAttr {
         sheet: SheetId,

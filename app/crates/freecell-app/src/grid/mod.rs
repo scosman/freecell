@@ -24,7 +24,7 @@ use gpui::{App, Window};
 
 use freecell_chart_model::{Anchor, ChartId};
 use freecell_core::selection::Direction;
-use freecell_core::{CellRange, CellRef, SelectionModel};
+use freecell_core::{CellRange, CellRef, FillAxis, SelectionModel};
 
 pub(crate) use view::caret_intent_modifiers;
 pub use view::{GridDataSources, GridView};
@@ -157,6 +157,15 @@ pub enum GridEvent {
     /// Cmd/Ctrl+R on the focused grid — fill the selection's left column **right** over the rest
     /// (the column analog of [`GridEvent::FillDown`]). Forwarded as `Command::FillRight`.
     FillRight(CellRange),
+    /// A drag of the selection's fill handle released past the seed (`gaps_closing_7_15 §3`):
+    /// extend `seed`'s content into `target` (⊇ seed) along the dominant `axis`. The window
+    /// forwards it as `Command::FillDrag` for the active sheet — a multi-cell seed extrapolates a
+    /// series, a single-cell seed copies.
+    FillDrag {
+        seed: CellRange,
+        target: CellRange,
+        axis: FillAxis,
+    },
     /// Cmd/Ctrl+arrow (`extend: false`) or Cmd/Ctrl+Shift+arrow (`extend: true`) on the focused grid
     /// — resolve the **edge-of-data** target from `from` in `dir` (`functional_spec.md §4`). Occupancy
     /// lives in the engine past the published viewport, so the window forwards this as an async

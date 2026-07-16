@@ -3742,11 +3742,14 @@ impl GridView {
         let (start, end) = (menu.run.0, menu.run.1);
         let after_at = end.saturating_add(1);
         // Axis-specific event constructors keep the labels/flags below axis-agnostic.
+        // Alias the constructor type so the 4-tuple annotation stays under clippy's
+        // type-complexity threshold.
+        type HeaderMenuEvent = fn(u32, u32) -> GridEvent;
         let (insert_ev, delete_ev, hide_ev, unhide_ev): (
-            fn(u32, u32) -> GridEvent,
-            fn(u32, u32) -> GridEvent,
-            fn(u32, u32) -> GridEvent,
-            fn(u32, u32) -> GridEvent,
+            HeaderMenuEvent,
+            HeaderMenuEvent,
+            HeaderMenuEvent,
+            HeaderMenuEvent,
         ) = match menu.axis {
             RowOrCol::Row => (
                 |at, count| GridEvent::InsertRows { at, count },

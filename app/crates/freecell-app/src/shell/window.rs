@@ -39,7 +39,7 @@ use super::lifecycle::{self, SaveTarget};
 use super::registry::WindowKey;
 use super::titlebar;
 use super::{
-    CloseWindow, FreeCellApp, OpenFind, Redo, Save, SaveAs, ToggleBold, ToggleItalic,
+    CloseWindow, ExportCsv, FreeCellApp, OpenFind, Redo, Save, SaveAs, ToggleBold, ToggleItalic,
     ToggleUnderline, Undo,
 };
 
@@ -152,6 +152,9 @@ pub struct WorkbookWindow {
     pending_save_path: Option<PathBuf>,
     /// The in-flight save's request id (matched against `Saved`/`SaveFailed`).
     pending_save_req: Option<u64>,
+    /// The in-flight CSV export's request id (matched against `CsvExported`/`CsvExportFailed`) —
+    /// export is a side output, so it touches nothing else on the window.
+    pending_export_req: Option<u64>,
     next_req_id: u64,
 
     /// The [`ChartSnapshot`](freecell_engine::ChartSnapshot) version last installed into the grid
@@ -185,7 +188,11 @@ impl WorkbookWindow {
     ) -> Self {
         let loading = match &source {
             DocumentSource::NewWorkbook => None,
-            DocumentSource::OpenFile(p) => Some(lifecycle::document_name(Some(p))),
+            // An open or a CSV import shows the "Opening <name>…" overlay until the worker emits
+            // `Loaded` (the import parse runs on the worker thread).
+            DocumentSource::OpenFile(p) | DocumentSource::ImportCsv(p) => {
+                Some(lifecycle::document_name(Some(p)))
+            }
         };
         let (client, receiver) = DocumentClient::spawn(source);
         Self::build(key, Rc::new(client), receiver, loading, path, window, cx)
@@ -310,6 +317,7 @@ impl WorkbookWindow {
             close_after_save: false,
             pending_save_path: None,
             pending_save_req: None,
+            pending_export_req: None,
             next_req_id: 0,
             installed_chart_version: 0,
             installed_chart_sheets: Vec::new(),
@@ -570,6 +578,29 @@ impl WorkbookWindow {
                     FreeCellApp::note_prompt_cancelled(cx);
                     self.modal = Some(ActiveModal::Error {
                         title: "Couldn't save the workbook".into(),
+                        detail: error.to_string(),
+                        close_window_on_dismiss: false,
+                    });
+                    cx.notify();
+                }
+            }
+            // CSV export replies (`functional_spec.md §2`). Export is a side output: success touches
+            // nothing on the document (dirty/path/title unchanged); a failure surfaces the standard
+            // save-error dialog. Both branch on the pending export `req_id` so a stale reply is
+            // ignored, keeping the match exhaustive with no catch-all.
+            WorkerEvent::CsvExported { req_id } => {
+                if self.pending_export_req == Some(req_id) {
+                    self.pending_export_req = None;
+                }
+            }
+            WorkerEvent::CsvExportFailed { req_id, error } => {
+                if self.pending_export_req == Some(req_id) {
+                    self.pending_export_req = None;
+                    // Set the error modal **unconditionally** (like `SaveFailed`): an export write
+                    // failure must always surface (`functional_spec.md §2`), never be silently
+                    // dropped just because another modal happened to be up when the reply arrived.
+                    self.modal = Some(ActiveModal::Error {
+                        title: "Couldn't export the CSV".into(),
                         detail: error.to_string(),
                         close_window_on_dismiss: false,
                     });
@@ -912,6 +943,59 @@ impl WorkbookWindow {
         cx.notify();
     }
 
+    // ---- CSV export (`functional_spec.md §2`, D2.2) ---------------------------------------
+
+    /// Runs the CSV export flow (**Export as CSV…**): opens a native save panel proposing
+    /// `<active-sheet-name>.csv`, then sends `Command::ExportCsv` for the active sheet. Export is a
+    /// side output — it does **not** change the document's dirty flag, path, or title. A cancelled
+    /// panel is a no-op (no close/quit follow-up rides an export).
+    fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sheet = self.sink_shared.active_sheet.get();
+        let suggested = self.export_csv_suggested_name(sheet);
+        let directory = self
+            .path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = receiver.await.ok().and_then(|r| r.ok()).flatten();
+            this.update_in(cx, |this, _window, _cx| {
+                if let Some(path) = picked {
+                    this.send_export_csv(sheet, lifecycle::with_csv_extension(path));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The proposed file name for a CSV export: `<active-sheet-name>.csv`, falling back to the
+    /// document name / `Untitled` when the sheet name isn't known.
+    fn export_csv_suggested_name(&self, sheet: SheetId) -> String {
+        let base = self
+            .sheets
+            .iter()
+            .find(|s| s.id == sheet)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| lifecycle::document_name(self.path.as_deref()));
+        format!("{base}.csv")
+    }
+
+    /// Dispatches the export command with a fresh request id (matched against the reply). Export
+    /// never mutates the model, so — unlike a save — there is no `.back` backup and no dirty change.
+    fn send_export_csv(&mut self, sheet: SheetId, path: PathBuf) {
+        let req_id = self.next_req_id;
+        self.next_req_id += 1;
+        self.pending_export_req = Some(req_id);
+        self.client.send(Command::ExportCsv {
+            sheet,
+            path,
+            req_id,
+        });
+    }
+
     // ---- Read accessors (tests) -----------------------------------------------------------
 
     /// The window's registry key.
@@ -1147,6 +1231,7 @@ impl Render for WorkbookWindow {
             // (`app.rs`), so it is deliberately *not* registered here.
             .on_action(cx.listener(|this, _: &Save, window, cx| this.save(false, window, cx)))
             .on_action(cx.listener(|this, _: &SaveAs, window, cx| this.save(true, window, cx)))
+            .on_action(cx.listener(|this, _: &ExportCsv, window, cx| this.export_csv(window, cx)))
             .on_action(
                 cx.listener(|this, _: &CloseWindow, window, cx| this.request_close(window, cx)),
             )
@@ -1882,6 +1967,18 @@ pub(super) fn open_panel_options() -> PathPromptOptions {
         directories: false,
         multiple: false,
         prompt: Some("Open".into()),
+    }
+}
+
+/// Options for the **Import CSV…** file panel (`functional_spec.md §2`): files-only, single
+/// selection, an "Import" prompt. `PathPromptOptions` has no extension filter at the pinned rev,
+/// so the `.csv` routing is decided post-selection by `open_path` (a non-csv pick opens normally).
+pub(super) fn import_panel_options() -> PathPromptOptions {
+    PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some("Import".into()),
     }
 }
 

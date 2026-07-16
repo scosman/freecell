@@ -21,6 +21,9 @@ pub const UNTITLED_FILE: &str = "Untitled.xlsx";
 /// The enforced workbook extension (MVP is `.xlsx`-only, `functional_spec.md §1, §5.2`).
 pub const XLSX_EXT: &str = "xlsx";
 
+/// The extension enforced on a CSV export save-panel result (`functional_spec.md §2`).
+pub const CSV_EXT: &str = "csv";
+
 /// The suffix appended to a document's path for its one-time backup copy
 /// (`functional_spec.md §7.3`): `Budget.xlsx` → `Budget.xlsx.back`.
 pub const BACKUP_SUFFIX: &str = ".back";
@@ -114,6 +117,21 @@ pub fn with_xlsx_extension(path: PathBuf) -> PathBuf {
         path
     } else {
         path.with_extension(XLSX_EXT)
+    }
+}
+
+/// Enforces the `.csv` extension on a CSV-export save-panel result (`functional_spec.md §2`): a
+/// path with no or a different extension gets `.csv`; an existing `.csv` (any case) is left as
+/// typed. Mirrors [`with_xlsx_extension`].
+pub fn with_csv_extension(path: PathBuf) -> PathBuf {
+    let already = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case(CSV_EXT))
+        .unwrap_or(false);
+    if already {
+        path
+    } else {
+        path.with_extension(CSV_EXT)
     }
 }
 
@@ -353,6 +371,30 @@ mod tests {
         assert_eq!(
             with_xlsx_extension(path("/a/book.csv")),
             path("/a/book.xlsx"),
+            "wrong extension → replace"
+        );
+    }
+
+    #[test]
+    fn csv_extension_added_kept_and_replaced() {
+        assert_eq!(
+            with_csv_extension(path("/a/book")),
+            path("/a/book.csv"),
+            "no extension → add"
+        );
+        assert_eq!(
+            with_csv_extension(path("/a/book.csv")),
+            path("/a/book.csv"),
+            "already csv → keep"
+        );
+        assert_eq!(
+            with_csv_extension(path("/a/book.CSV")),
+            path("/a/book.CSV"),
+            "case-insensitive csv → keep as typed"
+        );
+        assert_eq!(
+            with_csv_extension(path("/a/book.xlsx")),
+            path("/a/book.csv"),
             "wrong extension → replace"
         );
     }

@@ -23,8 +23,10 @@ use super::about::AboutView;
 use super::lifecycle::{QuitPlan, QuitStep};
 use super::registry::{OpenOutcome, WindowKey, WindowRegistry};
 use super::welcome::WelcomeView;
-use super::window::{open_panel_options, WorkbookWindow};
-use super::{menus, recents, About, ClearRecent, NewWorkbook, OpenFile, OpenRecent, Quit};
+use super::window::{import_panel_options, open_panel_options, WorkbookWindow};
+use super::{
+    menus, recents, About, ClearRecent, ImportCsv, NewWorkbook, OpenFile, OpenRecent, Quit,
+};
 
 /// A document window as the app tracks it: its registry key, gpui identity, and the root
 /// entity (so the app can drive its modals during the quit flow).
@@ -85,6 +87,7 @@ impl FreeCellApp {
 
         cx.on_action(|_: &NewWorkbook, cx| FreeCellApp::new_workbook(cx));
         cx.on_action(|_: &OpenFile, cx| FreeCellApp::open_via_panel(cx));
+        cx.on_action(|_: &ImportCsv, cx| FreeCellApp::import_csv_via_panel(cx));
         cx.on_action(|_: &About, cx| FreeCellApp::show_about(cx));
         cx.on_action(|_: &Quit, cx| FreeCellApp::request_quit(cx));
         // Open Recent carries the exact file path (not an install-time snapshot index), so it
@@ -150,6 +153,26 @@ impl FreeCellApp {
     /// Opens the native file panel, then opens the chosen `.xlsx` (`functional_spec.md §5.1`).
     pub fn open_via_panel(cx: &mut App) {
         let receiver = cx.prompt_for_paths(open_panel_options());
+        cx.spawn(async move |cx| {
+            let picked = receiver
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next());
+            if let Some(path) = picked {
+                cx.update(|cx| FreeCellApp::open_path(&path, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Opens the native file panel scoped to CSV import, then routes the pick through
+    /// [`open_path`](Self::open_path) — which imports a `.csv` as a new untitled workbook
+    /// (`functional_spec.md §2`). Picking a non-`.csv` opens it via the normal loader (the pinned
+    /// `PathPromptOptions` has no post-selection extension filter — see [`open_via_panel`]).
+    pub fn import_csv_via_panel(cx: &mut App) {
+        let receiver = cx.prompt_for_paths(import_panel_options());
         cx.spawn(async move |cx| {
             let picked = receiver
                 .await
@@ -281,6 +304,13 @@ impl FreeCellApp {
         // the Open… panel, CLI argv, a welcome-row click, and the Open Recent menu
         // (`functional_spec.md §1.1`, `architecture.md §3.1`).
         self.record_recent(canonical.clone(), cx);
+        // A `.csv` is **imported** into a fresh untitled workbook (`functional_spec.md §2`, D2.1):
+        // opened with `path: None` (so Save → Save-As-to-`.xlsx`, no `.back`), and never deduped —
+        // imports carry no path, so re-opening a csv yields a new untitled window.
+        if is_csv_path(&canonical) {
+            self.open_document(DocumentSource::ImportCsv(canonical.clone()), None, cx);
+            return;
+        }
         match self.registry.resolve_open(&canonical) {
             OpenOutcome::Activate(key) => {
                 if let Some(w) = self.windows.iter().find(|w| w.key == key) {
@@ -308,6 +338,11 @@ impl FreeCellApp {
         // under the deterministic test harness. `record` prunes a non-existent path, so a bogus
         // detached open never leaves a phantom entry.
         self.record_recent(canonical.clone(), cx);
+        // Mirror the production `.csv` → untitled-import branch (worker-less here).
+        if is_csv_path(&canonical) {
+            self.open_detached_document(None, cx);
+            return;
+        }
         match self.registry.resolve_open(&canonical) {
             OpenOutcome::Activate(key) => {
                 if let Some(w) = self.windows.iter().find(|w| w.key == key) {
@@ -657,6 +692,14 @@ impl FreeCellApp {
     }
 }
 
+/// Whether `path` has a `.csv` extension (case-insensitive) — the import trigger
+/// (`functional_spec.md §2`, D2.3: Open auto-detects `.csv` by extension).
+fn is_csv_path(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.eq_ignore_ascii_case("csv"))
+        .unwrap_or(false)
+}
+
 /// The transparent macOS titlebar options (`architecture.md §7.1`, `ui_design.md §1`): a
 /// hidden system title + hidden native titlebar (so the window draws its own 36 px row —
 /// [`super::titlebar`]) with the traffic lights repositioned to vertically center in that row.
@@ -795,6 +838,29 @@ mod tests {
     }
 
     // ---- Recent files (`architecture.md §3`, §7) -------------------------------------------
+
+    #[gpui::test]
+    fn opening_a_csv_imports_as_an_untitled_window(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.csv");
+        std::fs::write(&path, b"1,2,3\n").unwrap();
+
+        // A `.csv` routes to import: a new **untitled** window (path: None) so Save → Save-As
+        // (`functional_spec.md §2`, D2.1), and it is still recorded as a recent file.
+        cx.update(|cx| FreeCellApp::open_path_detached(&path, cx));
+        assert_eq!(window_count(cx), 1, "importing a csv opens one window");
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0).unwrap());
+        assert!(
+            cx.update(|cx| entity.read(cx).path().is_none()),
+            "an imported csv opens as an untitled (path: None) window"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)),
+            vec![path.canonicalize().unwrap()],
+            "the imported csv is recorded as a recent file"
+        );
+    }
 
     #[gpui::test]
     fn open_records_the_canonical_path_in_recents(cx: &mut TestAppContext) {

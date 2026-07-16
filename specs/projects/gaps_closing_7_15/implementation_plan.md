@@ -24,7 +24,7 @@ architecture.
       in-cell capture via new `GridEvent`s) + accept (`insert NAME(` via
       set_value+set_cursor_position) + list/sig-hint popovers. No fork, no pixel suite
       (chrome). Unit + gpui view tests.
-- [ ] **Phase 2 — CSV import + export (§2).** `freecell-engine`: add `csv` dep,
+- [x] **Phase 2 — CSV import + export (§2).** `freecell-engine`: add `csv` dep,
       `DocumentSource::ImportCsv` + `WorkbookDocument::import_csv` (untitled, RFC-4180,
       overflow guard, `LoadError::BadCsv`), `Command::ExportCsv` + `export_csv` (used-range
       → raw `value_token` values, atomic write). `freecell-app`: widen argv/open branch on

@@ -39,10 +39,10 @@ pub use window::WorkbookWindow;
 
 // The single source of truth for the app's actions (`components/app_shell.md §Menus &
 // actions`). The macOS menu bar and the per-platform key bindings both dispatch these exact
-// names; New/Open/About/Quit are handled globally (available from any window, incl. Welcome),
-// while Save/SaveAs/CloseWindow/Undo/Redo/ToggleBold/Italic/Underline are handled on the
-// `WorkbookWindow` (so they are naturally disabled when Welcome is frontmost — no handler in
-// scope = disabled menu item).
+// names; New/Open/ImportCsv/About/Quit are handled globally (available from any window, incl.
+// Welcome), while Save/SaveAs/ExportCsv/CloseWindow/Undo/Redo/ToggleBold/Italic/Underline are
+// handled on the `WorkbookWindow` (so they are naturally disabled when Welcome is frontmost — no
+// handler in scope = disabled menu item).
 actions!(
     freecell,
     [
@@ -50,10 +50,15 @@ actions!(
         NewWorkbook,
         /// Open an `.xlsx` file (native panel).
         OpenFile,
+        /// Import a `.csv` file as a new untitled workbook (native panel, `functional_spec.md §2`).
+        ImportCsv,
         /// Save the focused workbook (Save As if it has no path).
         Save,
         /// Save the focused workbook to a new path (native panel).
         SaveAs,
+        /// Export the focused workbook's active sheet to a `.csv` (native save panel,
+        /// `functional_spec.md §2`). Window-scoped like `SaveAs`.
+        ExportCsv,
         /// Close the focused window (prompts if dirty).
         CloseWindow,
         /// Undo the last edit in the focused workbook.

@@ -2757,3 +2757,68 @@ fn authored_chart_chrome_edits_roundtrip() {
     let dl = chart.series[0].data_labels.clone().expect("labels present");
     assert!(dl.show_value && dl.show_category_name);
 }
+
+// ---- CSV import / export (`functional_spec.md §2`, D2.2) -----------------------------------
+
+/// `DocumentSource::ImportCsv` builds a fresh single-sheet workbook whose fields are applied as
+/// user input (numbers/text/formulas), painting their published values.
+#[test]
+fn import_csv_source_loads_values() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.csv");
+    std::fs::write(&path, b"10,20\r\nhello,=A1+B1\r\n").unwrap();
+
+    let (client, _rx, sheets) = spawn(DocumentSource::ImportCsv(path));
+    let sheet = sheets[0].id;
+    client.send(full_viewport(sheet));
+
+    poll_until(
+        || published_text(&client, 0, 0) == "10",
+        "A1 imports as the number 10",
+    );
+    assert_eq!(published_text(&client, 0, 1), "20");
+    assert_eq!(published_text(&client, 1, 0), "hello");
+    // B2 = `=A1+B1` computes 10 + 20 = 30 (import evaluates for first paint).
+    assert_eq!(published_text(&client, 1, 1), "30");
+    // The import is not a user edit: the document opens clean (empty undo history), so the window's
+    // dirty flag (`committed_ops > last_saved_ops`, both 0) starts false.
+    assert_eq!(
+        client.committed_ops(),
+        0,
+        "an imported document opens clean (not dirty)"
+    );
+}
+
+/// `Command::ExportCsv` writes the active sheet's used range as CSV and, being a pure read, does
+/// not change the document's dirty accounting (`committed_ops`).
+#[test]
+fn export_csv_command_writes_file_and_keeps_document_clean() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(set_input(sheet, 0, 0, "5"));
+    client.send(set_input(sheet, 0, 1, "hi"));
+    poll_until(|| client.committed_ops() >= 2, "both edits committed");
+    let ops_before = client.committed_ops();
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.csv");
+    client.send(Command::ExportCsv {
+        sheet,
+        path: path.clone(),
+        req_id: 77,
+    });
+    assert!(
+        wait_for(&rx, |e| matches!(
+            e,
+            WorkerEvent::CsvExported { req_id: 77 }
+        ))
+        .is_some(),
+        "export replies CsvExported"
+    );
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "5,hi\r\n");
+    assert_eq!(
+        client.committed_ops(),
+        ops_before,
+        "export is a side output — it must not change the dirty accounting"
+    );
+}

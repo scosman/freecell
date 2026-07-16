@@ -514,6 +514,14 @@ pub enum Command {
     },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },
+    /// Export `sheet`'s used range to `path` as a `.csv` (`functional_spec.md §2`, D2.2 — raw
+    /// stored values). A **pure read**: it never touches the model, `ops_seen`, or the undo stack,
+    /// so it can't change the document's dirty flag. Replied via `CsvExported` / `CsvExportFailed`.
+    ExportCsv {
+        sheet: SheetId,
+        path: PathBuf,
+        req_id: u64,
+    },
     /// Drop the model and exit the loop.
     Shutdown,
     /// Test-only: panic inside the `catch_unwind`-guarded apply, to exercise the recovery +
@@ -603,6 +611,12 @@ pub enum WorkerEvent {
     Saved { req_id: u64, ops_seen: u64 },
     /// Reply to `Save`: failure (typed; the original file is untouched — atomic save).
     SaveFailed { req_id: u64, error: SaveError },
+    /// Reply to [`Command::ExportCsv`]: the `.csv` was written. Carries no state — export is a side
+    /// output (the document's dirty flag / path / title are unchanged, `functional_spec.md §2`).
+    CsvExported { req_id: u64 },
+    /// Reply to [`Command::ExportCsv`]: the export failed (typed; any existing file is untouched —
+    /// atomic write). Surfaced by the standard save-error dialog.
+    CsvExportFailed { req_id: u64, error: SaveError },
     /// An edit was refused (cap re-check, name validation, caught panic, or degraded).
     EditRejected { reason: EditRejectedReason },
     /// The style/geometry cache for `sheet` changed (deltas shipped via the shared cache).

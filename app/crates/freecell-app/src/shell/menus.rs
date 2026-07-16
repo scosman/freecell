@@ -11,8 +11,9 @@ use gpui::{App, KeyBinding, Menu, MenuItem};
 use freecell_core::recent::{RecentList, MENU_LIMIT};
 
 use super::{
-    recents, About, ClearRecent, CloseWindow, NewWorkbook, OpenFile, OpenFind, OpenRecent, Quit,
-    Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
+    recents, About, ClearRecent, CloseWindow, ExportCsv, ImportCsv, NewWorkbook, OpenFile,
+    OpenFind, OpenRecent, Quit, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline,
+    Undo,
 };
 
 /// The primary modifier for the current platform: `cmd` on macOS, `ctrl` elsewhere.
@@ -68,9 +69,11 @@ pub fn build_menus(recents: &RecentList, now: i64) -> Vec<Menu> {
             MenuItem::action("New", NewWorkbook),
             MenuItem::action("Open…", OpenFile),
             MenuItem::submenu(open_recent_submenu(recents, now)),
+            MenuItem::action("Import CSV…", ImportCsv),
             MenuItem::separator(),
             MenuItem::action("Save", Save),
             MenuItem::action("Save As…", SaveAs),
+            MenuItem::action("Export as CSV…", ExportCsv),
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
         ]),
@@ -192,6 +195,20 @@ mod tests {
         let menus = build_menus(&RecentList::default(), NOW);
         let names: Vec<_> = menus.iter().map(|m| m.name.to_string()).collect();
         assert_eq!(names, vec!["FreeCell", "File", "Edit"]);
+    }
+
+    #[test]
+    fn file_menu_has_csv_import_and_export_items() {
+        let menus = build_menus(&RecentList::default(), NOW);
+        let labels = action_labels(menu_named(&menus, "File"));
+        assert!(
+            labels.contains(&"Import CSV…".to_string()),
+            "File menu offers Import CSV…: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Export as CSV…".to_string()),
+            "File menu offers Export as CSV…: {labels:?}"
+        );
     }
 
     #[test]

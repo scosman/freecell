@@ -39,6 +39,10 @@ tracing.workspace = true
 # then `ClipboardData::deserialize(&Value)` on internal paste (`serde` supplies the trait).
 serde.workspace = true
 serde_json.workspace = true
+# CSV import/export (`WorkbookDocument::import_csv` / `export_csv`): the RFC-4180 comma parse
+# (fields → cells as user input) and the used-range → CSV serialization use the same `csv`
+# crate `freecell-core::tsv` uses for TSV-paste dims, so the quoting/terminator behavior matches.
+csv.workspace = true
 
 # `worker::run` tests build an `.xlsx` on the fly (`merged_fixture`) with `zip`; it is now a
 # runtime dependency (the `chart` file layer needs it), so it resolves for tests too and needs

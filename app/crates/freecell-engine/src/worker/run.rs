@@ -383,12 +383,16 @@ impl Worker {
             chart_version: 0,
             chart_source_path: match &source {
                 DocumentSource::OpenFile(path) => Some(path.clone()),
-                DocumentSource::NewWorkbook => None,
+                // A CSV import builds a fresh workbook — no source file carries charts.
+                DocumentSource::NewWorkbook | DocumentSource::ImportCsv(_) => None,
             },
             discovered_chart_sheets: HashSet::new(),
-            // A workbook never opened from a file has no charts to discover — start "fully
-            // discovered" so save takes the plain path without a wasted walk.
-            charts_fully_discovered: matches!(source, DocumentSource::NewWorkbook),
+            // A workbook not opened from an `.xlsx` (new, or CSV-imported) has no charts to
+            // discover — start "fully discovered" so save takes the plain path without a wasted walk.
+            charts_fully_discovered: matches!(
+                source,
+                DocumentSource::NewWorkbook | DocumentSource::ImportCsv(_)
+            ),
             chart_sheet_parts: HashMap::new(),
             manual_rows: HashMap::new(),
             wrap_heights: HashMap::new(),
@@ -455,6 +459,9 @@ impl Worker {
         // run after the edit batch so a jump observes this batch's mutations.
         let mut edge_ops: Vec<(SheetId, CellRef, Direction, u64)> = Vec::new();
         let mut saves: Vec<(PathBuf, u64)> = Vec::new();
+        // CSV exports (`Command::ExportCsv`) are pure reads (used-range → raw values → file); run
+        // after the edit batch so an export observes this batch's mutations, and never touch dirty.
+        let mut exports: Vec<(SheetId, PathBuf, u64)> = Vec::new();
         // Clipboard ops (copy/cut/paste) run one-by-one after the edit batch — a paste is one
         // undo entry, and running it after the batch keeps the undo/touch-set stacks aligned.
         let mut clipboard_ops: Vec<Command> = Vec::new();
@@ -531,6 +538,11 @@ impl Worker {
                     autogrow_ops.push((sheet, heights))
                 }
                 Command::Save { path, req_id } => saves.push((path, req_id)),
+                Command::ExportCsv {
+                    sheet,
+                    path,
+                    req_id,
+                } => exports.push((sheet, path, req_id)),
                 Command::Shutdown => shutdown = true,
                 clip @ (Command::CopySelection { .. }
                 | Command::PasteInternal { .. }
@@ -713,6 +725,21 @@ impl Worker {
                     ops_seen: self.ops_seen,
                 }),
                 Err(error) => self.emit(WorkerEvent::SaveFailed { req_id, error }),
+            }
+        }
+
+        // CSV exports (pure reads — no dirty change). An unresolvable sheet (deleted mid-flight)
+        // fails cleanly rather than writing a wrong sheet.
+        for (sheet, path, req_id) in exports {
+            let result = match self.resolve(sheet) {
+                Some(idx) => self.doc.export_csv(idx, &path),
+                None => Err(crate::document::SaveError::Io(
+                    "the sheet no longer exists".to_string(),
+                )),
+            };
+            match result {
+                Ok(()) => self.emit(WorkerEvent::CsvExported { req_id }),
+                Err(error) => self.emit(WorkerEvent::CsvExportFailed { req_id, error }),
             }
         }
 

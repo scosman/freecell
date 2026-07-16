@@ -56,6 +56,10 @@ pub enum DocumentSource {
     NewWorkbook,
     /// An existing `.xlsx` file on disk.
     OpenFile(PathBuf),
+    /// A `.csv` file on disk, imported into a fresh untitled single-sheet workbook
+    /// (`functional_spec.md §2`, D2.1): parsed comma-delimited, each field applied as user
+    /// input, opened with `path: None` so Save → Save-As-to-`.xlsx` and no `.back` backup.
+    ImportCsv(PathBuf),
 }
 
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
@@ -82,6 +86,10 @@ pub enum LoadError {
     /// The file couldn't be read from disk (missing, no permission, …).
     #[error("The file couldn't be read: {0}")]
     Io(String),
+    /// A `.csv` import failed: not valid UTF-8, larger than the maximum sheet size, or a
+    /// malformed record (`functional_spec.md §2`, D2.5). The message is the dialog detail.
+    #[error("This CSV can't be imported: {0}")]
+    BadCsv(String),
 }
 
 /// A typed save failure. Because saves are atomic (temp file + rename), any failure leaves
@@ -237,7 +245,80 @@ impl WorkbookDocument {
         match source {
             DocumentSource::NewWorkbook => Self::new_empty(),
             DocumentSource::OpenFile(path) => Self::open(path),
+            DocumentSource::ImportCsv(path) => Self::import_csv(path),
         }
+    }
+
+    /// Imports a `.csv` file into a fresh untitled single-sheet workbook (`functional_spec.md
+    /// §2`, D2.1/D2.4/D2.5). Comma-delimited RFC-4180 parse (quoted fields may contain commas,
+    /// embedded newlines, and doubled `""`); each **non-empty** field is applied as user input at
+    /// its `A1`-origin cell — so a number becomes a number, `TRUE`/`FALSE` a boolean, a leading
+    /// `=` a formula, everything else text (the same "apply as user input" typing as TSV paste).
+    /// Empty fields are skipped (the fresh sheet is already blank). Ragged rows are accepted.
+    ///
+    /// The document is built on a **raw** [`Model`] and wrapped with [`UserModel::from_model`], so
+    /// its undo history starts empty (the import is not an undoable edit — cross-cutting §Undo).
+    ///
+    /// Errors ([`LoadError::BadCsv`]): non-UTF-8 bytes (BOM tolerated), a CSV exceeding the
+    /// Excel-max grid (1,048,576 rows / 16,384 cols — rejected, never truncated), or a malformed
+    /// record.
+    pub fn import_csv(path: &Path) -> Result<Self, LoadError> {
+        crate::instrument::record_engine_call();
+        let mut bytes = std::fs::read(path).map_err(|e| LoadError::Io(e.to_string()))?;
+        // Tolerate a leading UTF-8 BOM (D2.5): strip it before decoding so A1 isn't polluted.
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            bytes.drain(0..3);
+        }
+        // Validate UTF-8 up front so invalid bytes surface a readable dialog rather than mojibake
+        // (D2.5) — the csv reader below then yields guaranteed-valid `StringRecord`s.
+        let text = String::from_utf8(bytes).map_err(|_| {
+            LoadError::BadCsv(
+                "the file isn't valid UTF-8 text and can't be read as CSV".to_string(),
+            )
+        })?;
+
+        let mut model = Model::new_empty(
+            NEW_WORKBOOK_NAME,
+            DEFAULT_LOCALE,
+            DEFAULT_TIMEZONE,
+            DEFAULT_LANGUAGE,
+        )
+        .map_err(LoadError::Corrupt)?;
+
+        let max_rows = freecell_core::limits::MAX_ROWS as usize;
+        let max_cols = freecell_core::limits::MAX_COLS as usize;
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(text.as_bytes());
+        for (r, record) in reader.records().enumerate() {
+            // A 0-based record index that reaches the row count means its 1-based row exceeds the
+            // Excel-max — reject (never truncate). Checked as we stream (no full materialization).
+            if r >= max_rows {
+                return Err(LoadError::BadCsv(
+                    "this CSV is larger than the maximum sheet size".to_string(),
+                ));
+            }
+            let record = record.map_err(|e| LoadError::BadCsv(e.to_string()))?;
+            for (c, field) in record.iter().enumerate() {
+                if c >= max_cols {
+                    return Err(LoadError::BadCsv(
+                        "this CSV is larger than the maximum sheet size".to_string(),
+                    ));
+                }
+                if !field.is_empty() {
+                    model
+                        .set_user_input(0, (r + 1) as i32, (c + 1) as i32, field.to_string())
+                        .map_err(LoadError::Corrupt)?;
+                }
+            }
+        }
+        // A fresh import carries no cached values (unlike an opened `.xlsx`), so evaluate once so
+        // formula cells paint their computed value on first frame.
+        model.evaluate();
+        Ok(Self {
+            model: UserModel::from_model(model),
+        })
     }
 
     /// Saves the workbook to `path` **atomically**: serialize into a temp file in the
@@ -1392,6 +1473,81 @@ impl WorkbookDocument {
         }
     }
 
+    /// One cell's **raw stored value** rendered for CSV export (`functional_spec.md §2`, D2.2 —
+    /// computed underlying values, *not* the formatted display string and *not* the formula
+    /// source). Like [`value_token`](Self::value_token) but text is written **verbatim** (no
+    /// leading-apostrophe quote-prefix — the csv writer handles RFC-4180 quoting), so a cell whose
+    /// display would be `50%` writes `0.5`, a date serial writes its serial number, a boolean
+    /// writes `TRUE`/`FALSE`, an error writes its error string, a formula writes its computed
+    /// value, and an empty cell writes `""`.
+    fn export_cell_value(&self, sheet_idx: u32, row: i32, col: i32, decimal_sep: char) -> String {
+        crate::instrument::record_engine_call();
+        match self
+            .model
+            .get_model()
+            .get_cell_value_by_index(sheet_idx, row, col)
+        {
+            // FOLLOW-ON (tracked in GAPS.md, localization): `number_token` renders the decimal point
+            // as the **workbook locale's** separator. For a comma-decimal locale (e.g. `de`) that
+            // collides with the comma CSV delimiter — `0.5 → "0,5"`, which the csv writer then quotes
+            // and a re-import reads as text. Latent only today: the app is en-locale-only
+            // (`DEFAULT_LOCALE = "en"` → `.`), and D2.4 keeps this round comma-only. The localization
+            // pass should switch the delimiter to `;` for comma-decimal locales.
+            Ok(CellValue::Number(n)) => number_token(n, decimal_sep),
+            Ok(CellValue::Boolean(b)) => if b { "TRUE" } else { "FALSE" }.to_string(),
+            // Both genuine text and an error cell surface as `String(s)`; write either verbatim
+            // (the error string is its value; text is its value).
+            Ok(CellValue::String(s)) => s,
+            Ok(CellValue::None) | Err(_) => String::new(),
+        }
+    }
+
+    /// Exports the active sheet's **used range** to `path` as a `.csv` (`functional_spec.md §2`,
+    /// D2.2). Each cell renders its raw stored value via [`export_cell_value`](Self::export_cell_value);
+    /// trailing empty fields in a row are trimmed (no trailing commas past the used range); the
+    /// `csv` writer serializes RFC-4180 with `CRLF` line endings, quoting any field containing a
+    /// comma, double-quote, or newline. Written atomically (temp-file + fsync + rename), so a
+    /// failure leaves any existing file intact. An empty sheet writes a 0-byte file. `pub(crate)`:
+    /// the walk reads the IronCalc `Worksheet`, which never leaves this crate.
+    pub(crate) fn export_csv(&self, sheet_idx: u32, path: &Path) -> Result<(), SaveError> {
+        crate::instrument::record_engine_call();
+        let ws = self.worksheet(sheet_idx).map_err(SaveError::Serialize)?;
+
+        // A sheet with no populated cells → a clean empty file (edge case: no error).
+        if ws.sheet_data.is_empty() {
+            let temp = new_temp_beside(path)?;
+            return persist_atomically(temp, path);
+        }
+
+        let dim = ws.dimension();
+        let (min_row, max_row) = (dim.min_row, dim.max_row);
+        let (min_col, max_col) = (dim.min_column, dim.max_column);
+        let decimal_sep = self.workbook_decimal_separator();
+
+        let temp = new_temp_beside(path)?;
+        {
+            // `flexible(true)` is required: trailing-empty trimming yields ragged records, which a
+            // strict writer would reject with an unequal-lengths error.
+            let mut writer = csv::WriterBuilder::new()
+                .terminator(csv::Terminator::CRLF)
+                .flexible(true)
+                .from_writer(BufWriter::new(temp.as_file()));
+            for row in min_row..=max_row {
+                let mut fields: Vec<String> = (min_col..=max_col)
+                    .map(|col| self.export_cell_value(sheet_idx, row, col, decimal_sep))
+                    .collect();
+                while fields.last().is_some_and(|f| f.is_empty()) {
+                    fields.pop();
+                }
+                writer
+                    .write_record(&fields)
+                    .map_err(|e| SaveError::Serialize(e.to_string()))?;
+            }
+            writer.flush().map_err(|e| SaveError::Io(e.to_string()))?;
+        }
+        persist_atomically(temp, path)
+    }
+
     /// Paste a previously-copied engine payload at `anchor` on `dest_idx` (`paste_from_clipboard`,
     /// `common.rs:1811`): Excel relative-reference adjustment on copy, move semantics + source
     /// clear on cut, one undoable diff list, then the pasted area is re-selected. `source_idx` /
@@ -1869,6 +2025,202 @@ mod tests {
     fn to_engine_coords_is_one_based() {
         assert_eq!(to_engine_coords(CellRef::new(0, 0)), (1, 1)); // A1
         assert_eq!(to_engine_coords(CellRef::new(6, 1)), (7, 2)); // B7
+    }
+
+    // ---- CSV import / export (`functional_spec.md §2`, D2.2) -------------------------------
+
+    /// Writes `content` to a fresh `.csv` in a temp dir and imports it, returning the doc and the
+    /// dir (kept alive so the file isn't cleaned up mid-test).
+    fn import_csv_str(content: &[u8]) -> (WorkbookDocument, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("in.csv");
+        fs::write(&path, content).unwrap();
+        let doc = WorkbookDocument::import_csv(&path).expect("import should succeed");
+        (doc, dir)
+    }
+
+    fn cell_val(doc: &WorkbookDocument, row: u32, col: u32) -> CellData {
+        doc.cell_value(0, CellRef::new(row, col))
+    }
+
+    #[test]
+    fn import_csv_applies_fields_as_user_input() {
+        // Numbers, booleans, formulas, and text each auto-type via `set_user_input`; a quoted field
+        // carries an embedded comma and newline as ONE field; a ragged short row leaves trailing
+        // cells empty.
+        let csv = b"42,hello,TRUE\r\n=1+2,\"a, b\",\"line1\nline2\"\r\nx\r\n";
+        let (doc, _dir) = import_csv_str(csv);
+
+        assert_eq!(cell_val(&doc, 0, 0), CellData::Number(42.0));
+        assert_eq!(cell_val(&doc, 0, 1), CellData::Text("hello".into()));
+        assert_eq!(cell_val(&doc, 0, 2), CellData::Bool(true));
+        // A leading `=` is a formula: its source is preserved and it computes.
+        assert_eq!(doc.cell_content(0, CellRef::new(1, 0)).unwrap(), "=1+2");
+        assert_eq!(cell_val(&doc, 1, 0), CellData::Number(3.0));
+        assert_eq!(cell_val(&doc, 1, 1), CellData::Text("a, b".into()));
+        assert_eq!(cell_val(&doc, 1, 2), CellData::Text("line1\nline2".into()));
+        // Ragged row: A3 populated, B3/C3 empty.
+        assert_eq!(cell_val(&doc, 2, 0), CellData::Text("x".into()));
+        assert_eq!(cell_val(&doc, 2, 1), CellData::Empty);
+        assert_eq!(doc.sheet_count(), 1);
+    }
+
+    #[test]
+    fn import_csv_leaves_undo_history_empty() {
+        // The import builds a raw `Model` wrapped with `UserModel::from_model`, so nothing lands on
+        // the undo stack — the imported document is fresh (cross-cutting §Undo; guards against a
+        // regression to applying inputs through `UserModel::set_user_input`, which would be undoable).
+        let (doc, _dir) = import_csv_str(b"1,2\r\n=A1+B1,text\r\n");
+        assert!(
+            !doc.model.can_undo(),
+            "an imported document's undo history starts empty (not dirty)"
+        );
+    }
+
+    #[test]
+    fn import_csv_strips_leading_bom() {
+        // A UTF-8 BOM must not pollute A1.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"hi,42\r\n");
+        let (doc, _dir) = import_csv_str(&bytes);
+        assert_eq!(cell_val(&doc, 0, 0), CellData::Text("hi".into()));
+        assert_eq!(cell_val(&doc, 0, 1), CellData::Number(42.0));
+    }
+
+    #[test]
+    fn import_csv_empty_file_yields_one_empty_sheet() {
+        let (doc, _dir) = import_csv_str(b"");
+        assert_eq!(doc.sheet_count(), 1);
+        assert_eq!(cell_val(&doc, 0, 0), CellData::Empty);
+    }
+
+    #[test]
+    fn import_csv_rejects_more_columns_than_max() {
+        // One row with MAX_COLS + 1 fields (16,384 commas ⇒ 16,385 fields) → the col guard fires.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wide.csv");
+        let line = ",".repeat(freecell_core::limits::MAX_COLS as usize);
+        fs::write(&path, line.as_bytes()).unwrap();
+        assert!(matches!(
+            WorkbookDocument::import_csv(&path),
+            Err(LoadError::BadCsv(_))
+        ));
+    }
+
+    #[test]
+    fn import_csv_rejects_invalid_utf8() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.csv");
+        // `0xFF` is never valid UTF-8.
+        fs::write(&path, [0x41, 0xFF, 0x42]).unwrap();
+        assert!(matches!(
+            WorkbookDocument::import_csv(&path),
+            Err(LoadError::BadCsv(_))
+        ));
+    }
+
+    /// Exports sheet 0 of `doc` to a temp `.csv` and returns its raw bytes.
+    fn export_csv_bytes(doc: &WorkbookDocument) -> Vec<u8> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        doc.export_csv(0, &path).expect("export should succeed");
+        fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn export_csv_writes_raw_stored_values() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "0.5").unwrap(); // number (not 50%)
+        doc.set_cell_input(0, CellRef::new(1, 0), "=1+2").unwrap(); // formula → computed value 3
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap(); // boolean
+        doc.set_cell_input(0, CellRef::new(3, 0), "hello, world")
+            .unwrap(); // text with a comma → quoted
+        doc.set_cell_input(0, CellRef::new(4, 0), "=1/0").unwrap(); // error string
+        doc.set_cell_input(0, CellRef::new(5, 0), "2024-01-15")
+            .unwrap(); // a date → serial number, not the formatted date
+        doc.evaluate();
+
+        let bytes = export_csv_bytes(&doc);
+        let text = String::from_utf8(bytes).unwrap();
+        // CRLF line endings (RFC 4180).
+        assert!(text.contains("\r\n"), "CRLF terminators: {text:?}");
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        assert_eq!(lines[0], "0.5", "raw number, not the 50% display");
+        assert_eq!(lines[1], "3", "formula writes its computed value");
+        assert_eq!(lines[2], "TRUE");
+        assert_eq!(lines[3], "\"hello, world\"", "comma cell is quoted");
+        assert_eq!(lines[4], "#DIV/0!", "error string verbatim");
+        // The date exports as its serial number (a plain decimal), NOT the formatted date.
+        assert_ne!(lines[5], "2024-01-15");
+        assert!(
+            lines[5].parse::<f64>().is_ok(),
+            "date serial is a plain number, got {:?}",
+            lines[5]
+        );
+    }
+
+    #[test]
+    fn export_csv_writes_text_that_looks_like_formula_verbatim() {
+        // A genuine TEXT cell whose content looks like a formula/number (`'=1+1` — the apostrophe
+        // forces literal text) exports as `=1+1` with NO leading apostrophe and NO re-interpretation.
+        // Locks in the `String(s) => s` export path (unlike the paste-values `value_token`, which
+        // apostrophe-quotes text).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "'=1+1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "'0123").unwrap(); // text that looks like a number
+        doc.evaluate();
+
+        let text = String::from_utf8(export_csv_bytes(&doc)).unwrap();
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        assert_eq!(
+            lines[0], "=1+1",
+            "text-as-formula exports verbatim, no apostrophe"
+        );
+        assert_eq!(
+            lines[1], "0123",
+            "text-as-number exports verbatim, no apostrophe"
+        );
+    }
+
+    #[test]
+    fn export_csv_trims_trailing_empty_fields() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // A1 and C1 populated (B1 empty); the used range is A1:C1, but B1 stays as an empty field
+        // and no trailing comma follows C1.
+        doc.set_cell_input(0, CellRef::new(0, 0), "a").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 2), "c").unwrap();
+        doc.evaluate();
+        let text = String::from_utf8(export_csv_bytes(&doc)).unwrap();
+        assert_eq!(text, "a,,c\r\n");
+    }
+
+    #[test]
+    fn export_csv_empty_sheet_writes_empty_file() {
+        let doc = WorkbookDocument::new_empty().unwrap();
+        assert!(
+            export_csv_bytes(&doc).is_empty(),
+            "an empty sheet exports a 0-byte file"
+        );
+    }
+
+    #[test]
+    fn export_then_import_round_trips_values() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "1").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "2.5").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 0), "TRUE").unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 1), "hello").unwrap();
+        doc.evaluate();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("round.csv");
+        doc.export_csv(0, &path).unwrap();
+        let reimported = WorkbookDocument::import_csv(&path).unwrap();
+
+        assert_eq!(cell_val(&reimported, 0, 0), CellData::Number(1.0));
+        assert_eq!(cell_val(&reimported, 1, 0), CellData::Number(2.5));
+        assert_eq!(cell_val(&reimported, 2, 0), CellData::Bool(true));
+        assert_eq!(cell_val(&reimported, 0, 1), CellData::Text("hello".into()));
     }
 
     /// A cell's evaluated display string (`""` for empty), for the fill assertions below.

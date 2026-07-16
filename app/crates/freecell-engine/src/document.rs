@@ -801,6 +801,38 @@ impl WorkbookDocument {
             .set_rows_height(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, px)
     }
 
+    /// Sets (or clears) the **hidden** flag on the inclusive 0-based row run `[row_start, row_end]`
+    /// (`gaps_closing_7_15 §4` Hide/Unhide). One undoable diff-list (the fork's `set_rows_hidden`,
+    /// `common.rs:1408`); a hidden row keeps its height (unhide restores it). The fork also moves its
+    /// internal view selection to the next visible track when hiding — harmless here, since
+    /// FreeCell's grid owns its own selection.
+    pub(crate) fn set_rows_hidden(
+        &mut self,
+        sheet_idx: u32,
+        row_start: u32,
+        row_end: u32,
+        hidden: bool,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .set_rows_hidden(sheet_idx, row_start as i32 + 1, row_end as i32 + 1, hidden)
+    }
+
+    /// Sets (or clears) the **hidden** flag on the inclusive 0-based column run `[col_start, col_end]`
+    /// (the column analog of [`set_rows_hidden`](Self::set_rows_hidden); the fork's
+    /// `set_columns_hidden`, `common.rs:1340`).
+    pub(crate) fn set_columns_hidden(
+        &mut self,
+        sheet_idx: u32,
+        col_start: u32,
+        col_end: u32,
+        hidden: bool,
+    ) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        self.model
+            .set_columns_hidden(sheet_idx, col_start as i32 + 1, col_end as i32 + 1, hidden)
+    }
+
     /// Inserts `count` blank rows so new rows appear at 0-based `row` (`InsertRows`); everything at/
     /// after `row` shifts down and formulas adjust (`insert_rows`, `common.rs:882`; undoable). A
     /// shift that would push used cells past the last row returns `Err(String)` (→ dialog).

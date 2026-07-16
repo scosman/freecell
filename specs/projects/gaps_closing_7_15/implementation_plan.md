@@ -41,14 +41,17 @@ architecture.
       multi-cell seed** (series detection; 1-cell → copy). **Check out the fork** to bind the
       exact `auto_fill_rows/columns` arg shape + up/left behavior (no fork *change*). One undo
       step. Unit + gpui tests + render **subset**.
-- [ ] **Phase 5 — Hide / unhide rows & columns (§4).** **Two fork branches** (D4.1):
-      `fix/row-hidden-setter` (undoable `set_rows_hidden` + export) and `fix/column-hidden`
-      (`Col.hidden` model + parse + export + undoable `set_columns_hidden`); integrate on
-      `freecell-fixes`, re-pin FreeCell. `freecell-engine`: read hidden flags in
-      `build_sheet_cache` (hidden set + preserved sizes), `SetRows/ColumnsHidden` commands.
-      `grid/`: zero-size axis rendering for hidden tracks; Hide/Unhide header-menu items
-      (disable-hide-all guard; unhide over spanning selection). Fork upstream-style tests +
-      engine + gpui tests + render **subset**. **Heaviest phase.**
+- [x] **Phase 5 — Hide / unhide rows & columns (§4).** **No fork work needed** — the planned
+      capabilities already exist in the pinned fork (`81feec4`/`freecell-fixes`) via upstream
+      `a520f48f` "Adds hide/show row/column to the API" (both `Row.hidden`/`Col.hidden` fields,
+      import parse + export emit, undoable `set_rows_hidden`/`set_columns_hidden`), so the two
+      `fix/` branches were **not** created and `freecell-fixes`/`Cargo.lock` are **unchanged**.
+      `freecell-engine`: read hidden flags in `build_sheet_cache` (hidden set + preserved sizes),
+      `SetRows/ColumnsHidden` commands. `grid/`: zero-size axis rendering for hidden tracks;
+      Hide/Unhide header-menu items (disable-hide-all guard; unhide over spanning selection).
+      Engine + gpui tests green; render **subset** deferred (no existing baseline moves — see
+      phase plan). **Turned out far lighter than planned** (the "heaviest phase" framing assumed
+      fork work that was already upstream).
 - [ ] **Phase 6 — Render validation (§6, dedicated late phase).** Regenerate + **eyeball**
       baselines for the fill handle + drag preview (P4), hidden-track zero-size (P5), and any
       row-height shifts (P3); add new cases; run the **full** pixel suite (timeout +
@@ -56,11 +59,10 @@ architecture.
 
 ## Notes for the build
 
-- **Fork policy:** Phase 5's two capabilities are **separate** `fix/` branches = separate
-  upstream PRs (never combined). Push the fork branches + integrate on `freecell-fixes` +
-  re-pin FreeCell so it builds; **do not open the upstream ironcalc PRs automatically**
-  (leave them ready to open) unless the owner asks — consistent with "no PRs unless
-  explicitly requested." Same for any FreeCell PR.
+- **Fork policy:** Phase 5's two capabilities turned out to **already exist upstream** (fork
+  rev `81feec4`/`freecell-fixes`, via `a520f48f`), so **no `fix/` branches were created and the
+  fork is untouched** — the general policy (one fix = one branch = one clean upstream PR, never
+  combined; no upstream PRs opened automatically) still stands for any *future* fork work.
 - **Ephemeral container:** commit + push after **every** phase (and mid-phase for the big
   ones).
 - **Efficiency:** crate-scoped checks per phase; reserve `--workspace` for the final

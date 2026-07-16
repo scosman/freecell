@@ -1760,6 +1760,25 @@ fn make_grid_sink(
             col: *at,
             count: *count,
         }),
+        // Hide / Unhide (`gaps_closing_7_15 §4`): the header menu emits a 0-based inclusive run; the
+        // worker sets the fork's hidden flag (one undo step) and rebuilds the sheet cache → zero-size
+        // geometry. Hide → `hidden: true`, Unhide (restore) → `hidden: false`.
+        GridEvent::HideRows { at, count } | GridEvent::UnhideRows { at, count } => {
+            client.send(Command::SetRowsHidden {
+                sheet: shared.active_sheet.get(),
+                start: *at,
+                end: at.saturating_add(count.saturating_sub(1)),
+                hidden: matches!(event, GridEvent::HideRows { .. }),
+            });
+        }
+        GridEvent::HideColumns { at, count } | GridEvent::UnhideColumns { at, count } => {
+            client.send(Command::SetColumnsHidden {
+                sheet: shared.active_sheet.get(),
+                start: *at,
+                end: at.saturating_add(count.saturating_sub(1)),
+                hidden: matches!(event, GridEvent::HideColumns { .. }),
+            });
+        }
         // Chart manipulation (P18): move/resize (a new anchor) + delete route straight to the worker,
         // like the other grid-initiated structure ops. The worker resolves the `ChartId` to the
         // authored set or a loaded binding and republishes the chart snapshot.

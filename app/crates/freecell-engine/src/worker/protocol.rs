@@ -298,6 +298,24 @@ pub enum Command {
         sheet: SheetId,
         heights: Vec<(u32, f32)>,
     },
+    /// Set (or clear) the **hidden** flag on the inclusive 0-based row run `[start, end]`
+    /// (`gaps_closing_7_15 §4`). Geometry-only (no evaluation — hiding never changes values), one
+    /// undoable diff-list (`set_rows_hidden`); the active sheet's cache is rebuilt (it re-reads the
+    /// hidden flags → zero-size geometry). `hidden: true` = Hide, `false` = Unhide (restore).
+    SetRowsHidden {
+        sheet: SheetId,
+        start: u32,
+        end: u32,
+        hidden: bool,
+    },
+    /// Set (or clear) the **hidden** flag on the inclusive 0-based column run `[start, end]` (the
+    /// column analog of [`Command::SetRowsHidden`]).
+    SetColumnsHidden {
+        sheet: SheetId,
+        start: u32,
+        end: u32,
+        hidden: bool,
+    },
     /// Insert `count` blank rows so new rows appear at 0-based `row` (`functional_spec.md §5.3`);
     /// content at/after `row` shifts down and formulas adjust. Undoable; needs evaluation. The
     /// worker **merge-guards** it first (a merge at/after `row` → [`EditRejectedReason::MergedCells`]

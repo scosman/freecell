@@ -203,6 +203,18 @@ pub enum GridEvent {
     DeleteRows { at: u32, count: u32 },
     /// Delete `count` columns starting at 0-based `at`.
     DeleteColumns { at: u32, count: u32 },
+    /// Hide the inclusive 0-based row run `[at, at+count-1]` (`gaps_closing_7_15 §4`, header menu).
+    /// The window forwards it as `Command::SetRowsHidden { hidden: true }` for the active sheet.
+    HideRows { at: u32, count: u32 },
+    /// Hide the inclusive 0-based column run (the column analog of [`GridEvent::HideRows`]).
+    HideColumns { at: u32, count: u32 },
+    /// Unhide (restore) every hidden row in the inclusive 0-based run `[at, at+count-1]` — the
+    /// minimal `[first_hidden, last_hidden]` span within the selected header run, so Select-All →
+    /// Unhide bounds the op to the hidden span, not the whole axis. Forwarded as
+    /// `Command::SetRowsHidden { hidden: false }`.
+    UnhideRows { at: u32, count: u32 },
+    /// Unhide (restore) every hidden column in the run (the column analog of [`GridEvent::UnhideRows`]).
+    UnhideColumns { at: u32, count: u32 },
     /// A chart was **moved or resized** on the ChartLayer (P18, `ui_design §3.2`) — both produce a
     /// new [`Anchor`]. The window forwards it as `Command::SetChartAnchor` for the active sheet.
     ChartAnchorChanged { id: ChartId, anchor: Anchor },

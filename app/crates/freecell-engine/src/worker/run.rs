@@ -565,6 +565,8 @@ impl Worker {
                 | Command::SetBorders { .. }
                 | Command::SetColumnWidths { .. }
                 | Command::SetRowHeights { .. }
+                | Command::SetRowsHidden { .. }
+                | Command::SetColumnsHidden { .. }
                 | Command::InsertRows { .. }
                 | Command::InsertColumns { .. }
                 | Command::DeleteRows { .. }
@@ -3282,6 +3284,26 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.set_row_heights_px(idx, *row_start, *row_end, *px)?;
             Ok(AppliedKind::GeometryOnly)
         }
+        Command::SetRowsHidden {
+            sheet,
+            start,
+            end,
+            hidden,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_rows_hidden(idx, *start, *end, *hidden)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
+        Command::SetColumnsHidden {
+            sheet,
+            start,
+            end,
+            hidden,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.set_columns_hidden(idx, *start, *end, *hidden)?;
+            Ok(AppliedKind::GeometryOnly)
+        }
         Command::InsertRows { sheet, row, count } => {
             let idx = resolve_idx(doc, *sheet)?;
             doc.insert_rows(idx, *row, *count)?;
@@ -3482,6 +3504,8 @@ fn op_of(edit: &Command) -> AppliedOp {
         // so the whole sheet cache is rebuilt on apply and on undo/redo.
         Command::SetColumnWidths { sheet, .. }
         | Command::SetRowHeights { sheet, .. }
+        | Command::SetRowsHidden { sheet, .. }
+        | Command::SetColumnsHidden { sheet, .. }
         | Command::InsertRows { sheet, .. }
         | Command::InsertColumns { sheet, .. }
         | Command::DeleteRows { sheet, .. }
@@ -7106,6 +7130,86 @@ mod tests {
         assert!(
             (row_h(&worker, sheet, 3) - 24.0).abs() < 1.0,
             "after undo row 3 default"
+        );
+    }
+
+    /// Whether the resident cache flags `row` hidden.
+    fn row_hidden(worker: &Worker, sheet: SheetId, row: u32) -> bool {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .is_row_hidden(row)
+    }
+    /// Whether the resident cache flags `col` hidden.
+    fn col_hidden(worker: &Worker, sheet: SheetId, col: u32) -> bool {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .unwrap()
+            .is_col_hidden(col)
+    }
+
+    #[test]
+    fn set_rows_hidden_renders_zero_size_and_undo_restores() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Hide rows 2..=4.
+        worker.process_batch(vec![Command::SetRowsHidden {
+            sheet,
+            start: 2,
+            end: 4,
+            hidden: true,
+        }]);
+        assert!(row_hidden(&worker, sheet, 3), "row 3 flagged hidden");
+        // A hidden row renders zero-size; its neighbor keeps the default.
+        assert_eq!(row_h(&worker, sheet, 3), 0.0, "hidden row is zero-size");
+        assert!(
+            (row_h(&worker, sheet, 1) - 24.0).abs() < 1.0,
+            "row 1 default"
+        );
+        // Geometry-only: the batch published (StyleCacheUpdated) but ran no eval.
+        let events = drain_events(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+
+        // One undo step restores full visibility + size.
+        worker.process_batch(vec![Command::Undo]);
+        assert!(!row_hidden(&worker, sheet, 3), "undo unhides row 3");
+        assert!(
+            (row_h(&worker, sheet, 3) - 24.0).abs() < 1.0,
+            "undo restores row 3 size"
+        );
+    }
+
+    #[test]
+    fn set_columns_hidden_toggle_and_unhide() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetColumnsHidden {
+            sheet,
+            start: 1,
+            end: 1,
+            hidden: true,
+        }]);
+        assert!(col_hidden(&worker, sheet, 1));
+        assert_eq!(col_w(&worker, sheet, 1), 0.0, "hidden col is zero-size");
+        // Unhide (hidden: false) over the same run restores it — one undo-independent op.
+        worker.process_batch(vec![Command::SetColumnsHidden {
+            sheet,
+            start: 1,
+            end: 1,
+            hidden: false,
+        }]);
+        assert!(!col_hidden(&worker, sheet, 1));
+        assert!(
+            (col_w(&worker, sheet, 1) - 100.0).abs() < 1.0,
+            "col restored"
         );
     }
 

@@ -133,6 +133,18 @@ struct HeaderMenu {
     insert_before_blocked: bool,
     insert_after_blocked: bool,
     delete_blocked: bool,
+    /// Hide is disabled when hiding the run would leave **zero** visible tracks on the axis
+    /// (reachable only via Select-All → Hide, since the axis is Excel-max; `gaps_closing_7_15 §4`).
+    hide_blocked: bool,
+    /// The minimal `[first_hidden, last_hidden]` span of hidden tracks **within** the run, or
+    /// `None` when the run contains no hidden track (Unhide disabled). Unhide targets this span (not
+    /// the whole run) so Select-All → Unhide reveals the hidden cluster in one undo step without
+    /// touching the whole 1M-row axis.
+    unhide_run: Option<(u32, u32)>,
+    /// How many tracks in the run are already hidden — drives the accurate menu-item counts
+    /// (Unhide N; Hide counts the newly-hidden `run_len − hidden_in_run`), independent of the
+    /// span width (`unhide_run` may be wider than the count when the hidden tracks are sparse).
+    hidden_in_run: u32,
 }
 
 /// The open cell-area right-click context menu (`functional_spec.md §2`, cloned from
@@ -2046,8 +2058,8 @@ impl GridView {
         let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
-        // Hit-test the ChartLayer + headers + read the merge list under one lock.
-        let (hit, chart_hit, merges) = {
+        // Hit-test the ChartLayer + headers + read the merge list + hidden sets under one lock.
+        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
@@ -2080,7 +2092,14 @@ impl GridView {
                 &row_axis,
                 &col_axis,
             );
-            (hit, chart_hit, cache.merges().to_vec())
+            (
+                hit,
+                chart_hit,
+                cache.merges().to_vec(),
+                cache.hidden_rows().clone(),
+                cache.hidden_cols().clone(),
+                cache.dims(),
+            )
         };
         // A right-click on a chart selects it and opens the "Delete chart" context menu (P18) — the
         // alternate delete affordance. Any chart hit (body or a handle of the already-selected
@@ -2154,6 +2173,11 @@ impl GridView {
         }
         let run = self.resize_run_for(axis, index);
         let (before, after, delete) = merge_block_flags(axis, run, &merges);
+        let (hidden_set, total) = match axis {
+            RowOrCol::Row => (&hidden_rows, dims.0),
+            RowOrCol::Col => (&hidden_cols, dims.1),
+        };
+        let (hide_blocked, unhide_run, hidden_in_run) = hide_unhide_flags(run, hidden_set, total);
         self.cell_menu = None;
         self.header_menu = Some(HeaderMenu {
             axis,
@@ -2163,6 +2187,9 @@ impl GridView {
             insert_before_blocked: before,
             insert_after_blocked: after,
             delete_blocked: delete,
+            hide_blocked,
+            unhide_run,
+            hidden_in_run,
         });
         cx.notify();
     }
@@ -3678,61 +3705,93 @@ impl GridView {
     /// The header insert/delete context menu overlay: a click-away backdrop + a small card of items
     /// (`functional_spec.md §5.3`). Items whose op would displace a merge are disabled + a footnote
     /// explains why. Built in `render` (needs `cx` for the item listeners).
-    fn header_menu_elements(&self, menu: HeaderMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The header context-menu item list — `(label, enabled, event)` — for the axis + run in `menu`
+    /// (`functional_spec.md §2`, `gaps_closing_7_15 §4`): Insert before / Insert after / Delete, then
+    /// **Hide** / **Unhide**. Pure (no gpui) so the mapping is unit-testable, mirroring
+    /// [`cell_menu_items`](Self::cell_menu_items). Note `enabled` (not `blocked`) — the render loop
+    /// draws a disabled item when `!enabled`.
+    fn header_menu_items(menu: &HeaderMenu) -> Vec<(String, bool, GridEvent)> {
         let count = menu.run.1 - menu.run.0 + 1;
         let (unit, before_word, after_word) = match menu.axis {
             RowOrCol::Row => ("row", "above", "below"),
             RowOrCol::Col => ("column", "left", "right"),
         };
-        let plural = if count == 1 { "" } else { "s" };
-        let n = |verb: &str, side: &str| format!("{verb} {count} {unit}{plural} {side}");
-
-        // The three items: (label, disabled, event).
+        let plural = |n: u32| if n == 1 { "" } else { "s" };
+        let p = plural(count);
         let (start, end) = (menu.run.0, menu.run.1);
         let after_at = end.saturating_add(1);
-        let items: [(String, bool, GridEvent); 3] = match menu.axis {
-            RowOrCol::Row => [
-                (
-                    n("Insert", before_word),
-                    menu.insert_before_blocked,
-                    GridEvent::InsertRows { at: start, count },
-                ),
-                (
-                    n("Insert", after_word),
-                    menu.insert_after_blocked,
-                    GridEvent::InsertRows {
-                        at: after_at,
-                        count,
-                    },
-                ),
-                (
-                    format!("Delete {count} {unit}{plural}"),
-                    menu.delete_blocked,
-                    GridEvent::DeleteRows { at: start, count },
-                ),
-            ],
-            RowOrCol::Col => [
-                (
-                    n("Insert", before_word),
-                    menu.insert_before_blocked,
-                    GridEvent::InsertColumns { at: start, count },
-                ),
-                (
-                    n("Insert", after_word),
-                    menu.insert_after_blocked,
-                    GridEvent::InsertColumns {
-                        at: after_at,
-                        count,
-                    },
-                ),
-                (
-                    format!("Delete {count} {unit}{plural}"),
-                    menu.delete_blocked,
-                    GridEvent::DeleteColumns { at: start, count },
-                ),
-            ],
+        // Axis-specific event constructors keep the labels/flags below axis-agnostic.
+        let (insert_ev, delete_ev, hide_ev, unhide_ev): (
+            fn(u32, u32) -> GridEvent,
+            fn(u32, u32) -> GridEvent,
+            fn(u32, u32) -> GridEvent,
+            fn(u32, u32) -> GridEvent,
+        ) = match menu.axis {
+            RowOrCol::Row => (
+                |at, count| GridEvent::InsertRows { at, count },
+                |at, count| GridEvent::DeleteRows { at, count },
+                |at, count| GridEvent::HideRows { at, count },
+                |at, count| GridEvent::UnhideRows { at, count },
+            ),
+            RowOrCol::Col => (
+                |at, count| GridEvent::InsertColumns { at, count },
+                |at, count| GridEvent::DeleteColumns { at, count },
+                |at, count| GridEvent::HideColumns { at, count },
+                |at, count| GridEvent::UnhideColumns { at, count },
+            ),
         };
-        let any_blocked = items.iter().any(|(_, blocked, _)| *blocked);
+        let mut items = vec![
+            (
+                format!("Insert {count} {unit}{p} {before_word}"),
+                !menu.insert_before_blocked,
+                insert_ev(start, count),
+            ),
+            (
+                format!("Insert {count} {unit}{p} {after_word}"),
+                !menu.insert_after_blocked,
+                insert_ev(after_at, count),
+            ),
+            (
+                format!("Delete {count} {unit}{p}"),
+                !menu.delete_blocked,
+                delete_ev(start, count),
+            ),
+            {
+                // The label counts the tracks Hide will actually collapse (visible ones in the run),
+                // not the run width — already-hidden tracks in the run stay hidden (a no-op). The
+                // EVENT still targets the whole run (one undo step; re-hiding a hidden track is inert).
+                let newly = count - menu.hidden_in_run;
+                (
+                    format!("Hide {newly} {unit}{}", plural(newly)),
+                    !menu.hide_blocked,
+                    hide_ev(start, count),
+                )
+            },
+        ];
+        // Unhide targets the minimal hidden SPAN in the run (bounded, one undo step), but the label
+        // counts the ACTUAL hidden tracks in it (`hidden_in_run`) — which is < the span width when the
+        // hidden tracks are sparse. Disabled (with the axis label) when the run holds no hidden track.
+        match menu.unhide_run {
+            Some((first, last)) => {
+                let span = last - first + 1;
+                let uc = menu.hidden_in_run;
+                items.push((
+                    format!("Unhide {uc} {unit}{}", plural(uc)),
+                    true,
+                    unhide_ev(first, span),
+                ));
+            }
+            None => items.push((format!("Unhide {unit}s"), false, unhide_ev(start, count))),
+        }
+        items
+    }
+
+    fn header_menu_elements(&self, menu: HeaderMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let items = Self::header_menu_items(&menu);
+        // The "merged cells" footnote is about the insert/delete merge guard only — Hide/Unhide are
+        // never merge-blocked, so gate the note on the merge-guard flags, not every disabled item.
+        let any_blocked =
+            menu.insert_before_blocked || menu.insert_after_blocked || menu.delete_blocked;
 
         let mut card = div()
             .debug_selector(|| "header-menu-card".into())
@@ -3755,14 +3814,14 @@ impl GridView {
             .shadow_md()
             .text_size(px(CELL_FONT_PX))
             .min_w(px(180.0));
-        for (label, blocked, event) in items {
+        for (label, enabled, event) in items {
             let mut item = div()
                 .px(px(10.0))
                 .py(px(4.0))
                 .rounded_sm()
                 .whitespace_nowrap()
                 .child(label);
-            if blocked {
+            if !enabled {
                 item = item.text_color(rgb(HEADER_TEXT)).opacity(0.4);
             } else {
                 item = item
@@ -4227,6 +4286,47 @@ fn merge_block_flags(axis: RowOrCol, run: (u32, u32), merges: &[CellRange]) -> (
             blocks_col_op(merges, start),
         ),
     }
+}
+
+/// The `(hide_blocked, unhide_run, hidden_in_run)` header-menu flags for a run over an axis of
+/// `total` tracks with the given `hidden` set (`gaps_closing_7_15 §4`).
+///
+/// - **Hide** is blocked when hiding the run would leave zero visible tracks:
+///   `total − |hidden ∪ run| == 0` (where `|hidden ∪ run| = |hidden| + run_len − hidden_in_run`).
+///   Usually this means Select-All → Hide, but it also (correctly) blocks a *smaller* run that
+///   happens to cover every remaining visible track — e.g. when most of the axis is already hidden.
+/// - **Unhide** targets the minimal `[first_hidden, last_hidden]` span **within** the run (so
+///   Select-All → Unhide reveals the hidden cluster without spanning the whole axis); `None` when
+///   the run contains no hidden track.
+/// - **`hidden_in_run`** = how many tracks in the run are already hidden — the accurate count for
+///   the menu labels (Unhide N; Hide counts the *newly*-hidden `run_len − hidden_in_run`).
+fn hide_unhide_flags(
+    run: (u32, u32),
+    hidden: &std::collections::BTreeSet<u32>,
+    total: u32,
+) -> (bool, Option<(u32, u32)>, u32) {
+    let (start, end) = run;
+    // One pass over the hidden tracks within the run: first, last, and count.
+    let mut first_hidden = None;
+    let mut last_hidden = 0u32;
+    let mut hidden_in_run = 0u32;
+    for &i in hidden.range(start..=end) {
+        if first_hidden.is_none() {
+            first_hidden = Some(i);
+        }
+        last_hidden = i;
+        hidden_in_run += 1;
+    }
+    let unhide_run = first_hidden.map(|f| (f, last_hidden));
+
+    let run_len = (end - start + 1) as u64;
+    let hidden_count = hidden.len() as u64;
+    // Tracks hidden after the op = |hidden ∪ run| = run_len + (already-hidden outside the run).
+    // Computed as a union size (not a running subtraction) so it can't underflow when run_len == total.
+    // `hidden_in_run <= hidden_count`, so the inner subtraction is safe.
+    let hidden_after = run_len + (hidden_count - hidden_in_run as u64);
+    let visible_after = (total as u64).saturating_sub(hidden_after);
+    (visible_after == 0, unhide_run, hidden_in_run)
 }
 
 /// A cell's px rectangle in **content-local** coordinates (origin at the content area's
@@ -7293,6 +7393,126 @@ mod tests {
             &items[9],
             Some((l, false, GridEvent::InsertColumns { .. })) if l == "Insert 1 column left"
         ));
+    }
+
+    fn header_menu_fixture(
+        axis: RowOrCol,
+        run: (u32, u32),
+        hide_blocked: bool,
+        unhide_run: Option<(u32, u32)>,
+        hidden_in_run: u32,
+    ) -> HeaderMenu {
+        HeaderMenu {
+            axis,
+            run,
+            x: 0.0,
+            y: 0.0,
+            insert_before_blocked: false,
+            insert_after_blocked: false,
+            delete_blocked: false,
+            hide_blocked,
+            unhide_run,
+            hidden_in_run,
+        }
+    }
+
+    #[test]
+    fn header_menu_items_include_hide_and_unhide() {
+        use freecell_core::limits;
+        // A 3-column run C:E with nothing hidden → Hide (all 3 newly-hidden) enabled, Unhide disabled.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Col,
+            (2, 4),
+            false,
+            None,
+            0,
+        ));
+        assert!(matches!(
+            &items[3],
+            (l, true, GridEvent::HideColumns { at: 2, count: 3 }) if l == "Hide 3 columns"
+        ));
+        assert!(matches!(
+            &items[4],
+            (l, false, GridEvent::UnhideColumns { .. }) if l == "Unhide columns"
+        ));
+
+        // Same run but D (3) hidden → Unhide enabled (1 hidden), scoped to the hidden span; Hide now
+        // counts only the 2 newly-hidden (C, E), while its event still targets the whole run.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Col,
+            (2, 4),
+            false,
+            Some((3, 3)),
+            1,
+        ));
+        assert!(matches!(
+            &items[3],
+            (l, true, GridEvent::HideColumns { at: 2, count: 3 }) if l == "Hide 2 columns"
+        ));
+        assert!(matches!(
+            &items[4],
+            (l, true, GridEvent::UnhideColumns { at: 3, count: 1 }) if l == "Unhide 1 column"
+        ));
+
+        // SPARSE case (the reviewer's fix): a run C:G where only D and F are hidden → the span is
+        // [3, 5] (width 3) but the label counts the ACTUAL 2 hidden ("Unhide 2 columns"); the event
+        // still clears the whole span.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Col,
+            (2, 6),
+            false,
+            Some((3, 5)),
+            2,
+        ));
+        assert!(matches!(
+            &items[4],
+            (l, true, GridEvent::UnhideColumns { at: 3, count: 3 }) if l == "Unhide 2 columns"
+        ));
+
+        // Select-All → Hide is blocked (would hide every visible row) → the Hide item is disabled.
+        let items = GridView::header_menu_items(&header_menu_fixture(
+            RowOrCol::Row,
+            (0, limits::MAX_ROWS - 1),
+            true,
+            None,
+            0,
+        ));
+        assert!(matches!(
+            &items[3],
+            (l, false, GridEvent::HideRows { at: 0, .. }) if l == "Hide 1048576 rows"
+        ));
+    }
+
+    #[test]
+    fn hide_unhide_flags_compute_span_count_and_hide_all_guard() {
+        use freecell_core::limits;
+        use std::collections::BTreeSet;
+        let total = limits::MAX_ROWS;
+        // Nothing hidden in the run → Hide allowed, Unhide None, count 0.
+        let (hb, ur, n) = hide_unhide_flags((2, 4), &BTreeSet::new(), total);
+        assert!(!hb && ur.is_none() && n == 0);
+        // Hidden 3 and 7 within run 2..=9 → the unhide span is the minimal [3, 7] but the count is 2
+        // (the sparse case: span width 5, only 2 actually hidden).
+        let hidden: BTreeSet<u32> = [3u32, 7].into_iter().collect();
+        let (_, ur, n) = hide_unhide_flags((2, 9), &hidden, total);
+        assert_eq!(ur, Some((3, 7)));
+        assert_eq!(n, 2);
+        // Select-All over the whole axis with nothing hidden → hiding all → blocked.
+        let (hb, _, _) = hide_unhide_flags((0, total - 1), &BTreeSet::new(), total);
+        assert!(hb);
+        // Select-All with some already hidden → still hides every remaining visible → blocked.
+        let (hb, _, _) = hide_unhide_flags((0, total - 1), &hidden, total);
+        assert!(hb);
+        // A partial run that leaves visible tracks is never hide-blocked.
+        let (hb, _, _) = hide_unhide_flags((0, 4), &BTreeSet::new(), total);
+        assert!(!hb);
+        // A smaller-than-select-all run that still covers every remaining visible track is blocked
+        // too (most of the axis already hidden) — the softened-doc case.
+        let mut almost_all: BTreeSet<u32> = (0..total).collect();
+        almost_all.remove(&5);
+        almost_all.remove(&6);
+        let (hb, _, _) = hide_unhide_flags((5, 6), &almost_all, total);
+        assert!(hb, "hiding the last 2 visible tracks is blocked");
     }
 
     /// Whether any item emits a row-structural (Insert/Delete rows) command.

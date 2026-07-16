@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: gaps_closing_7_15 (v0.5 low-hanging-fruit batch, round 3)
@@ -25,10 +25,12 @@ Cross-cutting conventions (apply to every feature):
   Features **1, 2** are chrome/non-grid and out of pixel-suite scope (gpui view tests +
   smoke launch).
 
-**Highest-impact open decisions** (each has a recommended default below; owner may
-override at review): **D4.1** (does hide/unhide round-trip to `.xlsx` via a fork fix, or
-ship session-only first?), **D1.1** (signature-hint depth), **D2.2** (what values CSV
-export writes). All decisions are collected per-feature under "Decisions to confirm".
+**Highest-impact decisions — RESOLVED by owner (2026-07-16):** **D4.1** hide/unhide
+**round-trips to `.xlsx`** via the two fork fixes (not session-only); **D1.1** signature
+hint is the **static whole template** (no current-arg tracking); **D2.2** CSV export writes
+**raw stored values** (computed underlying values, *not* formatted display strings). All
+decisions are collected per-feature under "Decisions to confirm"; unresolved ones carry a
+recommended default.
 
 ---
 
@@ -107,10 +109,10 @@ memorized" bar (GAPS.md v0.5, §364).
 
 ### Decisions to confirm
 
-- **D1.1 — Signature-hint depth.** *Recommended:* **static** whole-template hint (no
-  current-arg tracking). Alt: tokenize the formula to bold the active argument — richer,
-  but needs the engine lexer surfaced (heavier, riskier) and pushes this out of "one
-  low-risk phase."
+- **D1.1 — Signature-hint depth. RESOLVED (owner, 2026-07-16): static** whole-template
+  hint (no current-arg tracking). Rejected alt: tokenize the formula to bold the active
+  argument (needs the engine lexer surfaced — heavier/riskier, out of "one low-risk
+  phase").
 - **D1.2 — Paren insertion on accept.** *Recommended:* insert `NAME(` only, caret after
   `(`, no auto-closing `)` (matches "type the rest yourself"; avoids caret-management
   complexity if the pinned gpui-component `InputState` lacks an insert-at-caret API —
@@ -167,11 +169,14 @@ downloaded CSV is a top-3 home task; export is the round-trip partner.
 - **Scope — active sheet only.** CSV is single-sheet; export writes the **active sheet's
   used range** (`A1` through the sheet's occupied extent). Other sheets are not written
   (no multi-file export this round).
-- **What is written (D2.2).** *Recommended:* each cell's **displayed value** — the
-  engine-formatted string the user sees (numbers with their number format applied, dates
-  as displayed, `TRUE`/`FALSE`, error text like `#DIV/0!`), **not** raw stored values or
-  formulas. This matches "export what's on screen" and Excel's CSV behavior for most cells.
-  (Alt in D2.2: raw values / formulas.)
+- **What is written (D2.2 — RESOLVED: raw stored values).** Each cell's **raw stored
+  value** — the computed underlying value **without** its number format applied: a number
+  writes its plain decimal (`0.5`, not `50%`; a date serial writes the serial number, not
+  the formatted date), a boolean writes `TRUE`/`FALSE`, an error writes its error string
+  (`#DIV/0!`), text writes verbatim, a formula writes its **computed** value (not the
+  formula text). This is exactly the `value_token` / paste-values ("computed value")
+  rendering, reused for export. (It is **not** the on-screen formatted string, and **not**
+  the formula source.)
 - **Serialization (RFC 4180).** Comma-delimited, UTF-8, `CRLF` line endings; a field
   containing a comma, double-quote, or newline is wrapped in double-quotes with internal
   quotes doubled. Trailing empty cells in a row are omitted (no trailing commas beyond the
@@ -200,8 +205,9 @@ downloaded CSV is a top-3 home task; export is the round-trip partner.
 
 - **D2.1 — Import target.** *Recommended:* **untitled workbook** (simple; Save→Save-As to
   `.xlsx`). (Owner already leaned this way in the overview.)
-- **D2.2 — Export values.** *Recommended:* **displayed/formatted** strings. Alt: raw
-  stored values (loses number formatting) or formula text (rarely wanted in CSV).
+- **D2.2 — Export values. RESOLVED (owner, 2026-07-16): raw stored values** (computed
+  underlying values via the `value_token` path — plain numbers/date serials, no number
+  formatting). Rejected alts: formatted display strings; formula text.
 - **D2.3 — Menu shape.** *Recommended:* Open **auto-detects** `.csv` by extension **and** a
   dedicated **Import CSV…** item exists; Export is its own **Export as CSV…** item. Alt:
   export lives under Save As with a `.csv` type instead of a separate item.
@@ -316,10 +322,10 @@ hidden rows/cols are everywhere; today FreeCell has no hide concept at all.
 - **Distinct from resize (D4.3).** Hide is an **explicit command**, not "drag to 0px".
   Dragging a divider to minimum still clamps to the existing `MIN_*` (it does not hide);
   hiding is separately tracked so Unhide can restore the pre-hide size.
-- **Persistence / round-trip (D4.1).** *Recommended:* hidden state **round-trips to
-  `.xlsx`** — a file saved with hidden rows/cols reopens with them hidden (in FreeCell and
-  in Excel), and a file **opened** with hidden rows/cols shows them hidden. This requires
-  the fork half (see below).
+- **Persistence / round-trip (D4.1 — RESOLVED: round-trips to `.xlsx`).** Hidden state
+  **round-trips** — a file saved with hidden rows/cols reopens with them hidden (in
+  FreeCell and in Excel), and a file **opened** with hidden rows/cols shows them hidden.
+  This requires the fork half (see below).
 - **Undo.** Hide and Unhide are each **one** undo step.
 
 ### Engine / fork work (per the fork policy — one fix = one branch = one PR)
@@ -354,13 +360,10 @@ renders hidden tracks as zero-size.
 
 ### Decisions to confirm
 
-- **D4.1 — Round-trip vs session-only.** *Recommended:* **round-trip via the two fork
-  fixes** (the point of the feature; files with hidden tracks are common). This makes §4
-  the heaviest phase in the batch (two fork branches + FreeCell render/UI). *If the owner
-  wants this round strictly light*, the fallback is **session-only hide** (no fork work:
-  hidden state lives in FreeCell, not saved) shipped now, with round-trip as a follow-on —
-  but that ships a feature that silently loses hidden state on save, which is a poor v0.5
-  signal. **Flagging prominently.**
+- **D4.1 — Round-trip vs session-only. RESOLVED (owner, 2026-07-16): round-trip via the
+  two fork fixes** (the point of the feature; files with hidden tracks are common). This
+  makes §4 the heaviest phase in the batch (two fork branches + FreeCell render/UI).
+  Rejected alt: session-only hide (loses hidden state on save — poor v0.5 signal).
 - **D4.2 — Unhide discoverability.** *Recommended:* spanning-selection + Select-All →
   Unhide, **no** header marker this round. Alt: add the thick-divider marker (new header
   render work).

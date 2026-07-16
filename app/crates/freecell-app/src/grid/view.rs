@@ -38,6 +38,8 @@ use freecell_core::{
     CellRef, Edge, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
+use crate::chrome::AutocompleteDisplay;
+
 use super::chart_layer::{self, ChartPlacement, ChartRect, Handle};
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
@@ -307,6 +309,12 @@ pub struct GridView {
     incell_input: Option<Entity<InputState>>,
     /// The in-cell editor's cap-error popover message, if a cap rejection is active there.
     incell_cap: Option<SharedString>,
+    /// The function-completion list to render under the in-cell overlay, or `None`
+    /// (`gaps_closing_7_15 §1`). Pushed by the chrome via `set_edit_state`; also read in
+    /// `capture_key_down` to intercept nav/accept/dismiss keys while it is open.
+    incell_autocomplete: Option<AutocompleteDisplay>,
+    /// The passive signature-hint template to render under the in-cell overlay, or `None`.
+    incell_sig_hint: Option<SharedString>,
     /// The in-cell editor overlay's measured, viewport-clamped `(width, height)` in device px for the
     /// current frame, or `None` when the editor is closed (or on a non-`render` build path that skips
     /// measurement — the overlay then falls back to its base cell-rect size). Computed in
@@ -582,6 +590,8 @@ impl GridView {
             incell_open: None,
             incell_input: None,
             incell_cap: None,
+            incell_autocomplete: None,
+            incell_sig_hint: None,
             incell_geom: None,
             quick_edit: false,
             charts: HashMap::new(),
@@ -738,16 +748,21 @@ impl GridView {
     /// Pushes the chrome's current edit state onto the grid (live mirror, in-cell overlay cell,
     /// in-cell cap message). `None`s clear the corresponding overlay. Repaints so the mirror tracks
     /// each keystroke (`components/edit_controller.md §4.3–4.4`).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_edit_state(
         &mut self,
         mirror: Option<(SheetId, CellRef, SharedString)>,
         incell_open: Option<CellRef>,
         incell_cap: Option<SharedString>,
         quick_edit: bool,
+        autocomplete: Option<AutocompleteDisplay>,
+        sig_hint: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
         self.mirror = mirror;
         self.quick_edit = quick_edit;
+        self.incell_autocomplete = autocomplete;
+        self.incell_sig_hint = sig_hint;
         // Opening the in-cell editor ends any grid selection drag at its root (BUG #2): a drag armed
         // before the editor opened must not survive into (or past) the editor's lifetime. The
         // overlay `.occlude()`s the follow-up mouse-up, so the grid would never clear such a drag,
@@ -838,6 +853,8 @@ impl GridView {
         self.mirror = None;
         self.incell_open = None;
         self.incell_cap = None;
+        self.incell_autocomplete = None;
+        self.incell_sig_hint = None;
         // Structural interactions are anchored to the previous sheet's geometry — drop them.
         self.resize_drag = None;
         self.resize_preview = None;
@@ -4580,6 +4597,105 @@ impl GridView {
 
         elements
     }
+
+    /// The in-cell overlay's function-completion list + signature hint (`gaps_closing_7_15 §1`),
+    /// anchored below the measured editor box (like the in-cell cap popover). Interactive (row
+    /// clicks accept), so it is built at the root render level where `cx` is available. The cap
+    /// error takes precedence at the shared anchor; the list takes precedence over the hint.
+    fn incell_autocomplete_elements(
+        &self,
+        frame: &Frame,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        if self.incell_cap.is_some() {
+            return Vec::new();
+        }
+        let Some(cell) = self.incell_open else {
+            return Vec::new();
+        };
+        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let (_, h) = self
+            .incell_geom
+            .unwrap_or((cell_w.max(IN_CELL_MIN_W), cell_h));
+        let top = y + h + 2.0;
+
+        if let Some(list) = &self.incell_autocomplete {
+            let card = div()
+                .id("incell-autocomplete")
+                .absolute()
+                .left(px(x))
+                .top(px(top))
+                .occlude()
+                .flex()
+                .flex_col()
+                .min_w(px(300.0))
+                .max_h(px(320.0))
+                .overflow_y_scroll()
+                .bg(rgb(CELL_BG))
+                .border_1()
+                .border_color(rgb(HEADER_HAIRLINE))
+                .rounded_md()
+                .shadow_md()
+                .children(list.rows.iter().enumerate().map(|(i, row)| {
+                    let highlighted = i == list.highlight;
+                    div()
+                        .id(gpui::ElementId::Name(
+                            format!("incell-autocomplete-row-{i}").into(),
+                        ))
+                        .flex()
+                        .items_baseline()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.0))
+                        .when(highlighted, |d| d.bg(rgb(HEADER_SELECTED_BG)))
+                        // Hover highlights a row too (`functional_spec.md §1`, Mouse).
+                        .hover(|s| s.bg(rgb(HEADER_SELECTED_BG)))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(CELL_TEXT))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(row.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(HEADER_TEXT))
+                                .whitespace_nowrap()
+                                .child(row.template.clone()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                                this.events
+                                    .emit(&GridEvent::AutocompleteAcceptAt(i), window, cx);
+                            }),
+                        )
+                }));
+            return vec![deferred(card).into_any_element()];
+        }
+
+        if let Some(template) = &self.incell_sig_hint {
+            let hint = div()
+                .absolute()
+                .left(px(x))
+                .top(px(top))
+                .px_2()
+                .py_1()
+                .bg(rgb(CELL_BG))
+                .text_color(rgb(HEADER_TEXT))
+                .text_size(px(11.0))
+                .border_1()
+                .border_color(rgb(HEADER_HAIRLINE))
+                .rounded_md()
+                .shadow_md()
+                .whitespace_nowrap()
+                .child(template.clone());
+            return vec![deferred(hint).into_any_element()];
+        }
+
+        Vec::new()
+    }
 }
 
 impl Focusable for GridView {
@@ -4658,6 +4774,12 @@ impl Render for GridView {
             self.run_autogrow(&frame, window, cx);
             // Divider resize hotspots paint last (over the header strips) so they win the hit-test.
             root_children.extend(self.resize_hotspots(&frame, cx));
+            // The in-cell completion list / signature hint (`gaps_closing_7_15 §1`) — rendered at
+            // the root (not in `build_grid_layers`) so its rows can carry `cx.listener` click
+            // handlers, like the header/cell context menus.
+            if self.incell_open.is_some() {
+                root_children.extend(self.incell_autocomplete_elements(&frame, cx));
+            }
         }
 
         // Header insert/delete context menu (deferred → above everything but the loading overlay).
@@ -4749,6 +4871,43 @@ impl Render for GridView {
                 if this.incell_open.is_none() {
                     return;
                 }
+                // The in-cell completion list preempts navigation/accept/dismiss keys before the
+                // Tab/Esc/quick-edit arms below (`gaps_closing_7_15 §1`), routed to the chrome
+                // (the list-state owner) via the window like the other in-cell events.
+                if this.incell_autocomplete.is_some() {
+                    match event.keystroke.key.as_str() {
+                        "down" => {
+                            cx.stop_propagation();
+                            this.events.emit(
+                                &GridEvent::AutocompleteNav { down: true },
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
+                        "up" => {
+                            cx.stop_propagation();
+                            this.events.emit(
+                                &GridEvent::AutocompleteNav { down: false },
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
+                        "enter" | "tab" => {
+                            cx.stop_propagation();
+                            this.events.emit(&GridEvent::AutocompleteAccept, window, cx);
+                            return;
+                        }
+                        "escape" => {
+                            cx.stop_propagation();
+                            this.events
+                                .emit(&GridEvent::AutocompleteDismiss, window, cx);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 let modifiers = event.keystroke.modifiers;
                 match event.keystroke.key.as_str() {
                     "tab" => {
@@ -4784,6 +4943,13 @@ impl Render for GridView {
                         };
                         this.events
                             .emit(&GridEvent::InCellCommitMove(dir), window, cx);
+                    }
+                    // A caret-only key falls through to the input (no `stop_propagation`); ask the
+                    // chrome to recompute the list/hint once the caret has moved, since the input
+                    // fires no event on a pure caret move (`gaps_closing_7_15 §1`).
+                    "left" | "right" | "home" | "end" => {
+                        this.events
+                            .emit(&GridEvent::AutocompleteCaretMoved, window, cx);
                     }
                     _ => {}
                 }
@@ -5633,7 +5799,15 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     events.borrow_mut().clear();
                     // A printable key and an arrow both no-op while the overlay owns the keyboard.
                     grid.handle_key_down(&key_ev("x", Some("x"), false), window, cx);
@@ -5659,12 +5833,20 @@ mod tests {
         window
             .update(cx, |_root, _window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, cx);
+                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, None, None, cx);
                     assert!(
                         grid.quick_edit_for_test(),
                         "quick_edit must thread through set_edit_state"
                     );
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     assert!(
                         !grid.quick_edit_for_test(),
                         "quick_edit clears when pushed false"
@@ -6633,7 +6815,15 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(3, 3)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                 });
                 input
             })
@@ -6711,7 +6901,15 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input, cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(3, 3)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                 });
             })
             .unwrap();
@@ -6786,7 +6984,15 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(2, 2)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     grid.mouse_down_cell(
                         2,
                         2,
@@ -6835,13 +7041,21 @@ mod tests {
                     );
                     assert!(grid.has_active_drag(), "a single click arms a cell drag");
                     // Open the editor → the drag must be cleared at the root.
-                    grid.set_edit_state(None, Some(CellRef::new(2, 2)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(2, 2)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                     assert!(
                         !grid.has_active_drag(),
                         "opening the in-cell editor clears the pre-armed drag"
                     );
                     // Close the editor; the drag must stay cleared (no move-gate applies now).
-                    grid.set_edit_state(None, None, None, false, cx);
+                    grid.set_edit_state(None, None, None, false, None, None, cx);
                     assert!(
                         !grid.has_active_drag(),
                         "the drag stays cleared after the editor closes"
@@ -7033,7 +7247,15 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(3, 3)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        cx,
+                    );
                 });
                 input
             })
@@ -7044,7 +7266,7 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7062,7 +7284,7 @@ mod tests {
                 )
             });
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, cx)
+                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7084,7 +7306,7 @@ mod tests {
         // Cancel closes the overlay — normal rendering resumes (no persistent overlay).
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, cx)
+                grid.set_edit_state(None, None, None, false, None, None, cx)
             })
         });
         vcx.run_until_parked();
@@ -7106,7 +7328,7 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(cell), None, false, cx);
+                    grid.set_edit_state(None, Some(cell), None, false, None, None, cx);
                 });
                 input
             })
@@ -7116,7 +7338,7 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, cx)
+                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7127,7 +7349,7 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value(WRAP_LONG, window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, cx)
+                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
             });
         });
         vcx.run_until_parked();
@@ -7149,7 +7371,7 @@ mod tests {
         // Commit closes the overlay.
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, cx)
+                grid.set_edit_state(None, None, None, false, None, None, cx)
             })
         });
         vcx.run_until_parked();

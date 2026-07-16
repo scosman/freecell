@@ -1507,6 +1507,33 @@ fn make_grid_sink(
                 chrome.update(cx, |c, cx| c.cancel_incell(window, cx));
             }
         }
+        GridEvent::AutocompleteNav { down } => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let down = *down;
+                chrome.update(cx, |c, cx| c.autocomplete_nav(down, cx));
+            }
+        }
+        GridEvent::AutocompleteAccept => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                chrome.update(cx, |c, cx| c.autocomplete_accept(window, cx));
+            }
+        }
+        GridEvent::AutocompleteAcceptAt(index) => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let index = *index;
+                chrome.update(cx, |c, cx| c.autocomplete_accept_at(index, window, cx));
+            }
+        }
+        GridEvent::AutocompleteDismiss => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                chrome.update(cx, |c, cx| c.autocomplete_dismiss(window, cx));
+            }
+        }
+        GridEvent::AutocompleteCaretMoved => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                chrome.update(cx, |c, cx| c.autocomplete_caret_moved(window, cx));
+            }
+        }
         GridEvent::Copy { cut } => {
             // Copy/cut operate on the current (last-accepted) selection.
             shared.clipboard.borrow_mut().copy(
@@ -1759,6 +1786,8 @@ fn make_chrome_grid_sink(
                 in_cell,
                 cap,
                 quick_edit,
+                autocomplete,
+                sig_hint,
             } => {
                 // Deferred: the chrome may be emitting this from inside the grid's own `update`
                 // (a grid-originated type-to-replace / in-cell trigger), so touching the grid now
@@ -1767,10 +1796,20 @@ fn make_chrome_grid_sink(
                 let in_cell = *in_cell;
                 let cap = cap.clone();
                 let quick_edit = *quick_edit;
+                let autocomplete = autocomplete.clone();
+                let sig_hint = sig_hint.clone();
                 window.defer(cx, move |_window, cx| {
                     if let Some(grid) = grid.upgrade() {
                         grid.update(cx, |g, cx| {
-                            g.set_edit_state(mirror, in_cell, cap, quick_edit, cx)
+                            g.set_edit_state(
+                                mirror,
+                                in_cell,
+                                cap,
+                                quick_edit,
+                                autocomplete,
+                                sig_hint,
+                                cx,
+                            )
                         });
                     }
                 });

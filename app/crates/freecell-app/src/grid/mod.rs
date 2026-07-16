@@ -122,6 +122,22 @@ pub enum GridEvent {
     InCellCommitMove(Direction),
     /// Escape captured in the in-cell overlay — cancel the pending edit.
     InCellCancel,
+    /// Arrow up/down captured in the in-cell overlay while the completion list is open — move the
+    /// highlighted completion row (`gaps_closing_7_15 §1`). Routed to `ChromeView`.
+    AutocompleteNav { down: bool },
+    /// Tab/Enter captured in the in-cell overlay while the completion list is open — accept the
+    /// highlighted completion. Routed to `ChromeView::autocomplete_accept`.
+    AutocompleteAccept,
+    /// A mouse click on in-cell completion row `index` — accept that completion. Routed to
+    /// `ChromeView::autocomplete_accept_at`.
+    AutocompleteAcceptAt(usize),
+    /// Escape captured in the in-cell overlay while the completion list is open — close the list
+    /// only (the edit continues). Routed to `ChromeView::autocomplete_dismiss`.
+    AutocompleteDismiss,
+    /// A caret-only key (←/→/Home/End) in the in-cell overlay — recompute the list/hint after the
+    /// caret moves (the pinned input fires no event on a pure caret move). Routed to
+    /// `ChromeView::autocomplete_caret_moved`.
+    AutocompleteCaretMoved,
     /// Cmd/Ctrl+C (`cut: false`) / Cmd/Ctrl+X (`cut: true`) on the focused grid — copy/cut the
     /// selection to the range clipboard (`functional_spec.md §2.1`). The window routes this to
     /// the `ClipboardCoordinator`.

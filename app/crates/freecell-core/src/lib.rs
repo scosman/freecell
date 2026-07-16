@@ -20,6 +20,7 @@ pub mod eval_indicator;
 pub mod find;
 pub mod format_color;
 pub mod format_ui;
+pub mod functions;
 pub mod input_cap;
 pub mod merge_guard;
 pub mod palette;

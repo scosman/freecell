@@ -25,7 +25,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::spinner::Spinner;
 use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 
@@ -35,6 +35,7 @@ use freecell_core::format_ui::{
     adjust_decimals_cell, displayed_decimals, font_size_display, is_more_only_num_fmt,
     num_fmt_category, toggle_thousands, Category, BASIC_FORMATS, NUM_FMT_GROUPS,
 };
+use freecell_core::functions::{self, FnSig};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
@@ -55,8 +56,21 @@ use freecell_engine::{
 
 use super::h_scroller::{h_scroller, HScroller};
 use super::{
-    ChromeClient, ChromeGridRequest, ChromeGridSink, EditController, EditOrigin, SheetTab,
+    AutocompleteDisplay, AutocompleteRow, ChromeClient, ChromeGridRequest, ChromeGridSink,
+    EditController, EditOrigin, SheetTab,
 };
+
+/// The function-autocomplete list's live state while the dropdown is open (`ChromeView`-owned,
+/// `gaps_closing_7_15 §1`). Cleared to `None` when the list dismisses.
+struct Autocomplete {
+    /// The current filtered, ordered match list (from [`functions::complete`]).
+    matches: Vec<&'static FnSig>,
+    /// The highlighted row index into [`matches`](Self::matches).
+    highlight: usize,
+    /// The byte offset in the edit text where the typed prefix begins — the replace point on
+    /// accept.
+    token_start: usize,
+}
 
 /// The 250 ms no-flash delay for both the content-fetch and evaluating spinners
 /// (`ui_design.md §3.1/§3.2`, mirrored from the grid's own delayed hooks).
@@ -78,6 +92,11 @@ const DANGER: u32 = 0xDC2626;
 /// Dark tooltip fill + text for the cap-error popover (`ui_design.md §4`).
 const TOOLTIP_BG: u32 = 0x2B2B2B;
 const TOOLTIP_TEXT: u32 = 0xF5F5F5;
+/// The highlighted-row tint in the function-completion list (a light accent wash,
+/// `gaps_closing_7_15 §1`).
+const AUTOCOMPLETE_HL_BG: u32 = 0xE8F0FE;
+/// The completion list's minimum width so argument templates fit without jitter.
+const AUTOCOMPLETE_MIN_W: f32 = 300.0;
 /// Accent ring around the borders popover's selected color swatch (Office Accent 1 — reads over a
 /// black or white swatch, unlike a grey/dark ring; `ui_design.md §2.1`).
 const SWATCH_SELECTED_RING: u32 = 0x4472C4;
@@ -348,6 +367,15 @@ pub struct ChromeView {
     /// carries the rejection so the popover shows the same message as a local cap reject.
     cap_error_external: Option<InputRejection>,
 
+    /// The function-autocomplete dropdown's live state while open, else `None`
+    /// (`gaps_closing_7_15 §1`). Driven off the active editor's text + caret after each
+    /// keystroke ([`recompute_autocomplete`](Self::recompute_autocomplete)); rendered under the
+    /// data row directly, and under the in-cell overlay by the grid (via `EditState`).
+    autocomplete: Option<Autocomplete>,
+    /// The active passive signature-hint template (the whole `NAME(args…)` line), or `None`
+    /// when the caret is not inside a recognized call. Static (D1.1 — no current-arg tracking).
+    sig_hint: Option<&'static str>,
+
     /// The evaluating-spinner state machine (`freecell-core`).
     eval: EvalIndicator,
 
@@ -575,14 +603,16 @@ impl ChromeView {
                         return;
                     }
                     let keystroke = &event.keystroke;
-                    if this.handle_data_row_edit_key(
-                        keystroke.key.as_str(),
-                        keystroke.modifiers,
-                        window,
-                        cx,
-                    ) {
+                    let key = keystroke.key.as_str();
+                    if this.handle_data_row_edit_key(key, keystroke.modifiers, window, cx) {
                         // Suppress the input's competing caret action for this keystroke.
                         cx.stop_propagation();
+                    } else if matches!(key, "left" | "right" | "home" | "end")
+                        && this.data_mode() == FieldMode::Editing
+                    {
+                        // A caret-only key falls through to the input; recompute the list/hint once
+                        // the input has moved the caret (`functional_spec.md §1`).
+                        this.schedule_autocomplete_recompute(window, cx);
                     }
                 });
             }),
@@ -607,6 +637,8 @@ impl ChromeView {
             quick_edit: false,
             committed_cell: None,
             cap_error_external: None,
+            autocomplete: None,
+            sig_hint: None,
             eval: EvalIndicator::default(),
             fill_open: false,
             color_picker,
@@ -885,6 +917,8 @@ impl ChromeView {
         self.apply_data_effects(effects, window, cx);
         self.edit.close();
         self.quick_edit = false;
+        self.autocomplete = None;
+        self.sig_hint = None;
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -919,6 +953,7 @@ impl ChromeView {
             input.focus(window, cx);
         });
         self.apply_data_effects(effects, window, cx);
+        self.recompute_autocomplete(cx);
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -968,6 +1003,7 @@ impl ChromeView {
         });
         self.edit.set_syncing(false);
         self.edit.open_on(cell);
+        self.recompute_autocomplete(cx);
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -1019,6 +1055,8 @@ impl ChromeView {
         if self.data_row.mode() != FieldMode::Editing {
             self.edit.close();
             self.quick_edit = false;
+            self.autocomplete = None;
+            self.sig_hint = None;
         }
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
@@ -1068,6 +1106,30 @@ impl ChromeView {
     ) -> bool {
         if self.data_mode() != FieldMode::Editing {
             return false;
+        }
+        // When the completion list is open it preempts navigation/accept/dismiss keys
+        // (`functional_spec.md §1`); every other key falls through to update/dismiss the list via
+        // the normal `Change` recompute.
+        if self.autocomplete.is_some() {
+            match key {
+                "down" => {
+                    self.autocomplete_nav(true, cx);
+                    return true;
+                }
+                "up" => {
+                    self.autocomplete_nav(false, cx);
+                    return true;
+                }
+                "enter" | "tab" => {
+                    self.autocomplete_accept(window, cx);
+                    return true;
+                }
+                "escape" => {
+                    self.autocomplete_dismiss(window, cx);
+                    return true;
+                }
+                _ => {}
+            }
         }
         if key == "tab" {
             let dir = if modifiers.shift {
@@ -1132,6 +1194,7 @@ impl ChromeView {
                 self.edit.set_syncing(false);
                 let effects = self.data_row.reduce(DataRowEvent::Edited { text });
                 self.apply_data_effects(effects, window, cx);
+                self.recompute_autocomplete(cx);
                 self.refresh_edit_grid_state(window, cx);
                 cx.notify();
             }
@@ -1190,6 +1253,16 @@ impl ChromeView {
         // Quick-edit is meaningful only while the edit is live; gate on `editing` so the grid's copy
         // auto-clears the instant the edit ends (`functional_spec.md §5`).
         let quick_edit = editing && self.quick_edit;
+        // The autocomplete list + signature hint render under the in-cell overlay only when it is
+        // the driving editor (the data row renders its own — §1). Cleared otherwise so a data-row
+        // list never leaks into the grid.
+        let in_cell_driving = self.edit.origin() == EditOrigin::InCell;
+        let autocomplete = in_cell_driving
+            .then(|| self.autocomplete_display())
+            .flatten();
+        let sig_hint = in_cell_driving
+            .then(|| self.sig_hint.map(SharedString::from))
+            .flatten();
         let nonempty = mirror.is_some() || in_cell.is_some();
         // Skip an all-`None` clear when nothing was shown (idle selection moves would otherwise
         // re-push every keystroke); always push when something is/was shown so the clear lands.
@@ -1203,10 +1276,262 @@ impl ChromeView {
                 in_cell,
                 cap,
                 quick_edit,
+                autocomplete,
+                sig_hint,
             },
             window,
             cx,
         );
+    }
+
+    // ---- Function autocomplete + signature hints (`gaps_closing_7_15 §1`) ------------------
+
+    /// The `InputState` currently driving the shared pending edit (the editor the user types in),
+    /// so autocomplete reads the right caret.
+    fn driving_input(&self) -> &Entity<InputState> {
+        match self.edit.origin() {
+            EditOrigin::DataRow => &self.content_input,
+            EditOrigin::InCell => self.edit.in_cell(),
+        }
+    }
+
+    /// Recomputes the autocomplete list + signature hint from the **driving** editor's text and
+    /// caret after a keystroke (`architecture.md §1.3`). Sets both
+    /// [`autocomplete`](Self::autocomplete) and [`sig_hint`](Self::sig_hint); the caller pushes
+    /// grid state + notifies. A visible cap error takes precedence — both are cleared while it
+    /// shows.
+    fn recompute_autocomplete(&mut self, cx: &mut Context<Self>) {
+        if self.cap_error_visible() {
+            self.autocomplete = None;
+            self.sig_hint = None;
+            return;
+        }
+        let input = self.driving_input().read(cx);
+        let text = input.value().to_string();
+        let caret = input.cursor();
+
+        self.autocomplete = match functions::fn_edit_context(&text, caret) {
+            Some(ctx) => {
+                let matches = functions::complete(&ctx.prefix);
+                if matches.is_empty() {
+                    None
+                } else {
+                    // Preserve the highlight across a same-token refresh (typing more of the same
+                    // name); reset to the top when the token moved or the list shrank past it.
+                    let highlight = match &self.autocomplete {
+                        Some(prev) if prev.token_start == ctx.token_start => {
+                            prev.highlight.min(matches.len() - 1)
+                        }
+                        _ => 0,
+                    };
+                    Some(Autocomplete {
+                        matches,
+                        highlight,
+                        token_start: ctx.token_start,
+                    })
+                }
+            }
+            None => None,
+        };
+
+        self.sig_hint = functions::enclosing_fn_name(&text, caret)
+            .and_then(functions::signature)
+            .map(|s| s.template);
+    }
+
+    /// Recompute the list/hint and re-push grid state + notify (the full per-keystroke effect,
+    /// used by the deferred caret-move recompute below).
+    fn recompute_autocomplete_and_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.recompute_autocomplete(cx);
+        self.refresh_edit_grid_state(window, cx);
+        cx.notify();
+    }
+
+    /// Schedule a recompute for *after* a caret-only key (←/→/Home/End) has moved the caret. The
+    /// pinned `InputState` fires no event on a pure caret move, and the intercept/`capture_key_down`
+    /// seams run *before* the input moves the caret — so a synchronous recompute would read the
+    /// stale (pre-move) caret. Deferring to the next cycle reads the moved caret, so the list
+    /// updates/dismisses and the signature hint tracks the caret (`functional_spec.md §1`).
+    fn schedule_autocomplete_recompute(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            if let Some(view) = weak.upgrade() {
+                view.update(cx, |this, cx| {
+                    this.recompute_autocomplete_and_refresh(window, cx);
+                });
+            }
+        });
+    }
+
+    /// The autocomplete list as grid-renderable display state (all matches; the render caps the
+    /// visible height + scrolls per `functional_spec.md §1`), or `None` when the list is closed.
+    fn autocomplete_display(&self) -> Option<AutocompleteDisplay> {
+        let ac = self.autocomplete.as_ref()?;
+        let rows = ac
+            .matches
+            .iter()
+            .map(|f| AutocompleteRow {
+                name: f.name.into(),
+                template: f.template.into(),
+            })
+            .collect();
+        Some(AutocompleteDisplay {
+            rows,
+            highlight: ac.highlight,
+        })
+    }
+
+    /// Move the highlighted row down/up, clamped (no wrap — `functional_spec.md §1`).
+    pub fn autocomplete_nav(&mut self, down: bool, cx: &mut Context<Self>) {
+        if let Some(ac) = self.autocomplete.as_mut() {
+            let last = ac.matches.len().saturating_sub(1);
+            ac.highlight = if down {
+                (ac.highlight + 1).min(last)
+            } else {
+                ac.highlight.saturating_sub(1)
+            };
+            cx.notify();
+        }
+    }
+
+    /// Close the list only — the edit continues, nothing is committed or reverted
+    /// (`functional_spec.md §1`, Esc). The signature hint stays as-is.
+    pub fn autocomplete_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete.take().is_some() {
+            self.refresh_edit_grid_state(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Accept the highlighted completion (Tab / Enter / mouse click on the highlighted row).
+    pub fn autocomplete_accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.accept_autocomplete(window, cx);
+    }
+
+    /// A caret-only key (←/→/Home/End) moved the caret in the **in-cell** overlay (routed from the
+    /// grid, which sees these keys but does not own the list state). Recompute the list/hint after
+    /// the move (`functional_spec.md §1`), mirroring the data-row intercept path.
+    pub fn autocomplete_caret_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.schedule_autocomplete_recompute(window, cx);
+    }
+
+    /// Accept the completion at `index` (a mouse click on a specific in-cell list row).
+    pub fn autocomplete_accept_at(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ac) = self.autocomplete.as_mut() {
+            if index < ac.matches.len() {
+                ac.highlight = index;
+            }
+        }
+        self.accept_autocomplete(window, cx);
+    }
+
+    /// Replace the typed prefix with `NAME(` and place the caret just after the paren (D1.2), then
+    /// show the accepted function's signature hint. Drives both editors + the reducer so the
+    /// pending edit stays consistent (`architecture.md §1.5`).
+    fn accept_autocomplete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ac) = self.autocomplete.take() else {
+            return;
+        };
+        let Some(sig) = ac.matches.get(ac.highlight).copied() else {
+            return;
+        };
+        let origin = self.edit.origin();
+        let text = self.driving_input().read(cx).value().to_string();
+        let caret = self.driving_input().read(cx).cursor();
+        // Re-derive the token span from the CURRENT text + caret (never the stored `token_start`):
+        // the caret may have moved within the token since the list opened, so accepting must replace
+        // the WHOLE identifier token, not just `[token_start, caret)`. Without this, `=sum` with the
+        // caret moved to offset 2 would splice to `=SUM(um` instead of `=SUM(`. If the caret is no
+        // longer in a name token, there is nothing to complete.
+        let Some(ctx) = functions::fn_edit_context(&text, caret) else {
+            self.refresh_edit_grid_state(window, cx);
+            cx.notify();
+            return;
+        };
+        let token_start = ctx.token_start;
+        // Extend right over the remaining identifier chars (letters/digits/`.`/`_`) to the token end.
+        let bytes = text.as_bytes();
+        let mut token_end = caret;
+        while token_end < bytes.len()
+            && (bytes[token_end].is_ascii_alphanumeric()
+                || bytes[token_end] == b'.'
+                || bytes[token_end] == b'_')
+        {
+            token_end += 1;
+        }
+        let insertion = format!("{}(", sig.name);
+        let new_caret = token_start + insertion.len();
+        let mut new_text = String::with_capacity(text.len() + insertion.len());
+        new_text.push_str(&text[..token_start]);
+        new_text.push_str(&insertion);
+        new_text.push_str(&text[token_end..]);
+
+        // Drive the shared reducer with the new canonical text (keeps cap-validation/commit
+        // consistent), exactly as the programmatic-text paths do.
+        let effects = self.data_row.reduce(DataRowEvent::Edited {
+            text: new_text.clone(),
+        });
+        // Position the caret just after the inserted `(` (single-line editor → line 0, char col).
+        let char_col = new_text[..new_caret].chars().count() as u32;
+        self.set_driving_text_and_caret(origin, &new_text, char_col, window, cx);
+        self.apply_data_effects(effects, window, cx);
+        // Mirror into the other editor (its caret at end is fine — it is not the one being typed in).
+        self.mirror_other_editor(origin, &new_text, window, cx);
+
+        self.sig_hint = Some(sig.template);
+        self.refresh_edit_grid_state(window, cx);
+        cx.notify();
+    }
+
+    /// Sets the driving editor's text (events suppressed) and moves its caret to `char_col`.
+    fn set_driving_text_and_caret(
+        &mut self,
+        origin: EditOrigin,
+        text: &str,
+        char_col: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = match origin {
+            EditOrigin::DataRow => self.content_input.clone(),
+            EditOrigin::InCell => self.edit.in_cell().clone(),
+        };
+        input.update(cx, |input, cx| {
+            input.set_value(text.to_string(), window, cx);
+            input.set_cursor_position(Position::new(0, char_col), window, cx);
+        });
+    }
+
+    /// Pushes `text` into the editor that is **not** driving (its caret lands at end), under the
+    /// sync guard so the echo is ignored.
+    fn mirror_other_editor(
+        &mut self,
+        origin: EditOrigin,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit.set_syncing(true);
+        match origin {
+            EditOrigin::DataRow => {
+                if self.edit.is_open() {
+                    self.edit.in_cell().update(cx, |input, cx| {
+                        input.set_value(text.to_string(), window, cx);
+                    });
+                }
+            }
+            EditOrigin::InCell => {
+                self.content_input.update(cx, |input, cx| {
+                    input.set_value(text.to_string(), window, cx);
+                });
+            }
+        }
+        self.edit.set_syncing(false);
     }
 
     /// Folds a worker event into the chrome (Phase 11 calls this from the event task; tests
@@ -1324,6 +1649,7 @@ impl ChromeView {
                 let effects = self.data_row.reduce(DataRowEvent::Edited { text });
                 self.apply_data_effects(effects, window, cx);
                 self.mirror_to_in_cell(window, cx);
+                self.recompute_autocomplete(cx);
                 self.refresh_edit_grid_state(window, cx);
                 cx.notify();
             }
@@ -4105,9 +4431,15 @@ impl ChromeView {
 
         // The data-row cap popover anchors under the data row only when it is the active editor;
         // an in-cell cap error is shown under the overlay by the grid (`edit_controller.md §4.2`).
+        // The completion list + signature hint anchor at the same spot but yield to the cap error
+        // (it means the edit can't commit — `functional_spec.md §1`).
         if self.edit.origin() == EditOrigin::DataRow {
             if let Some(message) = self.cap_error_message() {
                 overlays.push(self.render_cap_error_popover(message));
+            } else if let Some(list) = self.autocomplete_display() {
+                overlays.push(self.render_autocomplete_popover(&list, cx));
+            } else if let Some(template) = self.sig_hint {
+                overlays.push(self.render_sig_hint_popover(template));
             }
         }
         if self.fill_open {
@@ -4181,6 +4513,105 @@ impl ChromeView {
             .shadow_md()
             .whitespace_nowrap()
             .child(message)
+            .into_any_element()
+    }
+
+    /// The function-completion dropdown under the data-row field (`functional_spec.md §1`): a
+    /// passive (no-backdrop) list anchored below the content entry, capped to ~10 rows with
+    /// internal scroll. Each row accepts on click; the highlighted row is tinted. Mirrors the
+    /// in-cell list the grid draws from the same [`AutocompleteDisplay`].
+    fn render_autocomplete_popover(
+        &self,
+        list: &AutocompleteDisplay,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id("autocomplete-list")
+            .absolute()
+            .top(px(ACTION_ROW_H + DATA_ROW_H + 2.0))
+            .left(px(DATA_ROW_CONTENT_LEFT))
+            .occlude()
+            .debug_selector(|| "autocomplete-list".into())
+            .flex()
+            .flex_col()
+            .min_w(px(AUTOCOMPLETE_MIN_W))
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .bg(rgb(ACTIVE_TAB_BG))
+            .border_1()
+            .border_color(rgb(HAIRLINE))
+            .rounded_md()
+            .shadow_md()
+            .children(
+                list.rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| self.autocomplete_row(i, row, i == list.highlight, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// One completion row (shared shape with the grid's in-cell list): name + argument template,
+    /// tinted when highlighted, accepting on click.
+    fn autocomplete_row(
+        &self,
+        index: usize,
+        row: &AutocompleteRow,
+        highlighted: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(gpui::ElementId::Name(
+                format!("autocomplete-row-{index}").into(),
+            ))
+            .flex()
+            .items_baseline()
+            .gap_2()
+            .px_2()
+            .py(px(2.0))
+            .when(highlighted, |d| d.bg(rgb(AUTOCOMPLETE_HL_BG)))
+            // Hover highlights a row too (`functional_spec.md §1`, Mouse), matching the keyboard tint.
+            .hover(|s| s.bg(rgb(AUTOCOMPLETE_HL_BG)))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(TEXT))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(row.name.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED_TEXT))
+                    .whitespace_nowrap()
+                    .child(row.template.clone()),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.autocomplete_accept_at(index, window, cx);
+                }),
+            )
+    }
+
+    /// The passive one-line signature hint under the data-row field (D1.1 — the whole template,
+    /// no current-arg tracking). Shown only when the list is not covering the same anchor.
+    fn render_sig_hint_popover(&self, template: &str) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .top(px(ACTION_ROW_H + DATA_ROW_H + 2.0))
+            .left(px(DATA_ROW_CONTENT_LEFT))
+            .px_2()
+            .py_1()
+            .bg(rgb(ACTIVE_TAB_BG))
+            .text_color(rgb(MUTED_TEXT))
+            .text_size(px(11.0))
+            .border_1()
+            .border_color(rgb(HAIRLINE))
+            .rounded_md()
+            .shadow_md()
+            .whitespace_nowrap()
+            .child(template.to_string())
             .into_any_element()
     }
 
@@ -10714,5 +11145,183 @@ mod tests {
             None,
             "the in-cell cap popover clears when focus flips to the data row"
         );
+    }
+
+    // ---- Function autocomplete + signature hints (`gaps_closing_7_15 §1`) ------------------
+
+    /// The autocomplete display on the most recent in-cell edit-state push.
+    fn last_edit_state_autocomplete(reqs: &[ChromeGridRequest]) -> Option<AutocompleteDisplay> {
+        reqs.iter().rev().find_map(|r| match r {
+            ChromeGridRequest::EditState { autocomplete, .. } => Some(autocomplete.clone()),
+            _ => None,
+        })?
+    }
+
+    #[gpui::test]
+    fn typing_prefix_opens_list(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=su", window, cx));
+        upd(&h, cx, |c, _w, _cx| {
+            let ac = c.autocomplete.as_ref().expect("list open on =su");
+            assert!(ac.matches.len() >= 3, "several SU* matches");
+            assert!(ac.matches.iter().all(|f| f.name.starts_with("SU")));
+            assert!(ac.matches.iter().any(|f| f.name == "SUM"), "SUM present");
+            assert_eq!(ac.highlight, 0, "top row highlighted");
+            // The leading block is the common (rank-0) set, alphabetical.
+            assert_eq!(ac.matches[0].rank, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn non_formula_never_triggers(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("su", window, cx));
+        upd(&h, cx, |c, _w, _cx| {
+            assert!(c.autocomplete.is_none(), "no `=` → no list");
+        });
+    }
+
+    #[gpui::test]
+    fn nav_moves_highlight_clamped(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=su", window, cx));
+        upd(&h, cx, |c, _w, cx| {
+            c.autocomplete_nav(false, cx);
+            assert_eq!(
+                c.autocomplete.as_ref().unwrap().highlight,
+                0,
+                "clamp at top"
+            );
+            c.autocomplete_nav(true, cx);
+            assert_eq!(c.autocomplete.as_ref().unwrap().highlight, 1);
+            c.autocomplete_nav(false, cx);
+            assert_eq!(c.autocomplete.as_ref().unwrap().highlight, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn accept_inserts_name_paren_and_places_caret(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // "=sum" → SUM is the exact match, highlighted first.
+        upd(&h, cx, |c, window, cx| c.begin_typed("=sum", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            assert_eq!(
+                c.autocomplete.as_ref().unwrap().matches[0].name,
+                "SUM",
+                "exact SUM highlighted"
+            );
+            c.autocomplete_accept(window, cx);
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert!(c.autocomplete.is_none(), "list closes on accept");
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=SUM(");
+            assert_eq!(c.content_input.read(cx).cursor(), 5, "caret just after `(`");
+            assert_eq!(c.sig_hint, Some("SUM(number1, [number2], …)"));
+            assert_eq!(c.data_mode(), FieldMode::Editing, "edit continues");
+        });
+    }
+
+    #[gpui::test]
+    fn accept_mid_formula_keeps_suffix(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=1+sum", window, cx));
+        // Move the caret back before the trailing (none here) — caret is at end (6).
+        upd(&h, cx, |c, window, cx| c.autocomplete_accept(window, cx));
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=1+SUM(");
+            assert_eq!(c.content_input.read(cx).cursor(), 7);
+        });
+    }
+
+    #[gpui::test]
+    fn esc_closes_list_keeps_edit(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=su", window, cx));
+        upd(&h, cx, |c, window, cx| c.autocomplete_dismiss(window, cx));
+        upd(&h, cx, |c, _w, cx| {
+            assert!(c.autocomplete.is_none(), "list dismissed");
+            assert_eq!(c.data_mode(), FieldMode::Editing, "edit continues");
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                "=su",
+                "text unchanged"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sig_hint_shows_when_caret_inside_call(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=SUM(", window, cx));
+        upd(&h, cx, |c, _w, _cx| {
+            assert!(c.autocomplete.is_none(), "no name token after `(`");
+            assert_eq!(c.sig_hint, Some("SUM(number1, [number2], …)"));
+        });
+    }
+
+    #[gpui::test]
+    fn in_cell_path_opens_and_accepts(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // Open the in-cell overlay over the active cell, then type a formula prefix into it.
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx)
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.edit.in_cell().update(cx, |i, cx| {
+                i.set_value("=sum", window, cx);
+                i.set_cursor_position(Position::new(0, 4), window, cx);
+            });
+            c.recompute_autocomplete(cx);
+            c.refresh_edit_grid_state(window, cx);
+        });
+        upd(&h, cx, |c, _w, _cx| {
+            assert!(c.autocomplete.is_some(), "in-cell list open");
+        });
+        // The in-cell list is pushed to the grid for rendering.
+        assert!(
+            last_edit_state_autocomplete(&h.grid_requests.borrow()).is_some(),
+            "in-cell autocomplete pushed to grid"
+        );
+        upd(&h, cx, |c, window, cx| c.autocomplete_accept(window, cx));
+        upd(&h, cx, |c, _w, cx| {
+            assert!(c.autocomplete.is_none());
+            assert_eq!(c.edit.in_cell().read(cx).value().to_string(), "=SUM(");
+            assert_eq!(c.edit.in_cell().read(cx).cursor(), 5);
+        });
+        // The list-cleared state reached the grid.
+        assert!(
+            last_edit_state_autocomplete(&h.grid_requests.borrow()).is_none(),
+            "in-cell list cleared on the grid after accept"
+        );
+    }
+
+    #[gpui::test]
+    fn caret_move_updates_list_and_accept_replaces_whole_token(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=sum", window, cx));
+        // Move the caret into the MIDDLE of the token (offset 2 = "=s|um"); the recompute the caret
+        // seam schedules is exercised here directly.
+        let name = upd(&h, cx, |c, window, cx| {
+            c.content_input.update(cx, |i, cx| {
+                i.set_cursor_position(Position::new(0, 2), window, cx);
+            });
+            c.recompute_autocomplete(cx);
+            let ac = c
+                .autocomplete
+                .as_ref()
+                .expect("list still open on prefix 's'");
+            assert!(ac.matches[0].name.starts_with('S'));
+            ac.matches[ac.highlight].name
+        });
+        upd(&h, cx, |c, window, cx| c.autocomplete_accept(window, cx));
+        upd(&h, cx, |c, _w, cx| {
+            // The WHOLE token is replaced — not spliced at the caret (which would leave "um").
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                format!("={name}("),
+                "accept after a mid-token caret move replaces the whole token"
+            );
+            assert_eq!(c.content_input.read(cx).cursor(), 1 + name.len() + 1);
+        });
     }
 }

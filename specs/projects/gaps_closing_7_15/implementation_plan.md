@@ -17,7 +17,7 @@ architecture.
 
 ## Phases
 
-- [ ] **Phase 1 — Function autocomplete + signature hints (§1).** New
+- [x] **Phase 1 — Function autocomplete + signature hints (§1).** New
       `freecell-core/functions.rs` (static 345-name catalog + `complete`/`signature` +
       `fn_edit_context`/`enclosing_fn_name` lexical heuristics); `ChromeView` autocomplete
       state + per-keystroke recompute + keyboard interception (data-row interceptor +

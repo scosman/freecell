@@ -1973,4 +1973,27 @@ mod tests {
             "focus returns to the grid after an in-cell key command (deferred FocusGrid landed)"
         );
     }
+
+    #[gpui::test]
+    fn document_window_focuses_grid_on_mount(cx: &mut TestAppContext) {
+        use gpui::Focusable as _;
+
+        // v0.5 gap ("Grid lacks keyboard focus on initial load"): a freshly opened document window
+        // rendered A1 selected but took no keystrokes until a click focused the grid — the shell used
+        // to focus its OWN handle on mount, and GPUI dispatches keys UP from the focused node, so the
+        // grid child never saw them. Mount now focuses the grid. `new_injectable_window` opens the
+        // real Welcome→New document window (worker-less), so this guards that exact path.
+        boot(cx);
+        let (handle, entity) = new_injectable_window(cx);
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+        let mut vcx = gpui::VisualTestContext::from_window(handle, cx);
+        vcx.run_until_parked();
+
+        let grid_focused =
+            vcx.update(|window, cx| grid.read(cx).focus_handle(cx).is_focused(window));
+        assert!(
+            grid_focused,
+            "a document window focuses the grid on mount so typing works without a click first"
+        );
+    }
 }

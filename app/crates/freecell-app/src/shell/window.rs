@@ -290,7 +290,17 @@ impl WorkbookWindow {
             grid.update(cx, |g, cx| g.set_loading(Some(name), cx));
         }
 
-        focus_handle.focus(window, cx);
+        // Focus the **grid**, not the shell, on mount so a freshly opened workbook (or a
+        // Welcome→New/Open document window) takes keystrokes immediately — A1 is already selected,
+        // but GPUI dispatches keys up from the focused node, so with the shell (a parent) focused
+        // the grid child received no key events until a click focused it (v0.5 gap). Reuse the
+        // grid's own `focus_self`; the shell's window-scoped actions still fire because they bubble
+        // up from the focused grid through the `WorkbookWindow` subtree. `focus_handle` remains the
+        // window's tracked handle (`track_focus` in `render`) and its `Focusable` identity. Focusing
+        // here is a synchronous `grid.update` like the two above — we are in the window's own `build`
+        // (a `Context<WorkbookWindow>`), not inside the grid's own update, so unlike `FocusGrid` from
+        // an in-cell key command it cannot re-enter a leased grid update (BUG #5), and needs no defer.
+        grid.update(cx, |g, cx| g.focus_self(window, cx));
         window.set_window_title(&lifecycle::window_title(
             &lifecycle::document_name(path.as_deref()),
             false,

@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # gaps_closing_7_15
@@ -31,24 +31,23 @@ number-format presets, autofit column width, render polish pair).
 4. **Hide / unhide rows & columns** — header context-menu entries. Fork half per policy
    (two clean branches: row-hidden `UserModel` setter; column-hidden modelling +
    round-trip); FreeCell half renders hidden as zero-size in the axis geometry.
-5. **Everyday scalar functions batch + TRIM bug (fork)** — SUMPRODUCT, PROPER, REPLACE,
-   CHAR, CODE, CLEAN, DOLLAR, ADDRESS, plus the TRIM internal-runs fix. Each is an
-   independently-implementable engine function = one `fix/` branch = one upstream PR
-   (per the fork policy); pure engine + tests, fully autonomous. SUMPRODUCT alone bites
-   real home sheets. (TRANSPOSE/XMATCH/percentile-quartile stay out — array/semantics
-   heavier.)
-6. **Basic sort (A→Z / Z→A)** — selection/column sort, header-aware, via the context
-   menu. **The borderline one:** needs a new fork range-sort op (values + styles move
-   together, one undo step) — the largest single phase here; flagged so the owner can cut
-   it if this round should stay strictly low-risk.
-7. **Autofit row height** (double-click a row divider) — small; pairs with the shipped
+5. **Autofit row height** (double-click a row divider) — small; pairs with the shipped
    autofit column width and reuses the wrap-measurement machinery from row auto-grow.
 
-Plus a final **render-validation phase** (required by convention: items 3, 4, and 7 touch
+Plus a final **render-validation phase** (required by convention: items 3, 4, and 5 touch
 grid geometry/overlay pixels): full pixel suite + baseline eyeball + CI `render` gate,
 once, after all coding phases.
 
+**Owner scope call (2026-07-16):** approved items 1, 2, 3, 4, and autofit row height;
+**cut** the everyday-scalar-functions fork batch (SUMPRODUCT etc. + TRIM fix) and **basic
+sort** from this round — both stay open in GAPS.md for a later round.
+
 ## Explicitly excluded (and why)
+
+- **Everyday scalar functions batch + TRIM bug (fork)** — cut at scope review 2026-07-16;
+  independent fork-function work, better as its own upstreaming batch.
+- **Basic sort (A→Z / Z→A)** — cut at scope review 2026-07-16; needs a brand-new fork
+  range-sort op (values + styles, one undo step) — the largest/riskiest candidate.
 
 - **Conditional formatting** — engine-side done in the fork, but rule-editor UI + grid
   render (data bars, color scales) + round-trip is a multi-phase project of its own.

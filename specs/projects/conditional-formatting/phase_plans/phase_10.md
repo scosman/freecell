@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 10: Render validation + perf (late phase)
@@ -99,5 +99,36 @@ this phase iterates with the `cf_` subset only.
   populates them in the cache (P3). So this phase cannot move a non-CF baseline.
 - The full pixel suite run + CI `render` dispatch is the **manager's** step after this phase (per the
   prompt), not done here.
-</content>
-</invoke>
+
+## What was done
+
+- **Render cases + scene builder** (steps 1-3) were already scaffolded; verified they compile and
+  render over the real GridView + engine stack. The `Scene::cond_fmt` builder sends a real
+  `Command::AddCondFmt`; the P3 value-dependent cache folds the winning rule's differential into the
+  published `RenderStyle`, so the captured `SheetCache` carries the CF fills the grid paints.
+- **3 CF baselines generated + eyeballed + committed** (`414840a`), via `render_tests.sh generate
+  --only cf_` so no existing baseline was touched:
+  - `cf_highlight_greater_than` — `CellIs > 100` fills 150/200/175/120 light-red / dark-red; the rest
+    plain.
+  - `cf_color_scale_3` — a smooth green→yellow→red interpolation across 10→100 (midpoint 50 yellow).
+  - `cf_highlight_text_contains` — `Text Contains "Fail"` fills the two "Fail" cells; Pass/Pending plain.
+  These pixel captures confirm CF renders correctly end-to-end — and validate the BUG-1 fix (CF now
+  applies on rule add, no value nudge needed) at the pixel level.
+- **`cf_perf` bin** (step 4) written, committed (`c0ab04a`): headless CF edit-path benchmark through
+  the real `DocumentClient`, CF-on vs CF-off, force+asserted, `results/cf-perf.json` committed.
+
+## Verification
+
+- **Subset** `render_tests.sh test cf_` → 3/3 pass (against the fresh baselines).
+- **Full pixel suite via the CI `render` gate** (the required truth): dispatched on the branch (commit
+  `414840a`) and **green** — `render (Xvfb + lavapipe)` completed **success**, the full suite step
+  passing in ~25 min. (A full *local* run was not done: software lavapipe on this container renders at
+  ~185 s/case, so all ~150 cases locally would take hours; the CI gate is the authoritative full-suite
+  validation per CLAUDE.md, and the 3 new cases were validated + eyeballed locally.)
+- **Perf** (release, 4-core Xeon @2.8 GHz, `414840a`, n=250): edit CF-on p50 **7.86 ms** / p99
+  **11.07 ms**; CF-off p50 **3.38 ms** / p99 **5.88 ms**; delta +4.5 ms — the bounded 2048-cell CF
+  re-fold the touched-cell mirror skips (quantifies GAPS-CF8). Force+asserts all fired (matching cell
+  filled in CF-on / not in CF-off; the flipped cell's fill tracked its value each iteration).
+- **`cargo fmt --all --check`** clean; **`cargo build --workspace`** green.
+
+**First pass complete → presented for review.**

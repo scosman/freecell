@@ -72,7 +72,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   follow-up) + tag them in the release-target tier table. No code. *Exit:* GAPS updated; cross-links
   to this project.
 
-- [ ] **P10 — Render validation + perf (late phase, per CLAUDE.md).** Add render-test baselines for
+- [x] **P10 — Render validation + perf (late phase, per CLAUDE.md).** Add render-test baselines for
   a CF **highlight** scene + a **color-scale** scene over the real GridView; iterate with the
   `cond_`/`cf_` subset; run the **full** suite once (watchdog); eyeball + commit baselines; dispatch
   the CI `render` gate and confirm green. Benchmark edit→repaint + scroll on a CF-heavy sheet vs a

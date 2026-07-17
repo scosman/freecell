@@ -43,7 +43,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   + Add-rule button, no rows yet). *Exit:* view tests — button toggles sidebar; opening closes the
   chart panel; selection change doesn't close it; chart-panel tests still pass. Smoke launch.
 
-- [ ] **P5 — Rules list (List mode).** Build rows from `client.cond_fmt_rules`; render rows
+- [x] **P5 — Rules list (List mode).** Build rows from `client.cond_fmt_rules`; render rows
   (preview swatch / summary / range / reorder / edit / delete); wire delete + raise/lower; refresh
   on `CondFmtUpdated` + sheet switch; deferred-family rows non-editable but deletable. *Exit:* view
   tests — list renders rows; delete + reorder send commands; sheet switch refreshes; Badge row edit

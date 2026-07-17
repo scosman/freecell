@@ -87,7 +87,10 @@ enum AppliedKind {
     /// `needs_eval = true` to force the coalesced `doc.evaluate()` (which re-evaluates CF) to run —
     /// otherwise the freshly-added rule only shows after a later value edit. Records its op like
     /// `StyleOnly` (maps to `AppliedOp::Rebuild { sheet }`). A full workbook recompute on a CF
-    /// mutation is acceptable (user-driven, infrequent; perf follow-up tracked as GAPS CF8).
+    /// mutation is acceptable (user-driven, infrequent; perf follow-up tracked as GAPS CF8). That
+    /// forced full-workbook `evaluate()` also re-rolls volatile functions (`RAND`/`NOW`/`TODAY`/
+    /// `OFFSET`, etc.) — also acceptable, since it is user-driven/infrequent and Excel likewise
+    /// recalculates volatiles broadly.
     CondFmt,
     /// An edit that resolved to a **no change** (e.g. a fill whose selection is an edge/seed-line
     /// no-op, or whose full-line target clamped to an empty used range). It touched no cell, so the
@@ -8156,15 +8159,39 @@ mod tests {
     fn undo_redo_restores_and_republishes_cf() {
         let (mut worker, rx) = test_worker();
         let sheet = sheet0(&worker);
+        // Seed a matching VALUE (A1 = 150 > 100) in its own batch and make the sheet cache resident,
+        // so the render-cache fill assertions below are real. The CF add stays value-free — exactly
+        // the BUG-1 case — so undo/redo must refresh the render cache on their own. A rule-list-only
+        // check (published_cf) would miss a stale-`cf_cache` render regression across undo/redo.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..10,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "150"),
+        ]);
+        drain_events(&rx);
+
         worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
         drain_events(&rx);
         assert_eq!(published_cf(&worker, sheet).len(), 1);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "A1 (150 > 100) is filled in the render cache after the add"
+        );
 
         // Undo the add → the rule is gone and the map republishes empty.
         worker.process_batch(vec![Command::Undo]);
         assert!(
             published_cf(&worker, sheet).is_empty(),
             "undo removes the published rule"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "undo clears the render-cache fill (rule gone, no value edit) — the BUG-1 coverage class"
         );
         assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
 
@@ -8173,6 +8200,11 @@ mod tests {
         let rules = published_cf(&worker, sheet);
         assert_eq!(rules.len(), 1, "redo restores the rule");
         assert_eq!(rules[0].range, "A1:A10");
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "redo restores the render-cache fill (no value edit)"
+        );
         assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
     }
 

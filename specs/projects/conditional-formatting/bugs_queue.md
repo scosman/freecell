@@ -8,7 +8,25 @@ Status legend: `OPEN` → `FIXING` → `FIXED` (commit).
 
 ---
 
-## BUG-1 — CF does not apply when a rule is added; only applies after a value change  — OPEN
+## BUG-1 — CF does not apply when a rule is added; only applies after a value change  — FIXED (b6e0678 + hardening)
+
+**Fix (commit `b6e0678`):** added an `AppliedKind::CondFmt` variant that records its op like `StyleOnly`
+but sets `needs_eval = true`, so a CF add/update/delete/reorder forces the single coalesced
+`doc.evaluate()` — refreshing IronCalc's `cf_cache` **before** the `AppliedOp::Rebuild` cache refresh
+reads it. CF now applies/updates/clears immediately with no value change. `op_of` unchanged, so the CF
+republish + `CondFmtUpdated` reconcile still fires. 3 worker-seam regression tests added
+(`cond_fmt_applies_on_add_without_value_change`, `…_removed_on_delete_…`, `…_updated_on_edit_…`), each
+asserting the **published render cache** with a value-free batch (so they fail pre-fix).
+
+**Review:** diff-only CR — APPROVE-WITH-NITS. Confirmed the ordering (evaluate runs before the cache
+rebuild), no double-rebuild (the post-recompute path skips already-rebuilt sheets), and that **undo/redo
+of a CF op was already safe** (Undo/Redo return `AppliedKind::Cell` → unconditional eval; the CF op's
+`Touch::Rebuild` re-lands the sheet). Two non-blocking follow-ups folded in as a hardening commit:
+(a) render-cache-fill assertions added to `undo_redo_restores_and_republishes_cf` (closes the exact
+coverage class BUG-1 slipped through — a path proven safe by reasoning now has an assertion);
+(b) a doc-comment note that the forced eval re-rolls volatiles. All checks green (371 lib tests).
+
+<details><summary>Original root-cause analysis (kept for the record)</summary>
 
 **Reported:** "Rendering doesn't update after adding a rule. Need to change the value to make
 conditional formatting apply."
@@ -57,7 +75,9 @@ the matching cell — i.e. CF applies on add. Add analogous coverage for delete 
 update. Then re-verify in the live app.
 
 **Also unblocks:** P10 render validation (its render scenes drive this same worker path — correct CF
-baselines can't be generated until BUG-1 is fixed).
+baselines can't be generated until BUG-1 is fixed). ✅ Now unblocked.
+
+</details>
 
 ---
 

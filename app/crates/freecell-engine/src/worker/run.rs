@@ -80,6 +80,15 @@ enum AppliedKind {
     /// An insert/delete rows/columns — content + geometry + formulas shift, so it needs a
     /// recompute **and** a full active-sheet cache rebuild (`components/grid_structure.md §5.3`).
     Structure,
+    /// A conditional-formatting mutation (add/update/delete/reorder a rule). Values are unchanged,
+    /// but the CF results depend on the new rule set, so IronCalc's `cf_cache` must be refreshed
+    /// **before** the `AppliedOp::Rebuild` cache refresh reads it (BUG-1). Under the batch's paused
+    /// evaluation the fork's internal `evaluate_if_not_paused()` is a no-op, so this variant sets
+    /// `needs_eval = true` to force the coalesced `doc.evaluate()` (which re-evaluates CF) to run —
+    /// otherwise the freshly-added rule only shows after a later value edit. Records its op like
+    /// `StyleOnly` (maps to `AppliedOp::Rebuild { sheet }`). A full workbook recompute on a CF
+    /// mutation is acceptable (user-driven, infrequent; perf follow-up tracked as GAPS CF8).
+    CondFmt,
     /// An edit that resolved to a **no change** (e.g. a fill whose selection is an edge/seed-line
     /// no-op, or whose full-line target clamped to an empty used range). It touched no cell, so the
     /// batch must not count it, recompute, republish, or record an undo op for it.
@@ -850,6 +859,15 @@ impl Worker {
                             applied_ops.push(op_of(edit));
                         }
                         Ok(AppliedKind::Structure) => {
+                            applied += 1;
+                            needs_eval = true;
+                            applied_ops.push(op_of(edit));
+                        }
+                        // A CF mutation records its op like a style edit, but MUST force the eval
+                        // (BUG-1): under paused evaluation nothing refreshes IronCalc's `cf_cache`,
+                        // so the coalesced `doc.evaluate()` has to run before the sheet-cache rebuild
+                        // reads it — otherwise the rule only applies after a later value change.
+                        Ok(AppliedKind::CondFmt) => {
                             applied += 1;
                             needs_eval = true;
                             applied_ops.push(op_of(edit));
@@ -3522,8 +3540,9 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
         Command::AddCondFmt { sheet, range, spec } => {
             let idx = resolve_idx(doc, *sheet)?;
             doc.add_cond_fmt(idx, range, spec)?;
-            // A CF rule changes styles, not values → no recompute (like the other style edits).
-            Ok(AppliedKind::StyleOnly)
+            // A CF rule leaves values unchanged, but its result depends on the new rule → force a
+            // CF re-eval so `cf_cache` is fresh before the cache rebuild reads it (BUG-1).
+            Ok(AppliedKind::CondFmt)
         }
         Command::UpdateCondFmt {
             sheet,
@@ -3533,12 +3552,12 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
         } => {
             let idx = resolve_idx(doc, *sheet)?;
             doc.update_cond_fmt(idx, *index, range, spec)?;
-            Ok(AppliedKind::StyleOnly)
+            Ok(AppliedKind::CondFmt)
         }
         Command::DeleteCondFmt { sheet, index } => {
             let idx = resolve_idx(doc, *sheet)?;
             doc.delete_cond_fmt(idx, *index)?;
-            Ok(AppliedKind::StyleOnly)
+            Ok(AppliedKind::CondFmt)
         }
         // Raise/Lower may be a boundary NO-OP (rule already top/bottom): the engine records no undo
         // diff in that case, so returning anything but `NoOp` would push a phantom worker undo entry
@@ -3550,7 +3569,7 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             Ok(if doc.cond_fmt_rules(idx)? == before {
                 AppliedKind::NoOp
             } else {
-                AppliedKind::StyleOnly
+                AppliedKind::CondFmt
             })
         }
         Command::LowerCondFmtPriority { sheet, index } => {
@@ -3560,7 +3579,7 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             Ok(if doc.cond_fmt_rules(idx)? == before {
                 AppliedKind::NoOp
             } else {
-                AppliedKind::StyleOnly
+                AppliedKind::CondFmt
             })
         }
         Command::Undo => {
@@ -8437,6 +8456,139 @@ mod tests {
         );
         assert_ne!(mid, Some(green), "mid is not the min endpoint");
         assert_ne!(mid, Some(red), "mid is not the max endpoint");
+    }
+
+    // BUG-1 regression: a CF mutation must refresh the published render cache immediately, with no
+    // subsequent value edit. Pre-fix, a CF-only batch left `needs_eval = false`, so `doc.evaluate()`
+    // never ran, IronCalc's `cf_cache` stayed stale, and the sheet-cache rebuild read no CF overlay
+    // — the rule only appeared after a later value change. Each of these tests isolates a CF op in
+    // its own value-free batch, so it FAILS pre-fix and PASSES once CF forces the coalesced eval.
+
+    #[test]
+    fn cond_fmt_applies_on_add_without_value_change() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Seed the values in their OWN batch and let it settle. The CF add below carries NO value
+        // edit — exactly the case BUG-1 missed (a value edit would have forced the eval anyway).
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "10"),
+            set_input(sheet, 1, 0, "20"),
+            set_input(sheet, 2, 0, "30"),
+        ]);
+        drain_events(&rx);
+
+        // A "> 15" red-fill rule over A1:A3 with NO subsequent value change: A2/A3 match, A1 doesn't.
+        worker.process_batch(vec![add_cf(sheet, "A1:A3", "15")]);
+
+        assert_eq!(
+            cache_fill(&worker, sheet, 1, 0),
+            Some(CF_RED),
+            "A2 (20 > 15) is filled immediately on add — no value edit needed (BUG-1)"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 2, 0),
+            Some(CF_RED),
+            "A3 (30 > 15) is filled immediately on add"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "A1 (10) is below the threshold → not filled"
+        );
+        assert!(
+            cond_fmt_updated_for(&drain_events(&rx), sheet),
+            "the add republishes the CF map"
+        );
+    }
+
+    #[test]
+    fn cond_fmt_removed_on_delete_without_value_change() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Value + rule in one batch → the value edit forces the eval, so the fill is present even
+        // pre-fix. This isolates the DELETE (value-free) batch as the thing under test.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "150"),
+            add_cf(sheet, "A1:A10", "100"),
+        ]);
+        drain_events(&rx);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "A1 (150 > 100) is filled after the add"
+        );
+
+        // Delete the rule with NO value edit — the fill must clear from the published cache at once.
+        worker.process_batch(vec![Command::DeleteCondFmt { sheet, index: 0 }]);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "deleting the rule clears the fill without any value change (BUG-1)"
+        );
+        assert!(
+            cond_fmt_updated_for(&drain_events(&rx), sheet),
+            "the delete republishes the CF map"
+        );
+    }
+
+    #[test]
+    fn cond_fmt_updated_on_edit_without_value_change() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Value + "> 100" rule in one batch (fill present pre-fix), isolating the UPDATE batch.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "50"),
+            set_input(sheet, 1, 0, "150"),
+            add_cf(sheet, "A1:A2", "100"),
+        ]);
+        drain_events(&rx);
+        assert_eq!(
+            cache_fill(&worker, sheet, 1, 0),
+            Some(CF_RED),
+            "A2 (150 > 100) starts filled"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "A1 (50) does not match > 100"
+        );
+
+        // Lower the threshold to > 40 with NO value edit — A1 (50) now matches and must gain the fill.
+        worker.process_batch(vec![Command::UpdateCondFmt {
+            sheet,
+            index: 0,
+            range: "A1:A2".to_string(),
+            spec: gt_rule("40"),
+        }]);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "A1 (50 > 40) gains the fill after the threshold edit — no value change (BUG-1)"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 1, 0),
+            Some(CF_RED),
+            "A2 (150 > 40) stays filled"
+        );
+        assert!(
+            cond_fmt_updated_for(&drain_events(&rx), sheet),
+            "the update republishes the CF map"
+        );
     }
 
     #[test]

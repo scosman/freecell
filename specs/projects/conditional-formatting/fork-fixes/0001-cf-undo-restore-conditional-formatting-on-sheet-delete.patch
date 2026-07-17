@@ -1,0 +1,65 @@
+From 1a2c63c0b24570551299811ec4a3aa9a4be4c7f4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 17 Jul 2026 09:35:54 +0000
+Subject: [PATCH] Restore conditional formatting on undo of a sheet delete
+
+The DeleteSheet undo arm re-inserted the worksheet and restored every field
+(cell data, rows, cols, frozen panes, state, color, merge cells, shared
+formulas) except conditional_formatting, so undoing a sheet delete silently
+dropped the sheet's CF rules. Restore them from the diff's old_data alongside
+the other worksheet fields.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DybikvxLNH3WsMP9nyAjhL
+---
+ .../user_model/test_conditional_formatting.rs | 24 +++++++++++++++++++
+ base/src/user_model/undo_redo.rs              |  1 +
+ 2 files changed, 25 insertions(+)
+
+diff --git a/base/src/test/user_model/test_conditional_formatting.rs b/base/src/test/user_model/test_conditional_formatting.rs
+index 16d725a..97be51a 100644
+--- a/base/src/test/user_model/test_conditional_formatting.rs
++++ b/base/src/test/user_model/test_conditional_formatting.rs
+@@ -1220,3 +1220,27 @@ fn test_undo_redo_lower_priority() {
+     model.redo().unwrap();
+     assert_eq!(priorities(&model), vec![2, 1]);
+ }
++
++#[test]
++fn test_delete_sheet_undo_restores_conditional_formatting() {
++    // A sheet's CF rules must survive delete -> undo: the `DeleteSheet` diff carries the whole
++    // worksheet, so undo re-inserting it must bring back its `conditional_formatting`. Regression
++    // for the undo arm that restored every other worksheet field but dropped the CF rules.
++    let mut model = new_empty_user_model();
++    model.new_sheet().unwrap();
++    model
++        .add_conditional_formatting(1, "A1:A5", color_scale())
++        .unwrap();
++    assert_eq!(model.get_conditional_formatting_list(1).unwrap().len(), 1);
++
++    model.delete_sheet(1).unwrap();
++
++    model.undo().unwrap();
++    let list = model.get_conditional_formatting_list(1).unwrap();
++    assert_eq!(list.len(), 1, "undo of delete-sheet restores the CF rules");
++    assert_eq!(list[0].range, "A1:A5");
++
++    // Redo deletes the sheet again (and its CF with it).
++    model.redo().unwrap();
++    assert_eq!(model.get_worksheets_properties().len(), 1);
++}
+diff --git a/base/src/user_model/undo_redo.rs b/base/src/user_model/undo_redo.rs
+index 54209db..596b6e1 100644
+--- a/base/src/user_model/undo_redo.rs
++++ b/base/src/user_model/undo_redo.rs
+@@ -440,6 +440,7 @@ impl<'a> UserModel<'a> {
+                     worksheet.color = old_data.color.clone();
+                     worksheet.merge_cells = old_data.merge_cells.clone();
+                     worksheet.shared_formulas = old_data.shared_formulas.clone();
++                    worksheet.conditional_formatting = old_data.conditional_formatting.clone();
+                     self.model.reset_parsed_structures();
+ 
+                     self.set_selected_sheet(sheet_index)?;
+-- 
+2.43.0
+

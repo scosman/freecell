@@ -931,13 +931,21 @@ impl Worker {
                 // tab bar. Compared by value so undo/redo of a sheet op is caught too.
                 let sheets_after = self.sheet_metas();
                 if sheets_after != sheets_before {
-                    // Drop CF map entries for removed sheets (delete / undo-of-add) so the published
-                    // map never outlives its sheet.
-                    let live: HashSet<SheetId> = sheets_after.iter().map(|m| m.id).collect();
+                    // Reconcile the CF map with the changed sheet SET. Removed sheets (delete /
+                    // undo-of-add) are dropped so the map never outlives its sheet. Sheets that
+                    // REAPPEARED (undo-of-delete restores the worksheet + its CF rules) are
+                    // reconciled so a returning CF sheet republishes its rules + emits
+                    // `CondFmtUpdated` — that undo pushes `Touch::Sheets`, not `Touch::Rebuild`, so
+                    // the returning sheet never entered `cf_sheets` above.
+                    let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
+                    let ids_after: HashSet<SheetId> = sheets_after.iter().map(|m| m.id).collect();
                     self.shared
                         .cond_fmt
                         .write()
-                        .retain(|id, _| live.contains(id));
+                        .retain(|id, _| ids_after.contains(id));
+                    let appeared: Vec<SheetId> =
+                        ids_after.difference(&ids_before).copied().collect();
+                    self.reconcile_published_cond_fmt(&appeared);
                     self.emit(WorkerEvent::SheetsChanged {
                         sheets: sheets_after,
                     });
@@ -3140,7 +3148,18 @@ impl Worker {
                 continue; // non-CF sheet, nothing published → the fast path stays free
             }
             // A read failure degrades to "no rules" (never a panic) — the sheet's entry is dropped.
-            let rules = self.doc.cond_fmt_rules(idx).unwrap_or_default();
+            // Logged (architecture §6), matching `extended_render_style`'s fallback.
+            let rules = match self.doc.cond_fmt_rules(idx) {
+                Ok(rules) => rules,
+                Err(err) => {
+                    tracing::warn!(
+                        sheet = idx,
+                        error = %err,
+                        "cond_fmt_rules read failed; publishing an empty CF list",
+                    );
+                    Vec::new()
+                }
+            };
             let changed = {
                 let map = self.shared.cond_fmt.read();
                 match map.get(&sheet) {
@@ -8135,5 +8154,62 @@ mod tests {
             "a non-CF workbook keeps the published map empty"
         );
         assert!(!any_cond_fmt_updated(&drain_events(&rx)));
+    }
+
+    #[test]
+    fn structural_edit_shifts_published_cf_range() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![add_cf(sheet, "A5:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "A5:A10");
+
+        // Inserting a row above the rule's range shifts it down (the engine displaces CF ranges on a
+        // structural edit); the published list must reflect the new range + emit CondFmtUpdated.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+        assert_eq!(
+            published_cf(&worker, sheet)[0].range,
+            "A6:A11",
+            "the published CF range follows the structural shift"
+        );
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    // Verifies the FreeCell-side reconcile-of-reappeared-sheets fix end-to-end, but only passes
+    // once the engine restores CF on undo-of-delete. That engine fix is committed on the fork's
+    // `freecell-fixes` branch (base/src/user_model/undo_redo.rs `Diff::DeleteSheet` arm) but could
+    // not be pushed from this container (git-proxy 403 on push to scosman/ironcalc), so the pinned
+    // engine still drops CF on undo-of-delete. Remove this `#[ignore]` once `freecell-fixes` carries
+    // the fix and `app/Cargo.lock` is re-pinned (validated green against the fixed fork locally).
+    #[ignore = "blocked on fork CF-undo fix on freecell-fixes (push 403-denied); re-pin then un-ignore"]
+    #[test]
+    fn undo_of_sheet_delete_repopulates_cf_map() {
+        let (mut worker, rx) = test_worker();
+        // Add a second sheet, put a CF rule on it, then delete it — the delete prunes its CF entry.
+        worker.process_batch(vec![Command::AddSheet]);
+        let sheet1 = worker.sheet_metas().last().unwrap().id;
+        worker.process_batch(vec![add_cf(sheet1, "A1:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet1).len(), 1);
+
+        worker.process_batch(vec![Command::DeleteSheet { sheet: sheet1 }]);
+        assert!(
+            published_cf(&worker, sheet1).is_empty(),
+            "deleting the sheet prunes its CF entry"
+        );
+        drain_events(&rx);
+
+        // Undo restores the sheet AND its CF rules — the published map must be repopulated and a
+        // CondFmtUpdated emitted (undo-of-delete pushes `Touch::Sheets`, so the returning sheet only
+        // reaches the reconcile via the sheet-set-change path).
+        worker.process_batch(vec![Command::Undo]);
+        let rules = published_cf(&worker, sheet1);
+        assert_eq!(rules.len(), 1, "undo-of-delete repopulates the CF map");
+        assert_eq!(rules[0].range, "A1:A10");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet1));
     }
 }

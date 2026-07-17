@@ -97,6 +97,18 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
         "icons/paint-bucket.svg",
         include_bytes!("../../assets/icons/paint-bucket.svg"),
     ),
+    // Conditional-formatting rule-list row controls (`components/cf_sidebar.md §5`): the Lucide
+    // `pencil` (edit) + `trash-2` (delete) glyphs, neither shipped by the gpui-component bundle
+    // (it has only a `delete` backspace glyph), vendored in the same tintable form. The row's
+    // reorder ▲/▼ use the bundle's `chevron-up`/`chevron-down` (shared with the find bar).
+    (
+        "icons/pencil.svg",
+        include_bytes!("../../assets/icons/pencil.svg"),
+    ),
+    (
+        "icons/trash-2.svg",
+        include_bytes!("../../assets/icons/trash-2.svg"),
+    ),
     // Legend-position glyphs for the chart edit panel (`panel-top` / `square-x`, post-v1 Batch 2).
     // The bundle ships `panel-right/left/bottom` but not `panel-top`, and no `square-x` at all, so
     // these two are vendored in the same tintable Lucide form; the other three resolve from the
@@ -266,6 +278,24 @@ mod tests {
             assert!(
                 matches!(AppAssets.load(path), Ok(Some(_))),
                 "find-bar icon {path} must resolve"
+            );
+        }
+    }
+
+    /// The CF rule-list row controls' icons all resolve through the combined source: `pencil`
+    /// (edit) + `trash-2` (delete) are FreeCell-vendored, while `chevron-up`/`chevron-down` (the
+    /// reorder ▲/▼) fall through to the gpui-component bundle (`components/cf_sidebar.md §5`).
+    #[test]
+    fn cf_sidebar_icons_all_resolve() {
+        for path in [
+            "icons/pencil.svg",
+            "icons/trash-2.svg",
+            "icons/chevron-up.svg",
+            "icons/chevron-down.svg",
+        ] {
+            assert!(
+                matches!(AppAssets.load(path), Ok(Some(_))),
+                "CF sidebar icon {path} must resolve"
             );
         }
     }

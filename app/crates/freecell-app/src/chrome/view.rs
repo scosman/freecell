@@ -41,8 +41,8 @@ use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
-    format_stat_count, format_stat_value, limits, Align, CellKind, CellRef, RenderStyle, Rgb,
-    SelectionModel, SelectionStats, SheetId, VAlign,
+    format_stat_count, format_stat_value, limits, Align, CellKind, CellRef, CfPreview, CfRuleView,
+    RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -109,6 +109,13 @@ const SWATCH_SELECTED_RING: u32 = 0x4472C4;
 const TARGET_ICON_PX: f32 = 22.0;
 const TARGET_ICON_GREY: u32 = 0xC8C8C8;
 const TARGET_ICON_DARK: u32 = 0x1F1F1F;
+/// The conditional-formatting list-row preview swatch (`components/cf_sidebar.md §5`): a small
+/// hairline chip carrying a highlight rule's fill+text, a colour scale's banded gradient, or a
+/// deferred-family Badge tag.
+const CF_SWATCH_W: f32 = 22.0;
+const CF_SWATCH_H: f32 = 16.0;
+/// The muted tag background behind a deferred-family Badge preview (a light grey).
+const CF_BADGE_BG: u32 = 0xEDEDED;
 
 // `pub(crate)` so the shared docked-sidebar container (`chrome::sidebar`) positions the card
 // between the data row and the tab bar (the right-docked width is `sidebar::SIDEBAR_W`).
@@ -2191,6 +2198,45 @@ impl ChromeView {
             panel.rows = rows;
             cx.notify();
         }
+    }
+
+    /// Raise the priority of the CF rule at storage `index` — the row's ▲ control
+    /// (`components/cf_sidebar.md §5`). Fire-and-forget; the worker republishes the reordered list
+    /// and the sidebar refreshes via `CondFmtUpdated` → [`refresh_cond_fmt`](Self::refresh_cond_fmt).
+    /// A no-op when the sidebar is closed (no target sheet). `index` is the rule's stable storage
+    /// index, not its display position.
+    pub fn raise_cf_rule(&mut self, index: u32) {
+        if let Some(sheet) = self.cond_fmt_sheet() {
+            self.client
+                .send(Command::RaiseCondFmtPriority { sheet, index });
+        }
+    }
+
+    /// Lower the priority of the CF rule at storage `index` — the row's ▼ control (the mirror of
+    /// [`raise_cf_rule`](Self::raise_cf_rule)).
+    pub fn lower_cf_rule(&mut self, index: u32) {
+        if let Some(sheet) = self.cond_fmt_sheet() {
+            self.client
+                .send(Command::LowerCondFmtPriority { sheet, index });
+        }
+    }
+
+    /// Delete the CF rule at storage `index` — the row's 🗑 control. Enabled for every row,
+    /// including deferred-family/Badge rows (which are non-editable but deletable —
+    /// `functional_spec.md §9`). A no-op when the sidebar is closed.
+    pub fn delete_cf_rule(&mut self, index: u32) {
+        if let Some(sheet) = self.cond_fmt_sheet() {
+            self.client.send(Command::DeleteCondFmt { sheet, index });
+        }
+    }
+
+    /// Open the rule editor (List → Editor mode) for `edit_index` (`Some` = edit an existing rule,
+    /// `None` = add). **P6 stub:** the editor form itself lands in Phase 6, so for now this is a
+    /// no-op — the row's ✎ control and the "+ Add rule" button call it but nothing opens yet
+    /// (`components/cf_sidebar.md §4`, implementation_plan P5/P6).
+    fn open_cf_editor(&mut self, _edit_index: Option<u32>, _cx: &mut Context<Self>) {
+        // TODO(P6): assemble CfEditorState (seed from the row's `spec` when editing, or from the
+        // current selection when adding), seed the text inputs, set `panel.editor`, cx.notify().
     }
 
     /// Switch the panel's chart to `kind` (P19). A mutating chart control — like `insert_chart` it
@@ -5220,16 +5266,42 @@ impl ChromeView {
             .text_color(rgb(MUTED_TEXT))
             .child(format!("Rules on {sheet_name}"));
 
-        // TODO(P6): open the rule editor (List → Editor mode). A no-op click for now — the P4 shell
-        // only proves the sidebar opens/closes and docks.
+        // The priority-descending rule rows, or the empty state — placed above the Add button so
+        // "No rules on this sheet yet." reads as the list's own placeholder (`ui_design.md §2.1`).
+        let content = if panel.rows.is_empty() {
+            div()
+                .debug_selector(|| "cf-empty".to_string())
+                .text_size(px(12.0))
+                .text_color(rgb(MUTED_TEXT))
+                .child("No rules on this sheet yet.")
+                .into_any_element()
+        } else {
+            let last = panel.rows.len() - 1;
+            let mut list = div().flex().flex_col().gap_1();
+            for (i, row) in panel.rows.iter().enumerate() {
+                list = list.child(self.render_cf_row(row, i == 0, i == last, cx));
+            }
+            list.into_any_element()
+        };
+
+        // "+ Add rule" opens the (P6) editor in add mode; a no-op stub until Phase 6 builds the form.
         let add_rule = Button::new("cond-fmt-add-rule")
             .label("+ Add rule")
             .primary()
             .small()
             .disabled(self.degraded)
-            .on_click(cx.listener(|_this, _: &ClickEvent, _window, _cx| {}));
+            .debug_selector(|| "cond-fmt-add-rule".to_string())
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.open_cf_editor(None, cx);
+            }));
 
-        let body = div().flex().flex_col().gap_3().child(intro).child(add_rule);
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(intro)
+            .child(content)
+            .child(add_rule);
 
         docked_sidebar(
             "cond-fmt",
@@ -5240,6 +5312,112 @@ impl ChromeView {
             body,
         )
         .into_any_element()
+    }
+
+    /// One conditional-formatting rule as a List-mode row (`ui_design.md §2.1`,
+    /// `components/cf_sidebar.md §5`): the preview swatch, a two-line summary/range, and the
+    /// reorder/edit/delete controls. `is_first`/`is_last` are the row's ends in the
+    /// priority-descending list (they gate the ▲/▼ reorder buttons); `row.index` is the rule's
+    /// stable storage index (the handle the index-based mutators take).
+    fn render_cf_row(
+        &self,
+        row: &CfRuleView,
+        is_first: bool,
+        is_last: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let index = row.index;
+        let controls = cf_row_controls(row, is_first, is_last);
+
+        let summary = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(px(1.0))
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(TEXT))
+                    .child(row.summary.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(MUTED_TEXT))
+                    .child(row.range.clone()),
+            );
+
+        let controls_row = div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(1.0))
+            .child(
+                Button::new(gpui::ElementId::Name(format!("cf-row-{index}-up").into()))
+                    .icon(Icon::empty().path("icons/chevron-up.svg"))
+                    .tooltip("Move up")
+                    .ghost()
+                    .small()
+                    .disabled(!controls.move_up)
+                    .debug_selector(move || format!("cf-row-{index}-up"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, _cx| {
+                        this.raise_cf_rule(index);
+                    })),
+            )
+            .child(
+                Button::new(gpui::ElementId::Name(format!("cf-row-{index}-down").into()))
+                    .icon(Icon::empty().path("icons/chevron-down.svg"))
+                    .tooltip("Move down")
+                    .ghost()
+                    .small()
+                    .disabled(!controls.move_down)
+                    .debug_selector(move || format!("cf-row-{index}-down"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, _cx| {
+                        this.lower_cf_rule(index);
+                    })),
+            )
+            .child(
+                Button::new(gpui::ElementId::Name(format!("cf-row-{index}-edit").into()))
+                    .icon(Icon::empty().path("icons/pencil.svg"))
+                    .tooltip("Edit rule")
+                    .ghost()
+                    .small()
+                    .disabled(!controls.edit)
+                    .debug_selector(move || format!("cf-row-{index}-edit"))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.open_cf_editor(Some(index), cx);
+                    })),
+            )
+            .child(
+                Button::new(gpui::ElementId::Name(
+                    format!("cf-row-{index}-delete").into(),
+                ))
+                .icon(Icon::empty().path("icons/trash-2.svg"))
+                .tooltip("Delete rule")
+                .ghost()
+                .small()
+                // Always enabled — even a deferred-family/Badge rule is deletable
+                // (`functional_spec.md §9`); driven off the helper so every control has one source.
+                .disabled(!controls.delete)
+                .debug_selector(move || format!("cf-row-{index}-delete"))
+                .on_click(cx.listener(
+                    move |this, _: &ClickEvent, _window, _cx| {
+                        this.delete_cf_rule(index);
+                    },
+                )),
+            );
+
+        div()
+            .debug_selector(move || format!("cf-row-{index}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .py(px(4.0))
+            .child(render_cf_preview(&row.preview))
+            .child(summary)
+            .child(controls_row)
+            .into_any_element()
     }
 
     /// The Type row: one glyph button per authorable kind, the current one selected (authored only).
@@ -5944,6 +6122,97 @@ impl ChromeView {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// Which of a CF rule row's controls are enabled (`components/cf_sidebar.md §5`). Move-up/down are
+/// disabled at the ends of the priority-descending list; edit is disabled for a non-editable
+/// (deferred-family/Badge) rule; delete is always enabled (even deferred-family rules are
+/// deletable — `functional_spec.md §9`). Pure so the row test asserts the enablement logic without
+/// pixel clicks, and [`render_cf_row`](ChromeView::render_cf_row) derives its `.disabled(...)`
+/// flags from the same source.
+struct CfRowControls {
+    move_up: bool,
+    move_down: bool,
+    edit: bool,
+    delete: bool,
+}
+
+fn cf_row_controls(row: &CfRuleView, is_first: bool, is_last: bool) -> CfRowControls {
+    CfRowControls {
+        move_up: !is_first,
+        move_down: !is_last,
+        edit: row.editable,
+        delete: true,
+    }
+}
+
+/// A `freecell_core::Rgb` as a gpui fill/text colour (the grid maps `Rgb` the same way at draw
+/// time — `color.rs`).
+fn cf_color(c: Rgb) -> Rgba {
+    rgb(c.to_hex())
+}
+
+/// The List-mode preview swatch for a rule's effect (`components/cf_sidebar.md §5`): a highlight
+/// rule's fill + text-colour chip (an "A" glyph so both read), a colour scale's banded gradient,
+/// or a deferred-family/variant Badge tag (the first pass can't author it, only show + delete it).
+fn render_cf_preview(preview: &CfPreview) -> gpui::AnyElement {
+    match preview {
+        CfPreview::Highlight { fill, text_color } => {
+            // "No fill" reads as a white chip; "no text colour" as the default text colour — so the
+            // chip always renders on the sidebar's white card.
+            let bg = (*fill).map(cf_color).unwrap_or_else(|| rgb(ACTIVE_TAB_BG));
+            let fg = (*text_color).map(cf_color).unwrap_or_else(|| rgb(TEXT));
+            div()
+                .flex_shrink_0()
+                .w(px(CF_SWATCH_W))
+                .h(px(CF_SWATCH_H))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(HAIRLINE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(bg)
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child("A"),
+                )
+                .into_any_element()
+        }
+        CfPreview::ColorScale { colors } => {
+            // Equal-width bands across the stop colours — a stepped horizontal gradient the width
+            // of one swatch. `overflow_hidden` clips the bands to the rounded chip.
+            let mut chip = div()
+                .flex_shrink_0()
+                .w(px(CF_SWATCH_W))
+                .h(px(CF_SWATCH_H))
+                .rounded_sm()
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgb(HAIRLINE))
+                .flex();
+            for c in colors {
+                chip = chip.child(div().flex_1().h_full().bg(cf_color(*c)));
+            }
+            chip.into_any_element()
+        }
+        CfPreview::Badge(label) => div()
+            .flex_shrink_0()
+            .px(px(4.0))
+            .py(px(1.0))
+            .rounded_sm()
+            .bg(rgb(CF_BADGE_BG))
+            .border_1()
+            .border_color(rgb(HAIRLINE))
+            .text_size(px(9.5))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(rgb(MUTED_TEXT))
+            .child(label.clone())
+            .into_any_element(),
     }
 }
 
@@ -7464,6 +7733,374 @@ mod tests {
         assert!(
             !upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()),
             "degrade closes the CF sidebar (like the chart panel)"
+        );
+    }
+
+    // ---- Conditional-formatting rules list (P5, `components/cf_sidebar.md §5`) --------------
+
+    /// A no-fill/no-text highlight preview — the common shape for the list-rendering tests.
+    fn cf_highlight() -> CfPreview {
+        CfPreview::Highlight {
+            fill: None,
+            text_color: None,
+        }
+    }
+
+    /// A published rule row with a chosen storage `index`, `summary`, editability, and preview.
+    /// `priority` is irrelevant to rendering (the client publishes the list already
+    /// priority-sorted; the row order is the vec order), so it is fixed at 0.
+    fn cf_view(
+        index: u32,
+        range: &str,
+        summary: &str,
+        editable: bool,
+        preview: CfPreview,
+    ) -> CfRuleView {
+        CfRuleView {
+            index,
+            range: range.to_string(),
+            priority: 0,
+            editable,
+            summary: summary.to_string(),
+            preview,
+            spec: None,
+        }
+    }
+
+    /// The open sidebar's row summaries, top-to-bottom (priority order).
+    fn cf_row_summaries(h: &Harness, cx: &mut TestAppContext) -> Vec<String> {
+        upd(h, cx, |c, _w, _cx| {
+            c.cond_fmt
+                .as_ref()
+                .expect("sidebar open")
+                .rows
+                .iter()
+                .map(|r| r.summary.clone())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn cf_row_controls_reflect_position_and_editability() {
+        let editable = cf_view(1, "A1:A10", "Cell value > 100", true, cf_highlight());
+        let badge = cf_view(
+            4,
+            "C1:C9",
+            "Data bar",
+            false,
+            CfPreview::Badge("Data bar".to_string()),
+        );
+
+        let first = cf_row_controls(&editable, true, false);
+        assert!(
+            !first.move_up,
+            "the first (highest-priority) row can't move up"
+        );
+        assert!(first.move_down);
+        let last = cf_row_controls(&editable, false, true);
+        assert!(last.move_up);
+        assert!(
+            !last.move_down,
+            "the last (lowest-priority) row can't move down"
+        );
+        let middle = cf_row_controls(&editable, false, false);
+        assert!(middle.move_up && middle.move_down);
+        assert!(
+            first.edit && first.delete,
+            "an editable highlight rule can be edited AND deleted"
+        );
+
+        let badge_controls = cf_row_controls(&badge, false, false);
+        assert!(
+            !badge_controls.edit,
+            "a deferred-family Badge rule can't be edited"
+        );
+        assert!(
+            badge_controls.delete,
+            "but a deferred-family Badge rule can still be deleted"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_list_renders_one_row_per_rule(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(5, "A1:A10", "Cell value > 100", true, cf_highlight()),
+                cf_view(
+                    2,
+                    "B2:B20",
+                    "3-color scale",
+                    true,
+                    CfPreview::ColorScale {
+                        colors: vec![Rgb::from_hex(0x63BE7B), Rgb::from_hex(0xF8696B)],
+                    },
+                ),
+                cf_view(
+                    9,
+                    "C1:C9",
+                    "Data bar",
+                    false,
+                    CfPreview::Badge("Data bar".to_string()),
+                ),
+            ],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        // One row painted per published rule, keyed by its stable storage index (5/2/9).
+        for sel in ["cf-row-5", "cf-row-2", "cf-row-9"] {
+            assert!(
+                vcx.debug_bounds(sel).is_some(),
+                "{sel} must render one row per rule"
+            );
+        }
+        assert!(
+            vcx.debug_bounds("cf-empty").is_none(),
+            "no empty state renders while rules exist"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_empty_state_shown_when_no_rules(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("cf-empty").is_some(),
+            "the empty state shows when the sheet carries no rules"
+        );
+        assert!(vcx.debug_bounds("cf-row-0").is_none(), "no rows render");
+        assert!(
+            vcx.debug_bounds("cond-fmt-add-rule").is_some(),
+            "the '+ Add rule' button stays available in the empty state"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_delete_sends_delete_command(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![cf_view(3, "A1:A10", "Rule", true, cf_highlight())],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        h.client.take_commands();
+        upd(&h, cx, |c, _w, _cx| c.delete_cf_rule(3));
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::DeleteCondFmt {
+                    sheet: SheetId(0),
+                    index: 3
+                }]
+            ),
+            "delete sends DeleteCondFmt for the rule's storage index"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_move_up_sends_raise(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![cf_view(2, "A1:A10", "Rule", true, cf_highlight())],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        h.client.take_commands();
+        upd(&h, cx, |c, _w, _cx| c.raise_cf_rule(2));
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::RaiseCondFmtPriority {
+                    sheet: SheetId(0),
+                    index: 2
+                }]
+            ),
+            "move-up sends RaiseCondFmtPriority for the rule's storage index"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_move_down_sends_lower(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![cf_view(2, "A1:A10", "Rule", true, cf_highlight())],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        h.client.take_commands();
+        upd(&h, cx, |c, _w, _cx| c.lower_cf_rule(2));
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::LowerCondFmtPriority {
+                    sheet: SheetId(0),
+                    index: 2
+                }]
+            ),
+            "move-down sends LowerCondFmtPriority for the rule's storage index"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_commands_noop_when_sidebar_closed(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        // The sidebar is closed → no target sheet → the mutators are no-ops (they never target the
+        // active sheet blindly).
+        upd(&h, cx, |c, _w, _cx| {
+            c.raise_cf_rule(0);
+            c.lower_cf_rule(0);
+            c.delete_cf_rule(0);
+        });
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a closed CF sidebar sends no CF command"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_delete_button_click_sends_delete(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(5, "A1:A10", "Rule A", true, cf_highlight()),
+                cf_view(2, "B2:B20", "Rule B", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        h.client.take_commands();
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        let del = vcx
+            .debug_bounds("cf-row-5-delete")
+            .expect("the row's delete control is painted");
+        vcx.simulate_click(del.center(), Modifiers::default());
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::DeleteCondFmt {
+                    sheet: SheetId(0),
+                    index: 5
+                }]
+            ),
+            "clicking a row's delete button sends DeleteCondFmt for that row (button → method wiring)"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_first_row_move_up_disabled(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(5, "A1:A10", "Rule A", true, cf_highlight()),
+                cf_view(2, "B2:B20", "Rule B", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        h.client.take_commands();
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        // First row (highest priority) — its move-up is disabled, so a click sends nothing.
+        let up_first = vcx
+            .debug_bounds("cf-row-5-up")
+            .expect("first row move-up painted");
+        vcx.simulate_click(up_first.center(), Modifiers::default());
+        assert!(
+            h.client.take_commands().is_empty(),
+            "the first row's move-up is disabled (a click is inert)"
+        );
+        // A lower row's move-up is enabled and raises its priority.
+        let up_second = vcx
+            .debug_bounds("cf-row-2-up")
+            .expect("second row move-up painted");
+        vcx.simulate_click(up_second.center(), Modifiers::default());
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::RaiseCondFmtPriority {
+                    sheet: SheetId(0),
+                    index: 2
+                }]
+            ),
+            "a non-first row's move-up raises its priority"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_last_row_move_down_disabled(cx: &mut TestAppContext) {
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(5, "A1:A10", "Rule A", true, cf_highlight()),
+                cf_view(2, "B2:B20", "Rule B", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        h.client.take_commands();
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        // Last row (lowest priority) — its move-down is disabled, so a click sends nothing.
+        let down_last = vcx
+            .debug_bounds("cf-row-2-down")
+            .expect("last row move-down painted");
+        vcx.simulate_click(down_last.center(), Modifiers::default());
+        assert!(
+            h.client.take_commands().is_empty(),
+            "the last row's move-down is disabled (a click is inert)"
+        );
+        // A higher row's move-down is enabled and lowers its priority.
+        let down_first = vcx
+            .debug_bounds("cf-row-5-down")
+            .expect("first row move-down painted");
+        vcx.simulate_click(down_first.center(), Modifiers::default());
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::LowerCondFmtPriority {
+                    sheet: SheetId(0),
+                    index: 5
+                }]
+            ),
+            "a non-last row's move-down lowers its priority"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_list_reorders_after_cond_fmt_updated(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(0, "A1:A10", "Rule A", true, cf_highlight()),
+                cf_view(1, "B1:B10", "Rule B", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert_eq!(
+            cf_row_summaries(&h, cx).join(","),
+            "Rule A,Rule B",
+            "rows render in the published (priority) order"
+        );
+        // A raise/lower swapped their priority; the worker republishes the reordered list. The
+        // `CondFmtUpdated` refresh rebuilds the rows in the new order.
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(1, "B1:B10", "Rule B", true, cf_highlight()),
+                cf_view(0, "A1:A10", "Rule A", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, _w, cx| c.refresh_cond_fmt(cx));
+        assert_eq!(
+            cf_row_summaries(&h, cx).join(","),
+            "Rule B,Rule A",
+            "the list reflects the republished order after CondFmtUpdated"
         );
     }
 

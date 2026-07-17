@@ -56,7 +56,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   tests — add a Cell-value rule; edit it (seeded + `UpdateCondFmt`); validation blocks bad input;
   engine `Err` keeps editor open.
 
-- [ ] **P7 — Color-scale editor.** 2/3-color editor (stop kind/value/color + presets + gradient
+- [x] **P7 — Color-scale editor.** 2/3-color editor (stop kind/value/color + presets + gradient
   preview); add/edit `ColorScale` rules. *Exit:* view tests — add a 3-color scale (spec has 3
   stops); edit stops; the list shows a gradient preview.
 

@@ -2319,9 +2319,10 @@ impl ChromeView {
 
     /// Open the rule editor (List → Editor mode) for `edit_index` (`Some` = edit an existing rule,
     /// `None` = add). Add mode seeds a fresh [`CfEditorState`] + the Applies-to range from the
-    /// current selection; edit mode seeds both the state and the text inputs from the row's `spec`
-    /// (`Some` for an authorable highlight rule; a color-scale / non-editable row is a no-op — its
-    /// edit control is disabled in P6). `components/cf_sidebar.md §4`.
+    /// current selection; edit mode seeds the state, the text inputs, and (for a color scale) the
+    /// stop inputs from the row's `spec` — `Some` for any authorable rule (highlight **or** a
+    /// concrete-RGB color scale). A row with no `spec` (a deferred-family / theme-colored Badge,
+    /// whose edit control is disabled) is a no-op. `components/cf_sidebar.md §4`.
     fn open_cf_editor(
         &mut self,
         edit_index: Option<u32>,
@@ -2356,7 +2357,7 @@ impl ChromeView {
                     .map(|r| r.range.clone())
                     .unwrap_or_default();
                 let Some((state, op1, op2, formula)) = cf_state_from_spec(index, &spec) else {
-                    return; // a color-scale spec: authored by P7's editor, not here.
+                    return; // only a hypothetical future non-authorable spec variant lands here.
                 };
                 (state, range, op1, op2, formula)
             }
@@ -2450,9 +2451,11 @@ impl ChromeView {
         ) {
             return;
         }
-        for (i, stop) in editor.scale.iter_mut().enumerate() {
+        // Cap to the value-input count: only the up-to-3 authored stops have an input to read from,
+        // so a stop beyond index 2 (a pathological loaded scale) keeps its value untouched.
+        for (i, stop) in editor.scale.iter_mut().enumerate().take(values.len()) {
             if cf_stop_needs_value(stop.kind) {
-                stop.value = values.get(i).copied().flatten();
+                stop.value = values[i];
             }
         }
     }
@@ -6141,7 +6144,7 @@ impl ChromeView {
         col.into_any_element()
     }
 
-    /// The rule-type dropdown (the highlight families — color scales are P7's editor).
+    /// The rule-type dropdown (the highlight families + the color-scale group, per `CF_KIND_MENU`).
     fn render_cf_type_dropdown(
         &self,
         editor: &CfEditorState,

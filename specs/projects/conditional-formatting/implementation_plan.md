@@ -24,7 +24,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   (add→list, update-merge, delete, reorder, extended-style reflects a rule + **value change flips
   it**, conversions incl. deferred→Badge). Crate-scoped: `-p freecell-core -p freecell-engine`.
 
-- [ ] **P2 — Worker protocol + published rule list.** `Command` CF variants + `WorkerEvent::
+- [x] **P2 — Worker protocol + published rule list.** `Command` CF variants + `WorkerEvent::
   CondFmtUpdated`; `apply_one` dispatch (+ `Err` surfacing); `Shared.cond_fmt` map +
   `DocumentClient::cond_fmt_rules`; refresh + emit on mutation/undo/redo/open. *Exit:* worker-seam
   tests — `AddCondFmt`→`cond_fmt_rules` reflects it + `CondFmtUpdated`/`StyleCacheUpdated`;

@@ -414,6 +414,9 @@ impl Worker {
         // styles resident (values follow on the first `SetViewport`). Non-active sheets build on
         // first activation (`components/style_cache.md §Lifecycle`).
         worker.build_and_store_cache(worker.active_sheet);
+        // Publish the CF rule list for every sheet that already carries rules (an opened file), so
+        // the window can build a CF sidebar synchronously without waiting for a mutation.
+        worker.publish_all_cond_fmt_on_open();
         worker.emit(WorkerEvent::Loaded { sheets });
         worker.emit(WorkerEvent::StyleCacheUpdated {
             sheet: worker.active_sheet,
@@ -563,6 +566,14 @@ impl Worker {
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
+                // CF mutations bucket with the style edits: each is style-only (no recompute) and
+                // undoable, so it rides the coalesced-eval + publish + undo/redo machinery. The
+                // CF-map republish is folded into `apply_edit_batch` (§components/engine_cf.md §5).
+                | Command::AddCondFmt { .. }
+                | Command::UpdateCondFmt { .. }
+                | Command::DeleteCondFmt { .. }
+                | Command::RaiseCondFmtPriority { .. }
+                | Command::LowerCondFmtPriority { .. }
                 | Command::SetColumnWidths { .. }
                 | Command::SetRowHeights { .. }
                 | Command::SetRowsHidden { .. }
@@ -893,6 +904,10 @@ impl Worker {
                 // Record the batch's edited-cell set (this pops/pushes the undo-redo touch stacks)
                 // so both the chart re-resolve and the style-cache mirror below read the same ranges.
                 let (refresh, rebuild) = self.collect_edited_ranges(applied_ops);
+                // The rebuilt-sheet set is the CF-relevant one: a CF mutation, a structural CF-range
+                // shift, and the undo/redo of either land here (all map to `AppliedOp::Rebuild` /
+                // `Touch::Rebuild`). Captured before `rebuild` is consumed by `apply_cache_refresh`.
+                let mut cf_sheets = rebuild.clone();
                 // Re-resolve any charts whose source ranges the edit touched, BEFORE publishing, so
                 // the edit's single `Published` carries fresh cells AND fresh charts (P9,
                 // charts/architecture §4.1). Only intersecting charts recompute.
@@ -905,10 +920,24 @@ impl Worker {
                 // ship `StyleCacheUpdated` deltas. Ordered after `Published` (unchanged event order).
                 self.apply_cache_refresh(refresh, rebuild, &sheets_before);
 
+                // Republish the CF rule list for any rebuilt sheet whose rules actually changed, and
+                // notify the window (`components/engine_cf.md §5`). Gated inside so a non-CF sheet is
+                // free; deduped so a coalesced multi-CF batch reconciles each sheet once.
+                cf_sheets.sort_unstable();
+                cf_sheets.dedup();
+                self.reconcile_published_cond_fmt(&cf_sheets);
+
                 // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the
                 // tab bar. Compared by value so undo/redo of a sheet op is caught too.
                 let sheets_after = self.sheet_metas();
                 if sheets_after != sheets_before {
+                    // Drop CF map entries for removed sheets (delete / undo-of-add) so the published
+                    // map never outlives its sheet.
+                    let live: HashSet<SheetId> = sheets_after.iter().map(|m| m.id).collect();
+                    self.shared
+                        .cond_fmt
+                        .write()
+                        .retain(|id, _| live.contains(id));
                     self.emit(WorkerEvent::SheetsChanged {
                         sheets: sheets_after,
                     });
@@ -3092,6 +3121,68 @@ impl Worker {
         }
     }
 
+    /// Reconcile the published CF rule map for each of `sheets` against the document's current
+    /// rules, emitting [`WorkerEvent::CondFmtUpdated`] only when a sheet's published list actually
+    /// changed (`architecture.md §4.5`, `components/engine_cf.md §5`).
+    ///
+    /// Gated so a non-CF workbook pays nothing: a sheet with no CF rule **and** no published entry is
+    /// skipped before any list read. A rule change (add / update / delete / reorder, or a structural
+    /// range shift) or the undo/redo of one flips `has_cond_fmt` / the list contents, so it is
+    /// reconciled. The map holds no entry for a sheet with zero rules (so the client reads empty).
+    fn reconcile_published_cond_fmt(&self, sheets: &[SheetId]) {
+        for &sheet in sheets {
+            let Some(idx) = self.resolve(sheet) else {
+                continue; // sheet deleted out from under the touch-set — pruned by the caller
+            };
+            let has_now = self.doc.has_cond_fmt(idx);
+            let had_entry = self.shared.cond_fmt.read().contains_key(&sheet);
+            if !has_now && !had_entry {
+                continue; // non-CF sheet, nothing published → the fast path stays free
+            }
+            // A read failure degrades to "no rules" (never a panic) — the sheet's entry is dropped.
+            let rules = self.doc.cond_fmt_rules(idx).unwrap_or_default();
+            let changed = {
+                let map = self.shared.cond_fmt.read();
+                match map.get(&sheet) {
+                    Some(published) => published != &rules,
+                    None => !rules.is_empty(),
+                }
+            };
+            if !changed {
+                continue;
+            }
+            {
+                let mut map = self.shared.cond_fmt.write();
+                if rules.is_empty() {
+                    map.remove(&sheet);
+                } else {
+                    map.insert(sheet, rules);
+                }
+            }
+            self.emit(WorkerEvent::CondFmtUpdated { sheet });
+        }
+    }
+
+    /// Populate the published CF map once on open for every sheet that carries rules
+    /// (`components/engine_cf.md §5`). No event is emitted — the window reads the map when it first
+    /// builds a panel (the `Loaded` event already drives the initial UI). Cheap: gated on the
+    /// `has_cond_fmt` fast check, so a workbook with no CF writes nothing.
+    fn publish_all_cond_fmt_on_open(&self) {
+        for meta in self.sheet_metas() {
+            let Some(idx) = self.resolve(meta.id) else {
+                continue;
+            };
+            if !self.doc.has_cond_fmt(idx) {
+                continue;
+            }
+            if let Ok(rules) = self.doc.cond_fmt_rules(idx) {
+                if !rules.is_empty() {
+                    self.shared.cond_fmt.write().insert(meta.id, rules);
+                }
+            }
+        }
+    }
+
     /// The sheet list as `SheetMeta` (stable id + current name + `has_content`), in workbook
     /// order. `has_content` gates the UI's delete-confirm modal (`functional_spec.md §3.7`).
     fn sheet_metas(&self) -> Vec<SheetMeta> {
@@ -3346,6 +3437,50 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.move_sheet(idx, *to_index)?;
             Ok(AppliedKind::SheetOp)
         }
+        Command::AddCondFmt { sheet, range, spec } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.add_cond_fmt(idx, range, spec)?;
+            // A CF rule changes styles, not values → no recompute (like the other style edits).
+            Ok(AppliedKind::StyleOnly)
+        }
+        Command::UpdateCondFmt {
+            sheet,
+            index,
+            range,
+            spec,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.update_cond_fmt(idx, *index, range, spec)?;
+            Ok(AppliedKind::StyleOnly)
+        }
+        Command::DeleteCondFmt { sheet, index } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.delete_cond_fmt(idx, *index)?;
+            Ok(AppliedKind::StyleOnly)
+        }
+        // Raise/Lower may be a boundary NO-OP (rule already top/bottom): the engine records no undo
+        // diff in that case, so returning anything but `NoOp` would push a phantom worker undo entry
+        // and desync the 1:1 stack. Compare the rule list before/after to tell a real reorder apart.
+        Command::RaiseCondFmtPriority { sheet, index } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            let before = doc.cond_fmt_rules(idx)?;
+            doc.raise_cond_fmt(idx, *index)?;
+            Ok(if doc.cond_fmt_rules(idx)? == before {
+                AppliedKind::NoOp
+            } else {
+                AppliedKind::StyleOnly
+            })
+        }
+        Command::LowerCondFmtPriority { sheet, index } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            let before = doc.cond_fmt_rules(idx)?;
+            doc.lower_cond_fmt(idx, *index)?;
+            Ok(if doc.cond_fmt_rules(idx)? == before {
+                AppliedKind::NoOp
+            } else {
+                AppliedKind::StyleOnly
+            })
+        }
         Command::Undo => {
             doc.undo()?;
             Ok(AppliedKind::Cell)
@@ -3514,6 +3649,17 @@ fn op_of(edit: &Command) -> AppliedOp {
         | Command::RenameSheet { .. }
         | Command::DeleteSheet { .. }
         | Command::MoveSheet { .. } => AppliedOp::Sheets,
+        // Every CF mutation maps to a full sheet-cache rebuild (not `Cells { range }`): Delete/Raise/
+        // Lower carry no range, a rule's range may be a multi-area address, and a rule/reorder can
+        // affect its whole (possibly large) range — so a wholesale rebuild is the simple, always-
+        // correct refresh (matching the value-publish path, architecture §6). This rebuilt-sheet set
+        // is also what drives the CF-map republish in `apply_edit_batch` (incl. structural range
+        // shifts + undo/redo of a CF op, whose `Touch::Rebuild` re-lands the sheet here).
+        Command::AddCondFmt { sheet, .. }
+        | Command::UpdateCondFmt { sheet, .. }
+        | Command::DeleteCondFmt { sheet, .. }
+        | Command::RaiseCondFmtPriority { sheet, .. }
+        | Command::LowerCondFmtPriority { sheet, .. } => AppliedOp::Rebuild { sheet: *sheet },
         Command::Undo => AppliedOp::Undo,
         Command::Redo => AppliedOp::Redo,
         _ => unreachable!("op_of called on a non-edit command"),
@@ -3628,7 +3774,7 @@ mod tests {
     use super::*;
     use crate::worker::protocol::StylePath;
     use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
-    use freecell_core::Rgb;
+    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, Rgb};
 
     /// Build a headless worker over a fresh empty workbook plus the event receiver, without a
     /// spawned thread — the deterministic substrate for the coalescing / recovery tests.
@@ -7729,5 +7875,265 @@ mod tests {
             "a no-op fill must not republish"
         );
         assert_eq!(value_at(&worker, 0, 0), "5"); // unchanged
+    }
+
+    // ---- Conditional formatting (P2 worker seam) ----
+
+    const CF_RED: Rgb = Rgb::new(255, 0, 0);
+
+    /// A "Cell value > operand" highlight rule filling matches red — the common CF fixture.
+    fn gt_rule(operand: &str) -> CfRuleSpec {
+        CfRuleSpec::CellIs {
+            op: CfValueOp::Gt,
+            operand: operand.to_string(),
+            operand2: None,
+            format: CfFormat {
+                fill: Some(CF_RED),
+                ..Default::default()
+            },
+            stop_if_true: false,
+        }
+    }
+
+    fn add_cf(sheet: SheetId, range: &str, operand: &str) -> Command {
+        Command::AddCondFmt {
+            sheet,
+            range: range.to_string(),
+            spec: gt_rule(operand),
+        }
+    }
+
+    /// The published CF rules for `sheet` (a clone of the shared map entry; empty when absent).
+    fn published_cf(worker: &Worker, sheet: SheetId) -> Vec<freecell_core::CfRuleView> {
+        worker
+            .shared
+            .cond_fmt
+            .read()
+            .get(&sheet)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn cond_fmt_updated_for(events: &[WorkerEvent], sheet: SheetId) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::CondFmtUpdated { sheet: s } if *s == sheet))
+    }
+
+    fn any_cond_fmt_updated(events: &[WorkerEvent]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::CondFmtUpdated { .. }))
+    }
+
+    #[test]
+    fn add_cond_fmt_publishes_rules_and_emits_events() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // A resident, viewport-covered sheet so the style-cache mirror ships its delta.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "150"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+
+        let rules = published_cf(&worker, sheet);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].range, "A1:A10");
+        assert_eq!(rules[0].summary, "Cell value > 100");
+
+        let events = drain_events(&rx);
+        assert!(
+            cond_fmt_updated_for(&events, sheet),
+            "an AddCondFmt republishes the rule list",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
+            "an AddCondFmt ships a StyleCacheUpdated delta (the rule range refreshes)",
+        );
+    }
+
+    #[test]
+    fn update_cond_fmt_republishes() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::UpdateCondFmt {
+            sheet,
+            index: 0,
+            range: "B1:B20".to_string(),
+            spec: gt_rule("50"),
+        }]);
+
+        let rules = published_cf(&worker, sheet);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].range, "B1:B20");
+        assert_eq!(rules[0].summary, "Cell value > 50");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn delete_cond_fmt_removes_from_map() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet).len(), 1);
+
+        worker.process_batch(vec![Command::DeleteCondFmt { sheet, index: 0 }]);
+
+        assert!(
+            published_cf(&worker, sheet).is_empty(),
+            "the sheet's rules are gone"
+        );
+        assert!(
+            !worker.shared.cond_fmt.read().contains_key(&sheet),
+            "no empty-vec entry lingers (a zero-rule sheet holds no key)"
+        );
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn raise_lower_reorders_published_list() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Rule A (index 0, priority 1) then rule B (index 1, priority 2) → priority-desc: B first.
+        worker.process_batch(vec![
+            add_cf(sheet, "A1:A1", "1"),
+            add_cf(sheet, "B1:B1", "1"),
+        ]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "B1:B1");
+
+        // Raise A (storage index 0) above B.
+        worker.process_batch(vec![Command::RaiseCondFmtPriority { sheet, index: 0 }]);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "A1:A1");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+
+        // Lower A back down.
+        worker.process_batch(vec![Command::LowerCondFmtPriority { sheet, index: 0 }]);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "B1:B1");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn raise_at_top_is_noop() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            add_cf(sheet, "A1:A1", "1"),
+            add_cf(sheet, "B1:B1", "1"),
+        ]);
+        drain_events(&rx);
+        let ops_before = worker.ops_seen;
+
+        // B (storage index 1) already holds the highest priority → raising it changes nothing: it
+        // must record no undo op (the engine pushes no diff) and must not republish. This keeps the
+        // worker undo stack 1:1 with the engine's.
+        worker.process_batch(vec![Command::RaiseCondFmtPriority { sheet, index: 1 }]);
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "a boundary raise commits no op"
+        );
+        assert!(
+            !any_cond_fmt_updated(&drain_events(&rx)),
+            "a no-op raise does not republish"
+        );
+    }
+
+    #[test]
+    fn undo_redo_restores_and_republishes_cf() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet).len(), 1);
+
+        // Undo the add → the rule is gone and the map republishes empty.
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            published_cf(&worker, sheet).is_empty(),
+            "undo removes the published rule"
+        );
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+
+        // Redo → the rule and its publication come back.
+        worker.process_batch(vec![Command::Redo]);
+        let rules = published_cf(&worker, sheet);
+        assert_eq!(rules.len(), 1, "redo restores the rule");
+        assert_eq!(rules[0].range, "A1:A10");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn bad_range_add_surfaces_error() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::AddCondFmt {
+            sheet,
+            range: "not-a-range".to_string(),
+            spec: gt_rule("100"),
+        }]);
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(_)
+                }
+            )),
+            "a bad-range add surfaces an engine error on the result channel"
+        );
+        assert!(
+            published_cf(&worker, sheet).is_empty(),
+            "nothing was added on a rejected op"
+        );
+        assert!(
+            !any_cond_fmt_updated(&events),
+            "a rejected add does not republish"
+        );
+    }
+
+    #[test]
+    fn non_cf_sheet_has_empty_published_map() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..4,
+                cols: 0..4,
+            },
+            set_input(sheet, 0, 0, "42"),
+        ]);
+        // A style edit (AppliedOp::Cells) and a structural edit (AppliedOp::Rebuild) on a CF-free
+        // sheet must never populate the map or emit CondFmtUpdated — the non-CF fast path stays free.
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+            attr: StyleAttr::Bold,
+        }]);
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+
+        assert!(
+            worker.shared.cond_fmt.read().is_empty(),
+            "a non-CF workbook keeps the published map empty"
+        );
+        assert!(!any_cond_fmt_updated(&drain_events(&rx)));
     }
 }

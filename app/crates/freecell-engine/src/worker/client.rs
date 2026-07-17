@@ -2,13 +2,14 @@
 //! read-surfaces the worker writes and the UI reads (`components/engine_worker.md §Public
 //! interface`, `architecture.md §2`).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use freecell_core::{Publication, SheetCaches, SheetId};
+use freecell_core::{CfRuleView, Publication, SheetCaches, SheetId};
 use parking_lot::RwLock;
 
 use crate::document::DocumentSource;
@@ -44,6 +45,12 @@ pub(super) struct Shared {
     /// [`publication`](Self::publication); stored by the worker before the `Published` bump and
     /// installed UI-side on a version change (charts/architecture §4.1).
     pub(super) chart_snapshot: Arc<ArcSwap<ChartSnapshot>>,
+    /// The published conditional-formatting rule list per sheet (`architecture.md §4.5`,
+    /// `components/engine_cf.md §5`). The worker writes `document.cond_fmt_rules(sheet)` here after
+    /// any CF mutation, on undo/redo of a CF op, and once on open; the UI reads it synchronously via
+    /// [`DocumentClient::cond_fmt_rules`] to build the sidebar. A sheet with no CF rule has **no**
+    /// entry (never an empty vec), so a non-CF workbook keeps this map empty.
+    pub(super) cond_fmt: Arc<RwLock<HashMap<SheetId, Vec<CfRuleView>>>>,
 }
 
 impl Shared {
@@ -54,6 +61,7 @@ impl Shared {
             committed_ops: AtomicU64::new(0),
             caches: Arc::new(RwLock::new(SheetCaches::new())),
             chart_snapshot: Arc::new(ArcSwap::from_pointee(ChartSnapshot::empty())),
+            cond_fmt: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -146,6 +154,19 @@ impl DocumentClient {
         self.shared.chart_snapshot.store(Arc::new(snapshot));
     }
 
+    /// The published conditional-formatting rules for `sheet` (`architecture.md §4.5`) — a clone of
+    /// the worker's latest `document.cond_fmt_rules(sheet)`, read under the shared read lock. Empty
+    /// when the sheet carries no CF (the map holds no entry for a non-CF sheet). The window reads
+    /// this on `Loaded` / `CondFmtUpdated` / sheet switch to build the sidebar rows.
+    pub fn cond_fmt_rules(&self, sheet: SheetId) -> Vec<CfRuleView> {
+        self.shared
+            .cond_fmt
+            .read()
+            .get(&sheet)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// The current generation counter — the UI treats a change as "repaint from the
     /// publication".
     pub fn generation(&self) -> u64 {
@@ -199,5 +220,44 @@ impl WorkerEventReceiver {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freecell_core::{CfPreview, CfRuleView};
+
+    fn sample_rule() -> CfRuleView {
+        CfRuleView {
+            index: 0,
+            range: "A1:A10".to_string(),
+            priority: 1,
+            editable: true,
+            summary: "Cell value > 100".to_string(),
+            preview: CfPreview::Highlight {
+                fill: None,
+                text_color: None,
+            },
+            spec: None,
+        }
+    }
+
+    #[test]
+    fn cond_fmt_rules_reads_published_map() {
+        // A `DocumentClient` reads the CF rules the worker published into `Shared::cond_fmt`.
+        let shared = Arc::new(Shared::new(SheetId(0)));
+        shared
+            .cond_fmt
+            .write()
+            .insert(SheetId(7), vec![sample_rule()]);
+        let (tx, _rx) = mpsc::channel();
+        let client = DocumentClient { tx, shared };
+
+        let rules = client.cond_fmt_rules(SheetId(7));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].range, "A1:A10");
+        // A sheet with no published entry reads empty (a non-CF sheet holds no map entry).
+        assert!(client.cond_fmt_rules(SheetId(0)).is_empty());
     }
 }

@@ -7,10 +7,10 @@
 //! `ironcalc` type leaks past this crate. Mutations delegate to the identically-purposed
 //! `UserModel` CF API (each records its own undoable diff); reads convert through the same seam.
 //!
-//! P1 is the headless engine seam only: these methods' non-test consumers (the worker `Command`
-//! dispatch + the value-dependent cache path) land in P2/P3. They are fully exercised by this
-//! module's unit tests, so the seam is allowed to sit ahead of its production consumer until then.
-#![allow(dead_code)]
+//! P2 wires the mutators + list/gate reads to the worker `Command` dispatch + the published CF map.
+//! [`WorkbookDocument::extended_render_style`] is the one method still ahead of its consumer — the
+//! value-dependent render cache lands in P3 — so it keeps a targeted `#[allow(dead_code)]` until then
+//! (it is fully exercised by this module's unit tests meanwhile).
 
 use freecell_core::{CellRef, CfRuleSpec, CfRuleView, RenderStyle};
 use ironcalc_base::types::Theme;
@@ -126,6 +126,9 @@ impl WorkbookDocument {
     /// rule matches, so it is always correct. The `.icon`/`.data_bar`/`.rating` decorations are
     /// dropped this pass (their families are deferred). A read failure degrades to the default
     /// style (logged), never a panic.
+    // Consumed by P3's value-dependent render cache (`build_sheet_cache`/`refresh_cell`); until then
+    // it is only exercised by this module's tests.
+    #[allow(dead_code)]
     pub(crate) fn extended_render_style(
         &self,
         sheet_idx: u32,

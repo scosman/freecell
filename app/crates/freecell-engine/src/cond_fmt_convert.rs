@@ -10,11 +10,9 @@
 //! `cf_types::{CfRule, CfRuleInput, ValueOperator, TextOperator, PeriodType, Cfvo,
 //! ColorScaleThreshold}` and `types::{Color, Dxf, DxfFont, Fill}`.
 //!
-//! P1 is the headless engine seam only: these conversions are consumed by the `WorkbookDocument`
-//! CF methods, whose non-test call sites (the worker `Command` dispatch) arrive in P2. They are
-//! fully exercised by this module's + `document::cond_fmt`'s unit tests, so the seam is allowed to
-//! sit ahead of its production consumer until P2 wires it.
-#![allow(dead_code)]
+//! These conversions are reached from the `WorkbookDocument` CF methods, which P2 wires to the
+//! worker `Command` dispatch + the published CF map — so the whole seam is now consumed in a release
+//! build (no module-level dead-code allow needed).
 
 use freecell_core::cond_fmt::{
     CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind,

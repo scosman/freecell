@@ -507,6 +507,12 @@ impl WorkbookWindow {
                     self.chrome.update(cx, |c, cx| c.refresh_active_style(cx));
                 }
             }
+            WorkerEvent::CondFmtUpdated { sheet: _ } => {
+                // The published conditional-formatting rule list changed. The CF sidebar that
+                // rebuilds its rows from `client.cond_fmt_rules` lands in P4/P5
+                // (`components/cf_sidebar.md`); until that surface exists there is nothing to
+                // refresh, so this is a deliberate no-op that keeps the exhaustive match honest.
+            }
             WorkerEvent::SheetsChanged { sheets } => {
                 self.reconcile_sheets(sheets, window, cx);
                 self.refresh_dirty(window, cx);

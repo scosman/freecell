@@ -42,9 +42,9 @@ use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
-    format_stat_count, format_stat_value, limits, Align, CellKind, CellRef, CfColorStop, CfFormat,
-    CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind, CfValueOp, RenderStyle,
-    Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
+    format_stat_count, format_stat_value, limits, Align, CellKind, CellRange, CellRef, CfColorStop,
+    CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind, CfValueOp,
+    RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -5809,23 +5809,41 @@ impl ChromeView {
         .into_any_element()
     }
 
-    /// The CF sidebar's **List mode** body (`ui_design.md §2.1`): an intro line naming the active
-    /// sheet, the priority-descending rule rows (or the empty state), and the primary "+ Add rule".
+    /// The CF sidebar's **List mode** body (`ui_design.md §2.1`, BUG-3): an intro line naming the
+    /// current selection, the rule rows **whose target range intersects the selection** (or one of
+    /// two empty states), and the primary "+ Add rule".
+    ///
+    /// The list is **selection-scoped**: only rules intersecting the current selection are shown
+    /// (a sheet can carry hundreds of rules), re-filtered live as the selection changes. Filtering
+    /// is display-only — each surviving row keeps its GLOBAL priority position (for the first/last
+    /// reorder-disable) and its true engine `index` (the handle the mutators target), so a filtered
+    /// view never mis-targets a Raise/Lower/Delete.
     fn render_cf_list(&self, panel: &CondFmtPanel, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let sheet_name = self
-            .sheets
-            .iter()
-            .find(|t| t.id == panel.sheet)
-            .map(|t| t.name.clone())
-            .unwrap_or_default();
+        let selection_ref = freecell_core::format_selection_ref(&self.selection);
 
         let intro = div()
             .text_size(px(12.0))
             .text_color(rgb(MUTED_TEXT))
-            .child(format!("Rules on {sheet_name}"));
+            .child(format!("Rules for {selection_ref}"));
 
-        // The priority-descending rule rows, or the empty state — placed above the Add button so
-        // "No rules on this sheet yet." reads as the list's own placeholder (`ui_design.md §2.1`).
+        // The sidebar tracks the active sheet, so the (active-sheet) selection is the right scope.
+        // If the panel is somehow scoped to a different sheet, fall back to showing every rule
+        // (defensive — never hide rules against a selection from another sheet).
+        let sel = self.selection.range();
+        let filter_to_selection = panel.sheet == self.active_sheet;
+
+        // Keep the ORIGINAL enumerate index alongside each surviving row: it is the rule's global
+        // priority position (drives the first/last reorder-disable), preserved through the filter.
+        let global_last = panel.rows.len().saturating_sub(1);
+        let visible: Vec<(usize, &CfRuleView)> = panel
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !filter_to_selection || cf_rule_intersects_selection(row, &sel))
+            .collect();
+
+        // Two distinct empty states (both above the Add button, `ui_design.md §2.1`): the sheet
+        // truly has no rules, vs. it has rules but none apply to the current selection.
         let content = if panel.rows.is_empty() {
             div()
                 .debug_selector(|| "cf-empty".to_string())
@@ -5833,11 +5851,17 @@ impl ChromeView {
                 .text_color(rgb(MUTED_TEXT))
                 .child("No rules on this sheet yet.")
                 .into_any_element()
+        } else if visible.is_empty() {
+            div()
+                .debug_selector(|| "cf-empty-selection".to_string())
+                .text_size(px(12.0))
+                .text_color(rgb(MUTED_TEXT))
+                .child("No rules apply to the selected cells.")
+                .into_any_element()
         } else {
-            let last = panel.rows.len() - 1;
             let mut list = div().flex().flex_col().gap_1();
-            for (i, row) in panel.rows.iter().enumerate() {
-                list = list.child(self.render_cf_row(row, i == 0, i == last, cx));
+            for (orig_i, row) in visible {
+                list = list.child(self.render_cf_row(row, orig_i == 0, orig_i == global_last, cx));
             }
             list.into_any_element()
         };
@@ -7410,6 +7434,18 @@ fn cf_row_controls(row: &CfRuleView, is_first: bool, is_last: bool) -> CfRowCont
         edit: row.editable,
         delete: true,
     }
+}
+
+/// Whether `row`'s target range intersects the selection `sel` (BUG-3, selection-scoped list). A
+/// rule's `range` is its sqref and may be a **multi-area** address (whitespace-separated A1 ranges,
+/// e.g. `"A1:A10 C1:C10"`); the rule matches if **any** sub-area parses and overlaps `sel`. A
+/// sub-area that fails to parse is skipped (never matches, never panics), so a malformed sqref
+/// simply contributes no match rather than crashing the list.
+fn cf_rule_intersects_selection(row: &CfRuleView, sel: &CellRange) -> bool {
+    row.range
+        .split_whitespace()
+        .filter_map(CellRange::from_a1)
+        .any(|area| area.intersects(sel))
 }
 
 /// The rule-type dropdown menu (`components/cf_sidebar.md §5`): the highlight families in Excel's
@@ -9676,7 +9712,15 @@ mod tests {
                 ),
             ],
         );
-        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        upd(&h, cx, |c, _w, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            // The list is selection-scoped (BUG-3): widen the selection (A1:C20) to cover all
+            // three rule ranges so every published row is in scope.
+            c.selection = SelectionModel {
+                anchor: cell(0, 0),
+                active: cell(19, 2),
+            };
+        });
         let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
         vcx.run_until_parked();
         // One row painted per published rule, keyed by its stable storage index (5/2/9).
@@ -9704,8 +9748,173 @@ mod tests {
         );
         assert!(vcx.debug_bounds("cf-row-0").is_none(), "no rows render");
         assert!(
+            vcx.debug_bounds("cf-empty-selection").is_none(),
+            "the zero-rules state is the sheet-empty message, not the no-rules-in-selection one"
+        );
+        assert!(
             vcx.debug_bounds("cond-fmt-add-rule").is_some(),
             "the '+ Add rule' button stays available in the empty state"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_list_filters_rows_to_selection(cx: &mut TestAppContext) {
+        // BUG-3: the list shows only rules whose target range intersects the current selection,
+        // and re-filters live as the selection moves. Two rules with disjoint ranges (A over
+        // A1:A5, B over C1:C5); the selection picks exactly one at a time.
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(7, "A1:A5", "Rule A", true, cf_highlight()),
+                cf_view(3, "C1:C5", "Rule B", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            // Selection inside Rule A's range (A2).
+            c.on_selection_changed(SelectionModel::single(cell(1, 0)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-7").is_some(),
+                "Rule A (A1:A5) intersects the A2 selection → its row shows"
+            );
+            assert!(
+                vcx.debug_bounds("cf-row-3").is_none(),
+                "Rule B (C1:C5) does not intersect the A2 selection → its row is hidden"
+            );
+            assert!(
+                vcx.debug_bounds("cf-empty-selection").is_none(),
+                "a matching rule is shown, so no empty state"
+            );
+        }
+        // Move the selection into Rule B's range (C3): the list re-filters to the other row.
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(2, 2)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-3").is_some(),
+                "Rule B (C1:C5) now intersects the C3 selection → its row shows"
+            );
+            assert!(
+                vcx.debug_bounds("cf-row-7").is_none(),
+                "Rule A (A1:A5) no longer intersects → its row is hidden"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn cf_no_rules_apply_shows_selection_empty_state(cx: &mut TestAppContext) {
+        // BUG-3: rules exist but none intersect the selection → the distinct "no rules apply"
+        // empty state (NOT the sheet-empty one), and the "+ Add rule" button stays available.
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(7, "A1:A5", "Rule A", true, cf_highlight()),
+                cf_view(3, "C1:C5", "Rule B", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            // E1 intersects neither A1:A5 nor C1:C5.
+            c.on_selection_changed(SelectionModel::single(cell(0, 4)), window, cx);
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("cf-empty-selection").is_some(),
+            "no rule intersects the selection → the selection empty state shows"
+        );
+        assert!(
+            vcx.debug_bounds("cf-empty").is_none(),
+            "the sheet DOES have rules, so it is not the sheet-empty state"
+        );
+        assert!(
+            vcx.debug_bounds("cf-row-7").is_none() && vcx.debug_bounds("cf-row-3").is_none(),
+            "no rule rows render"
+        );
+        assert!(
+            vcx.debug_bounds("cond-fmt-add-rule").is_some(),
+            "the '+ Add rule' button stays available in the selection empty state"
+        );
+    }
+
+    #[gpui::test]
+    fn cf_filtered_row_keeps_global_index_and_priority(cx: &mut TestAppContext) {
+        // BUG-3: filtering is display-only. Two rules — A (idx5, A1:A10, GLOBAL first/highest
+        // priority) and B (idx2, C1:C10, GLOBAL last/lowest). The selection (C3) shows only B.
+        // B is the GLOBAL last, so its move-down stays disabled even though it is the only row;
+        // its move-up and delete still target its ORIGINAL engine index (2), not a filtered slot.
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![
+                cf_view(5, "A1:A10", "Rule A", true, cf_highlight()),
+                cf_view(2, "C1:C10", "Rule B", true, cf_highlight()),
+            ],
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            c.on_selection_changed(SelectionModel::single(cell(2, 2)), window, cx);
+            // C3 → only B
+        });
+        h.client.take_commands();
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("cf-row-2").is_some(),
+            "the intersecting rule (idx2) is the only row shown"
+        );
+        assert!(
+            vcx.debug_bounds("cf-row-5").is_none(),
+            "the non-intersecting rule (idx5) is filtered out"
+        );
+        // Move-down is disabled (idx2 is the GLOBAL last row) — a click is inert.
+        let down = vcx
+            .debug_bounds("cf-row-2-down")
+            .expect("the shown row's move-down is painted");
+        vcx.simulate_click(down.center(), Modifiers::default());
+        assert!(
+            h.client.take_commands().is_empty(),
+            "the shown row is GLOBAL-last, so its move-down stays disabled even when it is the \
+             only visible row"
+        );
+        // Move-up is enabled (idx2 is not the GLOBAL first) and raises by the ORIGINAL index.
+        let up = vcx
+            .debug_bounds("cf-row-2-up")
+            .expect("the shown row's move-up is painted");
+        vcx.simulate_click(up.center(), Modifiers::default());
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::RaiseCondFmtPriority {
+                    sheet: SheetId(0),
+                    index: 2
+                }]
+            ),
+            "move-up targets the rule's ORIGINAL engine index (2), not a filtered position"
+        );
+        // Delete likewise targets the original engine index.
+        let del = vcx
+            .debug_bounds("cf-row-2-delete")
+            .expect("the shown row's delete is painted");
+        vcx.simulate_click(del.center(), Modifiers::default());
+        assert!(
+            matches!(
+                h.client.take_commands().as_slice(),
+                [Command::DeleteCondFmt {
+                    sheet: SheetId(0),
+                    index: 2
+                }]
+            ),
+            "delete targets the rule's ORIGINAL engine index (2) from a filtered view"
         );
     }
 
@@ -9831,7 +10040,14 @@ mod tests {
                 cf_view(2, "B2:B20", "Rule B", true, cf_highlight()),
             ],
         );
-        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        upd(&h, cx, |c, _w, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            // Selection-scoped list (BUG-3): widen to A1:B20 so both rules are shown.
+            c.selection = SelectionModel {
+                anchor: cell(0, 0),
+                active: cell(19, 1),
+            };
+        });
         h.client.take_commands();
         let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
         vcx.run_until_parked();
@@ -9871,7 +10087,14 @@ mod tests {
                 cf_view(2, "B2:B20", "Rule B", true, cf_highlight()),
             ],
         );
-        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        upd(&h, cx, |c, _w, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            // Selection-scoped list (BUG-3): widen to A1:B20 so both rules are shown.
+            c.selection = SelectionModel {
+                anchor: cell(0, 0),
+                active: cell(19, 1),
+            };
+        });
         h.client.take_commands();
         let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
         vcx.run_until_parked();

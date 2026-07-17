@@ -199,6 +199,21 @@ impl CellRange {
             && cell.col <= self.end.col
     }
 
+    /// Whether this range overlaps `other` — i.e. they share at least one cell, which holds iff
+    /// their row spans overlap **and** their column spans overlap (inclusive rectangle
+    /// intersection). Reflexive and symmetric. Ranges that share a boundary row/column (e.g.
+    /// `A1:C6` and `C6:E9`) overlap on that shared line; ranges that are merely *adjacent* with no
+    /// shared cell (e.g. cols `2..=6` and `7..=9`) do **not**. Both ranges are normalized
+    /// (`start` ≤ `end` on each axis), so this is the standard 1-D interval-overlap test per axis.
+    /// Used to selection-scope the conditional-formatting rule list (only rules whose target range
+    /// intersects the selection are shown).
+    pub fn intersects(&self, other: &CellRange) -> bool {
+        self.start.row <= other.end.row
+            && other.start.row <= self.end.row
+            && self.start.col <= other.end.col
+            && other.start.col <= self.end.col
+    }
+
     /// A1 notation: `"B7"` for a single cell, `"B2:D9"` for a rectangle.
     pub fn to_a1(&self) -> String {
         if self.is_single() {
@@ -312,6 +327,48 @@ mod tests {
         assert!(r.contains(CellRef::new(5, 2)));
         assert!(!r.contains(CellRef::new(1, 2)));
         assert!(!r.contains(CellRef::new(5, 4)));
+    }
+
+    #[test]
+    fn cell_range_intersects() {
+        let base = CellRange::new(CellRef::new(2, 2), CellRef::new(6, 6)); // rows 2..=6, cols 2..=6
+
+        // Overlapping rectangles (share an interior region).
+        let overlap = CellRange::new(CellRef::new(4, 4), CellRef::new(9, 9));
+        assert!(base.intersects(&overlap));
+        assert!(overlap.intersects(&base), "intersection is symmetric");
+
+        // Edge-touching on the shared boundary column (col 6 belongs to both) → overlap.
+        let share_col = CellRange::new(CellRef::new(2, 6), CellRef::new(6, 10));
+        assert!(base.intersects(&share_col));
+        assert!(share_col.intersects(&base));
+        // Edge-touching on the shared boundary row (row 6 belongs to both) → overlap.
+        let share_row = CellRange::new(CellRef::new(6, 2), CellRef::new(10, 6));
+        assert!(base.intersects(&share_row));
+
+        // Merely adjacent columns (2..=6 vs 7..=9) share no cell → NOT an intersection.
+        let adjacent_col = CellRange::new(CellRef::new(2, 7), CellRef::new(6, 9));
+        assert!(!base.intersects(&adjacent_col));
+
+        // Disjoint by row: columns overlap but the row spans do not (rows 2..=6 vs 8..=10).
+        let disjoint_row = CellRange::new(CellRef::new(8, 2), CellRef::new(10, 6));
+        assert!(!base.intersects(&disjoint_row));
+        assert!(!disjoint_row.intersects(&base));
+
+        // Disjoint by col: rows overlap but the column spans do not (cols 2..=6 vs 8..=10).
+        let disjoint_col = CellRange::new(CellRef::new(2, 8), CellRef::new(6, 10));
+        assert!(!base.intersects(&disjoint_col));
+
+        // Single cell inside → intersects; single cell outside → does not.
+        let inside = CellRange::single(CellRef::new(4, 4));
+        assert!(base.intersects(&inside));
+        assert!(inside.intersects(&base));
+        let outside = CellRange::single(CellRef::new(0, 0));
+        assert!(!base.intersects(&outside));
+        assert!(!outside.intersects(&base));
+
+        // A range always intersects itself.
+        assert!(base.intersects(&base));
     }
 
     #[test]

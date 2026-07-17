@@ -5,7 +5,7 @@
 //! **Editor** mode. The editor's seeded text inputs (range / operands / formula) live on
 //! [`ChromeView`](super::view::ChromeView) itself (mirroring the chart title/axis inputs).
 
-use freecell_core::{CfFormat, CfPeriod, CfRuleView, CfTextOp, CfValueOp, SheetId};
+use freecell_core::{CfColorStop, CfFormat, CfPeriod, CfRuleView, CfTextOp, CfValueOp, SheetId};
 
 /// The open conditional-formatting sidebar's state — `Some` on [`ChromeView`](super::view::ChromeView)
 /// ⇒ the sidebar is open (mirrors the chart panel's `Option<ChartPanel>`).
@@ -19,10 +19,10 @@ pub(crate) struct CondFmtPanel {
     pub editor: Option<CfEditorState>,
 }
 
-/// Which highlight rule family/variant the editor is authoring (`components/cf_sidebar.md §3`).
-/// Drives the operand controls + the assembled [`CfRuleSpec`](freecell_core::CfRuleSpec). The
-/// color-scale variants (`ColorScale2`/`ColorScale3`) are added by P7 (its dedicated editor); they
-/// are omitted here so no never-constructed variant trips the `-D warnings` dead-code lint.
+/// Which rule family/variant the editor is authoring (`components/cf_sidebar.md §3`). Drives the
+/// operand controls + the assembled [`CfRuleSpec`](freecell_core::CfRuleSpec). The highlight kinds
+/// carry a [`CfFormat`]; the color-scale kinds (`ColorScale2`/`ColorScale3`, P7) carry their
+/// [`scale`](CfEditorState::scale) stops instead and drive the dedicated color-scale editor body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CfEditorKind {
     CellValue,
@@ -34,6 +34,10 @@ pub(crate) enum CfEditorKind {
     Blanks,
     Errors,
     Formula,
+    /// A 2-stop color scale (endpoints only).
+    ColorScale2,
+    /// A 3-stop color scale (endpoints + a midpoint).
+    ColorScale3,
 }
 
 /// The rule editor's working state (`components/cf_sidebar.md §3`). The A1 range + the value / text
@@ -69,8 +73,13 @@ pub(crate) struct CfEditorState {
     pub blanks_no: bool,
     /// Errors targets **non-error** cells rather than errors.
     pub errors_no: bool,
-    /// The differential format the highlight applies (fill / text color / bold / italic).
+    /// The differential format the highlight applies (fill / text color / bold / italic). Unused by
+    /// the color-scale kinds (a `ColorScale` carries no `CfFormat`).
     pub format: CfFormat,
+    /// The color-scale stops (2 for `ColorScale2`, 3 for `ColorScale3`); empty for the highlight
+    /// kinds. Authoritative for a stop's kind / value / color — the `cf_stop_value_inputs` widgets
+    /// on [`ChromeView`](super::view::ChromeView) mirror the values and sync back into it on edit.
+    pub scale: Vec<CfColorStop>,
     /// Halt lower-priority rules for a cell this rule matches.
     pub stop_if_true: bool,
     /// Engine `Err` messages surfaced inline (client-side validation is computed live, not stored).
@@ -100,6 +109,7 @@ impl CfEditorState {
             blanks_no: false,
             errors_no: false,
             format: CfFormat::default(),
+            scale: Vec::new(),
             stop_if_true: false,
             errors: Vec::new(),
             pending_save: false,

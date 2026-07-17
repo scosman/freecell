@@ -9,7 +9,8 @@ use freecell_chart_model::{
     ScatterStyle, Series, SizeRepresentation, SourceXml, ThemeSlot,
 };
 use freecell_core::{
-    Align, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern, Rgb, SelectionModel, VAlign,
+    Align, BorderSpec, CellRange, CellRef, CfColorStop, CfFormat, CfRuleSpec, CfTextOp,
+    CfThresholdKind, CfValueOp, Edge, FillAxis, LinePattern, Rgb, SelectionModel, VAlign,
 };
 
 use crate::scene::Scene;
@@ -41,6 +42,27 @@ fn all_edges_pat(weight: u8, pattern: LinePattern) -> BorderSpec {
         right: edge_pat(weight, pattern),
         bottom: edge_pat(weight, pattern),
         left: edge_pat(weight, pattern),
+    }
+}
+
+/// A highlight [`CfFormat`] carrying a solid `fill` + `text` colour (the two attributes the
+/// first-pass highlight render cases show), the CF analogue of the `edge()` border shorthand.
+fn cf_fill_text(fill: u32, text: u32) -> CfFormat {
+    CfFormat {
+        fill: Some(Rgb::from_hex(fill)),
+        text_color: Some(Rgb::from_hex(text)),
+        bold: false,
+        italic: false,
+    }
+}
+
+/// A color-scale stop at an endpoint (`Min`/`Max`, no value) coloured `hex` — the two ends of the
+/// `cf_color_scale_3` gradient.
+fn cf_endpoint(kind: CfThresholdKind, hex: u32) -> CfColorStop {
+    CfColorStop {
+        kind,
+        value: None,
+        color: Rgb::from_hex(hex),
     }
 }
 
@@ -1378,6 +1400,95 @@ pub fn all() -> Vec<RenderCase> {
             (480, 120),
         )
         .titlebar("Budget.xlsx — Edited"),
+        // ---- Conditional formatting (P10, `functional_spec.md §2/§3`) -------------------
+        // Value-dependent CF folded into the resident style cache by the real worker (P3), rendered
+        // by the real grid. Each case sends a real `Command::AddCondFmt` over the engine-published
+        // column, so the baseline proves the CF result actually paints (some cells filled, others
+        // not — the effect is value-dependent, not a blanket style).
+        //
+        // A `CellIs > 100` highlight over a column straddling the threshold: the > 100 cells get the
+        // light-red fill + dark-red text, the rest render plain (proves the highlight is value-driven).
+        RenderCase::new(
+            "cf_highlight_greater_than",
+            Scene::new()
+                .input(0, 1, "Score")
+                .input(1, 1, "50")
+                .input(2, 1, "150")
+                .input(3, 1, "80")
+                .input(4, 1, "200")
+                .input(5, 1, "30")
+                .input(6, 1, "175")
+                .input(7, 1, "120")
+                .input(8, 1, "90")
+                .cond_fmt(
+                    "B2:B9",
+                    CfRuleSpec::CellIs {
+                        op: CfValueOp::Gt,
+                        operand: "100".to_string(),
+                        operand2: None,
+                        format: cf_fill_text(0xFFC7CE, 0x9C0006),
+                        stop_if_true: false,
+                    },
+                ),
+            GRID_VP,
+        ),
+        // A 3-stop green→yellow→red color scale over an ascending column: the cache holds the
+        // interpolated per-cell fill, so the baseline shows a top-to-bottom gradient across the ten
+        // cells (proves the scale interpolates into the render cache, not just the endpoints).
+        RenderCase::new(
+            "cf_color_scale_3",
+            Scene::new()
+                .input(0, 1, "Value")
+                .input(1, 1, "10")
+                .input(2, 1, "20")
+                .input(3, 1, "30")
+                .input(4, 1, "40")
+                .input(5, 1, "50")
+                .input(6, 1, "60")
+                .input(7, 1, "70")
+                .input(8, 1, "80")
+                .input(9, 1, "90")
+                .input(10, 1, "100")
+                .cond_fmt(
+                    "B2:B11",
+                    CfRuleSpec::ColorScale {
+                        stops: vec![
+                            cf_endpoint(CfThresholdKind::Min, 0x63BE7B),
+                            CfColorStop {
+                                kind: CfThresholdKind::Percentile,
+                                value: Some(50.0),
+                                color: Rgb::from_hex(0xFFEB84),
+                            },
+                            cf_endpoint(CfThresholdKind::Max, 0xF8696B),
+                        ],
+                    },
+                ),
+            GRID_VP,
+        ),
+        // A `Text Contains "Fail"` highlight over a status column: the "Fail" cells get the fill, the
+        // rest render plain — a second highlight family (text rather than numeric), rendered the same
+        // value-dependent way.
+        RenderCase::new(
+            "cf_highlight_text_contains",
+            Scene::new()
+                .input(0, 1, "Status")
+                .input(1, 1, "Pass")
+                .input(2, 1, "Fail")
+                .input(3, 1, "Pass")
+                .input(4, 1, "Pending")
+                .input(5, 1, "Fail")
+                .input(6, 1, "Pass")
+                .cond_fmt(
+                    "B2:B7",
+                    CfRuleSpec::Text {
+                        op: CfTextOp::Contains,
+                        value: "Fail".to_string(),
+                        format: cf_fill_text(0xFFC7CE, 0x9C0006),
+                        stop_if_true: false,
+                    },
+                ),
+            GRID_VP,
+        ),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

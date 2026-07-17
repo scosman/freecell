@@ -27,7 +27,9 @@ use arc_swap::ArcSwap;
 
 use freecell_app::grid::GridDataSources;
 use freecell_core::cache::SheetCaches;
-use freecell_core::{Align, BorderSpec, CellRange, CellRef, RenderStyle, Rgb, SheetId, VAlign};
+use freecell_core::{
+    Align, BorderSpec, CellRange, CellRef, CfRuleSpec, RenderStyle, Rgb, SheetId, VAlign,
+};
 use freecell_engine::{Command, DocumentClient, DocumentSource, StyleAttr, WorkerEvent};
 
 /// One command-less style injection applied to the real `SheetCache` after the worker builds it.
@@ -59,6 +61,10 @@ pub struct Scene {
     hidden_rows: Vec<(u32, u32)>,
     /// Inclusive 0-based column runs to hide via a real `Command::SetColumnsHidden`.
     hidden_cols: Vec<(u32, u32)>,
+    /// Conditional-formatting rules `(A1 range, spec)` applied via a real `Command::AddCondFmt`
+    /// (`components/engine_cf.md §5`). The worker folds each winning rule into the published style
+    /// cache (P3), so the captured `SheetCache` carries the value-dependent CF fills / font colour.
+    cond_fmt: Vec<(String, CfRuleSpec)>,
     publish_rows: Range<u32>,
     publish_cols: Range<u32>,
 }
@@ -80,6 +86,7 @@ impl Scene {
             injects: Vec::new(),
             hidden_rows: Vec::new(),
             hidden_cols: Vec::new(),
+            cond_fmt: Vec::new(),
             publish_rows: 0..80,
             publish_cols: 0..48,
         }
@@ -206,6 +213,17 @@ impl Scene {
         self
     }
 
+    /// Adds a conditional-formatting rule over the A1 `range` — a real `Command::AddCondFmt` worker
+    /// edit (`components/engine_cf.md §5`). The worker folds the winning rule's differential (a
+    /// highlight fill/font, or a color-scale's interpolated fill) into the published style cache via
+    /// the value-dependent extended-style path (P3), and [`build_sources`] drains to idle after
+    /// sending it, so the captured `SheetCache` carries the CF result the grid then paints — no cache
+    /// injection needed (unlike alignment/geometry, CF *does* have a real worker command).
+    pub fn cond_fmt(mut self, range: &str, spec: CfRuleSpec) -> Self {
+        self.cond_fmt.push((range.to_string(), spec));
+        self
+    }
+
     /// Overrides the published viewport window (for cases whose values sit deeper than the
     /// default 80×48 window).
     pub fn publish(mut self, rows: Range<u32>, cols: Range<u32>) -> Self {
@@ -256,6 +274,18 @@ pub fn build_sources(scene: &Scene) -> Result<GridDataSources> {
             sheet,
             range: *range,
             attr: *attr,
+        });
+    }
+    // Conditional-formatting rules through the real worker path (`Command::AddCondFmt`). Sent after
+    // the value inputs so the CF fold already sees the values (a value publish would re-fold anyway);
+    // the worker folds each winning rule into the published style cache (P3), and the viewport-time
+    // `build_and_store_cache(cf = has_cond_fmt)` + the final `drain_to_idle` guarantee the resident
+    // cache the grid renders carries the value-dependent CF fills.
+    for (range, spec) in &scene.cond_fmt {
+        client.send(Command::AddCondFmt {
+            sheet,
+            range: range.clone(),
+            spec: spec.clone(),
         });
     }
     // Hide row/column runs through the real worker path (`gaps_closing_7_15 §4`), so the rebuilt

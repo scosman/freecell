@@ -40,6 +40,10 @@ pub(crate) enum CfEditorKind {
 /// / formula operands live in `ChromeView`'s seeded text inputs; everything else — the chosen
 /// family/variant, the operators, the boolean sub-toggles, the differential format, and the
 /// validation/engine messages — lives here.
+///
+/// `Debug`/`PartialEq` back the spec build ↔ seed round-trip tests (`cf_build_spec` /
+/// `cf_state_from_spec`).
+#[derive(Debug, PartialEq)]
 pub(crate) struct CfEditorState {
     /// `None` = adding a new rule; `Some(index)` = editing the rule at that stable storage index.
     pub edit_index: Option<u32>,

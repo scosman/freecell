@@ -9763,6 +9763,419 @@ mod tests {
         assert!(controls.delete, "but it stays deletable");
     }
 
+    /// A minimal editor state (fresh add-defaults, `edit_index == Some(1)`) with only the
+    /// kind-relevant fields set — the exact shape [`cf_state_from_spec`] reconstructs, so a
+    /// build→seed round-trip can assert full equality.
+    fn cf_state(mutate: impl FnOnce(&mut CfEditorState)) -> CfEditorState {
+        let mut s = CfEditorState::new(Some(1));
+        mutate(&mut s);
+        s
+    }
+
+    /// The exhaustive mapping + round-trip guard: for **every** highlight `CfEditorKind` and its
+    /// sub-toggles, `cf_build_spec` must produce the expected `CfRuleSpec` variant+fields, and
+    /// `cf_state_from_spec(build(state))` must reproduce the state + operand strings exactly. This
+    /// red-flags any future field transposition (e.g. `blanks_no`↔`errors_no`, or a swapped
+    /// `bottom`/`percent`) that the per-kind mappings would otherwise hide. Pure — no gpui context.
+    #[test]
+    fn cf_build_spec_and_state_round_trip_cover_every_highlight_kind() {
+        use CfEditorKind::*;
+        // A non-default format proves the fill/text/bold/italic + stop_if_true seed round-trips
+        // across non-CellValue kinds (used by Text + Formula below).
+        let fancy = CfFormat {
+            fill: Some(Rgb::from_hex(0xC6EFCE)),
+            text_color: Some(Rgb::from_hex(0x006100)),
+            bold: true,
+            italic: true,
+        };
+        let plain = CfFormat::default();
+
+        // (label, state, operand1, operand2, formula, expected spec)
+        let cases: Vec<(&str, CfEditorState, &str, &str, &str, CfRuleSpec)> = vec![
+            (
+                "cell value gt",
+                cf_state(|s| s.value_op = CfValueOp::Gt),
+                "100",
+                "",
+                "",
+                CfRuleSpec::CellIs {
+                    op: CfValueOp::Gt,
+                    operand: "100".to_string(),
+                    operand2: None,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "cell value between",
+                cf_state(|s| {
+                    s.value_op = CfValueOp::Between;
+                    s.stop_if_true = true;
+                }),
+                "10",
+                "20",
+                "",
+                CfRuleSpec::CellIs {
+                    op: CfValueOp::Between,
+                    operand: "10".to_string(),
+                    operand2: Some("20".to_string()),
+                    format: plain,
+                    stop_if_true: true,
+                },
+            ),
+            (
+                "text contains (fancy format)",
+                cf_state(|s| {
+                    s.kind = Text;
+                    s.text_op = CfTextOp::Contains;
+                    s.format = fancy;
+                    s.stop_if_true = true;
+                }),
+                "foo",
+                "",
+                "",
+                CfRuleSpec::Text {
+                    op: CfTextOp::Contains,
+                    value: "foo".to_string(),
+                    format: fancy,
+                    stop_if_true: true,
+                },
+            ),
+            (
+                "text not-contains",
+                cf_state(|s| {
+                    s.kind = Text;
+                    s.text_op = CfTextOp::NotContains;
+                }),
+                "bar",
+                "",
+                "",
+                CfRuleSpec::Text {
+                    op: CfTextOp::NotContains,
+                    value: "bar".to_string(),
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "text begins-with",
+                cf_state(|s| {
+                    s.kind = Text;
+                    s.text_op = CfTextOp::BeginsWith;
+                }),
+                "pre",
+                "",
+                "",
+                CfRuleSpec::Text {
+                    op: CfTextOp::BeginsWith,
+                    value: "pre".to_string(),
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "text ends-with",
+                cf_state(|s| {
+                    s.kind = Text;
+                    s.text_op = CfTextOp::EndsWith;
+                }),
+                "post",
+                "",
+                "",
+                CfRuleSpec::Text {
+                    op: CfTextOp::EndsWith,
+                    value: "post".to_string(),
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "text equals",
+                cf_state(|s| {
+                    s.kind = Text;
+                    s.text_op = CfTextOp::Equals;
+                }),
+                "exact",
+                "",
+                "",
+                CfRuleSpec::Text {
+                    op: CfTextOp::Equals,
+                    value: "exact".to_string(),
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "dates today",
+                cf_state(|s| {
+                    s.kind = Dates;
+                    s.period = CfPeriod::Today;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::TimePeriod {
+                    period: CfPeriod::Today,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "dates last-month",
+                cf_state(|s| {
+                    s.kind = Dates;
+                    s.period = CfPeriod::LastMonth;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::TimePeriod {
+                    period: CfPeriod::LastMonth,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "top N",
+                cf_state(|s| {
+                    s.kind = TopBottom;
+                    s.top_rank = 25;
+                    s.top_percent = false;
+                    s.top_bottom = false;
+                }),
+                "25",
+                "",
+                "",
+                CfRuleSpec::Top {
+                    rank: 25,
+                    percent: false,
+                    bottom: false,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "top percent",
+                cf_state(|s| {
+                    s.kind = TopBottom;
+                    s.top_rank = 10;
+                    s.top_percent = true;
+                    s.top_bottom = false;
+                }),
+                "10",
+                "",
+                "",
+                CfRuleSpec::Top {
+                    rank: 10,
+                    percent: true,
+                    bottom: false,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "bottom N",
+                cf_state(|s| {
+                    s.kind = TopBottom;
+                    s.top_rank = 5;
+                    s.top_percent = false;
+                    s.top_bottom = true;
+                }),
+                "5",
+                "",
+                "",
+                CfRuleSpec::Top {
+                    rank: 5,
+                    percent: false,
+                    bottom: true,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "bottom percent",
+                cf_state(|s| {
+                    s.kind = TopBottom;
+                    s.top_rank = 15;
+                    s.top_percent = true;
+                    s.top_bottom = true;
+                }),
+                "15",
+                "",
+                "",
+                CfRuleSpec::Top {
+                    rank: 15,
+                    percent: true,
+                    bottom: true,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "above average",
+                cf_state(|s| {
+                    s.kind = Average;
+                    s.average_below = false;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::Average {
+                    below: false,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "below average",
+                cf_state(|s| {
+                    s.kind = Average;
+                    s.average_below = true;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::Average {
+                    below: true,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "duplicate values",
+                cf_state(|s| {
+                    s.kind = Duplicate;
+                    s.duplicate_unique = false;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::DuplicateValues {
+                    unique: false,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "unique values",
+                cf_state(|s| {
+                    s.kind = Duplicate;
+                    s.duplicate_unique = true;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::DuplicateValues {
+                    unique: true,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "blank",
+                cf_state(|s| {
+                    s.kind = Blanks;
+                    s.blanks_no = false;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::Blanks {
+                    no_blanks: false,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "no blanks",
+                cf_state(|s| {
+                    s.kind = Blanks;
+                    s.blanks_no = true;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::Blanks {
+                    no_blanks: true,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "error",
+                cf_state(|s| {
+                    s.kind = Errors;
+                    s.errors_no = false;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::Errors {
+                    no_errors: false,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "no errors",
+                cf_state(|s| {
+                    s.kind = Errors;
+                    s.errors_no = true;
+                }),
+                "",
+                "",
+                "",
+                CfRuleSpec::Errors {
+                    no_errors: true,
+                    format: plain,
+                    stop_if_true: false,
+                },
+            ),
+            (
+                "formula (fancy format)",
+                cf_state(|s| {
+                    s.kind = Formula;
+                    s.format = fancy;
+                    s.stop_if_true = true;
+                }),
+                "",
+                "",
+                "=A1>0",
+                CfRuleSpec::Formula {
+                    formula: "=A1>0".to_string(),
+                    format: fancy,
+                    stop_if_true: true,
+                },
+            ),
+        ];
+
+        // Sanity: every highlight kind is represented at least once.
+        let covered: Vec<CfEditorKind> = cases.iter().map(|(_, s, ..)| s.kind).collect();
+        for kind in [
+            CellValue, Text, Dates, TopBottom, Average, Duplicate, Blanks, Errors, Formula,
+        ] {
+            assert!(
+                covered.contains(&kind),
+                "the table must exercise every highlight kind (missing {kind:?})"
+            );
+        }
+
+        for (label, state, op1, op2, formula, expected) in cases {
+            // Forward: the editor state maps to the expected engine spec.
+            let built = cf_build_spec(&state, op1, op2, formula);
+            assert_eq!(built, expected, "cf_build_spec mismatch for `{label}`");
+            // Round-trip: seeding the editor back from that spec reproduces the state exactly.
+            let (state2, r1, r2, rf) =
+                cf_state_from_spec(1, &built).expect("highlight specs are authorable");
+            assert_eq!(state2, state, "state round-trip mismatch for `{label}`");
+            assert_eq!(
+                (r1.as_str(), r2.as_str(), rf.as_str()),
+                (op1, op2, formula),
+                "operand round-trip mismatch for `{label}`"
+            );
+        }
+    }
+
     // ---- Chart edit panel (P19) -----------------------------------------------------------
 
     #[gpui::test]

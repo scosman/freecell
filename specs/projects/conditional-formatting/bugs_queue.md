@@ -58,3 +58,74 @@ update. Then re-verify in the live app.
 
 **Also unblocks:** P10 render validation (its render scenes drive this same worker path — correct CF
 baselines can't be generated until BUG-1 is fixed).
+
+---
+
+## BUG-2 — CF not loading from `demospreadsheet.xlsx` — INVESTIGATED (no code fix; needs file re-share to confirm)
+
+**Reported:** "not loading conditional formatting in attached spreadsheet. Works in Numbers, but not
+FreeCell. Others work, so loading works, just this one."
+
+**Severity:** Medium (file-specific load fidelity) — but see finding.
+
+**Investigation (raw xlsx inspection, 2026-07-17):** unzipped the attached
+`e80e7207-demospreadsheet.xlsx` and scanned every worksheet part. **The file contains no
+conditional-formatting markup at all:**
+- All 4 sheets: `legacy <conditionalFormatting>=0`, `cfRule=0` (catches both legacy and `x14:cfRule`),
+  `<extLst>=0`, `x14:conditionalFormatting=0`.
+- `xl/styles.xml` has no `<dxfs>` differential-format block (CF fills/fonts live in `<dxfs>`).
+- The workbook does contain charts (`chart1..5`) + drawings — so it's a real, non-trivial file; it
+  simply carries **zero** CF in the OOXML.
+
+**Conclusion:** there is nothing for FreeCell (or IronCalc, or any OOXML reader) to load — the CF is
+absent from the xlsx. Most likely **Apple Numbers did not export its conditional formatting into the
+xlsx** (Numbers CF→OOXML export is known-lossy): the user sees CF in the Numbers-native document, but
+the exported `.xlsx` lost it. A less-likely alternative is that a different file was intended. Either
+way this is **not a FreeCell load defect** reproducible from this file, so there is **no code change
+to make**.
+
+**Disposition:** BLOCKED on evidence, not on code. To turn this into an actionable bug we need a file
+that actually contains `<conditionalFormatting>`/`<dxfs>` markup and still fails to load in FreeCell.
+Action item for the owner: re-share the file (uploads are ephemeral and this one is already gone), or
+confirm whether the CF only exists in the `.numbers` original. If a re-shared xlsx *does* contain CF
+markup and still doesn't load, reopen as a real load bug (then chase IronCalc's xlsx CF reader).
+
+---
+
+## BUG-3 — Sidebar rule list should show only rules intersecting the current selection — OPEN
+
+**Reported:** "the sidebar list should only show rules in the list that intersect the currently
+selected cell(s). Large sheets can have hundreds."
+
+**Severity:** Medium (UX / scalability of the list) — feature refinement, not a correctness defect.
+
+**Current behavior:** `render_cf_list` (in `app/crates/freecell-app/src/chrome/view.rs`) builds one row
+per rule returned by `client.cond_fmt_rules(sheet)` — i.e. **every** rule on the sheet, regardless of
+selection. On a sheet with hundreds of rules the list is unusable.
+
+**Desired behavior:** the list shows only rules whose target range **intersects the current
+selection**; it re-filters live as the selection changes.
+
+**Design notes for the coding agent (verify against the code before implementing):**
+- `CfRuleView.range` is the rule's sqref string and **may be a multi-area address** (space-separated,
+  e.g. `"A1:A10 C1:C10"`). Parse all sub-areas and test intersection against the current selection
+  (also potentially multi-area). Reuse the existing A1/range parsing + rectangle-intersection helpers
+  in `freecell-core` rather than hand-rolling — find them first (grid selection already parses ranges).
+- **Preserve the true engine index.** Raise/Lower/Update/Delete operate on `CfRuleView.index`, which is
+  the rule's position in the *full* sheet list. Filtering is **display-only** — never renumber; keep
+  passing the real `index` to the worker commands so reorder/edit/delete still target the right rule.
+- **Refresh on selection change.** Today `on_selection_changed` (~view.rs:772) deliberately does **not**
+  close the CF sidebar (good), but it also doesn't re-render the filtered list. It must now trigger a
+  re-render / `cx.notify()` so the list tracks the selection. Keep the existing "selection change does
+  not close the sidebar" behavior.
+- **Empty state.** When no rule intersects the selection, show a short empty message (e.g. "No rules
+  apply to the selected cells") plus the existing **Add rule** button — adding must still work
+  (a new rule's range defaults from the current selection, as today).
+- **Priority-reorder semantics under a filtered view:** CF priority is sheet-global, so raising a rule
+  that's shown (filtered) still reorders it against hidden rules. That's acceptable for the first pass;
+  note it, don't try to make priority selection-relative.
+
+**Tests:** view test(s) — with two rules on a sheet (one intersecting the selection, one not), the list
+renders only the intersecting row; changing the selection to the other rule's range swaps which row
+shows; empty selection intersection shows the empty state + Add button; a filtered row's Delete/reorder
+still sends the command with the correct original index.

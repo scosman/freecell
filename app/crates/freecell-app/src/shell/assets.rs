@@ -292,6 +292,11 @@ mod tests {
             "icons/trash-2.svg",
             "icons/chevron-up.svg",
             "icons/chevron-down.svg",
+            // Editor mode (P6): the back-chevron + the format editor's bold/italic toggles.
+            // `chevron-left` falls through to the bundle; `bold`/`italic` are FreeCell-vendored.
+            "icons/chevron-left.svg",
+            "icons/bold.svg",
+            "icons/italic.svg",
         ] {
             assert!(
                 matches!(AppAssets.load(path), Ok(Some(_))),

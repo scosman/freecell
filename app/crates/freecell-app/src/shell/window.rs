@@ -703,6 +703,17 @@ impl WorkbookWindow {
                 });
             }
             EditRejectedReason::EnginePanic | EditRejectedReason::Engine(_) => {
+                // A typed engine error while the CF rule editor is open is (almost certainly) that
+                // editor's Save being refused — surface it inline and keep the editor open
+                // (`functional_spec.md §8`) instead of the transient modal.
+                if let EditRejectedReason::Engine(msg) = &reason {
+                    if self.chrome.read(cx).cf_editor_open() {
+                        let msg = msg.clone();
+                        self.chrome
+                            .update(cx, |c, cx| c.show_cf_editor_error(msg, cx));
+                        return;
+                    }
+                }
                 if self.modal.is_none() {
                     let detail = match &reason {
                         EditRejectedReason::Engine(msg) => msg.clone(),

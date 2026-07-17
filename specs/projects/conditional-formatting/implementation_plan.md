@@ -49,7 +49,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   tests — list renders rows; delete + reorder send commands; sheet switch refreshes; Badge row edit
   disabled.
 
-- [ ] **P6 — Rule editor: highlight rules + format editor.** Editor mode; rule-type dropdown;
+- [x] **P6 — Rule editor: highlight rules + format editor.** Editor mode; rule-type dropdown;
   per-type operands (Cell value, Text, Dates, Top/Bottom, Above/Below, Duplicate/Unique,
   Blanks/Errors, Formula); the **format editor** (fill/text color + bold/italic + presets +
   preview); validation; Save → `AddCondFmt`/`UpdateCondFmt`; edit seeds from `spec`. *Exit:* view

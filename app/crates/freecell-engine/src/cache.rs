@@ -310,9 +310,20 @@ fn v_align_of(style: &Style) -> Option<freecell_core::VAlign> {
 /// build-on-activation path (open builds the active sheet; other sheets build on first switch).
 /// Cost is bounded by the sheet's populated/styled cells + band/size records, not the Excel-max
 /// grid (`components/style_cache.md §Lifecycle`).
+///
+/// `cf` is the sheet's conditional-formatting gate (`WorkbookDocument::has_cond_fmt`, computed once
+/// by the caller). When `false` a populated cell takes the UNCHANGED fast path (its base own style
+/// → [`render_style_from`]); a workbook with no CF pays nothing. When `true` the cell's fill/font
+/// differential comes from the **effective** (base + winning CF overlay) style
+/// ([`WorkbookDocument::extended_render_style`]) instead — the engine returns the base style when no
+/// rule matches, so every populated cell is correct. Side-table fields (num_fmt / font size / font
+/// family / border) are not part of the CF format this pass, so they resolve from the base own style
+/// on both paths (`architecture.md §4.4`, `components/engine_cf.md §6`). Band (row/col) styles keep
+/// the base path — CF is per-cell.
 pub(crate) fn build_sheet_cache(
     doc: &WorkbookDocument,
     sheet_idx: u32,
+    cf: bool,
 ) -> Result<SheetCache, String> {
     let mut builder = SheetCacheBuilder::new(limits::MAX_ROWS, limits::MAX_COLS);
     let ws = doc.worksheet(sheet_idx)?;
@@ -411,7 +422,15 @@ pub(crate) fn build_sheet_cache(
             let col0 = (*col_1 - 1) as u32;
             let cell = CellRef::new(row0, col0);
             if let Some(style) = doc.cell_own_style(sheet_idx, cell)? {
-                let mut rs = render_style_from(&style, doc.workbook_theme());
+                // CF gate: on a CF sheet the fill/font differential is the cell's EFFECTIVE style
+                // (base + winning CF overlay); off a CF sheet it is the base own style (fast path).
+                // The side-table fields below resolve from the base `style` on both paths — CF
+                // formats don't carry num_fmt/font/border this pass.
+                let mut rs = if cf {
+                    doc.extended_render_style(sheet_idx, cell, doc.workbook_theme())
+                } else {
+                    render_style_from(&style, doc.workbook_theme())
+                };
                 rs.num_fmt = builder.intern_num_fmt(&style.num_fmt);
                 rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
                 rs.font_family = resolve_family(&mut builder, &style.font.name, &def_name);
@@ -443,6 +462,11 @@ pub(crate) fn build_sheet_cache(
 ///
 /// `def_sz` / `def_name` are the workbook default font (`doc.default_font()`), passed in so a
 /// multi-cell refresh resolves it **once** rather than re-reading + re-cloning it per cell.
+///
+/// `cf` is the sheet's CF gate (`WorkbookDocument::has_cond_fmt`, resolved once per range by the
+/// caller). It mirrors [`build_sheet_cache`]: when `true` the refreshed cell's fill/font
+/// differential comes from the effective (base + CF overlay) style, so a **style** edit to a cell
+/// that a rule fills keeps its overlay; when `false` it takes the unchanged base-style fast path.
 pub(crate) fn refresh_cell(
     cache: &mut SheetCache,
     doc: &WorkbookDocument,
@@ -450,10 +474,15 @@ pub(crate) fn refresh_cell(
     cell: CellRef,
     def_sz: i32,
     def_name: &str,
+    cf: bool,
 ) -> Result<(), String> {
     match doc.cell_own_style(sheet_idx, cell)? {
         Some(style) => {
-            let mut rs = render_style_from(&style, doc.workbook_theme());
+            let mut rs = if cf {
+                doc.extended_render_style(sheet_idx, cell, doc.workbook_theme())
+            } else {
+                render_style_from(&style, doc.workbook_theme())
+            };
             rs.num_fmt = cache.intern_num_fmt(&style.num_fmt);
             rs.font_size_q = font_size_q_of(style.font.sz, def_sz);
             rs.font_family = if style.font.name == def_name {
@@ -704,7 +733,7 @@ mod tests {
             .update_range_style(&area, "num_fmt", "$#,##0.00")
             .unwrap();
 
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let formatted = cache
             .render_style(0, 0)
             .expect("format-only cell is stored");
@@ -720,7 +749,7 @@ mod tests {
         // 0 — so a default-font cell interns to the default style and renders at the grid default.
         let mut doc = WorkbookDocument::new_empty().unwrap();
         doc.set_cell_input(0, CellRef::new(0, 0), "plain").unwrap();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         assert!(
             cache.render_style(0, 0).is_none(),
             "a default-font cell is not stored (interns to default)"
@@ -739,7 +768,7 @@ mod tests {
         assert_eq!(doc.default_font(), (10, "Arial".to_string()));
 
         doc.set_cell_input(0, CellRef::new(0, 0), "x").unwrap();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         assert!(
             cache.render_style(0, 0).is_none(),
             "a cell inheriting the file default font interns to the sentinel (renders unchanged)"
@@ -761,7 +790,7 @@ mod tests {
             &def_name,
         )
         .unwrap();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let rs = cache
             .render_style(1, 0)
             .expect("a font differing from the file default is stored");
@@ -787,7 +816,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let rs = cache.render_style(0, 0).expect("font-only cell is stored");
         assert_eq!(rs.font_size_q, 24 * 4, "24pt → 96 quarter-points");
         assert_ne!(rs.font_family, 0);
@@ -814,7 +843,7 @@ mod tests {
             .update_range_style(&col_area, "font.size_delta", "10")
             .unwrap();
         let (def_sz, _) = doc.default_font();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         // A cell in the band (no own style) resolves to the band's font size.
         let rs = cache
             .render_style(20, 3)
@@ -935,7 +964,7 @@ mod tests {
         )
         .unwrap();
 
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let rs = cache
             .render_style(0, 0)
             .expect("a border-only cell is stored");
@@ -1069,7 +1098,7 @@ mod tests {
     #[test]
     fn build_matches_engine_styled_fixture() {
         let doc = reference_doc();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let (rows, cols) = probes();
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
     }
@@ -1077,7 +1106,7 @@ mod tests {
     #[test]
     fn build_matches_engine_empty() {
         let doc = WorkbookDocument::new_empty().unwrap();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let rows: Vec<u32> = (0..8).collect();
         assert_cache_agrees(&doc, &cache, 0, &rows, &rows).unwrap();
     }
@@ -1096,7 +1125,7 @@ mod tests {
         doc.user_model_mut()
             .update_range_style(&row_area, "fill.fg_color", "#EEEEEE")
             .unwrap();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let rows: Vec<u32> = (0..8).collect();
         let cols: Vec<u32> = (0..8).collect();
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
@@ -1106,7 +1135,7 @@ mod tests {
     fn excel_max_geometry_totals_match_engine() {
         // A 1M-row default sheet: the axis total equals rows × the converted engine default.
         let doc = WorkbookDocument::new_empty().unwrap();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let expected = limits::MAX_ROWS as f64 * row_px(IRONCALC_DEFAULT_ROW_HEIGHT_PX) as f64;
         assert!((cache.total_height() - expected).abs() < 1.0);
     }
@@ -1133,7 +1162,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         assert_eq!(cache.render_style(0, 0), cache.render_style(1, 1));
         assert_ne!(cache.render_style(0, 0), cache.render_style(3, 3));
     }
@@ -1145,7 +1174,16 @@ mod tests {
         let (def_sz, def_name) = doc.default_font();
         for row in range.rows() {
             for col in range.cols() {
-                refresh_cell(cache, doc, 0, CellRef::new(row, col), def_sz, &def_name).unwrap();
+                refresh_cell(
+                    cache,
+                    doc,
+                    0,
+                    CellRef::new(row, col),
+                    def_sz,
+                    &def_name,
+                    false,
+                )
+                .unwrap();
             }
         }
     }
@@ -1153,13 +1191,13 @@ mod tests {
     /// Refresh a single cell's cache entry, resolving the workbook default font inline (test-only).
     fn refresh_one(cache: &mut SheetCache, doc: &WorkbookDocument, cell: CellRef) {
         let (def_sz, def_name) = doc.default_font();
-        refresh_cell(cache, doc, 0, cell, def_sz, &def_name).unwrap();
+        refresh_cell(cache, doc, 0, cell, def_sz, &def_name, false).unwrap();
     }
 
     #[test]
     fn mirror_set_style_each_attr_agrees() {
         let mut doc = WorkbookDocument::new_empty().unwrap();
-        let mut cache = build_sheet_cache(&doc, 0).unwrap();
+        let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
         let (rows, cols) = probes();
 
         // Single cell, then a multi-cell range, then a range overlapping a col band.
@@ -1193,7 +1231,7 @@ mod tests {
         // The contract must have discriminating power: apply an edit to the engine but DON'T
         // mirror it into the cache, and the agreement helper must FAIL.
         let mut doc = reference_doc();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let (rows, cols) = probes();
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap(); // agrees before
 
@@ -1218,7 +1256,7 @@ mod tests {
         // the exact per-frame budget is the macOS perf harness (Phase 12). The axes span the
         // full Excel-max sheet, so a passing sweep proves the lookups are sub-linear in it.
         let doc = reference_doc();
-        let cache = build_sheet_cache(&doc, 0).unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
         let (row_axis, col_axis) = cache.axes();
         // Precompute per-track offsets once (as the real grid does), then resolve the 2k cells.
         let start = std::time::Instant::now();
@@ -1256,7 +1294,7 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/libreoffice_custom_height_wrap.xlsx");
         let doc = WorkbookDocument::open(&path).expect("LibreOffice demo workbook should open");
-        let cache = build_sheet_cache(&doc, 0).expect("sheet 0 cache builds");
+        let cache = build_sheet_cache(&doc, 0, false).expect("sheet 0 cache builds");
 
         // Custom row heights are seeded at their stored tall height on load (no edit). Points →
         // IronCalc px (× ROW_HEIGHT_FACTOR 1.5625) → device px (× 24/25): 33.75pt → 50.625,
@@ -1286,5 +1324,148 @@ mod tests {
             .render_style(4, 1)
             .expect("wrapped header cell B5 is stored");
         assert!(b5.wrap, "B5 should be wrap-on after import");
+    }
+
+    // ---- Conditional formatting: the value-dependent build/refresh gate (P3) ----
+
+    const CF_RED: Rgb = Rgb::new(255, 0, 0);
+
+    /// A "Cell value > operand" highlight rule filling matches red — the CF cache fixture.
+    fn gt_fill_rule(operand: &str) -> freecell_core::CfRuleSpec {
+        freecell_core::CfRuleSpec::CellIs {
+            op: freecell_core::CfValueOp::Gt,
+            operand: operand.to_string(),
+            operand2: None,
+            format: freecell_core::CfFormat {
+                fill: Some(CF_RED),
+                ..Default::default()
+            },
+            stop_if_true: false,
+        }
+    }
+
+    #[test]
+    fn cf_build_applies_matching_highlight_and_gate() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "150").unwrap(); // A1 > 100
+        doc.set_cell_input(0, CellRef::new(4, 0), "50").unwrap(); // A5 <= 100
+        doc.add_cond_fmt(0, "A1:A10", &gt_fill_rule("100")).unwrap();
+
+        // cf = true → the matching cell carries the CF fill; the non-matching cell keeps its base
+        // style (its own style is plain, so it is not even stored).
+        let cache = build_sheet_cache(&doc, 0, true).unwrap();
+        assert_eq!(
+            cache.render_style(0, 0).and_then(|rs| rs.fill),
+            Some(CF_RED),
+            "a cell over the threshold gets the rule's fill in the render cache"
+        );
+        assert!(
+            cache.render_style(4, 0).is_none(),
+            "a cell under the threshold keeps the (default) base style"
+        );
+
+        // cf = false (the fast path) on the SAME doc → the fill is NOT applied (it is a CF overlay,
+        // absent from the cell's base own style), proving the flag gates the extended read.
+        let base = build_sheet_cache(&doc, 0, false).unwrap();
+        assert!(
+            base.render_style(0, 0).is_none(),
+            "the fast path never reads CF: A1's base own style is plain"
+        );
+    }
+
+    #[test]
+    fn cf_build_color_scale_interpolates_into_cache() {
+        use freecell_core::{CfColorStop, CfThresholdKind};
+        let green = Rgb::new(0, 255, 0);
+        let red = Rgb::new(255, 0, 0);
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "0").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "50").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 0), "100").unwrap();
+        doc.add_cond_fmt(
+            0,
+            "A1:A3",
+            &freecell_core::CfRuleSpec::ColorScale {
+                stops: vec![
+                    CfColorStop {
+                        kind: CfThresholdKind::Min,
+                        value: None,
+                        color: green,
+                    },
+                    CfColorStop {
+                        kind: CfThresholdKind::Max,
+                        value: None,
+                        color: red,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let cache = build_sheet_cache(&doc, 0, true).unwrap();
+        let mid = cache.render_style(1, 0).and_then(|rs| rs.fill);
+        assert!(
+            mid.is_some(),
+            "the mid cell gets an interpolated scale fill in the cache"
+        );
+        assert_ne!(mid, Some(green), "mid is not the min endpoint");
+        assert_ne!(mid, Some(red), "mid is not the max endpoint");
+        assert!(cache.render_style(0, 0).and_then(|rs| rs.fill).is_some());
+        assert!(cache.render_style(2, 0).and_then(|rs| rs.fill).is_some());
+    }
+
+    #[test]
+    fn cf_refresh_cell_keeps_overlay() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "150").unwrap();
+        doc.add_cond_fmt(0, "A1:A10", &gt_fill_rule("100")).unwrap();
+        let mut cache = build_sheet_cache(&doc, 0, true).unwrap();
+        assert_eq!(
+            cache.render_style(0, 0).and_then(|rs| rs.fill),
+            Some(CF_RED)
+        );
+
+        // A style edit (bold) on the rule-filled cell. Refreshing with cf = true keeps BOTH the base
+        // bold AND the CF fill (the effective style), so a style edit never drops a cell's overlay.
+        doc.set_font_flag(
+            0,
+            CellRange::single(CellRef::new(0, 0)),
+            crate::document::FontFlag::Bold,
+            true,
+        )
+        .unwrap();
+        let (def_sz, def_name) = doc.default_font();
+        refresh_cell(
+            &mut cache,
+            &doc,
+            0,
+            CellRef::new(0, 0),
+            def_sz,
+            &def_name,
+            true,
+        )
+        .unwrap();
+        let rs = cache.render_style(0, 0).copied().expect("A1 stored");
+        assert!(rs.bold, "the base bold edit is reflected");
+        assert_eq!(
+            rs.fill,
+            Some(CF_RED),
+            "the CF overlay survives the style edit"
+        );
+
+        // The discriminating control: the fast path (cf = false) drops the overlay.
+        refresh_cell(
+            &mut cache,
+            &doc,
+            0,
+            CellRef::new(0, 0),
+            def_sz,
+            &def_name,
+            false,
+        )
+        .unwrap();
+        let rs = cache.render_style(0, 0).copied().expect("A1 stored");
+        assert!(rs.bold);
+        assert_eq!(rs.fill, None, "the fast path never reads the CF overlay");
     }
 }

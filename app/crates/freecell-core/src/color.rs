@@ -6,8 +6,10 @@
 //! `datagen::Rgb` (`experiments/shared/datagen/src/cell.rs`) — copied, not referenced,
 //! because the app must not depend on throwaway experiment crates (`architecture.md §1`).
 
+use serde::{Deserialize, Serialize};
+
 /// A 24-bit RGB colour (`0xRRGGBB` when packed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rgb {
     pub r: u8,
     pub g: u8,

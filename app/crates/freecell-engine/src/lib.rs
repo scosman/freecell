@@ -24,6 +24,7 @@
 
 pub(crate) mod cache;
 pub mod chart;
+pub(crate) mod cond_fmt_convert;
 pub mod document;
 pub mod fixtures;
 pub mod instrument;

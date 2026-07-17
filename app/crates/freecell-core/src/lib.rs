@@ -15,6 +15,7 @@ pub mod axis;
 pub mod border;
 pub mod cache;
 pub mod color;
+pub mod cond_fmt;
 pub mod data_row;
 pub mod eval_indicator;
 pub mod find;
@@ -40,6 +41,10 @@ pub use axis::Axis;
 pub use border::{effective_edge, BorderSpec, Edge, LinePattern};
 pub use cache::{SheetCache, SheetCacheBuilder, SheetCaches, StyleId};
 pub use color::Rgb;
+pub use cond_fmt::{
+    CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind,
+    CfValueOp,
+};
 pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};
 pub use merge_guard::{blocks_col_op, blocks_row_op};
 pub use publication::{CellKind, Publication, PublishedCell};

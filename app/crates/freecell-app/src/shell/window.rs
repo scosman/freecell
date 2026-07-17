@@ -507,11 +507,13 @@ impl WorkbookWindow {
                     self.chrome.update(cx, |c, cx| c.refresh_active_style(cx));
                 }
             }
-            WorkerEvent::CondFmtUpdated { sheet: _ } => {
-                // The published conditional-formatting rule list changed. The CF sidebar that
-                // rebuilds its rows from `client.cond_fmt_rules` lands in P4/P5
-                // (`components/cf_sidebar.md`); until that surface exists there is nothing to
-                // refresh, so this is a deliberate no-op that keeps the exhaustive match honest.
+            WorkerEvent::CondFmtUpdated { sheet } => {
+                // The published conditional-formatting rule list changed. Rebuild the CF sidebar's
+                // rows if it is open on this sheet (`components/cf_sidebar.md §9`); a closed sidebar
+                // or an update for a different sheet is a no-op.
+                if self.chrome.read(cx).cond_fmt_sheet() == Some(sheet) {
+                    self.chrome.update(cx, |c, cx| c.refresh_cond_fmt(cx));
+                }
             }
             WorkerEvent::SheetsChanged { sheets } => {
                 self.reconcile_sheets(sheets, window, cx);

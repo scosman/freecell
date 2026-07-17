@@ -19,15 +19,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, CursorStyle, ElementId, Entity,
-    FocusHandle, Focusable, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Rgba, SharedString, Window,
+    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
+    Focusable, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::spinner::Spinner;
-use gpui_component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
@@ -54,7 +54,9 @@ use freecell_engine::{
     DataLabelToggles, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
 };
 
+use super::cond_fmt::CondFmtPanel;
 use super::h_scroller::{h_scroller, HScroller};
+use super::sidebar::{close_button, docked_sidebar, section};
 use super::{
     AutocompleteDisplay, AutocompleteRow, ChromeClient, ChromeGridRequest, ChromeGridSink,
     EditController, EditOrigin, SheetTab,
@@ -82,11 +84,13 @@ const STATS_DEBOUNCE: Duration = Duration::from_millis(120);
 
 // --- Chrome look constants (functional POC greys; `ui_design.md §3`) -----------------
 const CHROME_BG: u32 = 0xF3F3F3;
-const HAIRLINE: u32 = 0xD9D9D9;
+// `HAIRLINE`, `ACTIVE_TAB_BG`, `TEXT`, `MUTED_TEXT` are `pub(crate)` so the shared docked-sidebar
+// container (`chrome::sidebar`) paints the identical card + section labels.
+pub(crate) const HAIRLINE: u32 = 0xD9D9D9;
 const DIVIDER: u32 = 0xC8C8C8;
-const ACTIVE_TAB_BG: u32 = 0xFFFFFF;
-const TEXT: u32 = 0x1F1F1F;
-const MUTED_TEXT: u32 = 0x555555;
+pub(crate) const ACTIVE_TAB_BG: u32 = 0xFFFFFF;
+pub(crate) const TEXT: u32 = 0x1F1F1F;
+pub(crate) const MUTED_TEXT: u32 = 0x555555;
 /// Danger border/text for cap-rejected input + invalid rename (theme danger, `#DC2626`).
 const DANGER: u32 = 0xDC2626;
 /// Dark tooltip fill + text for the cap-error popover (`ui_design.md §4`).
@@ -106,11 +110,9 @@ const TARGET_ICON_PX: f32 = 22.0;
 const TARGET_ICON_GREY: u32 = 0xC8C8C8;
 const TARGET_ICON_DARK: u32 = 0x1F1F1F;
 
-const ACTION_ROW_H: f32 = 36.0;
-
-/// The right-docked chart edit-panel width (P19, `ui_design §4`) — a compact side panel over the
-/// grid's right edge, wide enough for the type glyph row + the range status/apply button.
-const CHART_PANEL_W: f32 = 268.0;
+// `pub(crate)` so the shared docked-sidebar container (`chrome::sidebar`) positions the card
+// between the data row and the tab bar (the right-docked width is `sidebar::SIDEBAR_W`).
+pub(crate) const ACTION_ROW_H: f32 = 36.0;
 
 /// The default footprint (in cells) of a chart inserted from the action bar — a typical Excel
 /// default chart size (~8 columns × 15 rows), anchored at the active cell (`ui_design §3.1`).
@@ -169,13 +171,15 @@ impl Anchor {
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];
 /// The top "clear the family override" entry in the font-family dropdown (`ui_design.md §2`).
 const SYSTEM_DEFAULT_FAMILY: &str = "Default (Inter)";
-const DATA_ROW_H: f32 = 32.0;
+// `DATA_ROW_H` / `TAB_BAR_H` are `pub(crate)` so the shared docked-sidebar container
+// (`chrome::sidebar`) can dock the card between the data row and the tab bar.
+pub(crate) const DATA_ROW_H: f32 = 32.0;
 /// The formula-bar content entry's height: [`DATA_ROW_H`] minus 2 px breathing room above **and**
 /// below (BUG C), so the row's `items_center` insets the entry within the bar without changing the
 /// bar height. gpui-component's single-line `Input` otherwise renders at its fixed control height
 /// (`Size::Medium` → 32 px) and fills the row edge-to-edge, which reads as cramped.
 const DATA_ROW_FIELD_H: f32 = DATA_ROW_H - 4.0;
-const TAB_BAR_H: f32 = 30.0;
+pub(crate) const TAB_BAR_H: f32 = 30.0;
 /// A tab press that moves less than this (device px) is a click (select / rename), not a drag —
 /// only past it does the lift + drop indicator appear (`ui_design.md §3`).
 const TAB_DRAG_THRESHOLD_PX: f32 = 4.0;
@@ -419,6 +423,12 @@ pub struct ChromeView {
     /// captured key no longer matches the panel and the stale commit is dropped, so a field's text can
     /// never be sent to the wrong chart. `None` when no chart input is focused.
     chart_input_focus: Option<(SheetId, ChartId)>,
+    /// The right-docked **conditional-formatting sidebar** (`components/cf_sidebar.md`), open while
+    /// managing a sheet's CF rules. `Some` ⇒ open (mirrors [`chart_panel`](Self::chart_panel)); the
+    /// two share the right dock and are **mutually exclusive** (opening one closes the other). Closes
+    /// on its × / the action-bar toggle / degrade; does **not** close on grid selection change, and
+    /// re-scopes to the new sheet on a sheet switch. P4 renders List mode only (rows P5, editor P6).
+    cond_fmt: Option<CondFmtPanel>,
     /// The installed font-family names for the family dropdown, fetched once at build
     /// (`cx.text_system().all_font_names()`), sorted-unique with "Default (Inter)" prepended
     /// (`components/action_bar.md`). `Rc` so the render closure can clone it cheaply.
@@ -652,6 +662,7 @@ impl ChromeView {
             chart_cat_axis_input,
             chart_val_axis_input,
             chart_input_focus: None,
+            cond_fmt: None,
             anchor_x: [0.0; ANCHOR_COUNT],
             font_names,
             font_family_open: false,
@@ -769,6 +780,10 @@ impl ChromeView {
         // A click on *another chart* does NOT route here — the grid emits `ChartSelected` instead,
         // which re-points the panel (a switch, not a close) — and the panel's own controls never
         // change the grid selection, so they can't dismiss it either.
+        //
+        // The CF sidebar is deliberately EXEMPT from this click-away close (`components/cf_sidebar.md
+        // §4`): it stays open across selection changes so the user can pick the "Applies to" range by
+        // selecting cells. It re-scopes to a new sheet via the sheet-switch path, not here.
         self.close_chart_panel(cx);
         // Refresh the tab-bar selection-stats readout for the new selection (debounced).
         self.request_selection_stats(cx);
@@ -2052,6 +2067,10 @@ impl ChromeView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The chart panel and the CF sidebar share the right dock — opening one closes the other
+        // (`components/cf_sidebar.md §2`). A no-op when the CF sidebar is already closed (the common
+        // case: this also runs to reconcile an already-open chart panel on republish).
+        self.close_cond_fmt(cx);
         let new_chart = self.chart_panel.as_ref().map(|p| p.id) != Some(panel.id);
         if new_chart {
             self.seed_chart_input(
@@ -2101,6 +2120,77 @@ impl ChromeView {
     /// The chart the edit panel is currently shaping, if any (window introspection: refresh / close).
     pub fn chart_panel_target(&self) -> Option<ChartId> {
         self.chart_panel.as_ref().map(|p| p.id)
+    }
+
+    // ---- Conditional-formatting sidebar (P4, `components/cf_sidebar.md`) -------------------
+
+    /// Whether the CF sidebar is open (the action-bar `split` button's `selected` state + the render
+    /// gate + tests).
+    pub fn cond_fmt_open(&self) -> bool {
+        self.cond_fmt.is_some()
+    }
+
+    /// The sheet the open CF sidebar targets, if any (window introspection: the `CondFmtUpdated`
+    /// refresh gate).
+    pub fn cond_fmt_sheet(&self) -> Option<SheetId> {
+        self.cond_fmt.as_ref().map(|p| p.sheet)
+    }
+
+    /// Toggle the right-docked CF sidebar (the action-bar `split` button): open it in List mode if
+    /// closed, else close it.
+    pub fn toggle_cond_fmt_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.cond_fmt.is_some() {
+            self.close_cond_fmt(cx);
+        } else {
+            self.open_cond_fmt(cx);
+        }
+    }
+
+    /// Open the CF sidebar in List mode for the active sheet, building its rows from the published
+    /// rules. Closes the chart panel first (they share the right dock — `components/cf_sidebar.md §2`).
+    fn open_cond_fmt(&mut self, cx: &mut Context<Self>) {
+        self.close_chart_panel(cx);
+        let sheet = self.active_sheet;
+        let rows = self.client.cond_fmt_rules(sheet);
+        self.cond_fmt = Some(CondFmtPanel { sheet, rows });
+        cx.notify();
+    }
+
+    /// Close the CF sidebar (its ×, the action-bar toggle, or a degrade).
+    pub fn close_cond_fmt(&mut self, cx: &mut Context<Self>) {
+        if self.cond_fmt.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Rebuild the open CF sidebar's rows from the latest published rules for its own sheet — the
+    /// `WorkerEvent::CondFmtUpdated` refresh (and, from P5, after a CF command). A no-op when the
+    /// sidebar is closed.
+    pub fn refresh_cond_fmt(&mut self, cx: &mut Context<Self>) {
+        let Some(sheet) = self.cond_fmt.as_ref().map(|p| p.sheet) else {
+            return;
+        };
+        let rows = self.client.cond_fmt_rules(sheet);
+        if let Some(panel) = self.cond_fmt.as_mut() {
+            panel.rows = rows;
+            cx.notify();
+        }
+    }
+
+    /// Re-scope the open CF sidebar to the newly active sheet (rebuild its rows), if open — the
+    /// sheet-switch path (`components/cf_sidebar.md §4/§9`: the sidebar does **not** close on a sheet
+    /// change, it re-scopes). A no-op when the sidebar is closed. (P6 also cancels any open editor here.)
+    fn rescope_cond_fmt_if_open(&mut self, cx: &mut Context<Self>) {
+        if self.cond_fmt.is_none() {
+            return;
+        }
+        let sheet = self.active_sheet;
+        let rows = self.client.cond_fmt_rules(sheet);
+        if let Some(panel) = self.cond_fmt.as_mut() {
+            panel.sheet = sheet;
+            panel.rows = rows;
+            cx.notify();
+        }
     }
 
     /// Switch the panel's chart to `kind` (P19). A mutating chart control — like `insert_chart` it
@@ -2608,6 +2698,7 @@ impl ChromeView {
                 self.borders_open = false;
                 self.chart_menu_open = false;
                 self.chart_panel = None;
+                self.cond_fmt = None;
             }
             cx.notify();
         }
@@ -2669,6 +2760,8 @@ impl ChromeView {
         self.context_menu = None;
         // An open find bar re-scopes to the new sheet (`functional_spec.md §4.5`).
         self.rescope_find_if_open(cx);
+        // An open CF sidebar re-scopes to the new sheet (`components/cf_sidebar.md §9`).
+        self.rescope_cond_fmt_if_open(cx);
         self.refresh_active_style(cx);
     }
 
@@ -2690,6 +2783,8 @@ impl ChromeView {
         self.context_menu = None;
         // An open find bar re-scopes to the new sheet (`functional_spec.md §4.5`).
         self.rescope_find_if_open(cx);
+        // An open CF sidebar re-scopes to the new sheet (`components/cf_sidebar.md §9`).
+        self.rescope_cond_fmt_if_open(cx);
         self.grid
             .emit(ChromeGridRequest::SetActiveSheet(id), window, cx);
         cx.notify();
@@ -3216,22 +3311,6 @@ fn border_target_icon(preset: BorderPreset) -> gpui::AnyElement {
     icon.into_any_element()
 }
 
-/// The shared **close / dismiss** button for the chrome's overlay surfaces (the find bar, the chart
-/// edit panel — `functional_spec.md §4`, `ui_design.md §3`). A ghost, `small` icon button rendering
-/// the bundled Lucide "x" ([`IconName::Close`] → `icons/close.svg`, resolved from the gpui-component
-/// icon bundle), so every dismiss affordance is visually identical instead of an ad-hoc `×` text
-/// glyph. Returns the `Button` so each call site chains its own `tooltip` / `debug_selector`.
-fn close_button(
-    id: impl Into<ElementId>,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Button {
-    Button::new(id)
-        .icon(IconName::Close)
-        .ghost()
-        .small()
-        .on_click(on_click)
-}
-
 /// A borders **line-style preview** (`ui_design.md §2.3`): a short horizontal sample of the real
 /// line, vertically centered in a ~34px box. Solid weights are one dark bar (1/2/3px); dashed is a
 /// row of short dark dashes; double is two 1px dark bars with a gap.
@@ -3683,6 +3762,21 @@ impl ChromeView {
                         })),
                     cx,
                 ),
+            )
+            // Conditional formatting — toggles the right-docked CF sidebar directly (no menu, unlike
+            // the chart-insert glyph). `selected` (accent) while the sidebar is open; disabled in
+            // degraded/read-only mode (`components/cf_sidebar.md §5`, `ui_design.md §1`).
+            .child(
+                Button::new("cond-fmt")
+                    .icon(Icon::empty().path("icons/split.svg"))
+                    .tooltip("Conditional formatting")
+                    .ghost()
+                    .small()
+                    .disabled(disabled)
+                    .selected(self.cond_fmt_open())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_cond_fmt_sidebar(cx);
+                    })),
             )
             .child(action_divider())
             // Find & Replace trigger (`ui_design.md §2`): toggles the find bar; `selected` (accent)
@@ -4428,6 +4522,12 @@ impl ChromeView {
         if self.chart_panel.is_some() {
             overlays.push(self.render_chart_panel(cx));
         }
+        // The CF sidebar shares the right dock and is mutually exclusive with the chart panel, so at
+        // most one of these ever renders; like the chart panel it is a persistent docked surface, so
+        // it is pushed early to stay below the transient action-bar popovers.
+        if self.cond_fmt.is_some() {
+            overlays.push(self.render_cond_fmt_sidebar(cx));
+        }
 
         // The data-row cap popover anchors under the data row only when it is the active editor;
         // an in-cell cap error is shown under the overlay by the grid (`edit_controller.md §4.2`).
@@ -5027,45 +5127,8 @@ impl ChromeView {
             .as_ref()
             .expect("render_chart_panel only runs while the panel is open");
 
-        let section_label = |text: &'static str| {
-            div()
-                .text_size(px(10.5))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(rgb(MUTED_TEXT))
-                .child(text)
-        };
-        let section = |label: &'static str, body: gpui::AnyElement| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(section_label(label))
-                .child(body)
-        };
-
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
-                    .child("Edit chart"),
-            )
-            .child(
-                close_button(
-                    "chart-panel-close",
-                    cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.close_chart_panel(cx);
-                    }),
-                )
-                .debug_selector(|| "chart-panel-close".into()),
-            );
-
-        // The scrollable body sections (the header stays pinned above them, so the × is always
-        // reachable — post-v1 Batch 2, item 7).
+        // The scrollable body sections (the docked-sidebar header stays pinned above them, so the ×
+        // is always reachable — post-v1 Batch 2, item 7).
         let mut sections: Vec<gpui::AnyElement> = Vec::new();
 
         // Type + Data range — authored charts only (loaded re-type/re-range is not P20).
@@ -5082,10 +5145,7 @@ impl ChromeView {
         sections.push(
             section(
                 "Title",
-                Input::new(&self.chart_title_input)
-                    .small()
-                    .w_full()
-                    .into_any_element(),
+                Input::new(&self.chart_title_input).small().w_full(),
             )
             .into_any_element(),
         );
@@ -5104,8 +5164,7 @@ impl ChromeView {
                     .flex_col()
                     .gap_1()
                     .child(Input::new(&self.chart_cat_axis_input).small().w_full())
-                    .child(Input::new(&self.chart_val_axis_input).small().w_full())
-                    .into_any_element(),
+                    .child(Input::new(&self.chart_val_axis_input).small().w_full()),
             )
             .into_any_element(),
         );
@@ -5127,43 +5186,60 @@ impl ChromeView {
             .into_any_element(),
         );
 
-        div()
-            .absolute()
-            .top(px(ACTION_ROW_H + DATA_ROW_H))
-            .right_0()
-            .bottom(px(TAB_BAR_H))
-            .w(px(CHART_PANEL_W))
-            .occlude()
-            .debug_selector(|| "chart-panel-card".into())
-            .flex()
-            .flex_col()
-            // Clip to the panel's own bounds so overflowing controls never paint over the tab bar /
-            // grid on a short window (post-v1 Batch 2, item 7).
-            .overflow_hidden()
-            .bg(rgb(ACTIVE_TAB_BG))
-            .border_l_1()
-            .border_color(rgb(HAIRLINE))
-            .shadow_md()
-            // Pinned header (never scrolls, so the close × is always reachable).
-            .child(div().flex_shrink_0().px_3().pt_3().pb_2().child(header))
-            // Scrollable body: fills the remaining height and scrolls when the controls overflow, so
-            // every control (data-label toggles, etc.) is reachable at any window height. `min_h_0`
-            // lets the flex child shrink below its content so `overflow_y_scroll` engages; the `id`
-            // gives it a tracked scroll offset.
-            .child(
-                div()
-                    .id("chart-panel-body")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .px_3()
-                    .pb_3()
-                    .children(sections),
-            )
-            .into_any_element()
+        let body = div().flex().flex_col().gap_3().children(sections);
+
+        docked_sidebar(
+            "chart-panel",
+            "Edit chart",
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.close_chart_panel(cx);
+            }),
+            body,
+        )
+        .into_any_element()
+    }
+
+    /// The right-docked **conditional-formatting sidebar** (`components/cf_sidebar.md §5`). P4 renders
+    /// the **List-mode shell** only: an intro line naming the active sheet + a primary "+ Add rule"
+    /// button. The rule rows (P5) and the rule editor (P6) build on this shell inside the same
+    /// [`docked_sidebar`] container.
+    fn render_cond_fmt_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let panel = self
+            .cond_fmt
+            .as_ref()
+            .expect("render_cond_fmt_sidebar only runs while the sidebar is open");
+        let sheet_name = self
+            .sheets
+            .iter()
+            .find(|t| t.id == panel.sheet)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+
+        let intro = div()
+            .text_size(px(12.0))
+            .text_color(rgb(MUTED_TEXT))
+            .child(format!("Rules on {sheet_name}"));
+
+        // TODO(P6): open the rule editor (List → Editor mode). A no-op click for now — the P4 shell
+        // only proves the sidebar opens/closes and docks.
+        let add_rule = Button::new("cond-fmt-add-rule")
+            .label("+ Add rule")
+            .primary()
+            .small()
+            .disabled(self.degraded)
+            .on_click(cx.listener(|_this, _: &ClickEvent, _window, _cx| {}));
+
+        let body = div().flex().flex_col().gap_3().child(intro).child(add_rule);
+
+        docked_sidebar(
+            "cond-fmt",
+            "Conditional formatting",
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.close_cond_fmt(cx);
+            }),
+            body,
+        )
+        .into_any_element()
     }
 
     /// The Type row: one glyph button per authorable kind, the current one selected (authored only).
@@ -7223,6 +7299,172 @@ mod tests {
             "degrading closes the open chart menu"
         );
         assert!(upd(&h, cx, |c, _w, _cx| c.is_degraded()));
+    }
+
+    // ---- Conditional-formatting sidebar (P4, `components/cf_sidebar.md`) -------------------
+
+    /// A minimal published rule row for a given range (P4 doesn't render rows, but the sidebar
+    /// carries them, so the re-scope / refresh tests assert on `rows`).
+    fn cf_rule(range: &str) -> freecell_core::CfRuleView {
+        freecell_core::CfRuleView {
+            index: 0,
+            range: range.to_string(),
+            priority: 1,
+            editable: true,
+            summary: format!("Cell value > 100 ({range})"),
+            preview: freecell_core::CfPreview::Highlight {
+                fill: None,
+                text_color: None,
+            },
+            spec: None,
+        }
+    }
+
+    fn cf_rows_len(h: &Harness, cx: &mut TestAppContext) -> Option<usize> {
+        upd(h, cx, |c, _w, _cx| {
+            c.cond_fmt.as_ref().map(|p| p.rows.len())
+        })
+    }
+
+    #[gpui::test]
+    fn cond_fmt_button_toggles_sidebar(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        assert!(!upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()));
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()),
+            "the toggle opens the sidebar"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.cond_fmt_sheet()),
+            Some(SheetId(0)),
+            "it opens on the active sheet"
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()),
+            "toggling again closes it"
+        );
+    }
+
+    #[gpui::test]
+    fn opening_cond_fmt_closes_chart_panel(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.open_chart_panel(
+                ChartPanel::skeleton(SheetId(0), ChartId(7), true, ChartInsertKind::Line),
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target()),
+            Some(ChartId(7))
+        );
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target()),
+            None,
+            "opening the CF sidebar closes the chart panel (shared right dock)"
+        );
+    }
+
+    #[gpui::test]
+    fn opening_chart_panel_closes_cond_fmt(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()));
+        upd(&h, cx, |c, window, cx| {
+            c.open_chart_panel(
+                ChartPanel::skeleton(SheetId(0), ChartId(7), true, ChartInsertKind::Line),
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.chart_panel_target()),
+            Some(ChartId(7))
+        );
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()),
+            "opening the chart panel closes the CF sidebar (shared right dock)"
+        );
+    }
+
+    #[gpui::test]
+    fn selection_change_does_not_close_cond_fmt(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()));
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(3, 2)), window, cx)
+        });
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()),
+            "a grid selection change must NOT close the CF sidebar (the range-pick exemption)"
+        );
+    }
+
+    #[gpui::test]
+    fn sheet_switch_rescopes_cond_fmt(cx: &mut TestAppContext) {
+        let h = build(
+            cx,
+            vec![
+                SheetTab::new(SheetId(0), "Sheet1"),
+                SheetTab::new(SheetId(1), "Sheet2"),
+            ],
+            SheetId(0),
+        );
+        h.client
+            .set_cond_fmt_rules(SheetId(1), vec![cf_rule("B2:B20")]);
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.cond_fmt_sheet()),
+            Some(SheetId(0))
+        );
+        assert_eq!(cf_rows_len(&h, cx), Some(0), "sheet 0 has no CF rules");
+        // A window-driven sheet switch re-scopes the open sidebar to the new sheet + rebuilds rows.
+        upd(&h, cx, |c, _w, cx| c.adopt_active_sheet(SheetId(1), cx));
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.cond_fmt_sheet()),
+            Some(SheetId(1)),
+            "the sidebar re-scopes to the new sheet"
+        );
+        assert_eq!(
+            cf_rows_len(&h, cx),
+            Some(1),
+            "and rebuilds its rows from the new sheet's published rules"
+        );
+    }
+
+    #[gpui::test]
+    fn cond_fmt_updated_refreshes_rows(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert_eq!(cf_rows_len(&h, cx), Some(0), "opens with no rules");
+        // A CF mutation republishes the rule list; `refresh_cond_fmt` (the `CondFmtUpdated` handler)
+        // rebuilds the sidebar's rows from the published map.
+        h.client
+            .set_cond_fmt_rules(SheetId(0), vec![cf_rule("A1:A10")]);
+        upd(&h, cx, |c, _w, cx| c.refresh_cond_fmt(cx));
+        assert_eq!(
+            cf_rows_len(&h, cx),
+            Some(1),
+            "the sidebar rebuilt its rows from the published map"
+        );
+    }
+
+    #[gpui::test]
+    fn degrade_closes_cond_fmt(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, _w, cx| c.toggle_cond_fmt_sidebar(cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()));
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        assert!(
+            !upd(&h, cx, |c, _w, _cx| c.cond_fmt_open()),
+            "degrade closes the CF sidebar (like the chart panel)"
+        );
     }
 
     // ---- Chart edit panel (P19) -----------------------------------------------------------

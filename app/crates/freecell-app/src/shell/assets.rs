@@ -113,6 +113,12 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
         "icons/separator-horizontal.svg",
         include_bytes!("../../assets/icons/separator-horizontal.svg"),
     ),
+    // Conditional-formatting action-bar button glyph (`components/cf_sidebar.md §5`): the Lucide
+    // `split` icon, not shipped by the gpui-component bundle, vendored in the same tintable form.
+    (
+        "icons/split.svg",
+        include_bytes!("../../assets/icons/split.svg"),
+    ),
     (
         "icons/strikethrough.svg",
         include_bytes!("../../assets/icons/strikethrough.svg"),

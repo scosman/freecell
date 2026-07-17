@@ -66,7 +66,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   (Badge, delete-only) and don't break the cache. *Exit:* round-trip test green; a loaded data-bar
   rule lists as a Badge and its cell isn't corrupted.
 
-- [ ] **P9 — GAPS + docs.** Append a **"Conditional Formatting — deferred behaviors"** section to
+- [x] **P9 — GAPS + docs.** Append a **"Conditional Formatting — deferred behaviors"** section to
   `GAPS.md` (data bars, icon sets, ratings; TimePeriod date-range variant; color-scale formula
   thresholds; Dxf attrs: underline/strike/border/num-fmt/alignment; per-cell-vs-range perf
   follow-up) + tag them in the release-target tier table. No code. *Exit:* GAPS updated; cross-links

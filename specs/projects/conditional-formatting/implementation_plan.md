@@ -30,7 +30,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   tests — `AddCondFmt`→`cond_fmt_rules` reflects it + `CondFmtUpdated`/`StyleCacheUpdated`;
   update/delete/reorder; undo/redo; bad-range `Err` surfaces.
 
-- [ ] **P3 — Value-dependent render cache.** Thread `has_cond_fmt` gate into
+- [x] **P3 — Value-dependent render cache.** Thread `has_cond_fmt` gate into
   `build_sheet_cache`/`refresh_cell` (extended read for CF sheets); value-publish → style-cache
   rebuild for CF sheets in the worker publish path. *Exit:* cache tests — a `> 100` rule paints a
   fill in the render cache; editing a source value flips a Top-N/threshold cell **with no CF

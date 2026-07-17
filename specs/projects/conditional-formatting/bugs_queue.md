@@ -112,7 +112,31 @@ markup and still doesn't load, reopen as a real load bug (then chase IronCalc's 
 
 ---
 
-## BUG-3 — Sidebar rule list should show only rules intersecting the current selection — OPEN
+## BUG-3 — Sidebar rule list should show only rules intersecting the current selection — FIXED (52ea2da + CR follow-up)
+
+**Fix (commit `52ea2da`):** `render_cf_list` now filters `panel.rows` to rules whose target range
+intersects `self.selection.range()` (when the panel tracks the active sheet; defensive fallback shows
+all). New `CellRange::intersects` (freecell-core). Filtering is **display-only** — each surviving row
+keeps its GLOBAL priority position (first/last reorder-disable via the original enumerate index) and
+its true engine `index` (Raise/Lower/Delete never mis-target). Two empty states (`cf-empty` vs
+`cf-empty-selection`); intro shows the selection ref; `on_selection_changed` already notifies + keeps
+the sidebar open.
+
+**Review:** diff-only CR — index/priority preservation, `intersects`, add/edit/refresh decoupling, and
+tests all confirmed correct. One **High** regression found + fixed in the CR follow-up commit:
+whole-column (`sqref="A:A"`) / whole-row (`"1:1"`) CF rules — stored verbatim on XLSX load — are
+unparseable by `CellRange::from_a1`, so they were silently hidden for **every** selection (a rule became
+unmanageable). Follow-up adds `CellRange::from_sqref_area` (parses single / rect / whole-col / whole-row,
+strips `$`, rejects garbage) and makes `cf_rule_intersects_selection` **fail-open** (a rule with no
+parseable sub-area is always shown — never vanishes). Tests: whole-col/row scope correctly by
+column/row; unparseable range fails open. All green (core 203, app 521 lib tests).
+
+**Known minor follow-up (CR Finding 2, Low, largely pre-existing — not fixed here):** on sheet delete,
+`merge_sheet_metas` re-points `active_sheet` without calling `rescope_cond_fmt_if_open`, so an open CF
+panel can briefly show a deleted sheet's rows with an intro labeled by the active-sheet selection.
+Cosmetic + pre-existing (the panel-shows-deleted-sheet part predates BUG-3); logged for a later polish.
+
+## BUG-3 (original report) — was OPEN
 
 **Reported:** "the sidebar list should only show rules in the list that intersect the currently
 selected cell(s). Large sheets can have hundreds."

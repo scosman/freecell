@@ -141,6 +141,43 @@ pub fn column_from_label(label: &str) -> Option<u32> {
     u32::try_from(n - 1).ok()
 }
 
+/// Parses ONE OOXML `sqref` endpoint that is a *pure column label* (`"A"`, `"$C"`) into its
+/// zero-based column index. An optional leading `$` is stripped; the rest must be letters
+/// only. Anything with digits is a cell ref (not a bare column), so it returns `None` here
+/// and is handled by the rectangle branch instead. Out-of-range labels are rejected like
+/// [`CellRef::from_a1`].
+fn column_only_label(endpoint: &str) -> Option<u32> {
+    let label = endpoint.strip_prefix('$').unwrap_or(endpoint);
+    if label.is_empty() || !label.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let col = column_from_label(label)?;
+    if col >= limits::MAX_COLS {
+        return None;
+    }
+    Some(col)
+}
+
+/// Parses ONE OOXML `sqref` endpoint that is a *pure 1-based row number* (`"1"`, `"$7"`) into
+/// its zero-based row index. An optional leading `$` is stripped; the rest must be digits
+/// only. Rejects row `0` (A1 rows are one-based) and anything out of the Excel-max range,
+/// matching [`CellRef::from_a1`].
+fn row_only_number(endpoint: &str) -> Option<u32> {
+    let digits = endpoint.strip_prefix('$').unwrap_or(endpoint);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let row_one = digits.parse::<u64>().ok()?;
+    if row_one == 0 {
+        return None;
+    }
+    let row = u32::try_from(row_one - 1).ok()?;
+    if row >= limits::MAX_ROWS {
+        return None;
+    }
+    Some(row)
+}
+
 /// A normalized rectangular range of cells. `start` is always the top-left corner and
 /// `end` the bottom-right (both inclusive), regardless of which corner the user anchored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +271,47 @@ impl CellRange {
             Some((a, b)) => Some(Self::new(CellRef::from_a1(a)?, CellRef::from_a1(b)?)),
             None => Some(Self::single(CellRef::from_a1(s)?)),
         }
+    }
+
+    /// Parses ONE OOXML `sqref` sub-area into a normalized range, handling every shape Excel
+    /// writes verbatim into a conditional-formatting target's `sqref`:
+    /// - **single cell** (`"B2"`) → that one cell,
+    /// - **cell rectangle** (`"B2:D9"`) → the rectangle (delegates to [`CellRange::from_a1`]),
+    /// - **whole column(s)** (`"A:A"`, `"A:C"`) → those columns spanning ALL rows,
+    /// - **whole row(s)** (`"1:1"`, `"3:7"`) → those rows spanning ALL columns.
+    ///
+    /// Absolute `$` markers on either endpoint are accepted and ignored. Endpoint order does
+    /// not matter (`CellRange::new` normalizes). Returns `None` for anything else — a mixed
+    /// `col:cell` form, garbage, or empty input. This is the counterpart to `from_a1` that
+    /// additionally understands the column-only / row-only forms `from_a1` rejects (it requires
+    /// both letters and digits), so whole-column/whole-row CF rules parse instead of vanishing.
+    pub fn from_sqref_area(area: &str) -> Option<CellRange> {
+        let s = area.trim();
+        let (a, b) = match s.split_once(':') {
+            // No colon: a lone cell reference.
+            None => return CellRef::from_a1(s).map(CellRange::single),
+            Some(parts) => parts,
+        };
+        // Cell rectangle: both endpoints are complete cell refs.
+        if let (Some(start), Some(end)) = (CellRef::from_a1(a), CellRef::from_a1(b)) {
+            return Some(CellRange::new(start, end));
+        }
+        // Whole column(s): both endpoints are pure column labels → span all rows.
+        if let (Some(col_a), Some(col_b)) = (column_only_label(a), column_only_label(b)) {
+            return Some(CellRange::new(
+                CellRef::new(0, col_a),
+                CellRef::new(limits::MAX_ROWS - 1, col_b),
+            ));
+        }
+        // Whole row(s): both endpoints are pure row numbers → span all columns.
+        if let (Some(row_a), Some(row_b)) = (row_only_number(a), row_only_number(b)) {
+            return Some(CellRange::new(
+                CellRef::new(row_a, 0),
+                CellRef::new(row_b, limits::MAX_COLS - 1),
+            ));
+        }
+        // Mixed (col:cell), garbage, or otherwise unrecognized.
+        None
     }
 }
 
@@ -415,6 +493,99 @@ mod tests {
             "A1048577:B2",
         ] {
             assert_eq!(CellRange::from_a1(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn from_sqref_area_all_shapes() {
+        // Single cell → single-cell range.
+        assert_eq!(
+            CellRange::from_sqref_area("B2"),
+            Some(CellRange::single(CellRef::new(1, 1)))
+        );
+        // Cell rectangle → delegates to from_a1: B2:D9 → rows 1..=8, cols 1..=3.
+        assert_eq!(
+            CellRange::from_sqref_area("B2:D9"),
+            Some(CellRange::new(CellRef::new(1, 1), CellRef::new(8, 3)))
+        );
+        // Whole column: "A:A" → col A (0) over every row.
+        assert_eq!(
+            CellRange::from_sqref_area("A:A"),
+            Some(CellRange::new(
+                CellRef::new(0, 0),
+                CellRef::new(limits::MAX_ROWS - 1, 0)
+            ))
+        );
+        // Whole columns: "A:C" → cols A..=C (0..=2) over every row.
+        assert_eq!(
+            CellRange::from_sqref_area("A:C"),
+            Some(CellRange::new(
+                CellRef::new(0, 0),
+                CellRef::new(limits::MAX_ROWS - 1, 2)
+            ))
+        );
+        // Whole row: "1:1" → row 0 over every column.
+        assert_eq!(
+            CellRange::from_sqref_area("1:1"),
+            Some(CellRange::new(
+                CellRef::new(0, 0),
+                CellRef::new(0, limits::MAX_COLS - 1)
+            ))
+        );
+        // Whole rows: "3:7" → rows 2..=6 over every column.
+        assert_eq!(
+            CellRange::from_sqref_area("3:7"),
+            Some(CellRange::new(
+                CellRef::new(2, 0),
+                CellRef::new(6, limits::MAX_COLS - 1)
+            ))
+        );
+        // Absolute `$` markers accepted and ignored on either endpoint.
+        assert_eq!(
+            CellRange::from_sqref_area("$A:$A"),
+            Some(CellRange::new(
+                CellRef::new(0, 0),
+                CellRef::new(limits::MAX_ROWS - 1, 0)
+            ))
+        );
+        assert_eq!(
+            CellRange::from_sqref_area("$1:$1"),
+            Some(CellRange::new(
+                CellRef::new(0, 0),
+                CellRef::new(0, limits::MAX_COLS - 1)
+            ))
+        );
+        // Endpoint order does not matter (normalized).
+        assert_eq!(
+            CellRange::from_sqref_area("C:A"),
+            CellRange::from_sqref_area("A:C")
+        );
+    }
+
+    #[test]
+    fn from_sqref_area_whole_col_row_intersection() {
+        // "A:A" intersects a selection anywhere in column A, but NOT one confined to column B.
+        let col_a = CellRange::from_sqref_area("A:A").unwrap();
+        assert!(col_a.intersects(&CellRange::single(CellRef::new(500, 0))));
+        assert!(!col_a.intersects(&CellRange::new(CellRef::new(0, 1), CellRef::new(9, 1))));
+
+        // "1:1" intersects a row-1 selection (row index 0) but not a row-5 (index 4) selection.
+        let row_1 = CellRange::from_sqref_area("1:1").unwrap();
+        assert!(row_1.intersects(&CellRange::single(CellRef::new(0, 42))));
+        assert!(!row_1.intersects(&CellRange::new(CellRef::new(4, 0), CellRef::new(4, 9))));
+    }
+
+    #[test]
+    fn from_sqref_area_rejects_junk() {
+        // Mixed col:cell / cell:col, garbage, empty, incomplete → None (never panics).
+        for bad in [
+            "###", "", "A1:B", "A:B5", "1:B2", "A:", ":A", "0:0", "$$A:$$A",
+        ] {
+            assert_eq!(
+                CellRange::from_sqref_area(bad),
+                None,
+                "should reject {bad:?}"
+            );
         }
     }
 }

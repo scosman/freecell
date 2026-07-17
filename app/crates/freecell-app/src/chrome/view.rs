@@ -7437,15 +7437,27 @@ fn cf_row_controls(row: &CfRuleView, is_first: bool, is_last: bool) -> CfRowCont
 }
 
 /// Whether `row`'s target range intersects the selection `sel` (BUG-3, selection-scoped list). A
-/// rule's `range` is its sqref and may be a **multi-area** address (whitespace-separated A1 ranges,
-/// e.g. `"A1:A10 C1:C10"`); the rule matches if **any** sub-area parses and overlaps `sel`. A
-/// sub-area that fails to parse is skipped (never matches, never panics), so a malformed sqref
-/// simply contributes no match rather than crashing the list.
+/// rule's `range` is its raw sqref and may be a **multi-area** address (whitespace-separated
+/// sub-areas, e.g. `"A1:A10 C1:C10"`). Each sub-area is parsed with [`CellRange::from_sqref_area`],
+/// which — unlike plain A1 parsing — also understands the **whole-column** (`"A:A"`) and
+/// **whole-row** (`"1:1"`) shapes Excel writes verbatim on XLSX load; the rule matches if **any**
+/// sub-area parses and overlaps `sel`.
+///
+/// **Fail-open:** if NOT ONE sub-area parses (every sub-area is an unrecognized shape), the rule is
+/// shown anyway. A rule must never silently vanish from the list just because its sqref shape isn't
+/// understood — leaving it unmanageable. Only when sub-areas *did* parse but none overlap does the
+/// rule hide (it genuinely doesn't cover the selection).
 fn cf_rule_intersects_selection(row: &CfRuleView, sel: &CellRange) -> bool {
-    row.range
-        .split_whitespace()
-        .filter_map(CellRange::from_a1)
-        .any(|area| area.intersects(sel))
+    let mut any_parsed = false;
+    for area in row.range.split_whitespace() {
+        if let Some(r) = CellRange::from_sqref_area(area) {
+            any_parsed = true;
+            if r.intersects(sel) {
+                return true;
+            }
+        }
+    }
+    !any_parsed
 }
 
 /// The rule-type dropdown menu (`components/cf_sidebar.md §5`): the highlight families in Excel's
@@ -9805,6 +9817,114 @@ mod tests {
             assert!(
                 vcx.debug_bounds("cf-row-7").is_none(),
                 "Rule A (A1:A5) no longer intersects → its row is hidden"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn cf_whole_column_rule_scopes_by_column(cx: &mut TestAppContext) {
+        // BUG-3 regression: Excel writes whole-column CF as sqref "A:A" (verbatim on load).
+        // The rule must show whenever the selection touches column A and hide otherwise — it
+        // used to vanish for EVERY selection because "A:A" doesn't parse as a plain A1 range.
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![cf_view(7, "A:A", "Whole-column A", true, cf_highlight())],
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            // Selection deep inside column A (A501).
+            c.on_selection_changed(SelectionModel::single(cell(500, 0)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-7").is_some(),
+                "the whole-column rule \"A:A\" intersects a column-A selection → its row shows"
+            );
+        }
+        // Move to a selection confined to a different column (B2): the rule hides.
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(1, 1)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-7").is_none(),
+                "the whole-column rule \"A:A\" does not cover column B → its row is hidden"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn cf_whole_row_rule_scopes_by_row(cx: &mut TestAppContext) {
+        // BUG-3 regression: Excel writes whole-row CF as sqref "1:1" (verbatim on load). The
+        // rule must show for a row-1 selection and hide for a different row.
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![cf_view(4, "1:1", "Whole-row 1", true, cf_highlight())],
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            // Selection in row 1 (C1) but a non-A column, to prove it's the ROW that matches.
+            c.on_selection_changed(SelectionModel::single(cell(0, 2)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-4").is_some(),
+                "the whole-row rule \"1:1\" intersects a row-1 selection → its row shows"
+            );
+        }
+        // Move to row 5 (A5): the rule hides.
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(4, 0)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-4").is_none(),
+                "the whole-row rule \"1:1\" does not cover row 5 → its row is hidden"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn cf_unparseable_rule_fails_open(cx: &mut TestAppContext) {
+        // BUG-3 regression / fail-open: a rule whose sqref shape is unrecognized must never
+        // silently vanish (that would make it unmanageable). It shows for ANY selection.
+        let h = tall_sheet(cx);
+        h.client.set_cond_fmt_rules(
+            SheetId(0),
+            vec![cf_view(2, "###", "Mystery range", true, cf_highlight())],
+        );
+        upd(&h, cx, |c, window, cx| {
+            c.toggle_cond_fmt_sidebar(cx);
+            c.on_selection_changed(SelectionModel::single(cell(1, 0)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-2").is_some(),
+                "an unparseable range fails open at A2 → the row still shows"
+            );
+        }
+        // A totally different, distant selection: still shown (fail-open, not selection-scoped).
+        upd(&h, cx, |c, window, cx| {
+            c.on_selection_changed(SelectionModel::single(cell(900, 20)), window, cx);
+        });
+        {
+            let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("cf-row-2").is_some(),
+                "an unparseable range stays visible for any selection (fail-open)"
             );
         }
     }

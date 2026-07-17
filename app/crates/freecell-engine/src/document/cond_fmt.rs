@@ -157,10 +157,10 @@ impl WorkbookDocument {
 #[cfg(test)]
 mod tests {
     use freecell_core::cond_fmt::{
-        CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfTextOp, CfThresholdKind,
-        CfValueOp,
+        CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp,
+        CfThresholdKind, CfValueOp,
     };
-    use freecell_core::{CellRef, Rgb};
+    use freecell_core::{CellRef, RenderStyle, Rgb};
 
     use crate::document::WorkbookDocument;
 
@@ -188,8 +188,20 @@ mod tests {
     /// Reads the effective fill for a cell (fresh theme borrow so the read never conflicts with a
     /// later `&mut` edit).
     fn fill_at(doc: &WorkbookDocument, row: u32, col: u32) -> Option<Rgb> {
+        render_at(doc, row, col).fill
+    }
+
+    /// Reads a cell's full effective [`RenderStyle`] (base + winning CF overlay).
+    fn render_at(doc: &WorkbookDocument, row: u32, col: u32) -> RenderStyle {
         doc.extended_render_style(0, CellRef::new(row, col), doc.workbook_theme())
-            .fill
+    }
+
+    /// Finds the single rule covering `range` in a rules list (ranges are unique per test).
+    fn rule_by_range<'a>(rules: &'a [CfRuleView], range: &str) -> &'a CfRuleView {
+        rules
+            .iter()
+            .find(|r| r.range == range)
+            .unwrap_or_else(|| panic!("no rule over {range} in {rules:?}"))
     }
 
     #[test]
@@ -470,5 +482,171 @@ mod tests {
         // The endpoints still receive a fill from the scale.
         assert!(fill_at(&doc, 0, 0).is_some());
         assert!(fill_at(&doc, 2, 0).is_some());
+    }
+
+    /// CF is part of the IronCalc worksheet model, so it must save/load through the **native**
+    /// `.xlsx` writer/reader with **no** special FreeCell save handling (unlike charts). This
+    /// drives the real FreeCell save path (`WorkbookDocument::save` — the exact call the worker's
+    /// chart-less `save_workbook` branch makes, funnelling through `save_xlsx_to_writer`) then
+    /// reopens into a fresh document via `open`, and asserts both the **rules** (range / kind /
+    /// priority / the highlight rule's format) and the **effective render style** survive the
+    /// round-trip (`components/engine_cf.md §7`, `functional_spec.md §7`).
+    #[test]
+    fn cond_fmt_round_trips_through_xlsx_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cf.xlsx");
+
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        // Highlight domain over A1:A10 — one cell above the threshold, one below.
+        doc.set_cell_input(0, CellRef::new(0, 0), "150").unwrap(); // A1 > 100
+        doc.set_cell_input(0, CellRef::new(4, 0), "50").unwrap(); // A5 <= 100
+                                                                  // Color-scale domain over C1:C3.
+        doc.set_cell_input(0, CellRef::new(0, 2), "0").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 2), "50").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 2), "100").unwrap();
+
+        // A highlight rule carrying a full format (fill + text colour + bold) — every modeled
+        // format attribute, so a lossy writer/reader would show up as a changed spec.
+        let highlight = CfRuleSpec::CellIs {
+            op: CfValueOp::Gt,
+            operand: "100".to_string(),
+            operand2: None,
+            format: CfFormat {
+                fill: Some(RED),
+                text_color: Some(BLUE),
+                bold: true,
+                italic: false,
+            },
+            stop_if_true: false,
+        };
+        doc.add_cond_fmt(0, "A1:A10", &highlight).unwrap();
+
+        let scale = CfRuleSpec::ColorScale {
+            stops: vec![
+                CfColorStop {
+                    kind: CfThresholdKind::Min,
+                    value: None,
+                    color: GREEN,
+                },
+                CfColorStop {
+                    kind: CfThresholdKind::Max,
+                    value: None,
+                    color: RED,
+                },
+            ],
+        };
+        doc.add_cond_fmt(0, "C1:C3", &scale).unwrap();
+
+        // Sanity before saving: both rules present and the highlight already paints.
+        let before = doc.cond_fmt_rules(0).unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(fill_at(&doc, 0, 0), Some(RED));
+        // range → priority, to prove priority is preserved across the round-trip.
+        let priorities_before: std::collections::BTreeMap<String, u32> = before
+            .iter()
+            .map(|r| (r.range.clone(), r.priority))
+            .collect();
+
+        // Save via the real FreeCell save API, then reopen into a *fresh* document.
+        doc.save(&path).expect("save should succeed");
+        let reopened = WorkbookDocument::open(&path).expect("reopen should succeed");
+
+        // The rules survive: same count, same range → priority mapping.
+        let after = reopened.cond_fmt_rules(0).unwrap();
+        assert_eq!(after.len(), 2, "both rules survive the round-trip");
+        let priorities_after: std::collections::BTreeMap<String, u32> = after
+            .iter()
+            .map(|r| (r.range.clone(), r.priority))
+            .collect();
+        assert_eq!(
+            priorities_after, priorities_before,
+            "each rule keeps its range and priority"
+        );
+
+        // The highlight rule round-trips to the same editable spec — this equality proves the
+        // operator AND the full format (fill / text colour / bold) survived the writer/reader.
+        let highlight_after = rule_by_range(&after, "A1:A10");
+        assert!(highlight_after.editable);
+        assert_eq!(highlight_after.spec.as_ref(), Some(&highlight));
+
+        // The color scale round-trips to the same editable spec (concrete-RGB stops).
+        let scale_after = rule_by_range(&after, "C1:C3");
+        assert!(scale_after.editable);
+        assert_eq!(scale_after.spec.as_ref(), Some(&scale));
+
+        // The effective render style still reflects the rules on the reopened document (the CF
+        // cache is repopulated by the loader — no explicit evaluate needed).
+        let a1 = render_at(&reopened, 0, 0);
+        assert_eq!(a1.fill, Some(RED), ">100 cell keeps its fill after reopen");
+        assert_eq!(a1.font_color, Some(BLUE), "text colour survives");
+        assert!(a1.bold, "bold survives");
+        assert_eq!(
+            fill_at(&reopened, 4, 0),
+            None,
+            "the below-threshold cell has no fill"
+        );
+        assert!(
+            fill_at(&reopened, 1, 2).is_some(),
+            "the color-scale midpoint still gets an interpolated fill after reopen"
+        );
+    }
+
+    /// A **loaded** deferred-family rule (data bar / icon set / rating) must degrade gracefully:
+    /// it lists as a non-editable `Badge` (delete-only, `spec: None`) and its cell render is not
+    /// corrupted — `extended_render_style` drops the in-cell decoration and returns the base style
+    /// (`functional_spec.md §9`, `components/engine_cf.md §6`). There is no `CfRuleSpec` variant
+    /// for these families, so the rule is constructed straight through the engine's `UserModel`
+    /// (the same shape a rule loaded from an xlsx authored elsewhere takes).
+    #[test]
+    fn loaded_deferred_family_rule_is_badge_and_renders_base_style() {
+        use ironcalc_base::cf_types::CfRuleInput;
+        use ironcalc_base::types::Color;
+
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "10").unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "50").unwrap();
+        doc.set_cell_input(0, CellRef::new(2, 0), "100").unwrap();
+
+        // A data bar — a deferred family with no first-pass `CfRuleSpec`. Automatic (None) min/max
+        // so it always evaluates; it produces an `ExtendedStyle.data_bar` the render read drops.
+        doc.user_model_mut()
+            .add_conditional_formatting(
+                0,
+                "A1:A3",
+                CfRuleInput::DataBar {
+                    min: None,
+                    max: None,
+                    positive_color: Color::Rgb("#638EC6".to_string()),
+                    negative_color: Color::Rgb("#FF0000".to_string()),
+                    is_gradient: true,
+                    show_value: true,
+                },
+            )
+            .unwrap();
+
+        // It lists as a non-editable, spec-less Badge (delete-only), and the gate still sees CF.
+        assert!(doc.has_cond_fmt(0));
+        let rules = doc.cond_fmt_rules(0).unwrap();
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.range, "A1:A3");
+        assert!(
+            !rule.editable,
+            "a deferred family is not authorable this pass"
+        );
+        assert!(rule.spec.is_none(), "no spec for a deferred family");
+        assert!(
+            matches!(rule.preview, CfPreview::Badge(_)),
+            "surfaced as a read-only Badge, got {:?}",
+            rule.preview
+        );
+
+        // The cell render is not corrupted: the data-bar decoration is dropped and the read
+        // returns the cell's base style (a plain cell → the default style), never garbage/panic.
+        assert_eq!(
+            render_at(&doc, 1, 0),
+            RenderStyle::default(),
+            "a data-bar cell renders its base style (decoration dropped)"
+        );
     }
 }

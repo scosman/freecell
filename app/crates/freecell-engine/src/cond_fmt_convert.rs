@@ -244,18 +244,18 @@ fn cfvo_to_kind_value(cfvo: &Cfvo) -> Option<(CfThresholdKind, Option<f64>)> {
     })
 }
 
-/// Reconstructs the [`CfColorStop`]s of a color scale, or `None` if any threshold is a deferred
-/// `Formula` cfvo (which makes the whole rule non-authorable this pass).
+/// Reconstructs the [`CfColorStop`]s of a color scale, or `None` if the scale is non-authorable
+/// this pass — either a deferred `Formula` cfvo, or a **non-RGB stop colour** (`Color::Theme`/
+/// `Color::None`, e.g. from an imported file). Returning `None` for a theme colour is load-bearing:
+/// coercing it to a concrete `Rgb` here would let a later edit+save overwrite the file's original
+/// theme colours, so such a scale is surfaced read-only (Badge) instead (`functional_spec.md §9`).
 fn color_scale_stops(thresholds: &[ColorScaleThreshold]) -> Option<Vec<CfColorStop>> {
     thresholds
         .iter()
         .map(|t| {
             let (kind, value) = cfvo_to_kind_value(&t.cfvo)?;
-            Some(CfColorStop {
-                kind,
-                value,
-                color: color_to_rgb(&t.color).unwrap_or(Rgb::new(0, 0, 0)),
-            })
+            let color = color_to_rgb(&t.color)?;
+            Some(CfColorStop { kind, value, color })
         })
         .collect()
 }
@@ -420,8 +420,8 @@ pub(crate) fn cf_rule_spec_to_input(spec: &CfRuleSpec, dxf: Dxf) -> CfRuleInput 
 /// the list read model (`components/engine_cf.md §3`): authorable rules get `editable:true`, a
 /// human `summary`, a highlight/gradient `preview`, and a reconstructed `spec`; deferred families
 /// (`DataBar`/`IconSet`/`IconRating`) and deferred variants (a `TimePeriod`
-/// `Between`/`NotBetween`/`Next7Days`, a `ColorScale` with a `Formula` threshold) get
-/// `editable:false`, a [`CfPreview::Badge`], and no `spec`.
+/// `Between`/`NotBetween`/`Next7Days`, a `ColorScale` with a `Formula` threshold or a non-RGB
+/// theme stop colour) get `editable:false`, a [`CfPreview::Badge`], and no `spec`.
 pub(crate) fn cf_rule_to_view(
     index: u32,
     range: String,
@@ -695,7 +695,8 @@ pub(crate) fn cf_rule_to_view(
                     spec: Some(CfRuleSpec::ColorScale { stops }),
                 }
             }
-            // A `Formula` threshold makes the scale non-authorable this pass.
+            // A `Formula` threshold or a non-RGB (theme) stop colour makes the scale
+            // non-authorable this pass — surfaced read-only so an edit can't overwrite it.
             None => badge_view(
                 index,
                 range,
@@ -1161,6 +1162,29 @@ mod tests {
             ],
         };
         let view = cf_rule_to_view(1, "A1:A9".into(), 2, &scale, None);
+        assert!(!view.editable);
+        assert!(view.spec.is_none());
+        assert!(matches!(view.preview, CfPreview::Badge(_)));
+    }
+
+    #[test]
+    fn rule_to_view_theme_colored_scale_is_badge() {
+        // A colour scale with a non-RGB (theme) stop colour must NOT round-trip to an editable
+        // spec: reconstructing it would coerce the theme colour to a concrete RGB and an
+        // edit+save would overwrite the file's original colour. It is surfaced read-only instead.
+        let scale = CfRule::ColorScale {
+            thresholds: vec![
+                ColorScaleThreshold {
+                    cfvo: Cfvo::Min,
+                    color: Color::Theme(4, 0.0),
+                },
+                ColorScaleThreshold {
+                    cfvo: Cfvo::Max,
+                    color: rgb_to_color(red()),
+                },
+            ],
+        };
+        let view = cf_rule_to_view(0, "A1:A9".into(), 1, &scale, None);
         assert!(!view.editable);
         assert!(view.spec.is_none());
         assert!(matches!(view.preview, CfPreview::Badge(_)));

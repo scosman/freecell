@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 1: Engine-free CF types + wrapper + conversions (headless)
@@ -109,3 +109,11 @@ is de-risked first. Exit = `engine_cf.md §7` engine tests green.
 
 Verify with `cargo build -p freecell-core -p freecell-engine`, `cargo test -p freecell-core --lib`,
 `cargo test -p freecell-engine --lib`, `cargo fmt --all --check` (run from `app/`).
+
+## Notes / limitations
+
+- A color scale whose stop colours are **non-RGB** (`Color::Theme`/`Color::None`, e.g. from an
+  imported file) is surfaced **non-editable** (Badge, `spec: None`) rather than reconstructed — a
+  reconstructed spec would coerce theme colours to concrete RGB and an edit+save would overwrite the
+  file's original colours. Log this in **GAPS during P9** alongside the other deferred CF fidelity
+  limits (covered by `rule_to_view_theme_colored_scale_is_badge`).

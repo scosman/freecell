@@ -17,7 +17,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
 
 ## Core first pass
 
-- [ ] **P1 — Engine-free CF types + wrapper + conversions (headless).** `freecell-core::cond_fmt`
+- [x] **P1 — Engine-free CF types + wrapper + conversions (headless).** `freecell-core::cond_fmt`
   types; `freecell-engine` `cond_fmt_convert` (spec↔input, format↔dxf, rule→view) +
   `WorkbookDocument` methods (add/update/delete/raise/lower/list/`has_cond_fmt`/
   `extended_render_style`). No protocol/UI. *Exit:* `engine_cf.md §7` engine tests green

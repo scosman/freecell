@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 4: Reusable sidebar container + action-bar button + empty CF sidebar shell

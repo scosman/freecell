@@ -36,7 +36,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   fill in the render cache; editing a source value flips a Top-N/threshold cell **with no CF
   command**; color scale interpolates; non-CF sheets unchanged (fast path). Grid paint untouched.
 
-- [ ] **P4 — Reusable sidebar container + action-bar button + empty sidebar.** Extract
+- [x] **P4 — Reusable sidebar container + action-bar button + empty sidebar.** Extract
   `chrome/sidebar.rs::docked_sidebar` + shared `section` helpers; refactor `render_chart_panel` onto
   it (no visual change); add the lucide **`split`** button, `cond_fmt` state, toggle/open/close,
   selection-change exemption, chart↔CF mutual exclusion; render a minimal **List-mode shell** (intro

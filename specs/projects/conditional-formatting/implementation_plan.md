@@ -60,7 +60,7 @@ for review. Every skipped option is logged in `GAPS.md` (done in P9).
   preview); add/edit `ColorScale` rules. *Exit:* view tests — add a 3-color scale (spec has 3
   stops); edit stops; the list shows a gradient preview.
 
-- [ ] **P8 — Persistence + deferred-rule handling + round-trip.** Confirm CF saves/loads via the
+- [x] **P8 — Persistence + deferred-rule handling + round-trip.** Confirm CF saves/loads via the
   engine writer (add a `WorkbookDocument` round-trip test: author highlight + color-scale → save →
   reopen → rules + effective styles survive); ensure loaded deferred-family rules appear in the list
   (Badge, delete-only) and don't break the cache. *Exit:* round-trip test green; a loaded data-bar

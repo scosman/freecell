@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 8: Persistence + deferred-rule handling + round-trip verification

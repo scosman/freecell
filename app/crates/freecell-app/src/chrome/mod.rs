@@ -16,8 +16,10 @@
 //! `DocumentClient` + `GridView`.
 
 pub mod client;
+mod cond_fmt;
 mod edit;
 mod h_scroller;
+mod sidebar;
 mod view;
 
 use freecell_core::selection::Motion;

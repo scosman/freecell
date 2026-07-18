@@ -790,6 +790,13 @@ impl SheetCaches {
         self.sheets.contains_key(&sheet)
     }
 
+    /// The stable ids of every resident cache, in arbitrary order. The worker snapshots these into
+    /// an owned Vec so it can drop the read lock before rebuilding each conditional-formatting
+    /// sheet after a recompute (the value-dependent CF invalidation).
+    pub fn resident_ids(&self) -> Vec<SheetId> {
+        self.sheets.keys().copied().collect()
+    }
+
     /// The number of resident sheet caches.
     pub fn len(&self) -> usize {
         self.sheets.len()

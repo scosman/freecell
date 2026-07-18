@@ -1,0 +1,48 @@
+{
+  "name": "freecell-cf-perf",
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "renderer": "assumed Mesa lavapipe / software Vulkan (ICD presence enforced by perf.sh) — CPU render-build path measured; GPU present NOT measured",
+    "profile": "release",
+    "commit": "414840a"
+  },
+  "note": "Conditional-formatting edit-path perf (P10 Step 4): headless send → last publish/cache event round-trip through the real DocumentClient, on a populated 256×8 range (A1:H256), CF-on vs CF-off. Each iteration flips one in-range cell 50↔150 across the >100 threshold (a real change every iteration). CF-on adds the bounded full-range CF rebuild (2048-cell fold); CF-off stays on the cheap touched-cell mirror. Force+asserted: the CF fold fills a matching cell in CF-on / not in CF-off, the flipped cell's fill tracks its value each iteration, and every edit emitted an event.",
+  "fixture": {
+    "rows": 256,
+    "cols": 8,
+    "cells": 2048,
+    "range": "A1:H256",
+    "rule": "CellIs > 100 (fill highlight)",
+    "edit": "flip one in-range cell 50<->150 across the >100 threshold",
+    "warmup": 50,
+    "measured": 250
+  },
+  "ops": {
+    "edit_cf_on": {
+      "count": 250,
+      "p50_ns": 7862224,
+      "p99_ns": 11069662,
+      "max_ns": 12289869,
+      "p50": "7.86 ms",
+      "p99": "11.07 ms",
+      "max": "12.29 ms"
+    },
+    "edit_cf_off": {
+      "count": 250,
+      "p50_ns": 3382380,
+      "p99_ns": 5878679,
+      "max_ns": 48485151,
+      "p50": "3.38 ms",
+      "p99": "5.88 ms",
+      "max": "48.49 ms"
+    }
+  },
+  "delta_ns": {
+    "p50": 4479844,
+    "p99": 5190983
+  }
+}

@@ -80,6 +80,18 @@ enum AppliedKind {
     /// An insert/delete rows/columns — content + geometry + formulas shift, so it needs a
     /// recompute **and** a full active-sheet cache rebuild (`components/grid_structure.md §5.3`).
     Structure,
+    /// A conditional-formatting mutation (add/update/delete/reorder a rule). Values are unchanged,
+    /// but the CF results depend on the new rule set, so IronCalc's `cf_cache` must be refreshed
+    /// **before** the `AppliedOp::Rebuild` cache refresh reads it (BUG-1). Under the batch's paused
+    /// evaluation the fork's internal `evaluate_if_not_paused()` is a no-op, so this variant sets
+    /// `needs_eval = true` to force the coalesced `doc.evaluate()` (which re-evaluates CF) to run —
+    /// otherwise the freshly-added rule only shows after a later value edit. Records its op like
+    /// `StyleOnly` (maps to `AppliedOp::Rebuild { sheet }`). A full workbook recompute on a CF
+    /// mutation is acceptable (user-driven, infrequent; perf follow-up tracked as GAPS CF8). That
+    /// forced full-workbook `evaluate()` also re-rolls volatile functions (`RAND`/`NOW`/`TODAY`/
+    /// `OFFSET`, etc.) — also acceptable, since it is user-driven/infrequent and Excel likewise
+    /// recalculates volatiles broadly.
+    CondFmt,
     /// An edit that resolved to a **no change** (e.g. a fill whose selection is an edge/seed-line
     /// no-op, or whose full-line target clamped to an empty used range). It touched no cell, so the
     /// batch must not count it, recompute, republish, or record an undo op for it.
@@ -414,6 +426,9 @@ impl Worker {
         // styles resident (values follow on the first `SetViewport`). Non-active sheets build on
         // first activation (`components/style_cache.md §Lifecycle`).
         worker.build_and_store_cache(worker.active_sheet);
+        // Publish the CF rule list for every sheet that already carries rules (an opened file), so
+        // the window can build a CF sidebar synchronously without waiting for a mutation.
+        worker.publish_all_cond_fmt_on_open();
         worker.emit(WorkerEvent::Loaded { sheets });
         worker.emit(WorkerEvent::StyleCacheUpdated {
             sheet: worker.active_sheet,
@@ -563,6 +578,14 @@ impl Worker {
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
+                // CF mutations bucket with the style edits: each is style-only (no recompute) and
+                // undoable, so it rides the coalesced-eval + publish + undo/redo machinery. The
+                // CF-map republish is folded into `apply_edit_batch` (§components/engine_cf.md §5).
+                | Command::AddCondFmt { .. }
+                | Command::UpdateCondFmt { .. }
+                | Command::DeleteCondFmt { .. }
+                | Command::RaiseCondFmtPriority { .. }
+                | Command::LowerCondFmtPriority { .. }
                 | Command::SetColumnWidths { .. }
                 | Command::SetRowHeights { .. }
                 | Command::SetRowsHidden { .. }
@@ -843,6 +866,15 @@ impl Worker {
                             needs_eval = true;
                             applied_ops.push(op_of(edit));
                         }
+                        // A CF mutation records its op like a style edit, but MUST force the eval
+                        // (BUG-1): under paused evaluation nothing refreshes IronCalc's `cf_cache`,
+                        // so the coalesced `doc.evaluate()` has to run before the sheet-cache rebuild
+                        // reads it — otherwise the rule only applies after a later value change.
+                        Ok(AppliedKind::CondFmt) => {
+                            applied += 1;
+                            needs_eval = true;
+                            applied_ops.push(op_of(edit));
+                        }
                         // A no-op edit changed nothing: don't count it, recompute, or record an op.
                         Ok(AppliedKind::NoOp) => {}
                         Err(msg) => engine_errors.push(msg),
@@ -893,6 +925,10 @@ impl Worker {
                 // Record the batch's edited-cell set (this pops/pushes the undo-redo touch stacks)
                 // so both the chart re-resolve and the style-cache mirror below read the same ranges.
                 let (refresh, rebuild) = self.collect_edited_ranges(applied_ops);
+                // The rebuilt-sheet set is the CF-relevant one: a CF mutation, a structural CF-range
+                // shift, and the undo/redo of either land here (all map to `AppliedOp::Rebuild` /
+                // `Touch::Rebuild`). Captured before `rebuild` is consumed by `apply_cache_refresh`.
+                let mut cf_sheets = rebuild.clone();
                 // Re-resolve any charts whose source ranges the edit touched, BEFORE publishing, so
                 // the edit's single `Published` carries fresh cells AND fresh charts (P9,
                 // charts/architecture §4.1). Only intersecting charts recompute.
@@ -905,10 +941,42 @@ impl Worker {
                 // ship `StyleCacheUpdated` deltas. Ordered after `Published` (unchanged event order).
                 self.apply_cache_refresh(refresh, rebuild, &sheets_before);
 
+                // Value-dependent conditional formatting: a recompute can change cell values, which
+                // flips CF results (a threshold crosses, a Top-N/average cell enters or leaves the
+                // set, a color scale re-interpolates) with NO CF command. Rebuild the affected CF
+                // sheets' style caches via the extended path — only on a recompute, and short-circuited
+                // for a non-CF workbook by the empty-map gate inside. `cf_sheets` (this batch's full
+                // rebuilds) is passed so a CF/structural op already rebuilt above isn't rebuilt twice.
+                if needs_eval {
+                    self.refresh_cf_caches_after_recompute(&cf_sheets);
+                }
+
+                // Republish the CF rule list for any rebuilt sheet whose rules actually changed, and
+                // notify the window (`components/engine_cf.md §5`). Gated inside so a non-CF sheet is
+                // free; deduped so a coalesced multi-CF batch reconciles each sheet once.
+                cf_sheets.sort_unstable();
+                cf_sheets.dedup();
+                self.reconcile_published_cond_fmt(&cf_sheets);
+
                 // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the
                 // tab bar. Compared by value so undo/redo of a sheet op is caught too.
                 let sheets_after = self.sheet_metas();
                 if sheets_after != sheets_before {
+                    // Reconcile the CF map with the changed sheet SET. Removed sheets (delete /
+                    // undo-of-add) are dropped so the map never outlives its sheet. Sheets that
+                    // REAPPEARED (undo-of-delete restores the worksheet + its CF rules) are
+                    // reconciled so a returning CF sheet republishes its rules + emits
+                    // `CondFmtUpdated` — that undo pushes `Touch::Sheets`, not `Touch::Rebuild`, so
+                    // the returning sheet never entered `cf_sheets` above.
+                    let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
+                    let ids_after: HashSet<SheetId> = sheets_after.iter().map(|m| m.id).collect();
+                    self.shared
+                        .cond_fmt
+                        .write()
+                        .retain(|id, _| ids_after.contains(id));
+                    let appeared: Vec<SheetId> =
+                        ids_after.difference(&ids_before).copied().collect();
+                    self.reconcile_published_cond_fmt(&appeared);
                     self.emit(WorkerEvent::SheetsChanged {
                         sheets: sheets_after,
                     });
@@ -1102,6 +1170,9 @@ impl Worker {
                     for s in self.refresh_cache_cells(&touched) {
                         self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
                     }
+                    // A replace recomputes values → re-evaluate CF on the resident CF sheets
+                    // (empty-map gated, so a non-CF workbook is unaffected).
+                    self.refresh_cf_caches_after_recompute(&[]);
                 }
                 self.emit(WorkerEvent::ReplacedCount { n });
             }
@@ -1145,6 +1216,8 @@ impl Worker {
         for sheet in self.refresh_cache_cells(touched) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
         }
+        // A replace recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
+        self.refresh_cf_caches_after_recompute(&[]);
     }
 
     /// Copy (or cut) `range` to the engine clipboard slot and reply with the system-clipboard
@@ -1469,6 +1542,8 @@ impl Worker {
         for sheet in self.refresh_cache_cells(&touched) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
         }
+        // A paste recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
+        self.refresh_cf_caches_after_recompute(&[]);
 
         self.emit(WorkerEvent::Pasted {
             sheet: dest,
@@ -1714,6 +1789,43 @@ impl Worker {
         }
     }
 
+    /// Re-evaluate conditional formatting for the resident CF sheets after a recompute may have
+    /// changed cell values (`architecture.md §4.4`, `components/engine_cf.md §6`). CF results are
+    /// **value-dependent** — a `CellIs` threshold crosses, a Top-N / average cell enters or leaves the
+    /// set, a color scale re-interpolates — all with NO CF command. Because a rule can be **global**
+    /// (its result at one cell depends on the whole range), the touched-cell mirror is insufficient,
+    /// so each affected CF sheet's whole style cache is rebuilt via the extended path
+    /// ([`build_and_store_cache`](Self::build_and_store_cache) → `build_sheet_cache(cf = true)`) and a
+    /// `StyleCacheUpdated` emitted. This is the one new coupling in FreeCell: value publish → style
+    /// refresh.
+    ///
+    /// **Fast gate (the perf invariant):** the published CF map is empty ⟺ no sheet carries a rule
+    /// (P2 maintains it), so a non-CF workbook returns here immediately — no resident scan, no
+    /// `has_cond_fmt` reads, no rebuilds. `already_rebuilt` names sheets the caller has just fully
+    /// rebuilt this batch (a CF-rule mutation or a structural op), so they are not rebuilt twice.
+    fn refresh_cf_caches_after_recompute(&mut self, already_rebuilt: &[SheetId]) {
+        if self.shared.cond_fmt.read().is_empty() {
+            return; // no CF anywhere → nothing value-dependent to refresh (non-CF fast path)
+        }
+        // Snapshot the resident ids (bounded by the few activated sheets) so the read lock is
+        // released before the per-sheet `&mut` rebuild below.
+        let resident = self.shared.caches.read().resident_ids();
+        for sheet in resident {
+            if already_rebuilt.contains(&sheet) {
+                continue;
+            }
+            let Some(idx) = self.resolve(sheet) else {
+                continue; // sheet deleted out from under the snapshot
+            };
+            if !self.doc.has_cond_fmt(idx) {
+                continue; // a non-CF sheet's cache is value-independent → leave it untouched
+            }
+            if self.build_and_store_cache(sheet) {
+                self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+            }
+        }
+    }
+
     /// Re-read every cell in `refresh` and update its cache entry (the mirror primitive), for the
     /// sheets that are resident. Returns the distinct sheets whose cache changed.
     ///
@@ -1744,6 +1856,10 @@ impl Worker {
             } else {
                 // Resolve the workbook default font once for the whole range (not per cell).
                 let (def_sz, def_name) = self.doc.default_font();
+                // CF gate once per range (not per cell): a CF sheet re-reads the effective (base +
+                // CF overlay) style so a style edit to a rule-filled cell keeps its overlay; a
+                // non-CF sheet takes the unchanged base-style fast path.
+                let cf = self.doc.has_cond_fmt(idx);
                 let mut guard = caches.write();
                 if let Some(cache) = guard.get_mut(*sheet) {
                     for row in range.rows() {
@@ -1755,6 +1871,7 @@ impl Worker {
                                 CellRef::new(row, col),
                                 def_sz,
                                 &def_name,
+                                cf,
                             );
                         }
                     }
@@ -1816,7 +1933,11 @@ impl Worker {
                 return false;
             }
         };
-        match cache::build_sheet_cache(&self.doc, idx) {
+        // The CF gate (`components/engine_cf.md §6`): a CF sheet builds each populated cell's style
+        // from the effective (base + CF overlay) style; a non-CF sheet takes the unchanged base-style
+        // fast path. Computed once per build.
+        let cf = self.doc.has_cond_fmt(idx);
+        match cache::build_sheet_cache(&self.doc, idx, cf) {
             Ok(mut built) => {
                 // Seed the manual set on the FIRST build for this sheet from the freshly built
                 // cache's height overrides — a loaded `custom_height` row starts **manual** so
@@ -3092,6 +3213,79 @@ impl Worker {
         }
     }
 
+    /// Reconcile the published CF rule map for each of `sheets` against the document's current
+    /// rules, emitting [`WorkerEvent::CondFmtUpdated`] only when a sheet's published list actually
+    /// changed (`architecture.md §4.5`, `components/engine_cf.md §5`).
+    ///
+    /// Gated so a non-CF workbook pays nothing: a sheet with no CF rule **and** no published entry is
+    /// skipped before any list read. A rule change (add / update / delete / reorder, or a structural
+    /// range shift) or the undo/redo of one flips `has_cond_fmt` / the list contents, so it is
+    /// reconciled. The map holds no entry for a sheet with zero rules (so the client reads empty).
+    fn reconcile_published_cond_fmt(&self, sheets: &[SheetId]) {
+        for &sheet in sheets {
+            let Some(idx) = self.resolve(sheet) else {
+                continue; // sheet deleted out from under the touch-set — pruned by the caller
+            };
+            let has_now = self.doc.has_cond_fmt(idx);
+            let had_entry = self.shared.cond_fmt.read().contains_key(&sheet);
+            if !has_now && !had_entry {
+                continue; // non-CF sheet, nothing published → the fast path stays free
+            }
+            // A read failure degrades to "no rules" (never a panic) — the sheet's entry is dropped.
+            // Logged (architecture §6), matching `extended_render_style`'s fallback.
+            let rules = match self.doc.cond_fmt_rules(idx) {
+                Ok(rules) => rules,
+                Err(err) => {
+                    tracing::warn!(
+                        sheet = idx,
+                        error = %err,
+                        "cond_fmt_rules read failed; publishing an empty CF list",
+                    );
+                    Vec::new()
+                }
+            };
+            let changed = {
+                let map = self.shared.cond_fmt.read();
+                match map.get(&sheet) {
+                    Some(published) => published != &rules,
+                    None => !rules.is_empty(),
+                }
+            };
+            if !changed {
+                continue;
+            }
+            {
+                let mut map = self.shared.cond_fmt.write();
+                if rules.is_empty() {
+                    map.remove(&sheet);
+                } else {
+                    map.insert(sheet, rules);
+                }
+            }
+            self.emit(WorkerEvent::CondFmtUpdated { sheet });
+        }
+    }
+
+    /// Populate the published CF map once on open for every sheet that carries rules
+    /// (`components/engine_cf.md §5`). No event is emitted — the window reads the map when it first
+    /// builds a panel (the `Loaded` event already drives the initial UI). Cheap: gated on the
+    /// `has_cond_fmt` fast check, so a workbook with no CF writes nothing.
+    fn publish_all_cond_fmt_on_open(&self) {
+        for meta in self.sheet_metas() {
+            let Some(idx) = self.resolve(meta.id) else {
+                continue;
+            };
+            if !self.doc.has_cond_fmt(idx) {
+                continue;
+            }
+            if let Ok(rules) = self.doc.cond_fmt_rules(idx) {
+                if !rules.is_empty() {
+                    self.shared.cond_fmt.write().insert(meta.id, rules);
+                }
+            }
+        }
+    }
+
     /// The sheet list as `SheetMeta` (stable id + current name + `has_content`), in workbook
     /// order. `has_content` gates the UI's delete-confirm modal (`functional_spec.md §3.7`).
     fn sheet_metas(&self) -> Vec<SheetMeta> {
@@ -3346,6 +3540,51 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.move_sheet(idx, *to_index)?;
             Ok(AppliedKind::SheetOp)
         }
+        Command::AddCondFmt { sheet, range, spec } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.add_cond_fmt(idx, range, spec)?;
+            // A CF rule leaves values unchanged, but its result depends on the new rule → force a
+            // CF re-eval so `cf_cache` is fresh before the cache rebuild reads it (BUG-1).
+            Ok(AppliedKind::CondFmt)
+        }
+        Command::UpdateCondFmt {
+            sheet,
+            index,
+            range,
+            spec,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.update_cond_fmt(idx, *index, range, spec)?;
+            Ok(AppliedKind::CondFmt)
+        }
+        Command::DeleteCondFmt { sheet, index } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.delete_cond_fmt(idx, *index)?;
+            Ok(AppliedKind::CondFmt)
+        }
+        // Raise/Lower may be a boundary NO-OP (rule already top/bottom): the engine records no undo
+        // diff in that case, so returning anything but `NoOp` would push a phantom worker undo entry
+        // and desync the 1:1 stack. Compare the rule list before/after to tell a real reorder apart.
+        Command::RaiseCondFmtPriority { sheet, index } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            let before = doc.cond_fmt_rules(idx)?;
+            doc.raise_cond_fmt(idx, *index)?;
+            Ok(if doc.cond_fmt_rules(idx)? == before {
+                AppliedKind::NoOp
+            } else {
+                AppliedKind::CondFmt
+            })
+        }
+        Command::LowerCondFmtPriority { sheet, index } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            let before = doc.cond_fmt_rules(idx)?;
+            doc.lower_cond_fmt(idx, *index)?;
+            Ok(if doc.cond_fmt_rules(idx)? == before {
+                AppliedKind::NoOp
+            } else {
+                AppliedKind::CondFmt
+            })
+        }
         Command::Undo => {
             doc.undo()?;
             Ok(AppliedKind::Cell)
@@ -3514,6 +3753,17 @@ fn op_of(edit: &Command) -> AppliedOp {
         | Command::RenameSheet { .. }
         | Command::DeleteSheet { .. }
         | Command::MoveSheet { .. } => AppliedOp::Sheets,
+        // Every CF mutation maps to a full sheet-cache rebuild (not `Cells { range }`): Delete/Raise/
+        // Lower carry no range, a rule's range may be a multi-area address, and a rule/reorder can
+        // affect its whole (possibly large) range — so a wholesale rebuild is the simple, always-
+        // correct refresh (matching the value-publish path, architecture §6). This rebuilt-sheet set
+        // is also what drives the CF-map republish in `apply_edit_batch` (incl. structural range
+        // shifts + undo/redo of a CF op, whose `Touch::Rebuild` re-lands the sheet here).
+        Command::AddCondFmt { sheet, .. }
+        | Command::UpdateCondFmt { sheet, .. }
+        | Command::DeleteCondFmt { sheet, .. }
+        | Command::RaiseCondFmtPriority { sheet, .. }
+        | Command::LowerCondFmtPriority { sheet, .. } => AppliedOp::Rebuild { sheet: *sheet },
         Command::Undo => AppliedOp::Undo,
         Command::Redo => AppliedOp::Redo,
         _ => unreachable!("op_of called on a non-edit command"),
@@ -3628,7 +3878,7 @@ mod tests {
     use super::*;
     use crate::worker::protocol::StylePath;
     use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
-    use freecell_core::Rgb;
+    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, Rgb};
 
     /// Build a headless worker over a fresh empty workbook plus the event receiver, without a
     /// spawned thread — the deterministic substrate for the coalescing / recovery tests.
@@ -7729,5 +7979,673 @@ mod tests {
             "a no-op fill must not republish"
         );
         assert_eq!(value_at(&worker, 0, 0), "5"); // unchanged
+    }
+
+    // ---- Conditional formatting (P2 worker seam) ----
+
+    const CF_RED: Rgb = Rgb::new(255, 0, 0);
+
+    /// A "Cell value > operand" highlight rule filling matches red — the common CF fixture.
+    fn gt_rule(operand: &str) -> CfRuleSpec {
+        CfRuleSpec::CellIs {
+            op: CfValueOp::Gt,
+            operand: operand.to_string(),
+            operand2: None,
+            format: CfFormat {
+                fill: Some(CF_RED),
+                ..Default::default()
+            },
+            stop_if_true: false,
+        }
+    }
+
+    fn add_cf(sheet: SheetId, range: &str, operand: &str) -> Command {
+        Command::AddCondFmt {
+            sheet,
+            range: range.to_string(),
+            spec: gt_rule(operand),
+        }
+    }
+
+    /// The published CF rules for `sheet` (a clone of the shared map entry; empty when absent).
+    fn published_cf(worker: &Worker, sheet: SheetId) -> Vec<freecell_core::CfRuleView> {
+        worker
+            .shared
+            .cond_fmt
+            .read()
+            .get(&sheet)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn cond_fmt_updated_for(events: &[WorkerEvent], sheet: SheetId) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::CondFmtUpdated { sheet: s } if *s == sheet))
+    }
+
+    fn any_cond_fmt_updated(events: &[WorkerEvent]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::CondFmtUpdated { .. }))
+    }
+
+    #[test]
+    fn add_cond_fmt_publishes_rules_and_emits_events() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // A resident, viewport-covered sheet so the style-cache mirror ships its delta.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "150"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+
+        let rules = published_cf(&worker, sheet);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].range, "A1:A10");
+        assert_eq!(rules[0].summary, "Cell value > 100");
+
+        let events = drain_events(&rx);
+        assert!(
+            cond_fmt_updated_for(&events, sheet),
+            "an AddCondFmt republishes the rule list",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
+            "an AddCondFmt ships a StyleCacheUpdated delta (the rule range refreshes)",
+        );
+    }
+
+    #[test]
+    fn update_cond_fmt_republishes() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![Command::UpdateCondFmt {
+            sheet,
+            index: 0,
+            range: "B1:B20".to_string(),
+            spec: gt_rule("50"),
+        }]);
+
+        let rules = published_cf(&worker, sheet);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].range, "B1:B20");
+        assert_eq!(rules[0].summary, "Cell value > 50");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn delete_cond_fmt_removes_from_map() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet).len(), 1);
+
+        worker.process_batch(vec![Command::DeleteCondFmt { sheet, index: 0 }]);
+
+        assert!(
+            published_cf(&worker, sheet).is_empty(),
+            "the sheet's rules are gone"
+        );
+        assert!(
+            !worker.shared.cond_fmt.read().contains_key(&sheet),
+            "no empty-vec entry lingers (a zero-rule sheet holds no key)"
+        );
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn raise_lower_reorders_published_list() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Rule A (index 0, priority 1) then rule B (index 1, priority 2) → priority-desc: B first.
+        worker.process_batch(vec![
+            add_cf(sheet, "A1:A1", "1"),
+            add_cf(sheet, "B1:B1", "1"),
+        ]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "B1:B1");
+
+        // Raise A (storage index 0) above B.
+        worker.process_batch(vec![Command::RaiseCondFmtPriority { sheet, index: 0 }]);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "A1:A1");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+
+        // Lower A back down.
+        worker.process_batch(vec![Command::LowerCondFmtPriority { sheet, index: 0 }]);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "B1:B1");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn raise_at_top_is_noop() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            add_cf(sheet, "A1:A1", "1"),
+            add_cf(sheet, "B1:B1", "1"),
+        ]);
+        drain_events(&rx);
+        let ops_before = worker.ops_seen;
+
+        // B (storage index 1) already holds the highest priority → raising it changes nothing: it
+        // must record no undo op (the engine pushes no diff) and must not republish. This keeps the
+        // worker undo stack 1:1 with the engine's.
+        worker.process_batch(vec![Command::RaiseCondFmtPriority { sheet, index: 1 }]);
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "a boundary raise commits no op"
+        );
+        assert!(
+            !any_cond_fmt_updated(&drain_events(&rx)),
+            "a no-op raise does not republish"
+        );
+    }
+
+    #[test]
+    fn undo_redo_restores_and_republishes_cf() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Seed a matching VALUE (A1 = 150 > 100) in its own batch and make the sheet cache resident,
+        // so the render-cache fill assertions below are real. The CF add stays value-free — exactly
+        // the BUG-1 case — so undo/redo must refresh the render cache on their own. A rule-list-only
+        // check (published_cf) would miss a stale-`cf_cache` render regression across undo/redo.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..10,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "150"),
+        ]);
+        drain_events(&rx);
+
+        worker.process_batch(vec![add_cf(sheet, "A1:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet).len(), 1);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "A1 (150 > 100) is filled in the render cache after the add"
+        );
+
+        // Undo the add → the rule is gone and the map republishes empty.
+        worker.process_batch(vec![Command::Undo]);
+        assert!(
+            published_cf(&worker, sheet).is_empty(),
+            "undo removes the published rule"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "undo clears the render-cache fill (rule gone, no value edit) — the BUG-1 coverage class"
+        );
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+
+        // Redo → the rule and its publication come back.
+        worker.process_batch(vec![Command::Redo]);
+        let rules = published_cf(&worker, sheet);
+        assert_eq!(rules.len(), 1, "redo restores the rule");
+        assert_eq!(rules[0].range, "A1:A10");
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "redo restores the render-cache fill (no value edit)"
+        );
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    #[test]
+    fn bad_range_add_surfaces_error() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::AddCondFmt {
+            sheet,
+            range: "not-a-range".to_string(),
+            spec: gt_rule("100"),
+        }]);
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::Engine(_)
+                }
+            )),
+            "a bad-range add surfaces an engine error on the result channel"
+        );
+        assert!(
+            published_cf(&worker, sheet).is_empty(),
+            "nothing was added on a rejected op"
+        );
+        assert!(
+            !any_cond_fmt_updated(&events),
+            "a rejected add does not republish"
+        );
+    }
+
+    #[test]
+    fn non_cf_sheet_has_empty_published_map() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..4,
+                cols: 0..4,
+            },
+            set_input(sheet, 0, 0, "42"),
+        ]);
+        // A style edit (AppliedOp::Cells) and a structural edit (AppliedOp::Rebuild) on a CF-free
+        // sheet must never populate the map or emit CondFmtUpdated — the non-CF fast path stays free.
+        worker.process_batch(vec![Command::SetStyleAttr {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+            attr: StyleAttr::Bold,
+        }]);
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+
+        assert!(
+            worker.shared.cond_fmt.read().is_empty(),
+            "a non-CF workbook keeps the published map empty"
+        );
+        assert!(!any_cond_fmt_updated(&drain_events(&rx)));
+    }
+
+    #[test]
+    fn structural_edit_shifts_published_cf_range() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![add_cf(sheet, "A5:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet)[0].range, "A5:A10");
+
+        // Inserting a row above the rule's range shifts it down (the engine displaces CF ranges on a
+        // structural edit); the published list must reflect the new range + emit CondFmtUpdated.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+        assert_eq!(
+            published_cf(&worker, sheet)[0].range,
+            "A6:A11",
+            "the published CF range follows the structural shift"
+        );
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet));
+    }
+
+    // Verifies the FreeCell-side reconcile-of-reappeared-sheets fix end-to-end, but only passes
+    // once the engine restores CF on undo-of-delete. That engine fix is committed on the fork's
+    // `freecell-fixes` branch (base/src/user_model/undo_redo.rs `Diff::DeleteSheet` arm) but could
+    // not be pushed from this container (git-proxy 403 on push to scosman/ironcalc), so the pinned
+    // engine still drops CF on undo-of-delete. Remove this `#[ignore]` once `freecell-fixes` carries
+    // the fix and `app/Cargo.lock` is re-pinned (validated green against the fixed fork locally).
+    #[ignore = "blocked on fork CF-undo fix on freecell-fixes (push 403-denied); re-pin then un-ignore"]
+    #[test]
+    fn undo_of_sheet_delete_repopulates_cf_map() {
+        let (mut worker, rx) = test_worker();
+        // Add a second sheet, put a CF rule on it, then delete it — the delete prunes its CF entry.
+        worker.process_batch(vec![Command::AddSheet]);
+        let sheet1 = worker.sheet_metas().last().unwrap().id;
+        worker.process_batch(vec![add_cf(sheet1, "A1:A10", "100")]);
+        drain_events(&rx);
+        assert_eq!(published_cf(&worker, sheet1).len(), 1);
+
+        worker.process_batch(vec![Command::DeleteSheet { sheet: sheet1 }]);
+        assert!(
+            published_cf(&worker, sheet1).is_empty(),
+            "deleting the sheet prunes its CF entry"
+        );
+        drain_events(&rx);
+
+        // Undo restores the sheet AND its CF rules — the published map must be repopulated and a
+        // CondFmtUpdated emitted (undo-of-delete pushes `Touch::Sheets`, so the returning sheet only
+        // reaches the reconcile via the sheet-set-change path).
+        worker.process_batch(vec![Command::Undo]);
+        let rules = published_cf(&worker, sheet1);
+        assert_eq!(rules.len(), 1, "undo-of-delete repopulates the CF map");
+        assert_eq!(rules[0].range, "A1:A10");
+        assert!(cond_fmt_updated_for(&drain_events(&rx), sheet1));
+    }
+
+    // ---- Conditional formatting: value-dependent render cache (P3) ----
+
+    /// The cached render-style fill for a resident sheet's cell (`None` when unstored or unfilled).
+    fn cache_fill(worker: &Worker, sheet: SheetId, row: u32, col: u32) -> Option<Rgb> {
+        worker
+            .shared
+            .caches
+            .read()
+            .get(sheet)
+            .expect("sheet cache resident")
+            .render_style(row, col)
+            .and_then(|rs| rs.fill)
+    }
+
+    /// A "Top rank" highlight rule filling matches red. A **global** rule: its result at one cell
+    /// depends on the whole range, so a value edit anywhere must re-evaluate every cell.
+    fn top_fill_rule(rank: u32) -> CfRuleSpec {
+        CfRuleSpec::Top {
+            rank,
+            percent: false,
+            bottom: false,
+            format: CfFormat {
+                fill: Some(CF_RED),
+                ..Default::default()
+            },
+            stop_if_true: false,
+        }
+    }
+
+    #[test]
+    fn cf_value_change_flips_cached_style_no_cf_command() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // A Top-1 rule over A1:A3 with values 10/20/30 → A3 (row 2) holds the top value.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "10"),
+            set_input(sheet, 1, 0, "20"),
+            set_input(sheet, 2, 0, "30"),
+            Command::AddCondFmt {
+                sheet,
+                range: "A1:A3".to_string(),
+                spec: top_fill_rule(1),
+            },
+        ]);
+        drain_events(&rx);
+        assert_eq!(
+            cache_fill(&worker, sheet, 2, 0),
+            Some(CF_RED),
+            "A3 (the top value) is filled"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "A1 is not the top value"
+        );
+
+        // Edit A1 to 100 — the new top — with NO CF command. The whole range must re-evaluate: A1
+        // gains the fill and A3 loses it (though A3's own value 30 never changed), proving the
+        // global value-publish invalidation (not just a touched-cell refresh).
+        worker.process_batch(vec![set_input(sheet, 0, 0, "100")]);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "A1 is now the top value → filled after the value edit"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 2, 0),
+            None,
+            "A3 lost the fill though its own value never changed"
+        );
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
+            "the value edit ships a StyleCacheUpdated for the CF sheet"
+        );
+    }
+
+    #[test]
+    fn cf_threshold_value_change_flips_cached_style() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "50"),
+            add_cf(sheet, "A1:A10", "100"),
+        ]);
+        drain_events(&rx);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "50 is below the > 100 threshold"
+        );
+
+        worker.process_batch(vec![set_input(sheet, 0, 0, "150")]);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "150 crosses the threshold → filled, with no CF command"
+        );
+
+        worker.process_batch(vec![set_input(sheet, 0, 0, "50")]);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "back below the threshold → fill gone"
+        );
+    }
+
+    #[test]
+    fn cf_color_scale_reflected_in_render_cache() {
+        use freecell_core::{CfColorStop, CfThresholdKind};
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let green = Rgb::new(0, 255, 0);
+        let red = Rgb::new(255, 0, 0);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "0"),
+            set_input(sheet, 1, 0, "50"),
+            set_input(sheet, 2, 0, "100"),
+            Command::AddCondFmt {
+                sheet,
+                range: "A1:A3".to_string(),
+                spec: CfRuleSpec::ColorScale {
+                    stops: vec![
+                        CfColorStop {
+                            kind: CfThresholdKind::Min,
+                            value: None,
+                            color: green,
+                        },
+                        CfColorStop {
+                            kind: CfThresholdKind::Max,
+                            value: None,
+                            color: red,
+                        },
+                    ],
+                },
+            },
+        ]);
+        drain_events(&rx);
+        let mid = cache_fill(&worker, sheet, 1, 0);
+        assert!(
+            mid.is_some(),
+            "the scale's mid cell carries an interpolated fill in the render cache"
+        );
+        assert_ne!(mid, Some(green), "mid is not the min endpoint");
+        assert_ne!(mid, Some(red), "mid is not the max endpoint");
+    }
+
+    // BUG-1 regression: a CF mutation must refresh the published render cache immediately, with no
+    // subsequent value edit. Pre-fix, a CF-only batch left `needs_eval = false`, so `doc.evaluate()`
+    // never ran, IronCalc's `cf_cache` stayed stale, and the sheet-cache rebuild read no CF overlay
+    // — the rule only appeared after a later value change. Each of these tests isolates a CF op in
+    // its own value-free batch, so it FAILS pre-fix and PASSES once CF forces the coalesced eval.
+
+    #[test]
+    fn cond_fmt_applies_on_add_without_value_change() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Seed the values in their OWN batch and let it settle. The CF add below carries NO value
+        // edit — exactly the case BUG-1 missed (a value edit would have forced the eval anyway).
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "10"),
+            set_input(sheet, 1, 0, "20"),
+            set_input(sheet, 2, 0, "30"),
+        ]);
+        drain_events(&rx);
+
+        // A "> 15" red-fill rule over A1:A3 with NO subsequent value change: A2/A3 match, A1 doesn't.
+        worker.process_batch(vec![add_cf(sheet, "A1:A3", "15")]);
+
+        assert_eq!(
+            cache_fill(&worker, sheet, 1, 0),
+            Some(CF_RED),
+            "A2 (20 > 15) is filled immediately on add — no value edit needed (BUG-1)"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 2, 0),
+            Some(CF_RED),
+            "A3 (30 > 15) is filled immediately on add"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "A1 (10) is below the threshold → not filled"
+        );
+        assert!(
+            cond_fmt_updated_for(&drain_events(&rx), sheet),
+            "the add republishes the CF map"
+        );
+    }
+
+    #[test]
+    fn cond_fmt_removed_on_delete_without_value_change() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Value + rule in one batch → the value edit forces the eval, so the fill is present even
+        // pre-fix. This isolates the DELETE (value-free) batch as the thing under test.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "150"),
+            add_cf(sheet, "A1:A10", "100"),
+        ]);
+        drain_events(&rx);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "A1 (150 > 100) is filled after the add"
+        );
+
+        // Delete the rule with NO value edit — the fill must clear from the published cache at once.
+        worker.process_batch(vec![Command::DeleteCondFmt { sheet, index: 0 }]);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "deleting the rule clears the fill without any value change (BUG-1)"
+        );
+        assert!(
+            cond_fmt_updated_for(&drain_events(&rx), sheet),
+            "the delete republishes the CF map"
+        );
+    }
+
+    #[test]
+    fn cond_fmt_updated_on_edit_without_value_change() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        // Value + "> 100" rule in one batch (fill present pre-fix), isolating the UPDATE batch.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 0, 0, "50"),
+            set_input(sheet, 1, 0, "150"),
+            add_cf(sheet, "A1:A2", "100"),
+        ]);
+        drain_events(&rx);
+        assert_eq!(
+            cache_fill(&worker, sheet, 1, 0),
+            Some(CF_RED),
+            "A2 (150 > 100) starts filled"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            None,
+            "A1 (50) does not match > 100"
+        );
+
+        // Lower the threshold to > 40 with NO value edit — A1 (50) now matches and must gain the fill.
+        worker.process_batch(vec![Command::UpdateCondFmt {
+            sheet,
+            index: 0,
+            range: "A1:A2".to_string(),
+            spec: gt_rule("40"),
+        }]);
+        assert_eq!(
+            cache_fill(&worker, sheet, 0, 0),
+            Some(CF_RED),
+            "A1 (50 > 40) gains the fill after the threshold edit — no value change (BUG-1)"
+        );
+        assert_eq!(
+            cache_fill(&worker, sheet, 1, 0),
+            Some(CF_RED),
+            "A2 (150 > 40) stays filled"
+        );
+        assert!(
+            cond_fmt_updated_for(&drain_events(&rx), sheet),
+            "the update republishes the CF map"
+        );
+    }
+
+    #[test]
+    fn non_cf_value_edit_stays_on_fast_path() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..6,
+                cols: 0..6,
+            },
+            set_input(sheet, 1, 1, "42"),
+        ]);
+        drain_events(&rx);
+
+        // A value edit on a workbook with no CF: the invalidation gate short-circuits (the published
+        // CF map stays empty), and the cache still matches a fresh BASE engine re-read — no CF
+        // behavior leaked onto the non-CF fast path.
+        worker.process_batch(vec![set_input(sheet, 1, 1, "99")]);
+        assert!(
+            worker.shared.cond_fmt.read().is_empty(),
+            "a non-CF workbook keeps the published CF map empty"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
     }
 }

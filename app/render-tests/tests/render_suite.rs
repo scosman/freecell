@@ -304,6 +304,9 @@ render_cases! {
     header_full_column_selected, header_full_row_selected,
     // Chrome / formatting (Phase 8): explicit text colour + the macOS titlebar row
     text_color_red, titlebar_row,
+    // Conditional formatting (P10): value-dependent CF folded into the cache (P3) — a numeric
+    // highlight, a 3-color scale gradient, and a text highlight.
+    cf_highlight_greater_than, cf_color_scale_3, cf_highlight_text_contains,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

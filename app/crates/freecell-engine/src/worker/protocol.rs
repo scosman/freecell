@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
-use freecell_core::{CellRange, CellRef, Direction, FillAxis, Rgb, SelectionStats, SheetId};
+use freecell_core::{
+    CellRange, CellRef, CfRuleSpec, Direction, FillAxis, Rgb, SelectionStats, SheetId,
+};
 
 use crate::document::{LoadError, SaveError};
 
@@ -539,6 +541,36 @@ pub enum Command {
         id: ChartId,
         edit: ChartChromeEdit,
     },
+    /// Add a conditional-formatting rule over `range` (an A1 range / multi-area) on `sheet`
+    /// (`architecture.md §4.2`, `components/engine_cf.md §5`). Style-only (no recompute): the CF rule
+    /// changes styles, not values. Undoable (the engine records a diff). On success the worker
+    /// refreshes the published CF map + emits [`WorkerEvent::CondFmtUpdated`] (plus the usual
+    /// `StyleCacheUpdated`); a bad range/formula/operand surfaces as
+    /// [`EditRejectedReason::Engine`] on the result channel, nothing partially applied. `spec` is an
+    /// engine-free [`CfRuleSpec`] — no IronCalc type crosses the seam.
+    AddCondFmt {
+        sheet: SheetId,
+        range: String,
+        spec: CfRuleSpec,
+    },
+    /// Replace the CF rule at storage `index` with `spec` over `new_range` (the column analog of
+    /// [`Command::AddCondFmt`] for an existing rule). For a highlight rule the engine merges the new
+    /// [`CfFormat`](freecell_core::CfFormat) onto the rule's existing `Dxf`, preserving unmodeled
+    /// differential attributes (`components/engine_cf.md §4`).
+    UpdateCondFmt {
+        sheet: SheetId,
+        index: u32,
+        range: String,
+        spec: CfRuleSpec,
+    },
+    /// Delete the CF rule at storage `index` on `sheet`.
+    DeleteCondFmt { sheet: SheetId, index: u32 },
+    /// Raise the priority of the CF rule at storage `index` (swap with the next-higher rule; a
+    /// boundary raise is a no-op that records nothing).
+    RaiseCondFmtPriority { sheet: SheetId, index: u32 },
+    /// Lower the priority of the CF rule at storage `index` (the mirror of
+    /// [`Command::RaiseCondFmtPriority`]).
+    LowerCondFmtPriority { sheet: SheetId, index: u32 },
     /// Serialize + atomically save to `path` — replied via `Saved` / `SaveFailed`.
     Save { path: PathBuf, req_id: u64 },
     /// Export `sheet`'s used range to `path` as a `.csv` (`functional_spec.md §2`, D2.2 — raw
@@ -649,6 +681,11 @@ pub enum WorkerEvent {
     /// The style/geometry cache for `sheet` changed (deltas shipped via the shared cache).
     /// Defined now for the seam; **emitted in Phase 5** when the cache logic lands.
     StyleCacheUpdated { sheet: SheetId },
+    /// The conditional-formatting rule list for `sheet` changed (add / update / delete / reorder, a
+    /// structural CF-range shift, or the undo/redo of one). The published CF map has already been
+    /// refreshed; the window re-reads [`DocumentClient::cond_fmt_rules`](super::client::DocumentClient::cond_fmt_rules)
+    /// and rebuilds the sidebar rows (`architecture.md §4.2`, `components/engine_cf.md §5`).
+    CondFmtUpdated { sheet: SheetId },
     /// The sheet list changed (add / rename / delete) — the UI re-syncs its tab bar.
     SheetsChanged { sheets: Vec<SheetMeta> },
     /// Reply to [`Command::CopySelection`]: the tab-separated text the UI writes to the system

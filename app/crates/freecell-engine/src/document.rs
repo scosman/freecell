@@ -36,6 +36,12 @@ use serde::Deserialize;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
+/// The conditional-formatting `WorkbookDocument` methods (add/update/delete/reorder/list/
+/// `has_cond_fmt`/`extended_render_style`). A child module of `document` so it can reach the
+/// private `model` field while keeping the CF surface in its own file
+/// (`components/engine_cf.md §4`).
+mod cond_fmt;
+
 /// Locale used for a new/opened workbook (`en` — `components/engine_worker.md §File I/O`).
 pub const DEFAULT_LOCALE: &str = "en";
 /// Timezone used for a new/opened workbook. The component doc says "system tz"; the adapter
@@ -1779,6 +1785,20 @@ impl WorkbookDocument {
     pub(crate) fn user_model_mut(&mut self) -> &mut UserModel<'static> {
         crate::instrument::record_engine_call();
         &mut self.model
+    }
+
+    /// Shared reference to the owned model — the read seam the CF wrapper
+    /// ([`document::cond_fmt`](crate::document::cond_fmt)) uses to reach the `UserModel` CF query
+    /// API (`get_conditional_formatting_list` / `get_dxf_for_conditional_formatting` /
+    /// `get_extended_cell_style`). In-crate only; the `UserModel` is an `ironcalc` type and never
+    /// leaves this crate. Bumps the engine-call counter to keep the "any engine model access is
+    /// counted" invariant airtight (the reads performed *through* it are not individually
+    /// instrumented).
+    // P1 seam: the CF read methods that consume this land their non-test callers in P2/P3.
+    #[allow(dead_code)]
+    pub(crate) fn user_model(&self) -> &UserModel<'static> {
+        crate::instrument::record_engine_call();
+        &self.model
     }
 
     /// The resolved `ironcalc` style of a cell — a test-only helper for style round-trip

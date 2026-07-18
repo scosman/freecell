@@ -507,6 +507,14 @@ impl WorkbookWindow {
                     self.chrome.update(cx, |c, cx| c.refresh_active_style(cx));
                 }
             }
+            WorkerEvent::CondFmtUpdated { sheet } => {
+                // The published conditional-formatting rule list changed. Rebuild the CF sidebar's
+                // rows if it is open on this sheet (`components/cf_sidebar.md §9`); a closed sidebar
+                // or an update for a different sheet is a no-op.
+                if self.chrome.read(cx).cond_fmt_sheet() == Some(sheet) {
+                    self.chrome.update(cx, |c, cx| c.refresh_cond_fmt(cx));
+                }
+            }
             WorkerEvent::SheetsChanged { sheets } => {
                 self.reconcile_sheets(sheets, window, cx);
                 self.refresh_dirty(window, cx);
@@ -695,6 +703,17 @@ impl WorkbookWindow {
                 });
             }
             EditRejectedReason::EnginePanic | EditRejectedReason::Engine(_) => {
+                // A typed engine error while the CF rule editor is open is (almost certainly) that
+                // editor's Save being refused — surface it inline and keep the editor open
+                // (`functional_spec.md §8`) instead of the transient modal.
+                if let EditRejectedReason::Engine(msg) = &reason {
+                    if self.chrome.read(cx).cf_editor_open() {
+                        let msg = msg.clone();
+                        self.chrome
+                            .update(cx, |c, cx| c.show_cf_editor_error(msg, cx));
+                        return;
+                    }
+                }
                 if self.modal.is_none() {
                     let detail = match &reason {
                         EditRejectedReason::Engine(msg) => msg.clone(),

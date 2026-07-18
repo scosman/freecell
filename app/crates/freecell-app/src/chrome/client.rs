@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use freecell_core::{CellKind, CellRef, RenderStyle, SheetId};
+use freecell_core::{CellKind, CellRef, CfRuleView, RenderStyle, SheetId};
 use freecell_engine::{Command, DocumentClient};
 
 /// What the chrome needs from the engine: send commands, and read a cell's resolved style.
@@ -47,6 +47,11 @@ pub trait ChromeClient {
     /// map to "not a numeric cell here" → ± disabled). Read only at selection-change /
     /// style-refresh time, when the active cell is on screen.
     fn published_cell(&self, sheet: SheetId, cell: CellRef) -> Option<(CellKind, String)>;
+
+    /// The published conditional-formatting rules for `sheet` (`components/cf_sidebar.md §3`), read
+    /// to build the CF sidebar's List-mode rows. Empty when the sheet carries no CF. Read on sidebar
+    /// open / `CondFmtUpdated` / sheet switch — never per frame.
+    fn cond_fmt_rules(&self, sheet: SheetId) -> Vec<CfRuleView>;
 }
 
 impl ChromeClient for DocumentClient {
@@ -112,6 +117,10 @@ impl ChromeClient for DocumentClient {
             .find(|c| c.row == cell.row && c.col == cell.col)
             .map(|c| (c.kind, c.display_text.clone()))
     }
+
+    fn cond_fmt_rules(&self, sheet: SheetId) -> Vec<CfRuleView> {
+        DocumentClient::cond_fmt_rules(self, sheet)
+    }
 }
 
 /// A test/demo double for [`ChromeClient`]: records every sent [`Command`] and answers
@@ -125,6 +134,7 @@ pub struct RecordingClient {
     font_families: RefCell<HashMap<(SheetId, CellRef), String>>,
     default_font_size_pt: RefCell<Option<f64>>,
     published: RefCell<HashMap<(SheetId, CellRef), (CellKind, String)>>,
+    cond_fmt_rules: RefCell<HashMap<SheetId, Vec<CfRuleView>>>,
 }
 
 impl RecordingClient {
@@ -162,6 +172,11 @@ impl RecordingClient {
         self.published
             .borrow_mut()
             .insert((sheet, cell), (kind, display.to_string()));
+    }
+
+    /// Injects the CF rules `cond_fmt_rules` will return for `sheet`.
+    pub fn set_cond_fmt_rules(&self, sheet: SheetId, rules: Vec<CfRuleView>) {
+        self.cond_fmt_rules.borrow_mut().insert(sheet, rules);
     }
 
     /// Drains and returns every command recorded so far (clearing the log).
@@ -207,5 +222,13 @@ impl ChromeClient for RecordingClient {
 
     fn published_cell(&self, sheet: SheetId, cell: CellRef) -> Option<(CellKind, String)> {
         self.published.borrow().get(&(sheet, cell)).cloned()
+    }
+
+    fn cond_fmt_rules(&self, sheet: SheetId) -> Vec<CfRuleView> {
+        self.cond_fmt_rules
+            .borrow()
+            .get(&sheet)
+            .cloned()
+            .unwrap_or_default()
     }
 }

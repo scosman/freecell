@@ -49,12 +49,13 @@ are driven off the same text/caret regardless of which editor has focus.
   edit is **one** undo step (the existing per-edit commit), exactly as if the reference had
   been typed. Point-mode itself adds no separate undo entries.
 - **Pixel suite scope.** Range highlighting draws colored **outlines on the grid** and
-  colors the **in-cell editor** tokens (grid-rendered `TextRun`s) — both move grid pixels,
-  so this feature is **in-scope** for the pixel render suite (verify with a `render_tests.sh
-  test` subset while iterating; full suite + CI `render` gate once, in a dedicated late
-  phase). The **data-row** field's token coloring is chrome, **out** of pixel-suite scope
-  (verify with gpui view tests + a smoke launch). Plan render validation as its own late
-  phase per the repo convention.
+  colors the **in-cell editor** tokens — the in-cell editor is the `InputState` the grid
+  renders as an absolute overlay, so its pixels land in the grid's rendered frame — both
+  move grid pixels, so this feature is **in-scope** for the pixel render suite (verify with a
+  `render_tests.sh test` subset while iterating; full suite + CI `render` gate once, in a
+  dedicated late phase). The **data-row** field's token coloring renders in the chrome
+  element tree, **out** of pixel-suite scope (verify with gpui view tests + a smoke launch).
+  Plan render validation as its own late phase per the repo convention.
 
 ---
 
@@ -374,13 +375,21 @@ recommended default.
    against the shared reducer. The grid consults the pushed signal in `mouse_down_cell` to
    choose point vs. commit.
 
-3. **Where highlight colors are computed and painted, for both editors.** The in-cell editor
-   is grid-drawn (`TextRun`s — per-token color is straightforward) and the grid paints the
-   outlines; the **data-row** editor is a gpui-component `InputState` whose per-range text
-   coloring capability is unconfirmed. *Recommended:* compute the token→color map **once** in
-   chrome from the shared tokenization; the grid paints outlines + colors the in-cell
-   `TextRun`s from it; confirm (or vendor) a **styled-range/highlight-run API** on the
-   data-row `InputState` for the formula-bar coloring.
+3. **Where highlight colors are computed and painted, for both editors. — RESOLVED (owner,
+   2026-07-18).** Corrected premise: **both** editors are the *same* control —
+   `gpui_component::input::InputState` (the in-cell editor is the chrome-owned `InputState`
+   the grid renders as an overlay, **not** hand-rolled `TextRun`s). `InputState` is
+   code-editor-capable (its `input/` module has a `CodeEditor` mode carrying a
+   `SyntaxHighlighter` + a `display_map`), but exposes no public per-range highlight hook an
+   external caller can drive per-keystroke. **Decision:** compute the token→color map **once**
+   on the shared edit state; the grid paints the same-sheet **outlines** from it; and add
+   **one public per-range highlight API to the vendored gpui-component `InputState`**
+   (upstreamable), driven from that same map, so **both** editors color identically from one
+   code path. Consolidate the formula-feature stack (autocomplete, sig-hints, color map,
+   pending-ref/point-mode state) onto the existing shared layer — the `DataRow` reducer +
+   `EditController` promoted into the single owner/factory for the formula-editor pair —
+   rather than per-editor helpers. Grid outlines ship regardless of the highlight-hook
+   timing. Detail belongs in `architecture.md` / `components/edit_controller.md`.
 
 4. **Cross-sheet highlight handling (token color ↔ grid outline correspondence).** With the
    DPM.4 default, a cross-sheet token is colored in the editor but has no on-grid outline —

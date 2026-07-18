@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Freeze Panes
@@ -14,8 +14,8 @@ renders as an ordinary scrolling sheet.
 - **Interaction:** header-driven freeze. Right-click a row or column header → **Freeze**
   pins that track and everything above/left of it; if the clicked track is already the
   current freeze boundary, the item reads **Unfreeze**. (Header-driven, not Excel's
-  "freeze at the active cell" variant.) A small View menu may also offer the two common
-  presets (Freeze Top Row / Freeze First Column) — see functional spec.
+  "freeze at the active cell" variant.) Header context menu only for v0.5 — no View-menu
+  presets.
 - **Engine wiring (no fork change):** IronCalc already models frozen panes end-to-end and
   round-trips them through `<pane>` on open/save (`UserModel::set_frozen_rows_count` /
   `set_frozen_columns_count`, undoable — round-3 API audit). Work is thin: a `SetFrozen`

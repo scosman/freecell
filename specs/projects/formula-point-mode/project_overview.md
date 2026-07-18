@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Formula Point-Mode + Range Highlighting

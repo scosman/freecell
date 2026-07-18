@@ -1,20 +1,21 @@
 ---
-status: draft
+status: complete
 ---
 
 # Scalar Functions Batch (+ TRIM fix)
 
-A **lightweight upstreaming batch** (in the spirit of `ironcalc-upstreaming`, not a full
-product spec) that closes everyday spreadsheet-function gaps in the calculation engine.
-FreeCell's IronCalc fork implements 345 of ~506 common Excel functions today; when a
-formula calls one of the missing everyday ones, the cell errors instead of computing. This
-batch fills the common scalar (non-array) gaps and fixes one TRIM correctness bug.
+An engine-coverage batch that closes everyday spreadsheet-function gaps in the calculation
+engine. FreeCell's IronCalc fork implements 345 of ~506 common Excel functions today; when
+a formula calls one of the missing everyday ones, the cell errors instead of computing.
+This batch fills the common scalar (non-array) gaps and fixes one TRIM correctness bug.
 
-No UI, no product design — pure engine coverage/correctness. Per the fork policy
-(`CLAUDE.md`): **one fix = one `fix/<name>` branch = one clean upstream PR**, all
-integrated onto `freecell-fixes`; FreeCell picks them up via the existing pin. The agent
-prepares each upstream PR (compare link + title + body) for the owner to open — the owner
-shepherds the PRs.
+No UI, no product design — pure engine coverage/correctness — but it gets the **full spec
+treatment** (functional spec + architecture + phased implementation plan) so another agent
+can implement it cold, and so each function's exact Excel-compatible contract is written
+down and testable. Per the fork policy (`CLAUDE.md`): **one fix = one `fix/<name>` branch =
+one clean upstream PR**, all integrated onto `freecell-fixes`; FreeCell picks them up via
+the existing pin. The agent prepares each upstream PR (compare link + title + body) for the
+owner to open — the owner shepherds the PRs.
 
 ## Scope — 11 functions + 1 bug fix
 

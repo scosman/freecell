@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Merged Cell UI

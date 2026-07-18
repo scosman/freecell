@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: Merged Cell UI
@@ -85,8 +85,9 @@ Across, or no-center variants — see scope). It is reachable from:
   (bold, borders, fill).
 - **Menu-bar item + keyboard shortcut** — a **"Merge Cells" item in the Edit menu** (there
   is no Format menu today; formatting toggles live only as keybindings + toolbar buttons)
-  and a keybinding (proposed **⌘⇧M** — ⌘M is the system minimize; final key to confirm at
-  review), mirroring the `ToggleBold` action wiring in `shell/menus.rs`.
+  and a keybinding **⌃⌘M** (Control+Command+M, matching Apple Numbers' merge shortcut;
+  ⌘M alone is the system minimize), mirroring the `ToggleBold` action wiring in
+  `shell/menus.rs`.
 
 There is **no right-click context menu** entry (deferred — FreeCell has no context-menu
 component today).

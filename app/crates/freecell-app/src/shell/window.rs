@@ -188,11 +188,12 @@ impl WorkbookWindow {
     ) -> Self {
         let loading = match &source {
             DocumentSource::NewWorkbook => None,
-            // An open or a CSV import shows the "Opening <name>…" overlay until the worker emits
-            // `Loaded` (the import parse runs on the worker thread).
-            DocumentSource::OpenFile(p) | DocumentSource::ImportCsv(p) => {
-                Some(lifecycle::document_name(Some(p)))
-            }
+            // An open, a CSV import, or the demo shows the "Opening <name>…" overlay until the
+            // worker emits `Loaded` (the parse/load runs on the worker thread). The demo's temp
+            // file is named `Demo.xlsx`, so this briefly reads "Opening Demo.xlsx…".
+            DocumentSource::OpenFile(p)
+            | DocumentSource::ImportCsv(p)
+            | DocumentSource::OpenDemo(p) => Some(lifecycle::document_name(Some(p))),
         };
         let (client, receiver) = DocumentClient::spawn(source);
         Self::build(key, Rc::new(client), receiver, loading, path, window, cx)

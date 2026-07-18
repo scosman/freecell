@@ -23,6 +23,7 @@ pub mod titlebar;
 mod about;
 mod app;
 mod clipboard;
+mod demo;
 mod fonts;
 mod welcome;
 mod window;

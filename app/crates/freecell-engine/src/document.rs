@@ -68,6 +68,14 @@ pub enum DocumentSource {
     /// (`functional_spec.md §2`, D2.1): parsed comma-delimited, each field applied as user
     /// input, opened with `path: None` so Save → Save-As-to-`.xlsx` and no `.back` backup.
     ImportCsv(PathBuf),
+    /// The bundled **demo** workbook, materialized to a temp `.xlsx` at `path` (the app writes the
+    /// embedded demo bytes there — the IronCalc loader is path-based). Loads exactly like
+    /// [`OpenFile`](Self::OpenFile) — a real `.xlsx` with charts we want to render + preserve, so
+    /// the worker treats its chart discovery like an open (not like a fresh/CSV workbook). It is
+    /// **the app** that opens the window untitled (`path: None`) so Save → Save-As-to-`.xlsx`, no
+    /// `.back` backup, and no dedupe — each demo open is a fresh untitled copy of the same static
+    /// file.
+    OpenDemo(PathBuf),
 }
 
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
@@ -254,6 +262,10 @@ impl WorkbookDocument {
             DocumentSource::NewWorkbook => Self::new_empty(),
             DocumentSource::OpenFile(path) => Self::open(path),
             DocumentSource::ImportCsv(path) => Self::import_csv(path),
+            // The demo is a real `.xlsx` (materialized from bundled bytes) — load it exactly like
+            // an open so its cells, styles, and charts come through. The untitled/save-as behavior
+            // is applied by the app opening the window with `path: None`, not here.
+            DocumentSource::OpenDemo(path) => Self::open(path),
         }
     }
 

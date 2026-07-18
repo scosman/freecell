@@ -1,0 +1,114 @@
+//! The bundled **Demo spreadsheet** — the embedded demo workbook the welcome-window link opens.
+//!
+//! FreeCell ships one committed demo `.xlsx` asset. The welcome window's "Open Demo Spreadsheet"
+//! opens a fresh **untitled** copy of it each time (Save → Save-As, like a new sheet) — the app
+//! opens the window with `path: None` (`FreeCellApp::open_demo`), which gives the untitled/save-as
+//! behavior; this module only produces a file the engine can load.
+//!
+//! The IronCalc loader is path-based (no bytes/reader API), so the embedded bytes are materialized
+//! to an `.xlsx` on disk that the engine opens. That file must **outlive** the window: the demo is
+//! a real chart workbook, and FreeCell's chart system re-reads the source file lazily (on first
+//! paint of each sheet) and again on save (chart re-inject) — so it is a persisted (non-deleted)
+//! path, not a drop-on-close temp handle.
+//!
+//! It materializes into the **per-user** cache dir (`<cache_dir>/FreeCell`), matching how the app
+//! keeps per-user files (`shell::recents` uses `<data_dir>/FreeCell`). This deliberately avoids a
+//! predictable world-shared `/tmp/FreeCell/Demo.xlsx` — a fixed path in the shared temp root a
+//! co-tenant could pre-create or content-swap out from under us (a TOCTOU / DoS smell on a
+//! multi-user host). The per-user cache dir is the user's own (not world-writable), and the demo is
+//! a regenerable cache artifact, so the cache dir (not the data dir) is its natural home.
+//!
+//! **Tuning:** replace `assets/demo/demo.xlsx` and rebuild. This module is the single place that
+//! points at the asset.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The embedded demo workbook bytes — the single committed demo asset (`assets/demo/demo.xlsx`).
+const DEMO_XLSX: &[u8] = include_bytes!("../../assets/demo/demo.xlsx");
+
+/// The name the demo is materialized under. Its stem is what the loading overlay briefly shows
+/// ("Opening Demo.xlsx…") before the window settles on its untitled title.
+const DEMO_FILE_NAME: &str = "Demo.xlsx";
+
+/// Materializes the embedded demo workbook to an `.xlsx` under the per-user cache dir and returns
+/// its path, for the path-based engine loader to open.
+///
+/// Published atomically: the bytes are written to a unique sibling temp file, then renamed over the
+/// destination. A same-filesystem rename is atomic, so an already-open demo window whose worker
+/// re-reads the source file (lazy chart discovery, or a save) never observes a half-written file
+/// when a second demo open refreshes it. In the per-user cache dir repeated opens reuse the one
+/// destination (the bytes are identical + static); the file is intentionally not deleted.
+pub(crate) fn materialize_demo_xlsx() -> std::io::Result<PathBuf> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = demo_dir();
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(DEMO_FILE_NAME);
+
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let staging = dir.join(format!(".demo-{}-{seq}.xlsx.tmp", std::process::id()));
+    std::fs::write(&staging, DEMO_XLSX)?;
+    match std::fs::rename(&staging, &dest) {
+        Ok(()) => Ok(dest),
+        Err(e) => {
+            let _ = std::fs::remove_file(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// The directory the demo materializes into: the per-user cache dir `<cache_dir>/FreeCell`
+/// (falling back to the per-user data dir), so the demo file lives under the user's own directory
+/// rather than a predictable world-shared temp path (see the module docs).
+///
+/// - Linux: `${XDG_CACHE_HOME:-~/.cache}/FreeCell` (then `${XDG_DATA_HOME:-~/.local/share}/FreeCell`)
+/// - macOS: `~/Library/Caches/FreeCell` (then `~/Library/Application Support/FreeCell`)
+///
+/// Fallback: on a headless host where no per-user directory resolves (no `HOME`), a **randomized,
+/// per-process** subdir of the temp root — never the fixed shared `<temp>/FreeCell` — so the path
+/// still isn't predictable to a co-tenant.
+fn demo_dir() -> PathBuf {
+    if let Some(base) = dirs::cache_dir().or_else(dirs::data_dir) {
+        return base.join("FreeCell");
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ_DIR.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "FreeCell-demo-{}-{nanos}-{seq}",
+        std::process::id()
+    ))
+}
+
+/// Counter for the headless fallback's randomized subdir name (see [`demo_dir`]).
+static SEQ_DIR: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The embedded bytes materialize to a real `.xlsx` on disk that our engine can open with the
+    /// demo's actual shape — the same load path the demo window drives. Guards the asset staying
+    /// present + loadable and its sheet count, so a future content swap that trips an IronCalc gap
+    /// or drops a sheet is caught here (a corrupt/removed file also fails the build's
+    /// `include_bytes!` or this `open`).
+    #[test]
+    fn materialized_demo_loads_in_the_engine() {
+        let path = materialize_demo_xlsx().expect("demo materializes to an .xlsx");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(DEMO_FILE_NAME),
+            "the demo materializes under its display name"
+        );
+        let doc = freecell_engine::WorkbookDocument::open(&path).expect("the demo workbook loads");
+        assert_eq!(
+            doc.sheet_count(),
+            4,
+            "the demo workbook has its four sheets (Sales Overview / Product Catalog / \
+             Regional Sales / Quarterly P&L)"
+        );
+    }
+}

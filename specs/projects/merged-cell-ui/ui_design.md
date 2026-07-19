@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # UI Design: Merged Cell UI

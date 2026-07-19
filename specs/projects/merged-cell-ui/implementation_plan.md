@@ -25,7 +25,7 @@ repo's render-tests policy — earlier phases verify with crate-scoped checks + 
   active outline / range overlay / in-cell editor (arch §6, ui §3–5). Verify with
   `render_tests.sh test merge_` subset (full suite deferred to Phase 5).
 
-- [ ] **Phase 3 — Merge-aware selection & editing.**
+- [x] **Phase 3 — Merge-aware selection & editing.**
   `snap_cell`, `effective_range`, merge-aware `apply_motion` (enter/exit/shift-extend fixpoint),
   click/drag snapping at the input call-sites; edit/clear route to the anchor (arch §7,
   fspec F4–F5). Heavy pure unit-test coverage (the delicate phase).

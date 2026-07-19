@@ -199,11 +199,17 @@ Grows monotonically, bounded by the sheet → terminates; O(n²) worst, n small.
   - if in region R spanning rows[r0..r1]×cols[c0..c1]: exit past the far edge —
     Right→(r0,c1+1), Left→(r0,c0−1), Down→(r1+1,c0), Up→(r0−1,c0); else normal single step.
   - clamp to `dims`; then `active = snap_cell(landing)`; `anchor = active` (collapse).
-- *Shift-extend* (grow the selection): compute the moving edge from `effective_range(sel)`
-  on the `active` side; step it one line in `motion` (clamped); set `active` to the snapped
-  far corner (`snap_cell`) of `expand_to_regions(bbox(anchor, stepped_corner))`; keep `anchor`.
-  Re-snapping each step prevents "sticking" inside a tall region (the edge advances off the
-  effective range, not off the anchor).
+- *Shift-extend*: move the `active`-side edge one line, read off `effective_range(sel)` (not the
+  raw `active` cell, so it advances off the *whole* region — no "sticking" on a tall/wide merge).
+  Whether the step **grows** (edge moving away from the anchor) or **shrinks** (toward it) decides
+  how a region the stepped edge lands in is handled: a grow lets `expand_to_regions` swallow it
+  whole; a shrink instead moves the contracting (active-side) edge **to the first cell past that
+  region in the direction of the step** (i.e. just clear of the merge on the anchor side),
+  *excluding* the whole merge (mirroring the plain-arrow exit rule above) — otherwise
+  `expand_to_regions` would immediately re-pull it and the edge would stick. Clamp the shrink jump
+  so the contracting edge never crosses the anchor (a merge containing the anchor floors the shrink
+  at that merge). Then `active = snap_cell(far corner of expand_to_regions(bbox(anchor, stepped)))`;
+  keep `anchor`.
 - ⌘+arrow (edge-of-data) keeps its async `ResolveEdge` path, then snaps the resolved cell.
 
 **Click / drag (`grid/view.rs`):**

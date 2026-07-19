@@ -33,10 +33,10 @@ use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
-    apply_motion, effective_edge, expand_to_regions, is_full_column_selection,
-    is_full_row_selection, region_at, regions_intersecting, spans_all_cols, spans_all_rows, Align,
-    Axis, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern, RenderStyle, SelectionModel,
-    SheetDims, VAlign,
+    apply_motion, effective_edge, effective_range, expand_to_regions, is_full_column_selection,
+    is_full_row_selection, region_at, regions_intersecting, snap_cell, spans_all_cols,
+    spans_all_rows, Align, Axis, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern,
+    RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
 use crate::chrome::AutocompleteDisplay;
@@ -1001,6 +1001,12 @@ impl GridView {
     /// `SelectionChanged` (the chrome-grid sink mirrors it into the chrome itself, avoiding a
     /// double fold), then reveals it (which announces the possibly-widened viewport so an
     /// off-screen match is published). The caller keeps the find field focused.
+    ///
+    /// Assumes `cell` is already non-covered: the only caller is Find, which matches non-empty
+    /// cells and a covered cell is always empty, so it never lands on one (unlike the grid's own
+    /// input paths, this one does not snap). A future name-box "go to cell" wiring, which *can*
+    /// name a covered cell, must snap it (`snap_selection`) before calling here to keep the
+    /// covered-cell invariant (`architecture.md §7`).
     pub fn select_and_reveal(
         &mut self,
         cell: CellRef,
@@ -1316,6 +1322,34 @@ impl GridView {
         Some(SheetDims::new(row_axis.count(), col_axis.count()))
     }
 
+    /// Runs `f` with the active sheet's merged regions (0-based) borrowed **under the cache read
+    /// guard** — the small merge slice the merge-aware selection/edit logic runs against
+    /// (`architecture.md §7`). Borrowing (rather than cloning to a `Vec`) keeps the per-keystroke /
+    /// per-mouse-move input path allocation-free; `f` returns an owned result so the guard drops
+    /// before any `&mut self` follow-up. Unlike [`Self::visible_merges`] (viewport-scoped, for
+    /// rendering) this is the whole sheet's list, so a motion touching a region scrolled off-screen
+    /// still snaps correctly. The slice is empty when the sheet has no cache yet or no merges — then
+    /// every `merge`/`selection` helper is the identity.
+    fn with_sheet_merges<R>(&self, f: impl FnOnce(&[CellRange]) -> R) -> R {
+        let caches = self.sources.caches.read();
+        let merges = caches
+            .get(self.active_sheet)
+            .map(|cache| cache.merges())
+            .unwrap_or(&[]);
+        f(merges)
+    }
+
+    /// Snaps both corners of `sel` to whole regions (a covered cell → its region anchor), enforcing
+    /// the no-covered-cell invariant (`architecture.md §7`) for a selection built **outside** the
+    /// grid's own input handlers — the async ⌘+arrow edge reply (`WorkerEvent::EdgeResolved`) the
+    /// window applies. Idempotent and an identity on a merge-free sheet.
+    pub fn snap_selection(&self, sel: SelectionModel) -> SelectionModel {
+        self.with_sheet_merges(|merges| SelectionModel {
+            anchor: snap_cell(merges, sel.anchor),
+            active: snap_cell(merges, sel.active),
+        })
+    }
+
     /// The number of rows in the current viewport — the Page Up/Down step
     /// (`ui_design.md §6`). At least 1 so a page always advances.
     fn page_rows(&self, window: &Window) -> u32 {
@@ -1557,7 +1591,9 @@ impl GridView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cell = CellRef::new(row, col);
+        // Snap the clicked cell to its region anchor: a click on any cell of a merge selects the
+        // whole region (`functional_spec.md F4`), and the anchor is the valid edit target.
+        let cell = self.with_sheet_merges(|m| snap_cell(m, CellRef::new(row, col)));
         let selection = if event.modifiers.shift {
             // Shift-click extends the range from the existing anchor.
             SelectionModel {
@@ -2317,7 +2353,10 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         if !self.selection().range().contains(cell) {
-            self.set_selection_and_emit(SelectionModel::single(cell), window, cx);
+            // A right-click outside the selection collapses onto the clicked cell — snapped, so a
+            // right-click on a merge selects the whole region (`functional_spec.md F4`).
+            let snapped = self.with_sheet_merges(|m| snap_cell(m, cell));
+            self.set_selection_and_emit(SelectionModel::single(snapped), window, cx);
         }
         let range = self.selection().range();
         let paste_enabled = cx
@@ -2376,9 +2415,11 @@ impl GridView {
                 content_h,
             )
         };
+        // Snap the drag endpoint so a range that reaches into a merge grabs the whole region
+        // (`functional_spec.md F4`); `effective_range` then widens the visible box.
         let selection = SelectionModel {
             anchor,
-            active: cell,
+            active: self.with_sheet_merges(|m| snap_cell(m, cell)),
         };
         if *self.selection() != selection {
             self.set_selection_and_emit(selection, window, cx);
@@ -2649,9 +2690,10 @@ impl GridView {
             changed = true;
         }
         if let Some(drag) = self.drag {
+            // Snap the auto-scrolled drag endpoint to whole regions, matching `extend_drag_to_point`.
             let selection = SelectionModel {
                 anchor: drag.anchor,
-                active: cell,
+                active: self.with_sheet_merges(|m| snap_cell(m, cell)),
             };
             if *self.selection() != selection {
                 self.set_selection_and_emit(selection, window, cx);
@@ -2818,7 +2860,10 @@ impl GridView {
         match command {
             GridKeyCommand::Motion(motion) => self.move_active(motion, window, cx),
             GridKeyCommand::ClearCells => {
-                let range = self.selection().range();
+                // Clear over the effective range so a selection touching a merge clears the whole
+                // region — i.e. its anchor content (`architecture.md §7`, `functional_spec.md F5`).
+                let sel = *self.selection();
+                let range = self.with_sheet_merges(|m| effective_range(m, sel));
                 self.events.emit(&GridEvent::ClearCells(range), window, cx);
             }
             // Copy/cut/paste route to the window's `ClipboardCoordinator`. Reaching here means the
@@ -2902,7 +2947,7 @@ impl GridView {
             );
             return;
         }
-        let selection = apply_motion(sel, motion, dims);
+        let selection = self.with_sheet_merges(|m| apply_motion(sel, motion, dims, m));
         if *self.selection() != selection {
             self.set_selection_and_emit(selection, window, cx);
             self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
@@ -8152,6 +8197,148 @@ mod tests {
             click_count,
             first_mouse: false,
         }
+    }
+
+    fn shift_mouse_down_at(pos: gpui::Point<gpui::Pixels>) -> MouseDownEvent {
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            click_count: 1,
+            first_mouse: false,
+        }
+    }
+
+    // ---- Merge-aware selection & editing (merged-cell-ui `functional_spec.md F4–F5`) -----------
+
+    /// Sources over a sheet whose only merge is region `R` = rows 5..=7 × cols 3..=5 (anchor
+    /// `(5,3)`), so the input handlers exercise `snap_cell` / `effective_range`.
+    fn merge_sources() -> GridDataSources {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::Publication;
+        let cache = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .merge(CellRange::new(CellRef::new(5, 3), CellRef::new(7, 5)))
+        .build();
+        let mut caches = SheetCaches::new();
+        caches.insert(SheetId(0), cache);
+        let publication = Publication {
+            sheet: SheetId(0),
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: Vec::new(),
+        };
+        GridDataSources {
+            publication: Arc::new(ArcSwap::from_pointee(publication)),
+            caches: Arc::new(RwLock::new(caches)),
+        }
+    }
+
+    #[gpui::test]
+    fn mouse_down_on_covered_cell_selects_the_region_anchor(cx: &mut TestAppContext) {
+        // A plain click on a covered cell selects the whole region (its anchor is the active cell).
+        let (g, window, _events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.mouse_down_cell(
+                        6,
+                        4,
+                        &mouse_down_at(gpui::point(px(1.0), px(1.0)), 1),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        *grid.selection(),
+                        SelectionModel::single(CellRef::new(5, 3)),
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn shift_click_into_a_region_snaps_the_active_corner(cx: &mut TestAppContext) {
+        // Shift-click keeps the anchor and snaps the new active corner to the region anchor.
+        let (g, window, _events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_selection(SelectionModel::single(CellRef::new(0, 0)), cx);
+                    grid.mouse_down_cell(
+                        7,
+                        5,
+                        &shift_mouse_down_at(gpui::point(px(1.0), px(1.0))),
+                        window,
+                        cx,
+                    );
+                    let sel = *grid.selection();
+                    assert_eq!(sel.anchor, CellRef::new(0, 0), "anchor kept");
+                    assert_eq!(
+                        sel.active,
+                        CellRef::new(5, 3),
+                        "active snapped to the anchor"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn double_click_covered_cell_opens_editor_on_the_anchor(cx: &mut TestAppContext) {
+        // Double-clicking any cell of a merge edits the anchor — never a covered cell (which the
+        // engine would reject on commit).
+        let (g, window, events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.mouse_down_cell(
+                        6,
+                        4,
+                        &mouse_down_at(gpui::point(px(1.0), px(1.0)), 2),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            events.borrow().iter().any(|e| matches!(
+                e,
+                GridEvent::OpenInCellEditor(c) if *c == CellRef::new(5, 3)
+            )),
+            "the in-cell editor opens on the region anchor: {:?}",
+            events.borrow()
+        );
+    }
+
+    #[gpui::test]
+    fn delete_over_a_region_clears_the_effective_range(cx: &mut TestAppContext) {
+        // Delete on a selection resolving into a region clears the whole region (its anchor).
+        let (g, window, events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_selection(SelectionModel::single(CellRef::new(5, 3)), cx);
+                    grid.handle_key_down(&key_ev("delete", None, false), window, cx);
+                });
+            })
+            .unwrap();
+        assert!(
+            events.borrow().iter().any(|e| matches!(
+                e,
+                GridEvent::ClearCells(r)
+                    if *r == CellRange::new(CellRef::new(5, 3), CellRef::new(7, 5))
+            )),
+            "Delete clears the whole region via the effective range: {:?}",
+            events.borrow()
+        );
     }
 
     fn mouse_move_at(pos: gpui::Point<gpui::Pixels>) -> MouseMoveEvent {

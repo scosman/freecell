@@ -51,8 +51,9 @@ pub use publication::{CellKind, Publication, PublishedCell};
 pub use recent::{DisplayEntry, RecentEntry, RecentList};
 pub use refs::{CellRange, CellRef, FillAxis, SheetId};
 pub use selection::{
-    apply_motion, format_selection_ref, is_full_column_selection, is_full_row_selection,
-    resolve_edge, spans_all_cols, spans_all_rows, Direction, Motion, SelectionModel, SheetDims,
+    apply_motion, effective_range, format_selection_ref, is_full_column_selection,
+    is_full_row_selection, resolve_edge, snap_cell, spans_all_cols, spans_all_rows, Direction,
+    Motion, SelectionModel, SheetDims,
 };
 pub use stats::{format_stat_count, format_stat_value, SelectionStats};
 pub use style::{Align, RenderStyle, VAlign};

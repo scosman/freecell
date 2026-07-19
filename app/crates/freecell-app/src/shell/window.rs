@@ -551,6 +551,10 @@ impl WorkbookWindow {
                         } else {
                             SelectionModel::single(target)
                         };
+                        // An edge-of-data jump can land on a covered cell at a sheet edge — snap
+                        // both corners so a covered cell is never stored (merged-cell-ui
+                        // `architecture.md §7`). Identity on a merge-free sheet.
+                        let sel = self.grid.read(cx).snap_selection(sel);
                         self.sink_shared.last_selection.set(sel);
                         self.grid
                             .update(cx, |g, cx| g.set_selection_and_reveal(sel, window, cx));

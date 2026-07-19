@@ -33,9 +33,9 @@ use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
-    apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
-    is_full_row_selection, spans_all_cols, spans_all_rows, Align, Axis, BorderSpec, CellRange,
-    CellRef, Edge, FillAxis, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
+    apply_motion, effective_edge, is_full_column_selection, is_full_row_selection, spans_all_cols,
+    spans_all_rows, Align, Axis, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern,
+    RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
 use crate::chrome::AutocompleteDisplay;
@@ -120,9 +120,10 @@ struct DragState {
     mode: DragMode,
 }
 
-/// The open insert/delete header context menu (`functional_spec.md §5.3`). Grid-owned (it holds
-/// the cache's merge list for the guard + renders overlays already). `x`/`y` are grid-local; the
-/// `*_blocked` flags disable the corresponding item when the op would displace a file-loaded merge.
+/// The open insert/delete + hide/unhide header context menu (`functional_spec.md §5.3`).
+/// Grid-owned (it renders overlays already). `x`/`y` are grid-local. Insert/delete items are always
+/// enabled — the engine displaces merges across structural edits, so the interim merge-block flags
+/// are retired (merged-cell-ui `architecture.md §5`).
 #[derive(Debug, Clone, Copy)]
 struct HeaderMenu {
     axis: RowOrCol,
@@ -130,9 +131,6 @@ struct HeaderMenu {
     run: (u32, u32),
     x: f32,
     y: f32,
-    insert_before_blocked: bool,
-    insert_after_blocked: bool,
-    delete_blocked: bool,
     /// Hide is disabled when hiding the run would leave **zero** visible tracks on the axis
     /// (reachable only via Select-All → Hide, since the axis is Excel-max; `gaps_closing_7_15 §4`).
     hide_blocked: bool,
@@ -153,21 +151,15 @@ struct HeaderMenu {
 /// rows/cols set the insert/delete span and it is itself the Clear-contents target. `paste_enabled`
 /// gates both Paste and Paste-values (the grid can't distinguish an internal vs foreign clipboard —
 /// that state lives in the window's `ClipboardCoordinator` — and Paste-values falls back to a TSV
-/// paste for a foreign clipboard anyway, `functional_spec.md §5`, so they share one gate). The
-/// `*_blocked` flags disable an insert/delete item when the op would displace a file-loaded merge,
-/// reusing the header menu's merge guard for each axis.
+/// paste for a foreign clipboard anyway, `functional_spec.md §5`, so they share one gate).
+/// (Insert/delete items are always enabled — the interim merge-block flags are retired,
+/// merged-cell-ui `architecture.md §5`.)
 #[derive(Debug, Clone, Copy)]
 struct CellMenu {
     x: f32,
     y: f32,
     range: CellRange,
     paste_enabled: bool,
-    insert_row_above_blocked: bool,
-    insert_row_below_blocked: bool,
-    delete_rows_blocked: bool,
-    insert_col_left_blocked: bool,
-    insert_col_right_blocked: bool,
-    delete_cols_blocked: bool,
 }
 
 /// A live row/column resize (`components/grid_structure.md §5.1`). `start_px` is the dragged
@@ -2079,8 +2071,8 @@ impl GridView {
         let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
-        // Hit-test the ChartLayer + headers + read the merge list + hidden sets under one lock.
-        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims) = {
+        // Hit-test the ChartLayer + headers + read the hidden sets + dims under one lock.
+        let (hit, chart_hit, hidden_rows, hidden_cols, dims) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
@@ -2116,7 +2108,6 @@ impl GridView {
             (
                 hit,
                 chart_hit,
-                cache.merges().to_vec(),
                 cache.hidden_rows().clone(),
                 cache.hidden_cols().clone(),
                 cache.dims(),
@@ -2150,14 +2141,7 @@ impl GridView {
             GridHit::Cell { row, col } => {
                 // A right-click on the cell body opens the cell-area context menu
                 // (`functional_spec.md §2`), adjusting the selection first (move-if-outside).
-                self.open_cell_menu(
-                    CellRef::new(row, col),
-                    local_x,
-                    local_y,
-                    &merges,
-                    window,
-                    cx,
-                );
+                self.open_cell_menu(CellRef::new(row, col), local_x, local_y, window, cx);
                 return;
             }
             GridHit::Corner => {
@@ -2193,7 +2177,6 @@ impl GridView {
             }
         }
         let run = self.resize_run_for(axis, index);
-        let (before, after, delete) = merge_block_flags(axis, run, &merges);
         let (hidden_set, total) = match axis {
             RowOrCol::Row => (&hidden_rows, dims.0),
             RowOrCol::Col => (&hidden_cols, dims.1),
@@ -2205,9 +2188,6 @@ impl GridView {
             run,
             x: local_x,
             y: local_y,
-            insert_before_blocked: before,
-            insert_after_blocked: after,
-            delete_blocked: delete,
             hide_blocked,
             unhide_run,
             hidden_in_run,
@@ -2225,15 +2205,15 @@ impl GridView {
     /// Opens the cell-area right-click context menu over cell `(row, col)` at grid-local `(x, y)`
     /// (`functional_spec.md §2`). Excel selection semantics: a right-click **outside** the current
     /// selection first collapses it to the clicked cell; a click **inside** keeps the (possibly
-    /// multi-cell) selection so the menu's ops span it. The insert/delete items reuse the header
-    /// menu's per-axis merge guard over the selection's row/column span; `paste_enabled` reflects
-    /// whether the system clipboard currently holds text (gating both Paste and Paste-values).
+    /// multi-cell) selection so the menu's ops span it. Insert/delete items are always enabled (the
+    /// interim merge guard is retired — the engine displaces merges, merged-cell-ui `architecture.md
+    /// §5`); `paste_enabled` reflects whether the system clipboard currently holds text (gating both
+    /// Paste and Paste-values).
     fn open_cell_menu(
         &mut self,
         cell: CellRef,
         x: f32,
         y: f32,
-        merges: &[CellRange],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2241,10 +2221,6 @@ impl GridView {
             self.set_selection_and_emit(SelectionModel::single(cell), window, cx);
         }
         let range = self.selection().range();
-        let (insert_row_above_blocked, insert_row_below_blocked, delete_rows_blocked) =
-            merge_block_flags(RowOrCol::Row, (range.start.row, range.end.row), merges);
-        let (insert_col_left_blocked, insert_col_right_blocked, delete_cols_blocked) =
-            merge_block_flags(RowOrCol::Col, (range.start.col, range.end.col), merges);
         let paste_enabled = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
@@ -2255,12 +2231,6 @@ impl GridView {
             y,
             range,
             paste_enabled,
-            insert_row_above_blocked,
-            insert_row_below_blocked,
-            delete_rows_blocked,
-            insert_col_left_blocked,
-            insert_col_right_blocked,
-            delete_cols_blocked,
         });
         cx.notify();
     }
@@ -3724,8 +3694,8 @@ impl GridView {
     }
 
     /// The header insert/delete context menu overlay: a click-away backdrop + a small card of items
-    /// (`functional_spec.md §5.3`). Items whose op would displace a merge are disabled + a footnote
-    /// explains why. Built in `render` (needs `cx` for the item listeners).
+    /// (`functional_spec.md §5.3`). Insert/delete items are always enabled (the engine displaces
+    /// merges, merged-cell-ui `architecture.md §5`). Built in `render` (needs `cx` for the listeners).
     /// The header context-menu item list — `(label, enabled, event)` — for the axis + run in `menu`
     /// (`functional_spec.md §2`, `gaps_closing_7_15 §4`): Insert before / Insert after / Delete, then
     /// **Hide** / **Unhide**. Pure (no gpui) so the mapping is unit-testable, mirroring
@@ -3767,17 +3737,17 @@ impl GridView {
         let mut items = vec![
             (
                 format!("Insert {count} {unit}{p} {before_word}"),
-                !menu.insert_before_blocked,
+                true,
                 insert_ev(start, count),
             ),
             (
                 format!("Insert {count} {unit}{p} {after_word}"),
-                !menu.insert_after_blocked,
+                true,
                 insert_ev(after_at, count),
             ),
             (
                 format!("Delete {count} {unit}{p}"),
-                !menu.delete_blocked,
+                true,
                 delete_ev(start, count),
             ),
             {
@@ -3812,21 +3782,16 @@ impl GridView {
 
     fn header_menu_elements(&self, menu: HeaderMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let items = Self::header_menu_items(&menu);
-        // The "merged cells" footnote is about the insert/delete merge guard only — Hide/Unhide are
-        // never merge-blocked, so gate the note on the merge-guard flags, not every disabled item.
-        let any_blocked =
-            menu.insert_before_blocked || menu.insert_after_blocked || menu.delete_blocked;
 
         let mut card = div()
             .debug_selector(|| "header-menu-card".into())
             .absolute()
             .left(px(menu.x))
             .top(px(menu.y))
-            // Occlude the card so a mouse-down anywhere on it — the p(4) padding ring or the
-            // "Sheet has merged cells…" footnote row, neither of which carries a listener — can't
-            // fall through to the deferred dismiss backdrop and close the menu without acting (same
-            // backdrop-on-down bug as the action-bar popovers, BUG A/B). The item rows already
-            // `stop_propagation`; this covers the dead zones around them.
+            // Occlude the card so a mouse-down anywhere on it — the p(4) padding ring, which carries
+            // no listener — can't fall through to the deferred dismiss backdrop and close the menu
+            // without acting (same backdrop-on-down bug as the action-bar popovers, BUG A/B). The
+            // item rows already `stop_propagation`; this covers the dead zones around them.
             .occlude()
             .flex()
             .flex_col()
@@ -3862,17 +3827,6 @@ impl GridView {
                     );
             }
             card = card.child(item);
-        }
-        if any_blocked {
-            card = card.child(
-                div()
-                    .px(px(10.0))
-                    .py(px(3.0))
-                    .text_size(px(11.0))
-                    .text_color(rgb(HEADER_TEXT))
-                    .max_w(px(220.0))
-                    .child("Sheet has merged cells — not yet supported here."),
-            );
         }
 
         // A transparent full-grid backdrop closes the menu on any click outside it (and swallows
@@ -3979,9 +3933,10 @@ impl GridView {
     /// entry is a separator (`functional_spec.md §2` / D2.1 ordering). Split out from
     /// [`cell_menu_elements`](Self::cell_menu_elements) so the label/enable/event mapping is unit-
     /// testable without painting. Cut/Copy/Clear are always enabled (a selection is always ≥1 cell);
-    /// Paste + Paste-values share `paste_enabled`; Insert/Delete are gated by the per-axis merge
-    /// guard and reuse the header menu's row/column commands scoped to the selection's span. Clear
-    /// Formatting is omitted (no style-clear op exists this batch).
+    /// Paste + Paste-values share `paste_enabled`; Insert/Delete are always enabled (the interim
+    /// merge guard is retired — the engine displaces merges, merged-cell-ui `architecture.md §5`) and
+    /// reuse the header menu's row/column commands scoped to the selection's span. Clear Formatting is
+    /// omitted (no style-clear op exists this batch).
     ///
     /// **Full-line suppression (data safety):** a full-**column** selection is stored literally as
     /// `rows 0..=MAX_ROWS-1`, so its row-structural items would read "Delete 1048576 rows" and wipe
@@ -4025,7 +3980,7 @@ impl GridView {
             items.extend([
                 Some((
                     format!("Insert {rows} row{rp} above"),
-                    !menu.insert_row_above_blocked,
+                    true,
                     GridEvent::InsertRows {
                         at: start.row,
                         count: rows,
@@ -4033,7 +3988,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Insert {rows} row{rp} below"),
-                    !menu.insert_row_below_blocked,
+                    true,
                     GridEvent::InsertRows {
                         at: row_after,
                         count: rows,
@@ -4041,7 +3996,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Delete {rows} row{rp}"),
-                    !menu.delete_rows_blocked,
+                    true,
                     GridEvent::DeleteRows {
                         at: start.row,
                         count: rows,
@@ -4053,7 +4008,7 @@ impl GridView {
             items.extend([
                 Some((
                     format!("Insert {cols} column{cp} left"),
-                    !menu.insert_col_left_blocked,
+                    true,
                     GridEvent::InsertColumns {
                         at: start.col,
                         count: cols,
@@ -4061,7 +4016,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Insert {cols} column{cp} right"),
-                    !menu.insert_col_right_blocked,
+                    true,
                     GridEvent::InsertColumns {
                         at: col_after,
                         count: cols,
@@ -4069,7 +4024,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Delete {cols} column{cp}"),
-                    !menu.delete_cols_blocked,
+                    true,
                     GridEvent::DeleteColumns {
                         at: start.col,
                         count: cols,
@@ -4290,26 +4245,6 @@ impl GridView {
 /// Maps a core `Rgb` onto a gpui colour.
 fn to_rgba(c: Rgb) -> Rgba {
     rgb(c.to_hex())
-}
-
-/// The `(insert_before, insert_after, delete)` merge-guard block flags for a header run
-/// (`components/grid_structure.md §5.3`). Insert-before / delete affect the run's start index;
-/// insert-after affects one past the run's end. `true` = the op would displace a merge → disabled.
-fn merge_block_flags(axis: RowOrCol, run: (u32, u32), merges: &[CellRange]) -> (bool, bool, bool) {
-    let (start, end) = run;
-    let after = end.saturating_add(1);
-    match axis {
-        RowOrCol::Row => (
-            blocks_row_op(merges, start),
-            blocks_row_op(merges, after),
-            blocks_row_op(merges, start),
-        ),
-        RowOrCol::Col => (
-            blocks_col_op(merges, start),
-            blocks_col_op(merges, after),
-            blocks_col_op(merges, start),
-        ),
-    }
 }
 
 /// The `(hide_blocked, unhide_run, hidden_in_run)` header-menu flags for a run over an axis of
@@ -6726,29 +6661,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn merge_block_flags_match_predicate() {
-        use freecell_core::{CellRange, CellRef};
-        // A merge over columns 2..=4 (0-based): a column op at/before 4 blocks, past 4 allows.
-        let merges = [CellRange::new(CellRef::new(0, 2), CellRef::new(0, 4))];
-        // Run (0,1): insert-before at 0 → blocked (merge extends to 4 >= 0); insert-after at 2 →
-        // blocked; delete at 0 → blocked.
-        assert_eq!(
-            merge_block_flags(RowOrCol::Col, (0, 1), &merges),
-            (true, true, true)
-        );
-        // Run (5,6): insert-before at 5 (past the merge) → allowed; after at 7 → allowed.
-        assert_eq!(
-            merge_block_flags(RowOrCol::Col, (5, 6), &merges),
-            (false, false, false)
-        );
-        // No merges → nothing blocked.
-        assert_eq!(
-            merge_block_flags(RowOrCol::Row, (0, 0), &[]),
-            (false, false, false)
-        );
-    }
-
     #[gpui::test]
     fn header_clicks_and_select_all(cx: &mut TestAppContext) {
         let (g, window, _events) = grid_recording(cx);
@@ -7308,8 +7220,6 @@ mod tests {
                         .header_menu
                         .expect("a header right-click opens the menu");
                     assert_eq!(menu.axis, RowOrCol::Col);
-                    // The demo sheet has no merges → nothing blocked.
-                    assert!(!menu.insert_before_blocked && !menu.delete_blocked);
                     // Escape closes it.
                     grid.handle_key_down(&key_ev("escape", None, false), window, cx);
                     assert!(grid.header_menu.is_none());
@@ -7320,20 +7230,14 @@ mod tests {
 
     // ---- Cell-area right-click context menu (`functional_spec.md §2`, Phase 5) -------------
 
-    /// A `CellMenu` over the B2:D4 (rows 1..=3, cols 1..=3) selection with nothing blocked, for the
-    /// pure item-mapping test.
+    /// A `CellMenu` over the B2:D4 (rows 1..=3, cols 1..=3) selection, for the pure item-mapping
+    /// test.
     fn cell_menu_b2_d4(paste_enabled: bool) -> CellMenu {
         CellMenu {
             x: 0.0,
             y: 0.0,
             range: CellRange::new(CellRef::new(1, 1), CellRef::new(3, 3)),
             paste_enabled,
-            insert_row_above_blocked: false,
-            insert_row_below_blocked: false,
-            delete_rows_blocked: false,
-            insert_col_left_blocked: false,
-            insert_col_right_blocked: false,
-            delete_cols_blocked: false,
         }
     }
 
@@ -7390,14 +7294,11 @@ mod tests {
     }
 
     #[test]
-    fn cell_menu_items_single_cell_labels_and_paste_and_block_flags() {
+    fn cell_menu_items_single_cell_labels_and_paste_and_always_enabled_structure() {
         // A single-cell A1 selection singularizes the row/column labels.
         let single = CellMenu {
             range: CellRange::single(CellRef::new(0, 0)),
             paste_enabled: true,
-            // Block delete-rows + insert-column-left to prove the guard disables the right items.
-            delete_rows_blocked: true,
-            insert_col_left_blocked: true,
             ..cell_menu_b2_d4(true)
         };
         let items = GridView::cell_menu_items(&single);
@@ -7406,16 +7307,17 @@ mod tests {
         assert!(matches!(&items[3], Some((_, true, GridEvent::PasteValues))));
         assert!(matches!(
             &items[6],
-            Some((l, _, GridEvent::InsertRows { at: 0, count: 1 })) if l == "Insert 1 row above"
+            Some((l, true, GridEvent::InsertRows { at: 0, count: 1 })) if l == "Insert 1 row above"
         ));
-        // Blocked ops render disabled (enabled == false).
+        // The interim merge guard is retired: structural items are always enabled (the engine
+        // displaces merges, merged-cell-ui `architecture.md §5`).
         assert!(matches!(
             &items[8],
-            Some((l, false, GridEvent::DeleteRows { .. })) if l == "Delete 1 row"
+            Some((l, true, GridEvent::DeleteRows { .. })) if l == "Delete 1 row"
         ));
         assert!(matches!(
             &items[9],
-            Some((l, false, GridEvent::InsertColumns { .. })) if l == "Insert 1 column left"
+            Some((l, true, GridEvent::InsertColumns { .. })) if l == "Insert 1 column left"
         ));
     }
 
@@ -7431,9 +7333,6 @@ mod tests {
             run,
             x: 0.0,
             y: 0.0,
-            insert_before_blocked: false,
-            insert_after_blocked: false,
-            delete_blocked: false,
             hide_blocked,
             unhide_run,
             hidden_in_run,
@@ -7745,7 +7644,7 @@ mod tests {
                     };
                     grid.set_selection(b2_d4, cx);
                     events.borrow_mut().clear();
-                    grid.open_cell_menu(CellRef::new(2, 2), 0.0, 0.0, &[], window, cx);
+                    grid.open_cell_menu(CellRef::new(2, 2), 0.0, 0.0, window, cx);
                     let menu = grid.cell_menu.expect("the cell menu opened");
                     assert_eq!(*grid.selection(), b2_d4, "an inside click keeps B2:D4");
                     assert_eq!(

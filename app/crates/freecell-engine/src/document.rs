@@ -25,7 +25,7 @@ use ironcalc_base::cell::CellValue;
 use ironcalc_base::expressions::types::Area;
 use ironcalc_base::formatter::format::format_number;
 use ironcalc_base::locale::get_locale;
-use ironcalc_base::types::{CellType, Font, Style, Worksheet};
+use ironcalc_base::types::{Cell, CellType, Font, Style, Worksheet};
 use ironcalc_base::Model;
 
 use crate::chart::binding::CellData; // engine-free resolved value the live-binding read produces
@@ -891,16 +891,87 @@ impl WorkbookDocument {
             .delete_columns(sheet_idx, col as i32 + 1, count as i32)
     }
 
-    /// The sheet's file-loaded merged ranges (0-based), parsed from `worksheet.merge_cells`
-    /// (`Vec<String>` A1 ranges). Unparseable entries are skipped (defensive). The worker's merge
-    /// guard reads this before an insert/delete (`components/grid_structure.md §5.3`).
-    pub(crate) fn merge_ranges(&self, sheet_idx: u32) -> Result<Vec<CellRange>, String> {
-        let ws = self.worksheet(sheet_idx)?;
-        Ok(ws
-            .merge_cells
-            .iter()
-            .filter_map(|m| CellRange::from_a1(m))
+    /// Merges `area` (0-based inclusive) into a single region, keeping the anchor (`area.start`)
+    /// value and clearing the covered cells' content — one undoable engine step (merged-cell-ui
+    /// `architecture.md §3`). Converts the 0-based rectangle to the engine's 1-based
+    /// `(row, column, width, height)` (`§2`). The engine rejects (returns `Err`) an out-of-bounds /
+    /// degenerate (1×1) / overlapping / array-spill-colliding merge; a valid multi-cell selection
+    /// never trips the first two.
+    pub(crate) fn merge_cells(&mut self, sheet_idx: u32, area: CellRange) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let (row, column) = to_engine_coords(area.start);
+        let width = area.width() as i32;
+        let height = area.height() as i32;
+        self.model
+            .merge_cells(sheet_idx, row, column, width, height)
+    }
+
+    /// Removes the merged region containing `anchor` (0-based) — the toggle always passes a
+    /// region's anchor, but the engine accepts any covered cell too. A cell in no region is an
+    /// engine no-op. One undoable step (`architecture.md §3`).
+    pub(crate) fn unmerge_cells(&mut self, sheet_idx: u32, anchor: CellRef) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(anchor);
+        self.model.unmerge_cells(sheet_idx, row, col)
+    }
+
+    /// The sheet's merged regions (0-based) from the engine's normalized `get_merge_cells` — the
+    /// resident `MergeMap` source (`architecture.md §2/§3`). The engine `MergeCell { row, column,
+    /// width, height }` is 1-based with `width`=cols / `height`=rows; converted to a 0-based
+    /// inclusive `CellRange` here (the single conversion site, `§2`). Reflects post-displacement
+    /// truth (unlike the raw `worksheet.merge_cells` A1 strings), so it replaces the former
+    /// `merge_ranges` parse the cache build used.
+    pub(crate) fn merged_regions(&self, sheet_idx: u32) -> Result<Vec<CellRange>, String> {
+        crate::instrument::record_engine_call();
+        Ok(self
+            .model
+            .get_merge_cells(sheet_idx)?
+            .into_iter()
+            .map(|m| {
+                CellRange::new(
+                    CellRef::new((m.row - 1) as u32, (m.column - 1) as u32),
+                    CellRef::new(
+                        (m.row - 1 + m.height - 1) as u32,
+                        (m.column - 1 + m.width - 1) as u32,
+                    ),
+                )
+            })
             .collect())
+    }
+
+    /// Whether merging `area` (0-based) would **discard** covered content — the data-loss confirm
+    /// gate (`architecture.md §8`, `functional_spec.md F3`). Scans the sheet's **populated** cells
+    /// via the sparse worksheet cell map (never a dense `width*height` address walk, so a
+    /// whole-column merge stays cheap) and returns `true` when any cell inside `area` other than the
+    /// anchor (`area.start`) holds content (a non-`EmptyCell` — `EmptyCell` is style-only). An
+    /// all-empty or single-value merge returns `false` (no warning).
+    pub(crate) fn merge_would_lose_data(
+        &self,
+        sheet_idx: u32,
+        area: CellRange,
+    ) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        let ws = self.worksheet(sheet_idx)?;
+        // `area` is 0-based inclusive; the sheet_data map is keyed 1-based.
+        let (r0, r1) = (area.start.row as i32 + 1, area.end.row as i32 + 1);
+        let (c0, c1) = (area.start.col as i32 + 1, area.end.col as i32 + 1);
+        let (anchor_r, anchor_c) = to_engine_coords(area.start);
+        for (r, row_data) in &ws.sheet_data {
+            if *r < r0 || *r > r1 {
+                continue;
+            }
+            for (c, cell) in row_data {
+                if *c < c0 || *c > c1 {
+                    continue;
+                }
+                // The anchor keeps its value; only a covered cell with content is a loss.
+                let is_anchor = *r == anchor_r && *c == anchor_c;
+                if !is_anchor && !matches!(cell, Cell::EmptyCell { .. }) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Whether `cell` currently has the given character-format flag set (the per-cell read the

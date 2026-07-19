@@ -345,6 +345,24 @@ pub enum Command {
         col: u32,
         count: u32,
     },
+    /// Merge `area` (0-based inclusive) into one region, keeping only the anchor (`area.start`)
+    /// value and clearing the covered cells' content (merged-cell-ui `functional_spec.md F2`,
+    /// `architecture.md §3`). Undoable + needs a recompute (a covered-content clear can feed
+    /// formulas). `confirmed` is the data-loss round-trip flag: an unconfirmed merge that would
+    /// discard covered content replies [`WorkerEvent::MergeNeedsConfirm`] and applies nothing; the
+    /// UI re-sends with `confirmed: true` to proceed. A merge with no covered content (or a single
+    /// value) applies regardless of `confirmed`. Engine-rejected (array/spill collision) → an
+    /// `Engine` [`WorkerEvent::EditRejected`]; the toggle structurally avoids overlap rejects.
+    MergeCells {
+        sheet: SheetId,
+        area: CellRange,
+        confirmed: bool,
+    },
+    /// Remove the merged region whose anchor is `anchor` (0-based) — Unmerge (merged-cell-ui
+    /// `functional_spec.md F2`). The toggle always names a region's anchor; a cell in no region is
+    /// an engine no-op. Undoable + republishes so the resident `MergeMap` and restored region draw
+    /// together.
+    UnmergeCells { sheet: SheetId, anchor: CellRef },
     /// Append a new sheet.
     AddSheet,
     /// Rename a sheet (re-validated against the other sheet names here).
@@ -599,9 +617,11 @@ pub enum EditRejectedReason {
     InvalidSheetName(SheetNameError),
     /// IronCalc returned a typed error for the edit (message preserved).
     Engine(String),
-    /// An insert/delete rows/columns was blocked because the sheet has merged cells the op would
-    /// displace (`functional_spec.md §5.3`). Merged cells aren't yet supported, so the op is
-    /// refused and the UI shows the merge-guard dialog. Carries no payload (fixed message).
+    /// A **fill** (⌘D / ⌘R / drag-fill) was blocked because its target intersects a merged region
+    /// (merged-cell-ui `functional_spec.md F6` documented limitation — fill into a merge isn't a
+    /// supported edit target, matching the engine's covered-cell write rejection). Insert/delete
+    /// near a merge is **no longer** blocked (the engine now displaces merges), so this reason is
+    /// now fill-only. Carries no payload (fixed message).
     MergedCells,
     /// The apply panicked and was caught (`catch_unwind`); the batch was dropped.
     EnginePanic,
@@ -678,6 +698,11 @@ pub enum WorkerEvent {
     CsvExportFailed { req_id: u64, error: SaveError },
     /// An edit was refused (cap re-check, name validation, caught panic, or degraded).
     EditRejected { reason: EditRejectedReason },
+    /// A [`Command::MergeCells`] with `confirmed: false` would discard covered content — the UI
+    /// must confirm before it applies (merged-cell-ui `functional_spec.md F3`, `architecture.md
+    /// §8`). Nothing was mutated. The window opens the data-loss confirm dialog; **Merge** re-sends
+    /// `MergeCells { area, confirmed: true }`, **Cancel** dismisses.
+    MergeNeedsConfirm { sheet: SheetId, area: CellRange },
     /// The style/geometry cache for `sheet` changed (deltas shipped via the shared cache).
     /// Defined now for the seam; **emitted in Phase 5** when the cache logic lands.
     StyleCacheUpdated { sheet: SheetId },

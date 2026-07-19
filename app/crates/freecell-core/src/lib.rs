@@ -23,7 +23,7 @@ pub mod format_color;
 pub mod format_ui;
 pub mod functions;
 pub mod input_cap;
-pub mod merge_guard;
+pub mod merge;
 pub mod palette;
 pub mod perf;
 pub mod publication;
@@ -46,7 +46,7 @@ pub use cond_fmt::{
     CfValueOp,
 };
 pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};
-pub use merge_guard::{blocks_col_op, blocks_row_op};
+pub use merge::{anchor_of, blocks_fill, expand_to_regions, region_at, regions_intersecting};
 pub use publication::{CellKind, Publication, PublishedCell};
 pub use recent::{DisplayEntry, RecentEntry, RecentList};
 pub use refs::{CellRange, CellRef, FillAxis, SheetId};

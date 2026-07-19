@@ -561,6 +561,13 @@ impl WorkbookWindow {
                 }
             }
             WorkerEvent::EditRejected { reason } => self.on_edit_rejected(reason, window, cx),
+            // A data-losing merge asked to confirm (merged-cell-ui `functional_spec.md F3`). The
+            // confirm dialog + `MergeCells { confirmed: true }` re-send are wired in Phase 4
+            // (`architecture.md §8`); no UI surface exists yet and nothing sends `Command::MergeCells`
+            // this phase, so this is a log-only backstop keeping the match exhaustive.
+            WorkerEvent::MergeNeedsConfirm { .. } => {
+                tracing::debug!("merge needs confirmation (confirm dialog wired in a later phase)");
+            }
             // Saved / SaveFailed match unconditionally then branch on the pending-save `req_id`
             // (a stale ack from a superseded save is ignored) — so the match stays exhaustive with
             // no catch-all, and a new `WorkerEvent` variant is a compile error that forces a
@@ -727,8 +734,10 @@ impl WorkbookWindow {
                     cx.notify();
                 }
             }
-            // The insert/delete merge guard (`functional_spec.md §5.3`): an OK-only dialog, nothing
-            // changed.
+            // The fill merge-guard (merged-cell-ui `functional_spec.md F6`): a fill (⌘D/⌘R/drag)
+            // into a merged region is rejected — an OK-only dialog, nothing changed. (Insert/delete
+            // near a merge is no longer guarded; the engine displaces merges. The dialog copy is
+            // re-worded to "can't fill merged cells" in Phase 4, `architecture.md §9`.)
             EditRejectedReason::MergedCells => {
                 if self.modal.is_none() {
                     self.modal = Some(ActiveModal::Error {

@@ -26,7 +26,7 @@ use std::time::Instant;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use freecell_core::input_cap::validate_input;
-use freecell_core::merge_guard::{blocks_col_op, blocks_fill, blocks_row_op};
+use freecell_core::merge::blocks_fill;
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{
@@ -594,6 +594,11 @@ impl Worker {
                 | Command::InsertColumns { .. }
                 | Command::DeleteRows { .. }
                 | Command::DeleteColumns { .. }
+                // Merge/unmerge ride the coalesced-eval + publish + undo/redo machinery like a
+                // structural insert/delete (they clear covered content + rebuild the sheet cache,
+                // which re-reads `merged_regions`), so they bucket with the edits.
+                | Command::MergeCells { .. }
+                | Command::UnmergeCells { .. }
                 | Command::AddSheet
                 | Command::RenameSheet { .. }
                 | Command::DeleteSheet { .. }
@@ -781,9 +786,28 @@ impl Worker {
     /// publish-then-bump. Returns whether it published. Emits the SP1 observable timings
     /// (apply / eval / publish) at `debug` — Phase 12's perf harness reads these.
     fn apply_edit_batch(&mut self, edits: Vec<Command>) -> bool {
-        // Clean rejects (no panic risk): input cap + sheet-name re-check.
+        // Clean rejects (no panic risk): input cap + sheet-name re-check + fill merge-guard.
         let mut valid: Vec<Command> = Vec::new();
         for edit in edits {
+            // Data-loss confirm gate (`architecture.md §8`): an unconfirmed merge that would discard
+            // covered content is not applied — the UI must confirm first. Emit `MergeNeedsConfirm`
+            // and drop the command (no mutation, no undo step). A confirmed merge, or one with no
+            // covered content, falls through and applies. Realized here (a pre-apply read like the
+            // fill merge-guard) rather than in the emit-free `apply_one` — same behavior as §3.
+            if let Command::MergeCells {
+                sheet,
+                area,
+                confirmed: false,
+            } = &edit
+            {
+                if self.merge_would_lose_data(*sheet, *area) {
+                    self.emit(WorkerEvent::MergeNeedsConfirm {
+                        sheet: *sheet,
+                        area: *area,
+                    });
+                    continue;
+                }
+            }
             match self.pre_validate(&edit) {
                 Ok(()) => valid.push(edit),
                 Err(reason) => self.emit(WorkerEvent::EditRejected { reason }),
@@ -2134,35 +2158,30 @@ impl Worker {
                     .collect();
                 validate_sheet_name(name, &existing).map_err(EditRejectedReason::InvalidSheetName)
             }
-            // Merge guard (authoritative layer, `components/grid_structure.md §5.3`): block an
-            // insert/delete that would displace a file-loaded merge. A merge at/after the affected
-            // 0-based index blocks (the UI also disables the menu item; this covers staleness). If
-            // the sheet doesn't resolve, let the apply path surface the error.
-            Command::InsertRows { sheet, row, .. } | Command::DeleteRows { sheet, row, .. } => {
-                self.merge_guard(*sheet, |merges| blocks_row_op(merges, *row))
-            }
-            Command::InsertColumns { sheet, col, .. }
-            | Command::DeleteColumns { sheet, col, .. } => {
-                self.merge_guard(*sheet, |merges| blocks_col_op(merges, *col))
-            }
-            // Fill into a merged region is rejected (merged cells aren't a supported edit target),
-            // consistently with the structural ops → the same `MergedCells` dialog
-            // (`functional_spec.md §3` edge case). The written rectangle is the selection `range`.
+            // Insert/delete rows/columns near a merge is NO LONGER guarded — the engine displaces
+            // merges across structural edits (grow/shrink/drop, never split), so the op proceeds and
+            // the cache re-reads the new region (merged-cell-ui `architecture.md §5`,
+            // `functional_spec.md F6`).
+            //
+            // Fill into a merged region stays rejected (merged cells aren't a supported fill target,
+            // matching the engine's covered-cell write rejection) → the fill-only `MergedCells`
+            // dialog (`functional_spec.md F6`). The written rectangle is the selection `range`.
             Command::FillDown { sheet, range } | Command::FillRight { sheet, range } => {
-                self.merge_guard(*sheet, |merges| blocks_fill(merges, *range))
+                self.fill_merge_guard(*sheet, |merges| blocks_fill(merges, *range))
             }
             // A drag-fill writes over `target` (⊇ seed); a fill into a merged region is rejected.
             Command::FillDrag { sheet, target, .. } => {
-                self.merge_guard(*sheet, |merges| blocks_fill(merges, *target))
+                self.fill_merge_guard(*sheet, |merges| blocks_fill(merges, *target))
             }
             _ => Ok(()),
         }
     }
 
-    /// Runs the merge-guard predicate against `sheet`'s file-loaded merges, returning
-    /// `Err(MergedCells)` when `blocked` is true. A sheet that doesn't resolve (or whose merges
+    /// Runs the fill merge-guard predicate against `sheet`'s live merged regions, returning
+    /// `Err(MergedCells)` when `blocked` is true. Reads the engine's normalized `merged_regions`
+    /// (live truth — file-loaded + in-app-created). A sheet that doesn't resolve (or whose merges
     /// can't be read) passes the guard — the apply path then surfaces its own error.
-    fn merge_guard(
+    fn fill_merge_guard(
         &self,
         sheet: SheetId,
         blocked: impl Fn(&[CellRange]) -> bool,
@@ -2170,10 +2189,22 @@ impl Worker {
         let Some(idx) = self.resolve(sheet) else {
             return Ok(());
         };
-        match self.doc.merge_ranges(idx) {
+        match self.doc.merged_regions(idx) {
             Ok(merges) if blocked(&merges) => Err(EditRejectedReason::MergedCells),
             _ => Ok(()),
         }
+    }
+
+    /// Whether an unconfirmed `MergeCells` over `area` on `sheet` would discard covered content —
+    /// the data-loss confirm gate (`architecture.md §8`). Fails **closed**: an unresolvable sheet
+    /// or a doc read error returns `true` (assume a loss), so the gate errs toward asking the user
+    /// to confirm rather than silently discarding content. (The sheet id comes from a live UI
+    /// selection, so this backstop rarely triggers in practice.)
+    fn merge_would_lose_data(&self, sheet: SheetId, area: CellRange) -> bool {
+        let Some(idx) = self.resolve(sheet) else {
+            return true;
+        };
+        self.doc.merge_would_lose_data(idx, area).unwrap_or(true)
     }
 
     /// Re-resolve the charts whose source ranges the edit touched, and store a fresh
@@ -3518,6 +3549,19 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.delete_columns(idx, *col, *count)?;
             Ok(AppliedKind::Structure)
         }
+        // The data-loss confirm gate runs BEFORE apply (`apply_edit_batch`), so a `MergeCells` that
+        // reaches here is safe to perform (confirmed, or no covered content). `Structure` triggers
+        // the eval + full active-sheet cache rebuild that re-reads `merged_regions` (§3).
+        Command::MergeCells { sheet, area, .. } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.merge_cells(idx, *area)?;
+            Ok(AppliedKind::Structure)
+        }
+        Command::UnmergeCells { sheet, anchor } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            doc.unmerge_cells(idx, *anchor)?;
+            Ok(AppliedKind::Structure)
+        }
         Command::AddSheet => {
             doc.add_sheet()?;
             Ok(AppliedKind::SheetOp)
@@ -3748,7 +3792,11 @@ fn op_of(edit: &Command) -> AppliedOp {
         | Command::InsertRows { sheet, .. }
         | Command::InsertColumns { sheet, .. }
         | Command::DeleteRows { sheet, .. }
-        | Command::DeleteColumns { sheet, .. } => AppliedOp::Rebuild { sheet: *sheet },
+        | Command::DeleteColumns { sheet, .. }
+        // Merge/unmerge shift covered content + the region set → a full active-sheet rebuild that
+        // re-reads `merged_regions` (merged-cell-ui `architecture.md §3`).
+        | Command::MergeCells { sheet, .. }
+        | Command::UnmergeCells { sheet, .. } => AppliedOp::Rebuild { sheet: *sheet },
         Command::AddSheet
         | Command::RenameSheet { .. }
         | Command::DeleteSheet { .. }
@@ -7825,62 +7873,51 @@ mod tests {
     }
 
     #[test]
-    fn merge_guard_blocks_and_allows_on_fixture() {
+    fn insert_near_merge_displaces_no_longer_blocked() {
+        // The interim insert/delete merge guard is retired (merged-cell-ui `architecture.md §5`):
+        // the engine now DISPLACES merges across structural edits, so an insert near a merge applies
+        // (no `MergedCells` rejection) and the resident cache reflects the shifted region.
         let dir = tempfile::tempdir().unwrap();
         let path = merged_fixture(dir.path());
         let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
-        // The merge parses into a 0-based range (K7:L10 → rows 6..=9, cols 10..=11)…
+        // The merge reads back 0-based via the normalized engine API (K7:L10 → rows 6..=9,
+        // cols 10..=11).
         let merge = CellRange::new(CellRef::new(6, 10), CellRef::new(9, 11));
-        assert_eq!(doc.merge_ranges(0).unwrap(), vec![merge]);
+        assert_eq!(doc.merged_regions(0).unwrap(), vec![merge]);
         let (mut worker, rx) = worker_over(doc);
         let sheet = sheet0(&worker);
-        // …and rides into the resident cache for the UI guard layer.
+        // …and rides into the resident cache for the UI to render/select from.
         assert_eq!(
             worker.shared.caches.read().get(sheet).unwrap().merges(),
             &[merge]
         );
 
-        // Inserting ABOVE the merge (0-based row 6 = 1-based 7) is blocked with the typed dialog
-        // reason, and nothing changes.
+        // Inserting a row ABOVE the merge (0-based row 0) now APPLIES — no rejection — and shifts the
+        // whole region down by one (rows 6..=9 → 7..=10, cols unchanged).
         let ops_before = worker.ops_seen;
         worker.process_batch(vec![Command::InsertRows {
             sheet,
-            row: 6,
+            row: 0,
             count: 1,
         }]);
         assert!(
-            drain_events(&rx).iter().any(|e| matches!(
+            !drain_events(&rx).iter().any(|e| matches!(
                 e,
                 WorkerEvent::EditRejected {
                     reason: EditRejectedReason::MergedCells
                 }
             )),
-            "insert above a merge must be refused with MergedCells"
+            "insert near a merge must no longer be merge-blocked"
         );
-        assert_eq!(
-            worker.ops_seen, ops_before,
-            "a blocked insert commits nothing"
-        );
-
-        // Inserting BELOW every merge (0-based row 10 = 1-based 11) is allowed and commits.
-        worker.process_batch(vec![Command::InsertRows {
-            sheet,
-            row: 10,
-            count: 1,
-        }]);
         assert!(
             worker.ops_seen > ops_before,
-            "an insert below all merges must apply"
+            "the displacing insert must commit"
         );
-        let deleting_col_left_of_merge = drain_events(&rx);
-        assert!(
-            !deleting_col_left_of_merge.iter().any(|e| matches!(
-                e,
-                WorkerEvent::EditRejected {
-                    reason: EditRejectedReason::MergedCells
-                }
-            )),
-            "an op below all merges must not be merge-blocked"
+        let displaced = CellRange::new(CellRef::new(7, 10), CellRef::new(10, 11));
+        assert_eq!(
+            worker.shared.caches.read().get(sheet).unwrap().merges(),
+            &[displaced],
+            "the resident cache reflects the displaced region"
         );
     }
 
@@ -7954,6 +7991,184 @@ mod tests {
                 }
             )),
             "a fill disjoint from every merge must not be merge-blocked"
+        );
+    }
+
+    #[test]
+    fn merge_cells_creates_region_and_clears_covered_content() {
+        // A merge over a range with content only in the anchor applies with no confirm, keeps the
+        // anchor value, clears covered content, and the resident cache reflects the new region
+        // (merged-cell-ui `functional_spec.md F2`, `architecture.md §3`).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![set_input(sheet, 0, 0, "hi")]);
+        drain_events(&rx);
+
+        let area = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 1)); // A1:B2
+        worker.process_batch(vec![Command::MergeCells {
+            sheet,
+            area,
+            confirmed: false,
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::MergeNeedsConfirm { .. })),
+            "an all-anchor merge needs no confirm"
+        );
+        assert_eq!(
+            worker.shared.caches.read().get(sheet).unwrap().merges(),
+            &[area],
+            "the cache reflects the new region"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "hi"
+        );
+
+        // Unmerge (by the anchor) removes the region.
+        worker.process_batch(vec![Command::UnmergeCells {
+            sheet,
+            anchor: CellRef::new(0, 0),
+        }]);
+        drain_events(&rx);
+        assert!(
+            worker
+                .shared
+                .caches
+                .read()
+                .get(sheet)
+                .unwrap()
+                .merges()
+                .is_empty(),
+            "unmerge clears the region from the cache"
+        );
+    }
+
+    #[test]
+    fn merge_data_loss_round_trip() {
+        // A merge that would discard covered content asks to confirm first (no mutation); the
+        // re-send with `confirmed: true` performs it, discarding the covered value
+        // (merged-cell-ui `functional_spec.md F3`, `architecture.md §8`).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "anchor"),
+            set_input(sheet, 1, 1, "covered"), // B2 — a covered cell with content
+        ]);
+        drain_events(&rx);
+        let area = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 1)); // A1:B2
+
+        // Unconfirmed → MergeNeedsConfirm, nothing applied.
+        let ops_before = worker.ops_seen;
+        worker.process_batch(vec![Command::MergeCells {
+            sheet,
+            area,
+            confirmed: false,
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::MergeNeedsConfirm { sheet: s, area: a } if *s == sheet && *a == area
+            )),
+            "a data-losing merge must ask to confirm"
+        );
+        assert_eq!(
+            worker.ops_seen, ops_before,
+            "an unconfirmed data-losing merge commits nothing"
+        );
+        assert!(
+            worker
+                .shared
+                .caches
+                .read()
+                .get(sheet)
+                .unwrap()
+                .merges()
+                .is_empty(),
+            "nothing merged before confirmation"
+        );
+
+        // Confirmed → performs the merge (covered content discarded).
+        worker.process_batch(vec![Command::MergeCells {
+            sheet,
+            area,
+            confirmed: true,
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::MergeNeedsConfirm { .. })),
+            "a confirmed merge does not re-ask"
+        );
+        assert_eq!(
+            worker.shared.caches.read().get(sheet).unwrap().merges(),
+            &[area]
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(1, 1)).unwrap(),
+            "",
+            "the covered cell's content was discarded"
+        );
+    }
+
+    #[test]
+    fn merge_unmerge_undo_redo_restores_region_and_content() {
+        // Merge/unmerge are single undoable engine steps; undo restores the prior merge state AND
+        // any discarded content (merged-cell-ui `functional_spec.md F7`, `architecture.md §4`).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "anchor"),
+            set_input(sheet, 1, 1, "covered"),
+        ]);
+        drain_events(&rx);
+        let area = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 1));
+
+        worker.process_batch(vec![Command::MergeCells {
+            sheet,
+            area,
+            confirmed: true,
+        }]);
+        drain_events(&rx);
+        assert_eq!(
+            worker.shared.caches.read().get(sheet).unwrap().merges(),
+            &[area]
+        );
+
+        // Undo restores both the (absent) region and the discarded covered content.
+        worker.process_batch(vec![Command::Undo]);
+        drain_events(&rx);
+        assert!(
+            worker
+                .shared
+                .caches
+                .read()
+                .get(sheet)
+                .unwrap()
+                .merges()
+                .is_empty(),
+            "undo removes the region"
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(1, 1)).unwrap(),
+            "covered",
+            "undo restores the discarded covered content"
+        );
+
+        // Redo re-applies the merge (content discarded again).
+        worker.process_batch(vec![Command::Redo]);
+        drain_events(&rx);
+        assert_eq!(
+            worker.shared.caches.read().get(sheet).unwrap().merges(),
+            &[area]
+        );
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(1, 1)).unwrap(),
+            ""
         );
     }
 

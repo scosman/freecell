@@ -405,14 +405,12 @@ pub(crate) fn build_sheet_cache(
         }
     }
 
-    // Merged ranges: parse the sheet's file-loaded A1 merge strings once (0-based) for the
-    // insert/delete merge guard (`components/grid_structure.md §5.3`). A hostile/unparseable
-    // entry is skipped + logged (never panics — defensive against malformed files).
-    for m in &ws.merge_cells {
-        match freecell_core::CellRange::from_a1(m) {
-            Some(range) => builder.push_merge(range),
-            None => tracing::debug!(merge = %m, "cache: skipping unparseable merge range"),
-        }
+    // Merged regions: the resident `MergeMap` the grid renders + selects from (merged-cell-ui
+    // `architecture.md §2/§3`). Read from the engine's normalized `merged_regions` (0-based) — not
+    // the raw `worksheet.merge_cells` A1 strings — so it reflects post-displacement truth and
+    // in-app-created merges alike.
+    for range in doc.merged_regions(sheet_idx)? {
+        builder.push_merge(range);
     }
 
     // Per-cell styles: every populated/styled cell in the sheet data.

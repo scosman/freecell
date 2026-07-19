@@ -11,7 +11,7 @@ repo's render-tests policy — earlier phases verify with crate-scoped checks + 
 
 ## Phases
 
-- [ ] **Phase 1 — Re-pin + engine wrapper + resident MergeMap + retire interim guard.**
+- [x] **Phase 1 — Re-pin + engine wrapper + resident MergeMap + retire interim guard.**
   Bump the `freecell-fixes` lock to the merge tip (arch §1); add `Document::merge_cells` /
   `unmerge_cells` / `merged_regions` / `merge_would_lose_data` (§3, §8); add
   `Command::{MergeCells,UnmergeCells}` + `WorkerEvent::MergeNeedsConfirm` and `apply_one`

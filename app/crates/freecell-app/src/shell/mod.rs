@@ -71,6 +71,10 @@ actions!(
         ToggleItalic,
         /// Toggle underline over the focused workbook's selection.
         ToggleUnderline,
+        /// Merge or unmerge the focused workbook's selection (merged-cell-ui `functional_spec.md
+        /// F2`) — the Edit-menu "Merge Cells" item + ⌃⌘M shortcut, routed through the chrome's
+        /// `toggle_merge` (same path as the action-row button).
+        ToggleMerge,
         /// Open (or toggle) the find/replace bar over the focused workbook (`functional_spec.md §4`).
         OpenFind,
         /// Quit the application (prompts each dirty window).

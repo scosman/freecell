@@ -65,6 +65,11 @@ pub struct Scene {
     /// (`components/engine_cf.md §5`). The worker folds each winning rule into the published style
     /// cache (P3), so the captured `SheetCache` carries the value-dependent CF fills / font colour.
     cond_fmt: Vec<(String, CfRuleSpec)>,
+    /// Merged regions (0-based inclusive) created via a **real** `Command::MergeCells`
+    /// (merged-cell-ui `functional_spec.md F1`), so the rebuilt cache carries the live merge list
+    /// the grid renders as one box. `confirmed: true` (the covered cells in these fixtures are
+    /// empty, so no data-loss round-trip).
+    merges: Vec<CellRange>,
     publish_rows: Range<u32>,
     publish_cols: Range<u32>,
 }
@@ -87,6 +92,7 @@ impl Scene {
             hidden_rows: Vec::new(),
             hidden_cols: Vec::new(),
             cond_fmt: Vec::new(),
+            merges: Vec::new(),
             publish_rows: 0..80,
             publish_cols: 0..48,
         }
@@ -224,6 +230,15 @@ impl Scene {
         self
     }
 
+    /// Merges the 0-based inclusive `range` into one region via a **real** `Command::MergeCells`
+    /// (merged-cell-ui `functional_spec.md F1`), so the rebuilt cache carries the live merge and the
+    /// grid renders it as one box. The covered cells are cleared by the engine (as in the product);
+    /// keep them empty in the fixture to avoid the data-loss round-trip (`confirmed: true` is sent).
+    pub fn merge(mut self, range: CellRange) -> Self {
+        self.merges.push(range);
+        self
+    }
+
     /// Overrides the published viewport window (for cases whose values sit deeper than the
     /// default 80×48 window).
     pub fn publish(mut self, rows: Range<u32>, cols: Range<u32>) -> Self {
@@ -304,6 +319,17 @@ pub fn build_sources(scene: &Scene) -> Result<GridDataSources> {
             start: *start,
             end: *end,
             hidden: true,
+        });
+    }
+    // Merged regions through the real worker path (`Command::MergeCells`), so the rebuilt cache
+    // carries the live merge list the grid renders as one box (merged-cell-ui `functional_spec.md
+    // F1`). Sent after the value inputs so the anchor value is present; `confirmed: true` skips the
+    // data-loss round-trip (these fixtures' covered cells are empty).
+    for area in &scene.merges {
+        client.send(Command::MergeCells {
+            sheet,
+            area: *area,
+            confirmed: true,
         });
     }
     client.send(Command::SetViewport {

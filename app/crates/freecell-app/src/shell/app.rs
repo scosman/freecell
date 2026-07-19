@@ -1435,7 +1435,7 @@ mod tests {
 
     use freecell_core::data_row::FieldMode;
     use freecell_core::input_cap::InputRejection;
-    use freecell_core::{CellRef, SelectionModel, SheetId};
+    use freecell_core::{CellRange, CellRef, SelectionModel, SheetId};
     use freecell_engine::{EditRejectedReason, SheetMeta};
 
     fn sheet_meta(id: u32, name: &str, has_content: bool) -> SheetMeta {
@@ -1606,6 +1606,123 @@ mod tests {
         assert!(
             cx.update(|cx| chrome.read(cx).cap_error_visible()),
             "a worker cap rejection lights the data-row danger state"
+        );
+    }
+
+    /// B2:C3 (0-based) — the merge fixture the confirm-dialog window tests reuse.
+    fn merge_area() -> CellRange {
+        CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2))
+    }
+
+    #[gpui::test]
+    fn merge_needs_confirm_opens_confirm_modal(cx: &mut TestAppContext) {
+        // A data-losing merge (merged-cell-ui `functional_spec.md F3`) surfaces the two-button
+        // confirm dialog carrying the exact region its Merge button will re-send.
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        let area = merge_area();
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::MergeNeedsConfirm {
+                            sheet: SheetId(3),
+                            area,
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            cx.update(|cx| entity.read(cx).has_confirm_modal()),
+            "MergeNeedsConfirm opens the data-loss confirm dialog"
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).confirm_modal_target()),
+            Some((SheetId(3), area)),
+            "the confirm dialog carries the merge to re-send"
+        );
+    }
+
+    #[gpui::test]
+    fn confirm_modal_merge_dismisses(cx: &mut TestAppContext) {
+        // Clicking **Merge** dismisses the dialog (and re-sends `MergeCells { confirmed: true }`,
+        // the command emission being the documented untestable window→worker boundary).
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::MergeNeedsConfirm {
+                            sheet: SheetId(3),
+                            area: merge_area(),
+                        },
+                        window,
+                        ctx,
+                    );
+                    w.confirm_merge_for_test(ctx);
+                });
+            })
+            .unwrap();
+        assert!(
+            !cx.update(|cx| entity.read(cx).has_confirm_modal()),
+            "Merge dismisses the confirm dialog"
+        );
+    }
+
+    #[gpui::test]
+    fn confirm_modal_cancel_dismisses(cx: &mut TestAppContext) {
+        // **Cancel** dismisses the dialog with no change (nothing re-sent).
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::MergeNeedsConfirm {
+                            sheet: SheetId(3),
+                            area: merge_area(),
+                        },
+                        window,
+                        ctx,
+                    );
+                    w.dismiss_modal_for_test(window, ctx);
+                });
+            })
+            .unwrap();
+        assert!(
+            !cx.update(|cx| entity.read(cx).has_confirm_modal()),
+            "Cancel dismisses the confirm dialog"
+        );
+    }
+
+    #[gpui::test]
+    fn fill_into_merge_shows_reworded_error(cx: &mut TestAppContext) {
+        // A fill (⌘D/⌘R) into a merge is rejected with the re-worded OK-only dialog (merged-cell-ui
+        // `ui_design.md §6`) — merges *are* supported now, just not as a fill target.
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EditRejected {
+                            reason: EditRejectedReason::MergedCells,
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert!(cx.update(|cx| entity.read(cx).has_error_modal()));
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("Can't fill merged cells".to_string()),
+            "the fill-into-merge rejection uses the re-worded copy"
         );
     }
 

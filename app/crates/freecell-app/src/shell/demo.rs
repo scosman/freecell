@@ -154,4 +154,39 @@ mod tests {
             );
         }
     }
+
+    /// The sheet-3 "Share of Revenue by Region" **pie** classifies **Faithful** — no "⚠ May not
+    /// display as intended" compatibility badge. The demo's pie originally carried unsupported
+    /// data-label options (per-point `<c:dLbl>` overrides plus series-level non-percent label
+    /// kinds — value / category / series / legend-key) that FreeCell's pie renderer does not draw,
+    /// so `fidelity::unsupported_data_labels` classified it **Degraded**. The demo's `chart3.xml`
+    /// was content-edited to keep only the on-slice **percent** labels the renderer honors, which
+    /// clears the badge without changing what FreeCell draws. This guards against a future content
+    /// swap silently reintroducing a degrading label option.
+    #[test]
+    fn demo_pie_chart_classifies_faithful() {
+        use freecell_chart_model::{ChartKind, Fidelity};
+
+        let path = materialize_demo_xlsx().expect("demo materializes to an .xlsx");
+        let specs = freecell_engine::chart::discover_and_parse(&path)
+            .expect("the demo's charts discover + parse");
+
+        let pie = specs
+            .iter()
+            .find(|s| {
+                s.title() == Some("Share of Revenue by Region")
+                    && matches!(s.chart().map(|c| &c.kind), Some(ChartKind::Pie { .. }))
+            })
+            .expect("the Regional Sales pie parses into a typed Pie chart with its title");
+
+        assert_eq!(
+            pie.display_fidelity(),
+            Fidelity::Faithful,
+            "the demo pie must classify Faithful (no compatibility badge), not Degraded"
+        );
+        assert!(
+            !pie.display_fidelity().shows_compatibility_warning(),
+            "a Faithful pie shows no '⚠ May not display as intended' badge"
+        );
+    }
 }

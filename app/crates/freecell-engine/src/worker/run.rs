@@ -1642,8 +1642,29 @@ impl Worker {
                         // IronCalc px (get_row_height's storage space) to compare + write directly.
                         let font_px = pt * 96.0 / 72.0;
                         let needed = cache::autofit_row_ironcalc_px(font_px).ceil();
+                        // Exclude multi-row merges from the auto-grow. A row is a grow-candidate
+                        // only if it holds at least one selected cell that is NOT inside a merge
+                        // taller than one row: a multi-row merge already spans its own height (the
+                        // anchor's content is drawn across the whole box), so Excel never auto-fits
+                        // it — growing every covered row to one line's height would balloon a tall
+                        // region. Height-1 (horizontal) merges and normal unmerged cells still grow
+                        // (one row must fit the font); a mixed row (a covered cell of a vertical
+                        // merge PLUS a normal selected cell) still grows via the normal cell. Fetch
+                        // the merges once; a read error falls back to "no merges" (the old
+                        // grow-everything behavior) rather than crashing a font change.
+                        let merges = doc.merged_regions(idx).unwrap_or_default();
                         let mut grow_rows: Vec<u32> = Vec::new();
                         for row in clamped.rows() {
+                            // Short-circuit on the first growable column so the common (unmerged)
+                            // case stays O(rows): a cell not in any merge, or in a height-1 merge,
+                            // makes the row a grow-candidate immediately.
+                            let growable = clamped.cols().any(|col| {
+                                freecell_core::merge::region_at(&merges, CellRef::new(row, col))
+                                    .is_none_or(|r| r.height() <= 1)
+                            });
+                            if !growable {
+                                continue;
+                            }
                             if let Ok(cur) = doc.row_height_px(idx, row) {
                                 if needed > cur {
                                     grow_rows.push(row);
@@ -5109,6 +5130,95 @@ mod tests {
         assert!(drain_events(&rx)
             .iter()
             .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+    }
+
+    #[test]
+    fn set_font_skips_multi_row_merge_grows_horizontal_and_normal() {
+        // Increasing the font over a MULTI-ROW merge must NOT grow every row of the region to fit
+        // one line (Excel does not auto-fit multi-row merged cells) — the region already spans its
+        // own height. But a single-row (horizontal) merge and a normal unmerged cell must STILL
+        // grow, so the fix doesn't over-suppress. FAILS on the old grow-every-row code (which grew
+        // all three merge rows). (merged-cell-ui: SetFont auto-grow merge exclusion.)
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..8,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "hi"), // A1 — anchor of the vertical merge
+            set_input(sheet, 4, 0, "x"),  // A5 — a normal, unmerged cell (control)
+            set_input(sheet, 6, 0, "hz"), // A7 — anchor of the horizontal merge (control)
+        ]);
+        // A1:B3 is a 3-row × 2-col vertical merge; A7:C7 is a 1-row × 3-col horizontal merge.
+        worker.process_batch(vec![
+            Command::MergeCells {
+                sheet,
+                area: CellRange::new(CellRef::new(0, 0), CellRef::new(2, 1)),
+                confirmed: true,
+            },
+            Command::MergeCells {
+                sheet,
+                area: CellRange::new(CellRef::new(6, 0), CellRef::new(6, 2)),
+                confirmed: true,
+            },
+        ]);
+        drain_events(&rx);
+
+        let height =
+            |w: &Worker, row: u32| w.shared.caches.read().get(sheet).unwrap().row_height(row);
+        let (merge_r0, merge_r1, merge_r2) =
+            (height(&worker, 0), height(&worker, 1), height(&worker, 2));
+        let normal_before = height(&worker, 4);
+        let hmerge_before = height(&worker, 6);
+
+        // Bump the font well above the default on each of the three targets.
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(2, 1)), // the whole vertical merge
+            None,
+            Some(36.0),
+        )]);
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::single(CellRef::new(4, 0)), // the normal cell
+            None,
+            Some(36.0),
+        )]);
+        worker.process_batch(vec![set_font(
+            sheet,
+            CellRange::new(CellRef::new(6, 0), CellRef::new(6, 2)), // the horizontal merge
+            None,
+            Some(36.0),
+        )]);
+
+        // The multi-row merge's rows are UNCHANGED — none was grown to one line's height.
+        assert!(
+            (height(&worker, 0) - merge_r0).abs() < 1e-3
+                && (height(&worker, 1) - merge_r1).abs() < 1e-3
+                && (height(&worker, 2) - merge_r2).abs() < 1e-3,
+            "a multi-row merge's rows must not auto-grow on a font bump (rows: {} {} {} → {} {} {})",
+            merge_r0,
+            merge_r1,
+            merge_r2,
+            height(&worker, 0),
+            height(&worker, 1),
+            height(&worker, 2),
+        );
+        // CONTROL: a normal cell and a single-row (horizontal) merge DO still grow to fit the font.
+        assert!(
+            height(&worker, 4) > normal_before + 1.0,
+            "a normal unmerged cell still auto-grows for a bigger font ({} → {})",
+            normal_before,
+            height(&worker, 4),
+        );
+        assert!(
+            height(&worker, 6) > hmerge_before + 1.0,
+            "a single-row (horizontal) merge still auto-grows for a bigger font ({} → {})",
+            hmerge_before,
+            height(&worker, 6),
+        );
     }
 
     #[test]

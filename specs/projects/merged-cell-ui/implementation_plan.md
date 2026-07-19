@@ -35,7 +35,7 @@ repo's render-tests policy — earlier phases verify with crate-scoped checks + 
   `MergeCells{confirmed}` + `MergeNeedsConfirm` round-trip, new `ActiveModal::Confirm`, fill
   message re-word (arch §8–9, ui §1–2,6). Chrome view tests + Xvfb smoke launch.
 
-- [ ] **Phase 5 — Render validation + round-trip (dedicated late phase).**
+- [x] **Phase 5 — Render validation + round-trip (dedicated late phase).**
   Full pixel suite under a ~10-min watchdog; regenerate + **eyeball** `merge_*` baselines,
   commit them; dispatch the CI `render` gate on the branch and confirm green; add the
   in-app-created-merge xlsx round-trip test (arch §10).

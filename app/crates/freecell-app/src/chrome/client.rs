@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use freecell_core::{CellKind, CellRef, CfRuleView, RenderStyle, SheetId};
+use freecell_core::{CellKind, CellRange, CellRef, CfRuleView, RenderStyle, SheetId};
 use freecell_engine::{Command, DocumentClient};
 
 /// What the chrome needs from the engine: send commands, and read a cell's resolved style.
@@ -52,6 +52,14 @@ pub trait ChromeClient {
     /// to build the CF sidebar's List-mode rows. Empty when the sheet carries no CF. Read on sidebar
     /// open / `CondFmtUpdated` / sheet switch — never per frame.
     fn cond_fmt_rules(&self, sheet: SheetId) -> Vec<CfRuleView>;
+
+    /// The active sheet's merged regions (0-based), for the Merge/Unmerge toggle's pressed/disabled
+    /// states + `toggle_merge` decision (merged-cell-ui `architecture.md §8`). Merge counts are tiny
+    /// (a few hundred), so cloning the small `Vec` per read is cheap; reading live (rather than
+    /// caching at selection-change like the style toggles) keeps the toggle correct the instant the
+    /// resident cache refreshes after a merge/unmerge. Empty when the sheet has no resident cache or
+    /// no merges.
+    fn sheet_merges(&self, sheet: SheetId) -> Vec<CellRange>;
 }
 
 impl ChromeClient for DocumentClient {
@@ -121,6 +129,17 @@ impl ChromeClient for DocumentClient {
     fn cond_fmt_rules(&self, sheet: SheetId) -> Vec<CfRuleView> {
         DocumentClient::cond_fmt_rules(self, sheet)
     }
+
+    fn sheet_merges(&self, sheet: SheetId) -> Vec<CellRange> {
+        // The same resident cache the grid reads per frame; a small clone off the read guard so the
+        // guard drops immediately (the toggle reads at render / click time, not per frame).
+        let caches = self.caches();
+        let guard = caches.read();
+        guard
+            .get(sheet)
+            .map(|cache| cache.merges().to_vec())
+            .unwrap_or_default()
+    }
 }
 
 /// A test/demo double for [`ChromeClient`]: records every sent [`Command`] and answers
@@ -135,6 +154,7 @@ pub struct RecordingClient {
     default_font_size_pt: RefCell<Option<f64>>,
     published: RefCell<HashMap<(SheetId, CellRef), (CellKind, String)>>,
     cond_fmt_rules: RefCell<HashMap<SheetId, Vec<CfRuleView>>>,
+    merges: RefCell<HashMap<SheetId, Vec<CellRange>>>,
 }
 
 impl RecordingClient {
@@ -177,6 +197,11 @@ impl RecordingClient {
     /// Injects the CF rules `cond_fmt_rules` will return for `sheet`.
     pub fn set_cond_fmt_rules(&self, sheet: SheetId, rules: Vec<CfRuleView>) {
         self.cond_fmt_rules.borrow_mut().insert(sheet, rules);
+    }
+
+    /// Injects the merged regions `sheet_merges` will return for `sheet` (0-based).
+    pub fn set_merges(&self, sheet: SheetId, merges: Vec<CellRange>) {
+        self.merges.borrow_mut().insert(sheet, merges);
     }
 
     /// Drains and returns every command recorded so far (clearing the log).
@@ -226,6 +251,14 @@ impl ChromeClient for RecordingClient {
 
     fn cond_fmt_rules(&self, sheet: SheetId) -> Vec<CfRuleView> {
         self.cond_fmt_rules
+            .borrow()
+            .get(&sheet)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn sheet_merges(&self, sheet: SheetId) -> Vec<CellRange> {
+        self.merges
             .borrow()
             .get(&sheet)
             .cloned()

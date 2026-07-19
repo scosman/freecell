@@ -42,9 +42,10 @@ use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
-    format_stat_count, format_stat_value, limits, Align, CellKind, CellRange, CellRef, CfColorStop,
-    CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind, CfValueOp,
-    RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
+    effective_range, format_stat_count, format_stat_value, limits, region_at, regions_intersecting,
+    Align, CellKind, CellRange, CellRef, CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec,
+    CfRuleView, CfTextOp, CfThresholdKind, CfValueOp, RenderStyle, Rgb, SelectionModel,
+    SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -1844,6 +1845,46 @@ impl ChromeView {
             range: self.selection.range(),
             attr,
         });
+    }
+
+    /// Merges or unmerges the selection — the action-row toggle + Edit-menu ⌃⌘M action
+    /// (merged-cell-ui `architecture.md §8`, `functional_spec.md F2`). Commits any pending edit
+    /// first (the same click-away rule as the other action-row controls). The decision mirrors
+    /// Excel's Merge & Center toggle:
+    /// - the selection's effective range contains any merged region → **unmerge** every
+    ///   intersecting region (one engine call each);
+    /// - otherwise a multi-cell range → **merge** it — sent unconfirmed, so the worker answers with
+    ///   [`WorkerEvent::MergeNeedsConfirm`] when the merge would discard data (the window's confirm
+    ///   dialog then re-sends `confirmed: true`);
+    /// - a lone 1×1 not in any merge → no-op (the button is disabled for this case anyway).
+    pub fn toggle_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No mutating control may dispatch while degraded/read-only (`functional_spec.md §6`) — a
+        // backstop to the disabled button, covering the menu/⌃⌘M path.
+        if self.degraded {
+            return;
+        }
+        if !self.commit_pending_edit(window, cx) {
+            return; // an invalid pending edit blocks the toggle, keeping the field editing
+        }
+        let merges = self.active_sheet_merges();
+        let range = effective_range(&merges, self.selection);
+        let hit = regions_intersecting(&merges, range);
+        if !hit.is_empty() {
+            // Unmerge every region the selection touches (each removed region is one engine call).
+            for region in hit {
+                self.client.send(Command::UnmergeCells {
+                    sheet: self.active_sheet,
+                    anchor: region.start,
+                });
+            }
+        } else if range.start != range.end {
+            // A merge-free multi-cell rectangle → merge it (unconfirmed; the worker gates data loss).
+            self.client.send(Command::MergeCells {
+                sheet: self.active_sheet,
+                area: range,
+                confirmed: false,
+            });
+        }
     }
 
     /// Applies a fill colour (`Some`) or clears it (`None`) over the selection; commits any
@@ -3662,6 +3703,32 @@ impl ChromeView {
         self.active_style.map(|s| s.wrap).unwrap_or(false)
     }
 
+    /// The active sheet's merged regions (0-based), read live from the resident cache
+    /// (merged-cell-ui `architecture.md §8`). Cheap (merge counts are tiny) and always current,
+    /// so the Merge toggle reflects the live merge state without a cached-at-selection snapshot.
+    fn active_sheet_merges(&self) -> Vec<CellRange> {
+        self.client.sheet_merges(self.active_sheet)
+    }
+
+    /// Whether the Merge/Unmerge toggle reads as **pressed/active** — the selection's effective
+    /// range contains a merged region, so a click unmerges (`ui_design.md §1`, mirroring
+    /// [`bold_active`](Self::bold_active)). Also drives the tooltip swap.
+    pub fn merge_active(&self) -> bool {
+        let merges = self.active_sheet_merges();
+        let range = effective_range(&merges, self.selection);
+        !regions_intersecting(&merges, range).is_empty()
+    }
+
+    /// Whether the Merge/Unmerge toggle is **disabled**: degraded/read-only, or the selection is a
+    /// lone 1×1 cell not in any merge (nothing to toggle) (`ui_design.md §1`, `architecture.md §8`).
+    pub fn merge_disabled(&self) -> bool {
+        if self.degraded {
+            return true;
+        }
+        let merges = self.active_sheet_merges();
+        self.selection.is_single() && region_at(&merges, self.selection.active).is_none()
+    }
+
     /// Whether an alignment button is pressed — the **explicit** alignment only (a number aligned
     /// right by type default shows no pressed button, matching Excel; `components/action_bar.md`).
     pub fn align_active(&self, align: Align) -> bool {
@@ -4274,6 +4341,28 @@ impl ChromeView {
                 StyleAttr::WrapText,
                 cx,
             ))
+            .child(action_divider())
+            // Merge / Unmerge toggle — a cell-layout concern grouped after wrap (`ui_design.md §1`).
+            // Built directly (not the shared `toggle` closure, which drives character styles): it has
+            // its own `on_click`, and a distinct disabled rule (a lone 1×1 not in any merge is
+            // disabled — nothing to toggle — as well as the degraded case). One icon both directions;
+            // the pressed state + tooltip swap convey mode.
+            .child(
+                Button::new("merge")
+                    .icon(Icon::empty().path("icons/table-cells-merge.svg"))
+                    .tooltip(if self.merge_active() {
+                        "Unmerge cells"
+                    } else {
+                        "Merge cells"
+                    })
+                    .ghost()
+                    .small()
+                    .disabled(self.merge_disabled())
+                    .selected(self.merge_active())
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.toggle_merge(window, cx);
+                    })),
+            )
             .child(action_divider())
             // Number format dropdown + decimals ±:
             .child(
@@ -8769,11 +8858,17 @@ mod tests {
             natural < 1152.0,
             "the old min_w=1152 over-estimated the controls; true natural width is {natural}"
         );
-        // A viewport a hair above the natural width — still < 1152 — must NOT overflow.
-        let fits = natural + 40.0;
+        // A window comfortably wider than the true controls but still below the old 1152 estimate —
+        // the band the removed `min_w = 1152` over-padded (its viewport would fall between the true
+        // width and 1152 → false chevrons). Derived as the middle of that band rather than a fixed
+        // offset, so it stays valid as the action row grows: the frame's `px_2` (16px total) is the
+        // gap between the window width and the scroller's viewport, so the band is
+        // `(natural + FRAME_PAD, 1152)`.
+        const FRAME_PAD: f32 = 16.0;
+        let fits = (natural + FRAME_PAD + 1152.0) / 2.0;
         assert!(
-            fits < 1152.0,
-            "the fit viewport {fits} is below the old estimate"
+            fits > natural + FRAME_PAD && fits < 1152.0,
+            "the fit window {fits} sits in the (controls, 1152) no-overflow band (natural {natural})"
         );
         let h2 = build_sized(
             cx,
@@ -9258,6 +9353,153 @@ mod tests {
         });
         assert!(upd(&h, cx, |c, _w, _cx| c.strikethrough_active()));
         assert!(!upd(&h, cx, |c, _w, _cx| c.wrap_active()));
+    }
+
+    // ---- Action row: Merge / Unmerge toggle ------------------------------------------------
+
+    /// B2:C3 (0-based rows 1–2, cols 1–2) — the merge fixture the toggle tests reuse.
+    fn b2_c3() -> CellRange {
+        CellRange::new(cell(1, 1), cell(2, 2))
+    }
+
+    /// Sets the active sheet's merges + drives a selection change, so `merge_active`/`toggle_merge`
+    /// read a known merge state against a known selection.
+    fn with_merges_and_selection(
+        h: &Harness,
+        cx: &mut TestAppContext,
+        merges: Vec<CellRange>,
+        selection: SelectionModel,
+    ) {
+        h.client.set_merges(SheetId(0), merges);
+        upd(h, cx, |c, window, cx| {
+            c.on_selection_changed(selection, window, cx)
+        });
+        h.client.take_commands(); // drop the selection-change fetch/commands
+    }
+
+    #[gpui::test]
+    fn merge_toggle_inactive_on_mergeable_multicell(cx: &mut TestAppContext) {
+        // A multi-cell selection with no merge inside it → inactive (a click would merge), enabled.
+        let h = one_sheet(cx);
+        with_merges_and_selection(
+            &h,
+            cx,
+            vec![],
+            SelectionModel {
+                anchor: cell(0, 0),
+                active: cell(1, 1),
+            },
+        );
+        assert!(!upd(&h, cx, |c, _w, _cx| c.merge_active()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.merge_disabled()));
+    }
+
+    #[gpui::test]
+    fn merge_toggle_active_when_selection_contains_a_merge(cx: &mut TestAppContext) {
+        // A selection whose effective range hits a region → pressed/active (a click would unmerge).
+        let h = one_sheet(cx);
+        with_merges_and_selection(&h, cx, vec![b2_c3()], SelectionModel::single(cell(1, 1)));
+        assert!(upd(&h, cx, |c, _w, _cx| c.merge_active()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.merge_disabled()));
+    }
+
+    #[gpui::test]
+    fn merge_toggle_disabled_on_lone_single_cell(cx: &mut TestAppContext) {
+        // A lone 1×1 not in any merge → nothing to toggle → disabled (and inactive).
+        let h = one_sheet(cx);
+        with_merges_and_selection(&h, cx, vec![b2_c3()], SelectionModel::single(cell(5, 5)));
+        assert!(upd(&h, cx, |c, _w, _cx| c.merge_disabled()));
+        assert!(!upd(&h, cx, |c, _w, _cx| c.merge_active()));
+    }
+
+    #[gpui::test]
+    fn merge_toggle_disabled_when_degraded(cx: &mut TestAppContext) {
+        // Degraded/read-only disables the toggle even over a mergeable multi-cell selection.
+        let h = one_sheet(cx);
+        with_merges_and_selection(
+            &h,
+            cx,
+            vec![],
+            SelectionModel {
+                anchor: cell(0, 0),
+                active: cell(1, 1),
+            },
+        );
+        upd(&h, cx, |c, _w, cx| c.set_degraded(true, cx));
+        assert!(upd(&h, cx, |c, _w, _cx| c.merge_disabled()));
+    }
+
+    #[gpui::test]
+    fn toggle_merge_merges_a_plain_multicell_selection(cx: &mut TestAppContext) {
+        // No interior merge → a click sends one unconfirmed MergeCells over the effective range.
+        let h = one_sheet(cx);
+        with_merges_and_selection(
+            &h,
+            cx,
+            vec![],
+            SelectionModel {
+                anchor: cell(0, 0),
+                active: cell(1, 1),
+            },
+        );
+        upd(&h, cx, |c, window, cx| c.toggle_merge(window, cx));
+        let cmds = h.client.take_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::MergeCells { area, confirmed: false, .. }]
+                    if *area == CellRange::new(cell(0, 0), cell(1, 1))
+            ),
+            "a merge-free multi-cell selection merges its effective range unconfirmed, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn toggle_merge_unmerges_when_selection_contains_regions(cx: &mut TestAppContext) {
+        // A selection spanning two regions → a click unmerges BOTH (one UnmergeCells each, at the
+        // region anchors), never a merge.
+        let h = one_sheet(cx);
+        let r1 = b2_c3(); // anchor (1,1)
+        let r2 = CellRange::new(cell(4, 4), cell(5, 5)); // anchor (4,4)
+        with_merges_and_selection(
+            &h,
+            cx,
+            vec![r1, r2],
+            SelectionModel {
+                anchor: cell(1, 1),
+                active: cell(5, 5),
+            },
+        );
+        upd(&h, cx, |c, window, cx| c.toggle_merge(window, cx));
+        let cmds = h.client.take_commands();
+        let anchors: Vec<CellRef> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::UnmergeCells { anchor, .. } => Some(*anchor),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            anchors,
+            vec![cell(1, 1), cell(4, 4)],
+            "unmerge both regions"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::MergeCells { .. })),
+            "a selection containing merges must never issue a MergeCells, got {cmds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn toggle_merge_noop_on_lone_single_cell(cx: &mut TestAppContext) {
+        // A lone 1×1 not in any merge → the toggle sends nothing (the button is disabled anyway).
+        let h = one_sheet(cx);
+        with_merges_and_selection(&h, cx, vec![b2_c3()], SelectionModel::single(cell(5, 5)));
+        upd(&h, cx, |c, window, cx| c.toggle_merge(window, cx));
+        assert!(
+            h.client.take_commands().is_empty(),
+            "a lone single cell not in a merge is a no-op"
+        );
     }
 
     #[gpui::test]

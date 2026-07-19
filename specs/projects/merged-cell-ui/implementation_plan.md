@@ -30,7 +30,7 @@ repo's render-tests policy — earlier phases verify with crate-scoped checks + 
   click/drag snapping at the input call-sites; edit/clear route to the anchor (arch §7,
   fspec F4–F5). Heavy pure unit-test coverage (the delicate phase).
 
-- [ ] **Phase 4 — Merge/Unmerge control + data-loss dialog.**
+- [x] **Phase 4 — Merge/Unmerge control + data-loss dialog.**
   Action-row toggle (icon/states/tooltip), Edit-menu item + ⌃⌘M, `toggle_merge` decision,
   `MergeCells{confirmed}` + `MergeNeedsConfirm` round-trip, new `ActiveModal::Confirm`, fill
   message re-word (arch §8–9, ui §1–2,6). Chrome view tests + Xvfb smoke launch.

@@ -40,6 +40,12 @@ for no real gain at this scope.
 
 - **Edit menu:** a "Merge Cells" item (static label) after Find, dispatching the same toggle
   action. It follows the standard menu enable/disable (grayed when the action is disabled).
+  - *Accuracy note (as built):* under GPUI's static macOS menu bar, this greys only by the
+    handler-in-scope rule (enabled whenever a workbook window is frontmost, disabled on the
+    Welcome window) — exactly like every other menu item (Undo/Redo/Find/…). It does **not**
+    dynamically grey on the lone-1×1 / degraded condition; that per-selection dynamic disable
+    is provided by the **action-row button**. Invoking the menu item (or ⌃⌘M) in a
+    non-actionable state is safe: `toggle_merge` no-ops.
 - **Shortcut:** **⌃⌘M** (Control+Command+M — Apple Numbers' merge shortcut), registered in
   `shell/menus.rs` next to `ToggleBold`.
 

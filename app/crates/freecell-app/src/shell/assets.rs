@@ -151,6 +151,13 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
         "icons/text-wrap.svg",
         include_bytes!("../../assets/icons/text-wrap.svg"),
     ),
+    // Merge/Unmerge toggle glyph for the action bar (merged-cell-ui `ui_design.md §1`): the
+    // Lucide `table-cells-merge` icon, which the gpui-component bundle does not ship (99-icon
+    // subset), vendored in the same tintable form. One icon for both directions.
+    (
+        "icons/table-cells-merge.svg",
+        include_bytes!("../../assets/icons/table-cells-merge.svg"),
+    ),
     // Thousands-separator toggle glyph for the action bar (Phase 6, `functional_spec.md §6`):
     // three `0` digit rings + a comma, hand-authored in the same tintable Lucide form (the bundle
     // ships no thousands/comma glyph).
@@ -303,6 +310,16 @@ mod tests {
                 "CF sidebar icon {path} must resolve"
             );
         }
+    }
+
+    /// The Merge/Unmerge action-row toggle's icon resolves through the combined source: the Lucide
+    /// `table-cells-merge` glyph is FreeCell-vendored (absent from the gpui-component bundle).
+    #[test]
+    fn merge_toggle_icon_resolves() {
+        assert!(
+            matches!(AppAssets.load("icons/table-cells-merge.svg"), Ok(Some(_))),
+            "the merge toggle's icon must resolve"
+        );
     }
 
     /// A path in neither FreeCell's icons nor the bundle delegates straight through to the

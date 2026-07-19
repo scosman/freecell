@@ -25,7 +25,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_chart_model::{ChartColor, ChartId, ChartInsertKind};
-use freecell_core::{limits, CellRef, Rgb, SelectionModel, SheetId};
+use freecell_core::{limits, CellRange, CellRef, Rgb, SelectionModel, SheetId};
 use freecell_engine::{
     Command, DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, PasteError,
     SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
@@ -40,7 +40,7 @@ use super::registry::WindowKey;
 use super::titlebar;
 use super::{
     CloseWindow, ExportCsv, FreeCellApp, OpenFind, Redo, Save, SaveAs, ToggleBold, ToggleItalic,
-    ToggleUnderline, Undo,
+    ToggleMerge, ToggleUnderline, Undo,
 };
 
 /// Shared, lock-free state the grid/chrome sinks read on the UI thread (they run from inside a
@@ -104,6 +104,10 @@ enum ActiveModal {
         detail: String,
         close_window_on_dismiss: bool,
     },
+    /// A merge that would discard covered content, awaiting confirmation (merged-cell-ui
+    /// `functional_spec.md F3`, opened from [`WorkerEvent::MergeNeedsConfirm`]). **Merge**
+    /// re-sends `MergeCells { area, confirmed: true }`; **Cancel** dismisses with no change.
+    Confirm { sheet: SheetId, area: CellRange },
 }
 
 /// A document window's shell state + lifecycle.
@@ -565,12 +569,15 @@ impl WorkbookWindow {
                 }
             }
             WorkerEvent::EditRejected { reason } => self.on_edit_rejected(reason, window, cx),
-            // A data-losing merge asked to confirm (merged-cell-ui `functional_spec.md F3`). The
-            // confirm dialog + `MergeCells { confirmed: true }` re-send are wired in Phase 4
-            // (`architecture.md §8`); no UI surface exists yet and nothing sends `Command::MergeCells`
-            // this phase, so this is a log-only backstop keeping the match exhaustive.
-            WorkerEvent::MergeNeedsConfirm { .. } => {
-                tracing::debug!("merge needs confirmation (confirm dialog wired in a later phase)");
+            // A data-losing merge asked to confirm (merged-cell-ui `functional_spec.md F3`,
+            // `architecture.md §8`): open the two-button data-loss confirm dialog. **Merge**
+            // re-sends `MergeCells { confirmed: true }`; **Cancel** dismisses. Gated on no modal
+            // already showing (consistent with the other worker-driven dialogs).
+            WorkerEvent::MergeNeedsConfirm { sheet, area } => {
+                if self.modal.is_none() {
+                    self.modal = Some(ActiveModal::Confirm { sheet, area });
+                    cx.notify();
+                }
             }
             // Saved / SaveFailed match unconditionally then branch on the pending-save `req_id`
             // (a stale ack from a superseded save is ignored) — so the match stays exhaustive with
@@ -738,17 +745,16 @@ impl WorkbookWindow {
                     cx.notify();
                 }
             }
-            // The fill merge-guard (merged-cell-ui `functional_spec.md F6`): a fill (⌘D/⌘R/drag)
-            // into a merged region is rejected — an OK-only dialog, nothing changed. (Insert/delete
-            // near a merge is no longer guarded; the engine displaces merges. The dialog copy is
-            // re-worded to "can't fill merged cells" in Phase 4, `architecture.md §9`.)
+            // The fill merge-guard (merged-cell-ui `functional_spec.md F6`, `ui_design.md §6`): a
+            // fill (⌘D/⌘R/drag) into a merged region is rejected — an OK-only dialog, nothing
+            // changed. (Insert/delete near a merge is no longer guarded; the engine displaces
+            // merges. Merges *are* supported now — just not as a fill target — so the copy names
+            // the fill limitation directly.)
             EditRejectedReason::MergedCells => {
                 if self.modal.is_none() {
                     self.modal = Some(ActiveModal::Error {
-                        title: "Merged cells not supported".into(),
-                        detail: "This sheet contains merged cells (not yet supported); \
-                                 inserting or deleting here would corrupt them."
-                            .into(),
+                        title: "Can't fill merged cells".into(),
+                        detail: "Fill (⌘D / ⌘R) can't write into a merged region.".into(),
                         close_window_on_dismiss: false,
                     });
                     cx.notify();
@@ -908,6 +914,19 @@ impl WorkbookWindow {
         }
     }
 
+    /// Data-loss confirm → **Merge** (merged-cell-ui `functional_spec.md F3`, `architecture.md §8`):
+    /// dismiss the dialog and re-send the merge with `confirmed: true`, so the worker applies it
+    /// (keeping only the upper-left value — a single undo step, discarded content restorable via ⌘Z).
+    fn confirm_merge(&mut self, sheet: SheetId, area: CellRange, cx: &mut Context<Self>) {
+        self.modal = None;
+        self.client.send(Command::MergeCells {
+            sheet,
+            area,
+            confirmed: true,
+        });
+        cx.notify();
+    }
+
     // ---- Save flow (silent strip — no fidelity warning, functional_spec §5.2) --------------
 
     /// Runs the save flow (`components/app_shell.md §Save flow`). `Save` on an untitled
@@ -1063,6 +1082,10 @@ impl WorkbookWindow {
     /// Whether an error modal is showing.
     pub fn has_error_modal(&self) -> bool {
         matches!(self.modal, Some(ActiveModal::Error { .. }))
+    }
+    /// Whether the merge data-loss confirm modal is showing (merged-cell-ui `functional_spec.md F3`).
+    pub fn has_confirm_modal(&self) -> bool {
+        matches!(self.modal, Some(ActiveModal::Confirm { .. }))
     }
     /// The window title as it would be set now.
     pub fn title(&self) -> String {
@@ -1248,6 +1271,34 @@ impl WorkbookWindow {
             _ => None,
         }
     }
+
+    /// Test seam: the active error modal's title (so a test can assert the exact copy); `None` when
+    /// no error modal is showing.
+    #[cfg(test)]
+    pub(crate) fn error_modal_title(&self) -> Option<String> {
+        match &self.modal {
+            Some(ActiveModal::Error { title, .. }) => Some(title.clone()),
+            _ => None,
+        }
+    }
+
+    /// Test seam: the `(sheet, area)` the merge confirm modal carries — the exact merge that its
+    /// **Merge** button re-sends with `confirmed: true`; `None` when no confirm modal is showing.
+    #[cfg(test)]
+    pub(crate) fn confirm_modal_target(&self) -> Option<(SheetId, CellRange)> {
+        match &self.modal {
+            Some(ActiveModal::Confirm { sheet, area }) => Some((*sheet, *area)),
+            _ => None,
+        }
+    }
+
+    /// Test seam: the confirm modal's **Merge** click — dismiss + re-send `confirmed: true`.
+    #[cfg(test)]
+    pub(crate) fn confirm_merge_for_test(&mut self, cx: &mut Context<Self>) {
+        if let Some(ActiveModal::Confirm { sheet, area }) = self.modal {
+            self.confirm_merge(sheet, area, cx);
+        }
+    }
 }
 
 impl Focusable for WorkbookWindow {
@@ -1294,6 +1345,12 @@ impl Render for WorkbookWindow {
             }))
             .on_action(cx.listener(|this, _: &ToggleUnderline, window, cx| {
                 this.toggle_style(StyleAttr::Underline, window, cx)
+            }))
+            // Merge/Unmerge (⌃⌘M / Edit-menu "Merge Cells") toggles the merge over the grid
+            // selection through the chrome — the same path as the action-row button (commit any
+            // pending edit first, then decide merge vs unmerge).
+            .on_action(cx.listener(|this, _: &ToggleMerge, window, cx| {
+                this.chrome.update(cx, |c, cx| c.toggle_merge(window, cx));
             }))
             // ⌘F / Ctrl-F opens (toggles) the find/replace bar over the grid (`functional_spec.md
             // §4.2`) — the same path as the action-row search button.
@@ -1371,6 +1428,28 @@ impl WorkbookWindow {
                 vec![Button::new("ok").label("OK").primary().on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.dismiss_modal(window, cx)),
                 )],
+            ),
+            // The data-loss confirm (merged-cell-ui `ui_design.md §6`): Cancel (ghost) then Merge
+            // (primary, rightmost — the unsaved-changes button ordering). Merge carries the region
+            // to re-send `confirmed: true`; Cancel dismisses with no change.
+            &ActiveModal::Confirm { sheet, area } => dialog_card(
+                "Merge cells?",
+                "Merging keeps only the upper-left value and discards the other values in the \
+                 selection.",
+                vec![
+                    Button::new("cancel")
+                        .label("Cancel")
+                        .ghost()
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.dismiss_modal(window, cx)
+                        })),
+                    Button::new("merge")
+                        .label("Merge")
+                        .primary()
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            this.confirm_merge(sheet, area, cx)
+                        })),
+                ],
             ),
         };
         Some(

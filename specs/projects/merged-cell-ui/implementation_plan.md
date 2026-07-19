@@ -19,7 +19,7 @@ repo's render-tests policy — earlier phases verify with crate-scoped checks + 
   `freecell-core/src/merge.rs` (§2); remove the insert/delete guard + menu flags/footnote,
   keep the fill guard (§5). Worker + pure unit tests; no visible UI change yet.
 
-- [ ] **Phase 2 — Render merged regions as one box.**
+- [x] **Phase 2 — Render merged regions as one box.**
   `visible_merges` snapshot in `resolve_frame`; skip covered cells; region-draw pass via
   `span_rect`; interior-gridline suppression; explicit-border + text-spill handling; span the
   active outline / range overlay / in-cell editor (arch §6, ui §3–5). Verify with

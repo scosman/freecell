@@ -307,6 +307,11 @@ render_cases! {
     // Conditional formatting (P10): value-dependent CF folded into the cache (P3) — a numeric
     // highlight, a 3-color scale gradient, and a text highlight.
     cf_highlight_greater_than, cf_color_scale_3, cf_highlight_text_contains,
+    // Merged cells (merged-cell-ui P2): render a region as one box — basic box + interior-gridline
+    // suppression, anchor fill + centered alignment, a wide header span, the active outline spanning
+    // a region, a range selection snapping to whole regions, and an off-screen-anchor scroll boundary.
+    merge_basic_box, merge_fill_center, merge_wide_header, merge_active_outline,
+    merge_range_selection, merge_scroll_boundary,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

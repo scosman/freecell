@@ -33,9 +33,10 @@ use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
-    apply_motion, effective_edge, is_full_column_selection, is_full_row_selection, spans_all_cols,
-    spans_all_rows, Align, Axis, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern,
-    RenderStyle, SelectionModel, SheetDims, VAlign,
+    apply_motion, effective_edge, expand_to_regions, is_full_column_selection,
+    is_full_row_selection, region_at, regions_intersecting, spans_all_cols, spans_all_rows, Align,
+    Axis, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern, RenderStyle, SelectionModel,
+    SheetDims, VAlign,
 };
 
 use crate::chrome::AutocompleteDisplay;
@@ -308,6 +309,11 @@ pub struct GridView {
     /// `RenderStyle::border` index resolves to a [`BorderSpec`] after the cache lock is released
     /// (`components/style_render.md §Border painting`). Index `0` = [`BorderSpec::NONE`].
     visible_border_specs: Vec<BorderSpec>,
+    /// Reused per-frame snapshot of the merged regions touching the viewport (`architecture.md §6`,
+    /// merged-cell-ui `functional_spec.md F1`) — `regions_intersecting(cache.merges(),
+    /// visible_range)`. Keyed on the visible range (not the anchors) so a region whose anchor
+    /// scrolled off-screen is still present; the region-box pass draws each entry as one span.
+    visible_merges: Vec<CellRange>,
     /// The grid element's real laid-out bounds, captured during paint (a `canvas` probe).
     /// `None` until the first paint. Used instead of `window.viewport_size()` so the grid's
     /// virtualization + hit-testing are correct once chrome wraps it (the grid is no longer
@@ -586,6 +592,19 @@ struct SpillPlan {
     font_family: Option<SharedString>,
 }
 
+/// A cell's fully-resolved paint inputs for [`cell_element`] — the merged-region box's content is
+/// the anchor's, resolved by the same rules the per-cell loop uses (mirror → publication →
+/// default), so a box paints exactly like the anchor would in a 1×1 cell.
+struct CellPaint {
+    text: String,
+    text_color: Rgba,
+    kind: CellKind,
+    /// The cell's own resolved style (`None` for a mirror/pending or unstyled cell).
+    style: Option<RenderStyle>,
+    font_family: Option<SharedString>,
+    fill: Rgba,
+}
+
 impl GridView {
     /// Builds the grid over `sources`, delivering [`GridEvent`]s to `events`. The active
     /// sheet defaults to the publication's sheet, at origin scroll with an A1 selection.
@@ -619,6 +638,7 @@ impl GridView {
             visible_styles: HashMap::new(),
             visible_font_families: Vec::new(),
             visible_border_specs: Vec::new(),
+            visible_merges: Vec::new(),
             bounds: None,
             mirror: None,
             incell_open: None,
@@ -847,10 +867,71 @@ impl GridView {
         if self.mirror_text_for(CellRef::new(row, col)).is_some()
             || !publication.covers(row, col)
             || self.cell_index.contains_key(&(row, col))
+            // A merged region's cell (anchor or covered) is Blocked: a normal cell never spills its
+            // text into a region (the box paints over it), and a covered cell — being skipped in the
+            // cell loop — never originates spill (`architecture.md §6` text-spill).
+            || region_at(&self.visible_merges, CellRef::new(row, col)).is_some()
         {
             layout::Occupancy::Blocked
         } else {
             layout::Occupancy::Empty
+        }
+    }
+
+    /// Resolves a cell's [`cell_element`] paint inputs from the per-frame state — the mirror (raw
+    /// pending text) → the publication index (`cell_index`) → the default — mirroring the per-cell
+    /// loop's resolution. The merged-region box uses this for the anchor, so a box paints exactly as
+    /// the anchor would in a 1×1 cell (`architecture.md §6`).
+    fn resolve_cell_paint(&self, cell: CellRef, publication: &Publication) -> CellPaint {
+        let style = self.visible_styles.get(&(cell.row, cell.col)).copied();
+        let fill = style
+            .and_then(|s| s.fill)
+            .map(to_rgba)
+            .unwrap_or_else(|| rgb(CELL_BG));
+        let (text, text_color, kind, attr_style) = match self.mirror_text_for(cell) {
+            Some(raw) => (raw.to_string(), rgb(CELL_TEXT), CellKind::Text, None),
+            None => match self.cell_index.get(&(cell.row, cell.col)) {
+                Some(&idx) => {
+                    let pc = &publication.cells[idx];
+                    let color = pc
+                        .text_color
+                        .or(style.and_then(|s| s.font_color))
+                        .map(to_rgba)
+                        .unwrap_or_else(|| rgb(CELL_TEXT));
+                    (pc.display_text.clone(), color, pc.kind, style)
+                }
+                None => (String::new(), rgb(CELL_TEXT), CellKind::Text, style),
+            },
+        };
+        let font_family = attr_style.and_then(|s| {
+            let idx = s.font_family as usize;
+            self.visible_font_families
+                .get(idx)
+                .filter(|name| !name.is_empty())
+                .cloned()
+        });
+        CellPaint {
+            text,
+            text_color,
+            kind,
+            style: attr_style,
+            font_family,
+            fill,
+        }
+    }
+
+    /// The content-local px rect a cell paints/selects/edits into: the whole merged-region box
+    /// (`span_rect`) when `cell` resolves into a region, else the 1×1 [`cell_rect`]. Drives the
+    /// active-cell outline and the in-cell editor base rect so both span a region (`ui_design.md
+    /// §4–5`).
+    fn region_or_cell_rect(&self, cell: CellRef, frame: &Frame) -> (f32, f32, f32, f32) {
+        match region_at(&self.visible_merges, cell) {
+            Some(region) => span_rect(
+                region.start.row..region.end.row + 1,
+                region.start.col..region.end.col + 1,
+                frame,
+            ),
+            None => cell_rect(cell.row, cell.col, frame),
         }
     }
 
@@ -1093,6 +1174,24 @@ impl GridView {
         // Snapshot the border side table (cheap — `BorderSpec` is `Copy`), so a cell's `border`
         // index (and its neighbours') resolves to a spec after the lock is dropped.
         self.visible_border_specs = cache.border_specs().to_vec();
+        // Snapshot the merged regions touching the viewport (`architecture.md §6`, merged-cell-ui
+        // `functional_spec.md F1`). Keyed on the visible range so a region whose anchor scrolled
+        // above/left of the viewport is still drawn; the region-box pass paints each as one span.
+        let visible_range = CellRange::new(
+            CellRef::new(rows.start, cols.start),
+            CellRef::new(rows.end.saturating_sub(1), cols.end.saturating_sub(1)),
+        );
+        self.visible_merges = regions_intersecting(cache.merges(), visible_range);
+        // Also snapshot each region anchor's resolved style, even when the anchor is off-screen, so
+        // the region-box pass can style a box whose anchor is scrolled out of the visible range.
+        for region in &self.visible_merges {
+            let anchor = region.start;
+            if let Some(style) = cache.render_style(anchor.row, anchor.col) {
+                self.visible_styles
+                    .entry((anchor.row, anchor.col))
+                    .or_insert(*style);
+            }
+        }
         drop(caches);
 
         Some(Frame {
@@ -2851,7 +2950,14 @@ impl GridView {
         self.cell_index.clear();
         if covers_active {
             for (i, cell) in publication.cells.iter().enumerate() {
-                if frame.rows.contains(&cell.row) && frame.cols.contains(&cell.col) {
+                let in_frame = frame.rows.contains(&cell.row) && frame.cols.contains(&cell.col);
+                // A merged region's anchor may be scrolled off-screen while the box is still
+                // visible; index it too so the region-box pass can read its published value.
+                let is_visible_anchor = self
+                    .visible_merges
+                    .iter()
+                    .any(|m| m.start.row == cell.row && m.start.col == cell.col);
+                if in_frame || is_visible_anchor {
                     self.cell_index.insert((cell.row, cell.col), i);
                 }
             }
@@ -2875,6 +2981,17 @@ impl GridView {
 
         for r in frame.rows.clone() {
             for c in frame.cols.clone() {
+                // A merged region's cells (anchor + covered) are painted once by the region-box
+                // pass below, so skip them here: this drops the covered content AND the covered /
+                // anchor cells' own right/bottom gridline edges, which is what makes the interior
+                // gridlines vanish (`functional_spec.md F1`, `architecture.md §6`).
+                if self
+                    .visible_merges
+                    .iter()
+                    .any(|m| m.contains(CellRef::new(r, c)))
+                {
+                    continue;
+                }
                 let (x, y, w, h) = cell_rect(r, c, frame);
                 let style = self.visible_styles.get(&(r, c)).copied();
                 let fill_color = style.and_then(|s| s.fill);
@@ -2884,10 +3001,16 @@ impl GridView {
                 // gridline it shares with a right / bottom neighbour that resolves to the SAME fill;
                 // unfilled cells keep every gridline, and the block's outer boundary (a different
                 // fill, an unfilled cell, or an off-viewport neighbour — which reads as absent here)
-                // still draws. Explicit cell borders are a separate later pass and are unaffected.
+                // still draws. A merged neighbour never counts as same-fill, so the region's outer
+                // gridline is never suppressed by an adjacent same-coloured cell. Explicit cell
+                // borders are a separate later pass and are unaffected.
                 let same_fill = |nr: u32, nc: u32| {
                     fill_color.is_some()
                         && self.visible_styles.get(&(nr, nc)).and_then(|s| s.fill) == fill_color
+                        && !self
+                            .visible_merges
+                            .iter()
+                            .any(|m| m.contains(CellRef::new(nr, nc)))
                 };
                 let skip_right_gridline = same_fill(r, c + 1);
                 let skip_bottom_gridline = same_fill(r + 1, c);
@@ -3021,6 +3144,63 @@ impl GridView {
             }
         }
 
+        // ---- Merged-region boxes (`functional_spec.md F1`, `architecture.md §6`): each region
+        // touching the viewport paints as ONE box across its whole span. The per-cell loop skipped
+        // every region cell (anchor included), so the interior gridlines are already gone; this
+        // pass paints the anchor's fill + content once across the box and draws the box's own outer
+        // gridlines (`cell_element`) plus the anchor's explicit border at the box outer perimeter.
+        // Keyed on `visible_merges`, so a region whose anchor scrolled off-screen still draws (its
+        // style + published value were snapshotted for the off-screen anchor in `resolve_frame` /
+        // the per-frame index).
+        for region in &self.visible_merges {
+            let anchor = region.start;
+            let (x, y, w, h) = span_rect(
+                region.start.row..region.end.row + 1,
+                region.start.col..region.end.col + 1,
+                frame,
+            );
+            let paint = self.resolve_cell_paint(anchor, &publication);
+            // The box draws its own outer right/bottom gridlines (no same-fill suppression — a merge
+            // always reads as one solid box, `ui_design.md §3`).
+            content_children.push(cell_element(
+                x,
+                y,
+                w,
+                h,
+                paint.fill,
+                paint.text,
+                paint.text_color,
+                paint.kind,
+                paint.style,
+                paint.font_family,
+                false,
+                false,
+            ));
+            // The anchor's explicit borders at the box outer edge (per-cell stored styles only, no
+            // unified-border synthesis — `architecture.md §6`). Interior covered edges were dropped
+            // by the border pass's region skip below; right/bottom always draw; left/top only when
+            // no neighbour to the left/above owns the shared edge (mirrors the per-cell border pass).
+            let spec = self.border_spec_at(anchor.row, anchor.col);
+            if !spec.is_none() {
+                if let Some(edge) = spec.right {
+                    push_vertical_edge(&mut content_children, x + w, y, h, edge);
+                }
+                if let Some(edge) = spec.bottom {
+                    push_horizontal_edge(&mut content_children, x, y + h, w, edge);
+                }
+                if self.no_left_owner(anchor.row, anchor.col, frame) {
+                    if let Some(edge) = spec.left {
+                        push_vertical_edge(&mut content_children, x, y, h, edge);
+                    }
+                }
+                if self.no_top_owner(anchor.row, anchor.col, frame) {
+                    if let Some(edge) = spec.top {
+                        push_horizontal_edge(&mut content_children, x, y, w, edge);
+                    }
+                }
+            }
+        }
+
         // ---- Border edges: painted after every cell fill so they cover the gridline + any
         // neighbouring cell's fill (Excel look, `components/style_render.md §Border painting`).
         // Each shared edge is drawn exactly ONCE: a bordered cell always draws its right + bottom
@@ -3029,6 +3209,15 @@ impl GridView {
         // Effective edge = the heavier of the cell's own edge and the neighbour's opposing one.
         for r in frame.rows.clone() {
             for c in frame.cols.clone() {
+                // Region cells' interior explicit-border edges are suppressed here — the anchor's
+                // outer border is drawn once at the box perimeter in the region-box pass above.
+                if self
+                    .visible_merges
+                    .iter()
+                    .any(|m| m.contains(CellRef::new(r, c)))
+                {
+                    continue;
+                }
                 let spec = self.border_spec_at(r, c);
                 if spec.is_none() {
                     continue;
@@ -3091,26 +3280,31 @@ impl GridView {
             ));
         }
 
-        // Selection: translucent overlay (range − active), range border, active border.
+        // Selection: translucent overlay (range − active), range border, active outline. `painted`
+        // snaps the raw selection to whole regions (`functional_spec.md F4`, `ui_design.md §4`) so
+        // the fill, border, handle, and header highlight span merges with no partial-region
+        // slivers. A lone selection on a region draws only the spanned active outline (no range
+        // fill/border), so the gate is on the RAW selection being single, not `painted`.
         let range = selection.range();
-        for (rows, cols) in layout::range_overlay_rects(range, selection.active) {
-            // Clip to the visible ranges so the overlay divs stay viewport-sized.
-            let rows = rows.start.max(frame.rows.start)..rows.end.min(frame.rows.end);
-            let cols = cols.start.max(frame.cols.start)..cols.end.min(frame.cols.end);
-            if rows.start >= rows.end || cols.start >= cols.end {
-                continue;
-            }
-            let (x, y, w, h) = span_rect(rows, cols, frame);
-            content_children.push(
-                rect_div(x, y, w, h)
-                    .bg(rgb(ACCENT).opacity(SELECTION_FILL_ALPHA))
-                    .into_any_element(),
-            );
-        }
+        let painted = expand_to_regions(&self.visible_merges, range);
         if !range.is_single() {
+            for (rows, cols) in layout::range_overlay_rects(painted, selection.active) {
+                // Clip to the visible ranges so the overlay divs stay viewport-sized.
+                let rows = rows.start.max(frame.rows.start)..rows.end.min(frame.rows.end);
+                let cols = cols.start.max(frame.cols.start)..cols.end.min(frame.cols.end);
+                if rows.start >= rows.end || cols.start >= cols.end {
+                    continue;
+                }
+                let (x, y, w, h) = span_rect(rows, cols, frame);
+                content_children.push(
+                    rect_div(x, y, w, h)
+                        .bg(rgb(ACCENT).opacity(SELECTION_FILL_ALPHA))
+                        .into_any_element(),
+                );
+            }
             let (x, y, w, h) = span_rect(
-                range.start.row..range.end.row + 1,
-                range.start.col..range.end.col + 1,
+                painted.start.row..painted.end.row + 1,
+                painted.start.col..painted.end.col + 1,
                 frame,
             );
             content_children.push(
@@ -3121,7 +3315,9 @@ impl GridView {
             );
         }
         {
-            let (x, y, w, h) = cell_rect(selection.active.row, selection.active.col, frame);
+            // The active-cell outline spans the whole region box when `active` resolves into one
+            // (`ui_design.md §4`); otherwise it is the 1×1 active cell as before.
+            let (x, y, w, h) = self.region_or_cell_rect(selection.active, frame);
             content_children.push(
                 rect_div(x, y, w, h)
                     .border_2()
@@ -3154,8 +3350,8 @@ impl GridView {
             && self.resize_drag.is_none()
             && self.chart_drag.is_none()
         {
-            let right_x = frame.col_offset(range.end.col + 1);
-            let bottom_y = frame.row_offset(range.end.row + 1);
+            let right_x = frame.col_offset(painted.end.col + 1);
+            let bottom_y = frame.row_offset(painted.end.row + 1);
             let (hx, hy, hw, hh) = fill_handle_square(
                 right_x,
                 bottom_y,
@@ -3280,8 +3476,9 @@ impl GridView {
         }
 
         // ---- Header layer (fixed, opaque, clipped to its strip) ---------------------
-        let (sel_r0, sel_r1) = (range.start.row, range.end.row);
-        let (sel_c0, sel_c1) = (range.start.col, range.end.col);
+        // The header shading reflects the region-snapped selection (`ui_design.md §4`).
+        let (sel_r0, sel_r1) = (painted.start.row, painted.end.row);
+        let (sel_c0, sel_c1) = (painted.start.col, painted.end.col);
 
         // Column-header strip.
         let mut col_children: Vec<AnyElement> = Vec::new();
@@ -4889,7 +5086,9 @@ impl GridView {
         window: &mut Window,
         cx: &App,
     ) -> Option<(f32, f32)> {
-        let (x, _y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        // Seed the grow measurement from the region box when `cell` is a merged anchor, so the
+        // editor's base matches what `in_cell_overlay_elements` paints (`ui_design.md §5`).
+        let (x, _y, cell_w, cell_h) = self.region_or_cell_rect(cell, frame);
         let style = self.visible_styles.get(&(cell.row, cell.col)).copied();
         let wrap = style.map(|s| s.wrap).unwrap_or(false);
         let content_w = frame.content_w as f32;
@@ -4960,7 +5159,8 @@ impl GridView {
         input: &Entity<InputState>,
         frame: &Frame,
     ) -> Vec<AnyElement> {
-        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        // The editor spans the whole region box when `cell` is a merged anchor (`ui_design.md §5`).
+        let (x, y, cell_w, cell_h) = self.region_or_cell_rect(cell, frame);
         let wrap = self
             .visible_styles
             .get(&(cell.row, cell.col))

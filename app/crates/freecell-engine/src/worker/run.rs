@@ -394,7 +394,11 @@ impl Worker {
             loaded_deletes: HashSet::new(),
             chart_version: 0,
             chart_source_path: match &source {
-                DocumentSource::OpenFile(path) => Some(path.clone()),
+                // An open and the demo both carry a real `.xlsx` whose charts we render + preserve
+                // — their source file is re-read lazily (on paint) and on save (chart re-inject).
+                DocumentSource::OpenFile(path) | DocumentSource::OpenDemo(path) => {
+                    Some(path.clone())
+                }
                 // A CSV import builds a fresh workbook — no source file carries charts.
                 DocumentSource::NewWorkbook | DocumentSource::ImportCsv(_) => None,
             },
@@ -444,7 +448,7 @@ impl Worker {
         // the model's sheet names still match the file. Both discovery paths key off this stable
         // part (not the mutable live name), so a sheet renamed before it is painted still resolves to
         // its charts and follows the rename on save (P11 CR fix).
-        if let DocumentSource::OpenFile(path) = &source {
+        if let DocumentSource::OpenFile(path) | DocumentSource::OpenDemo(path) = &source {
             worker.chart_sheet_parts = worker.build_chart_sheet_part_map(path);
         }
 

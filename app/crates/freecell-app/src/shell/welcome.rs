@@ -157,7 +157,8 @@ impl Render for WelcomeView {
 }
 
 impl WelcomeView {
-    /// The LEFT pane: wordmark, tagline, and the two stacked full-width actions (`ui_design.md §2`).
+    /// The LEFT pane: wordmark, tagline, and the two stacked full-width actions at the top
+    /// (`ui_design.md §2`), plus the "Open Demo Spreadsheet" link anchored at the pane bottom.
     fn render_left_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w(px(LEFT_PANE_WIDTH))
@@ -212,6 +213,29 @@ impl WelcomeView {
                                 FreeCellApp::open_via_panel(cx);
                             })),
                     ),
+            )
+            // A flex grower pushes the demo link down so it anchors at the BOTTOM of the pane
+            // while the wordmark + buttons stay at the top. The pane's `p(32)` keeps the link off
+            // the bottom/left edges (not flush against the border).
+            .child(div().flex_1())
+            // A subtle tertiary text link (not a third button): opens the bundled demo workbook as
+            // a fresh untitled sheet (`FreeCellApp::open_demo`). Styled from the pane's muted-text
+            // token, darkening + underlining on hover for a link affordance.
+            .child(
+                div()
+                    .id("welcome-demo-link")
+                    // Registers the painted bounds under this name for the render test's
+                    // `debug_bounds("welcome-demo-link")` lookup.
+                    .debug_selector(|| "welcome-demo-link".to_string())
+                    .text_center()
+                    .cursor_pointer()
+                    .text_size(px(13.0))
+                    .text_color(rgb(MUTED_TEXT))
+                    .hover(|s| s.text_color(rgb(TEXT)).underline())
+                    .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
+                        FreeCellApp::open_demo(cx);
+                    }))
+                    .child("Open Demo Spreadsheet"),
             )
     }
 
@@ -431,6 +455,27 @@ mod tests {
         assert!(
             !cx.update(|cx| view.read(cx).is_empty_state()),
             "a populated list is not the empty state"
+        );
+    }
+
+    #[gpui::test]
+    fn render_paints_the_demo_link(cx: &mut TestAppContext) {
+        // The left pane paints the "Open Demo Spreadsheet" text link, anchored at the bottom of
+        // the pane — the link renders as part of the tree, not just as a constant string.
+        // `debug_bounds` resolves the element's `.debug_selector()` (the `.id()` is there for
+        // `.on_click` interactivity, not this lookup — see `grid/view.rs`). Its click routing to
+        // `FreeCellApp::open_demo` is exercised worker-free by the app-level
+        // `demo_opens_as_an_untitled_window` test.
+        cx.update(gpui_component::init);
+        let handle = cx.open_window(size(px(720.0), px(480.0)), |window, cx| {
+            let view = cx.new(|cx| WelcomeView::new(window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("welcome-demo-link").is_some(),
+            "the welcome left pane paints the Open Demo Spreadsheet link"
         );
     }
 

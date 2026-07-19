@@ -134,10 +134,33 @@ impl FreeCellApp {
         });
     }
 
+    /// Opens the bundled **demo** workbook in a new window (the welcome window's "Demo
+    /// spreadsheet" link). Materializes the embedded demo bytes to a temp `.xlsx`
+    /// ([`super::demo`]) and opens it with `path: None` — so it behaves exactly like a new,
+    /// unsaved sheet: Save → Save-As, no `.back` backup, no dedupe, and each open is a fresh
+    /// untitled copy of the same static file. Unlike `NewWorkbook` it is a real `.xlsx`, so the
+    /// worker renders + preserves its charts (`DocumentSource::OpenDemo`). A materialize failure
+    /// (e.g. no writable temp dir) surfaces the standard app error dialog rather than crashing.
+    pub fn open_demo(cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| app.do_open_demo(cx));
+    }
+
     /// Test-only mirror of [`new_workbook`](Self::new_workbook) over a worker-less window.
     #[cfg(test)]
     pub(crate) fn new_workbook_detached(cx: &mut App) {
         cx.update_global::<FreeCellApp, _>(|app, cx| app.open_detached_document(None, cx));
+    }
+
+    /// Test-only mirror of [`open_demo`](Self::open_demo) over a worker-less window: materializes
+    /// the bundled demo (exercising the real asset write + surfacing any failure) then opens it
+    /// **untitled** (`path: None`), so a `#[gpui::test]` can assert the untitled/no-dedupe wiring
+    /// without spawning an OS-thread worker.
+    #[cfg(test)]
+    pub(crate) fn open_demo_detached(cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| {
+            super::demo::materialize_demo_xlsx().expect("the bundled demo materializes");
+            app.open_detached_document(None, cx);
+        });
     }
 
     /// Test-only mirror of [`open_path`](Self::open_path): same canonicalize + dedupe, but the
@@ -303,6 +326,15 @@ impl FreeCellApp {
                     cx,
                 );
             }
+        }
+    }
+
+    fn do_open_demo(&mut self, cx: &mut App) {
+        match super::demo::materialize_demo_xlsx() {
+            // Opened with `path: None`: untitled window (Save → Save-As, no `.back` backup, no
+            // dedupe), but a real `.xlsx` source so the worker renders + preserves its charts.
+            Ok(path) => self.open_document(DocumentSource::OpenDemo(path), None, cx),
+            Err(e) => self.report_error("Couldn't open the demo spreadsheet", &e.to_string(), cx),
         }
     }
 
@@ -836,6 +868,27 @@ mod tests {
             cx.update(|cx| FreeCellApp::recents_paths(cx)),
             vec![path.canonicalize().unwrap()],
             "the imported csv is recorded as a recent file"
+        );
+    }
+
+    #[gpui::test]
+    fn demo_opens_as_an_untitled_window(cx: &mut TestAppContext) {
+        boot(cx);
+        // The welcome "Open Demo Spreadsheet" link opens the bundled demo as a fresh **untitled**
+        // window (path: None → Save → Save-As, no `.back`, no dedupe) — the same untitled behavior
+        // as an imported CSV, mirroring `opening_a_csv_imports_as_an_untitled_window`.
+        cx.update(FreeCellApp::open_demo_detached);
+        assert_eq!(window_count(cx), 1, "opening the demo opens one window");
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0).unwrap());
+        assert!(
+            cx.update(|cx| entity.read(cx).path().is_none()),
+            "the demo opens as an untitled (path: None) window"
+        );
+        // Unlike an Open, the demo is a bundled fixture, not a user file — it must NOT be recorded
+        // as a recent file.
+        assert!(
+            cx.update(|cx| FreeCellApp::recents_paths(cx)).is_empty(),
+            "the demo is not recorded as a recent file"
         );
     }
 

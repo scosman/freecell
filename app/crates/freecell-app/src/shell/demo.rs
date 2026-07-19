@@ -111,4 +111,47 @@ mod tests {
              Regional Sales / Quarterly P&L)"
         );
     }
+
+    /// All five embedded charts parse into typed, renderable specs (fidelity check), and the
+    /// Quarterly P&L **area** chart carries its four quarter categories. The category assertion is
+    /// the real guard for this fix: the area chart's category axis was rewritten from
+    /// `multiLvlStrRef` (which our loader ignored → **empty categories**) to a plain `strRef`, so
+    /// this asserts the categories now load in C→F order. Note the pre-fix "Unsupported chart type"
+    /// placeholder did **not** come from `display_fidelity()` — that is derived from the source-XML
+    /// classification and stayed Faithful even with empty categories (so the fidelity assertion was
+    /// already true pre-fix). The placeholder came from the **app layer**: `AreaPlot::from_chart`
+    /// returns `None` on empty categories, so `in_grid` drew `placeholder_element` for an
+    /// otherwise-Faithful chart. Empty categories are exactly what the category assertion catches.
+    #[test]
+    fn demo_charts_all_render_and_area_categories_load() {
+        use freecell_chart_model::{ChartKind, SeriesData};
+
+        let path = materialize_demo_xlsx().expect("demo materializes to an .xlsx");
+        let specs = freecell_engine::chart::discover_and_parse(&path)
+            .expect("the demo's charts discover + parse");
+        assert_eq!(specs.len(), 5, "the demo embeds five charts");
+        assert!(
+            specs
+                .iter()
+                .all(|s| s.display_fidelity().renders_as_chart()),
+            "every demo chart renders as a chart (none shows the Unsupported placeholder)"
+        );
+
+        let area = specs
+            .iter()
+            .filter_map(|s| s.chart())
+            .find(|c| matches!(c.kind, ChartKind::Area { .. }))
+            .expect("the Quarterly P&L area chart parses into a typed Area chart");
+        for series in &area.series {
+            let SeriesData::CategoryValue { categories, .. } = &series.data else {
+                panic!("area series should carry category/value data");
+            };
+            let labels: Vec<String> = categories.iter().map(|c| c.label()).collect();
+            assert_eq!(
+                labels,
+                ["Q1", "Q2", "Q3", "Q4"],
+                "the area chart's categories load from C5:F5 in C→F order"
+            );
+        }
+    }
 }

@@ -118,6 +118,19 @@ jobs:
     # Windows is best-effort: it must never gate a release. The app does not yet wire a
     # Windows GPUI backend, so this build may fail to compile — that is expected for now.
     continue-on-error: true
+    # OPTIONAL Azure Trusted Signing. These map secrets/vars into the env that
+    # app/scripts/sign-windows.ps1 reads (via package.ps1) to sign the core exe + installer.
+    # When they are unset (forks, or before signing is provisioned) every value is empty,
+    # sign-windows.ps1 skips signing, and the job still produces a normal UNSIGNED installer —
+    # signing is strictly opt-in and never blocks the build. To enable it, add the three
+    # AZURE_*_ID/SECRET repo *secrets* and the account/profile repo *variables*.
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+      AZURE_TRUSTED_SIGNING_PROFILE: ${{ vars.AZURE_TRUSTED_SIGNING_PROFILE }}
     steps:
       - uses: actions/checkout@v4
 
@@ -131,6 +144,12 @@ jobs:
 
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked --version 0.11.8
+
+      # Only needed when signing is configured — skipped (empty tenant/account) on forks or
+      # before signing is provisioned, so the unsigned build path pays nothing for it.
+      - name: Install Azure Trusted Signing CLI
+        if: ${{ env.AZURE_TENANT_ID != '' && env.AZURE_TRUSTED_SIGNING_ACCOUNT != '' }}
+        run: cargo install trusted-signing-cli --locked --version 0.11.0
 
       - name: Build + package (app/scripts/package.ps1)
         shell: pwsh

@@ -11,11 +11,14 @@ releases attached to a GitHub Release.
 ## Current state
 
 `cargo-packager` produces macOS `.app`/`.dmg`, Linux `.deb`/`.AppImage`, and (experimental)
-Windows NSIS `.exe`. Everything is **unsigned by design** — no signing config, no signing
-hooks, no secret plumbing exist in the repo (a deliberate scope decision, 2026-07-05):
+Windows NSIS `.exe`. Signing status by platform:
 
-- macOS: unsigned `.app`/`.dmg` trip Gatekeeper (right-click → **Open** to run).
-- Windows: unsigned `.exe` triggers SmartScreen warnings.
+- **macOS: unsigned** — `.app`/`.dmg` trip Gatekeeper (right-click → **Open** to run). No
+  signing/notarization plumbing yet.
+- **Windows: optional Authenticode wired (2026-07-20)** — `package.ps1` can sign the core
+  exe + installer via Azure Trusted Signing when env vars are set; otherwise unsigned and
+  SmartScreen warns. See item 2 below + `app/PACKAGING.md` §Signing.
+- **Linux: unsigned** — no GPG/AppImage signing yet.
 
 The `release` workflow uploads packages as **run artifacts**, not GitHub Release assets,
 specifically because publishing unsigned binaries as releases would be wrong.
@@ -24,8 +27,14 @@ specifically because publishing unsigned binaries as releases would be wrong.
 
 1. **macOS:** Developer ID Application certificate → sign the `.app`, then **notarize** +
    staple the `.dmg` (Apple notary service). Wire cert + credentials as CI secrets.
-2. **Windows:** Authenticode signing of the NSIS `.exe` (and ideally the inner binary) with
-   an OV/EV code-signing certificate.
+2. **Windows:** ✅ **Wired (2026-07-20).** Authenticode signing of **both** the inner
+   `freecell.exe` and the NSIS installer `.exe` via **Azure Trusted Signing** — `package.ps1`
+   signs the core binary before packaging (cargo-packager embeds the signed copy) and the
+   installer after, using `trusted-signing-cli` (`scripts/sign-windows.ps1`). Opt-in: a no-op
+   unless the `AZURE_*` signing env vars are set (see `app/PACKAGING.md` §Signing), so unsigned
+   builds still work. The `release` Windows job maps the creds/config from repo secrets +
+   variables. Not yet exercised end-to-end because the Windows app build itself is still
+   experimental (`projects/windows-port.md`).
 3. **Linux:** optional — GPG-sign the `.deb` / provide checksums; AppImage signing.
 4. **Distribution:** switch the workflow from artifact upload to **creating/attaching a
    GitHub Release** on tag push (checksums + release notes).

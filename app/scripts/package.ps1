@@ -7,8 +7,10 @@
   `../PACKAGING.md` (section "Windows: what a real port needs"). This script + the Windows
   CI job exist so the packaging path is ready the day the port lands.
 
-  Produces an NSIS setup .exe. Builds are UNSIGNED (SmartScreen will warn); signing is
-  future work (PACKAGING.md + projects/pre-distribution-security-audit.md).
+  Produces an NSIS setup .exe. Code signing is OPTIONAL: if the Azure Trusted Signing env
+  vars are set this signs BOTH the core freecell.exe (before packaging, so cargo-packager
+  embeds the signed binary) and the installer .exe; if they are unset the build is UNSIGNED
+  and still succeeds (SmartScreen will warn). See scripts\sign-windows.ps1 + PACKAGING.md.
 
   cargo-packager does not build the app itself and resolves icon paths relative to the CWD,
   so this builds the release binary first and always runs from `app/`.
@@ -40,10 +42,21 @@ Write-Host "package.ps1: building freecell (release)…"
 cargo build --release -p freecell-app --bin freecell
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# Optional Azure Trusted Signing (no-op unless the signing env is configured — see
+# sign-windows.ps1). Sign the core binary BEFORE packaging so cargo-packager embeds the
+# signed freecell.exe into the installer. sign-windows.ps1 throws on a real failure, which
+# halts here ($ErrorActionPreference = 'Stop').
+& (Join-Path $PSScriptRoot 'sign-windows.ps1') -Path (Join-Path $here 'target\release\freecell.exe')
+
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 Write-Host "package.ps1: packaging formats '$formats' -> $outDir"
 cargo packager --release --packages freecell-app --formats $formats --out-dir $outDir @args
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Sign each produced installer .exe (also a no-op unless signing is configured).
+Get-ChildItem -Path $outDir -Filter *.exe -File | ForEach-Object {
+    & (Join-Path $PSScriptRoot 'sign-windows.ps1') -Path $_.FullName
+}
 
 Write-Host "`npackage.ps1: done. Packages in ${outDir}:"
 Get-ChildItem $outDir

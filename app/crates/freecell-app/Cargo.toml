@@ -22,7 +22,10 @@ description = "The FreeCell GPUI application (macOS + Linux): app shell, windows
 # below are relative to THIS Cargo.toml, not to the workspace root or the shell's CWD.
 # Package FORMATS are chosen per-OS by the scripts (`--formats`), NOT pinned here, so this
 # one config serves macOS (app/dmg), Linux (deb/appimage) and the experimental Windows
-# (nsis) job. Builds are UNSIGNED (dev builds); signing is future work — see PACKAGING.md.
+# (nsis) job. Builds are UNSIGNED by default; Windows can OPTIONALLY Authenticode-sign the
+# core exe + installer via Azure Trusted Signing — driven around cargo-packager by
+# scripts/package.ps1 + scripts/sign-windows.ps1 (not a `sign_command` here), so an
+# unconfigured build stays unsigned rather than failing. See PACKAGING.md §Signing.
 # ---------------------------------------------------------------------------------
 [package.metadata.packager]
 product-name = "FreeCell"

@@ -9,10 +9,13 @@ FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-pack
 | Linux | `.deb` + `.AppImage` | **Supported** |
 | Windows | NSIS setup `.exe` | **Experimental / non-blocking** (see below) |
 
-> **All builds are UNSIGNED dev builds.** They are **not** for public distribution yet.
-> macOS Gatekeeper will block an unsigned `.app`/`.dmg` (right-click → **Open** to run
-> anyway); Windows SmartScreen will warn. Code signing + notarization, and publishing to a
-> GitHub Release, are deliberately **out of scope** here and gated behind
+> **Builds are UNSIGNED dev builds** and **not** for public distribution yet. macOS
+> Gatekeeper will block an unsigned `.app`/`.dmg` (right-click → **Open** to run anyway).
+> Windows is the one exception: the packaging path can **optionally** Authenticode-sign the
+> core exe + installer via Azure Trusted Signing when the signing env vars are set (see
+> [Signing](#signing) below) — otherwise the Windows build is unsigned too and SmartScreen
+> will warn. macOS signing + notarization, and publishing to a **GitHub Release**, remain
+> **out of scope** here and gated behind
 > [`projects/pre-distribution-security-audit.md`](../projects/pre-distribution-security-audit.md)
 > and [`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md).
 > That is why the CI workflow uploads packages as **run artifacts**, not Release assets.
@@ -111,11 +114,37 @@ The experimental Windows CI job + `scripts/package.ps1` exist so that, once the 
 compiles, producing an installer is already a solved problem. Tracked in
 [`projects/windows-port.md`](../projects/windows-port.md).
 
-## Signing (deferred)
+## Signing
 
-No signing is done here, by design — outputs are plain unsigned artifacts. macOS
-notarization and Windows Authenticode, and the switch to published GitHub Releases, are
-future work. See
+**Windows — Authenticode via Azure Trusted Signing (optional, wired).** `package.ps1` signs
+**both** the core `freecell.exe` (before packaging, so cargo-packager embeds the signed
+binary in the installer) and the produced `*-setup.exe`, using
+[`trusted-signing-cli`](https://crates.io/crates/trusted-signing-cli). It is **opt-in**:
+signing runs only when the signing env vars are set, and is otherwise a no-op that leaves the
+build unsigned — so unsigned local/CI builds keep working unchanged. Signing is driven
+*around* cargo-packager (in `scripts/sign-windows.ps1`) rather than via a Cargo.toml
+`sign_command`, so an unconfigured environment simply produces an unsigned build instead of
+failing.
+
+To enable it, set these (the CI `release` Windows job already maps them from repo
+secrets/variables):
+
+| Env var | Purpose |
+|---|---|
+| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` | Entra app-registration credentials (repo **secrets**) |
+| `AZURE_TRUSTED_SIGNING_ACCOUNT` | Trusted Signing account name (repo **variable**) |
+| `AZURE_TRUSTED_SIGNING_PROFILE` | certificate profile name (repo **variable**) |
+| `AZURE_TRUSTED_SIGNING_ENDPOINT` | optional; default `https://eus.codesigning.azure.net/` |
+| `FREECELL_WINDOWS_SIGN_TOOL` | optional; default `trusted-signing-cli` (e.g. set to `artifact-signing-cli`, the renamed successor crate) |
+
+All five required values must be present or signing is skipped (a partial config warns and
+skips, so unfinished setup never silently ships an unsigned binary as if signed). Locally:
+`cargo install trusted-signing-cli --locked --version 0.11.0`, set the env vars, then run
+`scripts\package.ps1`. Note Windows itself is still experimental (the app may not compile
+there yet — see above), so this path is not exercised end-to-end until the port lands.
+
+**Still deferred:** macOS signing + notarization, and the switch to published GitHub
+Releases. See
 [`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md),
 and note the **mandatory**
 [`projects/pre-distribution-security-audit.md`](../projects/pre-distribution-security-audit.md)

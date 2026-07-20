@@ -99,10 +99,11 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 - **Release Signing & Distribution** — *Future, required before publishing any binary.*
   The `cargo-packager` pipeline ships **unsigned dev artifacts** (uploaded as CI run
-  artifacts, not GitHub Releases) by deliberate scope decision — no signing config/hooks
-  exist. This adds macOS Developer-ID signing + notarization, Windows Authenticode, and the
-  switch to attaching signed assets to a GitHub Release. Hard-gated on the
-  pre-distribution security audit above. → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
+  artifacts, not GitHub Releases). **Windows Authenticode is now wired** (optional Azure
+  Trusted Signing of the core exe + installer, 2026-07-20); still outstanding are macOS
+  Developer-ID signing + notarization and the switch to attaching signed assets to a GitHub
+  Release. Hard-gated on the pre-distribution security audit above.
+  → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
 
 - **Rewrite chart `c:f` on sheet rename** — *Future (deferred from charts P10, 2026-07-10).*
   Chart save is source-first (charts/architecture §5): it byte-preserves / targeted-patches the

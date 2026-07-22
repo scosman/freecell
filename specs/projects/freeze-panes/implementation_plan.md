@@ -31,7 +31,7 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
     `<pane>` fixture → cache counts populated; save→reopen round-trips. Core builder test.
     Checks: `-p freecell-core -p freecell-engine -p freecell-app`, `fmt --all --check`.
 
-- [ ] **Phase 2 — Header-menu Freeze/Unfreeze (`architecture.md §4`, `functional_spec.md §1`).**
+- [x] **Phase 2 — Header-menu Freeze/Unfreeze (`architecture.md §4`, `functional_spec.md §1`).**
   No fork, no pixel (menu overlay is not a baseline surface).
   - `HeaderMenu` (`grid/view.rs`) gains `frozen: u32`; read `M`/`K` in `handle_right_mouse_down`
     under the existing lock and store at construction.

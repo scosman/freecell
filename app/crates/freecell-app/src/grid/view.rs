@@ -145,6 +145,10 @@ struct HeaderMenu {
     /// (Unhide N; Hide counts the newly-hidden `run_len − hidden_in_run`), independent of the
     /// span width (`unhide_run` may be wider than the count when the hidden tracks are sparse).
     hidden_in_run: u32,
+    /// The current frozen count on the menu's axis (`M` for a row header, `K` for a column header),
+    /// read from the cache at open. Drives the Freeze/Unfreeze slot (`freeze-panes`
+    /// `architecture.md §4`): the item Unfreezes when `frozen == run.1 + 1`, else Freezes.
+    frozen: u32,
 }
 
 /// The open cell-area right-click context menu (`functional_spec.md §2`, cloned from
@@ -2079,8 +2083,9 @@ impl GridView {
         let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
-        // Hit-test the ChartLayer + headers + read the merge list + hidden sets under one lock.
-        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims) = {
+        // Hit-test the ChartLayer + headers + read the merge list + hidden sets + frozen counts
+        // under one lock.
+        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims, frozen_rows, frozen_cols) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
@@ -2120,6 +2125,8 @@ impl GridView {
                 cache.hidden_rows().clone(),
                 cache.hidden_cols().clone(),
                 cache.dims(),
+                cache.frozen_rows(),
+                cache.frozen_cols(),
             )
         };
         // A right-click on a chart selects it and opens the "Delete chart" context menu (P18) — the
@@ -2199,6 +2206,10 @@ impl GridView {
             RowOrCol::Col => (&hidden_cols, dims.1),
         };
         let (hide_blocked, unhide_run, hidden_in_run) = hide_unhide_flags(run, hidden_set, total);
+        let frozen = match axis {
+            RowOrCol::Row => frozen_rows,
+            RowOrCol::Col => frozen_cols,
+        };
         self.cell_menu = None;
         self.header_menu = Some(HeaderMenu {
             axis,
@@ -2211,6 +2222,7 @@ impl GridView {
             hide_blocked,
             unhide_run,
             hidden_in_run,
+            frozen,
         });
         cx.notify();
     }
@@ -3807,6 +3819,29 @@ impl GridView {
             }
             None => items.push((format!("Unhide {unit}s"), false, unhide_ev(start, count))),
         }
+        // Freeze/Unfreeze (`freeze-panes` `architecture.md §4`, `functional_spec.md §1`): the
+        // boundary track is the run's last index `b`, so the implied count is `b + 1`. Unfreeze
+        // (set the axis to 0) when the current freeze already equals that boundary; else Freeze to
+        // `b + 1` — freezing the boundary track and everything above/left, moving the boundary if a
+        // different freeze existed. Always enabled (freeze hides nothing). The axis constructor puts
+        // the count on exactly the one axis the menu was opened on (one undo step).
+        let boundary_count = menu.run.1 + 1;
+        let (freeze_label, target) = if menu.frozen == boundary_count {
+            ("Unfreeze", 0)
+        } else {
+            ("Freeze", boundary_count)
+        };
+        let freeze_ev = match menu.axis {
+            RowOrCol::Row => GridEvent::SetFrozen {
+                rows: Some(target),
+                cols: None,
+            },
+            RowOrCol::Col => GridEvent::SetFrozen {
+                rows: None,
+                cols: Some(target),
+            },
+        };
+        items.push((format!("{freeze_label} {unit}s"), true, freeze_ev));
         items
     }
 
@@ -6228,6 +6263,34 @@ mod tests {
         (out.expect("grid built"), window, events)
     }
 
+    /// Sources for a blank Excel-max sheet carrying the given frozen counts (`freeze-panes`) — the
+    /// header menu reads these into `HeaderMenu::frozen` to drive the Freeze/Unfreeze slot.
+    fn frozen_sources(frozen_rows: u32, frozen_cols: u32) -> GridDataSources {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::Publication;
+        let sheet = SheetId(0);
+        let cache = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .frozen_rows(frozen_rows)
+        .frozen_cols(frozen_cols)
+        .build();
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, cache);
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: vec![],
+        };
+        GridDataSources {
+            publication: Arc::new(ArcSwap::from_pointee(publication)),
+            caches: Arc::new(RwLock::new(caches)),
+        }
+    }
+
     /// The heights carried by the single `AutoGrowRows` the recording captured, or `None`.
     fn captured_autogrow(events: &Rc<RefCell<Vec<GridEvent>>>) -> Option<Vec<(u32, f32)>> {
         events.borrow().iter().find_map(|e| match e {
@@ -7318,6 +7381,73 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn header_menu_carries_axis_frozen_count(cx: &mut TestAppContext) {
+        // A sheet frozen at M = 2 rows, K = 1 column: the header menu must read the count of the
+        // axis it was opened on into `HeaderMenu::frozen` (`freeze-panes architecture.md §4`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 1));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Row header: x inside the gutter (< 48), y past the column-header strip (> 24).
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 20.0, 60.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.header_menu.expect("a row header opens the menu");
+                    assert_eq!(menu.axis, RowOrCol::Row);
+                    assert_eq!(menu.frozen, 2, "row header carries M");
+                    // Column header: the column-header strip (y < 24) past the gutter.
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 60.0, 10.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.header_menu.expect("a column header opens the menu");
+                    assert_eq!(menu.axis, RowOrCol::Col);
+                    assert_eq!(menu.frozen, 1, "column header carries K");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn freeze_menu_item_emits_set_frozen(cx: &mut TestAppContext) {
+        // From an unfrozen sheet, the row header's Freeze item emits a one-axis `SetFrozen` — the
+        // end-to-end path from the opened menu through the recorded event.
+        let (g, window, events) = recording_over(cx, frozen_sources(0, 0));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 20.0, 60.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.header_menu.expect("a row header opens the menu");
+                    // The Freeze/Unfreeze slot is the last item; nothing frozen → it Freezes.
+                    let (label, enabled, event) = GridView::header_menu_items(&menu)
+                        .pop()
+                        .expect("the menu carries a Freeze/Unfreeze item");
+                    assert!(enabled && label.starts_with("Freeze"));
+                    grid.events.emit(&event, window, cx);
+                });
+            })
+            .unwrap();
+        let recorded = events.borrow();
+        assert!(
+            recorded.iter().any(|e| matches!(
+                e,
+                GridEvent::SetFrozen {
+                    rows: Some(_),
+                    cols: None
+                }
+            )),
+            "the row Freeze item records a rows-only SetFrozen, got {recorded:?}"
+        );
+    }
+
     // ---- Cell-area right-click context menu (`functional_spec.md §2`, Phase 5) -------------
 
     /// A `CellMenu` over the B2:D4 (rows 1..=3, cols 1..=3) selection with nothing blocked, for the
@@ -7425,6 +7555,7 @@ mod tests {
         hide_blocked: bool,
         unhide_run: Option<(u32, u32)>,
         hidden_in_run: u32,
+        frozen: u32,
     ) -> HeaderMenu {
         HeaderMenu {
             axis,
@@ -7437,6 +7568,7 @@ mod tests {
             hide_blocked,
             unhide_run,
             hidden_in_run,
+            frozen,
         }
     }
 
@@ -7449,6 +7581,7 @@ mod tests {
             (2, 4),
             false,
             None,
+            0,
             0,
         ));
         assert!(matches!(
@@ -7468,6 +7601,7 @@ mod tests {
             false,
             Some((3, 3)),
             1,
+            0,
         ));
         assert!(matches!(
             &items[3],
@@ -7487,6 +7621,7 @@ mod tests {
             false,
             Some((3, 5)),
             2,
+            0,
         ));
         assert!(matches!(
             &items[4],
@@ -7500,10 +7635,53 @@ mod tests {
             true,
             None,
             0,
+            0,
         ));
         assert!(matches!(
             &items[3],
             (l, false, GridEvent::HideRows { at: 0, .. }) if l == "Hide 1048576 rows"
+        ));
+    }
+
+    #[test]
+    fn header_menu_items_include_freeze_and_unfreeze() {
+        // The Freeze/Unfreeze slot is the LAST item; its label/target flips on whether the current
+        // frozen count already equals the boundary `run.1 + 1` (`freeze-panes architecture.md §4`).
+        let freeze_item = |axis, run, frozen| {
+            GridView::header_menu_items(&header_menu_fixture(axis, run, false, None, 0, frozen))
+                .pop()
+                .expect("the menu always carries a Freeze/Unfreeze item")
+        };
+
+        // Row header, single track 1 (boundary 0), nothing frozen → Freeze rows to count 1.
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (0, 0), 0),
+            (l, true, GridEvent::SetFrozen { rows: Some(1), cols: None }) if l == "Freeze rows"
+        ));
+        // Same boundary already frozen (M == 1) → the slot flips to Unfreeze (set M to 0).
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (0, 0), 1),
+            (l, true, GridEvent::SetFrozen { rows: Some(0), cols: None }) if l == "Unfreeze rows"
+        ));
+        // A different existing freeze (M == 3) at boundary 4 (run 2..=4) → Freeze MOVES it to 5.
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (2, 4), 3),
+            (l, true, GridEvent::SetFrozen { rows: Some(5), cols: None }) if l == "Freeze rows"
+        ));
+        // The boundary 4 (count 5) already frozen → Unfreeze.
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (2, 4), 5),
+            (l, true, GridEvent::SetFrozen { rows: Some(0), cols: None }) if l == "Unfreeze rows"
+        ));
+
+        // Column symmetry: a column header drives the `cols` axis only, leaving `rows` None.
+        assert!(matches!(
+            freeze_item(RowOrCol::Col, (0, 0), 0),
+            (l, true, GridEvent::SetFrozen { rows: None, cols: Some(1) }) if l == "Freeze columns"
+        ));
+        assert!(matches!(
+            freeze_item(RowOrCol::Col, (1, 3), 4),
+            (l, true, GridEvent::SetFrozen { rows: None, cols: Some(0) }) if l == "Unfreeze columns"
         ));
     }
 

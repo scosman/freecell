@@ -40,7 +40,7 @@ Section refs are to `architecture.md` / `functional_spec.md` §3.
       `fn_sumproduct` with the `eval_arg_as_grid` + `to_number_or_zero` helpers; dimension rule → `#VALUE!`;
       the two forms (multi-array booleans→0; single-expression `(A=x)*(B)` via array-context eval —
       resolve that [checkpoint] here). Tests = §3.1 table + error-element propagation.
-- [ ] **Phase 2 — TRIM fix (§4). `fix/trim-internal-runs`.** Read the current `fn_trim` body; replace
+- [x] **Phase 2 — TRIM fix (§4). `fix/trim-internal-runs`.** Read the current `fn_trim` body; replace
       with the `split(' ')/filter/join` one-liner (collapse internal 0x20 runs, 0x20-only scope).
       Regression tests = the §4 before/after table incl. the tab + NBSP 0x20-only proofs.
 - [ ] **Phase 3 — PROPER (§3.2). `fix/proper`.** `fn_proper`; word boundary = non-letter; UPPER/LOWER

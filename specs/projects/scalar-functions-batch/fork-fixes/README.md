@@ -22,7 +22,7 @@ durable tracker — like `conditional-formatting/fork-fixes/`, if fork **push** 
 | # | Branch | Function(s) | Impl fn (module, best-inferred) | Tests | `freecell-fixes` | Upstream PR | State |
 |---|--------|-------------|----------------------------------|-------|------------------|-------------|-------|
 | 1 | `fix/sumproduct` | SUMPRODUCT | `fn_sumproduct` (math) | — | ⬜ | ⬜ prep | not started |
-| 2 | `fix/trim-internal-runs` | TRIM (fix) | `fn_trim` body (text) | — | ⬜ | ⬜ prep | not started |
+| 2 | `fix/trim-internal-runs` | TRIM (fix) | `fn_trim` body (`base/src/functions/text/common.rs`) | `cargo test -p ironcalc_base` green + `make lint` | ✅ (merge `0a36e79e`) | ✅ prep (below) | **landed + pushed** — branch `6c894ba2` |
 | 3 | `fix/proper` | PROPER | `fn_proper` (text) | — | ⬜ | ⬜ prep | not started |
 | 4 | `fix/replace` | REPLACE | `fn_replace` (text) | — | ⬜ | ⬜ prep | not started |
 | 5 | `fix/char-code` | CHAR + CODE | `fn_char`, `fn_code` (text) | — | ⬜ | ⬜ prep | not started — **paired** |
@@ -72,6 +72,28 @@ Per-branch titles (bodies drafted at land-time from the matching functional-spec
 | `fix/percentile-quartile-inc` | Add PERCENTILE.INC / QUARTILE.INC (+ legacy PERCENTILE / QUARTILE) |
 | `fix/address` | Add ADDRESS (A1 + full R1C1) |
 | `fix/xmatch` | Add XMATCH (all match/search modes, incl. binary + wildcard) |
+
+## Upstream PR prep — completed branches (ready for owner to open)
+
+### `fix/trim-internal-runs` — Fix TRIM to collapse internal runs of spaces (Excel-compatible)
+
+- **Compare link:** https://github.com/ironcalc/IronCalc/compare/main...scosman:ironcalc:fix/trim-internal-runs
+- **Branch commit:** `6c894ba2` (off `main`) · **`freecell-fixes` merge:** `0a36e79e` · both pushed to `scosman/ironcalc`.
+- **Title:** `Fix TRIM to collapse internal runs of spaces (Excel-compatible)`
+- **Body:**
+
+  > TRIM previously returned `s.trim().to_owned()`, which only stripped the ends and — via Rust's
+  > `str::trim` — removed *all* Unicode whitespace (tab, NBSP, …), violating Excel's contract. Excel's
+  > TRIM operates on the **ASCII space `0x20` only**: it trims leading/trailing spaces **and** collapses
+  > each internal run of two or more spaces to a single space, while leaving tab (`0x09`), non-breaking
+  > space (`0xA0`), and every other whitespace character untouched. The fix replaces the body with a
+  > `0x20`-only `split(' ')/filter(non-empty)/join(" ")` normalization in
+  > `base/src/functions/text/common.rs`, which collapses internal runs and preserves the `0x20`-only scope.
+  >
+  > Minimal repro: `TRIM("a    b")` → `"a b"` (previously `"a    b"`). The `0x20`-only scope is proven by
+  > `TRIM("a"&CHAR(9)&CHAR(9)&"b")` keeping its tabs and `TRIM(CHAR(160)&"x"&CHAR(160))` keeping its NBSPs.
+  >
+  > tests included: `base/src/test/text_functions/mod.rs`
 
 ## Owner action
 

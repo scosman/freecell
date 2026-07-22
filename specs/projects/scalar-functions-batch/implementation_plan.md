@@ -29,7 +29,7 @@ Section refs are to `architecture.md` / `functional_spec.md` §3.
 
 ## Phases
 
-- [ ] **Phase 0 — Fork setup + batch-wide pre-checks.** Clone the fork (git-proxy or `add_repo`);
+- [x] **Phase 0 — Fork setup + batch-wide pre-checks.** Clone the fork (git-proxy or `add_repo`);
       confirm `main` is a clean upstream mirror; sync `main` from upstream if stale. Run the §5.2
       existence sweep for **all 12** names at once (`SUMPRODUCT, PROPER, REPLACE, CHAR, CODE, CLEAN,
       DOLLAR, ADDRESS, PERCENTILE[.INC], QUARTILE[.INC], XMATCH, TRIM`) and record which already exist

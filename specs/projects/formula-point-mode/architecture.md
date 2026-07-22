@@ -1,16 +1,20 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: Formula Point-Mode + Range Highlighting
 
 Technical design for the feature fixed in `functional_spec.md` (behaviour + DPM.1–8 are
-**locked**; owner resolved the editor-consolidation + highlight-API question — spec §Q3 /
-`functional_spec.md:378`). This doc resolves the six architecture questions, specifies the
-data model + seams + algorithms, and hands the coding agent a plan with no significant
-technical decisions left. Component-level detail for the consolidated editor and the vendored
-`InputState` highlight API lives in **[`components/formula_editor.md`](components/formula_editor.md)**;
-this doc references it rather than repeating it.
+**locked**; owner resolved the editor-consolidation question — spec §Q3). This doc resolves
+the six architecture questions, specifies the data model + seams + algorithms, and hands the
+coding agent a plan with no significant technical decisions left. Component-level detail for
+the consolidated editor lives in
+**[`components/formula_editor.md`](components/formula_editor.md)**; this doc references it
+rather than repeating it. **Scope note (owner, 2026-07-18):** in-editor token coloring is
+**out of v0.5** — deferred to the v1.0 FreeCell styled text-input control
+([`../../../projects/styled-text-input-control.md`](../../../projects/styled-text-input-control.md)),
+which will consume this project's color map. **There is no gpui-component / vendored-widget
+change in v0.5.**
 
 **Crate map (unchanged, `gaps_closing_7_15/architecture.md`):** `freecell-core` (pure — no
 gpui, **no IronCalc**, enforced by `tests/dependency_rule.rs`), `freecell-engine` (IronCalc-fork
@@ -22,9 +26,10 @@ GPUI wiring lives in `freecell-app`.
 
 **Standing conventions (`CLAUDE.md`):** crate-scoped build/test per phase; `cargo fmt --all
 --check` every phase; render **subset** while iterating the grid phases; **one** full render
-suite + CI `render` gate in the final phase; commit + push regularly; run cargo from `app/`. The
-vendored gpui-component change (§4.3) is a **bounded, upstreamable** edit to the pinned rev, not a
-fork-of-a-fork — see that section for the versioning note.
+suite + CI `render` gate in the final phase; commit + push regularly; run cargo from `app/`.
+The feature is FreeCell-only: no engine-fork change and **no gpui-component / vendored-widget
+change** (in-editor coloring, which would have needed the widget change, is deferred — see the
+scope note above).
 
 ---
 
@@ -47,21 +52,23 @@ Per edit transition (keystroke, caret move, point insert), while the edit text s
         │  Vec<u8>  (palette slot per token, first-appearance order, mod 7)
         ▼
  EditController formula-feature state  (tokens, colors, pending_ref)   [shared edit layer, Q3/Q5]
-        ├──► InputState::set_highlights(...)  on BOTH editors  [vendored API §4.3 → editor tokens]
-        └──► ChromeGridRequest::EditState { reference_ready, pending_ref, ref_outlines, … }
-                 │                                            [Q2 routing + Q4 same-sheet outlines]
+        └──► ChromeGridRequest::EditState { reference_ready, pending_ref, ref_highlights, … }
+                 │                                            [Q2 routing + Q4 same-sheet highlights]
                  ▼
-             GridView.set_edit_state(...)  → paints outlines (§4.1); mouse_down_cell consults
+             GridView.set_edit_state(...)  → paints highlights (§4.1); mouse_down_cell consults
              reference_ready / pending_ref to branch point-insert vs commit (§3.2); emits
              GridEvent::InsertReference { a1, replace_pending }  ──► chrome splices the ref.
 ```
 
-The two "editors" are the **same control** — `gpui_component::input::InputState` — one owned as
-the data-row `content_input` and one as the in-cell overlay `edit.in_cell()`, **both owned by the
-single `ChromeView` entity** (`chrome/edit.rs` ownership note, lines 1–14). So the token→color map
-is computed **once** on the shared edit state and applied to both inputs from **one** code path;
-the grid additionally paints same-sheet outlines. No per-editor formula logic exists — see §6 and
-the component doc.
+The token→color map is computed **once** on the shared edit state (`EditController`); the grid
+paints the same-sheet **highlights** (rich fill + border, §4.1) from it. The two "editors" — the
+data-row `content_input` and the in-cell overlay `edit.in_cell()`, both
+`gpui_component::input::InputState` and both owned by the single `ChromeView` entity
+(`chrome/edit.rs` ownership note, lines 1–14) — share that one pending edit, so the highlight
+reflects the edit regardless of which editor is focused. In-editor coloring of the reference
+*tokens inside the formula text* is **deferred** (scope note above); the color map is preserved
+because it drives the grid highlights now and the future styled-control will consume it. No
+per-editor formula logic exists — see §6 and the component doc.
 
 ---
 
@@ -142,7 +149,8 @@ crate boundary), consumable by pure core code and the app.
 ```rust
 /// One complete reference token found in an in-progress formula (`architecture.md §1`).
 /// Produced by `freecell_engine::lex_formula_refs`; consumed by color assignment + the grid
-/// outline pass + the editor highlight API. gpui-free + IronCalc-free (plain data).
+/// highlight pass (the `span` is also what the future v1.0 styled text-input control will use
+/// to color the token in-editor). gpui-free + IronCalc-free (plain data).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefToken {
     /// Byte span of the token text within the full edit text (leading `=` included).
@@ -153,7 +161,8 @@ pub struct RefToken {
     /// Part of the color key so a same-target ref on another sheet gets its own color.
     pub sheet: Option<String>,
     /// Whether `target` resolves to the currently visible sheet (Q4): `sheet` is `None` or names
-    /// the active sheet. Only `same_sheet` tokens draw a grid outline; every token colors its text.
+    /// the active sheet. Only `same_sheet` tokens draw a grid highlight; the color map still
+    /// assigns every token a color (consumed by the future in-editor styling control).
     pub same_sheet: bool,
 }
 ```
@@ -165,9 +174,10 @@ pub struct RefToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefColor { pub light: Rgb, pub dark: Rgb }
 
-/// The fixed 7-color reference-highlight cycle (DPM.3). Distinct + legible as editor text AND as
-/// a grid outline, in both themes. Curated from Excel's colored-refs feel; hexes chosen for
-/// contrast against the light cell background and the dark cell background respectively.
+/// The fixed 7-color reference-highlight cycle (DPM.3). Distinct + legible as a grid fill + border
+/// (and, for the future in-editor styling control, as editor text), in both themes. Curated from
+/// Excel's colored-refs feel; hexes chosen for contrast against the light cell background and the
+/// dark cell background respectively.
 pub const REF_HIGHLIGHT_PALETTE: [RefColor; 7] = [ /* … 7 authored light/dark pairs … */ ];
 
 /// The palette slot (0..7) for `index`, recycling past 7 (`index % 7`).
@@ -225,7 +235,7 @@ behaviour is unchanged. (Pushback note, §10.)
 ## 3. Q2 — Routing a grid click into the active editor
 
 **Decision: extend `ChromeGridRequest::EditState` with `reference_ready` + `pending_ref` booleans
-+ a same-sheet `ref_outlines` list; add `GridEvent::InsertReference { a1, replace_pending }`; the
++ a same-sheet `ref_highlights` list; add `GridEvent::InsertReference { a1, replace_pending }`; the
 grid consults the pushed booleans in `mouse_down_cell` to branch point-insert vs commit, and runs
 a local `point_drag` state machine for the drag/replace behaviour.**
 
@@ -246,19 +256,20 @@ EditState {
     /// While set, a grid click **replaces** it even when the caret is not reference-ready
     /// (the pending-ref override, `functional_spec.md §2`).
     pending_ref: bool,
-    /// The same-sheet reference outlines to paint on the grid: each visible-sheet target range
-    /// with its palette slot (Q4). Cross-sheet tokens are omitted here (colored in the editor
-    /// only). Empty while not editing / no same-sheet refs.
-    ref_outlines: Vec<(CellRange, u8)>,
+    /// The same-sheet reference highlights to paint on the grid: each visible-sheet target range
+    /// with its palette slot (Q4), drawn as a rich fill + border. Cross-sheet tokens are omitted
+    /// here (the color map still colors them for the future in-editor control). Empty while not
+    /// editing / no same-sheet refs.
+    ref_highlights: Vec<(CellRange, u8)>,
 }
 ```
 
 `ChromeView::refresh_edit_grid_state` (`chrome/view.rs:1322-1365`) fills these: `reference_ready =
 editing_formula && is_reference_ready(text, caret)`; `pending_ref = self.edit.pending_ref().is_some()`;
-`ref_outlines` = the `same_sheet` subset of `ref_tokens`, each mapped to `(token.target,
+`ref_highlights` = the `same_sheet` subset of `ref_tokens`, each mapped to `(token.target,
 ref_colors[i])`. The window's `EditState` handler (`shell/window.rs:1925-1957`) forwards them to
 `GridView::set_edit_state` (add the three params; stored as `self.reference_ready`,
-`self.pending_ref`, `self.ref_outlines`; `set_active_sheet` and the idle-clear path zero them,
+`self.pending_ref`, `self.ref_highlights`; `set_active_sheet` and the idle-clear path zero them,
 mirroring the existing `incell_*` fields at `view.rs:896-900`).
 
 ### 3.2 The mouse-down branch (`mouse_down_cell`, `grid/view.rs:1461`)
@@ -316,7 +327,7 @@ struct PointDrag {
   `pending_ref` catching up), update `last_range`, and `cx.notify()`. Kick
   `maybe_start_autoscroll`.
 - **Preview:** in the overlay pass (§4.1), when `point_drag` is set draw a preview border over
-  `last_range` — **visually distinct** from the selection border and the ref outlines
+  `last_range` — **visually distinct** from the selection border and the ref highlights
   (`functional_spec.md §2`): use a dashed/2px accent-variant border (reuse `rect_div(...).border_2()`
   with a distinct color constant, e.g. a "point-preview" accent). The editor text already tracks
   the range because each move emitted an `InsertReference`.
@@ -358,95 +369,54 @@ pointer + auto-scroll loop identically.
 
 ## 4. Range highlighting (render)
 
-Two independent render surfaces, both fed from the one token→color map (§0). Grid outlines
-(§4.1) ship **without** the vendored editor change; editor-token coloring (§4.2–4.3) adds it.
+**One** render surface, fed from the one token→color map (§0): the **grid highlight overlay**
+(§4.1), a rich fill + border per same-sheet reference. In-editor token coloring is deferred to the
+v1.0 styled-control project (scope note above), so there is **no editor render path and no
+gpui-component / vendored-widget change in v0.5**. The color map is still computed for every valid
+ref (§0, §6) — it drives the grid highlights now and the future control will consume it.
 
-### 4.1 Grid outlines (same-sheet, DPM.4/DPM.7)
+### 4.1 Grid highlights (same-sheet, DPM.4/DPM.7)
 
 In the grid overlay pass, immediately **after** the selection overlay + **before** the fill
-handle/in-cell overlay (`view.rs:3124-3204`), iterate `self.ref_outlines`. For each `(range,
+handle/in-cell overlay (`view.rs:3124-3204`), iterate `self.ref_highlights`. For each `(range,
 slot)`: clip to the visible frame exactly like the selection overlay (`view.rs:3128-3132`),
-compute `span_rect(range.rows, range.cols, frame)` (`view.rs:4368`), and push
-`rect_div(x,y,w,h).border_2().border_color(rgb(ref_slot_rgb(slot, is_dark)))` — a **border only,
-no fill, no handles** (DPM.7). `ref_slot_rgb(slot, is_dark)` resolves the palette slot to the
-theme-appropriate `Rgb` via `freecell_core::palette::ref_color(slot)`, picking `.light`/`.dark`
-from the window appearance (the grid already themes `ACCENT`/gridlines, so it has the appearance).
+compute `span_rect(range.rows, range.cols, frame)` (`view.rs:4368`), and push a **rich highlight —
+a translucent fill + a border** in the reference's color (DPM.7, no drag handles): a filled
+`rect_div(x,y,w,h)` with `.bg(...)` at a low alpha over `ref_slot_rgba(slot, is_dark)`, plus
+`.border_2().border_color(rgb(ref_slot_rgb(slot, is_dark)))`. `ref_slot_rgb`/`ref_slot_rgba` resolve
+the palette slot to the theme-appropriate color via `freecell_core::palette::ref_color(slot)`,
+picking `.light`/`.dark` from the window appearance (the grid already themes `ACCENT`/gridlines, so
+it has the appearance).
 
-- Off-screen same-sheet refs clip to nothing → no visible outline, editor token still colored
-  (`functional_spec.md §3`), by construction (the clip drops them; the token color is set
-  separately in §4.2).
-- Cross-sheet tokens are **absent from `ref_outlines`** (§3.1 sends only the `same_sheet` subset),
-  so they never draw a grid outline (DPM.4/Q4) yet are still colored in the editor.
-- Three overlays can coexist — selection rectangle, point-drag preview (§3.3), ref outlines — each
-  a distinct color/style, satisfying `functional_spec.md §Cross-cutting` "three visually distinct
-  things on screen at once."
+- Off-screen same-sheet refs clip to nothing → no visible highlight (`functional_spec.md §3`), by
+  construction (the clip drops them). The color map still holds their slot for the future control.
+- Cross-sheet tokens are **absent from `ref_highlights`** (§3.1 sends only the `same_sheet`
+  subset), so they never draw a grid highlight (DPM.4/Q4); the color map still assigns them a color
+  for the future in-editor control.
+- Three overlays can coexist — selection rectangle, point-drag preview (§3.3), ref highlights —
+  each a distinct color/style, satisfying `functional_spec.md §Cross-cutting` "three visually
+  distinct things on screen at once." Keep the translucent fill under the selection rectangle so
+  the active selection stays legible.
 
-### 4.2 Editor-token coloring (both editors, one code path)
+### 4.2 Theme-aware color resolution (shared helper)
 
-Because `ChromeView` owns **both** `InputState`s, the chrome drives the highlight on both from one
-place. In the consolidated recompute (§6), after building `ref_tokens`/`ref_colors`, build a
-`Vec<HighlightSpan>` — one span per token: `HighlightSpan { range: token.span.clone(), color:
-ref_slot_rgba(colors[i], is_dark) }` — for **every** valid ref (same-sheet **and** cross-sheet,
-DPM.4). Then call `input.set_highlights(spans.clone(), cx)` on `content_input` **and**, when the
-overlay is open, on `edit.in_cell()`. The in-cell `InputState` is the same entity the grid renders
-as the overlay (`view.rs:3209`), so its highlight styling flows into the grid's frame with **no
-extra grid wiring** — the grid renders the input; the input carries its own colored runs.
+One `freecell-app` helper resolves a palette slot to concrete colors for the grid render:
+`ref_slot_rgb(slot, is_dark) -> Rgb` (the border) and `ref_slot_rgba(slot, is_dark) -> Hsla` (the
+translucent fill), both over `freecell_core::palette::ref_color(slot)`. `is_dark` comes from the
+active gpui theme/appearance at the grid call site (the grid already resolves theme colors). The
+same helper is what the future styled-control will reuse for editor-text coloring — one palette,
+one resolution path.
 
-Highlights are **cleared** (`input.clear_highlights(cx)`) the instant the edit is non-formula or
-ends: on commit/cancel and whenever the recompute finds no `=`/no tokens. This gives the
-`functional_spec.md §3 Lifecycle` "fully removed on commit/cancel" guarantee for the editor text,
-matching the grid outlines clearing via the `None`/empty `EditState` push.
+### 4.3 Deferred: in-editor token coloring (v1.0 styled text-input control)
 
-### 4.3 Q3 — The vendored `InputState` highlight API
-
-**Decision: add a small, public, caller-driven per-range highlight API to the vendored
-gpui-component `InputState` — independent of its internal `SyntaxHighlighter`/LSP path.**
-
-Established facts (owner, spec §Q3): the pinned rev
-(`a9a7341c35b62f27ff512371c62419342264710c`) has a `CodeEditor` mode carrying `highlighter:
-Rc<RefCell<Option<SyntaxHighlighter>>>` + a `display_map` of styled runs + `lsp/`, but the
-highlighter accessors are `pub(super)` — **no public per-range hook** an external caller can drive
-per-keystroke. We add one. Surface (full spec + placement in **`components/formula_editor.md
-§2`**):
-
-```rust
-// gpui_component::input  (new public items)
-/// A caller-supplied foreground-color span over the input's current value, in **byte** offsets
-/// (consistent with `InputState::cursor()` and FreeCell's lexer byte spans).
-#[derive(Debug, Clone)]
-pub struct HighlightSpan { pub range: std::ops::Range<usize>, pub color: gpui::Hsla }
-
-impl InputState {
-    /// Replace all caller-driven highlights (empty clears). Overlaid as foreground-color runs on
-    /// top of the base text style at paint time; independent of the CodeEditor/SyntaxHighlighter
-    /// path, so a plain single-line input can use it. Notifies + repaints.
-    pub fn set_highlights(&mut self, spans: Vec<HighlightSpan>, cx: &mut Context<Self>);
-    /// Clears all caller-driven highlights.
-    pub fn clear_highlights(&mut self, cx: &mut Context<Self>);
-}
-```
-
-Implementation (bounded, upstreamable): a `highlights: Vec<HighlightSpan>` field on `InputState`;
-in the run-building path that produces the text's `TextRun`s, after the base run(s) are built,
-split/override the foreground color on each highlight range (clamped to char boundaries, mapped
-from byte → the run builder's index unit — confirm the internal unit at impl; the input already
-does byte↔char/utf-16 conversions for `cursor()`/`Position`). Empty `highlights` ⇒ no behavioural
-change (the default), so the edit is safe for the non-formula inputs that never call it. This
-mirrors what the `SyntaxHighlighter` already does (emit styled runs) but as an explicit, external,
-per-range set — a natural upstream contribution ("external per-range text highlights on
-`InputState`"). **Versioning:** this edits the pinned-rev vendored copy of gpui-component; bump the
-pin / carry the patch per the repo's gpui-component vendoring process (it is `git`-pinned in
-`app/Cargo.toml`), and prepare the upstream PR the same way the IronCalc fork fixes are prepared
-(one focused change). The grid-outline value (§4.1) ships **independently** of this, so a coding
-phase can land+validate outlines before the vendored change is merged (§9 phasing).
-
-### 4.4 Theme-aware color resolution (shared helper)
-
-One `freecell-app` helper resolves a palette slot to a concrete color for both render sites:
-`ref_slot_rgba(slot, is_dark) -> Hsla` (editor highlight) and `ref_slot_rgb(slot, is_dark) -> Rgb`
-(grid outline), both over `freecell_core::palette::ref_color(slot)`. `is_dark` comes from the
-active gpui theme/appearance at each call site (chrome for the data-row editor + the highlight on
-both inputs; grid for outlines). One palette, two render surfaces, identical color per ref.
+Coloring the reference *tokens inside the formula text* is **out of v0.5**. gpui-component's
+`InputState` exposes no public per-range text-styling hook an external caller can drive
+per-keystroke (the pinned rev's `SyntaxHighlighter`/`display_map` accessors are `pub(super)`, and
+its `CodeEditor` mode takes only a built-in language name), and the owner will not maintain a second
+fork. In-editor coloring is therefore deferred to the **v1.0 FreeCell styled text-input control**
+([`../../../projects/styled-text-input-control.md`](../../../projects/styled-text-input-control.md)),
+which replaces `InputState` for FreeCell's formula editors and consumes this project's token→color
+map (`RefToken.span` + `ref_colors`). **No gpui-component / vendored-widget change ships in v0.5.**
 
 ---
 
@@ -490,23 +460,31 @@ pending_ref`, so the pending ref is overwritten rather than a second ref appende
 
 Per the owner decision (spec §Q3), the formula-feature stack — autocomplete, sig-hints, the
 token→color map, the pending-ref/point-mode state — attaches to the **shared edit layer**
-(`DataRow` reducer + the promoted `EditController`), **not** as per-editor helpers, and both
-editors are the one `InputState` control. The consolidation shape, the exact `EditController`
-delta (new state + methods: `pending_ref`/`set_pending_ref`, the relocated autocomplete/sig-hint
-state, `recompute_formula_edit_state`, `insert_reference`, `formula_highlight_spans`), the two
-thin host adapters (grid overlay render/event; chrome data-row render/event — each carrying **zero
-formula logic**), and the migration steps are specified in
+(`DataRow` reducer + the promoted `EditController`), **not** as per-editor helpers. Both editors
+are the one `InputState` control, so point-mode and the shared derived state drive off the same
+pending edit regardless of which editor is focused. The consolidation shape, the exact
+`EditController` delta (new state + methods: `pending_ref`/`set_pending_ref`, the relocated
+autocomplete/sig-hint state, `recompute_formula_edit_state`, `insert_reference`, `ref_highlights`
+for the grid), the two thin host adapters (grid overlay render/event; chrome data-row
+render/event — each carrying **zero formula logic**), and the migration steps are specified in
 **[`components/formula_editor.md`](components/formula_editor.md)**. That doc is the DELTA to the
 existing (other-project) `specs/projects/mvp-gaps/components/edit_controller.md`, which is **not**
 edited here.
+
+In-editor coloring of the reference *tokens inside the formula text*, and the eventual
+`InputState` replacement it needs, are **out of v0.5** — deferred to the v1.0 FreeCell styled
+text-input control
+([`../../../projects/styled-text-input-control.md`](../../../projects/styled-text-input-control.md)).
+The consolidation here still computes the token→color map: it drives the grid highlights now, and
+the future control will consume it.
 
 The one consolidation seam this doc pins: the existing per-keystroke recompute
 `recompute_autocomplete` (`chrome/view.rs:1383`), called from both Change handlers + the
 caret-move path, is generalized to `recompute_formula_edit_state`, which additionally (a) calls
 `freecell_engine::lex_formula_refs`, (b) `assign_ref_colors`, (c) computes `is_reference_ready`,
-(d) clears `pending_ref` (except when re-entered from `insert_reference`), (e) drives
-`set_highlights` on both inputs. Autocomplete and highlighting thus recompute in lockstep off one
-text/caret read — no second traversal, no separate cadence.
+and (d) clears `pending_ref` (except when re-entered from `insert_reference`). Autocomplete and
+grid highlighting thus recompute in lockstep off one text/caret read — no second traversal, no
+separate cadence.
 
 ---
 
@@ -522,9 +500,9 @@ text/caret read — no second traversal, no separate cadence.
   an A1 string is tiny; the cap check still runs for consistency). A self-reference (clicking the
   edited cell in the data-row editor, DPM.5) inserts normally and surfaces as a circular-ref at
   commit via the engine's existing handling — no special-casing.
-- **No new async, no new worker command, no fork(-engine) change** — the whole feature is a
-  synchronous read (lex) + existing edit/commit plumbing + a bounded vendored-widget edit. The
-  only "engine" surface is one pure free function (§1.2).
+- **No new async, no new worker command, no fork(-engine) change, no vendored-widget change** —
+  the whole feature is a synchronous read (lex) + existing edit/commit plumbing. The only "engine"
+  surface is one pure free function (§1.2).
 
 ---
 
@@ -560,34 +538,30 @@ text/caret read — no second traversal, no separate cadence.
   - point-drag: a synthetic drag origin→target emits `InsertReference` with the merge-expanded
     `to_a1()` range and updates only on cell change; release on origin → single-cell ref.
   - merges: click a covered cell → anchor ref; drag touching a merge → whole-span range.
-  - highlight fan-out: after a recompute, both `content_input` and (when open) `edit.in_cell()`
-    received a `set_highlights` with one span per valid ref; cross-sheet token colored but absent
-    from `ref_outlines`; commit/cancel clears highlights + pushes empty `ref_outlines`.
+  - grid highlights: after a recompute, `ref_highlights` holds one entry per **same-sheet** valid
+    ref (`(target, slot)`); a cross-sheet ref is **absent** from `ref_highlights` but still present
+    in the color map (`ref_tokens`/`ref_colors`); commit/cancel pushes an empty `ref_highlights`.
   - the autocomplete→point happy path (`functional_spec.md §4`): accept `SUM(` then a point click
     → `=SUM(C3` with the caret reference-ready in between (guards the two features' shared caret
     contexts).
-- **Render (pixel) — in-scope surfaces only (`functional_spec.md §Pixel suite scope`):** the
-  in-cell overlay's **outlines + token colors** land in the grid frame → in-scope; the data-row
-  field's token color renders in chrome → out-of-scope (gpui view test + smoke launch). New
-  baseline cases (added in the §9 phase): `formula_ref_outlines_same_sheet` (a formula editing a
-  cell with `A1`/`C3:E7` refs on the visible sheet → colored outlines), `incell_editor_token_colors`
-  (the in-cell overlay showing colored ref tokens), `formula_ref_point_preview` (a live point-drag
-  preview vs selection vs outline, three distinct styles). Subset prefixes while iterating:
-  `render_tests.sh test incell_`, `… test formula_ref`, `… test selection`.
-- **Vendored `InputState` highlight API:** carry an upstream-style unit test with the
-  gpui-component change (a single-line input with two `HighlightSpan`s renders two colored runs;
-  empty clears). Its pixel effect is covered by the `incell_editor_token_colors` baseline.
+- **Render (pixel) — in-scope surfaces (`functional_spec.md §Pixel suite scope`):** the grid
+  highlight overlay (rich fill + border) and the point-drag preview land in the grid frame →
+  in-scope. New baseline cases (added in the §9 phase): `formula_ref_highlight_same_sheet` (a
+  formula editing a cell with `A1`/`C3:E7` refs on the visible sheet → rich fill + border
+  highlights), `formula_ref_point_preview` (a live point-drag preview vs selection vs highlight,
+  three distinct styles). There is **no in-editor token coloring** in v0.5, so no editor-coloring
+  baseline. Subset prefixes while iterating: `render_tests.sh test formula_ref`, `… test selection`.
 
 ---
 
 ## 9. Render validation (final, dedicated phase)
 
 Per `CLAUDE.md` (in-scope rendering change → its own late phase, never intermixed). After all
-coding phases are committed: regenerate + **eyeball** the new/affected baselines (the three new
-cases above + any `incell_editor_*`/`selection`/`cell_*` that shift), run the **full** pixel suite
-once under a `timeout` + ~10-min watchdog (`render_tests.sh test`), commit refreshed baselines with
-sign-off, then dispatch the CI **`render`** gate on the branch (`gh workflow run render.yml --ref
-<branch>`) and confirm green. Earlier coding phases use only the relevant **subset**.
+coding phases are committed: regenerate + **eyeball** the new/affected baselines (the two new
+cases above + any `selection`/`cell_*` that shift), run the **full** pixel suite once under a
+`timeout` + ~10-min watchdog (`render_tests.sh test`), commit refreshed baselines with sign-off,
+then dispatch the CI **`render`** gate on the branch (`gh workflow run render.yml --ref <branch>`)
+and confirm green. Earlier coding phases use only the relevant **subset**.
 
 ---
 
@@ -600,7 +574,7 @@ The functional spec is **locked**; nothing here changes locked behaviour. Two no
   *derived* `reference_ready` / `pending_ref` booleans (§3.1), and the chrome does the actual splice
   against the input's own caret. Pushing the caret too would duplicate a source of truth that can
   drift under the deferred `EditState` round-trip. So `EditState` carries the two booleans (+
-  `ref_outlines`), **not** the caret. Behaviour is identical; the seam is cleaner. Flagged for
+  `ref_highlights`), **not** the caret. Behaviour is identical; the seam is cleaner. Flagged for
   visibility; no owner decision needed.
 - **Mid-drag correctness owned by the grid, not the round-trip (§3.3).** Because `EditState` is
   pushed to the grid **deferred** (`shell/window.rs:1942`), the grid must not depend on the pushed
@@ -613,9 +587,10 @@ The functional spec is **locked**; nothing here changes locked behaviour. Two no
 
 ## 11. 1-phase vs 2-phase
 
-**Two-phase** (this `architecture.md` + one component doc). The consolidated editor + the vendored
-`InputState` highlight API is a genuinely complex, cross-cutting sub-component (it touches the
-shared edit layer, both host adapters, and an external vendored crate) that warrants its own
-`components/formula_editor.md`; the rest (tokenization seam, palette/predicate, grid routing +
-outlines) fits here. The engine tokenization function, the core palette/predicate, and the grid
-routing are simple enough to specify inline above and don't need their own docs.
+**Two-phase** (this `architecture.md` + one component doc). The consolidated editor — the promoted
+`EditController` as the single owner of the formula-feature state, with two thin host adapters — is
+a genuinely complex, cross-cutting sub-component (it touches the shared edit layer and both host
+adapters) that warrants its own `components/formula_editor.md`; the rest (tokenization seam,
+palette/predicate, grid routing + highlights) fits here. The engine tokenization function, the core
+palette/predicate, and the grid routing are simple enough to specify inline above and don't need
+their own docs.

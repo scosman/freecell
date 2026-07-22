@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: Formula Point-Mode + Range Highlighting
@@ -13,19 +13,21 @@ deferred to `architecture.md` and flagged under "Architecture questions" below.
 While a user is editing a **formula** (the edit text starts with `=`), two behaviors turn
 on:
 
-1. **Range highlighting** — every distinct cell reference already in the in-progress
-   formula is drawn with a colored outline on the grid, and that reference's token in the
-   editor text is drawn in the **same** color (Excel's colored-refs). "What does this
-   formula point at" becomes legible at a glance.
+1. **Range highlighting (grid)** — every distinct cell reference already in the in-progress
+   formula is drawn on the grid as a **rich colored highlight — a colored fill + border**
+   around the referenced range, each distinct reference a distinct color (Excel's
+   colored-refs). "What does this formula point at" becomes legible at a glance.
 2. **Point-mode** — clicking, or click-dragging, a cell/range on the grid inserts that
    reference into the formula at the caret, instead of the user typing `A1:B5` by hand. A
    grid click when the caret is **not** in a reference-ready position behaves as today
    (commits the edit and moves the selection).
 
-Both behaviors apply in **both** editors: the in-cell editor (the overlay the grid draws
+Point-mode works from **both** editors: the in-cell editor (the overlay the grid draws
 over the active cell) and the data-row editor (the formula bar). The two editors already
-share one pending edit through the chrome's edit reducer, so highlighting and point-mode
-are driven off the same text/caret regardless of which editor has focus.
+share one pending edit through the chrome's edit reducer, so the grid highlighting and
+point-mode are both driven off the same shared pending text/caret regardless of which
+editor has focus. Range highlighting is drawn **on the grid only** — there is no coloring
+of the reference tokens inside the editor text in v0.5 (that is deferred; see §6).
 
 ## Cross-cutting conventions
 
@@ -35,9 +37,10 @@ are driven off the same text/caret regardless of which editor has focus.
   enters point-mode; a grid click during a non-formula edit behaves exactly as today.
 - **View-only, never mutating the selection.** Neither behavior changes the actual grid
   `SelectionModel` (`freecell-core/src/selection.rs`). Point-mode changes **only the
-  formula text**; the active cell / selected range the grid tracks is untouched. Highlight
-  outlines are a **separate overlay** from the selection rectangle and the point-mode
-  drag preview — three visually distinct things can be on screen at once.
+  formula text**; the active cell / selected range the grid tracks is untouched. The
+  reference highlights (fill + border) are a **separate grid overlay** from the selection
+  rectangle and the point-mode drag preview — three visually distinct things can be on
+  screen at once.
 - **Reference source of truth = the engine lexer.** Which byte spans in the edit text are
   reference tokens (and what cell/range each resolves to) comes from tokenizing the
   in-progress formula with the engine's public `Lexer`/`Parser` (in the IronCalc fork, not
@@ -48,14 +51,13 @@ are driven off the same text/caret regardless of which editor has focus.
 - **Undo / commit.** Point-mode edits the pending text like typing does; committing the
   edit is **one** undo step (the existing per-edit commit), exactly as if the reference had
   been typed. Point-mode itself adds no separate undo entries.
-- **Pixel suite scope.** Range highlighting draws colored **outlines on the grid** and
-  colors the **in-cell editor** tokens — the in-cell editor is the `InputState` the grid
-  renders as an absolute overlay, so its pixels land in the grid's rendered frame — both
-  move grid pixels, so this feature is **in-scope** for the pixel render suite (verify with a
+- **Pixel suite scope.** Range highlighting draws a rich colored **fill + border on the
+  grid**, and the point-mode drag shows a **preview rectangle** on the grid — both move grid
+  pixels, so this feature is **in-scope** for the pixel render suite (verify with a
   `render_tests.sh test` subset while iterating; full suite + CI `render` gate once, in a
-  dedicated late phase). The **data-row** field's token coloring renders in the chrome
-  element tree, **out** of pixel-suite scope (verify with gpui view tests + a smoke launch).
-  Plan render validation as its own late phase per the repo convention.
+  dedicated late phase). There is **no in-editor token coloring** in v0.5, so no chrome
+  element-tree coloring to validate. Plan render validation as its own late phase per the
+  repo convention.
 
 ---
 
@@ -164,7 +166,7 @@ follow-up point action.
   cell-drag auto-scroll loop, `grid/view.rs`), so a range can be swept beyond the visible
   area; the inserted range reflects the final released rectangle.
 - A live point-mode drag shows a **preview rectangle** of the range being swept (visually
-  distinct from the selection rectangle and from the reference outlines), and the editor
+  distinct from the selection rectangle and from the reference highlights), and the editor
   text updates to the in-progress range as the drag grows (so `C3`, then `C3:D5`, then
   `C3:E7`), mirroring the pending-ref replace behavior on each frame.
 - Releasing on the **same cell** the drag started on inserts a single-cell ref (`C3`), not
@@ -172,19 +174,20 @@ follow-up point action.
 
 ---
 
-## 3. Range highlighting (colored refs)
+## 3. Range highlighting (colored refs, grid-only)
 
 ### What is highlighted
 
-For every **valid reference token** the engine lexer finds in the in-progress formula:
+For every **valid reference token** the engine lexer finds in the in-progress formula, if
+the reference resolves to a cell/range **on the currently visible sheet**, a rich colored
+**highlight — a fill + border (no drag handles — DPM.7)** — is drawn around that cell/range
+on the grid, in the reference's assigned color (DPM.3).
 
-- the reference's **token text in the editor** is drawn in an assigned color, and
-- if the reference resolves to a cell/range **on the currently visible sheet**, a colored
-  **outline** (a border, no fill, no drag handles — DPM.7) is drawn around that cell/range
-  on the grid, in the **same** color.
-
-Editor-token color and grid outline always use the same color for the same reference, so
-the eye pairs them.
+The highlight is drawn on the **grid only**; the reference token inside the editor text is
+**not** colored in v0.5 (in-editor coloring is deferred to the future styled text-input
+control — §6). The token→color map is still computed for every valid reference (§Color
+assignment below) — it drives the grid highlights now and will feed the future in-editor
+styling control.
 
 ### Color assignment — DPM.3
 
@@ -192,9 +195,10 @@ the eye pairs them.
   (so two occurrences of `A1` in one formula share one color; `A1` and `B2` get different
   colors).
 - The palette is a fixed cycle of **N distinct colors** (recommend **7**), theme-aware
-  (legible in light and dark, both as editor text and as a grid outline). Beyond N distinct
-  references the palette **recycles** (the 8th distinct ref reuses color 1, etc.) — Excel
-  does the same; collisions past 7 refs are acceptable.
+  (legible in light and dark, as a grid fill + border; the same slots will color editor
+  text in the future control). Beyond N distinct references the palette **recycles** (the
+  8th distinct ref reuses color 1, etc.) — Excel does the same; collisions past 7 refs are
+  acceptable.
 - Assignment order is by first appearance left-to-right in the formula text, so colors are
   stable as the user types more of the formula (adding a later ref never recolors earlier
   ones; only removing/merging references can shift the cycle).
@@ -203,24 +207,23 @@ the eye pairs them.
 
 - **Invalid / partial references** — a bare `=A`, an unterminated range `=A1:`, an
   incomplete sheet qualifier `=Sheet2!`, garbage, or a reference inside a string literal —
-  get **no** color and **no** outline. Only tokens the lexer classifies as complete
-  references highlight. As the user finishes typing a partial ref, it lights up.
+  get **no** highlight. Only tokens the lexer classifies as complete references highlight.
+  As the user finishes typing a partial ref, it lights up.
 - **Off-screen references** — a valid same-sheet ref scrolled out of view has **no visible
-  outline** (there is nothing on screen to outline); its editor token is still colored.
-  This is fine and expected.
-- **Cross-sheet references** (`Sheet2!A1`) — **no grid outline** on the current grid,
-  because the other sheet is not shown (default per the owner decision: outline only
-  same-sheet refs on the visible grid). Their **editor token is still colored** (coloring
-  text is free and matches the overview's "highlighting includes already-typed cross-sheet
-  refs"). The token↔outline correspondence is one-directional for these: a colored token
-  with no on-grid outline. (This split is an architecture question — DPM.4 / Q4.)
+  highlight** (there is nothing on screen to highlight). This is fine and expected. (The
+  color map still assigns it a color for the future control.)
+- **Cross-sheet references** (`Sheet2!A1`) — **no grid highlight** on the current grid,
+  because the other sheet is not shown (default per the owner decision: highlight only
+  same-sheet refs on the visible grid). The color map still assigns them a color (consumed
+  by the future in-editor styling control), but v0.5 draws nothing on the grid for them.
+  (This split is an architecture question — DPM.4 / Q4.)
 
 ### Lifecycle
 
 Highlights exist **only while a formula edit is open**. They appear as soon as the edit
 starts with `=` and a valid ref is present, update live per keystroke and per point action,
 and are **fully removed** the instant the edit commits (Enter/Tab/click-away) or cancels
-(Escape) — a committed cell shows its computed value with no colored outlines.
+(Escape) — a committed cell shows its computed value with no reference highlights.
 
 ---
 
@@ -242,7 +245,7 @@ never both apply to one caret position:
   click on `C3:E7` yields `=SUM(C3:E7`, no typing. Call this out; it is the payoff of the
   two features sharing plumbing.
 - The **signature hint** (passive, shows the arg template while the caret is inside a
-  recognized call) coexists with highlighting; it is unaffected. Highlight outlines and the
+  recognized call) coexists with highlighting; it is unaffected. The grid highlights and the
   hint can be on screen together.
 
 ### Merged cells (work in progress) — DPM.6
@@ -257,7 +260,7 @@ never both apply to one caret position:
 ### Selection
 
 Point-mode and highlighting **never** change the grid selection. The selected cell/range
-stays put throughout an edit; only the formula text and the overlay outlines change. (This
+stays put throughout an edit; only the formula text and the grid overlay highlights change. (This
 is the delicate part called out in the overview: routing grid mouse input into the active
 editor **without** firing the usual selection change / commit-on-click.)
 
@@ -299,6 +302,14 @@ editor **without** firing the usual selection change / commit-on-click.)
 
 ## 6. Out of scope (v0.5) — deferred to v1.0
 
+- **In-editor token coloring / rich in-editor text formatting** — coloring the reference
+  *tokens inside the formula text* (and richer in-editor formatting: backgrounds,
+  Excel/Numbers/Sheets-like styling). **Deferred to a separate future project — the
+  FreeCell styled text-input control** (v1.0 GAP,
+  [`projects/styled-text-input-control.md`](../../../projects/styled-text-input-control.md)) —
+  because gpui-component's `InputState` exposes no external per-range styling and the owner
+  will not fork it. The token→color map this project computes is exactly what that future
+  control will consume. **There is no gpui-component / vendored-widget change in v0.5.**
 - **Arrow-key point-mode** (arrow around the grid to build a reference without the mouse).
   **Explicit reason:** while a formula editor is focused, the arrow keys are **text-cursor
   movement inside the editor**; overloading them to also move a point-mode marker on the
@@ -307,9 +318,10 @@ editor **without** firing the usual selection change / commit-on-click.)
   v0.5. (v1.0 resolves the conflict, e.g. a mode gate.)
 - **Cross-sheet point-mode *insertion*** — clicking another sheet's tab mid-formula, then a
   cell on that sheet, to insert `Sheet2!A1`. **Out for v0.5, and a GAPS.md entry should be
-  added** for it (v1.0 tier). Note the asymmetry: *highlighting* of already-typed
-  cross-sheet references' **editor tokens** is **in** (§3); only cross-sheet *insertion* and
-  cross-sheet **grid outlines** are out.
+  added** for it (v1.0 tier). The color map still assigns a color to already-typed
+  cross-sheet references (consumed by the future in-editor styling control), but v0.5 draws
+  **no grid highlight** for them and inserts no cross-sheet reference — only same-sheet
+  *insertion* and same-sheet *grid highlights* ship.
 - **Editing an existing reference by dragging its highlight's handles** (Excel's blue
   resize box on a highlighted range) — v1.0.
 - **Absolute/mixed reference toggle** (F4 cycling `A1` → `$A$1` → `A$1` → `$A1`) while
@@ -332,16 +344,16 @@ editor **without** firing the usual selection change / commit-on-click.)
   reference** (repeats share), a fixed palette of **7** theme-aware colors that **recycle**,
   assigned by first-appearance order. Alt: per-token (recolors repeats differently — noisier)
   or a larger palette (diminishing returns; 7 matches Excel's feel).
-- **DPM.4 — Cross-sheet highlighting.** *Recommended:* **color the editor token for every
-  valid reference** (incl. cross-sheet), but draw a **grid outline only for references
-  resolving to the visible sheet**. Keeps token coloring cheap/complete while honoring
-  "outline only same-sheet on the visible grid." (Also an architecture seam — Q4.)
+- **DPM.4 — Cross-sheet highlighting.** *Recommended:* draw a **grid highlight only for
+  references resolving to the visible sheet**; the color map still assigns a color to every
+  valid reference (incl. cross-sheet) for the future in-editor styling control. Honors
+  "highlight only same-sheet on the visible grid." (Also an architecture seam — Q4.)
 - **DPM.5 — Clicking the edited cell.** *Recommended:* **insert the self-reference**; let the
   engine's circular-ref handling surface it at commit (data-row editor). The in-cell overlay
   occludes its own cell, so that path is naturally text-editing.
 - **DPM.6 — Merged cell resolution.** *Recommended:* a click on a covered cell inserts the
   **merge anchor** ref; a drag touching a merge expands to the **whole merged span**.
-- **DPM.7 — Grid outline style.** *Recommended:* a **colored border** (no fill, no drag
+- **DPM.7 — Grid highlight style.** *Recommended:* a **rich colored fill + border** (no drag
   handles) for v0.5. Handles are v1.0 (they enable drag-to-edit, which is out).
 - **DPM.8 — Highlight/point gating.** *Recommended:* both behaviors are **strictly gated on a
   formula edit** (leading `=`); a non-formula edit never highlights or enters point-mode.
@@ -375,28 +387,29 @@ recommended default.
    against the shared reducer. The grid consults the pushed signal in `mouse_down_cell` to
    choose point vs. commit.
 
-3. **Where highlight colors are computed and painted, for both editors. — RESOLVED (owner,
-   2026-07-18).** Corrected premise: **both** editors are the *same* control —
-   `gpui_component::input::InputState` (the in-cell editor is the chrome-owned `InputState`
-   the grid renders as an overlay, **not** hand-rolled `TextRun`s). `InputState` is
-   code-editor-capable (its `input/` module has a `CodeEditor` mode carrying a
-   `SyntaxHighlighter` + a `display_map`), but exposes no public per-range highlight hook an
-   external caller can drive per-keystroke. **Decision:** compute the token→color map **once**
-   on the shared edit state; the grid paints the same-sheet **outlines** from it; and add
-   **one public per-range highlight API to the vendored gpui-component `InputState`**
-   (upstreamable), driven from that same map, so **both** editors color identically from one
-   code path. Consolidate the formula-feature stack (autocomplete, sig-hints, color map,
-   pending-ref/point-mode state) onto the existing shared layer — the `DataRow` reducer +
-   `EditController` promoted into the single owner/factory for the formula-editor pair —
-   rather than per-editor helpers. Grid outlines ship regardless of the highlight-hook
-   timing. Detail belongs in `architecture.md` / `components/edit_controller.md`.
+3. **Where highlight colors are computed, and the editor consolidation. — RESOLVED (owner,
+   2026-07-18).** **Decision:** compute the token→color map **once** on the shared edit
+   state; the grid paints the same-sheet **highlights** (rich fill + border) from it.
+   In-editor coloring of the reference *tokens inside the formula text* is **out of v0.5** —
+   it needs external per-range text styling that gpui-component's `InputState` does not
+   expose and the owner will not fork; that work is **deferred to the v1.0 FreeCell styled
+   text-input control**
+   ([`projects/styled-text-input-control.md`](../../../projects/styled-text-input-control.md)),
+   which will consume this project's color map. **There is no gpui-component / vendored-widget
+   change in v0.5.** The consolidation still happens: fold the formula-feature stack
+   (autocomplete, sig-hints, color map, pending-ref/point-mode state) onto the existing
+   shared layer — the `DataRow` reducer + `EditController` promoted into the single
+   owner/factory for the formula-editor pair — rather than per-editor helpers (point-mode
+   needs the shared state, and it sets up the future control). Detail belongs in
+   `architecture.md` / `components/formula_editor.md`.
 
-4. **Cross-sheet highlight handling (token color ↔ grid outline correspondence).** With the
-   DPM.4 default, a cross-sheet token is colored in the editor but has no on-grid outline —
-   resolve how the color map handles references that never draw an outline, and whether a
-   cross-sheet ref *to the current sheet* (`Sheet1!A1` on Sheet1) should outline.
-   *Recommended:* outline any reference whose resolved **target sheet == the visible sheet**
-   (qualified or not); color the editor token for all valid refs regardless.
+4. **Cross-sheet highlight handling (grid-only).** With the DPM.4 default, a cross-sheet
+   reference draws **no grid highlight**, yet the color map still assigns it a color (for the
+   future in-editor styling control) — resolve how the color map handles references that
+   never draw a grid highlight, and whether a cross-sheet ref *to the current sheet*
+   (`Sheet1!A1` on Sheet1) should highlight. *Recommended:* highlight any reference whose
+   resolved **target sheet == the visible sheet** (qualified or not); the color map still
+   colors all valid refs regardless (the grid draws only the same-sheet subset).
 
 5. **Pending-ref state ownership + lifecycle.** Where the "just-pointed, replace-on-next-point"
    span lives, and how it is invalidated. *Recommended:* a chrome-owned pending-ref byte span

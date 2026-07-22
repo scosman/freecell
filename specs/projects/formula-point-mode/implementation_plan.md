@@ -21,7 +21,7 @@ from `app/`.
 
 ## Phases
 
-- [ ] **Phase 1 — Tokenization seam + pure foundation (§1, §2).** No pixels, no gpui.
+- [x] **Phase 1 — Tokenization seam + pure foundation (§1, §2).** No pixels, no gpui.
       - `freecell-core`: add `RefToken` (`refs.rs`), `is_reference_ready` (`functions.rs`, beside
         `is_function_position_prev`/`in_string_at`), `RefColor` + `REF_HIGHLIGHT_PALETTE` (7 authored
         light/dark pairs) + `ref_color` + `assign_ref_colors` (`palette.rs`).

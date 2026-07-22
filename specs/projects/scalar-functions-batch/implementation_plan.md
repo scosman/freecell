@@ -69,7 +69,7 @@ Section refs are to `architecture.md` / `functional_spec.md` §3.
       binary desc); reuse MATCH comparison + the fork wildcard matcher; type-sensitive + case-insensitive;
       2-D array → `#VALUE!`; not found → `#N/A`; invalid mode → `#N/A` (O-6). Tests = §3.11 + 2-D,
       case-insensitive, binary-desc, and the **binary≡linear-on-sorted** equivalence test.
-- [ ] **Phase 11 — Integration + FreeCell pickup + PR prep.** Confirm all 10 `fix/*` are merged into
+- [x] **Phase 11 — Integration + FreeCell pickup + PR prep.** Confirm all 10 `fix/*` are merged into
       `freecell-fixes` and pushed (or durable patches recorded). In FreeCell: `cd app && cargo update -p
       ironcalc_base -p ironcalc` to re-pin the lock onto the new `freecell-fixes` HEAD; add + run the
       **FreeCell-side smoke** (`freecell-engine` test: one formula per new function returns its computed
@@ -94,5 +94,18 @@ Section refs are to `architecture.md` / `functional_spec.md` §3.
 
 ## Status
 
-All phases **not started** (this is a planning artifact). The per-branch upstreaming state lives in
-`fork-fixes/README.md` (the tracker), updated as each branch lands.
+**All phases complete.** The batch's real deliverable narrowed during verification from the
+10 front-loaded `fix/*` branches to **4 real fork branches / PRs** — `fix/trim-internal-runs`
+(TRIM), `fix/dollar-negative-zero` (DOLLAR), `fix/address-empty-sheet` (ADDRESS), and
+`fix/xmatch-array-constant` (XMATCH) — all merged onto `freecell-fixes` (HEAD `9161a463`) and
+pushed. The other **7 functions** (PROPER, REPLACE, CHAR, CODE, CLEAN, PERCENTILE.INC,
+QUARTILE.INC) were found **already present upstream + verified in place** (no branch, no PR).
+**SUMPRODUCT** is present + verified; its `--`-idiom divergence is an **engine unary-minus
+operator** bug, spun out as a **deferred** off-critical-path follow-on
+(`projects/unary-minus-boolean-coercion.md`), not fixed here.
+
+Phase 11 re-pinned FreeCell's lock onto `freecell-fixes` HEAD (`81feec40` → `9161a463`) and
+added a `freecell-engine` smoke test (13 assertions: 9 presence + 4 fixes) proving the batch
+computes end-to-end through the FreeCell engine seam. The per-branch upstreaming state + the
+4 finalized upstream-PR preps (for the owner to open) live in `fork-fixes/README.md` (the
+tracker).

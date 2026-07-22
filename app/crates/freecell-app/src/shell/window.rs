@@ -1930,6 +1930,9 @@ fn make_chrome_grid_sink(
                 quick_edit,
                 autocomplete,
                 sig_hint,
+                reference_ready,
+                pending_ref,
+                ref_highlights,
             } => {
                 // Deferred: the chrome may be emitting this from inside the grid's own `update`
                 // (a grid-originated type-to-replace / in-cell trigger), so touching the grid now
@@ -1940,6 +1943,9 @@ fn make_chrome_grid_sink(
                 let quick_edit = *quick_edit;
                 let autocomplete = autocomplete.clone();
                 let sig_hint = sig_hint.clone();
+                let reference_ready = *reference_ready;
+                let pending_ref = *pending_ref;
+                let ref_highlights = ref_highlights.clone();
                 window.defer(cx, move |_window, cx| {
                     if let Some(grid) = grid.upgrade() {
                         grid.update(cx, |g, cx| {
@@ -1950,6 +1956,9 @@ fn make_chrome_grid_sink(
                                 quick_edit,
                                 autocomplete,
                                 sig_hint,
+                                reference_ready,
+                                pending_ref,
+                                ref_highlights,
                                 cx,
                             )
                         });

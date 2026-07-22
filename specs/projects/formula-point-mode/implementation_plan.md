@@ -36,7 +36,7 @@ from `app/`.
         table, `assign_ref_colors`, palette len/wrap, `lex_formula_refs` over crafted formulas incl.
         cross-sheet + partial). `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 2 — Shared color map + grid highlights (§2.4, §3.1, §4.1, §6).** Ships user-visible
+- [x] **Phase 2 — Shared color map + grid highlights (§2.4, §3.1, §4.1, §6).** Ships user-visible
       value with **no** gpui-component / vendored-widget dependency; no in-editor token coloring
       (deferred to v1.0).
       - `freecell-app` chrome: promote the formula-feature state onto `EditController`

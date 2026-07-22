@@ -128,6 +128,9 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             false,
                             None,
                             None,
+                            false,
+                            false,
+                            Vec::new(),
                             cx,
                         );
                     }
@@ -145,6 +148,9 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             false,
                             None,
                             None,
+                            false,
+                            false,
+                            Vec::new(),
                             cx,
                         );
                     }

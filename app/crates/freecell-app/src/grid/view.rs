@@ -354,6 +354,22 @@ pub struct GridView {
     /// path (only ever `true` while an edit is live).
     quick_edit: bool,
 
+    // ---- Formula reference highlighting + point-mode (`formula-point-mode`) --------------------
+    /// The same-sheet reference highlights to paint while a formula edit is open
+    /// (`formula-point-mode/architecture.md §4.1`): each target range + its palette slot, pushed by
+    /// the chrome via [`set_edit_state`](Self::set_edit_state). Painted as a rich fill + border in
+    /// the overlay pass; empty while not editing a formula. Cleared on sheet switch.
+    ref_highlights: Vec<(CellRange, u8)>,
+    /// Whether the driving formula editor's caret is reference-ready (pushed by the chrome,
+    /// `formula-point-mode/architecture.md §3.1`). Stored now; **consumed in Phase 3** by
+    /// `mouse_down_cell` to branch point-insert vs commit. (Write-only until Phase 3 wires the read.)
+    #[allow(dead_code)]
+    reference_ready: bool,
+    /// Whether a just-pointed reference is pending (pushed by the chrome). Stored now; consumed in
+    /// Phase 3 (a grid click replaces the pending ref). (Write-only until Phase 3 wires the read.)
+    #[allow(dead_code)]
+    pending_ref: bool,
+
     /// The charts painted on each sheet's **ChartLayer** (P8/P11, `charts/architecture.md §4.2`,
     /// §5 challenge 5), keyed by sheet. See [`SheetChartLayer`]: the per-sheet spec list is **shared**
     /// with the engine's published snapshot (no app-side copy), and the per-frame scan reads only the
@@ -634,6 +650,9 @@ impl GridView {
             incell_cap: None,
             incell_autocomplete: None,
             incell_sig_hint: None,
+            ref_highlights: Vec::new(),
+            reference_ready: false,
+            pending_ref: false,
             incell_geom: None,
             quick_edit: false,
             charts: HashMap::new(),
@@ -789,8 +808,11 @@ impl GridView {
     }
 
     /// Pushes the chrome's current edit state onto the grid (live mirror, in-cell overlay cell,
-    /// in-cell cap message). `None`s clear the corresponding overlay. Repaints so the mirror tracks
-    /// each keystroke (`components/edit_controller.md §4.3–4.4`).
+    /// in-cell cap message, autocomplete/sig-hint) plus the formula reference state
+    /// (`formula-point-mode/architecture.md §3.1`): `reference_ready` / `pending_ref` (stored for
+    /// the Phase-3 point-vs-commit branch) and `ref_highlights` (the same-sheet ranges painted in
+    /// the overlay pass). `None`s / empties clear the corresponding overlay. Repaints so the mirror
+    /// + highlights track each keystroke (`components/edit_controller.md §4.3–4.4`).
     #[allow(clippy::too_many_arguments)]
     pub fn set_edit_state(
         &mut self,
@@ -800,12 +822,18 @@ impl GridView {
         quick_edit: bool,
         autocomplete: Option<AutocompleteDisplay>,
         sig_hint: Option<SharedString>,
+        reference_ready: bool,
+        pending_ref: bool,
+        ref_highlights: Vec<(CellRange, u8)>,
         cx: &mut Context<Self>,
     ) {
         self.mirror = mirror;
         self.quick_edit = quick_edit;
         self.incell_autocomplete = autocomplete;
         self.incell_sig_hint = sig_hint;
+        self.reference_ready = reference_ready;
+        self.pending_ref = pending_ref;
+        self.ref_highlights = ref_highlights;
         // Opening the in-cell editor ends any grid selection drag at its root (BUG #2): a drag armed
         // before the editor opened must not survive into (or past) the editor's lifetime. The
         // overlay `.occlude()`s the follow-up mouse-up, so the grid would never clear such a drag,
@@ -898,6 +926,11 @@ impl GridView {
         self.incell_cap = None;
         self.incell_autocomplete = None;
         self.incell_sig_hint = None;
+        // Reference highlights + point-mode signals are anchored to the previous sheet's formula
+        // edit — drop them so they can never leak onto the new sheet.
+        self.ref_highlights.clear();
+        self.reference_ready = false;
+        self.pending_ref = false;
         // Structural interactions are anchored to the previous sheet's geometry — drop them.
         self.resize_drag = None;
         self.resize_preview = None;
@@ -3160,6 +3193,34 @@ impl GridView {
             );
         }
 
+        // Formula reference highlights (`formula-point-mode/architecture.md §4.1`): while a formula
+        // edit is open, each distinct same-sheet reference already typed is drawn as a rich colored
+        // fill + border in its assigned palette slot. Painted ABOVE the selection overlay and BELOW
+        // the fill handle / in-cell overlay, clipped to the visible frame exactly like the selection
+        // overlay — an off-screen ref clips to nothing (no visible highlight, by construction), and
+        // cross-sheet refs are excluded upstream (only the same-sheet subset reaches the grid). The
+        // grid renders on the white `CELL_BG` regardless of OS appearance, so the light palette
+        // variant is used (`ref_slot_border(_, false)`); the `is_dark` seam stays for the future
+        // theme-aware / in-editor styling control.
+        for (target, slot) in &self.ref_highlights {
+            let rows =
+                target.start.row.max(frame.rows.start)..(target.end.row + 1).min(frame.rows.end);
+            let cols =
+                target.start.col.max(frame.cols.start)..(target.end.col + 1).min(frame.cols.end);
+            if rows.start >= rows.end || cols.start >= cols.end {
+                continue;
+            }
+            let (x, y, w, h) = span_rect(rows, cols, frame);
+            let color = ref_slot_border(*slot, false);
+            content_children.push(
+                rect_div(x, y, w, h)
+                    .bg(rgb(color).opacity(REF_HIGHLIGHT_FILL_ALPHA))
+                    .border_2()
+                    .border_color(rgb(color))
+                    .into_any_element(),
+            );
+        }
+
         // Fill handle + drag preview (`gaps_closing_7_15 §3`). While a fill drag is live, draw its
         // previewed target region (a 2px accent border, like the range border); otherwise — when not
         // editing and no other drag is active — draw the grabbable handle square at the selection's
@@ -4708,6 +4769,25 @@ fn rect_div(x: f32, y: f32, w: f32, h: f32) -> gpui::Div {
     div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h))
 }
 
+/// Translucency of a reference-highlight **fill** (`formula-point-mode/architecture.md §4.1`): a
+/// touch richer than the selection fill so a colored ref reads distinctly, yet still translucent so
+/// the cell content stays legible underneath.
+const REF_HIGHLIGHT_FILL_ALPHA: f32 = 0.16;
+
+/// Resolves a reference-highlight palette slot to a concrete `0xRRGGBB` color for the current theme
+/// (`formula-point-mode/architecture.md §4.2`) — the highlight border color, and (via `.opacity`)
+/// its translucent fill. `is_dark` selects the palette's dark variant; the grid currently renders on
+/// the white `CELL_BG` regardless of OS appearance, so callers pass `false`, but the seam stays for
+/// the future theme-aware grid + the in-editor styling control that will reuse this one palette.
+fn ref_slot_border(slot: u8, is_dark: bool) -> u32 {
+    let color = freecell_core::palette::ref_color(slot as usize);
+    if is_dark {
+        color.dark.to_hex()
+    } else {
+        color.light.to_hex()
+    }
+}
+
 /// The live-resize size tooltip (`Width: N` / `Height: N`) anchored at grid-local `(x, y)`
 /// (`ui_design.md §3`). A small dark chip matching the app tooltip style.
 fn resize_tooltip(x: f32, y: f32, label: String) -> AnyElement {
@@ -5545,6 +5625,14 @@ impl GridView {
     #[cfg(test)]
     pub(crate) fn quick_edit_for_test(&self) -> bool {
         self.quick_edit
+    }
+
+    /// Test seam: the grid's stored reference highlights (proves
+    /// [`set_edit_state`](Self::set_edit_state) threads `ref_highlights`, which the overlay pass
+    /// paints — `formula-point-mode/architecture.md §4.1`).
+    #[cfg(test)]
+    pub(crate) fn ref_highlights_for_test(&self) -> &[(CellRange, u8)] {
+        &self.ref_highlights
     }
 
     /// The grid-local center of the current selection's fill handle for `window` — computed exactly
@@ -6385,6 +6473,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     events.borrow_mut().clear();
@@ -6412,7 +6503,18 @@ mod tests {
         window
             .update(cx, |_root, _window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, None, None, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        true,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
                     assert!(
                         grid.quick_edit_for_test(),
                         "quick_edit must thread through set_edit_state"
@@ -6424,11 +6526,66 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     assert!(
                         !grid.quick_edit_for_test(),
                         "quick_edit clears when pushed false"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn set_edit_state_threads_ref_highlights(cx: &mut TestAppContext) {
+        // The chrome pushes the same-sheet reference highlights through the edit-state; the grid
+        // stores them for its overlay paint pass (`formula-point-mode/architecture.md §4.1`), and a
+        // later push (edit committed / cancelled) with an empty vec clears them.
+        let (g, window, _events) = grid_recording(cx);
+        let highlights = vec![
+            (CellRange::single(CellRef::new(0, 0)), 0u8),
+            (CellRange::new(CellRef::new(2, 2), CellRef::new(6, 4)), 1u8),
+        ];
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        highlights.clone(),
+                        cx,
+                    );
+                    assert_eq!(
+                        grid.ref_highlights_for_test(),
+                        highlights.as_slice(),
+                        "ref_highlights must thread through set_edit_state"
+                    );
+                    // A commit/cancel pushes an empty vec → highlights clear.
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    assert!(
+                        grid.ref_highlights_for_test().is_empty(),
+                        "ref_highlights clear when an empty vec is pushed"
                     );
                 });
             })
@@ -7935,6 +8092,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                 });
@@ -8021,6 +8181,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                 });
@@ -8104,6 +8267,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     grid.mouse_down_cell(
@@ -8161,6 +8327,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     assert!(
@@ -8168,7 +8337,18 @@ mod tests {
                         "opening the in-cell editor clears the pre-armed drag"
                     );
                     // Close the editor; the drag must stay cleared (no move-gate applies now).
-                    grid.set_edit_state(None, None, None, false, None, None, cx);
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
                     assert!(
                         !grid.has_active_drag(),
                         "the drag stays cleared after the editor closes"
@@ -8367,6 +8547,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                 });
@@ -8379,7 +8562,18 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(CellRef::new(3, 3)),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8397,7 +8591,18 @@ mod tests {
                 )
             });
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(CellRef::new(3, 3)),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8419,7 +8624,18 @@ mod tests {
         // Cancel closes the overlay — normal rendering resumes (no persistent overlay).
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             })
         });
         vcx.run_until_parked();
@@ -8441,7 +8657,18 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(cell), None, false, None, None, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(cell),
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
                 });
                 input
             })
@@ -8451,7 +8678,18 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(cell),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8462,7 +8700,18 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value(WRAP_LONG, window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(cell),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8484,7 +8733,18 @@ mod tests {
         // Commit closes the overlay.
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             })
         });
         vcx.run_until_parked();

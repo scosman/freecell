@@ -216,4 +216,3 @@ mod tests {
         assert_eq!(toks[0].target, CellRange::from_a1("A1").unwrap());
     }
 }
-

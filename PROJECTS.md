@@ -160,3 +160,11 @@ registry: each entry is a short description plus a pointer to a design note unde
   doing it for one popover would make it the app's only gpui-component menu, diverging from its
   six siblings. So the flyout is only worth it as an app-wide unification (Phase 10 shipped a
   drill-in instead). → [`projects/gpui-component-menus.md`](projects/gpui-component-menus.md)
+
+- **Unary-minus boolean/text coercion (SUMPRODUCT `--` count idiom)** — *Future (deferred from
+  `scalar-functions-batch`, 2026-07-22).* The engine's unary-minus operator doesn't coerce a
+  boolean/text operand to a number before negating, so `=--TRUE` yields `TRUE` instead of `1` and
+  the classic `SUMPRODUCT(--(cond))` boolean-counting idiom returns `0`. SUMPRODUCT itself is
+  correct; the bug is operator-level, with a broad blast radius across every formula that negates a
+  non-number — out of the scalar-functions batch's function-local scope. Workarounds
+  `SUMPRODUCT(1*(cond))` and `SUMPRODUCT((A=x)*(B))` both work today. → [`projects/unary-minus-boolean-coercion.md`](projects/unary-minus-boolean-coercion.md)

@@ -215,6 +215,14 @@ pub enum GridEvent {
     UnhideRows { at: u32, count: u32 },
     /// Unhide (restore) every hidden column in the run (the column analog of [`GridEvent::UnhideRows`]).
     UnhideColumns { at: u32, count: u32 },
+    /// Set the frozen-rows and/or frozen-columns count (`freeze-panes` `architecture.md §2.5`,
+    /// header context menu). Each `Some` axis is a new count (`0` = unfreeze); the header menu
+    /// sends exactly ONE `Some` axis per action (one undo step). The window forwards it as
+    /// `Command::SetFrozen` for the active sheet.
+    SetFrozen {
+        rows: Option<u32>,
+        cols: Option<u32>,
+    },
     /// A chart was **moved or resized** on the ChartLayer (P18, `ui_design §3.2`) — both produce a
     /// new [`Anchor`]. The window forwards it as `Command::SetChartAnchor` for the active sheet.
     ChartAnchorChanged { id: ChartId, anchor: Anchor },

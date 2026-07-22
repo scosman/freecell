@@ -17,7 +17,7 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
 
 ## Phases
 
-- [ ] **Phase 1 — Engine wiring + read model (`architecture.md §2`).** No fork, no pixel.
+- [x] **Phase 1 — Engine wiring + read model (`architecture.md §2`).** No fork, no pixel.
   - `freecell-core/cache.rs`: add `frozen_rows`/`frozen_cols` `u32` to `SheetCache` +
     `SheetCacheBuilder` (accessors + setters + fluent, beside `hidden_rows`); **not** fed to
     `axis_from` (no geometry effect).

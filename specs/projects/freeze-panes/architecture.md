@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: Freeze Panes
@@ -311,3 +311,15 @@ Layered, cheapest-first (mirrors `gaps_closing_7_15`):
 
 No functional requirement forces disproportionate complexity — the locked spec maps cleanly onto
 the existing seams. **No pushback.** The one open contingency is Q4's probe outcome (§5).
+
+---
+
+## Owner decisions (2026-07-18)
+
+- **Q4 (structural edits vs. the frozen boundary) — RESOLVED.** Probe IronCalc's native
+  behavior first (Phase 5). If it does **not** adjust the frozen count on insert/delete of
+  rows/cols, the fix goes in the **fork** — a `fix/structural-edits-adjust-frozen-pane`
+  branch off `main` → integrated on `freecell-fixes` → a prepared upstream PR in our usual
+  one-fix-one-PR format (owner opens upstream). **No FreeCell-side compensating call** (a
+  second `set_frozen_*` would be a second undo diff and break the one-undo-step guarantee).
+  Per the standing "fix upstream, don't hack FreeCell" policy.

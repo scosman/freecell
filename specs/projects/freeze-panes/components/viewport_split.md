@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Viewport Split (four-quadrant render + frozen-aware geometry)

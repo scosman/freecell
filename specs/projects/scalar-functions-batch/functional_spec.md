@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Functional Spec: Scalar Functions Batch (+ TRIM fix)

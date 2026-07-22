@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: Scalar Functions Batch (+ TRIM fix)
@@ -521,3 +521,16 @@ branch matrix are the decomposition, and the implementation plan maps each 1:1 t
    inclusive, so this is a fidelity improvement); escalate only if it churns existing tests.
 
 Everything else is locked in §0 and above.
+
+---
+
+## Owner decisions (2026-07-18)
+
+- **F1 — family PRs confirmed.** `PERCENTILE.INC + QUARTILE.INC` ship as one branch/PR and
+  `CHAR + CODE` ship as one branch/PR (each a coupled feature sharing a new helper; not the
+  "unrelated fixes" the fork policy forbids bundling). Net **11 functions + TRIM → 10
+  branches → 10 upstream PRs**.
+- **F2 — proceed on the recommended defaults** for the conditional reconciliations (CHAR/CODE
+  → CP1252 if they already exist; legacy `PERCENTILE`/`QUARTILE` → inclusive method). The
+  implementer escalates to the owner **only** if a reconciliation would break currently-green
+  fork tests.

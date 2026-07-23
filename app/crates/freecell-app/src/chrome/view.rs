@@ -1390,6 +1390,19 @@ impl ChromeView {
     /// state + notifies. A visible cap error takes precedence — every formula feature is cleared
     /// while it shows.
     fn recompute_formula_edit_state(&mut self, cx: &mut Context<Self>) {
+        self.recompute_formula_edit_state_keep_pending(false, cx);
+    }
+
+    /// [`recompute_formula_edit_state`](Self::recompute_formula_edit_state) with explicit control
+    /// over the pending-ref span: every **user-driven** transition (keystroke / caret move) passes
+    /// `keep_pending = false` so the "replace on next point" window is exactly one action wide
+    /// (`architecture.md §5` Cleared); only [`insert_reference`](Self::insert_reference) passes
+    /// `true`, so the span it just set survives its own recompute.
+    fn recompute_formula_edit_state_keep_pending(
+        &mut self,
+        keep_pending: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.cap_error_visible() {
             self.edit.clear_formula_state();
             return;
@@ -1399,7 +1412,7 @@ impl ChromeView {
         let caret = input.cursor();
         let sheet = self.active_sheet_name();
         self.edit
-            .recompute_formula(&text, caret, &sheet, /*keep_pending=*/ false);
+            .recompute_formula(&text, caret, &sheet, keep_pending);
     }
 
     /// Recompute the formula state and re-push grid state + notify (the full per-keystroke effect,
@@ -1550,6 +1563,70 @@ impl ChromeView {
         // color map, and signature hint stay in lockstep (the caret now sits just after `(`, inside
         // the accepted call — the recompute derives the same `sig.template` signature hint).
         self.recompute_formula_edit_state(cx);
+        self.refresh_edit_grid_state(window, cx);
+        cx.notify();
+    }
+
+    /// Point-mode splice (`functional_spec.md §2`, `architecture.md §5`): insert the pointed
+    /// reference `a1` into the in-progress formula at the caret — the exact analog of
+    /// [`accept_autocomplete`](Self::accept_autocomplete). When `replace_pending` and a pending-ref
+    /// span is set (a just-pointed reference with nothing typed since), **overwrite** that span
+    /// (re-aiming / the live drag); otherwise **append** at the caret. The just-inserted span becomes
+    /// the new pending ref, so the next point action replaces it — until a keystroke / caret move
+    /// clears it (`§5` lifecycle). Routed here from [`GridEvent::InsertReference`].
+    pub fn insert_reference(
+        &mut self,
+        a1: &str,
+        replace_pending: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Point-mode only reaches an open edit (the grid emits only when reference-ready / pending);
+        // guard defensively so a stray route can never splice into an idle field.
+        if self.data_row.mode() != FieldMode::Editing {
+            return;
+        }
+        let origin = self.edit.origin();
+        let text = self.driving_input().read(cx).value().to_string();
+        let caret = self.driving_input().read(cx).cursor();
+        // Splice region: replace the pending span (re-aim / drag-grow), else insert at the caret.
+        let (start, end) = match self.edit.pending_ref() {
+            Some(span) if replace_pending && span.start <= text.len() && span.end <= text.len() => {
+                (span.start, span.end)
+            }
+            _ => (caret.min(text.len()), caret.min(text.len())),
+        };
+        let mut new_text = String::with_capacity(text.len() + a1.len());
+        new_text.push_str(&text[..start]);
+        new_text.push_str(a1);
+        new_text.push_str(&text[end..]);
+        let new_caret = start + a1.len();
+
+        // Drive the shared reducer + both editors exactly as the accept path does (keeps
+        // cap-validation / mirror / undo identical to typing — one commit = one undo step).
+        let effects = self.data_row.reduce(DataRowEvent::Edited {
+            text: new_text.clone(),
+        });
+        let char_col = new_text[..new_caret].chars().count() as u32;
+        self.set_driving_text_and_caret(origin, &new_text, char_col, window, cx);
+        self.apply_data_effects(effects, window, cx);
+        self.mirror_other_editor(origin, &new_text, window, cx);
+        // Return focus to the driving editor. The grid took keyboard focus in its own
+        // `handle_mouse_down` before emitting this point insert, and `prevent_default` only skips
+        // gpui's end-of-dispatch focus transfer — it does not undo that explicit grab. Without this,
+        // the next keystroke would miss the editor entirely (data-row → a fresh type-to-replace that
+        // wipes the formula; in-cell → swallowed). Re-focusing here (as `begin_typed`/`begin_in_cell`
+        // do) survives the built-in transfer because the whole emit chain is synchronous inside the
+        // mouse-down dispatch and `prevent_default` runs afterward (`functional_spec.md §2/§4`).
+        self.driving_input()
+            .clone()
+            .update(cx, |input, cx| input.focus(window, cx));
+        // The just-inserted span becomes pending (replace on the next point action).
+        self.edit
+            .set_pending_ref(Some(new_caret - a1.len()..new_caret));
+        // Recompute the formula state off the spliced text — KEEPING the pending span we just set
+        // (the programmatic `set_value` suppressed `Change`, so nothing else clears it here).
+        self.recompute_formula_edit_state_keep_pending(true, cx);
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -15412,6 +15489,206 @@ mod tests {
             Some(false),
             "caret right after a complete ref is not reference-ready"
         );
+    }
+
+    // ---- Point-mode insertion (formula-point-mode Phase 3) ----------------------------------
+
+    /// A point insert on an empty formula appends the reference at the caret and marks its span
+    /// pending (so the next point re-aims it).
+    #[gpui::test]
+    fn insert_reference_appends_at_caret(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("C3", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=C3");
+            assert_eq!(c.content_input.read(cx).cursor(), 3, "caret after the ref");
+            assert_eq!(
+                c.edit.pending_ref(),
+                Some(1..3),
+                "the inserted span is pending"
+            );
+        });
+    }
+
+    /// A second point with the ref still pending REPLACES it (Excel re-aiming), not appends.
+    #[gpui::test]
+    fn insert_reference_replaces_pending(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("A1", false, window, cx)
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("B2", true, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                "=B2",
+                "the pending A1 is replaced, not appended"
+            );
+            assert_eq!(c.edit.pending_ref(), Some(1..3), "B2 is now pending");
+        });
+    }
+
+    /// A keystroke after a point FIXES the pending ref (clears the span); the next point then appends
+    /// a fresh reference (`functional_spec.md §2` DPM.2).
+    #[gpui::test]
+    fn keystroke_after_point_appends_next(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("B2", false, window, cx)
+        });
+        // Simulate typing `+` (the Change path recomputes with keep_pending = false → clears pending).
+        upd(&h, cx, |c, window, cx| {
+            c.content_input.update(cx, |i, cx| {
+                i.set_value("=B2+", window, cx);
+                i.set_cursor_position(Position::new(0, 4), window, cx);
+            });
+            c.recompute_formula_edit_state(cx);
+        });
+        upd(&h, cx, |c, _w, _cx| {
+            assert_eq!(
+                c.edit.pending_ref(),
+                None,
+                "a keystroke fixes the pending ref"
+            );
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("C3", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                "=B2+C3",
+                "the next point appends a fresh ref"
+            );
+        });
+    }
+
+    /// A caret move (not a point) also clears the pending-ref window.
+    #[gpui::test]
+    fn pending_cleared_by_caret_move(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("A1", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, _cx| {
+            assert!(c.edit.pending_ref().is_some(), "pending after the point");
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.content_input.update(cx, |i, cx| {
+                i.set_cursor_position(Position::new(0, 1), window, cx);
+            });
+            c.recompute_formula_edit_state(cx);
+        });
+        upd(&h, cx, |c, _w, _cx| {
+            assert_eq!(
+                c.edit.pending_ref(),
+                None,
+                "a caret move clears the pending ref"
+            );
+        });
+    }
+
+    /// Pointing at the cell being edited inserts a self-reference (DPM.5) — not blocked; the engine's
+    /// circular-ref handling surfaces it at commit.
+    #[gpui::test]
+    fn self_reference_allowed(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            // A1 is the active cell; pointing it is allowed.
+            c.insert_reference("A1", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=A1");
+        });
+    }
+
+    /// The autocomplete→point happy path (`functional_spec.md §4`): accepting `SUM(` leaves the caret
+    /// reference-ready, so a point click yields `=SUM(C3` with no typing.
+    #[gpui::test]
+    fn autocomplete_then_point_happy_path(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=sum", window, cx));
+        upd(&h, cx, |c, window, cx| c.autocomplete_accept(window, cx));
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=SUM(");
+            assert!(
+                c.edit.reference_ready(),
+                "caret right after `(` is reference-ready"
+            );
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("C3", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                "=SUM(C3",
+                "the pointed ref lands inside the accepted call"
+            );
+        });
+    }
+
+    /// A point insert must RETURN keyboard focus to the driving editor: the grid takes focus in its
+    /// own `handle_mouse_down` before emitting the insert, so without an explicit re-focus the next
+    /// keystroke would miss the editor entirely (data-row → a fresh type-to-replace that wipes the
+    /// formula). We model the grid's focus grab by focusing a throwaway handle, then assert
+    /// `insert_reference` restored the data-row input's focus (so the next key appends to the formula
+    /// rather than starting a new edit).
+    #[gpui::test]
+    fn point_insert_returns_focus_to_data_row_editor(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        let focused = upd(&h, cx, |c, window, cx| {
+            // The grid grabbed focus at mouse-down; model that.
+            let grid_focus = cx.focus_handle();
+            window.focus(&grid_focus, cx);
+            c.insert_reference("C3", false, window, cx);
+            c.content_input.read(cx).focus_handle(cx).is_focused(window)
+        });
+        assert!(
+            focused,
+            "the data-row editor must regain focus so typing continues the formula"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c.content_text(cx)),
+            "=C3",
+            "the ref was inserted"
+        );
+    }
+
+    /// The in-cell driving editor half of the same guarantee: after a point insert the in-cell input
+    /// (not the grid) holds focus, so its next keystroke is not swallowed.
+    #[gpui::test]
+    fn point_insert_returns_focus_to_in_cell_editor(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type("=", window, cx);
+        });
+        let focused = upd(&h, cx, |c, window, cx| {
+            let grid_focus = cx.focus_handle();
+            window.focus(&grid_focus, cx);
+            c.insert_reference("C3", false, window, cx);
+            c.edit
+                .in_cell()
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(
+            focused,
+            "the in-cell editor must regain focus after a point insert"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "=C3");
     }
 
     #[gpui::test]

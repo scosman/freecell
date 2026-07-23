@@ -54,7 +54,7 @@ from `app/`.
         appear for same-sheet refs, absent for cross-sheet, cleared on commit); **render subset**
         `render_tests.sh test formula_ref` while iterating. `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 3 — Point-mode routing (§3, §5).** The `InsertReference` path + pending-ref.
+- [x] **Phase 3 — Point-mode routing (§3, §5).** The `InsertReference` path + pending-ref.
       - `GridEvent::InsertReference { a1, replace_pending }` (`grid/mod.rs`); route in `make_grid_sink`
         (`shell/window.rs`) → `ChromeView::insert_reference`.
       - `insert_reference` (chrome; analog of `accept_autocomplete`) + `pending_ref` lifecycle on

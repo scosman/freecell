@@ -218,6 +218,16 @@ struct FillDrag {
     axis: Option<FillAxis>,
 }
 
+/// An in-flight **point-mode** drag (`formula-point-mode/functional_spec.md §2`): sweeping a range
+/// into the active formula edit. `origin` is the merge-anchor-resolved cell the drag started on;
+/// `last_range` is the last (merge-expanded) range emitted as a reference, used both to dedupe
+/// per-cell re-emits and as the single-cell case when the drag releases on its origin.
+#[derive(Debug, Clone, Copy)]
+struct PointDrag {
+    origin: CellRef,
+    last_range: CellRange,
+}
+
 /// A right-click "Delete chart" context menu over a chart (P18, `ui_design §3.2` — the alternate
 /// delete affordance to Delete/Backspace). `x`/`y` are grid-local.
 #[derive(Debug, Clone, Copy)]
@@ -361,13 +371,12 @@ pub struct GridView {
     /// the overlay pass; empty while not editing a formula. Cleared on sheet switch.
     ref_highlights: Vec<(CellRange, u8)>,
     /// Whether the driving formula editor's caret is reference-ready (pushed by the chrome,
-    /// `formula-point-mode/architecture.md §3.1`). Stored now; **consumed in Phase 3** by
-    /// `mouse_down_cell` to branch point-insert vs commit. (Write-only until Phase 3 wires the read.)
-    #[allow(dead_code)]
+    /// `formula-point-mode/architecture.md §3.1`). Consumed by [`mouse_down_cell`](Self::mouse_down_cell)
+    /// to branch point-insert vs commit.
     reference_ready: bool,
-    /// Whether a just-pointed reference is pending (pushed by the chrome). Stored now; consumed in
-    /// Phase 3 (a grid click replaces the pending ref). (Write-only until Phase 3 wires the read.)
-    #[allow(dead_code)]
+    /// Whether a just-pointed reference is pending (pushed by the chrome). Consumed by
+    /// [`mouse_down_cell`](Self::mouse_down_cell): a grid click while set replaces the pending ref
+    /// even when the caret is not reference-ready (the pending-ref override).
     pending_ref: bool,
 
     /// The charts painted on each sheet's **ChartLayer** (P8/P11, `charts/architecture.md §4.2`,
@@ -385,6 +394,11 @@ pub struct GridView {
     /// The in-flight drag of the selection's fill handle, if any (`gaps_closing_7_15 §3`;
     /// `None` = not fill-dragging). Drives the live preview rect + the committed fill on release.
     fill_drag: Option<FillDrag>,
+    /// The in-flight point-mode drag, if any (`formula-point-mode/functional_spec.md §2`;
+    /// `None` = not point-dragging). Armed by the [`mouse_down_cell`](Self::mouse_down_cell) point
+    /// branch when a reference-ready / pending grid click points; drives the live preview rect + the
+    /// per-cell `InsertReference` re-emits as the range grows.
+    point_drag: Option<PointDrag>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
     /// The open cell-area right-click context menu, if any (`functional_spec.md §2`).
@@ -659,6 +673,7 @@ impl GridView {
             selected_chart: None,
             chart_drag: None,
             fill_drag: None,
+            point_drag: None,
             chart_menu: None,
             cell_menu: None,
             wrap_cells: Vec::new(),
@@ -931,6 +946,7 @@ impl GridView {
         self.ref_highlights.clear();
         self.reference_ready = false;
         self.pending_ref = false;
+        self.point_drag = None;
         // Structural interactions are anchored to the previous sheet's geometry — drop them.
         self.resize_drag = None;
         self.resize_preview = None;
@@ -1301,8 +1317,8 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         // A hotspot already started a resize (and stopped propagation); defensively, never treat
-        // this as a selection click. Likewise a live fill drag owns the pointer.
-        if self.resize_drag.is_some() || self.fill_drag.is_some() {
+        // this as a selection click. Likewise a live fill drag or point-mode drag owns the pointer.
+        if self.resize_drag.is_some() || self.fill_drag.is_some() || self.point_drag.is_some() {
             return;
         }
         // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op) and
@@ -1499,6 +1515,36 @@ impl GridView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Point-mode branch (`formula-point-mode/architecture.md §3.2`): while a formula edit is
+        // reference-ready (or a ref is pending), a plain click INSERTS the clicked reference into
+        // the formula instead of committing + moving the selection. Shift-click is excluded (its
+        // range-extend selection semantics stay). Emits `InsertReference` — never `SelectionChanged`
+        // — so the grid selection is untouched, and arms a `point_drag` so a drag sweeps a range.
+        let point_ready = self.reference_ready || self.pending_ref;
+        if point_ready && !event.modifiers.shift {
+            let anchor = self.resolve_merge_anchor(row, col); // DPM.6: covered cell → merge anchor
+            let a1 = CellRange::single(anchor).to_a1();
+            self.events.emit(
+                &GridEvent::InsertReference {
+                    a1,
+                    replace_pending: self.pending_ref,
+                },
+                window,
+                cx,
+            );
+            self.point_drag = Some(PointDrag {
+                origin: anchor,
+                last_range: CellRange::single(anchor),
+            });
+            // Suppress gpui's built-in end-of-dispatch focus transfer to the grid root (it is gated
+            // on `!default_prevented()`). NOTE: this does NOT undo the explicit grid focus already
+            // taken at the top of `handle_mouse_down`; the chrome's `insert_reference` re-focuses the
+            // driving editor after the synchronous splice, and that focus survives because this
+            // `prevent_default` runs afterward.
+            window.prevent_default();
+            cx.notify();
+            return;
+        }
         let cell = CellRef::new(row, col);
         let selection = if event.modifiers.shift {
             // Shift-click extends the range from the existing anchor.
@@ -1633,6 +1679,13 @@ impl GridView {
             self.update_fill_drag(local_x, local_y, window, cx);
             return;
         }
+        // A live point-mode drag grows the swept reference range (checked BEFORE the `incell_open`
+        // guard: a point-drag armed during an in-cell formula edit must still extend — the in-cell
+        // overlay occludes only its own cell, so clicks on other cells reach the grid).
+        if self.point_drag.is_some() {
+            self.update_point_drag(local_x, local_y, window, cx);
+            return;
+        }
         // While the in-cell editor owns the pointer, the grid must not extend a selection drag: a
         // press+drag inside the editor is text selection, not a cell-range drag (BUG #2). This
         // guards any drag still live from before the editor opened; `mouse_down_cell` also refuses
@@ -1675,6 +1728,14 @@ impl GridView {
         }
         if let Some(fd) = self.fill_drag.take() {
             self.commit_fill_drag(fd, window, cx);
+            return;
+        }
+        // A point-mode drag needs no commit — every move already emitted the current range as an
+        // `InsertReference`, so the editor text already reflects the released rectangle. Just clear
+        // the drag and stop any auto-scroll loop (epoch bump, like the selection/fill drags).
+        if self.point_drag.take().is_some() {
+            self.autoscroll_epoch = self.autoscroll_epoch.wrapping_add(1);
+            cx.notify();
             return;
         }
         if self.drag.take().is_some() {
@@ -2442,6 +2503,101 @@ impl GridView {
         };
     }
 
+    /// Update a live point-mode drag from a grid-local pointer (`formula-point-mode §2`): resolve the
+    /// hovered cell, grow the swept range, and (past a viewport edge) kick the auto-scroll loop.
+    fn update_point_drag(
+        &mut self,
+        local_x: f32,
+        local_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let cell = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            layout::cell_at_point(
+                local_x,
+                local_y,
+                row_header_w,
+                scroll_x,
+                scroll_y,
+                &row_axis,
+                &col_axis,
+                content_w,
+                content_h,
+            )
+        };
+        self.set_point_target_from_cell(cell, window, cx);
+        self.maybe_start_autoscroll(window, cx);
+        cx.notify();
+    }
+
+    /// Recompute the point-drag's swept range for a pointer over `cell` and, when it changed, re-emit
+    /// it as a reference (`formula-point-mode/architecture.md §3.3`). The range is `origin..cell`
+    /// normalized then **expanded for merges** (DPM.6 — a swept rect touching a merge grows to the
+    /// whole span). Shared by the mouse-move and the auto-scroll tick. Every emit is
+    /// `replace_pending: true` — the grid's own prior insert is the pending ref, so the drag re-aims
+    /// locally without waiting on the deferred `EditState` round-trip (`architecture.md §10`). A
+    /// release on the origin cell keeps `single(origin)` → a single-cell ref (no degenerate range).
+    fn set_point_target_from_cell(
+        &mut self,
+        cell: CellRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = self.point_drag.as_ref().map(|pd| pd.origin) else {
+            return;
+        };
+        let expanded = self.expand_range_for_merges(CellRange::new(origin, cell));
+        let changed = match self.point_drag.as_mut() {
+            Some(pd) if pd.last_range != expanded => {
+                pd.last_range = expanded;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.events.emit(
+                &GridEvent::InsertReference {
+                    a1: expanded.to_a1(),
+                    replace_pending: true,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Resolve a clicked `(row, col)` to the reference to insert (DPM.6, Q6): the top-left **anchor**
+    /// of the merge covering it, or the cell itself when uncovered. Reads the same `cache.merges()`
+    /// the selection/render path uses — one source of truth for merge geometry.
+    fn resolve_merge_anchor(&self, row: u32, col: u32) -> CellRef {
+        let caches = self.sources.caches.read();
+        match caches.get(self.active_sheet) {
+            Some(cache) => resolve_merge_anchor_in(row, col, cache.merges()),
+            None => CellRef::new(row, col),
+        }
+    }
+
+    /// Expand a swept point-drag `range` so it never bisects a merge (DPM.6, Q6): union it with every
+    /// merge it touches, over the same `cache.merges()` list. Identity when no cache is resident.
+    fn expand_range_for_merges(&self, range: CellRange) -> CellRange {
+        let caches = self.sources.caches.read();
+        match caches.get(self.active_sheet) {
+            Some(cache) => expand_range_for_merges_in(range, cache.merges()),
+            None => range,
+        }
+    }
+
     /// Commit a fill drag on release (`gaps_closing_7_15 §3`): stop any auto-scroll loop, then — if
     /// the target actually extended past the seed along a decided axis — emit
     /// [`GridEvent::FillDrag`] and expand the selection to the filled region (Excel behavior). A
@@ -2505,8 +2661,11 @@ impl GridView {
     /// (a `spawn_in` timer, so it advances even while the pointer is held still with no
     /// mouse-move events — the "drag to the edge and wait" case).
     fn maybe_start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Fires for a selection drag OR a fill drag (`gaps_closing_7_15 §3`) past a viewport edge.
-        if self.autoscrolling || (self.drag.is_none() && self.fill_drag.is_none()) {
+        // Fires for a selection drag, a fill drag (`gaps_closing_7_15 §3`), or a point-mode drag
+        // (`formula-point-mode §2`) past a viewport edge.
+        if self.autoscrolling
+            || (self.drag.is_none() && self.fill_drag.is_none() && self.point_drag.is_none())
+        {
             return;
         }
         let (dx, dy) = self.current_edge_delta(window);
@@ -2524,7 +2683,9 @@ impl GridView {
             let keep = this
                 .update_in(cx, |this, window, cx| {
                     if this.autoscroll_epoch != epoch
-                        || (this.drag.is_none() && this.fill_drag.is_none())
+                        || (this.drag.is_none()
+                            && this.fill_drag.is_none()
+                            && this.point_drag.is_none())
                     {
                         this.autoscrolling = false;
                         return false;
@@ -2543,7 +2704,7 @@ impl GridView {
     /// fill-drag target) to the hovered cell, and announce a debounced `ViewportChanged`. Returns
     /// whether to keep looping (`false` once the pointer returns inside the content).
     fn autoscroll_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.drag.is_none() && self.fill_drag.is_none() {
+        if self.drag.is_none() && self.fill_drag.is_none() && self.point_drag.is_none() {
             self.autoscrolling = false;
             return false;
         }
@@ -2624,6 +2785,10 @@ impl GridView {
         } else if self.fill_drag.is_some() {
             // A fill drag auto-scrolls too: re-extend its previewed target to the hovered cell.
             self.set_fill_target_from_cell(cell);
+            changed = true;
+        } else if self.point_drag.is_some() {
+            // A point-mode drag auto-scrolls too: re-emit the swept reference for the hovered cell.
+            self.set_point_target_from_cell(cell, window, cx);
             changed = true;
         }
         let ranges = (rows, cols);
@@ -3219,6 +3384,27 @@ impl GridView {
                     .border_color(rgb(color))
                     .into_any_element(),
             );
+        }
+
+        // Point-mode drag preview (`formula-point-mode/functional_spec.md §2`): while a point drag is
+        // live, draw its swept range as a 2px **dashed** indigo marquee — visually distinct from the
+        // solid-blue selection rectangle and the colored reference highlights (three overlays can be
+        // on screen at once). Clipped to the visible frame like the selection overlay; no fill, no
+        // handles (DPM.7). The editor text already tracks the range (each move emitted an insert).
+        if let Some(pd) = self.point_drag {
+            let t = pd.last_range;
+            let rows = t.start.row.max(frame.rows.start)..(t.end.row + 1).min(frame.rows.end);
+            let cols = t.start.col.max(frame.cols.start)..(t.end.col + 1).min(frame.cols.end);
+            if rows.start < rows.end && cols.start < cols.end {
+                let (x, y, w, h) = span_rect(rows, cols, frame);
+                content_children.push(
+                    rect_div(x, y, w, h)
+                        .border_2()
+                        .border_dashed()
+                        .border_color(rgb(POINT_PREVIEW_BORDER))
+                        .into_any_element(),
+                );
+            }
         }
 
         // Fill handle + drag preview (`gaps_closing_7_15 §3`). While a fill drag is live, draw its
@@ -4773,6 +4959,53 @@ fn rect_div(x: f32, y: f32, w: f32, h: f32) -> gpui::Div {
 /// touch richer than the selection fill so a colored ref reads distinctly, yet still translucent so
 /// the cell content stays legible underneath.
 const REF_HIGHLIGHT_FILL_ALPHA: f32 = 0.16;
+
+/// The point-mode drag **preview** border color (`formula-point-mode/functional_spec.md §2`): an
+/// indigo distinct from the solid-blue selection rectangle (`ACCENT`) and from the reference-highlight
+/// palette, drawn dashed (marching-ants marquee) so the three overlays that can coexist — selection,
+/// ref highlights, point preview — stay visually distinct.
+const POINT_PREVIEW_BORDER: u32 = 0x4F46E5;
+
+/// Resolves a clicked `(row, col)` to the reference cell to insert (DPM.6, Q6): the top-left anchor
+/// of the first merge in `merges` that covers it, or the cell itself when uncovered. Pure over the
+/// merge list so it is unit-testable headless.
+fn resolve_merge_anchor_in(row: u32, col: u32, merges: &[CellRange]) -> CellRef {
+    let cell = CellRef::new(row, col);
+    merges
+        .iter()
+        .find(|m| m.contains(cell))
+        .map(|m| m.start)
+        .unwrap_or(cell)
+}
+
+/// Expands a swept point-drag `range` so it never bisects a merge (DPM.6, Q6): union it with every
+/// merge it intersects, iterating to a fixed point (an expansion can newly touch another merge).
+/// Pure over the merge list so it is unit-testable headless.
+fn expand_range_for_merges_in(range: CellRange, merges: &[CellRange]) -> CellRange {
+    let mut result = range;
+    loop {
+        let mut grew = false;
+        for m in merges {
+            if m.intersects(&result) {
+                let unioned = CellRange::new(
+                    CellRef::new(
+                        result.start.row.min(m.start.row),
+                        result.start.col.min(m.start.col),
+                    ),
+                    CellRef::new(result.end.row.max(m.end.row), result.end.col.max(m.end.col)),
+                );
+                if unioned != result {
+                    result = unioned;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    result
+}
 
 /// Resolves a reference-highlight palette slot to a concrete `0xRRGGBB` color for the current theme
 /// (`formula-point-mode/architecture.md §4.2`) — the highlight border color, and (via `.opacity`)
@@ -6803,6 +7036,281 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    // ---- Point-mode routing (formula-point-mode Phase 3) ------------------------------------
+
+    /// The `InsertReference` targets emitted by a recording grid, in order.
+    fn inserted_refs(events: &Rc<RefCell<Vec<GridEvent>>>) -> Vec<(String, bool)> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GridEvent::InsertReference {
+                    a1,
+                    replace_pending,
+                } => Some((a1.clone(), *replace_pending)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A reference-ready formula edit turns a grid click into a point INSERT — it emits
+    /// `InsertReference` (never `SelectionChanged`) and leaves the grid selection untouched; a
+    /// pending-ref push makes the emit carry `replace_pending: true`.
+    #[gpui::test]
+    fn point_ready_click_inserts_not_selects(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let before = grid.selection().range();
+                    // Reference-ready formula edit → a click points instead of selecting.
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![("C3".to_string(), false)],
+                        "the click appends C3"
+                    );
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "no SelectionChanged is emitted in point-mode"
+                    );
+                    assert_eq!(grid.selection().range(), before, "selection is untouched");
+
+                    // A pending ref makes the next click a REPLACE even at a not-ready caret.
+                    grid.point_drag = None;
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        true,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.mouse_down_cell(0, 0, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![("A1".to_string(), true)],
+                        "a pending ref makes the click replace"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// With no reference-ready / pending signal, a grid click behaves exactly as today: it emits
+    /// `SelectionChanged` (the commit path) and no `InsertReference`.
+    #[gpui::test]
+    fn not_ready_click_selects_as_today(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "a not-ready click commits via SelectionChanged"
+                    );
+                    assert!(
+                        inserted_refs(&events).is_empty(),
+                        "no reference is inserted"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// A point drag re-emits the swept range as it grows (dedupe per cell), and a release on the
+    /// origin cell yields a single-cell ref (`functional_spec.md §2` Drag details).
+    #[gpui::test]
+    fn point_drag_emits_expanded_range_and_dedupes(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    // Mouse-down at C3 → origin, emits "C3".
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    // Grow to E7 → "C3:E7"; a repeat is deduped; back to origin → "C3".
+                    grid.set_point_target_from_cell(CellRef::new(6, 4), window, cx);
+                    grid.set_point_target_from_cell(CellRef::new(6, 4), window, cx);
+                    grid.set_point_target_from_cell(CellRef::new(2, 2), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![
+                            ("C3".to_string(), false),
+                            ("C3:E7".to_string(), true),
+                            ("C3".to_string(), true),
+                        ],
+                        "grow, dedupe the repeat, collapse back to a single cell"
+                    );
+                    // Release clears the drag.
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    assert!(grid.point_drag.is_none(), "release clears the point drag");
+                });
+            })
+            .unwrap();
+    }
+
+    /// A merged cache: a reference-ready click on a covered cell inserts the merge's anchor (DPM.6).
+    #[gpui::test]
+    fn point_click_on_merge_inserts_anchor(cx: &mut TestAppContext) {
+        let (g, window, events) = recording_over(cx, merged_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    // C3 (2,2) is covered by the merge B2:C3 → the anchor B2 is inserted.
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![("B2".to_string(), false)],
+                        "a click on a covered cell inserts the merge anchor"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The pure merge helpers: anchor resolution + fixed-point range expansion.
+    #[test]
+    fn merge_anchor_and_range_expansion() {
+        let merges = vec![CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2))]; // B2:C3
+        assert_eq!(
+            resolve_merge_anchor_in(2, 2, &merges),
+            CellRef::new(1, 1),
+            "a covered cell resolves to the anchor"
+        );
+        assert_eq!(
+            resolve_merge_anchor_in(5, 5, &merges),
+            CellRef::new(5, 5),
+            "an uncovered cell resolves to itself"
+        );
+        // A swept rect touching the merge grows to include the whole span (A1:B2 → A1:C3).
+        let swept = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 1));
+        assert_eq!(
+            expand_range_for_merges_in(swept, &merges),
+            CellRange::new(CellRef::new(0, 0), CellRef::new(2, 2))
+        );
+        // Chained fixed-point: expanding via the first merge newly touches the second.
+        let chained = vec![
+            CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)), // B2:C3
+            CellRange::new(CellRef::new(2, 2), CellRef::new(4, 4)), // C3:E5
+        ];
+        assert_eq!(
+            expand_range_for_merges_in(CellRange::single(CellRef::new(1, 1)), &chained),
+            CellRange::new(CellRef::new(1, 1), CellRef::new(4, 4)),
+            "B2 → B2:C3 → B2:E5 (both merges folded in)"
+        );
+    }
+
+    /// A sheet switch drops any armed point drag so it can never leak onto the new sheet.
+    #[gpui::test]
+    fn set_active_sheet_clears_point_drag(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.point_drag = Some(PointDrag {
+                        origin: CellRef::new(2, 2),
+                        last_range: CellRange::single(CellRef::new(2, 2)),
+                    });
+                    grid.set_active_sheet(SheetId(1), cx);
+                    assert!(
+                        grid.point_drag.is_none(),
+                        "point drag cleared on sheet switch"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Sources with a single merge B2:C3 (no published cells) for the point-on-merge test.
+    fn merged_sources() -> GridDataSources {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::Publication;
+        let sheet = SheetId(0);
+        let cache = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .merge(CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)))
+        .build();
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, cache);
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: Vec::new(),
+        };
+        GridDataSources {
+            publication: Arc::new(ArcSwap::from_pointee(publication)),
+            caches: Arc::new(RwLock::new(caches)),
+        }
     }
 
     #[test]

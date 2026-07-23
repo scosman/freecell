@@ -1843,6 +1843,21 @@ fn make_grid_sink(
                 }
             }
         }
+        // Point-mode: the grid clicked/dragged a reference into the active formula edit. Route it to
+        // the chrome (the single pending-edit owner), which splices it against the shared reducer
+        // (`formula-point-mode/architecture.md §3.2/§5`).
+        GridEvent::InsertReference {
+            a1,
+            replace_pending,
+        } => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let a1 = a1.clone();
+                let replace_pending = *replace_pending;
+                chrome.update(cx, |c, cx| {
+                    c.insert_reference(&a1, replace_pending, window, cx)
+                });
+            }
+        }
     })
 }
 

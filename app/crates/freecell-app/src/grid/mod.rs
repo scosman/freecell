@@ -226,6 +226,14 @@ pub enum GridEvent {
     /// range + type); a programmatic `set_selected_chart` does NOT emit this. Fires on every chart
     /// mouse-down (the window dedupes by id), so re-clicking the editing chart is a harmless no-op.
     ChartSelected(ChartId),
+    /// **Point-mode** (`formula-point-mode/functional_spec.md §2`): a grid click / click-drag on a
+    /// reference-ready caret (or a pending ref) inserts `a1` into the in-progress formula at the
+    /// caret instead of committing + moving the selection. The window routes it to
+    /// `ChromeView::insert_reference`. `replace_pending` overwrites the just-pointed reference's span
+    /// (re-aiming / the live drag) vs appends a fresh reference at the caret
+    /// (`architecture.md §3.2/§5`). Emitted **instead of** [`GridEvent::SelectionChanged`], so the
+    /// grid selection is untouched.
+    InsertReference { a1: String, replace_pending: bool },
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

@@ -66,10 +66,17 @@ pub struct PublishedCell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publication {
     pub sheet: SheetId,
-    /// The covered row range (already overscanned by the worker).
+    /// The covered **body** row range (already overscanned by the worker).
     pub rows: Range<u32>,
-    /// The covered column range (already overscanned by the worker).
+    /// The covered **body** column range (already overscanned by the worker).
     pub cols: Range<u32>,
+    /// Frozen-pane leading-row band `M` (`freeze-panes`): the worker **always** publishes rows
+    /// `0..M` alongside the body window, so a frozen band shows its values even when the body is
+    /// scrolled deep past it. The covered region is therefore the union `(0..M ∪ rows)` on this
+    /// axis; `0` when the sheet is unfrozen (the union reduces to `rows`).
+    pub frozen_rows: u32,
+    /// Frozen-pane leading-column band `K` (the column analog of [`frozen_rows`](Self::frozen_rows)).
+    pub frozen_cols: u32,
     /// The generation this snapshot belongs to — the UI repaints when it changes.
     pub generation: u64,
     /// The non-empty cells in the covered region.
@@ -84,15 +91,20 @@ impl Publication {
             sheet,
             rows: 0..0,
             cols: 0..0,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation,
             cells: Vec::new(),
         }
     }
 
-    /// Whether `(row, col)` falls inside the covered region. Cells outside coverage render
-    /// blank (the grid still draws their style from the resident cache).
+    /// Whether `(row, col)` falls inside the covered region — the union of the body window and the
+    /// leading frozen bands (`(rows ∪ 0..M) × (cols ∪ 0..K)`, `freeze-panes`). Cells outside
+    /// coverage render blank (the grid still draws their style from the resident cache). With
+    /// `M=K=0` this reduces to plain body-window membership.
     pub fn covers(&self, row: u32, col: u32) -> bool {
-        self.rows.contains(&row) && self.cols.contains(&col)
+        (self.rows.contains(&row) || row < self.frozen_rows)
+            && (self.cols.contains(&col) || col < self.frozen_cols)
     }
 }
 
@@ -114,6 +126,8 @@ mod tests {
             sheet: SheetId(1),
             rows: 10..20,
             cols: 3..8,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells: vec![PublishedCell {
                 row: 12,
@@ -128,6 +142,44 @@ mod tests {
         assert!(!p.covers(20, 4)); // row end is exclusive
         assert!(!p.covers(12, 8)); // col end is exclusive
         assert!(!p.covers(9, 4));
+    }
+
+    #[test]
+    fn covers_includes_frozen_bands() {
+        // A body window scrolled deep past M=2 frozen rows / K=1 frozen col: the leading bands are
+        // covered even though they sit outside the body range (`freeze-panes`), while a non-band
+        // track scrolled out of the body is not covered.
+        let p = Publication {
+            sheet: SheetId(0),
+            rows: 100..120,
+            cols: 5..10,
+            frozen_rows: 2,
+            frozen_cols: 1,
+            generation: 1,
+            cells: vec![],
+        };
+        // Frozen band rows/cols are covered regardless of the deep body window.
+        assert!(p.covers(0, 0), "corner band cell covered");
+        assert!(p.covers(1, 7), "top band (frozen row, body col) covered");
+        assert!(p.covers(110, 0), "left band (body row, frozen col) covered");
+        assert!(p.covers(110, 7), "body cell covered");
+        // A non-band track that scrolled out of the body window is NOT covered.
+        assert!(
+            !p.covers(2, 7),
+            "row 2 is past the band and outside the body"
+        );
+        assert!(
+            !p.covers(110, 1),
+            "col 1 is past the band and outside the body"
+        );
+        // With no freeze the union reduces to plain body-window membership.
+        let plain = Publication {
+            frozen_rows: 0,
+            frozen_cols: 0,
+            ..p.clone()
+        };
+        assert!(!plain.covers(0, 0));
+        assert!(plain.covers(110, 7));
     }
 
     #[test]

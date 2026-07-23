@@ -3181,9 +3181,27 @@ impl Worker {
         let sheet = self.active_sheet;
         match (self.resolve(sheet), &self.viewport) {
             (Some(idx), Some(vp)) => {
+                // Freeze-pane bands (`freeze-panes`): the leading `0..M` rows / `0..K` cols are
+                // ALWAYS published alongside the body window, so a frozen band shows its VALUES even
+                // when the body is scrolled deep past it (its cells fall outside `vp` then). Read the
+                // counts off the resident cache (0 when unfrozen, or not yet built on the very first
+                // publish — harmless, the band is inside the body window at scroll 0). The published
+                // set is the union of the ≤4 quadrant rectangles `(0..M ∪ body_rows) × (0..K ∪
+                // body_cols)`; O(visible) — the bands are a few leading tracks, never a sheet-size
+                // loop. Flooring the body ranges past the bands makes the chained iteration visit
+                // each cell exactly once.
+                let (m, k) = self
+                    .shared
+                    .caches
+                    .read()
+                    .get(sheet)
+                    .map(|c| (c.frozen_rows(), c.frozen_cols()))
+                    .unwrap_or((0, 0));
+                let body_rows = vp.rows.start.max(m)..vp.rows.end.max(m);
+                let body_cols = vp.cols.start.max(k)..vp.cols.end.max(k);
                 let mut cells = Vec::new();
-                for row in vp.rows.clone() {
-                    for col in vp.cols.clone() {
+                for row in (0..m).chain(body_rows.clone()) {
+                    for col in (0..k).chain(body_cols.clone()) {
                         let cell = CellRef::new(row, col);
                         if let Ok(text) = self.doc.formatted_value(idx, cell) {
                             if !text.is_empty() {
@@ -3210,6 +3228,8 @@ impl Worker {
                     sheet,
                     rows: vp.rows.clone(),
                     cols: vp.cols.clone(),
+                    frozen_rows: m,
+                    frozen_cols: k,
                     generation,
                     cells,
                 }
@@ -4629,6 +4649,52 @@ mod tests {
             .unwrap();
         assert_eq!(c3.display_text, "42"); // =40+2 evaluated
         assert!(publication.covers(1, 1) && !publication.covers(3, 3));
+    }
+
+    #[test]
+    fn publication_always_publishes_frozen_bands_when_body_scrolled_deep() {
+        // `freeze-panes` band publishing (Phase 4): a frozen band must show its VALUES even when the
+        // body is scrolled far past it — the worker always publishes the leading `0..M` rows / `0..K`
+        // cols alongside the body window. Without the fix the deep body window would omit row 0.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(2),
+            cols: None,
+        }]);
+        // Deep body window that does NOT contain the frozen band (rows 0..2).
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 490..520,
+            cols: 0..3,
+        }]);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "HDR"),    // frozen band cell
+            set_input(sheet, 500, 0, "deep"), // deep body cell
+        ]);
+        let publication = worker.shared.publication.load_full();
+        assert_eq!(publication.frozen_rows, 2, "band count published");
+        assert!(
+            publication
+                .cells
+                .iter()
+                .any(|c| c.row == 0 && c.col == 0 && c.display_text == "HDR"),
+            "the frozen band cell is published even though the body is scrolled past it"
+        );
+        assert!(
+            publication
+                .cells
+                .iter()
+                .any(|c| c.row == 500 && c.col == 0 && c.display_text == "deep"),
+            "the deep body cell is published"
+        );
+        // Coverage reports the band as covered; a non-band row scrolled out is not.
+        assert!(publication.covers(0, 0), "band row covered");
+        assert!(
+            !publication.covers(5, 0),
+            "a scrolled-out non-band row is not covered"
+        );
     }
 
     #[test]

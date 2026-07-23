@@ -55,7 +55,7 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
     Render **subset**: `render_tests.sh test freeze_` / `cell_` / `grid_` while iterating.
     Checks: `-p freecell-core -p freecell-app`, `fmt --all --check`.
 
-- [ ] **Phase 4 — Cross-boundary interactions (`components/viewport_split.md §3.2–§3.4, §5`).**
+- [x] **Phase 4 — Cross-boundary interactions (`components/viewport_split.md §3.2–§3.4, §5`).**
   Render **subset** only.
   - Wire the frozen-aware `hit_test`/`cell_at_point` into the mouse handlers
     (`handle_mouse_down`, `handle_right_mouse_down`, `update_fill_drag`, `autoscroll_tick`,

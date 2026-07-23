@@ -1181,17 +1181,20 @@ impl GridView {
             // which would shrink the real content width. Using the wider of the current and
             // target-row gutters is conservative — it never over-estimates content width, so a
             // cell near the right/bottom edge is never revealed a few px short (the second-order
-            // edge this guards; drivers land in Phase 8). NOTE: frozen-aware reveal (no-op on a
-            // frozen axis; reveal into the body sub-area) is Phase 4 — for `M=K=0` this is today's
-            // path exactly.
+            // edge this guards; drivers land in Phase 8). Frozen-aware reveal (`freeze-panes §3.2`):
+            // a target on a frozen axis is a no-op (already pinned in the band), a body target aligns
+            // into the body sub-area below/right of the divider. `M=K=0` reduces to `scroll_to_reveal`.
             let reveal_gutter = row_header_w.max(layout::row_header_width(rr));
-            let area = ContentArea {
+            let pane = layout::PaneGeometry {
                 row_header_w: reveal_gutter,
-                width: (viewport_w - reveal_gutter as f64).max(0.0),
-                height: content_h,
+                frozen_w,
+                frozen_h,
+                content_w: (viewport_w - reveal_gutter as f64).max(0.0),
+                content_h,
+                body_sx: scroll_x,
+                body_sy: scroll_y,
             };
-            let (nx, ny) =
-                layout::scroll_to_reveal(rr, rc, &row_axis, &col_axis, area, scroll_x, scroll_y);
+            let (nx, ny) = pane.reveal(rr, rc, &row_axis, &col_axis);
             scroll_x = nx;
             scroll_y = ny;
             self.scroll.insert(active, (nx, ny));
@@ -1457,10 +1460,38 @@ impl GridView {
         (f32::from(position.x) - ox, f32::from(position.y) - oy)
     }
 
-    /// The row-header gutter width for the current scroll (matches the render path's sizing).
-    fn gutter_width(row_axis: &Axis, scroll_y: f64, content_h: f64) -> f32 {
-        let rows = row_axis.visible_range(scroll_y, content_h, RENDER_OVERSCAN);
-        layout::row_header_width(rows.end.saturating_sub(1))
+    /// The frozen-pane geometry ([`layout::PaneGeometry`]) for an INPUT event on `cache`, computed
+    /// exactly as [`resolve_frame`](Self::resolve_frame)'s non-preview path (`freeze-panes`): the
+    /// band extents from `M/K`, the gutter sized to the deepest visible **body** row, the
+    /// body-relative scroll. Threading every hit-test / cell_at_point / reveal / edge-scroll through
+    /// this keeps interactions byte-for-byte consistent with the rendered frame; `M=K=0` reduces to
+    /// the pre-freeze single-region geometry (the gutter sizing matches the render path's).
+    /// Interactions never run during a resize drag, so no [`AxisPreview`] is applied here.
+    fn input_pane_geometry(
+        cache: &freecell_core::cache::SheetCache,
+        viewport_w: f64,
+        content_h: f64,
+        scroll_x: f64,
+        scroll_y: f64,
+    ) -> layout::PaneGeometry {
+        let (row_axis, col_axis) = cache.axes();
+        let m = cache.frozen_rows().min(row_axis.count());
+        let k = cache.frozen_cols().min(col_axis.count());
+        let frozen_h = row_axis.offset_of(m);
+        let frozen_w = col_axis.offset_of(k);
+        let body_h = (content_h - frozen_h).max(0.0);
+        let rows = row_axis.visible_range(frozen_h + scroll_y, body_h, RENDER_OVERSCAN);
+        let row_header_w = layout::row_header_width(rows.end.max(m).saturating_sub(1));
+        let content_w = (viewport_w - row_header_w as f64).max(0.0);
+        layout::PaneGeometry {
+            row_header_w,
+            frozen_w,
+            frozen_h,
+            content_w,
+            content_h,
+            body_sx: scroll_x,
+            body_sy: scroll_y,
+        }
     }
 
     /// Mouse down: claim keyboard focus, hit-test, and act by region — a data cell sets/extends the
@@ -1499,8 +1530,13 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            // Frozen-pane geometry (`freeze-panes §3.3`): the hit-test region-routes through the
+            // bands. `M=K=0` → the pre-freeze single-region geometry (pane.row_header_w equals the
+            // old gutter width). Charts/fill stay body-anchored (a chart under a band is the known
+            // minor limitation), so they keep the body-relative content offset.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            let row_header_w = pane.row_header_w;
+            let content_w = pane.content_w;
             // A chart floats above the cells, so hit-test the ChartLayer first — but only in the
             // content area (a point over a header can't be over a clipped chart).
             let content_x = local_x - row_header_w;
@@ -1542,15 +1578,7 @@ impl GridView {
             } else {
                 false
             };
-            let hit = layout::hit_test(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-            );
+            let hit = pane.hit_test(local_x, local_y, &row_axis, &col_axis);
             (hit, chart_hit, fill_hit)
         };
         // A chart under the pointer wins over the cell beneath it (this is the left-button handler:
@@ -2236,19 +2264,10 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            let cell = layout::cell_at_point(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-                content_w,
-                content_h,
-            );
+            // Frozen-pane cell_at_point (`freeze-panes §3.3`): a header drag past the divider resolves
+            // the track in whatever region the pointer lands.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            let cell = pane.cell_at_point(local_x, local_y, &row_axis, &col_axis);
             (
                 Some(SheetDims::new(row_axis.count(), col_axis.count())),
                 cell,
@@ -2293,11 +2312,13 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            // Frozen-pane geometry (`freeze-panes §3.3`): region-route the header/cell hit-test.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            let row_header_w = pane.row_header_w;
             let content_x = local_x - row_header_w;
             let content_y = local_y - COL_HEADER_H;
             let chart_hit = if content_x >= 0.0 && content_y >= 0.0 {
-                let content_w = (viewport_w - row_header_w as f64).max(0.0);
+                let content_w = pane.content_w;
                 let geom = AxisGeometry {
                     col_axis: &col_axis,
                     row_axis: &row_axis,
@@ -2311,15 +2332,7 @@ impl GridView {
             } else {
                 None
             };
-            let hit = layout::hit_test(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-            );
+            let hit = pane.hit_test(local_x, local_y, &row_axis, &col_axis);
             (
                 hit,
                 chart_hit,
@@ -2507,19 +2520,10 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            layout::cell_at_point(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-                content_w,
-                content_h,
-            )
+            // Frozen-pane cell_at_point (`freeze-panes §3.3/§4`): a drag past the divider lands on
+            // the band's cell, so a selection/fill drag extends continuously across the boundary.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            pane.cell_at_point(local_x, local_y, &row_axis, &col_axis)
         };
         let selection = SelectionModel {
             anchor,
@@ -2550,19 +2554,10 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            layout::cell_at_point(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-                content_w,
-                content_h,
-            )
+            // Frozen-pane cell_at_point (`freeze-panes §3.3/§4`): a drag past the divider lands on
+            // the band's cell, so a selection/fill drag extends continuously across the boundary.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            pane.cell_at_point(local_x, local_y, &row_axis, &col_axis)
         };
         self.set_fill_target_from_cell(cell);
         self.maybe_start_autoscroll(window, cx);
@@ -2661,22 +2656,19 @@ impl GridView {
         let pos = window.mouse_position();
         let (local_x, local_y) = self.event_local(pos);
         let active = self.active_sheet;
-        let (_, scroll_y) = self.scroll_of(active);
+        let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
         let caches = self.sources.caches.read();
         let Some(cache) = caches.get(active) else {
             return (0.0, 0.0);
         };
-        let (row_axis, _) = cache.axes();
-        let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-        let content_w = (viewport_w - row_header_w as f64).max(0.0);
-        layout::edge_autoscroll_delta(
+        // Auto-scroll fires only near the scrolling BODY's live edges, never over a frozen band
+        // (`freeze-panes §3.4`). `M=K=0` → the full content rect (today's behaviour).
+        let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+        pane.edge_delta(
             local_x,
             local_y,
-            row_header_w,
-            content_w,
-            content_h,
             EDGE_AUTOSCROLL_STEP_PX,
             EDGE_AUTOSCROLL_HOTZONE_PX,
         )
@@ -2744,40 +2736,37 @@ impl GridView {
             let (row_axis, col_axis) = cache.axes();
             let total_w = cache.total_width();
             let total_h = cache.total_height();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y0, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            let (dx, dy) = layout::edge_autoscroll_delta(
+            // Frozen-pane auto-scroll (`freeze-panes §3.4`): the edge hotzone is the BODY sub-rect and
+            // the scroll is body-relative — a drag into a frozen band does not auto-scroll, and the
+            // body-relative scroll clamps against the non-frozen tracks. `M=K=0` → today's math.
+            let pane =
+                Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x0, scroll_y0);
+            let (dx, dy) = pane.edge_delta(
                 local_x,
                 local_y,
-                row_header_w,
-                content_w,
-                content_h,
                 EDGE_AUTOSCROLL_STEP_PX,
                 EDGE_AUTOSCROLL_HOTZONE_PX,
             );
             if dx == 0.0 && dy == 0.0 {
-                None // pointer back inside — stop
+                None // pointer back inside the body — stop
             } else {
-                let area = ContentArea {
-                    row_header_w,
-                    width: content_w,
-                    height: content_h,
+                // Clamp the moved body-relative scroll, then resolve the hovered cell + the body
+                // visible ranges at the clamped scroll through panes at that scroll.
+                let moved = layout::PaneGeometry {
+                    body_sx: scroll_x0 + dx,
+                    body_sy: scroll_y0 + dy,
+                    ..pane
                 };
-                let (nx, ny) =
-                    layout::clamp_scroll(scroll_x0 + dx, scroll_y0 + dy, total_w, total_h, area);
-                let cell = layout::cell_at_point(
-                    local_x,
-                    local_y,
-                    row_header_w,
-                    nx,
-                    ny,
-                    &row_axis,
-                    &col_axis,
-                    content_w,
-                    content_h,
-                );
-                let rows = row_axis.visible_range(ny, content_h, RENDER_OVERSCAN);
-                let cols = col_axis.visible_range(nx, content_w, RENDER_OVERSCAN);
+                let (nx, ny) = moved.clamp(total_w, total_h);
+                let at = layout::PaneGeometry {
+                    body_sx: nx,
+                    body_sy: ny,
+                    ..pane
+                };
+                let cell = at.cell_at_point(local_x, local_y, &row_axis, &col_axis);
+                let (body_w, body_h) = pane.body_area();
+                let rows = row_axis.visible_range(pane.frozen_h + ny, body_h, RENDER_OVERSCAN);
+                let cols = col_axis.visible_range(pane.frozen_w + nx, body_w, RENDER_OVERSCAN);
                 Some((nx, ny, cell, rows, cols))
             }
         };
@@ -2841,25 +2830,36 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
+            // Frozen-pane band extents (`freeze-panes §3.2`): the reveal is body-relative and no-ops
+            // on a frozen axis. `M=K=0` reduces to the pre-freeze `scroll_to_reveal`.
+            let m = cache.frozen_rows().min(row_axis.count());
+            let k = cache.frozen_cols().min(col_axis.count());
+            let frozen_h = row_axis.offset_of(m);
+            let frozen_w = col_axis.offset_of(k);
+            let body_h = (content_h - frozen_h).max(0.0);
             // Gutter wide enough for both the current view and the (possibly deeper) target row,
-            // matching `resolve_frame`'s conservative reveal sizing.
-            let cur_rows = row_axis.visible_range(scroll_y0, content_h, RENDER_OVERSCAN);
-            let reveal_gutter = layout::row_header_width(cur_rows.end.saturating_sub(1))
+            // matching `resolve_frame`'s conservative reveal sizing (body-relative query).
+            let cur_rows = row_axis.visible_range(frozen_h + scroll_y0, body_h, RENDER_OVERSCAN);
+            let reveal_gutter = layout::row_header_width(cur_rows.end.max(m).saturating_sub(1))
                 .max(layout::row_header_width(row));
-            let content_w = (viewport_w - reveal_gutter as f64).max(0.0);
-            let area = ContentArea {
+            let pane = layout::PaneGeometry {
                 row_header_w: reveal_gutter,
-                width: content_w,
-                height: content_h,
+                frozen_w,
+                frozen_h,
+                content_w: (viewport_w - reveal_gutter as f64).max(0.0),
+                content_h,
+                body_sx: scroll_x0,
+                body_sy: scroll_y0,
             };
-            let (nx, ny) = layout::scroll_to_reveal(
-                row, col, &row_axis, &col_axis, area, scroll_x0, scroll_y0,
-            );
-            // Recompute the visible ranges (and gutter/content) at the new scroll.
-            let rows = row_axis.visible_range(ny, content_h, RENDER_OVERSCAN);
+            let (nx, ny) = pane.reveal(row, col, &row_axis, &col_axis);
+            // Recompute the body visible ranges (and gutter/content) at the new body-relative scroll.
+            let rows = row_axis.visible_range(frozen_h + ny, body_h, RENDER_OVERSCAN);
+            let rows = rows.start.max(m)..rows.end.max(m);
             let content_w2 =
                 (viewport_w - layout::row_header_width(rows.end.saturating_sub(1)) as f64).max(0.0);
-            let cols = col_axis.visible_range(nx, content_w2, RENDER_OVERSCAN);
+            let body_w2 = (content_w2 - frozen_w).max(0.0);
+            let cols = col_axis.visible_range(frozen_w + nx, body_w2, RENDER_OVERSCAN);
+            let cols = cols.start.max(k)..cols.end.max(k);
             (nx, ny, rows, cols)
         };
 
@@ -3448,11 +3448,10 @@ impl GridView {
         if covers_active {
             // Filter over the quadrant UNION (bands + body), so a published band cell is indexed
             // for its quadrant's lookup (§2). `M=K=0` → the single body quadrant, i.e. the old
-            // `frame.rows/cols` filter. NOTE: the `ViewportChanged` announce still reports only the
-            // body range, so a band cell scrolled far off the body is not PUBLISHED and shows no
-            // value (fills/borders still render from the cache). Publishing the bands is a tracked
-            // Phase-4 task (implementation_plan.md), and must land before the Phase-6
-            // `freeze_scrolled_body` baseline is generated.
+            // `frame.rows/cols` filter. The worker always publishes the leading `0..M` / `0..K`
+            // bands alongside the body window (Phase 4 band-publishing fix, `build_publication`), so
+            // a band cell's VALUE is present in `publication.cells` regardless of how deep the body
+            // is scrolled — the union filter then indexes it for its band quadrant.
             for (i, cell) in publication.cells.iter().enumerate() {
                 if frame.in_visible_union(cell.row, cell.col) {
                     self.cell_index.insert((cell.row, cell.col), i);
@@ -4004,75 +4003,105 @@ impl GridView {
         let mut out: Vec<AnyElement> = Vec::new();
         let content_right = frame.row_header_w + frame.content_w as f32;
         let content_bottom = COL_HEADER_H + frame.content_h as f32;
-        // Column dividers (drag a column's RIGHT edge → resize that column).
+        // The freeze-line boundaries (`freeze-panes §5`): frozen-track dividers live in the band
+        // `[header, divider]`, body-track dividers in the scrolling region `(divider, content edge]`.
+        let divider_x = frame.row_header_w + frame.frozen_w as f32;
+        let divider_y = COL_HEADER_H + frame.frozen_h as f32;
+        // Frozen-column dividers: unscrolled band position (the divider follows a resize because
+        // `frozen_w` is preview-aware). Skip past the freeze line.
+        for c in 0..frame.frozen_cols {
+            let edge = frame.row_header_w + (frame.col_offset(c) + frame.col_size(c) as f64) as f32;
+            if edge <= frame.row_header_w || edge > divider_x {
+                continue;
+            }
+            out.push(self.col_resize_hotspot(edge, c, cx));
+        }
+        // Body-column dividers: scroll with the body (the `frozen_w` term cancels, so the formula is
+        // unchanged; only the lower clip moves to the freeze line).
         for c in frame.cols.clone() {
             let edge = frame.row_header_w
                 + (frame.col_offset(c) + frame.col_size(c) as f64 - frame.scroll_x) as f32;
-            if edge <= frame.row_header_w || edge > content_right {
-                continue; // divider off the visible header strip
+            if edge <= divider_x || edge > content_right {
+                continue; // divider off the body header strip (scrolled under a band or past the edge)
             }
-            out.push(
-                rect_div(
-                    edge - RESIZE_HOTSPOT_HALF,
-                    0.0,
-                    RESIZE_HOTSPOT_HALF * 2.0,
-                    COL_HEADER_H,
-                )
-                .cursor_col_resize()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        // A single press begins the drag-resize; the 2nd click of a double-click
-                        // autofits the column to its content (`functional_spec.md §7`) without
-                        // beginning a resize. The 3rd+ click of a rapid multi-click burst is ignored
-                        // so a triple-click neither re-autofits (a redundant same-width undo step) nor
-                        // starts a stray resize.
-                        match event.click_count {
-                            1 => this.begin_resize(RowOrCol::Col, c, event, window, cx),
-                            2 => this.autofit_column(c, window, cx),
-                            _ => {}
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .into_any_element(),
-            );
+            out.push(self.col_resize_hotspot(edge, c, cx));
         }
-        // Row dividers (drag a row's BOTTOM edge → resize that row).
+        // Frozen-row dividers (unscrolled band position), then body-row dividers past the freeze line.
+        for r in 0..frame.frozen_rows {
+            let edge = COL_HEADER_H + (frame.row_offset(r) + frame.row_size(r) as f64) as f32;
+            if edge <= COL_HEADER_H || edge > divider_y {
+                continue;
+            }
+            out.push(self.row_resize_hotspot(edge, r, frame.row_header_w, cx));
+        }
         for r in frame.rows.clone() {
             let edge = COL_HEADER_H
                 + (frame.row_offset(r) + frame.row_size(r) as f64 - frame.scroll_y) as f32;
-            if edge <= COL_HEADER_H || edge > content_bottom {
+            if edge <= divider_y || edge > content_bottom {
                 continue;
             }
-            out.push(
-                rect_div(
-                    0.0,
-                    edge - RESIZE_HOTSPOT_HALF,
-                    frame.row_header_w,
-                    RESIZE_HOTSPOT_HALF * 2.0,
-                )
-                .cursor_row_resize()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        // A single press begins the drag-resize; the 2nd click of a double-click
-                        // autofits the row to its content (`functional_spec.md §5`) without beginning a
-                        // resize. The 3rd+ click of a rapid multi-click burst is ignored so a
-                        // triple-click neither re-autofits (a redundant same-height undo step) nor
-                        // starts a stray resize. Mirrors the column hotspot above.
-                        match event.click_count {
-                            1 => this.begin_resize(RowOrCol::Row, r, event, window, cx),
-                            2 => this.autofit_row(r, window, cx),
-                            _ => {}
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .into_any_element(),
-            );
+            out.push(self.row_resize_hotspot(edge, r, frame.row_header_w, cx));
         }
         out
+    }
+
+    /// One column-resize hotspot: a `col-resize` zone centered on the divider at grid-x `edge` for
+    /// column `c` (`components/grid_structure.md §5.1`, region-placed by
+    /// [`resize_hotspots`](Self::resize_hotspots)). A single press begins the drag-resize; the 2nd
+    /// click of a double-click autofits the column (`functional_spec.md §7`); the 3rd+ click of a
+    /// rapid burst is ignored so a triple-click neither re-autofits (a redundant same-width undo
+    /// step) nor starts a stray resize.
+    fn col_resize_hotspot(&self, edge: f32, c: u32, cx: &mut Context<Self>) -> AnyElement {
+        rect_div(
+            edge - RESIZE_HOTSPOT_HALF,
+            0.0,
+            RESIZE_HOTSPOT_HALF * 2.0,
+            COL_HEADER_H,
+        )
+        .cursor_col_resize()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                match event.click_count {
+                    1 => this.begin_resize(RowOrCol::Col, c, event, window, cx),
+                    2 => this.autofit_column(c, window, cx),
+                    _ => {}
+                }
+                cx.stop_propagation();
+            }),
+        )
+        .into_any_element()
+    }
+
+    /// One row-resize hotspot: a `row-resize` zone centered on the divider at grid-y `edge` for row
+    /// `r` (the row twin of [`col_resize_hotspot`](Self::col_resize_hotspot); the 2nd click autofits
+    /// the row, `functional_spec.md §5`).
+    fn row_resize_hotspot(
+        &self,
+        edge: f32,
+        r: u32,
+        row_header_w: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        rect_div(
+            0.0,
+            edge - RESIZE_HOTSPOT_HALF,
+            row_header_w,
+            RESIZE_HOTSPOT_HALF * 2.0,
+        )
+        .cursor_row_resize()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                match event.click_count {
+                    1 => this.begin_resize(RowOrCol::Row, r, event, window, cx),
+                    2 => this.autofit_row(r, window, cx),
+                    _ => {}
+                }
+                cx.stop_propagation();
+            }),
+        )
+        .into_any_element()
     }
 
     /// The header insert/delete context menu overlay: a click-away backdrop + a small card of items
@@ -5946,8 +5975,9 @@ impl GridView {
         let caches = self.sources.caches.read();
         let cache = caches.get(active)?;
         let (row_axis, col_axis) = cache.axes();
-        let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-        let content_w = (viewport_w - row_header_w as f64).max(0.0);
+        let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+        let row_header_w = pane.row_header_w;
+        let content_w = pane.content_w;
         let sel = self.selection().range();
         let right_x = col_axis.offset_of(sel.end.col + 1);
         let bottom_y = row_axis.offset_of(sel.end.row + 1);
@@ -6578,6 +6608,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells,
         };
@@ -6634,6 +6666,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells: vec![],
         };
@@ -7300,6 +7334,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells: published,
         };
@@ -7507,6 +7543,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells: published,
         };
@@ -7951,6 +7989,154 @@ mod tests {
                     assert!(frame.quadrants[QuadKind::Body as usize].is_some());
                     let layers = grid.build_grid_layers(&frame, None);
                     assert!(!layers.is_empty(), "a frozen sheet still builds layers");
+                });
+            })
+            .unwrap();
+    }
+
+    // ---- Phase 4: cross-boundary interactions (`components/viewport_split.md §3–§5`) --------
+
+    #[gpui::test]
+    fn click_in_top_band_selects_frozen_row_and_scrolled_col(cx: &mut TestAppContext) {
+        // With the body scrolled, a click in the top band (frozen row, scrolling col) region-routes
+        // through `pane.hit_test`: the row is a frozen band row, the column is a scrolled body column
+        // — the SAME column a body click at that x resolves. Validates the wired frozen hit-test.
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.scroll.insert(sheet, (500.0, 400.0)); // body-relative
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    let x_body = frame.row_header_w + frame.frozen_w as f32 + 1.0;
+                    let y_top = COL_HEADER_H + 1.0; // top band (frozen row)
+                    let y_body = COL_HEADER_H + frame.frozen_h as f32 + 1.0; // body
+
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, x_body, y_top), window, cx);
+                    let top = grid.selection().active;
+                    grid.handle_mouse_down(
+                        &mouse_ev(MouseButton::Left, x_body, y_body),
+                        window,
+                        cx,
+                    );
+                    let body = grid.selection().active;
+
+                    assert!(top.row < 2, "top-band click lands on a frozen row: {top:?}");
+                    assert!(
+                        top.col >= 2,
+                        "the column is a scrolled body column: {top:?}"
+                    );
+                    assert!(
+                        body.row >= 2,
+                        "body click lands on a scrolled body row: {body:?}"
+                    );
+                    assert_eq!(body.col, top.col, "same body column at the same x");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn drag_extends_selection_across_divider_into_band(cx: &mut TestAppContext) {
+        // A cell drag begun in the body and extended into the LEFT band (frozen col, scrolling row)
+        // lands on a frozen-column cell — a continuous drag across the divider (`§3.3/§4`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.scroll.insert(sheet, (500.0, 400.0));
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    let x_body = frame.row_header_w + frame.frozen_w as f32 + 1.0;
+                    let y_body = COL_HEADER_H + frame.frozen_h as f32 + 1.0;
+                    // Start a body cell drag.
+                    grid.handle_mouse_down(
+                        &mouse_ev(MouseButton::Left, x_body, y_body),
+                        window,
+                        cx,
+                    );
+                    let anchor = grid.selection().anchor;
+                    assert!(anchor.col >= 2, "drag anchor is a body cell");
+                    // Extend into the left band (x inside the frozen-col region, still a body row y).
+                    grid.extend_drag_to_point(anchor, frame.row_header_w + 1.0, y_body, window, cx);
+                    let sel = *grid.selection();
+                    assert_eq!(sel.anchor, anchor, "anchor preserved across the drag");
+                    assert!(
+                        sel.active.col < 2,
+                        "a drag into the left band selects a frozen column: {:?}",
+                        sel.active
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn reveal_frozen_row_is_noop_and_body_row_lands_below_divider(cx: &mut TestAppContext) {
+        // `pane.reveal` no-ops on a frozen axis (the band is already pinned) and reveals a deep body
+        // row into the body sub-area, never under the band (`§3.2`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 0));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.scroll.insert(sheet, (0.0, 123.0));
+                    // Revealing a frozen row (row 1) does not move the body scroll.
+                    grid.reveal_and_announce(1, 0, window, cx);
+                    assert_eq!(
+                        grid.scroll_of(sheet).1,
+                        123.0,
+                        "revealing a frozen row is a no-op on the vertical axis"
+                    );
+                    // Revealing a deep body row scrolls it into the body quadrant (not under the band).
+                    grid.reveal_and_announce(500, 0, window, cx);
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    let body = frame.quadrants[QuadKind::Body as usize]
+                        .as_ref()
+                        .expect("body quadrant");
+                    assert!(
+                        body.rows.contains(&500),
+                        "the revealed body row is visible in the body: {:?}",
+                        body.rows
+                    );
+                    assert!(body.rows.start >= 2, "the body never shows a frozen row");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn frozen_col_resize_grows_band_and_hotspots_build(cx: &mut TestAppContext) {
+        // A live resize of a frozen column grows the frozen band (`frozen_w` is preview-aware), and
+        // `resize_hotspots` builds region-placed dividers without panicking (`§5`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(0, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let base = grid.resolve_frame(vw, vh).expect("frame");
+                    let base_frozen_w = base.frozen_w;
+                    let start_px = base.col_size(0);
+                    // Simulate a live resize of frozen column 0, +60 px.
+                    grid.resize_drag = Some(ResizeDrag {
+                        axis: RowOrCol::Col,
+                        index: 0,
+                        start_px,
+                        current_px: start_px + 60.0,
+                        run: (0, 0),
+                        origin_coord: 0.0,
+                    });
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    assert!(
+                        frame.frozen_w > base_frozen_w + 50.0,
+                        "resizing a frozen column grows the band: {} vs {base_frozen_w}",
+                        frame.frozen_w
+                    );
+                    let hotspots = grid.resize_hotspots(&frame, cx);
+                    assert!(!hotspots.is_empty(), "frozen frame builds resize hotspots");
                 });
             })
             .unwrap();

@@ -50,6 +50,18 @@ icons = [
 name = "freecell_app"
 path = "src/lib.rs"
 
+# `build.rs` embeds the FreeCell app icon as executable resource ID 1 so the exe + window show the
+# FreeCell icon instead of the generic Windows icon (gpui's Windows backend loads the app icon from
+# that resource). A `[target.'cfg(...)'.build-dependencies]` table is selected by the compilation
+# TARGET — Cargo evaluates the `cfg` against `--target`, not the host — so `embed-resource` is pulled
+# in only when building FOR Windows, keeping it (and `cc`) off ordinary macOS/Linux target builds.
+# The packaging pipeline builds natively on `windows-latest` (host == target), so the dep is pulled
+# and the icon embedded. Note the embed is actually skipped by the HOST-based `#[cfg]` inside
+# build.rs, NOT by this gate: a Linux → Windows cross-compile would still pull `embed-resource` in
+# here, yet produce no icon (build.rs's `#[cfg]` is false on a non-Windows host). See build.rs.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3"
+
 [[bin]]
 name = "freecell"
 path = "src/main.rs"

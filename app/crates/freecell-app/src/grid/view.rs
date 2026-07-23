@@ -1020,6 +1020,22 @@ impl GridView {
         cx.notify();
     }
 
+    /// Arms a point-drag preview state directly (render-test / debug hook), so a static capture can
+    /// show the dashed point-mode preview marquee without synthesizing a live mouse drag. `origin` is
+    /// the merge-anchor start cell, `last_range` (⊇ origin) the swept, merge-expanded range — exactly
+    /// the state the live [`set_point_target_from_cell`](Self::set_point_target_from_cell) builds
+    /// (`formula-point-mode/functional_spec.md §2`). The normal app never calls this (the point-drag
+    /// machine owns the state); it exists so the pixel suite can baseline the preview overlay.
+    pub fn set_point_drag_preview(
+        &mut self,
+        origin: CellRef,
+        last_range: CellRange,
+        cx: &mut Context<Self>,
+    ) {
+        self.point_drag = Some(PointDrag { origin, last_range });
+        cx.notify();
+    }
+
     /// Freezes the loading spinner to a static loader icon (render-test / debug hook). The
     /// animated `Spinner` rotates by wall-clock elapsed time, so a capture taken at an
     /// arbitrary moment (after `xrefresh`) would be non-deterministic; freezing makes the

@@ -84,7 +84,7 @@ from `app/`.
       - Checks: `cargo build -p freecell-app`; full crate-scoped test run for the touched crates;
         `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 5 — Render validation (dedicated late phase, §9).** No new behaviour.
+- [x] **Phase 5 — Render validation (dedicated late phase, §9).** No new behaviour.
       - Regenerate + **eyeball** baselines: add `formula_ref_highlight_same_sheet`,
         `formula_ref_point_preview`; refresh any shifted `selection`/`cell_*`.
       - Run the **full** pixel suite once under `timeout` + ~10-min watchdog

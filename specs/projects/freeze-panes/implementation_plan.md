@@ -42,7 +42,7 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
     at a different track, symmetric for columns; pure `header_menu_items` label/event mapping.
     Checks: `-p freecell-app`, `fmt --all --check`.
 
-- [ ] **Phase 3 — Quadrant render + clamp rework (`components/viewport_split.md §1–§4`).** The
+- [x] **Phase 3 — Quadrant render + clamp rework (`components/viewport_split.md §1–§4`).** The
   core change. Moves grid pixels → iterate with the render **subset** only.
   - `layout.rs`: `PaneGeometry` (band extents, body area) + the re-based `clamp`/`reveal`/
     `hit_test`/`cell_at_point`/`edge_delta`/scrollbar helpers (§3); `M=K=0` reduces to today.
@@ -63,9 +63,21 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
     on a frozen axis + into the body sub-area; edge auto-scroll over the body sub-rect;
     `resize_hotspots` per-region (frozen vs scrolling dividers); selection/fill drags extend
     continuously across the divider (overlay per-quadrant).
+  - **Publish the frozen bands in the viewport announce (from Phase 3).** Phase 3 renders band
+    cells (`cell_index` is built over the quadrant union), but the `ViewportChanged` announce still
+    reports only the **body** range — so a leading-band cell falls outside the published window once
+    the body is scrolled deep past it, and the band then shows its fills/borders but **no VALUES**.
+    Fix here: make the announce (`resolve_frame` + `handle_scroll` `ViewportChanged`) cover the
+    union `(0..M ∪ body_rows) × (0..K ∪ body_cols)` — or always publish the leading `0..M` / `0..K`
+    bands — so band cells show their values regardless of body scroll. Keep it O(visible): the bands
+    are the few leading tracks, never a sheet-size loop. (Phase-3 code comment at the `cell_index`
+    union filter in `grid/view.rs::build_grid_layers` flags this pointer.) **This MUST land before
+    the Phase 6 `freeze_scrolled_body` baseline is generated** — otherwise that baseline would
+    enshrine the blank-band bug as golden.
   - Tests: gpui — click/drag select across the boundary, reveal into body not under a band,
-    auto-scroll only at body edges, resize a frozen track grows the band. Render **subset** for
-    the cross-divider selection overlay.
+    auto-scroll only at body edges, resize a frozen track grows the band, and the announced
+    viewport covers the frozen bands when the body is scrolled deep. Render **subset** for the
+    cross-divider selection overlay.
     Checks: `-p freecell-app`, `fmt --all --check`.
 
 - [ ] **Phase 5 — Structural-edit boundary tracking (`architecture.md §5`, Q4).** Engine, no
@@ -83,7 +95,9 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
   behavior.
   - `render-tests`: `Scene` builder `.frozen_rows(m)`/`.frozen_cols(k)` (mirror `.hide_row`); new
     cases `freeze_top_row`, `freeze_rows_band`, `freeze_first_col`, `freeze_cols_band`,
-    `freeze_four_quadrant`, `freeze_scrolled_body`, `freeze_divider`.
+    `freeze_four_quadrant`, `freeze_scrolled_body`, `freeze_divider`. **Prerequisite:** the Phase-4
+    band-publishing fix must be in before `freeze_scrolled_body` is generated (else the scrolled
+    band would baseline with blank values — see Phase 4).
   - Regenerate + **eyeball** baselines; run the **full** pixel suite under `timeout` + ~10-min
     watchdog; commit refreshed baselines; dispatch the CI `render` gate on the branch, poll green.
 

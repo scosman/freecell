@@ -212,11 +212,6 @@ impl EditController {
         self.sig_hint
     }
 
-    /// Sets the signature-hint template (used by the autocomplete-accept path).
-    pub fn set_sig_hint(&mut self, hint: Option<&'static str>) {
-        self.sig_hint = hint;
-    }
-
     /// Whether the driving caret is reference-ready (cached last recompute result).
     pub fn reference_ready(&self) -> bool {
         self.reference_ready

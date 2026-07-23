@@ -69,7 +69,7 @@ from `app/`.
         happy path). **Render subset** `… test formula_ref` (point-preview vs selection vs highlight).
         `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 4 — Consolidation cleanup + v1.0 GAP entries (§6).**
+- [x] **Phase 4 — Consolidation cleanup + v1.0 GAP entries (§6).**
       - Finish the consolidation: confirm the two host adapters carry **zero** formula logic (grid =
         primitives + paint; data-row bar = render only); remove any now-dead scattered fields; the
         migration-step-1 regression gate (all shipped autocomplete + `data_row` tests green).

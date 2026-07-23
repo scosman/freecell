@@ -21,7 +21,7 @@ from `app/`.
 
 ## Phases
 
-- [ ] **Phase 1 — Tokenization seam + pure foundation (§1, §2).** No pixels, no gpui.
+- [x] **Phase 1 — Tokenization seam + pure foundation (§1, §2).** No pixels, no gpui.
       - `freecell-core`: add `RefToken` (`refs.rs`), `is_reference_ready` (`functions.rs`, beside
         `is_function_position_prev`/`in_string_at`), `RefColor` + `REF_HIGHLIGHT_PALETTE` (7 authored
         light/dark pairs) + `ref_color` + `assign_ref_colors` (`palette.rs`).
@@ -36,7 +36,7 @@ from `app/`.
         table, `assign_ref_colors`, palette len/wrap, `lex_formula_refs` over crafted formulas incl.
         cross-sheet + partial). `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 2 — Shared color map + grid highlights (§2.4, §3.1, §4.1, §6).** Ships user-visible
+- [x] **Phase 2 — Shared color map + grid highlights (§2.4, §3.1, §4.1, §6).** Ships user-visible
       value with **no** gpui-component / vendored-widget dependency; no in-editor token coloring
       (deferred to v1.0).
       - `freecell-app` chrome: promote the formula-feature state onto `EditController`
@@ -54,7 +54,7 @@ from `app/`.
         appear for same-sheet refs, absent for cross-sheet, cleared on commit); **render subset**
         `render_tests.sh test formula_ref` while iterating. `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 3 — Point-mode routing (§3, §5).** The `InsertReference` path + pending-ref.
+- [x] **Phase 3 — Point-mode routing (§3, §5).** The `InsertReference` path + pending-ref.
       - `GridEvent::InsertReference { a1, replace_pending }` (`grid/mod.rs`); route in `make_grid_sink`
         (`shell/window.rs`) → `ChromeView::insert_reference`.
       - `insert_reference` (chrome; analog of `accept_autocomplete`) + `pending_ref` lifecycle on
@@ -69,7 +69,7 @@ from `app/`.
         happy path). **Render subset** `… test formula_ref` (point-preview vs selection vs highlight).
         `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 4 — Consolidation cleanup + v1.0 GAP entries (§6).**
+- [x] **Phase 4 — Consolidation cleanup + v1.0 GAP entries (§6).**
       - Finish the consolidation: confirm the two host adapters carry **zero** formula logic (grid =
         primitives + paint; data-row bar = render only); remove any now-dead scattered fields; the
         migration-step-1 regression gate (all shipped autocomplete + `data_row` tests green).
@@ -84,7 +84,7 @@ from `app/`.
       - Checks: `cargo build -p freecell-app`; full crate-scoped test run for the touched crates;
         `cargo fmt --all --check`. Commit + push.
 
-- [ ] **Phase 5 — Render validation (dedicated late phase, §9).** No new behaviour.
+- [x] **Phase 5 — Render validation (dedicated late phase, §9).** No new behaviour.
       - Regenerate + **eyeball** baselines: add `formula_ref_highlight_same_sheet`,
         `formula_ref_point_preview`; refresh any shifted `selection`/`cell_*`.
       - Run the **full** pixel suite once under `timeout` + ~10-min watchdog

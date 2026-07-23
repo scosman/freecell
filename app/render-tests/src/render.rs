@@ -70,6 +70,8 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
     let selected_chart = case.selected_chart;
     let auto_grow = case.auto_grow;
     let fill_drag = case.fill_drag;
+    let ref_highlights = case.ref_highlights;
+    let point_drag = case.point_drag;
 
     let app = application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx: &mut App| {
@@ -128,6 +130,9 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             false,
                             None,
                             None,
+                            false,
+                            false,
+                            ref_highlights.clone(),
                             cx,
                         );
                     }
@@ -145,6 +150,9 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                             false,
                             None,
                             None,
+                            false,
+                            false,
+                            Vec::new(),
                             cx,
                         );
                     }
@@ -160,6 +168,11 @@ pub fn run_render_scene(case_name: &str, exit_after_ms: u64) -> Result<()> {
                     // captured frame shows the target-region preview rectangle.
                     if let Some((seed, target, axis)) = fill_drag {
                         view.set_fill_drag_preview(seed, target, axis, cx);
+                    }
+                    // A live point-drag preview (`formula-point-mode/functional_spec.md §2`): arm the
+                    // point-drag state so the captured frame shows the dashed preview marquee.
+                    if let Some((origin, last_range)) = point_drag {
+                        view.set_point_drag_preview(origin, last_range, cx);
                     }
                     view
                 });

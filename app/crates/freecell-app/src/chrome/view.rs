@@ -36,7 +36,7 @@ use freecell_core::format_ui::{
     adjust_decimals_cell, displayed_decimals, font_size_display, is_more_only_num_fmt,
     num_fmt_category, toggle_thousands, Category, BASIC_FORMATS, NUM_FMT_GROUPS,
 };
-use freecell_core::functions::{self, FnSig};
+use freecell_core::functions;
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
@@ -63,18 +63,6 @@ use super::{
     AutocompleteDisplay, AutocompleteRow, ChromeClient, ChromeGridRequest, ChromeGridSink,
     EditController, EditOrigin, SheetTab,
 };
-
-/// The function-autocomplete list's live state while the dropdown is open (`ChromeView`-owned,
-/// `gaps_closing_7_15 §1`). Cleared to `None` when the list dismisses.
-struct Autocomplete {
-    /// The current filtered, ordered match list (from [`functions::complete`]).
-    matches: Vec<&'static FnSig>,
-    /// The highlighted row index into [`matches`](Self::matches).
-    highlight: usize,
-    /// The byte offset in the edit text where the typed prefix begins — the replace point on
-    /// accept.
-    token_start: usize,
-}
 
 /// The 250 ms no-flash delay for both the content-fetch and evaluating spinners
 /// (`ui_design.md §3.1/§3.2`, mirrored from the grid's own delayed hooks).
@@ -401,15 +389,6 @@ pub struct ChromeView {
     /// carries the rejection so the popover shows the same message as a local cap reject.
     cap_error_external: Option<InputRejection>,
 
-    /// The function-autocomplete dropdown's live state while open, else `None`
-    /// (`gaps_closing_7_15 §1`). Driven off the active editor's text + caret after each
-    /// keystroke ([`recompute_autocomplete`](Self::recompute_autocomplete)); rendered under the
-    /// data row directly, and under the in-cell overlay by the grid (via `EditState`).
-    autocomplete: Option<Autocomplete>,
-    /// The active passive signature-hint template (the whole `NAME(args…)` line), or `None`
-    /// when the caret is not inside a recognized call. Static (D1.1 — no current-arg tracking).
-    sig_hint: Option<&'static str>,
-
     /// The evaluating-spinner state machine (`freecell-core`).
     eval: EvalIndicator,
 
@@ -706,8 +685,6 @@ impl ChromeView {
             quick_edit: false,
             committed_cell: None,
             cap_error_external: None,
-            autocomplete: None,
-            sig_hint: None,
             eval: EvalIndicator::default(),
             fill_open: false,
             color_picker,
@@ -957,6 +934,12 @@ impl ChromeView {
         if committed {
             self.edit.close();
             self.quick_edit = false;
+            // Symmetric with `escape_edit` / `commit_and_move`: a click-away / adopt-selection /
+            // action-button commit ends the edit, so drop all formula-feature derived state
+            // (highlights, autocomplete, sig-hint, pending-ref). Not user-visible in Phase 2 (the
+            // grid push is gated on `editing`), but keeps the pending-ref span from surviving a
+            // commit into Phase 3's point-mode consumption.
+            self.edit.clear_formula_state();
         }
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
@@ -997,8 +980,7 @@ impl ChromeView {
         self.apply_data_effects(effects, window, cx);
         self.edit.close();
         self.quick_edit = false;
-        self.autocomplete = None;
-        self.sig_hint = None;
+        self.edit.clear_formula_state();
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -1033,7 +1015,7 @@ impl ChromeView {
             input.focus(window, cx);
         });
         self.apply_data_effects(effects, window, cx);
-        self.recompute_autocomplete(cx);
+        self.recompute_formula_edit_state(cx);
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -1083,7 +1065,7 @@ impl ChromeView {
         });
         self.edit.set_syncing(false);
         self.edit.open_on(cell);
-        self.recompute_autocomplete(cx);
+        self.recompute_formula_edit_state(cx);
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -1135,8 +1117,7 @@ impl ChromeView {
         if self.data_row.mode() != FieldMode::Editing {
             self.edit.close();
             self.quick_edit = false;
-            self.autocomplete = None;
-            self.sig_hint = None;
+            self.edit.clear_formula_state();
         }
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
@@ -1190,7 +1171,7 @@ impl ChromeView {
         // When the completion list is open it preempts navigation/accept/dismiss keys
         // (`functional_spec.md §1`); every other key falls through to update/dismiss the list via
         // the normal `Change` recompute.
-        if self.autocomplete.is_some() {
+        if self.edit.autocomplete().is_some() {
             match key {
                 "down" => {
                     self.autocomplete_nav(true, cx);
@@ -1274,7 +1255,7 @@ impl ChromeView {
                 self.edit.set_syncing(false);
                 let effects = self.data_row.reduce(DataRowEvent::Edited { text });
                 self.apply_data_effects(effects, window, cx);
-                self.recompute_autocomplete(cx);
+                self.recompute_formula_edit_state(cx);
                 self.refresh_edit_grid_state(window, cx);
                 cx.notify();
             }
@@ -1341,8 +1322,20 @@ impl ChromeView {
             .then(|| self.autocomplete_display())
             .flatten();
         let sig_hint = in_cell_driving
-            .then(|| self.sig_hint.map(SharedString::from))
+            .then(|| self.edit.sig_hint().map(SharedString::from))
             .flatten();
+        // Reference highlights + point-mode signals are meaningful only while a formula edit is
+        // live; gate on `editing` so the grid's copy auto-clears the instant the edit ends
+        // (`functional_spec.md §3` lifecycle). `reference_ready`/`pending_ref` are plumbed now but
+        // only consumed by the grid in Phase 3. `ref_highlights` already holds only same-sheet
+        // tokens (the color map colors cross-sheet refs for the future in-editor control).
+        let reference_ready = editing && self.edit.reference_ready();
+        let pending_ref = editing && self.edit.pending_ref().is_some();
+        let ref_highlights = if editing {
+            self.edit.ref_highlights()
+        } else {
+            Vec::new()
+        };
         let nonempty = mirror.is_some() || in_cell.is_some();
         // Skip an all-`None` clear when nothing was shown (idle selection moves would otherwise
         // re-push every keystroke); always push when something is/was shown so the clear lands.
@@ -1358,10 +1351,24 @@ impl ChromeView {
                 quick_edit,
                 autocomplete,
                 sig_hint,
+                reference_ready,
+                pending_ref,
+                ref_highlights,
             },
             window,
             cx,
         );
+    }
+
+    /// The active sheet's display name, resolved from the tab list (used to set each reference
+    /// token's `same_sheet` flag — `freecell_engine::lex_formula_refs`). Empty if the sheet is not
+    /// (yet) in the tab list.
+    fn active_sheet_name(&self) -> String {
+        self.sheets
+            .iter()
+            .find(|t| t.id == self.active_sheet)
+            .map(|t| t.name.clone())
+            .unwrap_or_default()
     }
 
     // ---- Function autocomplete + signature hints (`gaps_closing_7_15 §1`) ------------------
@@ -1375,54 +1382,43 @@ impl ChromeView {
         }
     }
 
-    /// Recomputes the autocomplete list + signature hint from the **driving** editor's text and
-    /// caret after a keystroke (`architecture.md §1.3`). Sets both
-    /// [`autocomplete`](Self::autocomplete) and [`sig_hint`](Self::sig_hint); the caller pushes
-    /// grid state + notifies. A visible cap error takes precedence — both are cleared while it
-    /// shows.
-    fn recompute_autocomplete(&mut self, cx: &mut Context<Self>) {
+    /// Recomputes **all** formula-feature state — reference highlights + color map, the
+    /// reference-ready predicate, the autocomplete list, and the signature hint — from the
+    /// **driving** editor's live text + caret in one pass (the consolidation seam,
+    /// `architecture.md §6`; generalizes the shipped `recompute_autocomplete`). Delegates the
+    /// computation to the `edit`-owned [`EditController::recompute_formula`]; the caller pushes grid
+    /// state + notifies. A visible cap error takes precedence — every formula feature is cleared
+    /// while it shows.
+    fn recompute_formula_edit_state(&mut self, cx: &mut Context<Self>) {
+        self.recompute_formula_edit_state_keep_pending(false, cx);
+    }
+
+    /// [`recompute_formula_edit_state`](Self::recompute_formula_edit_state) with explicit control
+    /// over the pending-ref span: every **user-driven** transition (keystroke / caret move) passes
+    /// `keep_pending = false` so the "replace on next point" window is exactly one action wide
+    /// (`architecture.md §5` Cleared); only [`insert_reference`](Self::insert_reference) passes
+    /// `true`, so the span it just set survives its own recompute.
+    fn recompute_formula_edit_state_keep_pending(
+        &mut self,
+        keep_pending: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.cap_error_visible() {
-            self.autocomplete = None;
-            self.sig_hint = None;
+            self.edit.clear_formula_state();
             return;
         }
         let input = self.driving_input().read(cx);
         let text = input.value().to_string();
         let caret = input.cursor();
-
-        self.autocomplete = match functions::fn_edit_context(&text, caret) {
-            Some(ctx) => {
-                let matches = functions::complete(&ctx.prefix);
-                if matches.is_empty() {
-                    None
-                } else {
-                    // Preserve the highlight across a same-token refresh (typing more of the same
-                    // name); reset to the top when the token moved or the list shrank past it.
-                    let highlight = match &self.autocomplete {
-                        Some(prev) if prev.token_start == ctx.token_start => {
-                            prev.highlight.min(matches.len() - 1)
-                        }
-                        _ => 0,
-                    };
-                    Some(Autocomplete {
-                        matches,
-                        highlight,
-                        token_start: ctx.token_start,
-                    })
-                }
-            }
-            None => None,
-        };
-
-        self.sig_hint = functions::enclosing_fn_name(&text, caret)
-            .and_then(functions::signature)
-            .map(|s| s.template);
+        let sheet = self.active_sheet_name();
+        self.edit
+            .recompute_formula(&text, caret, &sheet, keep_pending);
     }
 
-    /// Recompute the list/hint and re-push grid state + notify (the full per-keystroke effect,
+    /// Recompute the formula state and re-push grid state + notify (the full per-keystroke effect,
     /// used by the deferred caret-move recompute below).
     fn recompute_autocomplete_and_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.recompute_autocomplete(cx);
+        self.recompute_formula_edit_state(cx);
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -1446,7 +1442,7 @@ impl ChromeView {
     /// The autocomplete list as grid-renderable display state (all matches; the render caps the
     /// visible height + scrolls per `functional_spec.md §1`), or `None` when the list is closed.
     fn autocomplete_display(&self) -> Option<AutocompleteDisplay> {
-        let ac = self.autocomplete.as_ref()?;
+        let ac = self.edit.autocomplete()?;
         let rows = ac
             .matches
             .iter()
@@ -1463,7 +1459,7 @@ impl ChromeView {
 
     /// Move the highlighted row down/up, clamped (no wrap — `functional_spec.md §1`).
     pub fn autocomplete_nav(&mut self, down: bool, cx: &mut Context<Self>) {
-        if let Some(ac) = self.autocomplete.as_mut() {
+        if let Some(ac) = self.edit.autocomplete_mut() {
             let last = ac.matches.len().saturating_sub(1);
             ac.highlight = if down {
                 (ac.highlight + 1).min(last)
@@ -1477,7 +1473,7 @@ impl ChromeView {
     /// Close the list only — the edit continues, nothing is committed or reverted
     /// (`functional_spec.md §1`, Esc). The signature hint stays as-is.
     pub fn autocomplete_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.autocomplete.take().is_some() {
+        if self.edit.take_autocomplete().is_some() {
             self.refresh_edit_grid_state(window, cx);
             cx.notify();
         }
@@ -1502,7 +1498,7 @@ impl ChromeView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ac) = self.autocomplete.as_mut() {
+        if let Some(ac) = self.edit.autocomplete_mut() {
             if index < ac.matches.len() {
                 ac.highlight = index;
             }
@@ -1514,7 +1510,7 @@ impl ChromeView {
     /// show the accepted function's signature hint. Drives both editors + the reducer so the
     /// pending edit stays consistent (`architecture.md §1.5`).
     fn accept_autocomplete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ac) = self.autocomplete.take() else {
+        let Some(ac) = self.edit.take_autocomplete() else {
             return;
         };
         let Some(sig) = ac.matches.get(ac.highlight).copied() else {
@@ -1563,7 +1559,74 @@ impl ChromeView {
         // Mirror into the other editor (its caret at end is fine — it is not the one being typed in).
         self.mirror_other_editor(origin, &new_text, window, cx);
 
-        self.sig_hint = Some(sig.template);
+        // Recompute the whole formula state off the spliced text/caret so the reference highlights,
+        // color map, and signature hint stay in lockstep (the caret now sits just after `(`, inside
+        // the accepted call — the recompute derives the same `sig.template` signature hint).
+        self.recompute_formula_edit_state(cx);
+        self.refresh_edit_grid_state(window, cx);
+        cx.notify();
+    }
+
+    /// Point-mode splice (`functional_spec.md §2`, `architecture.md §5`): insert the pointed
+    /// reference `a1` into the in-progress formula at the caret — the exact analog of
+    /// [`accept_autocomplete`](Self::accept_autocomplete). When `replace_pending` and a pending-ref
+    /// span is set (a just-pointed reference with nothing typed since), **overwrite** that span
+    /// (re-aiming / the live drag); otherwise **append** at the caret. The just-inserted span becomes
+    /// the new pending ref, so the next point action replaces it — until a keystroke / caret move
+    /// clears it (`§5` lifecycle). Routed here from [`GridEvent::InsertReference`].
+    pub fn insert_reference(
+        &mut self,
+        a1: &str,
+        replace_pending: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Point-mode only reaches an open edit (the grid emits only when reference-ready / pending);
+        // guard defensively so a stray route can never splice into an idle field.
+        if self.data_row.mode() != FieldMode::Editing {
+            return;
+        }
+        let origin = self.edit.origin();
+        let text = self.driving_input().read(cx).value().to_string();
+        let caret = self.driving_input().read(cx).cursor();
+        // Splice region: replace the pending span (re-aim / drag-grow), else insert at the caret.
+        let (start, end) = match self.edit.pending_ref() {
+            Some(span) if replace_pending && span.start <= text.len() && span.end <= text.len() => {
+                (span.start, span.end)
+            }
+            _ => (caret.min(text.len()), caret.min(text.len())),
+        };
+        let mut new_text = String::with_capacity(text.len() + a1.len());
+        new_text.push_str(&text[..start]);
+        new_text.push_str(a1);
+        new_text.push_str(&text[end..]);
+        let new_caret = start + a1.len();
+
+        // Drive the shared reducer + both editors exactly as the accept path does (keeps
+        // cap-validation / mirror / undo identical to typing — one commit = one undo step).
+        let effects = self.data_row.reduce(DataRowEvent::Edited {
+            text: new_text.clone(),
+        });
+        let char_col = new_text[..new_caret].chars().count() as u32;
+        self.set_driving_text_and_caret(origin, &new_text, char_col, window, cx);
+        self.apply_data_effects(effects, window, cx);
+        self.mirror_other_editor(origin, &new_text, window, cx);
+        // Return focus to the driving editor. The grid took keyboard focus in its own
+        // `handle_mouse_down` before emitting this point insert, and `prevent_default` only skips
+        // gpui's end-of-dispatch focus transfer — it does not undo that explicit grab. Without this,
+        // the next keystroke would miss the editor entirely (data-row → a fresh type-to-replace that
+        // wipes the formula; in-cell → swallowed). Re-focusing here (as `begin_typed`/`begin_in_cell`
+        // do) survives the built-in transfer because the whole emit chain is synchronous inside the
+        // mouse-down dispatch and `prevent_default` runs afterward (`functional_spec.md §2/§4`).
+        self.driving_input()
+            .clone()
+            .update(cx, |input, cx| input.focus(window, cx));
+        // The just-inserted span becomes pending (replace on the next point action).
+        self.edit
+            .set_pending_ref(Some(new_caret - a1.len()..new_caret));
+        // Recompute the formula state off the spliced text — KEEPING the pending span we just set
+        // (the programmatic `set_value` suppressed `Change`, so nothing else clears it here).
+        self.recompute_formula_edit_state_keep_pending(true, cx);
         self.refresh_edit_grid_state(window, cx);
         cx.notify();
     }
@@ -1729,7 +1792,7 @@ impl ChromeView {
                 let effects = self.data_row.reduce(DataRowEvent::Edited { text });
                 self.apply_data_effects(effects, window, cx);
                 self.mirror_to_in_cell(window, cx);
-                self.recompute_autocomplete(cx);
+                self.recompute_formula_edit_state(cx);
                 self.refresh_edit_grid_state(window, cx);
                 cx.notify();
             }
@@ -5123,7 +5186,7 @@ impl ChromeView {
                 overlays.push(self.render_cap_error_popover(message));
             } else if let Some(list) = self.autocomplete_display() {
                 overlays.push(self.render_autocomplete_popover(&list, cx));
-            } else if let Some(template) = self.sig_hint {
+            } else if let Some(template) = self.edit.sig_hint() {
                 overlays.push(self.render_sig_hint_popover(template));
             }
         }
@@ -15302,12 +15365,338 @@ mod tests {
         })?
     }
 
+    /// The reference highlights on the most recent edit-state push (`None` = no `EditState` pushed).
+    fn last_edit_state_ref_highlights(reqs: &[ChromeGridRequest]) -> Option<Vec<(CellRange, u8)>> {
+        reqs.iter().rev().find_map(|r| match r {
+            ChromeGridRequest::EditState { ref_highlights, .. } => Some(ref_highlights.clone()),
+            _ => None,
+        })
+    }
+
+    /// The `reference_ready` flag on the most recent edit-state push.
+    fn last_edit_state_reference_ready(reqs: &[ChromeGridRequest]) -> Option<bool> {
+        reqs.iter().rev().find_map(|r| match r {
+            ChromeGridRequest::EditState {
+                reference_ready, ..
+            } => Some(*reference_ready),
+            _ => None,
+        })
+    }
+
+    fn a1(row: u32, col: u32) -> CellRange {
+        CellRange::single(CellRef::new(row, col))
+    }
+
+    // ---- Reference highlighting (formula-point-mode Phase 2) --------------------------------
+
+    #[gpui::test]
+    fn formula_edit_pushes_same_sheet_ref_highlights(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=A1+B2", window, cx));
+        let highlights = last_edit_state_ref_highlights(&h.grid_requests.borrow())
+            .expect("an EditState was pushed");
+        assert_eq!(
+            highlights,
+            vec![(a1(0, 0), 0), (a1(1, 1), 1)],
+            "A1 and B2 highlight in distinct slots, first-appearance order"
+        );
+    }
+
+    #[gpui::test]
+    fn repeated_ref_shares_highlight_color(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=A1+A1", window, cx));
+        let highlights = last_edit_state_ref_highlights(&h.grid_requests.borrow()).unwrap();
+        assert_eq!(
+            highlights,
+            vec![(a1(0, 0), 0), (a1(0, 0), 0)],
+            "the two A1 occurrences share slot 0"
+        );
+    }
+
+    #[gpui::test]
+    fn cross_sheet_ref_absent_from_highlights_but_in_color_map(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.begin_typed("=Sheet2!A1", window, cx)
+        });
+        // No grid highlight for a cross-sheet ref (the other sheet is not visible)…
+        let highlights = last_edit_state_ref_highlights(&h.grid_requests.borrow()).unwrap();
+        assert!(
+            highlights.is_empty(),
+            "a cross-sheet reference draws no grid highlight"
+        );
+        // …but the color map still colors it (consumed by the future in-editor styling control).
+        upd(&h, cx, |c, _w, _cx| {
+            assert_eq!(c.edit.ref_tokens().len(), 1, "the token is still lexed");
+            assert!(
+                !c.edit.ref_tokens()[0].same_sheet,
+                "and flagged cross-sheet"
+            );
+            assert_eq!(c.edit.ref_colors().len(), 1, "and still assigned a color");
+        });
+    }
+
+    #[gpui::test]
+    fn commit_clears_ref_highlights(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=A1", window, cx));
+        assert_eq!(
+            last_edit_state_ref_highlights(&h.grid_requests.borrow())
+                .unwrap()
+                .len(),
+            1,
+            "the highlight shows while editing"
+        );
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| {
+            c.on_edit_commit_requested(window, cx);
+        });
+        assert_eq!(
+            last_edit_state_ref_highlights(&h.grid_requests.borrow()),
+            Some(vec![]),
+            "committing the edit removes every reference highlight"
+        );
+    }
+
+    #[gpui::test]
+    fn escape_clears_ref_highlights(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=A1", window, cx));
+        h.grid_requests.borrow_mut().clear();
+        upd(&h, cx, |c, window, cx| c.escape_edit(window, cx));
+        assert_eq!(
+            last_edit_state_ref_highlights(&h.grid_requests.borrow()),
+            Some(vec![]),
+            "cancelling the edit removes every reference highlight"
+        );
+    }
+
+    #[gpui::test]
+    fn reference_ready_pushed_for_open_formula(cx: &mut TestAppContext) {
+        // After an operator the caret is reference-ready (point-mode entry, consumed in Phase 3)…
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=A1+", window, cx));
+        assert_eq!(
+            last_edit_state_reference_ready(&h.grid_requests.borrow()),
+            Some(true),
+            "caret after `+` is reference-ready"
+        );
+        // …but right after a complete reference it is not.
+        upd(&h, cx, |c, window, cx| c.begin_typed("=A1", window, cx));
+        assert_eq!(
+            last_edit_state_reference_ready(&h.grid_requests.borrow()),
+            Some(false),
+            "caret right after a complete ref is not reference-ready"
+        );
+    }
+
+    // ---- Point-mode insertion (formula-point-mode Phase 3) ----------------------------------
+
+    /// A point insert on an empty formula appends the reference at the caret and marks its span
+    /// pending (so the next point re-aims it).
+    #[gpui::test]
+    fn insert_reference_appends_at_caret(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("C3", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=C3");
+            assert_eq!(c.content_input.read(cx).cursor(), 3, "caret after the ref");
+            assert_eq!(
+                c.edit.pending_ref(),
+                Some(1..3),
+                "the inserted span is pending"
+            );
+        });
+    }
+
+    /// A second point with the ref still pending REPLACES it (Excel re-aiming), not appends.
+    #[gpui::test]
+    fn insert_reference_replaces_pending(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("A1", false, window, cx)
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("B2", true, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                "=B2",
+                "the pending A1 is replaced, not appended"
+            );
+            assert_eq!(c.edit.pending_ref(), Some(1..3), "B2 is now pending");
+        });
+    }
+
+    /// A keystroke after a point FIXES the pending ref (clears the span); the next point then appends
+    /// a fresh reference (`functional_spec.md §2` DPM.2).
+    #[gpui::test]
+    fn keystroke_after_point_appends_next(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("B2", false, window, cx)
+        });
+        // Simulate typing `+` (the Change path recomputes with keep_pending = false → clears pending).
+        upd(&h, cx, |c, window, cx| {
+            c.content_input.update(cx, |i, cx| {
+                i.set_value("=B2+", window, cx);
+                i.set_cursor_position(Position::new(0, 4), window, cx);
+            });
+            c.recompute_formula_edit_state(cx);
+        });
+        upd(&h, cx, |c, _w, _cx| {
+            assert_eq!(
+                c.edit.pending_ref(),
+                None,
+                "a keystroke fixes the pending ref"
+            );
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("C3", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                "=B2+C3",
+                "the next point appends a fresh ref"
+            );
+        });
+    }
+
+    /// A caret move (not a point) also clears the pending-ref window.
+    #[gpui::test]
+    fn pending_cleared_by_caret_move(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("A1", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, _cx| {
+            assert!(c.edit.pending_ref().is_some(), "pending after the point");
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.content_input.update(cx, |i, cx| {
+                i.set_cursor_position(Position::new(0, 1), window, cx);
+            });
+            c.recompute_formula_edit_state(cx);
+        });
+        upd(&h, cx, |c, _w, _cx| {
+            assert_eq!(
+                c.edit.pending_ref(),
+                None,
+                "a caret move clears the pending ref"
+            );
+        });
+    }
+
+    /// Pointing at the cell being edited inserts a self-reference (DPM.5) — not blocked; the engine's
+    /// circular-ref handling surfaces it at commit.
+    #[gpui::test]
+    fn self_reference_allowed(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        upd(&h, cx, |c, window, cx| {
+            // A1 is the active cell; pointing it is allowed.
+            c.insert_reference("A1", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=A1");
+        });
+    }
+
+    /// The autocomplete→point happy path (`functional_spec.md §4`): accepting `SUM(` leaves the caret
+    /// reference-ready, so a point click yields `=SUM(C3` with no typing.
+    #[gpui::test]
+    fn autocomplete_then_point_happy_path(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=sum", window, cx));
+        upd(&h, cx, |c, window, cx| c.autocomplete_accept(window, cx));
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(c.content_input.read(cx).value().to_string(), "=SUM(");
+            assert!(
+                c.edit.reference_ready(),
+                "caret right after `(` is reference-ready"
+            );
+        });
+        upd(&h, cx, |c, window, cx| {
+            c.insert_reference("C3", false, window, cx)
+        });
+        upd(&h, cx, |c, _w, cx| {
+            assert_eq!(
+                c.content_input.read(cx).value().to_string(),
+                "=SUM(C3",
+                "the pointed ref lands inside the accepted call"
+            );
+        });
+    }
+
+    /// A point insert must RETURN keyboard focus to the driving editor: the grid takes focus in its
+    /// own `handle_mouse_down` before emitting the insert, so without an explicit re-focus the next
+    /// keystroke would miss the editor entirely (data-row → a fresh type-to-replace that wipes the
+    /// formula). We model the grid's focus grab by focusing a throwaway handle, then assert
+    /// `insert_reference` restored the data-row input's focus (so the next key appends to the formula
+    /// rather than starting a new edit).
+    #[gpui::test]
+    fn point_insert_returns_focus_to_data_row_editor(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| c.begin_typed("=", window, cx));
+        let focused = upd(&h, cx, |c, window, cx| {
+            // The grid grabbed focus at mouse-down; model that.
+            let grid_focus = cx.focus_handle();
+            window.focus(&grid_focus, cx);
+            c.insert_reference("C3", false, window, cx);
+            c.content_input.read(cx).focus_handle(cx).is_focused(window)
+        });
+        assert!(
+            focused,
+            "the data-row editor must regain focus so typing continues the formula"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c.content_text(cx)),
+            "=C3",
+            "the ref was inserted"
+        );
+    }
+
+    /// The in-cell driving editor half of the same guarantee: after a point insert the in-cell input
+    /// (not the grid) holds focus, so its next keystroke is not swallowed.
+    #[gpui::test]
+    fn point_insert_returns_focus_to_in_cell_editor(cx: &mut TestAppContext) {
+        let h = idle_on_a1(cx, "");
+        upd(&h, cx, |c, window, cx| {
+            c.begin_in_cell(cell(0, 0), window, cx);
+            c.test_incell_type("=", window, cx);
+        });
+        let focused = upd(&h, cx, |c, window, cx| {
+            let grid_focus = cx.focus_handle();
+            window.focus(&grid_focus, cx);
+            c.insert_reference("C3", false, window, cx);
+            c.edit
+                .in_cell()
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(
+            focused,
+            "the in-cell editor must regain focus after a point insert"
+        );
+        assert_eq!(upd(&h, cx, |c, _w, cx| c.incell_text(cx)), "=C3");
+    }
+
     #[gpui::test]
     fn typing_prefix_opens_list(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
         upd(&h, cx, |c, window, cx| c.begin_typed("=su", window, cx));
         upd(&h, cx, |c, _w, _cx| {
-            let ac = c.autocomplete.as_ref().expect("list open on =su");
+            let ac = c.edit.autocomplete().expect("list open on =su");
             assert!(ac.matches.len() >= 3, "several SU* matches");
             assert!(ac.matches.iter().all(|f| f.name.starts_with("SU")));
             assert!(ac.matches.iter().any(|f| f.name == "SUM"), "SUM present");
@@ -15322,7 +15711,7 @@ mod tests {
         let h = one_sheet(cx);
         upd(&h, cx, |c, window, cx| c.begin_typed("su", window, cx));
         upd(&h, cx, |c, _w, _cx| {
-            assert!(c.autocomplete.is_none(), "no `=` → no list");
+            assert!(c.edit.autocomplete().is_none(), "no `=` → no list");
         });
     }
 
@@ -15332,15 +15721,11 @@ mod tests {
         upd(&h, cx, |c, window, cx| c.begin_typed("=su", window, cx));
         upd(&h, cx, |c, _w, cx| {
             c.autocomplete_nav(false, cx);
-            assert_eq!(
-                c.autocomplete.as_ref().unwrap().highlight,
-                0,
-                "clamp at top"
-            );
+            assert_eq!(c.edit.autocomplete().unwrap().highlight, 0, "clamp at top");
             c.autocomplete_nav(true, cx);
-            assert_eq!(c.autocomplete.as_ref().unwrap().highlight, 1);
+            assert_eq!(c.edit.autocomplete().unwrap().highlight, 1);
             c.autocomplete_nav(false, cx);
-            assert_eq!(c.autocomplete.as_ref().unwrap().highlight, 0);
+            assert_eq!(c.edit.autocomplete().unwrap().highlight, 0);
         });
     }
 
@@ -15351,17 +15736,17 @@ mod tests {
         upd(&h, cx, |c, window, cx| c.begin_typed("=sum", window, cx));
         upd(&h, cx, |c, window, cx| {
             assert_eq!(
-                c.autocomplete.as_ref().unwrap().matches[0].name,
+                c.edit.autocomplete().unwrap().matches[0].name,
                 "SUM",
                 "exact SUM highlighted"
             );
             c.autocomplete_accept(window, cx);
         });
         upd(&h, cx, |c, _w, cx| {
-            assert!(c.autocomplete.is_none(), "list closes on accept");
+            assert!(c.edit.autocomplete().is_none(), "list closes on accept");
             assert_eq!(c.content_input.read(cx).value().to_string(), "=SUM(");
             assert_eq!(c.content_input.read(cx).cursor(), 5, "caret just after `(`");
-            assert_eq!(c.sig_hint, Some("SUM(number1, [number2], …)"));
+            assert_eq!(c.edit.sig_hint(), Some("SUM(number1, [number2], …)"));
             assert_eq!(c.data_mode(), FieldMode::Editing, "edit continues");
         });
     }
@@ -15384,7 +15769,7 @@ mod tests {
         upd(&h, cx, |c, window, cx| c.begin_typed("=su", window, cx));
         upd(&h, cx, |c, window, cx| c.autocomplete_dismiss(window, cx));
         upd(&h, cx, |c, _w, cx| {
-            assert!(c.autocomplete.is_none(), "list dismissed");
+            assert!(c.edit.autocomplete().is_none(), "list dismissed");
             assert_eq!(c.data_mode(), FieldMode::Editing, "edit continues");
             assert_eq!(
                 c.content_input.read(cx).value().to_string(),
@@ -15399,8 +15784,8 @@ mod tests {
         let h = one_sheet(cx);
         upd(&h, cx, |c, window, cx| c.begin_typed("=SUM(", window, cx));
         upd(&h, cx, |c, _w, _cx| {
-            assert!(c.autocomplete.is_none(), "no name token after `(`");
-            assert_eq!(c.sig_hint, Some("SUM(number1, [number2], …)"));
+            assert!(c.edit.autocomplete().is_none(), "no name token after `(`");
+            assert_eq!(c.edit.sig_hint(), Some("SUM(number1, [number2], …)"));
         });
     }
 
@@ -15416,11 +15801,11 @@ mod tests {
                 i.set_value("=sum", window, cx);
                 i.set_cursor_position(Position::new(0, 4), window, cx);
             });
-            c.recompute_autocomplete(cx);
+            c.recompute_formula_edit_state(cx);
             c.refresh_edit_grid_state(window, cx);
         });
         upd(&h, cx, |c, _w, _cx| {
-            assert!(c.autocomplete.is_some(), "in-cell list open");
+            assert!(c.edit.autocomplete().is_some(), "in-cell list open");
         });
         // The in-cell list is pushed to the grid for rendering.
         assert!(
@@ -15429,7 +15814,7 @@ mod tests {
         );
         upd(&h, cx, |c, window, cx| c.autocomplete_accept(window, cx));
         upd(&h, cx, |c, _w, cx| {
-            assert!(c.autocomplete.is_none());
+            assert!(c.edit.autocomplete().is_none());
             assert_eq!(c.edit.in_cell().read(cx).value().to_string(), "=SUM(");
             assert_eq!(c.edit.in_cell().read(cx).cursor(), 5);
         });
@@ -15450,10 +15835,10 @@ mod tests {
             c.content_input.update(cx, |i, cx| {
                 i.set_cursor_position(Position::new(0, 2), window, cx);
             });
-            c.recompute_autocomplete(cx);
+            c.recompute_formula_edit_state(cx);
             let ac = c
-                .autocomplete
-                .as_ref()
+                .edit
+                .autocomplete()
                 .expect("list still open on prefix 's'");
             assert!(ac.matches[0].name.starts_with('S'));
             ac.matches[ac.highlight].name

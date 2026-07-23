@@ -122,6 +122,16 @@ pub struct RenderCase {
     /// calls `GridView::set_fill_drag_preview` so the captured frame shows the drag's target-region
     /// preview rectangle. `None` (the default) for every other case (no baseline change).
     pub fill_drag: Option<(CellRange, CellRange, FillAxis)>,
+    /// Same-sheet formula reference highlights `(target, palette slot)`
+    /// (`formula-point-mode/architecture.md §4.1`) — the harness threads them into
+    /// `GridView::set_edit_state` (the same payload `refresh_edit_grid_state` pushes), so the captured
+    /// frame shows the rich fill + border overlay. Empty (the default) for every non-formula case (no
+    /// baseline change).
+    pub ref_highlights: Vec<(CellRange, u8)>,
+    /// An armed point-drag preview `(origin, last_range)` (`formula-point-mode/functional_spec.md §2`)
+    /// — the harness calls `GridView::set_point_drag_preview` so the captured frame shows the dashed
+    /// preview marquee. `None` (the default) for every other case (no baseline change).
+    pub point_drag: Option<(CellRef, CellRange)>,
 }
 
 impl RenderCase {
@@ -141,12 +151,28 @@ impl RenderCase {
             selected_chart: None,
             auto_grow: false,
             fill_drag: None,
+            ref_highlights: Vec::new(),
+            point_drag: None,
         }
     }
 
     /// Arms a fill-drag preview `(seed, target, axis)` on this case (`gaps_closing_7_15 §3`).
     fn fill_drag(mut self, seed: CellRange, target: CellRange, axis: FillAxis) -> Self {
         self.fill_drag = Some((seed, target, axis));
+        self
+    }
+
+    /// Installs same-sheet formula reference highlights `(target, slot)` on this case
+    /// (`formula-point-mode/architecture.md §4.1`).
+    fn ref_highlights(mut self, highlights: Vec<(CellRange, u8)>) -> Self {
+        self.ref_highlights = highlights;
+        self
+    }
+
+    /// Arms a point-drag preview `(origin, last_range)` on this case
+    /// (`formula-point-mode/functional_spec.md §2`).
+    fn point_drag(mut self, origin: CellRef, last_range: CellRange) -> Self {
+        self.point_drag = Some((origin, last_range));
         self
     }
 
@@ -1136,6 +1162,51 @@ pub fn all() -> Vec<RenderCase> {
             1,
             1,
             "wrap this text onto several visual lines while editing in place",
+        ),
+        // ---- Formula point-mode + range highlighting (formula-point-mode §4.1, §2) ------
+        // A same-sheet formula edit open over B2 with the mirror showing the raw formula, and the
+        // three reference highlights the chrome would push: A1 (single, slot 0), C3:E7 (range,
+        // slot 1), and B2 (a SELF-reference coinciding with the active cell, slot 2). Each is a
+        // rich translucent fill + colored border in its palette slot. Proves distinct slots, the
+        // single-vs-range shapes, and the z-order where a highlight coincides with the active cell
+        // — the self-ref highlight paints ABOVE the active-cell selection outline (overlay order:
+        // selection → highlights → in-cell/handle).
+        RenderCase::new(
+            "formula_ref_highlight_same_sheet",
+            Scene::new()
+                .input(0, 0, "A1")
+                .input(1, 1, "B2")
+                .input(2, 2, "C3")
+                .input(6, 4, "E7"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .mirror(1, 1, "=A1+SUM(C3:E7)+B2")
+        .ref_highlights(vec![
+            (CellRange::single(CellRef::new(0, 0)), 0),
+            (CellRange::new(CellRef::new(2, 2), CellRef::new(6, 4)), 1),
+            (CellRange::single(CellRef::new(1, 1)), 2),
+        ]),
+        // A formula edit open over B2 MID point-drag: all three coexisting overlays at once, each
+        // visually distinct — the solid-blue selection outline at B2, one orange reference highlight
+        // at A1 (slot 4, a hue far from both blues so the eyeball is unambiguous), and the dashed
+        // indigo point-preview marquee over the swept C3:E7 range. Proves the preview marquee is
+        // distinct from the selection rectangle and the colored highlights (POINT_PREVIEW_BORDER vs
+        // ACCENT vs palette).
+        RenderCase::new(
+            "formula_ref_point_preview",
+            Scene::new()
+                .input(0, 0, "A1")
+                .input(1, 1, "B2")
+                .input(2, 2, "C3"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .mirror(1, 1, "=A1+C3:E7")
+        .ref_highlights(vec![(CellRange::single(CellRef::new(0, 0)), 4)])
+        .point_drag(
+            CellRef::new(2, 2),
+            CellRange::new(CellRef::new(2, 2), CellRef::new(6, 4)),
         ),
         // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
         cell(

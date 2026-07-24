@@ -48,7 +48,9 @@ render-tests       →  freecell-app (grid), gpui            # runs in Linux CI 
 ```
 
 **Platform support (product call, architecture round): macOS + Linux from the
-start; Windows out of scope.** macOS is the primary design target; Linux is a
+start; Windows was out of MVP scope** (since made a first-class target — it compiles,
+packages, and gates the `release` CI job; see `specs/projects/xlsx-file-association`
+and `projects/windows-port.md`). macOS is the primary design target; Linux is a
 supported build with three deliberate MVP deltas: Ctrl replaces Cmd (per-platform
 keymaps over the same actions), **no menu bar** (GPUI has no native global menubar
 on Linux — shortcuts cover every menu action), and GPUI's paths-prompt instead of
@@ -263,9 +265,10 @@ Full design in `components/app_shell.md`:
   (single source of truth).
 - Native NSOpen/NSSave panels via GPUI's paths-prompt APIs at the pinned rev;
   gpui-component dialogs as fallback if those bindings prove unusable (record if so).
-- Finder "open with" events: wire GPUI's open-files/urls handler if present at the
-  pinned rev; otherwise document as a known gap (best-effort feature,
-  DECISIONS_TO_REVIEW.md).
+- Finder "open with" events: **wired** (`specs/projects/xlsx-file-association`) — a macOS
+  Apple-Event bridge (`shell/open_files.rs`) routes GPUI's cx-less `on_open_urls` through the
+  `open_path` funnel; argv covers Windows/Linux/CLI. (Originally deferred as a best-effort gap
+  because the pinned-rev callback lacks `cx`.)
 - All dialogs (unsaved changes, errors, delete-sheet confirm) are
   gpui-component modals owned by the window entity; async flows (close-with-prompt →
   save → close) are small state machines on the entity, no blocking.

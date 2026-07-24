@@ -32,8 +32,8 @@ comment on `shell/window.rs`, not a real test — the compiled count is 92.)
 | Behavior | Status | Test(s) / entry |
 |---|---|---|
 | §2.1 Launch with no doc → Welcome | Auto | `shell/app.rs::welcome_window_opens_on_show` |
-| §2.1 Open `.xlsx` via CLI argv / xdg (Linux best-effort) | Auto+Manual | `main.rs` `xlsx_arg` wiring; **M-1** (launch with a fixture path) |
-| §2.1 macOS Finder open-file (`on_open_urls`) | Known-limitation | Deferred at pinned rev (callback lacks `cx`); CLI argv is the wired path. `DECISIONS` Phase 10; **M-15** documented-manual (macOS). Home: [`GAPS.md`](../../../GAPS.md) (#4) |
+| §2.1 Open `.xlsx` via CLI argv / xdg (Linux best-effort) | Auto+Manual | `main.rs` `open_arg` wiring; **M-1** (launch with a fixture path) |
+| §2.1 macOS Finder open-file (`on_open_urls`) | Resolved | ✅ Wired by `specs/projects/xlsx-file-association` (Phases 1–2, `84785fa` + `f2e72cc`): an OS `file-associations` declaration + a macOS Apple-Event bridge (`shell/open_files.rs`) route Finder opens through `open_path`; argv covers Windows/Linux/CLI. Non-blocking hardware smoke **M-15**. Home: [`GAPS.md`](../../../GAPS.md) (#4) |
 | §2.2 New Spreadsheet button → empty workbook window, Welcome closes | Auto+Manual | `shell/app.rs::new_workbook_registers_a_document_window`; **M-2** |
 | §2.2 Open… button → native picker, opens on success / stays on cancel | Manual | Native panel — **M-3** (driven), **M-16** (macOS NSOpenPanel doc) |
 | §2.2 No recent-files list (MVP) | N/A | Explicit MVP omission (§8) |
@@ -234,8 +234,9 @@ home**. The known-limitations (not silent):
    project note, `DECISIONS`.
 3. **Input-cap message-popover text** (§3.3) — danger border shown, popover text deferred. →
    chrome-polish, `DECISIONS` Phase 9.
-4. **macOS Finder open-file** (§2.1) — CLI argv wired; `on_open_urls` deferred at rev. →
-   `DECISIONS` Phase 10.
+4. **macOS Finder open-file** (§2.1) — ✅ **Resolved** by `specs/projects/xlsx-file-association`
+   (Phases 1–2, `84785fa` + `f2e72cc`): OS file associations + a macOS Apple-Event bridge route
+   Finder opens through `open_path`. → `GAPS.md` #4, `DECISIONS` Phase 10.
 5. **Bundled Inter font** (§3.3/§3.6) — deferred; default font, baselines pinned to the
    runner image. → `projects/bundled-inter-font.md`, `DECISIONS` Phase 13.
 6. **Save fidelity strip** (§5.2) — intentional; warn-and-strip is `projects/

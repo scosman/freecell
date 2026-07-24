@@ -24,7 +24,7 @@ this is the checklist. No pixel render suite (no baseline pixels move — archit
   fire at the pinned rev, stop and raise it (do not add an `NSApplicationDelegate`). Crate-scoped
   `cargo build`/`test -p freecell-app` + `cargo fmt --all --check`.
 
-- [ ] **Phase 3 — Docs & CI reconciliation.** After 1+2 land: drop `continue-on-error` from the
+- [x] **Phase 3 — Docs & CI reconciliation.** After 1+2 land: drop `continue-on-error` from the
   `release.yml` Windows job and correct the docs that assert Windows can't compile / macOS
   Finder-open is unwired (architecture §8, functional §8) — `PACKAGING.md`, `windows-port.md`,
   `GAPS.md` #4, DECISIONS Phase 10, `coverage_matrix.md`, `smoke_checklist.md` M-15, READMEs,

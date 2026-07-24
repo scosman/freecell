@@ -162,6 +162,13 @@ tracing.workspace = true
 # `<data_dir>/FreeCell/recents.json`. Already resolved at 6.0.0 in the lockfile (a transitive
 # dep), so pinning it as a direct dep adds no new crate to `Cargo.lock`.
 dirs = "6"
+# OS-delivered file opens (`shell::open_files`, xlsx-file-association project). `url` parses the
+# `file://` open-event URLs into paths (`file_url_to_path`, cfg-agnostic); `async-channel` bridges
+# gpui's cx-less macOS `on_open_urls` callback into the app task (macOS-only usage). Both are
+# already resolved in the lockfile (`url` 2.5.8, `async-channel` 2.5.0) as transitive deps, so
+# promoting them to direct deps adds no new crate to `Cargo.lock` (same pattern as `dirs` above).
+url = "2"
+async-channel = "2"
 
 [dev-dependencies]
 # Phase 9 chrome interaction tests drive `ChromeView` through gpui's headless

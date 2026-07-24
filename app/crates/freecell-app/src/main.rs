@@ -38,9 +38,10 @@ fn exit_after_ms() -> Option<u64> {
         .and_then(|s| s.parse().ok())
 }
 
-/// The first non-flag `.xlsx` / `.csv` path argument, if any (best-effort CLI open — Finder
-/// open-file events are a separate, deferred path; see DECISIONS_TO_REVIEW Phase 10). A `.csv`
-/// routes to CSV import (`open_path` branches on the extension, `functional_spec.md §2`).
+/// The first non-flag `.xlsx` / `.csv` path argument, if any (the Windows/Linux/CLI open path —
+/// macOS Finder opens arrive as an Apple Event instead, wired via `shell::install_finder_open`,
+/// xlsx-file-association project). A `.csv` routes to CSV import (`open_path` branches on the
+/// extension, `functional_spec.md §2`).
 fn open_arg() -> Option<PathBuf> {
     std::env::args().skip(1).find_map(|a| {
         if a.starts_with('-') {
@@ -90,9 +91,28 @@ fn main() {
         // Load the persisted recent-files list once, at startup (kept out of `init` so gpui
         // tests never read the real per-user data dir — architecture.md §3).
         FreeCellApp::load_recents(cx);
-        match open_path {
-            Some(path) => FreeCellApp::open_path(&path, cx),
-            None => FreeCellApp::show_welcome(cx),
+
+        // Startup welcome-vs-open decision, split per platform (xlsx-file-association,
+        // functional_spec.md §5.5, architecture.md §3.2). A CLI/argv path opens synchronously on
+        // every platform.
+        let opened_via_argv = match open_path {
+            Some(path) => {
+                FreeCellApp::open_path(&path, cx);
+                true
+            }
+            None => false,
+        };
+        // macOS: a Finder open arrives as an Apple Event, not argv. Install the `on_open_urls`
+        // bridge; it owns the DEFERRED welcome decision (welcome is shown only after a launch-time
+        // open event is drained — so a Finder cold-start never flashes welcome, §5.5). Full path,
+        // cfg-gated inline, so no unused import lands on the non-macOS build.
+        #[cfg(target_os = "macos")]
+        freecell_app::shell::install_finder_open(cx, opened_via_argv);
+        // Windows/Linux/CLI: the path (if any) already arrived via argv above, so decide welcome
+        // synchronously as before.
+        #[cfg(not(target_os = "macos"))]
+        if !opened_via_argv {
+            FreeCellApp::show_welcome(cx);
         }
 
         // Render-spike safety valve: quit after a real executor timer, independent of

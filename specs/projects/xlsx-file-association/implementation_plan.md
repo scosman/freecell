@@ -16,7 +16,7 @@ this is the checklist. No pixel render suite (no baseline pixels move — archit
   asserting the generated `freecell.desktop` has `MimeType=…spreadsheetml.sheet;text/csv;` and
   `Exec=… %F`. Enables Windows/Linux end-to-end (argv already wired). Small.
 
-- [ ] **Phase 2 — macOS entry-point bridge (the substantive phase + spike).** New
+- [x] **Phase 2 — macOS entry-point bridge (the substantive phase + spike).** New
   `shell/open_files.rs`: cfg-agnostic `file_url_to_path` (+ unit tests, architecture §3.3) and
   the `cfg(macos)` `install_finder_open` channel bridge; promote `url` + `async-channel` to
   direct deps; split the `main.rs` startup welcome-vs-open decision (architecture §3.2). Honor

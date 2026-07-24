@@ -2042,6 +2042,7 @@ name = "freecell-app"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-channel 2.5.0",
  "dirs",
  "embed-resource",
  "fontdb",
@@ -2057,6 +2058,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zip",
 ]
 

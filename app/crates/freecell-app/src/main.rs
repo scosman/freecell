@@ -1,3 +1,13 @@
+// Windows: a *release* build must open only the app window — not a console/terminal window
+// alongside it. Linking the GUI ("windows") subsystem instead of the default console subsystem
+// stops the OS from allocating a console for the process (the reported Windows launch issue).
+// Debug builds keep the console subsystem so `cargo run` still shows the tracing/log output on a
+// terminal. The attribute is Windows-only and a no-op on macOS/Linux, so it is safe to leave in.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 //! FreeCell application entry point (`components/app_shell.md §Structure`,
 //! `functional_spec.md §2`).
 //!

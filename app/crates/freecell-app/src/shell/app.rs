@@ -709,22 +709,52 @@ fn is_csv_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The transparent macOS titlebar options (`architecture.md §7.1`, `ui_design.md §1`): a
-/// hidden system title + hidden native titlebar (so the window draws its own 36 px row —
-/// [`super::titlebar`]) with the traffic lights repositioned to vertically center in that row.
-/// `None` on Linux (server decorations, unchanged) and whenever the §7.1 fallback flips
-/// [`super::titlebar::MACOS_TITLEBAR`] off. Verified present at the pinned gpui rev; the native
-/// behavior itself is the on-device smoke gate.
+/// The per-platform [`TitlebarOptions`] for every FreeCell window (`architecture.md §7.1`,
+/// `ui_design.md §1`). Thin wrapper over the pure [`titlebar_options_for`] so the Windows branch
+/// stays unit-testable off-target (this build host can't compile the Windows target).
 fn titlebar_options() -> Option<TitlebarOptions> {
-    if super::titlebar::MACOS_TITLEBAR {
+    titlebar_options_for(super::titlebar::MACOS_TITLEBAR, cfg!(target_os = "windows"))
+}
+
+/// Pure platform decision for a window's titlebar, split out so all three arms are testable on any
+/// build host:
+///
+/// - **macOS** (`macos_custom_titlebar`, i.e. [`super::titlebar::MACOS_TITLEBAR`]): a hidden system
+///   title + transparent native titlebar so the window draws its own 36 px row
+///   ([`super::titlebar`]), with the traffic lights repositioned to vertically center in that row.
+///   Unchanged; also disabled by the §7.1 fallback that flips `MACOS_TITLEBAR` off.
+/// - **Windows** (`is_windows`): `appears_transparent: false` so gpui does **not** hide the OS
+///   titlebar — the window gets the standard Windows caption with native minimize / maximize /
+///   close. gpui treats a `None` titlebar as `hide_title_bar = true` (a borderless, custom-drawn
+///   frame); because FreeCell draws no custom titlebar off macOS, that left the Windows window with
+///   no header bar at all — the reported bug. We do **not** build a custom titlebar here; we let the
+///   OS draw it.
+/// - **Linux**: `None` → server-side decorations (the window manager draws the titlebar), as today.
+fn titlebar_options_for(macos_custom_titlebar: bool, is_windows: bool) -> Option<TitlebarOptions> {
+    if macos_custom_titlebar {
         Some(TitlebarOptions {
             appears_transparent: true,
             traffic_light_position: Some(point(px(12.0), px(12.0))),
             title: None,
         })
+    } else if is_windows {
+        Some(TitlebarOptions {
+            appears_transparent: false,
+            traffic_light_position: None,
+            title: None,
+        })
     } else {
         None
     }
+}
+
+/// The window `app_id` — Linux only (Wayland `app_id` / X11 `WM_CLASS`). Set to the packaged bundle
+/// identifier so a Wayland compositor associates the window with the installed
+/// `com.scosman.freecell` `.desktop` entry (and thus the FreeCell icon cargo-packager ships to the
+/// hicolor theme). `None` on macOS/Windows, which take their icon from the `.app` bundle / the
+/// exe's embedded icon resource instead (so this never changes their behavior).
+fn window_app_id() -> Option<String> {
+    cfg!(target_os = "linux").then(|| "com.scosman.freecell".to_string())
 }
 
 /// The document window options: ~1200×800, centered, resizable, macOS custom titlebar (§7.1)
@@ -733,6 +763,7 @@ fn document_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.0), px(800.0)), cx)),
         titlebar: titlebar_options(),
+        app_id: window_app_id(),
         ..Default::default()
     }
 }
@@ -744,6 +775,7 @@ fn welcome_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(720.0), px(480.0)), cx)),
         titlebar: titlebar_options(),
+        app_id: window_app_id(),
         is_resizable: false,
         is_minimizable: false,
         ..Default::default()
@@ -760,6 +792,7 @@ fn about_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(400.0), px(296.0)), cx)),
         titlebar: titlebar_options(),
+        app_id: window_app_id(),
         is_resizable: false,
         is_minimizable: false,
         ..Default::default()
@@ -2048,5 +2081,75 @@ mod tests {
             grid_focused,
             "a document window focuses the grid on mount so typing works without a click first"
         );
+    }
+
+    // ---- Window chrome: titlebar + app-id platform decisions --------------------------------
+
+    /// macOS keeps the transparent custom titlebar (traffic lights repositioned into the app's own
+    /// 36 px row) — unchanged by the Windows fix.
+    #[test]
+    fn titlebar_options_macos_uses_transparent_custom_titlebar() {
+        let opts = titlebar_options_for(
+            /* macos_custom_titlebar */ true, /* is_windows */ false,
+        )
+        .expect("macOS custom titlebar sets titlebar options");
+        assert!(
+            opts.appears_transparent,
+            "macOS hides the system titlebar so the app can draw its own row"
+        );
+        assert!(
+            opts.traffic_light_position.is_some(),
+            "macOS repositions the traffic lights into the custom row"
+        );
+    }
+
+    /// Windows must get a **non**-transparent titlebar so gpui does NOT hide the native OS caption —
+    /// the fix for the missing header bar (title + minimize/maximize/close). A `None` here (the old
+    /// off-macOS behavior) is what left the Windows window with no header bar.
+    #[test]
+    fn titlebar_options_windows_keeps_native_os_titlebar() {
+        let opts = titlebar_options_for(
+            /* macos_custom_titlebar */ false, /* is_windows */ true,
+        )
+        .expect("Windows sets titlebar options so gpui keeps the native OS titlebar");
+        assert!(
+            !opts.appears_transparent,
+            "Windows must not hide the native OS titlebar (appears_transparent = false)"
+        );
+        assert!(
+            opts.traffic_light_position.is_none(),
+            "traffic-light repositioning is macOS-only; Windows uses the OS caption controls"
+        );
+    }
+
+    /// Linux keeps server-side decorations: no titlebar options, so the window manager draws the
+    /// title bar (unchanged).
+    #[test]
+    fn titlebar_options_linux_uses_server_side_decorations() {
+        assert!(
+            titlebar_options_for(/* macos_custom_titlebar */ false, /* is_windows */ false)
+                .is_none(),
+            "Linux relies on the window manager for decorations (no titlebar options)"
+        );
+    }
+
+    /// The window `app_id` is set only on Linux (Wayland/X11 desktop-file association) and matches
+    /// the packaged bundle identifier; it stays `None` on macOS/Windows so their icon sources are
+    /// untouched.
+    #[test]
+    fn window_app_id_is_linux_only_and_matches_bundle_identifier() {
+        let app_id = window_app_id();
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                app_id.as_deref(),
+                Some("com.scosman.freecell"),
+                "Linux app_id must match the packaged .desktop bundle identifier"
+            );
+        } else {
+            assert!(
+                app_id.is_none(),
+                "app_id is Linux-only; macOS/Windows take their icon from the bundle/exe resource"
+            );
+        }
     }
 }

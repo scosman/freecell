@@ -6,7 +6,7 @@ FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-pack
 | Platform | Formats | Status |
 |---|---|---|
 | macOS | `.app` bundle + `.dmg` | **Supported** (primary target) |
-| Linux | `.deb` + `.AppImage` | **Supported** |
+| Linux | `.deb` + `.AppImage` | **Supported** (native **x64 + arm64**) |
 | Windows | NSIS setup `.exe` | **Experimental / non-blocking** (see below) |
 
 > **All builds are UNSIGNED dev builds.** They are **not** for public distribution yet.
@@ -83,11 +83,15 @@ FREECELL_PACKAGE_OUT_DIR=/tmp/pkgs scripts/package.sh
 - a **version tag push** matching `v*` (e.g. `git tag v0.1.0 && git push --tags`), or
 - **manual dispatch** (Actions → *release* → *Run workflow*).
 
-It has three jobs — **macOS** and **Linux** (required), **Windows** (`continue-on-error`,
-never gates a release). Each installs the pinned toolchain + cargo-packager, then calls the
-**same** `scripts/package.*` used locally, and uploads the result as a workflow **artifact**
-(`freecell-macos` / `freecell-linux` / `freecell-windows`), downloadable from the run page.
-No GitHub Release object is created or attached.
+It has three job definitions — **macOS** and **Linux** (required), **Windows**
+(`continue-on-error`, never gates a release); Linux fans out to two runners, so a run shows
+four job instances. The Linux job is a **matrix over two native runners** —
+`ubuntu-24.04` (x64) and `ubuntu-24.04-arm` (arm64) — so each architecture is a true native
+build, not a cross-compile. Each leg installs the pinned toolchain + cargo-packager, then
+calls the **same** `scripts/package.*` used locally, and uploads the result as a workflow
+**artifact** (`freecell-macos` / `freecell-linux-x64` / `freecell-linux-arm64` /
+`freecell-windows`), downloadable from the run page. No GitHub Release object is created or
+attached.
 
 ## Windows: what a real port needs
 
@@ -125,9 +129,9 @@ distribution blocker is already handled — replaced by permissively-licensed no
 
 ## Verification status
 
-**Verified locally (cargo-packager 0.11.8, built on Linux):**
+**Verified locally (cargo-packager 0.11.8, built on Linux x64):**
 
-- `.deb` — installs the binary, desktop entry, and all hicolor icon sizes (16→512 +
+- `.deb` (x64) — installs the binary, desktop entry, and all hicolor icon sizes (16→512 +
   `256x256@2`), with a correct control file.
 - macOS `.app` bundle — gets the `.icns` in `Contents/Resources` and a correct `Info.plist`
   (identifier, product name, `public.app-category.productivity`). *Built* on Linux; not yet
@@ -140,6 +144,9 @@ distribution blocker is already handled — replaced by permissively-licensed no
   validation env).
 - `.AppImage` (needs linuxdeploy + network; the Linux job installs `file`, `patchelf`, and
   `libfuse2t64` as FUSE insurance — see the caveat below).
+- The **arm64** `.deb` + `.AppImage` — same config, first built natively on the
+  `ubuntu-24.04-arm` matrix leg when the `release` workflow runs (never validated locally in
+  the x64 env above).
 - NSIS `.exe` (Windows, experimental — see the Windows section).
 
 So the first `v*` tag is the first time `.dmg` / `.AppImage` / `.exe` are actually

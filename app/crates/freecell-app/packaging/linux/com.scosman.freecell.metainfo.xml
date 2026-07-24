@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metainfo for FreeCell.
+
+  Shipped into /usr/share/metainfo/ by cargo-packager's `[package.metadata.packager.deb].files`
+  mapping (see ../../Cargo.toml). App Center / GNOME Software read this in preference to the raw
+  Debian control fields, so it drives the displayed name, license, summary, and description.
+
+  - <id> / <launchable> tie this component to cargo-packager's generated `freecell.desktop`
+    (installed at /usr/share/applications/freecell.desktop; its Name= is "FreeCell").
+  - <project_license> is the SPDX id from the workspace `license` field ("MIT OR Apache-2.0"),
+    which is why App Center no longer shows License: unknown.
+  - Keep <summary> in sync with the packager `description` in ../../Cargo.toml.
+
+  Validate after edits with:  appstreamcli validate com.scosman.freecell.metainfo.xml
+-->
+<component type="desktop-application">
+  <id>com.scosman.freecell</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>FreeCell</name>
+  <summary>The open spreadsheet app</summary>
+  <description>
+    <p>
+      FreeCell is a free, open-source desktop spreadsheet app. It opens and edits Excel (.xlsx)
+      files and supports 90% of Excel formulas, plus the text formatting, borders, fills, and
+      sizing you expect.
+    </p>
+    <p>
+      It is a native app built in Rust (not Electron), so it is fast and light, and everything
+      runs on your machine.
+    </p>
+    <ul>
+      <li>Opens and edits Excel .xlsx files; supports 90% of Excel formulas</li>
+      <li>Text formatting, borders, fills, and cell sizing</li>
+      <li>GPU-rendered grid and charts</li>
+      <li>100% local: no cloud, no analytics, completely private</li>
+      <li>Cross platform: Mac, Windows, and Linux</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">freecell.desktop</launchable>
+  <url type="homepage">https://github.com/scosman/freecell</url>
+  <url type="bugtracker">https://github.com/scosman/freecell/issues</url>
+  <developer id="com.scosman">
+    <name>scosman</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+</component>

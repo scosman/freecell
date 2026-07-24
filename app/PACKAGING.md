@@ -22,11 +22,22 @@ FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-pack
 The packager config is `[package.metadata.packager]` in
 [`crates/freecell-app/Cargo.toml`](crates/freecell-app/Cargo.toml). cargo-packager reads it
 via `cargo metadata`, so it auto-fills the version (workspace `0.1.0`) and auto-detects the
-`freecell` binary — the config only sets product name, bundle identifier
-(`com.scosman.freecell`), category, description, homepage, and the icon list.
+`freecell` binary — the config sets product name, bundle identifier
+(`com.scosman.freecell`), category, short + long description, authors (the deb
+`Maintainer:`), homepage, and the icon list.
 
 Package **formats are chosen per-OS by the scripts** (`--formats`), not pinned in the
 config, so the same config serves all platforms.
+
+**Linux App Center / GNOME Software metadata.** The `[package.metadata.packager.deb]`
+sub-table sets `package-name = "freecell"` (the `Package:` control field — cargo-packager's
+default kebab-cased it to `free-cell`) and ships an **AppStream metainfo** file,
+[`packaging/linux/com.scosman.freecell.metainfo.xml`](crates/freecell-app/packaging/linux/com.scosman.freecell.metainfo.xml),
+into `/usr/share/metainfo/`. App Center reads that metainfo in preference to the bare
+Debian control fields, which is what gives the store view the proper name (**FreeCell**),
+license (**MIT OR Apache-2.0** — a Debian control file has no license field), and rich
+description. Keep the metainfo `<summary>` in sync with the packager `description`; keep the
+description ASCII (a Unicode em-dash rendered as `??` in App Center's synopsis).
 
 **Gotcha worth knowing:** cargo-packager `cd`s into the crate manifest directory
 (`crates/freecell-app/`) before packaging, so the `icons` paths in the config are relative

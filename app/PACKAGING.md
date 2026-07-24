@@ -6,7 +6,7 @@ FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-pack
 | Platform | Formats | Status |
 |---|---|---|
 | macOS | `.app` bundle + `.dmg` | **Supported** (primary target) |
-| Linux | `.deb` + `.AppImage` | **Supported** |
+| Linux | `.deb` + `.AppImage` | **Supported** (native **x64 + arm64**) |
 | Windows | NSIS setup `.exe` | **Experimental / non-blocking** (see below) |
 
 > **All builds are UNSIGNED dev builds.** They are **not** for public distribution yet.
@@ -84,10 +84,13 @@ FREECELL_PACKAGE_OUT_DIR=/tmp/pkgs scripts/package.sh
 - **manual dispatch** (Actions → *release* → *Run workflow*).
 
 It has three jobs — **macOS** and **Linux** (required), **Windows** (`continue-on-error`,
-never gates a release). Each installs the pinned toolchain + cargo-packager, then calls the
-**same** `scripts/package.*` used locally, and uploads the result as a workflow **artifact**
-(`freecell-macos` / `freecell-linux` / `freecell-windows`), downloadable from the run page.
-No GitHub Release object is created or attached.
+never gates a release). The Linux job is a **matrix over two native runners** —
+`ubuntu-24.04` (x64) and `ubuntu-24.04-arm` (arm64) — so each architecture is a true native
+build, not a cross-compile. Each leg installs the pinned toolchain + cargo-packager, then
+calls the **same** `scripts/package.*` used locally, and uploads the result as a workflow
+**artifact** (`freecell-macos` / `freecell-linux-x64` / `freecell-linux-arm64` /
+`freecell-windows`), downloadable from the run page. No GitHub Release object is created or
+attached.
 
 ## Windows: what a real port needs
 

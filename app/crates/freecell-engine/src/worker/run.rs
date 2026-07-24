@@ -594,6 +594,7 @@ impl Worker {
                 | Command::SetRowHeights { .. }
                 | Command::SetRowsHidden { .. }
                 | Command::SetColumnsHidden { .. }
+                | Command::SetFrozen { .. }
                 | Command::InsertRows { .. }
                 | Command::InsertColumns { .. }
                 | Command::DeleteRows { .. }
@@ -3180,9 +3181,27 @@ impl Worker {
         let sheet = self.active_sheet;
         match (self.resolve(sheet), &self.viewport) {
             (Some(idx), Some(vp)) => {
+                // Freeze-pane bands (`freeze-panes`): the leading `0..M` rows / `0..K` cols are
+                // ALWAYS published alongside the body window, so a frozen band shows its VALUES even
+                // when the body is scrolled deep past it (its cells fall outside `vp` then). Read the
+                // counts off the resident cache (0 when unfrozen, or not yet built on the very first
+                // publish — harmless, the band is inside the body window at scroll 0). The published
+                // set is the union of the ≤4 quadrant rectangles `(0..M ∪ body_rows) × (0..K ∪
+                // body_cols)`; O(visible) — the bands are a few leading tracks, never a sheet-size
+                // loop. Flooring the body ranges past the bands makes the chained iteration visit
+                // each cell exactly once.
+                let (m, k) = self
+                    .shared
+                    .caches
+                    .read()
+                    .get(sheet)
+                    .map(|c| (c.frozen_rows(), c.frozen_cols()))
+                    .unwrap_or((0, 0));
+                let body_rows = vp.rows.start.max(m)..vp.rows.end.max(m);
+                let body_cols = vp.cols.start.max(k)..vp.cols.end.max(k);
                 let mut cells = Vec::new();
-                for row in vp.rows.clone() {
-                    for col in vp.cols.clone() {
+                for row in (0..m).chain(body_rows.clone()) {
+                    for col in (0..k).chain(body_cols.clone()) {
                         let cell = CellRef::new(row, col);
                         if let Ok(text) = self.doc.formatted_value(idx, cell) {
                             if !text.is_empty() {
@@ -3209,6 +3228,8 @@ impl Worker {
                     sheet,
                     rows: vp.rows.clone(),
                     cols: vp.cols.clone(),
+                    frozen_rows: m,
+                    frozen_cols: k,
                     generation,
                     cells,
                 }
@@ -3502,6 +3523,18 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             doc.set_columns_hidden(idx, *start, *end, *hidden)?;
             Ok(AppliedKind::GeometryOnly)
         }
+        Command::SetFrozen { sheet, rows, cols } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            // The UI sends exactly one `Some` axis per action (one IronCalc diff = one undo
+            // step); handling both defensively keeps the command total either way.
+            if let Some(rows) = rows {
+                doc.set_frozen_rows(idx, *rows)?;
+            }
+            if let Some(cols) = cols {
+                doc.set_frozen_columns(idx, *cols)?;
+            }
+            Ok(AppliedKind::GeometryOnly)
+        }
         Command::InsertRows { sheet, row, count } => {
             let idx = resolve_idx(doc, *sheet)?;
             doc.insert_rows(idx, *row, *count)?;
@@ -3744,11 +3777,14 @@ fn op_of(edit: &Command) -> AppliedOp {
             range: expand_by_one_cell(*range),
         },
         // Resize / insert / delete: the touched region is unbounded (geometry + shifted content),
-        // so the whole sheet cache is rebuilt on apply and on undo/redo.
+        // so the whole sheet cache is rebuilt on apply and on undo/redo. `SetFrozen` rides the
+        // same path: the rebuild re-reads the worksheet's frozen counts, so undo/redo (which pops
+        // IronCalc's diff, restoring the count) needs no special handling.
         Command::SetColumnWidths { sheet, .. }
         | Command::SetRowHeights { sheet, .. }
         | Command::SetRowsHidden { sheet, .. }
         | Command::SetColumnsHidden { sheet, .. }
+        | Command::SetFrozen { sheet, .. }
         | Command::InsertRows { sheet, .. }
         | Command::InsertColumns { sheet, .. }
         | Command::DeleteRows { sheet, .. }
@@ -4613,6 +4649,52 @@ mod tests {
             .unwrap();
         assert_eq!(c3.display_text, "42"); // =40+2 evaluated
         assert!(publication.covers(1, 1) && !publication.covers(3, 3));
+    }
+
+    #[test]
+    fn publication_always_publishes_frozen_bands_when_body_scrolled_deep() {
+        // `freeze-panes` band publishing (Phase 4): a frozen band must show its VALUES even when the
+        // body is scrolled far past it — the worker always publishes the leading `0..M` rows / `0..K`
+        // cols alongside the body window. Without the fix the deep body window would omit row 0.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(2),
+            cols: None,
+        }]);
+        // Deep body window that does NOT contain the frozen band (rows 0..2).
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 490..520,
+            cols: 0..3,
+        }]);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "HDR"),    // frozen band cell
+            set_input(sheet, 500, 0, "deep"), // deep body cell
+        ]);
+        let publication = worker.shared.publication.load_full();
+        assert_eq!(publication.frozen_rows, 2, "band count published");
+        assert!(
+            publication
+                .cells
+                .iter()
+                .any(|c| c.row == 0 && c.col == 0 && c.display_text == "HDR"),
+            "the frozen band cell is published even though the body is scrolled past it"
+        );
+        assert!(
+            publication
+                .cells
+                .iter()
+                .any(|c| c.row == 500 && c.col == 0 && c.display_text == "deep"),
+            "the deep body cell is published"
+        );
+        // Coverage reports the band as covered; a non-band row scrolled out is not.
+        assert!(publication.covers(0, 0), "band row covered");
+        assert!(
+            !publication.covers(5, 0),
+            "a scrolled-out non-band row is not covered"
+        );
     }
 
     #[test]
@@ -7464,6 +7546,232 @@ mod tests {
         assert!(
             (col_w(&worker, sheet, 1) - 100.0).abs() < 1.0,
             "col restored"
+        );
+    }
+
+    /// The resident cache's frozen pair `(M, K)` for `sheet` (`freeze-panes`).
+    fn frozen(worker: &Worker, sheet: SheetId) -> (u32, u32) {
+        let caches = worker.shared.caches.read();
+        let cache = caches.get(sheet).unwrap();
+        (cache.frozen_rows(), cache.frozen_cols())
+    }
+
+    #[test]
+    fn set_frozen_toggles_counts_and_one_undo_restores() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        assert_eq!(frozen(&worker, sheet), (0, 0), "fresh sheet has no freeze");
+
+        // Freeze rows, then columns — each a separate one-axis command (the UI shape).
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(3),
+            cols: None,
+        }]);
+        assert_eq!(frozen(&worker, sheet), (3, 0));
+        // Geometry-only: the batch republished the cache (StyleCacheUpdated), no eval needed.
+        let events = drain_events(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)));
+
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: None,
+            cols: Some(2),
+        }]);
+        assert_eq!(frozen(&worker, sheet), (3, 2));
+
+        // Each action is ONE undo step (`functional_spec.md §5.4`): the first Undo restores only
+        // the column freeze, the second only the row freeze; Redo re-applies.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            frozen(&worker, sheet),
+            (3, 0),
+            "one undo pops the col freeze"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(frozen(&worker, sheet), (0, 0), "second undo pops the rows");
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(frozen(&worker, sheet), (3, 0), "redo re-applies the rows");
+    }
+
+    #[test]
+    fn set_frozen_clamps_to_engine_max() {
+        // The fork's `Model::set_frozen_*` errors at count >= LAST_ROW/LAST_COLUMN, so the
+        // document wrapper clamps to all-but-one track — a "freeze at the very last track"
+        // action degrades to the engine max instead of erroring (`functional_spec.md §5.2`).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(u32::MAX),
+            cols: Some(limits::MAX_COLS),
+        }]);
+        assert_eq!(
+            frozen(&worker, sheet),
+            (limits::MAX_ROWS - 1, limits::MAX_COLS - 1),
+            "out-of-range counts clamp to the engine max, never error"
+        );
+        let events = drain_events(&rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::EditRejected { .. })),
+            "the clamp keeps the edit applied; got {events:?}"
+        );
+    }
+
+    /// Builds a fixture xlsx carrying an Excel-style frozen `<pane ySplit="2" xSplit="1"/>` by
+    /// saving a fresh workbook and injecting the pane element into its sheetView XML (the same
+    /// zip-rewrite pattern as `merged_fixture`).
+    fn pane_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::{Read, Write};
+        let base = dir.join("base.xlsx");
+        WorkbookDocument::new_empty().unwrap().save(&base).unwrap();
+        let bytes = std::fs::read(&base).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let out = dir.join("pane.xlsx");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&out).unwrap());
+        let opts =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut content = Vec::new();
+            f.read_to_end(&mut content).unwrap();
+            if name.contains("worksheets/sheet1.xml") {
+                // The empty sheet's single <sheetView> carries one <selection …/>; put the pane
+                // element before it (the importer reads any state="frozen" <pane> in sheetView).
+                let s = String::from_utf8(content).unwrap().replace(
+                    "<selection ",
+                    "<pane xSplit=\"1\" ySplit=\"2\" topLeftCell=\"B3\" \
+                     activePane=\"bottomRight\" state=\"frozen\"/><selection ",
+                );
+                content = s.into_bytes();
+            }
+            writer.start_file(name, opts).unwrap();
+            writer.write_all(&content).unwrap();
+        }
+        writer.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn pane_fixture_populates_cache_counts_on_open() {
+        // The table-stakes fix (`functional_spec.md §4`): a file that already carries `<pane>`
+        // surfaces its frozen counts in the read model immediately on open — no user action.
+        let dir = tempfile::tempdir().unwrap();
+        let path = pane_fixture(dir.path());
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (worker, _rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+        assert_eq!(
+            frozen(&worker, sheet),
+            (2, 1),
+            "ySplit=2/xSplit=1 land in the cache at open"
+        );
+    }
+
+    #[test]
+    fn set_frozen_save_reopen_round_trips() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetFrozen {
+                sheet,
+                rows: Some(3),
+                cols: None,
+            },
+            Command::SetFrozen {
+                sheet,
+                rows: None,
+                cols: Some(2),
+            },
+        ]);
+        assert_eq!(frozen(&worker, sheet), (3, 2));
+
+        // Save, reopen, rebuild — the counts survive the xlsx `<pane>` round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frozen.xlsx");
+        worker.process_batch(vec![Command::Save {
+            path: path.clone(),
+            req_id: 1,
+        }]);
+        let events = drain_events(&rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Saved { req_id: 1, .. })),
+            "save succeeded; got {events:?}"
+        );
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (reopened, _rx) = worker_over(doc);
+        let sheet = sheet0(&reopened);
+        assert_eq!(
+            frozen(&reopened, sheet),
+            (3, 2),
+            "frozen counts round-trip save→reopen"
+        );
+    }
+
+    #[test]
+    fn structural_edits_track_frozen_boundary_in_one_undo_step() {
+        // `freeze-panes` Phase 5 (`architecture.md §5`, Q4): the frozen boundary tracks
+        // insert/delete of rows the way Excel does, and — because IronCalc adjusts the pane
+        // *inside* the structural op's single undo diff (fork fix
+        // `fix/structural-edits-adjust-frozen-pane`, no FreeCell-side compensating call) — a
+        // SINGLE undo reverts both the structural edit AND the boundary move.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(3),
+            cols: None,
+        }]);
+        assert_eq!(frozen(&worker, sheet), (3, 0), "baseline M=3");
+
+        // Insert a row above the band (0-based row 0) → the band grows to 4.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+        assert_eq!(frozen(&worker, sheet).0, 4, "insert above the band grows M");
+        // ONE undo pops the insert AND restores the boundary in the same step.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            3,
+            "a single undo reverts the insert and the boundary together"
+        );
+        // Redo re-applies both.
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            4,
+            "redo re-applies the grown band"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(frozen(&worker, sheet).0, 3, "back to the baseline");
+
+        // Delete a row within the band (0-based row 1 = 1-based row 2, a frozen row) → shrinks.
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 1,
+            count: 1,
+        }]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            2,
+            "delete within the band shrinks M"
+        );
+        // ONE undo restores the deleted row AND the boundary together.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            3,
+            "a single undo reverts the delete and the boundary together"
         );
     }
 

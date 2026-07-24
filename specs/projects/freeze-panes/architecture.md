@@ -281,7 +281,7 @@ Layered, cheapest-first (mirrors `gaps_closing_7_15`):
   `render-tests/src/cases.rs`; the `Scene` builder gains `.frozen_rows(m)` / `.frozen_cols(k)`
   mirroring `.hide_row`, `scene.rs:204`):
   - `freeze_top_row` (`M=1`), `freeze_rows_band` (`M=3`),
-  - `freeze_first_col` (`K=1`), `freeze_cols_band` (`K=2`),
+  - `freeze_first_col` (`K=1`), `freeze_cols_band` (`K=3`),
   - `freeze_four_quadrant` (`M=2, K=2`) — corner + both bands + body,
   - `freeze_scrolled_body` (`M=2, K=2` + `.reveal(...)` deep) — bands pinned while the body is
     scrolled, proving the re-based offsets + divider position,

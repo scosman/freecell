@@ -851,6 +851,27 @@ impl WorkbookDocument {
             .set_columns_hidden(sheet_idx, col_start as i32 + 1, col_end as i32 + 1, hidden)
     }
 
+    /// Sets the frozen-rows count `M` — leading rows `0..M` pinned to the top (`freeze-panes`
+    /// `architecture.md §2.2`). One undoable diff (the fork's `set_frozen_rows_count`). Defensive
+    /// clamp: the fork's `Model::set_frozen_rows` **errors** at `count >= LAST_ROW`, i.e. its max
+    /// accepted count is all-but-one track — so a "freeze at the very last track" action degrades
+    /// to the engine max instead of erroring (`functional_spec.md §5.2` tolerates, never blocks).
+    pub(crate) fn set_frozen_rows(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let clamped = count.min(freecell_core::limits::MAX_ROWS - 1);
+        self.model.set_frozen_rows_count(sheet_idx, clamped as i32)
+    }
+
+    /// Sets the frozen-columns count `K` — leading columns `0..K` pinned to the left (the column
+    /// analog of [`set_frozen_rows`](Self::set_frozen_rows); the fork's
+    /// `set_frozen_columns_count`, clamped below its `LAST_COLUMN` guard).
+    pub(crate) fn set_frozen_columns(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let clamped = count.min(freecell_core::limits::MAX_COLS - 1);
+        self.model
+            .set_frozen_columns_count(sheet_idx, clamped as i32)
+    }
+
     /// Inserts `count` blank rows so new rows appear at 0-based `row` (`InsertRows`); everything at/
     /// after `row` shifts down and formulas adjust (`insert_rows`, `common.rs:882`; undoable). A
     /// shift that would push used cells past the last row returns `Err(String)` (→ dialog).

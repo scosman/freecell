@@ -185,6 +185,7 @@ pub fn scroll_to_reveal(
         content.width,
         scroll_x,
         max_scroll(col_axis.total(), content.width),
+        0.0,
     );
     let y = reveal_axis(
         row,
@@ -192,14 +193,18 @@ pub fn scroll_to_reveal(
         content.height,
         scroll_y,
         max_scroll(row_axis.total(), content.height),
+        0.0,
     );
     (x, y)
 }
 
 /// One axis of [`scroll_to_reveal`]: nudge `scroll` just enough that track `index` is
-/// fully within `[scroll, scroll + content)`, then clamp to `[0, max]`.
-fn reveal_axis(index: u32, axis: &Axis, content: f64, scroll: f64, max: f64) -> f64 {
-    let start = axis.offset_of(index);
+/// fully within `[scroll, scroll + content)`, then clamp to `[0, max]`. `base` re-bases the
+/// axis offset (px) — 0 for the ordinary (un-frozen) case; [`PaneGeometry::reveal`] passes the
+/// frozen band extent so the target aligns inside the body sub-area below/right of the divider,
+/// never tucked under the band.
+fn reveal_axis(index: u32, axis: &Axis, content: f64, scroll: f64, max: f64, base: f64) -> f64 {
+    let start = axis.offset_of(index) - base;
     let end = start + axis.size_of(index) as f64;
     let scroll = if start < scroll {
         start // track is above/left of the viewport → align its start
@@ -293,6 +298,229 @@ pub fn edge_autoscroll_delta(
         0.0
     };
     (dx, dy)
+}
+
+/// The frozen-pane split for a frame (px band extents + body-relative scroll). **All** frozen
+/// geometry routes through this so callers thread one value, not six params
+/// (`freeze-panes/components/viewport_split.md §3`). `frozen_w`/`frozen_h` are
+/// `col_axis.offset_of(K)` / `row_axis.offset_of(M)` (0 when that axis is unfrozen — a hidden
+/// track contributes 0); `content_w`/`content_h` are the body area **before** removing the frozen
+/// band (viewport − headers, exactly as today). `body_sx`/`body_sy` are the **body-relative**
+/// scroll: `body_s* = 0` shows the first non-frozen track at the divider. With both band extents
+/// and both scrolls 0, every method reduces to the pre-freeze free-function math — the `M = K = 0`
+/// equivalence the baseline suite depends on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaneGeometry {
+    pub row_header_w: f32,
+    pub frozen_w: f64,
+    pub frozen_h: f64,
+    pub content_w: f64,
+    pub content_h: f64,
+    pub body_sx: f64,
+    pub body_sy: f64,
+}
+
+impl PaneGeometry {
+    /// The scrolling **body** area (px): the content area minus the frozen band, floored at 0 (a
+    /// band ≥ the viewport shrinks the body toward zero, `§6`).
+    pub fn body_area(&self) -> (f64, f64) {
+        (
+            (self.content_w - self.frozen_w).max(0.0),
+            (self.content_h - self.frozen_h).max(0.0),
+        )
+    }
+
+    /// The body sub-rect's grid-local left/top origin (px): the frozen band sits between the
+    /// header strip and the body.
+    fn body_left(&self) -> f64 {
+        self.row_header_w as f64 + self.frozen_w
+    }
+    fn body_top(&self) -> f64 {
+        COL_HEADER_H as f64 + self.frozen_h
+    }
+
+    /// Clamps the **body-relative** scroll to its valid range: the scrollable extent is the
+    /// non-frozen tracks (`total_* - frozen_*`) against the body area (`§3.1`). At `body_s* = 0`
+    /// the body top/left shows the first non-frozen track; at the max the last track just reaches
+    /// the body's bottom/right; a frozen track can never be scrolled into the body. Reduces to
+    /// [`clamp_scroll`] when the band extents are 0.
+    pub fn clamp(&self, total_w: f64, total_h: f64) -> (f64, f64) {
+        let (body_w, body_h) = self.body_area();
+        clamp_scroll(
+            self.body_sx,
+            self.body_sy,
+            total_w - self.frozen_w,
+            total_h - self.frozen_h,
+            ContentArea {
+                row_header_w: self.row_header_w,
+                width: body_w,
+                height: body_h,
+            },
+        )
+    }
+
+    /// The vertical overlay-scrollbar thumb, over the **scrolling** extent only (`§3.5`): the
+    /// non-frozen rows against the body height. `None` when the non-frozen rows fit (the thumb
+    /// vanishes even on a huge sheet, matching Excel). Reduces to [`scrollbar_thumb`] when unfrozen.
+    pub fn v_thumb(&self, total_h: f64) -> Option<Thumb> {
+        let (_, body_h) = self.body_area();
+        scrollbar_thumb(total_h - self.frozen_h, body_h, self.body_sy, body_h as f32)
+    }
+
+    /// The horizontal overlay-scrollbar thumb, over the non-frozen columns against the body width
+    /// (`§3.5`).
+    pub fn h_thumb(&self, total_w: f64) -> Option<Thumb> {
+        let (body_w, _) = self.body_area();
+        scrollbar_thumb(total_w - self.frozen_w, body_w, self.body_sx, body_w as f32)
+    }
+
+    /// The minimal new body-relative `(body_sx, body_sy)` to reveal cell `(row, col)` (`§3.2`):
+    /// - **No-op on a frozen axis** — a target row/col inside a pinned band (`offset_of < frozen`)
+    ///   is already visible, so that axis's scroll is untouched.
+    /// - **Body target** — reveal into the body sub-area via [`reveal_axis`] re-based by the band
+    ///   extent, so the revealed cell aligns below/right of the divider, never under the band.
+    ///
+    /// With band extents 0 this equals [`scroll_to_reveal`].
+    pub fn reveal(&self, row: u32, col: u32, row_axis: &Axis, col_axis: &Axis) -> (f64, f64) {
+        let (body_w, body_h) = self.body_area();
+        let x = if col_axis.offset_of(col) < self.frozen_w {
+            self.body_sx // frozen column → already pinned, don't move
+        } else {
+            reveal_axis(
+                col,
+                col_axis,
+                body_w,
+                self.body_sx,
+                max_scroll(col_axis.total() - self.frozen_w, body_w),
+                self.frozen_w,
+            )
+        };
+        let y = if row_axis.offset_of(row) < self.frozen_h {
+            self.body_sy // frozen row → already pinned
+        } else {
+            reveal_axis(
+                row,
+                row_axis,
+                body_h,
+                self.body_sy,
+                max_scroll(row_axis.total() - self.frozen_h, body_h),
+                self.frozen_h,
+            )
+        };
+        (x, y)
+    }
+
+    /// The effective content-x that maps a scrolling-region grid-local x back to content space:
+    /// `frozen_w + body_sx + (x - body_left)`. For a point in the frozen-columns band the mapping
+    /// is `x - row_header_w` (no scroll).
+    fn content_x_of(&self, local_x: f32) -> f64 {
+        let lx = local_x as f64;
+        if lx < self.body_left() {
+            (lx - self.row_header_w as f64).max(0.0)
+        } else {
+            self.frozen_w + self.body_sx + (lx - self.body_left())
+        }
+    }
+
+    /// The effective content-y for a grid-local y (symmetric to [`content_x_of`]).
+    fn content_y_of(&self, local_y: f32) -> f64 {
+        let ly = local_y as f64;
+        if ly < self.body_top() {
+            (ly - COL_HEADER_H as f64).max(0.0)
+        } else {
+            self.frozen_h + self.body_sy + (ly - self.body_top())
+        }
+    }
+
+    /// Hit-tests a **grid-local** pixel to a [`GridHit`], region-routing through the frozen bands
+    /// (`§3.3`). The frozen bands are still ordinary cells/headers — they are just resolved on the
+    /// band's (unscrolled) content coordinate. Reduces to the free [`hit_test`] when unfrozen.
+    pub fn hit_test(
+        &self,
+        local_x: f32,
+        local_y: f32,
+        row_axis: &Axis,
+        col_axis: &Axis,
+    ) -> GridHit {
+        let in_header_row = local_y < COL_HEADER_H;
+        let in_header_col = local_x < self.row_header_w;
+        match (in_header_col, in_header_row) {
+            (true, true) => GridHit::Corner,
+            (false, true) => GridHit::ColHeader {
+                col: col_axis
+                    .index_at(self.content_x_of(local_x))
+                    .min(col_axis.count().saturating_sub(1)),
+            },
+            (true, false) => GridHit::RowHeader {
+                row: row_axis
+                    .index_at(self.content_y_of(local_y))
+                    .min(row_axis.count().saturating_sub(1)),
+            },
+            (false, false) => GridHit::Cell {
+                row: row_axis
+                    .index_at(self.content_y_of(local_y))
+                    .min(row_axis.count().saturating_sub(1)),
+                col: col_axis
+                    .index_at(self.content_x_of(local_x))
+                    .min(col_axis.count().saturating_sub(1)),
+            },
+        }
+    }
+
+    /// Maps a grid-local pixel to the data cell under it for drag-extend (`§3.3`), resolving the
+    /// cell in **whatever region it lands** (frozen-band cells are interactive) and folding a
+    /// header hit into the adjacent cell. The point is clamped into the whole content rect (not
+    /// just the body) so a drag into a band selects that band's cell. Reduces to [`cell_at_point`].
+    pub fn cell_at_point(
+        &self,
+        local_x: f32,
+        local_y: f32,
+        row_axis: &Axis,
+        col_axis: &Axis,
+    ) -> CellRef {
+        // Clamp into the whole content rect first (headers fold into the adjacent content cell).
+        let left = self.row_header_w as f64;
+        let top = COL_HEADER_H as f64;
+        let clamped_x = (local_x as f64).clamp(left, left + self.content_w);
+        let clamped_y = (local_y as f64).clamp(top, top + self.content_h);
+        let content_x = self.content_x_of(clamped_x as f32);
+        let content_y = self.content_y_of(clamped_y as f32);
+        let col = col_axis
+            .index_at(content_x)
+            .min(col_axis.count().saturating_sub(1));
+        let row = row_axis
+            .index_at(content_y)
+            .min(row_axis.count().saturating_sub(1));
+        CellRef::new(row, col)
+    }
+
+    /// The per-axis auto-scroll delta for a drag past the **body's** live edges (`§3.4`): the
+    /// hotzone is measured against the body sub-rect (origin `body_left/body_top`, size the body
+    /// area), so a drag into a frozen band does not auto-scroll. The caller adds the delta to
+    /// `body_sx/body_sy` and re-clamps. Reduces to [`edge_autoscroll_delta`] when unfrozen.
+    pub fn edge_delta(&self, local_x: f32, local_y: f32, step: f64, hotzone: f64) -> (f64, f64) {
+        let (body_w, body_h) = self.body_area();
+        // Shift the grid-local point into a body-sub-rect-local frame whose header origin matches
+        // what `edge_autoscroll_delta` expects (row_header_w on x, COL_HEADER_H on y).
+        let bx = local_x - self.frozen_w as f32;
+        let by = local_y - self.frozen_h as f32;
+        let (mut dx, mut dy) =
+            edge_autoscroll_delta(bx, by, self.row_header_w, body_w, body_h, step, hotzone);
+        // Never auto-scroll while the pointer sits **inside a frozen band** (past the divider but
+        // not in the header gutter): the band does not scroll (`§3.4`). The body's own live
+        // bottom/right (window) edges and its left/top divider edge (just inside the body) still
+        // fire. When unfrozen the band region is empty, so this leaves `edge_autoscroll_delta`'s
+        // result untouched (the `M=K=0` gutter behaviour is preserved).
+        let lx = local_x as f64;
+        let ly = local_y as f64;
+        if lx >= self.row_header_w as f64 && lx < self.body_left() {
+            dx = 0.0;
+        }
+        if ly >= COL_HEADER_H as f64 && ly < self.body_top() {
+            dy = 0.0;
+        }
+        (dx, dy)
+    }
 }
 
 /// Decomposes a selection range **minus its active cell** into ≤4 index sub-rectangles
@@ -802,6 +1030,244 @@ mod tests {
             ),
             (20.0, 0.0)
         );
+    }
+
+    // --- PaneGeometry (freeze panes, `components/viewport_split.md §7`) ------------------
+
+    /// A `PaneGeometry` with no frozen band and the given body scroll — the `M=K=0` degenerate
+    /// that must reproduce the free-function results exactly.
+    fn zero_pane(rhw: f32, w: f64, h: f64, sx: f64, sy: f64) -> PaneGeometry {
+        PaneGeometry {
+            row_header_w: rhw,
+            frozen_w: 0.0,
+            frozen_h: 0.0,
+            content_w: w,
+            content_h: h,
+            body_sx: sx,
+            body_sy: sy,
+        }
+    }
+
+    #[test]
+    fn pane_geometry_zero_band_matches_freefns() {
+        // With no frozen band every PaneGeometry method must equal its free-function twin, over
+        // several scroll offsets and variable geometry — the byte-for-byte `M=K=0` guard.
+        let rows = varied(1000);
+        let cols = varied(1000);
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        for &(sx, sy) in &[(0.0, 0.0), (137.0, 289.0), (5000.0, 9000.0)] {
+            let pg = zero_pane(rhw, cw, ch, sx, sy);
+            // clamp
+            assert_eq!(
+                pg.clamp(cols.total(), rows.total()),
+                clamp_scroll(sx, sy, cols.total(), rows.total(), content(cw, ch)),
+                "clamp @ ({sx},{sy})"
+            );
+            // reveal
+            for &(rr, rc) in &[(2u32, 2u32), (500, 400), (999, 999)] {
+                assert_eq!(
+                    pg.reveal(rr, rc, &rows, &cols),
+                    scroll_to_reveal(rr, rc, &rows, &cols, content(cw, ch), sx, sy),
+                    "reveal ({rr},{rc}) @ ({sx},{sy})"
+                );
+            }
+            // hit_test + cell_at_point + edge_delta across a grid of probe points.
+            for &lx in &[10.0f32, rhw + 1.0, rhw + 200.0, rhw + 399.0] {
+                for &ly in &[5.0f32, COL_HEADER_H + 1.0, COL_HEADER_H + 150.0] {
+                    assert_eq!(
+                        pg.hit_test(lx, ly, &rows, &cols),
+                        hit_test(lx, ly, rhw, sx, sy, &rows, &cols),
+                        "hit_test ({lx},{ly}) @ ({sx},{sy})"
+                    );
+                    assert_eq!(
+                        pg.cell_at_point(lx, ly, &rows, &cols),
+                        cell_at_point(lx, ly, rhw, sx, sy, &rows, &cols, cw, ch),
+                        "cell_at_point ({lx},{ly}) @ ({sx},{sy})"
+                    );
+                    assert_eq!(
+                        pg.edge_delta(lx, ly, 20.0, HZ),
+                        edge_autoscroll_delta(lx, ly, rhw, cw, ch, 20.0, HZ),
+                        "edge_delta ({lx},{ly})"
+                    );
+                }
+            }
+            // scrollbar thumbs
+            assert_eq!(
+                pg.v_thumb(rows.total()),
+                scrollbar_thumb(rows.total(), ch, sy, ch as f32)
+            );
+            assert_eq!(
+                pg.h_thumb(cols.total()),
+                scrollbar_thumb(cols.total(), cw, sx, cw as f32)
+            );
+        }
+    }
+
+    #[test]
+    fn pane_geometry_rebased_clamp() {
+        // M=2 frozen rows (band = 48 px), K=0. Body area = content - band.
+        let rows = uniform(1000, 24.0);
+        let cols = uniform(1000, 100.0);
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        let frozen_h = rows.offset_of(2); // 48
+        let mut pg = zero_pane(rhw, cw, ch, 0.0, 0.0);
+        pg.frozen_h = frozen_h;
+        let (body_w, body_h) = pg.body_area();
+        assert_eq!(body_h, ch - frozen_h);
+        assert_eq!(body_w, cw);
+        // body_sy = 0 clamps to 0 (first non-frozen row 2 sits at the divider).
+        let (_x, y) = pg.clamp(cols.total(), rows.total());
+        assert_eq!(y, 0.0);
+        // The max body scroll: non-frozen rows (total - band) against the body height.
+        let max_y = max_scroll(rows.total() - frozen_h, body_h);
+        pg.body_sy = 1e9;
+        let (_x, y) = pg.clamp(cols.total(), rows.total());
+        assert!(
+            (y - max_y).abs() < 1e-6,
+            "clamped to body max: {y} vs {max_y}"
+        );
+        // At the max, the last row's end reaches the body bottom exactly: content-y of the body
+        // bottom = frozen_h + body_sy + body_h = total.
+        assert!((frozen_h + max_y + body_h - rows.total()).abs() < 1e-6);
+        // A frozen row can never be scrolled into the body: min body-content-y = frozen_h > any
+        // frozen row's offset.
+        assert!(frozen_h + 0.0 >= rows.offset_of(1) + rows.size_of(1) as f64 - 1e-9);
+    }
+
+    #[test]
+    fn pane_geometry_reveal_frozen_axis_noop_and_body_alignment() {
+        let rows = uniform(1000, 24.0);
+        let cols = uniform(1000, 100.0);
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        let mut pg = zero_pane(rhw, cw, ch, 55.0, 77.0);
+        pg.frozen_h = rows.offset_of(2); // M=2
+        pg.frozen_w = cols.offset_of(1); // K=1
+                                         // A target inside the frozen band is a no-op on that axis (scroll unchanged).
+        let (x, y) = pg.reveal(1, 0, &rows, &cols);
+        assert_eq!((x, y), (55.0, 77.0), "frozen (row 1,col 0) → no move");
+        // A body target below the viewport aligns its end into the BODY sub-area, never under the
+        // band: the resulting body-content top = frozen_h + body_sy; the target end must be exactly
+        // at the body bottom.
+        let (_x, y) = pg.reveal(40, 5, &rows, &cols);
+        let (_body_w, body_h) = pg.body_area();
+        let end = rows.offset_of(40) + rows.size_of(40) as f64;
+        assert!(
+            (pg.frozen_h + y + body_h - end).abs() < 1e-6,
+            "body target aligns to body bottom: y={y}"
+        );
+        // And the revealed row is strictly below the divider (its start >= frozen band top).
+        assert!(rows.offset_of(40) - (pg.frozen_h + y) >= 0.0 - 1e-9);
+    }
+
+    #[test]
+    fn pane_geometry_hit_test_regions() {
+        // M=2, K=1 with a scrolled body: probe each region resolves to the right track.
+        let rows = uniform(1000, 24.0); // 24 px each
+        let cols = uniform(1000, 100.0); // 100 px each
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        let mut pg = zero_pane(rhw, cw, ch, 0.0, 0.0);
+        pg.frozen_h = rows.offset_of(2); // 48
+        pg.frozen_w = cols.offset_of(1); // 100
+                                         // Scroll the body so its top-left shows row 10 / col 20.
+        pg.body_sy = rows.offset_of(10) - pg.frozen_h; // body-relative
+        pg.body_sx = cols.offset_of(20) - pg.frozen_w;
+        // Corner cell: just inside the frozen band, top-left → (0,0).
+        assert_eq!(
+            pg.hit_test(rhw + 1.0, COL_HEADER_H + 1.0, &rows, &cols),
+            GridHit::Cell { row: 0, col: 0 }
+        );
+        // Top band (frozen row, scrolling col): just right of the frozen col band → row 0, col 20.
+        let x_body = rhw + pg.frozen_w as f32 + 1.0;
+        assert_eq!(
+            pg.hit_test(x_body, COL_HEADER_H + 1.0, &rows, &cols),
+            GridHit::Cell { row: 0, col: 20 }
+        );
+        // Left band (scrolling row, frozen col): just below the frozen row band → row 10, col 0.
+        let y_body = COL_HEADER_H + pg.frozen_h as f32 + 1.0;
+        assert_eq!(
+            pg.hit_test(rhw + 1.0, y_body, &rows, &cols),
+            GridHit::Cell { row: 10, col: 0 }
+        );
+        // Body: both scrolled → row 10, col 20.
+        assert_eq!(
+            pg.hit_test(x_body, y_body, &rows, &cols),
+            GridHit::Cell { row: 10, col: 20 }
+        );
+        // Column-letter header split: frozen letter vs scrolling letter.
+        assert_eq!(
+            pg.hit_test(rhw + 1.0, 2.0, &rows, &cols),
+            GridHit::ColHeader { col: 0 }
+        );
+        assert_eq!(
+            pg.hit_test(x_body, 2.0, &rows, &cols),
+            GridHit::ColHeader { col: 20 }
+        );
+        // Row-number gutter split: frozen number vs scrolling number.
+        assert_eq!(
+            pg.hit_test(2.0, COL_HEADER_H + 1.0, &rows, &cols),
+            GridHit::RowHeader { row: 0 }
+        );
+        assert_eq!(
+            pg.hit_test(2.0, y_body, &rows, &cols),
+            GridHit::RowHeader { row: 10 }
+        );
+        // Corner cap.
+        assert_eq!(pg.hit_test(2.0, 2.0, &rows, &cols), GridHit::Corner);
+    }
+
+    #[test]
+    fn pane_geometry_edge_delta_body_only() {
+        // Auto-scroll fires only near the BODY's live edges, never in the frozen bands.
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        let mut pg = zero_pane(rhw, cw, ch, 0.0, 0.0);
+        pg.frozen_h = 48.0;
+        pg.frozen_w = 100.0;
+        let (body_w, body_h) = pg.body_area();
+        // Inside the frozen bands (near the divider top-left) → no auto-scroll.
+        assert_eq!(
+            pg.edge_delta(rhw + 5.0, COL_HEADER_H + 5.0, 20.0, HZ),
+            (0.0, 0.0),
+            "band edge does not auto-scroll"
+        );
+        // Just inside the body's right/bottom live edges → positive steps.
+        let body_right = rhw as f64 + pg.frozen_w + body_w;
+        let body_bottom = COL_HEADER_H as f64 + pg.frozen_h + body_h;
+        assert_eq!(
+            pg.edge_delta(
+                (body_right - 5.0) as f32,
+                (body_bottom - 5.0) as f32,
+                20.0,
+                HZ
+            ),
+            (20.0, 20.0)
+        );
+        // Just inside the body's left/top edges (right past the divider) → negative steps.
+        let body_left = rhw as f64 + pg.frozen_w;
+        let body_top = COL_HEADER_H as f64 + pg.frozen_h;
+        assert_eq!(
+            pg.edge_delta((body_left + 5.0) as f32, (body_top + 5.0) as f32, 20.0, HZ),
+            (-20.0, -20.0)
+        );
+    }
+
+    #[test]
+    fn pane_geometry_thumb_over_nonfrozen() {
+        // The thumb spans the non-frozen extent; it vanishes when the non-frozen tracks fit.
+        let rhw = ROW_HEADER_MIN_W;
+        let (cw, ch) = (400.0, 300.0);
+        let mut pg = zero_pane(rhw, cw, ch, 0.0, 0.0);
+        pg.frozen_h = 48.0;
+        let (_body_w, body_h) = pg.body_area();
+        // Total rows just larger than the body: a thumb exists over the non-frozen extent.
+        let total_h = pg.frozen_h + body_h + 100.0;
+        assert!(pg.v_thumb(total_h).is_some());
+        // When the non-frozen rows fit the body, no thumb (nothing to scroll).
+        assert_eq!(pg.v_thumb(pg.frozen_h + body_h), None);
     }
 
     #[test]

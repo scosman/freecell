@@ -61,6 +61,12 @@ pub struct Scene {
     hidden_rows: Vec<(u32, u32)>,
     /// Inclusive 0-based column runs to hide via a real `Command::SetColumnsHidden`.
     hidden_cols: Vec<(u32, u32)>,
+    /// Frozen-rows count `M` applied via a real `Command::SetFrozen` (`freeze-panes
+    /// architecture.md §2`) — the leading `0..M` rows pinned to the top. `None` = no row freeze.
+    frozen_rows: Option<u32>,
+    /// Frozen-columns count `K` applied via a real `Command::SetFrozen` — the leading `0..K`
+    /// columns pinned to the left. `None` = no column freeze.
+    frozen_cols: Option<u32>,
     /// Conditional-formatting rules `(A1 range, spec)` applied via a real `Command::AddCondFmt`
     /// (`components/engine_cf.md §5`). The worker folds each winning rule into the published style
     /// cache (P3), so the captured `SheetCache` carries the value-dependent CF fills / font colour.
@@ -86,6 +92,8 @@ impl Scene {
             injects: Vec::new(),
             hidden_rows: Vec::new(),
             hidden_cols: Vec::new(),
+            frozen_rows: None,
+            frozen_cols: None,
             cond_fmt: Vec::new(),
             publish_rows: 0..80,
             publish_cols: 0..48,
@@ -213,6 +221,22 @@ impl Scene {
         self
     }
 
+    /// Freezes the leading `m` rows (the `0..m` band) via a **real** `Command::SetFrozen`
+    /// (`freeze-panes architecture.md §2`) — the same worker path the header-menu Freeze drives, so
+    /// the published cache carries `frozen_rows = m` and the grid pins that band while the body
+    /// scrolls (mirrors [`Scene::hide_row`]).
+    pub fn frozen_rows(mut self, m: u32) -> Self {
+        self.frozen_rows = Some(m);
+        self
+    }
+
+    /// Freezes the leading `k` columns (the `0..k` band) via a real `Command::SetFrozen` — the
+    /// column analogue of [`Scene::frozen_rows`].
+    pub fn frozen_cols(mut self, k: u32) -> Self {
+        self.frozen_cols = Some(k);
+        self
+    }
+
     /// Adds a conditional-formatting rule over the A1 `range` — a real `Command::AddCondFmt` worker
     /// edit (`components/engine_cf.md §5`). The worker folds the winning rule's differential (a
     /// highlight fill/font, or a color-scale's interpolated fill) into the published style cache via
@@ -304,6 +328,17 @@ pub fn build_sources(scene: &Scene) -> Result<GridDataSources> {
             start: *start,
             end: *end,
             hidden: true,
+        });
+    }
+    // Freeze the leading row/column bands through the real worker path (`freeze-panes
+    // architecture.md §2`), so the rebuilt cache carries `frozen_rows`/`frozen_columns` the grid
+    // reads to pin the bands. Sent per axis independently (either may be `None`), matching how the
+    // header menu changes exactly one axis per action.
+    if scene.frozen_rows.is_some() || scene.frozen_cols.is_some() {
+        client.send(Command::SetFrozen {
+            sheet,
+            rows: scene.frozen_rows,
+            cols: scene.frozen_cols,
         });
     }
     client.send(Command::SetViewport {

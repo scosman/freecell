@@ -1809,6 +1809,14 @@ fn make_grid_sink(
                 hidden: matches!(event, GridEvent::HideColumns { .. }),
             });
         }
+        // Freeze/Unfreeze (`freeze-panes`): the header menu emits the new count for exactly one
+        // axis; the worker rides the fork's undoable frozen-count setter (one undo step) and
+        // rebuilds the sheet cache → the grid re-reads the counts on the next frame.
+        GridEvent::SetFrozen { rows, cols } => client.send(Command::SetFrozen {
+            sheet: shared.active_sheet.get(),
+            rows: *rows,
+            cols: *cols,
+        }),
         // Chart manipulation (P18): move/resize (a new anchor) + delete route straight to the worker,
         // like the other grid-initiated structure ops. The worker resolves the `ChartId` to the
         // authored set or a loaded binding and republishes the chart snapshot.

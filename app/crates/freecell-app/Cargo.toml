@@ -33,7 +33,7 @@ category = "productivity"
 # ASCII: a Unicode em-dash here rendered as "??" in elementary App Center's package view
 # (the control file is UTF-8, but the App Center synopsis display mangled the glyph), so
 # use plain ASCII punctuation to stay portable across deb/AppImage/NSIS front-ends.
-description = "A GPU-rendered, Excel-compatible spreadsheet, built to be stupid-fast on huge sheets."
+description = "The open spreadsheet app"
 # Extended description (the deb `Description:` continuation lines). WITHOUT this,
 # cargo-packager writes the literal placeholder "(none)" — which is exactly what App
 # Center showed under "Description". Keep ASCII, same reason as the synopsis above.

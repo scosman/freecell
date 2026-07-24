@@ -19,7 +19,7 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
   <name>FreeCell</name>
-  <summary>A GPU-rendered, Excel-compatible spreadsheet, built to be stupid-fast on huge sheets</summary>
+  <summary>The open spreadsheet app</summary>
   <description>
     <p>
       FreeCell is a GPU-rendered spreadsheet built in Rust for speed on very large sheets,

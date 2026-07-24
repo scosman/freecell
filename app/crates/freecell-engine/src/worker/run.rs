@@ -7715,6 +7715,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn structural_edits_track_frozen_boundary_in_one_undo_step() {
+        // `freeze-panes` Phase 5 (`architecture.md §5`, Q4): the frozen boundary tracks
+        // insert/delete of rows the way Excel does, and — because IronCalc adjusts the pane
+        // *inside* the structural op's single undo diff (fork fix
+        // `fix/structural-edits-adjust-frozen-pane`, no FreeCell-side compensating call) — a
+        // SINGLE undo reverts both the structural edit AND the boundary move.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(3),
+            cols: None,
+        }]);
+        assert_eq!(frozen(&worker, sheet), (3, 0), "baseline M=3");
+
+        // Insert a row above the band (0-based row 0) → the band grows to 4.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+        assert_eq!(frozen(&worker, sheet).0, 4, "insert above the band grows M");
+        // ONE undo pops the insert AND restores the boundary in the same step.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            3,
+            "a single undo reverts the insert and the boundary together"
+        );
+        // Redo re-applies both.
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            4,
+            "redo re-applies the grown band"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(frozen(&worker, sheet).0, 3, "back to the baseline");
+
+        // Delete a row within the band (0-based row 1 = 1-based row 2, a frozen row) → shrinks.
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 1,
+            count: 1,
+        }]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            2,
+            "delete within the band shrinks M"
+        );
+        // ONE undo restores the deleted row AND the boundary together.
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            3,
+            "a single undo reverts the delete and the boundary together"
+        );
+    }
+
     fn auto_grow(sheet: SheetId, heights: Vec<(u32, f32)>) -> Command {
         Command::AutoGrowRowHeights { sheet, heights }
     }

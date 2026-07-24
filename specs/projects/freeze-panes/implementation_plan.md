@@ -80,7 +80,7 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
     cross-divider selection overlay.
     Checks: `-p freecell-app`, `fmt --all --check`.
 
-- [ ] **Phase 5 — Structural-edit boundary tracking (`architecture.md §5`, Q4).** Engine, no
+- [x] **Phase 5 — Structural-edit boundary tracking (`architecture.md §5`, Q4).** Engine, no
   pixel. **Checkpoint first:** in the fork container probe whether `insert_rows`/`delete_rows`/
   `insert_columns`/`delete_columns` already adjust `frozen_rows`/`frozen_columns` (Excel: insert
   above/within grows, delete within shrinks, below unchanged).

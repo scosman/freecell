@@ -4,11 +4,12 @@
 //! Windows and Linux deliver the target path via process **argv**, already handled by
 //! `main.rs::open_arg` → [`FreeCellApp::open_path`](super::FreeCellApp::open_path). macOS instead
 //! delivers a Finder open as an Apple Event (`application:openURLs:`) that gpui surfaces through
-//! [`gpui::App::on_open_urls`], whose callback is `FnMut(Vec<String>)` with **no `cx`** — so it
-//! cannot open a window from inside itself. [`install_finder_open`] bridges that cx-less callback
-//! into the existing open funnel via an `async-channel` + a spawned app task (the Zed-proven
-//! pattern), and gates the welcome window behind the channel drain so a Finder cold-start never
-//! flashes welcome (functional_spec.md §5.5 REQUIREMENT).
+//! `Application::on_open_urls`, whose callback is `FnMut(Vec<String>)` with **no `cx`** — so it
+//! cannot open a window from inside itself. That handler is registered on the `Application` builder
+//! in `main.rs` (before `run` consumes it), forwarding the raw URL strings onto an `async-channel`;
+//! [`install_finder_open`] is spawned from inside `app.run` and owns the receiver: it bridges those
+//! strings into the existing open funnel and gates the welcome window behind the channel drain so a
+//! Finder cold-start never flashes welcome (functional_spec.md §5.5 REQUIREMENT).
 //!
 //! [`file_url_to_path`] — the `file://` → [`PathBuf`] conversion — is intentionally cfg-agnostic
 //! and pure, so it is unit-tested on the Linux CI (it carries the bulk of this feature's automated
@@ -40,7 +41,7 @@ pub fn file_url_to_path(raw: &str) -> Option<PathBuf> {
     raw.starts_with('/').then(|| PathBuf::from(raw))
 }
 
-/// The startup coalesce window: after registering [`gpui::App::on_open_urls`], the bridge task
+/// The startup coalesce window: after registering `Application::on_open_urls`, the bridge task
 /// yields this long before deciding welcome-vs-open, so a launch-time Finder `openURLs` (delivered
 /// through the event loop shortly *after* the `app.run` callback registers the handler — not
 /// synchronously inside it) is captured first and welcome never flashes (functional_spec.md §5.5,
@@ -49,30 +50,30 @@ pub fn file_url_to_path(raw: &str) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 const STARTUP_COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Installs the macOS Finder open-file bridge and owns the deferred welcome-vs-open decision
+/// Spawns the macOS Finder open-file bridge task and owns the deferred welcome-vs-open decision
 /// (functional_spec.md §5, architecture.md §3.2). Call **once**, inside `app.run`, right after the
 /// argv open is dispatched and before any synchronous welcome — welcome is shown only from inside
 /// the spawned task here, so a Finder cold-start that carries a file never flashes welcome.
 ///
-/// `opened_via_argv` reports whether `main.rs` already opened a CLI/argv path; if so (or if a
-/// launch-time `openURLs` arrives), welcome is suppressed.
+/// `rx` is the receiver end of the channel whose sender is fed by the `Application::on_open_urls`
+/// handler registered in `main.rs` (that method lives on the `Application` builder, not on `App`,
+/// so it must be wired before `run` consumes the builder — registering it there also means the
+/// handler is live *before* AppKit delivers launch-time `openURLs`). `opened_via_argv` reports
+/// whether `main.rs` already opened a CLI/argv path; if so (or if a launch-time `openURLs`
+/// arrives), welcome is suppressed.
 ///
-/// gpui's `on_open_urls` callback is cx-less, so it only forwards the raw URL strings onto a
-/// channel; the spawned task (which *does* have a `cx`) drains them through the existing
+/// The task (which *does* have a `cx`) drains the raw URL strings through the existing
 /// [`FreeCellApp::open_path`](super::FreeCellApp::open_path) funnel — reusing
 /// canonicalize/dedupe/recents/error-handling verbatim — for both the launch drain and warm-start
 /// events over the app's lifetime.
 #[cfg(target_os = "macos")]
-pub fn install_finder_open(cx: &mut gpui::App, opened_via_argv: bool) {
+pub fn install_finder_open(
+    cx: &mut gpui::App,
+    rx: async_channel::Receiver<Vec<String>>,
+    opened_via_argv: bool,
+) {
     use super::FreeCellApp;
     use gpui::AsyncApp;
-
-    let (tx, rx) = async_channel::unbounded::<Vec<String>>();
-    // The callback has no `cx`: it only forwards the raw URL strings onto the channel. `try_send`
-    // on an unbounded channel only fails if the receiver was dropped (app shutting down) — ignore.
-    cx.on_open_urls(move |urls| {
-        let _ = tx.try_send(urls);
-    });
 
     cx.spawn(async move |cx: &mut AsyncApp| {
         // Let the platform deliver any launch-time `openURLs` (fired through the event loop just

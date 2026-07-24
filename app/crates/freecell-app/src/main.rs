@@ -80,6 +80,25 @@ fn main() {
     // gpui-component bundle (`shell::assets`). The bundle still resolves `IconName::Loader`,
     // `ChevronDown`, etc. — see `AppAssets`.
     let app = application().with_assets(AppAssets);
+
+    // macOS: a Finder open arrives as an Apple Event surfaced by `Application::on_open_urls` — a
+    // method on the BUILDER (`Application`), NOT on `App`, so it must be registered here, before
+    // `run` consumes `app` (inside `run` the closure only has the inner `App`, which has no such
+    // method). The cx-less callback forwards the raw URL strings onto a channel; its receiver is
+    // handed to the bridge task spawned inside `run` (`shell::install_finder_open`). Registering it
+    // before `run` also means the handler is live before AppKit delivers any launch-time
+    // `openURLs`, strengthening the no-welcome-flash guarantee (functional_spec.md §5.5).
+    #[cfg(target_os = "macos")]
+    let finder_open_rx = {
+        let (tx, rx) = async_channel::unbounded::<Vec<String>>();
+        // `try_send` on an unbounded channel only fails if the receiver was dropped (app shutting
+        // down) — ignore. `on_open_urls` returns `&Self`; discard it so `app` stays owned for `run`.
+        app.on_open_urls(move |urls| {
+            let _ = tx.try_send(urls);
+        });
+        rx
+    };
+
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
         register_fonts(cx); // registers the bundled Inter faces + sets Inter as the UI font,
@@ -102,12 +121,13 @@ fn main() {
             }
             None => false,
         };
-        // macOS: a Finder open arrives as an Apple Event, not argv. Install the `on_open_urls`
-        // bridge; it owns the DEFERRED welcome decision (welcome is shown only after a launch-time
-        // open event is drained — so a Finder cold-start never flashes welcome, §5.5). Full path,
-        // cfg-gated inline, so no unused import lands on the non-macOS build.
+        // macOS: a Finder open arrives as an Apple Event, not argv. The `on_open_urls` handler was
+        // registered on the builder above; spawn the bridge task that owns its receiver and the
+        // DEFERRED welcome decision (welcome is shown only after a launch-time open event is
+        // drained — so a Finder cold-start never flashes welcome, §5.5). Full path, cfg-gated
+        // inline, so no unused import lands on the non-macOS build.
         #[cfg(target_os = "macos")]
-        freecell_app::shell::install_finder_open(cx, opened_via_argv);
+        freecell_app::shell::install_finder_open(cx, finder_open_rx, opened_via_argv);
         // Windows/Linux/CLI: the path (if any) already arrived via argv above, so decide welcome
         // synchronously as before.
         #[cfg(not(target_os = "macos"))]

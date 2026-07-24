@@ -28,7 +28,24 @@ description = "The FreeCell GPUI application (macOS + Linux): app shell, windows
 product-name = "FreeCell"
 identifier = "com.scosman.freecell"
 category = "productivity"
-description = "A GPU-rendered, Excel-compatible spreadsheet — stupid-fast on huge sheets."
+# Short synopsis. cargo-packager writes this VERBATIM into the Debian `Description:`
+# synopsis and the `.desktop` `Comment=`, and it is the App Center one-liner. Keep it
+# ASCII: a Unicode em-dash here rendered as "??" in elementary App Center's package view
+# (the control file is UTF-8, but the App Center synopsis display mangled the glyph), so
+# use plain ASCII punctuation to stay portable across deb/AppImage/NSIS front-ends.
+description = "The open spreadsheet app"
+# Extended description (the deb `Description:` continuation lines). WITHOUT this,
+# cargo-packager writes the literal placeholder "(none)" — which is exactly what App
+# Center showed under "Description". Keep ASCII, same reason as the synopsis above.
+long-description = """
+FreeCell is a GPU-rendered spreadsheet built in Rust for speed on very large sheets, up \
+to Excel's maximum of 1,048,576 rows by 16,384 columns. It reads and writes .xlsx files \
+and aims for Excel-compatible formulas, formatting, and charts, with a fast custom grid \
+rendered through GPUI (the renderer behind Zed and Ghostty).
+"""
+# Populates the Debian `Maintainer:` control field (absent otherwise, which lintian flags
+# and App Center shows as a blank developer) and the AppStream `<developer>` name.
+authors = ["scosman <scosman@gmail.com>"]
 homepage = "https://github.com/scosman/freecell"
 # Final app icons. cargo-packager uses the .icns for the macOS bundle, the .ico for the
 # Windows installer, and the sized PNGs for Linux hicolor theme entries. Regenerate all
@@ -45,6 +62,26 @@ icons = [
     "packaging/icons/256x256.png",
     "packaging/icons/512x512.png",
 ]
+
+# ---------------------------------------------------------------------------------
+# Debian (.deb) specifics. Must come AFTER every key of [package.metadata.packager]
+# above — a new table header ends the previous table.
+#
+# - package-name: the `Package:` control field. cargo-packager defaults it to
+#   kebab-case(product-name) => "free-cell", which is what App Center showed as the
+#   title. Debian package names must be lowercase, so the best the raw name can be is
+#   "freecell" (nicer than "free-cell", and it's what `apt install freecell` expects).
+# - files: ship an AppStream metainfo file into /usr/share/metainfo. This is the real
+#   fix for the App Center TITLE ("FreeCell", not the package name), the LICENSE
+#   ("MIT OR Apache-2.0" instead of "unknown" — the Debian control file has no license
+#   field at all), and a rich description. App Center / GNOME Software prefer AppStream
+#   metadata when present. The `<launchable>` inside it points at cargo-packager's
+#   generated `freecell.desktop`. Source path is relative to THIS crate's manifest dir
+#   (cargo-packager cd's here), same as the icons above.
+# ---------------------------------------------------------------------------------
+[package.metadata.packager.deb]
+package-name = "freecell"
+files = { "packaging/linux/com.scosman.freecell.metainfo.xml" = "usr/share/metainfo/com.scosman.freecell.metainfo.xml" }
 
 [lib]
 name = "freecell_app"

@@ -71,9 +71,11 @@ jobs:
     # Build x64 AND arm64 as separate NATIVE builds — one runner per architecture — rather
     # than cross-compiling. GitHub-hosted arm64 Linux runners (`ubuntu-24.04-arm`) are free
     # for public repos, so each arch gets a true native binary, and linuxdeploy downloads the
-    # arch-matched AppImage tooling on each runner. cargo-packager stamps the architecture
-    # into the output filenames (…_amd64.deb / …_arm64.deb, …_x86_64.AppImage /
-    # …_aarch64.AppImage), so the two legs never collide. `fail-fast: false` keeps one arch's
+    # arch-matched AppImage tooling on each runner. Each leg uploads under its own artifact
+    # name (freecell-linux-<arch>, below), so the two never collide on the run page;
+    # cargo-packager additionally stamps the arch into the filenames themselves (…_amd64.deb /
+    # …_arm64.deb, …_x86_64.AppImage / …_aarch64.AppImage), so they stay distinct even if both
+    # artifacts are later unpacked into one directory. `fail-fast: false` keeps one arch's
     # failure from cancelling the other. Both are REQUIRED (see the header note).
     strategy:
       fail-fast: false

@@ -65,6 +65,38 @@ icons = [
 ]
 
 # ---------------------------------------------------------------------------------
+# File associations. Register FreeCell as a CANDIDATE handler (not the default) for
+# spreadsheet files, so a Finder/Explorer/file-manager double-click, "Open With", drag-onto-
+# icon, or shell path-arg launches FreeCell with that file. Every path funnels into the app's
+# existing open logic (`FreeCellApp::open_path`): `.xlsx` opens/dedupes; `.csv` imports into a
+# fresh untitled workbook. See specs/projects/xlsx-file-association/. From these two entries
+# cargo-packager 0.11.8 emits, per format: macOS `.app` `CFBundleDocumentTypes`
+# (`CFBundleTypeExtensions`/`CFBundleTypeName`/`CFBundleTypeRole`); Linux `.deb` `.desktop`
+# `MimeType=<mime>;<mime>` + `Exec=… %F`; Windows NSIS registry ProgId + `shell\open\command`.
+#
+# These entries carry NO file paths, so the manifest-dir `cd` gotcha noted for `icons` above
+# does not apply. Array-of-tables must sit with the other `[package.metadata.packager.*]`
+# tables and BEFORE the `[package.metadata.packager.deb]` header below — a new table header
+# ends the packager table. NOTE the `role` value is lowercase `"editor"`: cargo-packager's
+# `CFBundleTypeRole` enum is camelCase + `deny_unknown_fields`, so `"Editor"` fails to
+# deserialize and would break packaging. `"editor"` is also the default. The `packaging_metadata`
+# tests in `lib.rs` guard both entries (and this casing).
+# ---------------------------------------------------------------------------------
+[[package.metadata.packager.file-associations]]
+extensions = ["xlsx"]
+mime-type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" # Linux .desktop MimeType
+description = "Excel Workbook"                                                  # Windows Explorer "Type" column
+name = "Excel Workbook"                                                         # macOS CFBundleTypeName
+role = "editor"                                                                 # macOS CFBundleTypeRole (default)
+
+[[package.metadata.packager.file-associations]]
+extensions = ["csv"]
+mime-type = "text/csv"
+description = "CSV Document"
+name = "CSV Document"
+role = "editor"
+
+# ---------------------------------------------------------------------------------
 # Debian (.deb) specifics. Must come AFTER every key of [package.metadata.packager]
 # above — a new table header ends the previous table.
 #
@@ -153,6 +185,10 @@ fontdb = "=0.23.0"
 # its font references are our bundled Inter (never Arial, which isn't on all systems). `zip` +
 # `deflate` are already in the lockfile via IronCalc, so this adds no new crate.
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# The `packaging_metadata` tests (`lib.rs`) parse THIS `Cargo.toml` to assert the cargo-packager
+# `file-associations` block stays present + well-formed (xlsx-file-association project). `toml` is
+# already resolved at 0.8.23 in the lockfile (transitive), so pinning it adds no new crate.
+toml = "0.8"
 
 [lints]
 workspace = true

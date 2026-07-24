@@ -10,7 +10,7 @@ this is the checklist. No pixel render suite (no baseline pixels move — archit
 
 ## Phases
 
-- [ ] **Phase 1 — Declaration (packaging config).** Add the two
+- [x] **Phase 1 — Declaration (packaging config).** Add the two
   `[[package.metadata.packager.file-associations]]` entries (`xlsx`, `csv`) to
   `crates/freecell-app/Cargo.toml` (architecture §2). Verify by building the `.deb` and
   asserting the generated `freecell.desktop` has `MimeType=…spreadsheetml.sheet;text/csv;` and

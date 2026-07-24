@@ -2054,6 +2054,7 @@ dependencies = [
  "gpui_platform",
  "parking_lot",
  "tempfile",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "zip",

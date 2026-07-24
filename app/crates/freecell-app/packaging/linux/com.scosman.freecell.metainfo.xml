@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metainfo for FreeCell.
+
+  Shipped into /usr/share/metainfo/ by cargo-packager's `[package.metadata.packager.deb].files`
+  mapping (see ../../Cargo.toml). App Center / GNOME Software read this in preference to the raw
+  Debian control fields, so it drives the displayed name, license, summary, and description.
+
+  - <id> / <launchable> tie this component to cargo-packager's generated `freecell.desktop`
+    (installed at /usr/share/applications/freecell.desktop; its Name= is "FreeCell").
+  - <project_license> is the SPDX id from the workspace `license` field ("MIT OR Apache-2.0"),
+    which is why App Center no longer shows License: unknown.
+  - Keep <summary> in sync with the packager `description` in ../../Cargo.toml.
+
+  Validate after edits with:  appstreamcli validate com.scosman.freecell.metainfo.xml
+-->
+<component type="desktop-application">
+  <id>com.scosman.freecell</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>FreeCell</name>
+  <summary>A GPU-rendered, Excel-compatible spreadsheet, built to be stupid-fast on huge sheets</summary>
+  <description>
+    <p>
+      FreeCell is a GPU-rendered spreadsheet built in Rust for speed on very large sheets,
+      up to Excel's maximum of 1,048,576 rows by 16,384 columns.
+    </p>
+    <p>
+      It reads and writes .xlsx files and aims for Excel-compatible formulas, formatting, and
+      charts, with a fast custom grid rendered through GPUI (the renderer behind Zed and Ghostty).
+    </p>
+  </description>
+  <launchable type="desktop-id">freecell.desktop</launchable>
+  <url type="homepage">https://github.com/scosman/freecell</url>
+  <url type="bugtracker">https://github.com/scosman/freecell/issues</url>
+  <developer id="com.scosman">
+    <name>scosman</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+</component>

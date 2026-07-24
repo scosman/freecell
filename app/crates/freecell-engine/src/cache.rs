@@ -405,6 +405,13 @@ pub(crate) fn build_sheet_cache(
         }
     }
 
+    // Frozen pane counts (`freeze-panes` `architecture.md §2.4`): copy the worksheet's
+    // `frozen_rows`/`frozen_columns` (xlsx `<pane>`, or a `SetFrozen` edit) into the read model —
+    // this is the "opening a file with `<pane>` shows the bands immediately" path. No geometry
+    // effect (not fed to the axes); the fork's fields are `i32`, defensively floored at 0.
+    builder.set_frozen_rows(ws.frozen_rows.max(0) as u32);
+    builder.set_frozen_cols(ws.frozen_columns.max(0) as u32);
+
     // Merged ranges: parse the sheet's file-loaded A1 merge strings once (0-based) for the
     // insert/delete merge guard (`components/grid_structure.md §5.3`). A hostile/unparseable
     // entry is skipped + logged (never panics — defensive against malformed files).

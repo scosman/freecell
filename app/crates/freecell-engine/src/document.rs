@@ -2055,6 +2055,56 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// End-to-end proof that FreeCell's IronCalc pin (`app/Cargo.toml`'s `[patch.crates-io]` →
+    /// the fork's `freecell-fixes` branch) actually carries the scalar-functions batch: each
+    /// function is set as a formula in A1 and its **computed, formatted** value is asserted. A
+    /// name the pinned engine doesn't know would return `#NAME?` (and a broken impl a wrong value
+    /// or `#VALUE!`/`#N/A`), so a literal-value match here is the regression guard that the batch
+    /// is present and correct through the real FreeCell engine seam — no FreeCell-side code beyond
+    /// the pin bump. Split into "presence" (the 9 functions verified already-present upstream) and
+    /// "fixes" (the 4 fork correctness fixes this batch actually landed:
+    /// `fix/trim-internal-runs`, `fix/dollar-negative-zero`, `fix/address-empty-sheet`,
+    /// `fix/xmatch-array-constant` — see `specs/projects/scalar-functions-batch/fork-fixes/`).
+    #[test]
+    fn scalar_functions_batch_computes_through_pinned_engine() {
+        // Set `formula` (a leading-`=` expression) into A1, evaluate, and return its formatted
+        // display value — the exact per-cell text FreeCell would paint.
+        fn eval(formula: &str) -> String {
+            let mut doc = WorkbookDocument::new_empty().unwrap();
+            doc.set_cell_input(0, CellRef::new(0, 0), formula).unwrap();
+            doc.evaluate();
+            doc.formatted_value(0, CellRef::new(0, 0)).unwrap()
+        }
+
+        // Presence: each function computes (not `#NAME?`) and returns its Excel value.
+        let presence = [
+            ("=SUMPRODUCT({1,2,3},{4,5,6})", "32"),
+            ("=PROPER(\"john smith\")", "John Smith"),
+            ("=REPLACE(\"abcdefg\",3,2,\"XY\")", "abXYefg"),
+            ("=CHAR(65)", "A"),
+            ("=CODE(\"A\")", "65"),
+            ("=CLEAN(\"Hello\"&CHAR(7)&\"World\")", "HelloWorld"),
+            ("=PERCENTILE.INC({1,2,3,4},0.5)", "2.5"),
+            ("=QUARTILE.INC({1,2,4,7,8,9,10,12},2)", "7.5"),
+            ("=XMATCH(30,{10,20,30,40,50})", "3"),
+        ];
+        // The four fork correctness fixes — prove the pin carries each landed branch.
+        let fixes = [
+            ("=TRIM(\"a    b\")", "a b"),           // fix/trim-internal-runs
+            ("=DOLLAR(-0.001,2)", "$0.00"),         // fix/dollar-negative-zero
+            ("=ADDRESS(1,1,1,TRUE,\"\")", "!$A$1"), // fix/address-empty-sheet
+            ("=XMATCH(\"ban*\",{\"apple\",\"banana\",\"cherry\"},2)", "2"), // fix/xmatch-array-constant
+        ];
+
+        for (formula, expected) in presence.iter().chain(fixes.iter()) {
+            assert_eq!(
+                eval(formula),
+                *expected,
+                "pinned engine mis-evaluated {formula} (expected {expected:?})"
+            );
+        }
+    }
+
     /// Every number-format preset code the dropdown can send must be renderable by the IronCalc
     /// formatter — a code the lexer can't parse renders `#VALUE!` in every cell (as bare `£`/`¥`
     /// did before they were switched to `[$£]…`/`[$¥]…`, and as the dropped `# ?/?` fraction did).

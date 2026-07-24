@@ -35,6 +35,23 @@ so they build and test headless in Linux CI.
   (`xrefresh`), `imagemagick`.
 - **macOS:** the standard Xcode command-line tools (Metal stack).
 
+## Compile cache (sccache + Cloudflare R2) — dev only
+
+Dev builds can use [sccache](https://github.com/mozilla/sccache) backed by a shared
+Cloudflare R2 bucket, so fresh dev containers don't recompile the pinned dep tree
+(gpui/zed, gpui-component, ironcalc fork) from scratch:
+
+```sh
+source scripts/setup_sccache.sh   # installs sccache if missing + exports the env
+```
+
+Web dev sessions run this automatically via the repo's `SessionStart` hook
+(`.claude/hooks/session-start.sh`). The script needs the `R2_ACCESS_KEY_ID` /
+`R2_SECRET_ACCESS_KEY` secrets in the environment; **without them it no-ops** (leaves
+`RUSTC_WRAPPER` unset) and builds work as before, just uncached. CI is deliberately
+untouched (it uses Swatinem/rust-cache). Design + token rotation:
+[`../projects/build-cache.md`](../projects/build-cache.md).
+
 ## Build / run / test
 
 ```sh

@@ -60,6 +60,15 @@ pub struct SheetCache {
     /// on every hide/unhide (which republishes the whole cache).
     hidden_rows: BTreeSet<u32>,
     hidden_cols: BTreeSet<u32>,
+    /// Frozen leading-band counts `(M, K)` (`freeze-panes` `architecture.md §1–§2`): rows `0..M`
+    /// pin to the top, columns `0..K` pin to the left; `0` = no freeze on that axis. **Track-index**
+    /// counts with **no geometry effect** — unlike `hidden_*` they are NOT fed to [`axis_from`];
+    /// the frozen band's pixel extent is derived at render time as `axis.offset_of(M)` (so hidden
+    /// tracks inside the band contribute zero px for free). Populated from the worksheet's
+    /// `frozen_rows`/`frozen_columns` (xlsx `<pane>`) at cache build and rebuilt on every
+    /// freeze/unfreeze (which republishes the whole cache).
+    frozen_rows: u32,
+    frozen_cols: u32,
     row_axis: Arc<Axis>,
     col_axis: Arc<Axis>,
     cell_styles: BTreeMap<(u32, u32), StyleId>,
@@ -508,6 +517,18 @@ impl SheetCache {
     pub fn is_col_hidden(&self, col: u32) -> bool {
         self.hidden_cols.contains(&col)
     }
+
+    /// The frozen-rows count `M` — leading rows `0..M` pinned to the top (`0` = no row freeze).
+    /// A track-index count with no geometry effect; see the field doc.
+    pub fn frozen_rows(&self) -> u32 {
+        self.frozen_rows
+    }
+
+    /// The frozen-columns count `K` — leading columns `0..K` pinned to the left (`0` = no column
+    /// freeze). See [`SheetCache::frozen_rows`].
+    pub fn frozen_cols(&self) -> u32 {
+        self.frozen_cols
+    }
 }
 
 /// Builds a [`SheetCache`] from geometry + styles. Used by test/render fixtures and by the
@@ -523,6 +544,8 @@ pub struct SheetCacheBuilder {
     col_overrides: BTreeMap<u32, f32>,
     hidden_rows: BTreeSet<u32>,
     hidden_cols: BTreeSet<u32>,
+    frozen_rows: u32,
+    frozen_cols: u32,
     cell_styles: BTreeMap<(u32, u32), StyleId>,
     row_styles: BTreeMap<u32, StyleId>,
     col_styles: BTreeMap<u32, StyleId>,
@@ -547,6 +570,8 @@ impl SheetCacheBuilder {
             col_overrides: BTreeMap::new(),
             hidden_rows: BTreeSet::new(),
             hidden_cols: BTreeSet::new(),
+            frozen_rows: 0,
+            frozen_cols: 0,
             cell_styles: BTreeMap::new(),
             row_styles: BTreeMap::new(),
             col_styles: BTreeMap::new(),
@@ -643,6 +668,18 @@ impl SheetCacheBuilder {
         self.hidden_cols.insert(col);
     }
 
+    /// Sets the frozen-rows count `M` (`freeze-panes`). The engine's build loop copies the
+    /// worksheet's `frozen_rows` here; no geometry effect (see [`SheetCache::frozen_rows`]).
+    pub fn set_frozen_rows(&mut self, count: u32) {
+        self.frozen_rows = count;
+    }
+
+    /// Sets the frozen-columns count `K` (`freeze-panes`). See
+    /// [`SheetCacheBuilder::set_frozen_rows`].
+    pub fn set_frozen_cols(&mut self, count: u32) {
+        self.frozen_cols = count;
+    }
+
     /// Interns + sets the style of a single cell.
     pub fn push_cell_style(&mut self, row: u32, col: u32, style: RenderStyle) {
         let id = self.intern(style);
@@ -684,6 +721,18 @@ impl SheetCacheBuilder {
     /// Flags `col` hidden (fluent; rendered at zero size).
     pub fn hidden_col(mut self, col: u32) -> Self {
         self.push_hidden_col(col);
+        self
+    }
+
+    /// Sets the frozen-rows count `M` (fluent, for fixtures).
+    pub fn frozen_rows(mut self, count: u32) -> Self {
+        self.set_frozen_rows(count);
+        self
+    }
+
+    /// Sets the frozen-columns count `K` (fluent, for fixtures).
+    pub fn frozen_cols(mut self, count: u32) -> Self {
+        self.set_frozen_cols(count);
         self
     }
 
@@ -729,6 +778,8 @@ impl SheetCacheBuilder {
             col_overrides: self.col_overrides,
             hidden_rows: self.hidden_rows,
             hidden_cols: self.hidden_cols,
+            frozen_rows: self.frozen_rows,
+            frozen_cols: self.frozen_cols,
             row_axis,
             col_axis,
             cell_styles: self.cell_styles,
@@ -1201,6 +1252,38 @@ mod tests {
         assert_eq!(row_axis.index_at(off), 3, "index_at skips the hidden row");
         let coff = col_axis.offset_of(1);
         assert_eq!(col_axis.index_at(coff), 2, "index_at skips the hidden col");
+    }
+
+    #[test]
+    fn frozen_counts_default_zero_and_round_trip_through_builder() {
+        // A fresh cache has no freeze on either axis.
+        let plain = SheetCacheBuilder::new(10, 10).build();
+        assert_eq!(plain.frozen_rows(), 0);
+        assert_eq!(plain.frozen_cols(), 0);
+
+        // Fluent setters (fixtures) surface through the built cache's accessors.
+        let frozen = SheetCacheBuilder::new(10, 10)
+            .frozen_rows(3)
+            .frozen_cols(2)
+            .build();
+        assert_eq!(frozen.frozen_rows(), 3);
+        assert_eq!(frozen.frozen_cols(), 2);
+
+        // Non-consuming setters (the engine's build loop) behave identically.
+        let mut b = SheetCacheBuilder::new(10, 10);
+        b.set_frozen_rows(5);
+        b.set_frozen_cols(1);
+        let built = b.build();
+        assert_eq!(built.frozen_rows(), 5);
+        assert_eq!(built.frozen_cols(), 1);
+
+        // The counts have NO geometry effect: axes/totals are identical with and without a
+        // freeze (unlike hidden, frozen is not fed to `axis_from`), and freeze is independent
+        // of the hidden mechanism.
+        assert_eq!(frozen.total_height(), plain.total_height());
+        assert_eq!(frozen.total_width(), plain.total_width());
+        assert_eq!(frozen.row_height(0), plain.row_height(0));
+        assert!(frozen.hidden_rows().is_empty() && frozen.hidden_cols().is_empty());
     }
 
     #[test]

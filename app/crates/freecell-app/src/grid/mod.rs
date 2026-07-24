@@ -54,6 +54,12 @@ pub const ACCENT: u32 = 0x2563EB;
 pub const SELECTION_FILL_ALPHA: f32 = 0.10;
 /// Overlay-scrollbar thumb colour (semi-transparent grey).
 pub const SCROLLBAR_RGBA: u32 = 0x8A8A8A99;
+/// Freeze-pane divider line colour (`#9E9E9E`) — a heavier mid-grey than [`GRIDLINE`], so the
+/// pinned bands read as pinned (`freeze-panes/components/viewport_split.md §4`). Drawn at the
+/// bottom edge of the frozen-rows band and/or the right edge of the frozen-columns band.
+pub const FREEZE_DIVIDER: u32 = 0x9E9E9E;
+/// Freeze-pane divider thickness (px) — ~1.5 px, matching the platform freeze-line convention.
+pub const FREEZE_DIVIDER_PX: f32 = 1.5;
 
 /// Cell text size (px) — `ui_design.md §3.3` ("13 px bundled Inter"). Defined in
 /// `freecell-core` so the engine's font-size row auto-grow can keep the default
@@ -215,6 +221,14 @@ pub enum GridEvent {
     UnhideRows { at: u32, count: u32 },
     /// Unhide (restore) every hidden column in the run (the column analog of [`GridEvent::UnhideRows`]).
     UnhideColumns { at: u32, count: u32 },
+    /// Set the frozen-rows and/or frozen-columns count (`freeze-panes` `architecture.md §2.5`,
+    /// header context menu). Each `Some` axis is a new count (`0` = unfreeze); the header menu
+    /// sends exactly ONE `Some` axis per action (one undo step). The window forwards it as
+    /// `Command::SetFrozen` for the active sheet.
+    SetFrozen {
+        rows: Option<u32>,
+        cols: Option<u32>,
+    },
     /// A chart was **moved or resized** on the ChartLayer (P18, `ui_design §3.2`) — both produce a
     /// new [`Anchor`]. The window forwards it as `Command::SetChartAnchor` for the active sheet.
     ChartAnchorChanged { id: ChartId, anchor: Anchor },

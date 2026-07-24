@@ -526,6 +526,19 @@ fn in_grid_unsupported_spec(title: &str) -> ChartSpec {
     )
 }
 
+/// Fills the half-open cell block `[r0, r1) × [c0, c1)` with short `r{R}c{C}` labels, so a freeze
+/// baseline shows exactly which track each visible cell belongs to — the frozen band cells keep
+/// their low indices while the scrolled body shows high ones, making a mis-pinned band or a blank
+/// (unpublished) band immediately obvious. Used only by the `freeze_*` cases.
+fn labeled(mut scene: Scene, r0: u32, r1: u32, c0: u32, c1: u32) -> Scene {
+    for r in r0..r1 {
+        for c in c0..c1 {
+            scene = scene.input(r, c, &format!("r{r}c{c}"));
+        }
+    }
+    scene
+}
+
 /// The whole initial suite (~45 cases). Rebuilt fresh on each call — the `render_scene` bin
 /// looks a case up by name, so this is the single source of truth.
 pub fn all() -> Vec<RenderCase> {
@@ -1007,6 +1020,79 @@ pub fn all() -> Vec<RenderCase> {
                 .input(3, 3, "D4")
                 .hide_row(2, 2)
                 .hide_col(1, 1),
+            GRID_VP,
+        ),
+        // ---- Freeze panes (freeze-panes `architecture.md §7`) ---------------------------
+        // The seven pixel proofs of the four-quadrant render. Each labels its cells `r{R}c{C}` so
+        // the frozen band (low indices, pinned) reads distinctly against the scrolled body (high
+        // indices). Driven through the real `SetFrozen` worker path (`Scene::frozen_rows/cols`).
+        //
+        // Freeze the top row (M=1): row 0's `r0c*` labels stay pinned at the top with the freeze
+        // divider beneath them while the body is scrolled down (its first visible rows are deep,
+        // not row 1) — the canonical "freeze header row" picture (`functional_spec.md §1`).
+        RenderCase::new(
+            "freeze_top_row",
+            labeled(Scene::new(), 0, 24, 0, 8).frozen_rows(1),
+            GRID_VP,
+        )
+        .reveal(16, 0),
+        // Freeze a 3-row band (M=3): rows 0–2 pinned as a block above the divider while the body
+        // scrolls beneath — proves a multi-row band pins as a unit, not just a single row.
+        RenderCase::new(
+            "freeze_rows_band",
+            labeled(Scene::new(), 0, 28, 0, 8).frozen_rows(3),
+            GRID_VP,
+        )
+        .reveal(20, 0),
+        // Freeze the first column (K=1): column 0's `r*c0` labels stay pinned at the left with the
+        // vertical divider to their right while the body is scrolled rightward (its first visible
+        // columns are deep) — the column analogue of `freeze_top_row`.
+        RenderCase::new(
+            "freeze_first_col",
+            labeled(Scene::new(), 0, 16, 0, 16).frozen_cols(1),
+            GRID_VP,
+        )
+        .reveal(0, 10),
+        // Freeze a 3-column band (K=3): columns 0–2 pinned as a block left of the divider while the
+        // body scrolls rightward — the column analogue of `freeze_rows_band`.
+        RenderCase::new(
+            "freeze_cols_band",
+            labeled(Scene::new(), 0, 16, 0, 18).frozen_cols(3),
+            GRID_VP,
+        )
+        .reveal(0, 12),
+        // Four-quadrant freeze (M=2, K=2): the corner block (rows 0–1 × cols 0–1) is pinned in
+        // both axes; the top band scrolls horizontally, the left band scrolls vertically, and the
+        // body scrolls both ways — with BOTH dividers meeting at the corner. The full split.
+        RenderCase::new(
+            "freeze_four_quadrant",
+            labeled(Scene::new(), 0, 28, 0, 18)
+                .frozen_rows(2)
+                .frozen_cols(2),
+            GRID_VP,
+        )
+        .reveal(18, 12),
+        // The band-publishing proof (Phase 4): with the body scrolled DEEP (row ~44, col ~13), the
+        // frozen top + left bands must still show their VALUES (`r0c*` / `r*c0`), not blank cells —
+        // the whole grid is labeled so a band cell rendered blank would be an unmistakable defect.
+        // Guards that the frozen bands are published/rendered regardless of body scroll depth.
+        RenderCase::new(
+            "freeze_scrolled_body",
+            labeled(Scene::new(), 0, 50, 0, 16)
+                .frozen_rows(2)
+                .frozen_cols(2),
+            GRID_VP,
+        )
+        .reveal(44, 13),
+        // The divider isolation case (M=1, K=1, body at the origin): with no scroll, the ONLY
+        // freeze-specific chrome is the two divider lines — horizontal beneath row 0, vertical
+        // right of column 0, meeting at the corner. Proves the divider draws whenever frozen, even
+        // unscrolled (the "divider present iff frozen" invariant, `components/viewport_split.md`).
+        RenderCase::new(
+            "freeze_divider",
+            labeled(Scene::new(), 0, 12, 0, 10)
+                .frozen_rows(1)
+                .frozen_cols(1),
             GRID_VP,
         ),
         // ---- In-grid charts (P8): the ChartLayer painted over cells at the anchor rect --------

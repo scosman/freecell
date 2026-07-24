@@ -97,6 +97,8 @@ pub fn demo_sources() -> GridDataSources {
         sheet: DEMO_SHEET,
         rows: 0..40,
         cols: 0..20,
+        frozen_rows: 0,
+        frozen_cols: 0,
         generation: 1,
         cells,
     };

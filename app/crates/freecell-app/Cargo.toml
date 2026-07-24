@@ -26,7 +26,7 @@ description = "The FreeCell GPUI application (macOS + Linux): app shell, windows
 # ---------------------------------------------------------------------------------
 [package.metadata.packager]
 product-name = "FreeCell"
-identifier = "com.scosman.freecell"
+identifier = "net.scosman.freecell"
 category = "productivity"
 description = "A GPU-rendered, Excel-compatible spreadsheet — stupid-fast on huge sheets."
 homepage = "https://github.com/scosman/freecell"

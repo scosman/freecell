@@ -23,7 +23,7 @@ The packager config is `[package.metadata.packager]` in
 [`crates/freecell-app/Cargo.toml`](crates/freecell-app/Cargo.toml). cargo-packager reads it
 via `cargo metadata`, so it auto-fills the version (workspace `0.1.0`) and auto-detects the
 `freecell` binary — the config only sets product name, bundle identifier
-(`com.scosman.freecell`), category, description, homepage, and the icon list.
+(`net.scosman.freecell`), category, description, homepage, and the icon list.
 
 Package **formats are chosen per-OS by the scripts** (`--formats`), not pinned in the
 config, so the same config serves all platforms.
@@ -31,6 +31,17 @@ config, so the same config serves all platforms.
 **Gotcha worth knowing:** cargo-packager `cd`s into the crate manifest directory
 (`crates/freecell-app/`) before packaging, so the `icons` paths in the config are relative
 to *that* directory (`packaging/icons/...`), not the workspace root or your shell's CWD.
+
+**Linux window-icon gotcha.** cargo-packager derives the installed Linux **desktop-entry id
+and icon name from the *binary name*** — it ships `usr/share/applications/freecell.desktop`
+with `Icon=freecell` and hicolor icons named `freecell.png`, *not* from the reverse-DNS
+`identifier`. GNOME maps a running window to its launcher (and thus its dock icon + app name)
+by the window's `app_id` (Wayland) / `WM_CLASS` (X11). So the app sets its Linux `app_id` to
+**`freecell`** (`window_app_id()` in `shell/app.rs`) to match that desktop-entry id — *not*
+`net.scosman.freecell`. Pointing `app_id` at the reverse-DNS identifier (which has no matching
+installed `.desktop`) makes GNOME show a **generic icon labelled with the raw app_id** — even
+for a correctly-installed `.deb`. Keep `window_app_id()` equal to the binary name. (The
+reverse-DNS `identifier` is still the macOS/Windows bundle id, where that form is required.)
 
 Icons are final — see
 [`crates/freecell-app/packaging/icons/README.md`](crates/freecell-app/packaging/icons/README.md)

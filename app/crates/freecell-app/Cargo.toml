@@ -149,6 +149,10 @@ tempfile.workspace = true
 # exact crate gpui's cosmic-text (Linux) text system uses. Pinned to the version already in the
 # lockfile via gpui, so this adds no new crate and matches the shipped backend's behavior.
 fontdb = "=0.23.0"
+# The demo-asset guard (`shell::demo` tests) unzips the embedded `demo.xlsx` in-memory to assert
+# its font references are our bundled Inter (never Arial, which isn't on all systems). `zip` +
+# `deflate` are already in the lockfile via IronCalc, so this adds no new crate.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

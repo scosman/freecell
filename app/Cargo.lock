@@ -2056,6 +2056,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

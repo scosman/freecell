@@ -91,7 +91,7 @@ runs from `app/`. Q4 is the one contingent item (Phase 5).
     compensating code** (keeps it one undo step; CLAUDE.md fix-upstream). Re-pin `freecell-fixes`.
     Checks: engine test green; `fmt --all --check`.
 
-- [ ] **Phase 6 — Render validation (`architecture.md §7`, dedicated late phase).** No new
+- [x] **Phase 6 — Render validation (`architecture.md §7`, dedicated late phase).** No new
   behavior.
   - `render-tests`: `Scene` builder `.frozen_rows(m)`/`.frozen_cols(k)` (mirror `.hide_row`); new
     cases `freeze_top_row`, `freeze_rows_band`, `freeze_first_col`, `freeze_cols_band`,

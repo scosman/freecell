@@ -54,9 +54,12 @@ argv path); **macOS is the actual work** (the Apple-Event bridge to reuse `open_
 
 ## Non-goals
 
-- **Becoming the default `.xlsx` handler.** We register as a candidate; making FreeCell the
-  default (over Excel / Numbers / LibreOffice) is a user action per OS, and cargo-packager
-  exposes no force-default knob.
+- **Silently seizing the default `.xlsx` handler.** Packaging registers FreeCell only as a
+  *candidate* handler — we never grab the default (over Excel / Numbers / LibreOffice) on the user's
+  behalf without being asked. **In scope, though (Phase 5):** an explicit, *user-initiated* "Set as
+  default" action on the welcome screen — on macOS/Linux it sets the default silently via
+  LaunchServices / `xdg-mime`, and on Windows (where an app cannot set the default itself) it opens
+  the OS "Default apps" Settings for the user to confirm.
 - **Code signing / notarization.** Unsigned dev builds still trip Gatekeeper/SmartScreen on
   first launch; that's the separate `projects/release-signing-and-distribution.md` deferral.
 - **Cross-process de-dupe / single-instance.** On Windows/Linux each double-click spawns a new

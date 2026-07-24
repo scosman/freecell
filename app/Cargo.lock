@@ -2059,6 +2059,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "windows 0.61.3",
  "zip",
 ]
 

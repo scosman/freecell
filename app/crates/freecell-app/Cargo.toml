@@ -170,6 +170,15 @@ dirs = "6"
 url = "2"
 async-channel = "2"
 
+# Default-handler detection on Windows (`shell::default_app`, xlsx-file-association Phase 5). The COM
+# `IApplicationAssociationRegistration` interface reports the current default app for an extension, so
+# the welcome screen can offer "Set as default" only when FreeCell is not already it. `windows` is
+# already resolved at 0.61.3 in the lockfile (gpui depends on it), so pinning `0.61` adds no new
+# crate; the features below union with gpui's. macOS uses raw CoreFoundation/CoreServices framework
+# FFI (no crate) and Linux shells out to `xdg-mime`, so this dep is Windows-only.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_UI_Shell", "Win32_System_Com"] }
+
 [dev-dependencies]
 # Phase 9 chrome interaction tests drive `ChromeView` through gpui's headless
 # `TestAppContext` / `VisualTestContext`, which live behind gpui's `test-support` feature

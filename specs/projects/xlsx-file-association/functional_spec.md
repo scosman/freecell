@@ -15,7 +15,8 @@ shell path arg) launches FreeCell with that file open.
   for effort/verification order is macOS + Windows (P1), Linux (P2), but all three ship here.
 - **Handler rank:** register as a **candidate** handler only (appears in the OS "Open With"
   list / is a valid double-click target). Making FreeCell the *default* `.xlsx`/`.csv` app is a
-  user action; we do not seize it. (See §9 Non-goals.)
+  user action; we never seize it automatically, but Phase 5 lets the user opt into it via a welcome-
+  screen "Set as default" link (`shell::default_app`). (See §9 Non-goals.)
 
 ## 2. Registered types
 
@@ -123,15 +124,20 @@ extensions  = ["xlsx"]
 mime-type   = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"  # Linux
 description = "Excel Workbook"   # Windows Explorer "Type" column
 name        = "Excel Workbook"   # macOS CFBundleTypeName
-role        = "Editor"           # macOS CFBundleTypeRole (default)
+role        = "editor"           # macOS CFBundleTypeRole (default); lowercase — see note below
 
 [[package.metadata.packager.file-associations]]
 extensions  = ["csv"]
 mime-type   = "text/csv"
 description = "CSV Document"
 name        = "CSV Document"
-role        = "Editor"
+role        = "editor"
 ```
+
+`role` MUST be lowercase `"editor"`: cargo-packager's `BundleTypeRole` enum is `camelCase` +
+`deny_unknown_fields`, so `"Editor"` fails to deserialize and breaks packaging (the `lib.rs`
+`packaging_metadata` tests pin this).
+
 
 What each format emits (verified against cargo-packager source):
 - **macOS `.app`:** `CFBundleDocumentTypes` with `CFBundleTypeExtensions` (extension-based;
@@ -194,8 +200,12 @@ decision, doc updates and code commits are **not blocked** on that smoke.
 
 ## 9. Non-goals
 
-- **Becoming the default handler.** Candidate registration only; no `xdg-mime default` hook,
-  no macOS `LSHandlerRank`, no Windows default-app manipulation (Win10/11 restrict it anyway).
+- **Silently becoming the default handler.** Packaging registers a **candidate** handler only; we
+  never seize the default on the user's behalf, and we set no `LSHandlerRank` to auto-outrank other
+  apps. **Now in scope (Phase 5):** an explicit, *user-initiated* "Set as default" action — macOS
+  `LSSetDefaultRoleHandlerForContentType` and Linux `xdg-mime default …` set it silently on click;
+  Windows cannot (the Win10/11 UserChoice hash), so it opens `ms-settings:defaultapps` as a guided
+  hand-off. See the `shell::default_app` module + welcome-screen link.
 - **Additional extensions** beyond `.xlsx`/`.csv` (e.g. `.xls` — unreadable by IronCalc;
   `.xlsm` — not requested).
 - **Custom URL scheme / deep links** (`freecell://…`). Only `file://` open events are handled.

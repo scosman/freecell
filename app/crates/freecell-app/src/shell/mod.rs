@@ -23,6 +23,7 @@ pub mod titlebar;
 mod about;
 mod app;
 mod clipboard;
+mod default_app;
 mod demo;
 mod fonts;
 mod open_files;

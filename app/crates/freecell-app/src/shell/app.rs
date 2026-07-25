@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    point, px, size, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Entity, Global,
-    TitlebarOptions, WindowBounds, WindowHandle, WindowId, WindowOptions,
+    point, px, size, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Entity,
+    Global, Pixels, Size, TitlebarOptions, WindowBounds, WindowHandle, WindowId, WindowOptions,
 };
 use gpui_component::Root;
 
@@ -760,23 +760,67 @@ fn window_app_id() -> Option<String> {
     cfg!(target_os = "linux").then(|| "freecell".to_string())
 }
 
-/// The document window options: ~1200×800, centered, resizable, macOS custom titlebar (§7.1)
-/// or standard traffic lights on Linux (`functional_spec.md §2.3`).
+/// Gap left on every screen edge when a window is clamped to fit its display, so the frame never
+/// butts against the screen edge or opens under the taskbar/dock ([`fit_window_size`]).
+const WINDOW_SCREEN_MARGIN: Pixels = px(24.0);
+
+/// Shrink a desired window size so it fits within a display's usable area, keeping it centered.
+///
+/// [`WindowBounds::centered`] centers a window of **exactly** the requested size on the primary
+/// display without clamping it, so a size taller/wider than the screen opens off-screen — the
+/// reported Linux/Windows bug where a HiDPI-scaled or taskbar-reduced usable area is smaller than
+/// the fixed 1200×800. This clamps the desired size down to fit first.
+///
+/// On a screen large enough to hold `desired` (plus [`WINDOW_SCREEN_MARGIN`] on every edge) the
+/// size is returned unchanged, so big screens keep the intended dimensions; a smaller screen
+/// shrinks each axis to the margin-inset extent. The margin is only applied while it leaves a
+/// positive size, so a pathologically small display still yields a usable (non-inset) window
+/// rather than a zero-area one. Split out as a pure fn so the clamp math is unit-testable without
+/// a gpui display context (mirrors [`titlebar_options_for`]).
+fn fit_window_size(desired: Size<Pixels>, available: Size<Pixels>, margin: Pixels) -> Size<Pixels> {
+    let fit_axis = |desired: Pixels, available: Pixels| -> Pixels {
+        let inset = available - margin * 2.0;
+        let limit = if inset > px(0.0) { inset } else { available };
+        desired.min(limit)
+    };
+    size(
+        fit_axis(desired.width, available.width),
+        fit_axis(desired.height, available.height),
+    )
+}
+
+/// [`WindowBounds`] centering `desired` on the primary display, first clamped to fit its usable
+/// area via [`fit_window_size`] so the window is never wider/taller than the screen. Falls back to
+/// the unclamped centered size when no primary display resolves (e.g. headless) so we never panic.
+fn fit_centered_bounds(desired: Size<Pixels>, cx: &App) -> WindowBounds {
+    match cx.primary_display() {
+        Some(display) => {
+            let visible = display.visible_bounds();
+            let clamped = fit_window_size(desired, visible.size, WINDOW_SCREEN_MARGIN);
+            WindowBounds::Windowed(Bounds::centered_at(visible.center(), clamped))
+        }
+        None => WindowBounds::centered(desired, cx),
+    }
+}
+
+/// The document window options: up to **1200×800** (clamped to fit the screen — see
+/// [`fit_centered_bounds`]), centered, resizable, macOS custom titlebar (§7.1) or standard traffic
+/// lights on Linux (`functional_spec.md §2.3`).
 fn document_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(1200.0), px(800.0)), cx)),
+        window_bounds: Some(fit_centered_bounds(size(px(1200.0), px(800.0)), cx)),
         titlebar: titlebar_options(),
         app_id: window_app_id(),
         ..Default::default()
     }
 }
 
-/// The welcome window options: fixed **720×480** two-pane launch surface (`ui_design.md §1`),
-/// non-resizable, non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic
-/// lights on Linux (`functional_spec.md §2.2`).
+/// The welcome window options: **720×480** two-pane launch surface (`ui_design.md §1`, clamped to
+/// fit the screen — see [`fit_centered_bounds`]), non-resizable, non-minimizable, centered, macOS
+/// custom titlebar (§7.1) or standard traffic lights on Linux (`functional_spec.md §2.2`).
 fn welcome_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(720.0), px(480.0)), cx)),
+        window_bounds: Some(fit_centered_bounds(size(px(720.0), px(480.0)), cx)),
         titlebar: titlebar_options(),
         app_id: window_app_id(),
         is_resizable: false,
@@ -785,15 +829,16 @@ fn welcome_window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// The About window options: small fixed **400×296** surface (`ui_design.md §6`), non-resizable,
-/// non-minimizable, centered, macOS custom titlebar (§7.1) or standard traffic lights on Linux
-/// (`functional_spec.md §4`). The height fits the top-packed identity/links body (`about.rs`)
-/// **plus the 36 px macOS titlebar row** — the earlier 262 was tuned against a titlebar-less Linux
-/// capture and clipped the last row on macOS; 296 clears the row with a balanced bottom margin.
-/// gpui has no fit-to-content window sizing, so this is a fixed height.
+/// The About window options: small **400×296** surface (`ui_design.md §6`, clamped to fit the
+/// screen — see [`fit_centered_bounds`]), non-resizable, non-minimizable, centered, macOS custom
+/// titlebar (§7.1) or standard traffic lights on Linux (`functional_spec.md §4`). The height fits
+/// the top-packed identity/links body (`about.rs`) **plus the 36 px macOS titlebar row** — the
+/// earlier 262 was tuned against a titlebar-less Linux capture and clipped the last row on macOS;
+/// 296 clears the row with a balanced bottom margin. gpui has no fit-to-content window sizing, so
+/// this is a fixed height.
 fn about_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(400.0), px(296.0)), cx)),
+        window_bounds: Some(fit_centered_bounds(size(px(400.0), px(296.0)), cx)),
         titlebar: titlebar_options(),
         app_id: window_app_id(),
         is_resizable: false,
@@ -2158,5 +2203,73 @@ mod tests {
                 "app_id is Linux-only; macOS/Windows take their icon from the bundle/exe resource"
             );
         }
+    }
+
+    // ---- Window sizing: clamp the desired size to the display --------------------------------
+
+    /// A screen with room to spare (desired + a full margin on every edge) leaves the desired size
+    /// untouched — big displays keep the intended 1200×800.
+    #[test]
+    fn fit_window_size_keeps_desired_when_screen_is_large_enough() {
+        let desired = size(px(1200.0), px(800.0));
+        let available = size(px(2560.0), px(1440.0));
+        assert_eq!(
+            fit_window_size(desired, available, px(24.0)),
+            desired,
+            "a large screen must not shrink the desired window size"
+        );
+    }
+
+    /// The bug: a usable area shorter than the desired height (HiDPI scaling / taskbar) must clamp
+    /// the height down to the margin-inset extent, and the width along with it if it too overflows.
+    #[test]
+    fn fit_window_size_clamps_axes_that_exceed_the_screen() {
+        let desired = size(px(1200.0), px(800.0));
+        // 1366×720 usable: width fits (1200 < 1366 - 48), height overflows (800 > 720).
+        let fitted = fit_window_size(desired, size(px(1366.0), px(720.0)), px(24.0));
+        assert_eq!(
+            fitted,
+            size(px(1200.0), px(672.0)),
+            "height clamps to available - 2*margin; a fitting width is left unchanged"
+        );
+
+        // A screen smaller than the desired size on both axes clamps both.
+        let both = fit_window_size(desired, size(px(1000.0), px(600.0)), px(24.0));
+        assert_eq!(both, size(px(952.0), px(552.0)));
+    }
+
+    /// The core guarantee for the reported bug: whatever the screen, the fitted window is never
+    /// wider or taller than the usable area — so it can always be centered fully on-screen.
+    #[test]
+    fn fit_window_size_never_exceeds_the_screen() {
+        let desired = size(px(1200.0), px(800.0));
+        for (w, h) in [
+            (2560.0, 1440.0),
+            (1366.0, 768.0),
+            (1024.0, 600.0),
+            (800.0, 480.0),
+            (640.0, 400.0),
+        ] {
+            let available = size(px(w), px(h));
+            let fitted = fit_window_size(desired, available, px(24.0));
+            assert!(
+                fitted.width <= available.width && fitted.height <= available.height,
+                "fitted {fitted:?} must fit within screen {available:?}"
+            );
+        }
+    }
+
+    /// A pathologically small display (smaller than twice the margin on an axis) falls back to the
+    /// raw available extent on that axis rather than producing a non-positive / zero-area window.
+    #[test]
+    fn fit_window_size_falls_back_when_margin_does_not_fit() {
+        let desired = size(px(1200.0), px(800.0));
+        // 30px available with a 24px margin would inset to a negative -18px; fall back to 30px.
+        let fitted = fit_window_size(desired, size(px(30.0), px(40.0)), px(24.0));
+        assert_eq!(fitted, size(px(30.0), px(40.0)));
+        assert!(
+            fitted.width > px(0.0) && fitted.height > px(0.0),
+            "the fallback must never yield a zero-area window"
+        );
     }
 }

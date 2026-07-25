@@ -44,6 +44,11 @@ pub struct WelcomeView {
     /// The recent-file rows the right pane renders, most-recent-first, already capped +
     /// formatted by the app (`set_recents`). Empty ⇒ the right pane shows the empty state.
     recents: Vec<DisplayEntry>,
+    /// Whether FreeCell is the OS default handler for `.xlsx`, cached from a single query at build
+    /// time (`shell::default_app`): `Some(false)` shows the "Set as default" link; `Some(true)` /
+    /// `None` (already default, or unknown) hide it. Never re-queried per render — only on demand
+    /// after a make-default click (`set_as_default_for_xlsx`).
+    xlsx_default_status: Option<bool>,
 }
 
 impl WelcomeView {
@@ -57,6 +62,7 @@ impl WelcomeView {
             focus_handle,
             modal: None,
             recents: Vec::new(),
+            xlsx_default_status: initial_xlsx_default_status(),
         }
     }
 
@@ -87,6 +93,21 @@ impl WelcomeView {
         cx.notify();
     }
 
+    /// Requests that FreeCell become the OS default handler for `.xlsx` (the "Set as default" link).
+    /// On macOS/Linux the change is silent, so we re-query and repaint — the link vanishes once we
+    /// are the default. On Windows the OS Settings UI was opened for the user to confirm, and on an
+    /// unsupported/failed attempt there is nothing to do; either way we leave the link as-is.
+    fn set_as_default_for_xlsx(&mut self, cx: &mut Context<Self>) {
+        use super::default_app::{make_default_for_xlsx, MakeDefaultOutcome};
+        match make_default_for_xlsx() {
+            MakeDefaultOutcome::SetSilently => {
+                self.xlsx_default_status = super::default_app::is_default_for_xlsx();
+                cx.notify();
+            }
+            MakeDefaultOutcome::OpenedSettings | MakeDefaultOutcome::Unavailable => {}
+        }
+    }
+
     /// Whether a dialog is currently showing (tests).
     pub fn has_modal(&self) -> bool {
         self.modal.is_some()
@@ -105,6 +126,18 @@ impl WelcomeView {
             let path = row.path.clone();
             cx.defer(move |cx| FreeCellApp::open_path(&path, cx));
         }
+    }
+
+    /// Forces the cached `.xlsx` default-handler status (tests), so a view test can assert the
+    /// "Set as default" link paints/hides without touching the OS (production queries it in `new`).
+    #[cfg(test)]
+    pub(crate) fn set_xlsx_default_status_for_test(
+        &mut self,
+        status: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        self.xlsx_default_status = status;
+        cx.notify();
     }
 
     /// The number of recent rows currently shown (tests).
@@ -214,29 +247,61 @@ impl WelcomeView {
                             })),
                     ),
             )
-            // A flex grower pushes the demo link down so it anchors at the BOTTOM of the pane
-            // while the wordmark + buttons stay at the top. The pane's `p(32)` keeps the link off
-            // the bottom/left edges (not flush against the border).
+            // A flex grower pushes the links down so they anchor at the BOTTOM of the pane while
+            // the wordmark + buttons stay at the top. The pane's `p(32)` keeps them off the
+            // bottom/left edges (not flush against the border).
             .child(div().flex_1())
-            // A subtle tertiary text link (not a third button): opens the bundled demo workbook as
-            // a fresh untitled sheet (`FreeCellApp::open_demo`). Styled from the pane's muted-text
-            // token, darkening + underlining on hover for a link affordance.
+            // The bottom-anchored tertiary text links, stacked tightly. The demo link is always
+            // shown; the "Set as default" link sits directly under it and appears only when
+            // FreeCell is not yet the `.xlsx` default (`render_set_default_link`).
             .child(
                 div()
-                    .id("welcome-demo-link")
-                    // Registers the painted bounds under this name for the render test's
-                    // `debug_bounds("welcome-demo-link")` lookup.
-                    .debug_selector(|| "welcome-demo-link".to_string())
-                    .text_center()
-                    .cursor_pointer()
-                    .text_size(px(13.0))
-                    .text_color(rgb(MUTED_TEXT))
-                    .hover(|s| s.text_color(rgb(TEXT)).underline())
-                    .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
-                        FreeCellApp::open_demo(cx);
-                    }))
-                    .child("Open Demo Spreadsheet"),
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        // A subtle tertiary text link (not a third button): opens the bundled demo
+                        // workbook as a fresh untitled sheet (`FreeCellApp::open_demo`). Styled from
+                        // the pane's muted-text token, darkening + underlining on hover.
+                        div()
+                            .id("welcome-demo-link")
+                            // Registers the painted bounds under this name for the render test's
+                            // `debug_bounds("welcome-demo-link")` lookup.
+                            .debug_selector(|| "welcome-demo-link".to_string())
+                            .text_center()
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .text_color(rgb(MUTED_TEXT))
+                            .hover(|s| s.text_color(rgb(TEXT)).underline())
+                            .on_click(cx.listener(|_this, _: &ClickEvent, _window, cx| {
+                                FreeCellApp::open_demo(cx);
+                            }))
+                            .child("Open Demo Spreadsheet"),
+                    )
+                    .children(self.render_set_default_link(cx)),
             )
+    }
+
+    /// The "Set as default app for xlsx files" tertiary link, rendered directly under the demo link
+    /// in the same style — but only when FreeCell is **not** the current `.xlsx` default
+    /// (`Some(false)`). `Some(true)` (already default) and `None` (unknown / unsupported) render
+    /// nothing: no nagging and no "you're already default" text. Clicking asks the OS to make us the
+    /// default (`set_as_default_for_xlsx`).
+    fn render_set_default_link(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        (self.xlsx_default_status == Some(false)).then(|| {
+            div()
+                .id("welcome-set-default-link")
+                .debug_selector(|| "welcome-set-default-link".to_string())
+                .text_center()
+                .cursor_pointer()
+                .text_size(px(13.0))
+                .text_color(rgb(MUTED_TEXT))
+                .hover(|s| s.text_color(rgb(TEXT)).underline())
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.set_as_default_for_xlsx(cx);
+                }))
+                .child("Set as default app for xlsx files")
+        })
     }
 
     /// The RIGHT pane: a `RECENT` header over the recent list or the empty state (`ui_design.md §3`).
@@ -412,6 +477,20 @@ impl WelcomeView {
     }
 }
 
+/// The `.xlsx` default-handler status cached into a fresh [`WelcomeView`]. In a normal build this is
+/// one cheap OS query at view-build time (`shell::default_app`); in tests it starts `None` so view
+/// tests are hermetic (no subprocess / OS call) and drive the state explicitly via
+/// [`WelcomeView::set_xlsx_default_status_for_test`].
+#[cfg(not(test))]
+fn initial_xlsx_default_status() -> Option<bool> {
+    super::default_app::is_default_for_xlsx()
+}
+
+#[cfg(test)]
+fn initial_xlsx_default_status() -> Option<bool> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +555,52 @@ mod tests {
         assert!(
             vcx.debug_bounds("welcome-demo-link").is_some(),
             "the welcome left pane paints the Open Demo Spreadsheet link"
+        );
+    }
+
+    #[gpui::test]
+    fn render_paints_the_set_default_link_when_not_default(cx: &mut TestAppContext) {
+        // The "Set as default app for xlsx files" link paints ONLY when the cached xlsx status is
+        // `Some(false)` (not the default). A fresh view starts `None` in tests (hermetic — no OS
+        // call), so the link is absent; forcing `Some(false)` shows it and `Some(true)` hides it
+        // again. `debug_bounds` resolves the element's `.debug_selector()`.
+        cx.update(gpui_component::init);
+        let mut view_slot = None;
+        let slot = &mut view_slot;
+        let handle = cx.open_window(size(px(720.0), px(480.0)), |window, cx| {
+            let view = cx.new(|cx| WelcomeView::new(window, cx));
+            *slot = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = view_slot.expect("welcome view built");
+        let mut vcx = gpui::VisualTestContext::from_window(handle.into(), cx);
+
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("welcome-set-default-link").is_none(),
+            "an unknown (None) status hides the Set-as-default link"
+        );
+
+        vcx.update(|_window, cx| {
+            view.update(cx, |w, cx| {
+                w.set_xlsx_default_status_for_test(Some(false), cx)
+            })
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("welcome-set-default-link").is_some(),
+            "Some(false) — FreeCell is not the xlsx default — paints the Set-as-default link"
+        );
+
+        vcx.update(|_window, cx| {
+            view.update(cx, |w, cx| {
+                w.set_xlsx_default_status_for_test(Some(true), cx)
+            })
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("welcome-set-default-link").is_none(),
+            "Some(true) — already the default — hides the Set-as-default link again"
         );
     }
 

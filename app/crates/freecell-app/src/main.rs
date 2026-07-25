@@ -38,9 +38,10 @@ fn exit_after_ms() -> Option<u64> {
         .and_then(|s| s.parse().ok())
 }
 
-/// The first non-flag `.xlsx` / `.csv` path argument, if any (best-effort CLI open — Finder
-/// open-file events are a separate, deferred path; see DECISIONS_TO_REVIEW Phase 10). A `.csv`
-/// routes to CSV import (`open_path` branches on the extension, `functional_spec.md §2`).
+/// The first non-flag `.xlsx` / `.csv` path argument, if any (the Windows/Linux/CLI open path —
+/// macOS Finder opens arrive as an Apple Event instead, wired via `shell::install_finder_open`,
+/// xlsx-file-association project). A `.csv` routes to CSV import (`open_path` branches on the
+/// extension, `functional_spec.md §2`).
 fn open_arg() -> Option<PathBuf> {
     std::env::args().skip(1).find_map(|a| {
         if a.starts_with('-') {
@@ -79,6 +80,25 @@ fn main() {
     // gpui-component bundle (`shell::assets`). The bundle still resolves `IconName::Loader`,
     // `ChevronDown`, etc. — see `AppAssets`.
     let app = application().with_assets(AppAssets);
+
+    // macOS: a Finder open arrives as an Apple Event surfaced by `Application::on_open_urls` — a
+    // method on the BUILDER (`Application`), NOT on `App`, so it must be registered here, before
+    // `run` consumes `app` (inside `run` the closure only has the inner `App`, which has no such
+    // method). The cx-less callback forwards the raw URL strings onto a channel; its receiver is
+    // handed to the bridge task spawned inside `run` (`shell::install_finder_open`). Registering it
+    // before `run` also means the handler is live before AppKit delivers any launch-time
+    // `openURLs`, strengthening the no-welcome-flash guarantee (functional_spec.md §5.5).
+    #[cfg(target_os = "macos")]
+    let finder_open_rx = {
+        let (tx, rx) = async_channel::unbounded::<Vec<String>>();
+        // `try_send` on an unbounded channel only fails if the receiver was dropped (app shutting
+        // down) — ignore. `on_open_urls` returns `&Self`; discard it so `app` stays owned for `run`.
+        app.on_open_urls(move |urls| {
+            let _ = tx.try_send(urls);
+        });
+        rx
+    };
+
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
         register_fonts(cx); // registers the bundled Inter faces + sets Inter as the UI font,
@@ -90,9 +110,29 @@ fn main() {
         // Load the persisted recent-files list once, at startup (kept out of `init` so gpui
         // tests never read the real per-user data dir — architecture.md §3).
         FreeCellApp::load_recents(cx);
-        match open_path {
-            Some(path) => FreeCellApp::open_path(&path, cx),
-            None => FreeCellApp::show_welcome(cx),
+
+        // Startup welcome-vs-open decision, split per platform (xlsx-file-association,
+        // functional_spec.md §5.5, architecture.md §3.2). A CLI/argv path opens synchronously on
+        // every platform.
+        let opened_via_argv = match open_path {
+            Some(path) => {
+                FreeCellApp::open_path(&path, cx);
+                true
+            }
+            None => false,
+        };
+        // macOS: a Finder open arrives as an Apple Event, not argv. The `on_open_urls` handler was
+        // registered on the builder above; spawn the bridge task that owns its receiver and the
+        // DEFERRED welcome decision (welcome is shown only after a launch-time open event is
+        // drained — so a Finder cold-start never flashes welcome, §5.5). Full path, cfg-gated
+        // inline, so no unused import lands on the non-macOS build.
+        #[cfg(target_os = "macos")]
+        freecell_app::shell::install_finder_open(cx, finder_open_rx, opened_via_argv);
+        // Windows/Linux/CLI: the path (if any) already arrived via argv above, so decide welcome
+        // synchronously as before.
+        #[cfg(not(target_os = "macos"))]
+        if !opened_via_argv {
+            FreeCellApp::show_welcome(cx);
         }
 
         // Render-spike safety valve: quit after a real executor timer, independent of

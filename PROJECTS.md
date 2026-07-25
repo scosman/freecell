@@ -90,11 +90,10 @@ registry: each entry is a short description plus a pointer to a design note unde
   FreeCell ships no binaries yet, so the documented posture is acceptable for now.
   → [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)
 
-- **Windows Port** — *Future (packaging wired 2026-07-05; app build not a real target).*
-  Make FreeCell compile + run on Windows (GPUI DirectX backend, `cfg(windows)` dep split,
-  Windows arms for the macOS/Linux-gated code paths), then promote the already-wired NSIS
-  installer + Windows CI job from experimental (`continue-on-error`) to supported. The
-  `cargo-packager` work added the packaging half; the app half is untouched.
+- **Windows Port** — *Largely done (2026-07-24): Windows compiles, packages, and gates CI;
+  `.xlsx`/`.csv` file associations wired.* The build compiles + runs, `scripts/package.ps1`
+  produces the NSIS installer, and the Windows `release` CI job is now **required**
+  (`continue-on-error` removed). Residual: a Windows hardware smoke + Authenticode signing.
   → [`projects/windows-port.md`](projects/windows-port.md)
 
 - **Release Signing & Distribution** — *Future, required before publishing any binary.*

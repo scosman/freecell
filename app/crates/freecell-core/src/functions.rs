@@ -164,6 +164,38 @@ pub fn fn_edit_context(text: &str, caret: usize) -> Option<FnEditContext> {
     })
 }
 
+/// Whether a grid click at `caret` (a byte offset into `text`) should **point-insert** a
+/// reference rather than commit the edit — the spec's "reference-ready" caret
+/// (`functional_spec.md §1`). True iff `text` is a formula (`=`-led), the caret is not inside a
+/// string literal, and the nearest non-space char before it is the leading `=` (empty formula)
+/// or an operator/opener/comma/colon.
+///
+/// Reuses the same [`is_function_position_prev`] operator set + [`in_string_at`] the shipped
+/// autocomplete treats as function position — a reference and a function name are legal in
+/// exactly the same syntactic slots. Pure + headless.
+pub fn is_reference_ready(text: &str, caret: usize) -> bool {
+    if !text.starts_with('=') || caret > text.len() || !text.is_char_boundary(caret) {
+        return false;
+    }
+    if in_string_at(text, caret) {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    // Skip the run of spaces immediately before the caret back to a non-space (ASCII-whitespace
+    // bytes are single-byte and never a UTF-8 continuation byte, so this can't split a char).
+    let mut i = caret;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        // Caret is at (or only spaces away from) the very start — before even the leading `=`.
+        return false;
+    }
+    // The char before is guaranteed non-whitespace, so this is true only for the
+    // operator/opener/separator/colon set (including the leading/`=`-comparison `=`).
+    is_function_position_prev(bytes[i - 1])
+}
+
 /// The name of the function call whose parentheses enclose `caret` (for the signature hint's
 /// "caret inside a call" trigger), or `None`. Scans `text[..caret]` (skipping string
 /// literals), tracking open parens; the innermost still-open `(` names the enclosing call.
@@ -711,6 +743,39 @@ mod tests {
 
         // Bare `=` (no identifier char) → None.
         assert!(fn_edit_context("=", 1).is_none());
+    }
+
+    #[test]
+    fn is_reference_ready_truth_table() {
+        // Reference-ready positions: after `=`, an operator, an open paren, a comma, a colon.
+        assert!(is_reference_ready("=", 1), "=| empty formula");
+        assert!(is_reference_ready("=A1+", 4), "=A1+| after operator");
+        assert!(is_reference_ready("=SUM(", 5), "=SUM(| after open paren");
+        assert!(is_reference_ready("=SUM(A1,", 8), "=SUM(A1,| after comma");
+        assert!(is_reference_ready("=A1:", 4), "=A1:| mid-range after colon");
+        assert!(
+            is_reference_ready("= ", 2),
+            "= | trailing space skips back to ="
+        );
+
+        // Not reference-ready: after a complete ref, after `)`, mid-identifier, mid-number,
+        // inside a string, a non-formula, and the pre-`=` caret.
+        assert!(!is_reference_ready("=A1", 3), "=A1| after complete ref");
+        assert!(
+            !is_reference_ready("=SUM(A1)", 8),
+            "=SUM(A1)| after close paren"
+        );
+        assert!(!is_reference_ready("=SU", 3), "=SU| mid-identifier");
+        assert!(!is_reference_ready("=12", 3), "=12| mid-number");
+        assert!(
+            !is_reference_ready("=\"A1+", 5),
+            "=\"A1+| inside a string literal"
+        );
+        assert!(!is_reference_ready("A1", 2), "A1| not a formula");
+        assert!(!is_reference_ready("=", 0), "|= caret before the leading =");
+
+        // Hostile carets never panic.
+        assert!(!is_reference_ready("=A1", 99), "out-of-range caret");
     }
 
     #[test]

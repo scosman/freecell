@@ -23,11 +23,11 @@ mod sidebar;
 mod view;
 
 use freecell_core::selection::Motion;
-use freecell_core::{CellRef, SheetId};
+use freecell_core::{CellRange, CellRef, SheetId};
 use gpui::{App, SharedString, Window};
 
 pub use client::{ChromeClient, RecordingClient};
-pub use edit::{EditController, EditOrigin};
+pub use edit::{Autocomplete, EditController, EditOrigin};
 pub use view::{ChartPanel, ChartPanelSeries, ChromeView};
 
 /// One row of the function-autocomplete list, in a grid-renderable (`InputState`-free) form
@@ -124,6 +124,20 @@ pub enum ChromeGridRequest {
         /// or `None`. Shown when the caret sits inside a recognized call and the list is not
         /// covering the same anchor.
         sig_hint: Option<SharedString>,
+        /// Whether the driving formula editor's caret is **reference-ready**
+        /// (`freecell_core::is_reference_ready`, `formula-point-mode/architecture.md §3.1`). Only
+        /// ever `true` during a formula edit. Pushed now; the grid reads it at mouse-down to choose
+        /// point-insert vs commit in **Phase 3** (plumbed here so the payload lands once).
+        reference_ready: bool,
+        /// Whether a just-pointed reference is pending (a point action with nothing typed since).
+        /// While set, a grid click **replaces** it even when the caret is not reference-ready.
+        /// Pushed now; consumed by the grid in **Phase 3**.
+        pending_ref: bool,
+        /// The same-sheet reference highlights to paint on the grid: each visible-sheet target
+        /// range with its palette slot (Q4), drawn as a rich fill + border. Cross-sheet tokens are
+        /// omitted (the color map still colors them for the future in-editor control). Empty while
+        /// not editing a formula (`formula-point-mode/architecture.md §3.1/§4.1`).
+        ref_highlights: Vec<(CellRange, u8)>,
     },
 }
 

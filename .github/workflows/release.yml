@@ -7,7 +7,8 @@
 # and must not be published as releases until signing/notarization + the pre-distribution
 # security audit are done (see app/PACKAGING.md, projects/pre-distribution-security-audit.md).
 #
-# macOS + Linux are REQUIRED (they build today). Windows is EXPERIMENTAL and non-blocking
+# macOS + Linux are REQUIRED (they build today); Linux fans out to native x64 AND arm64
+# builds (a runner per architecture). Windows is EXPERIMENTAL and non-blocking
 # (`continue-on-error`): the app currently wires only macOS/Metal + Linux x11/wayland, so a
 # Windows build is not guaranteed to compile without port work (app/PACKAGING.md).
 #
@@ -65,8 +66,25 @@ jobs:
           if-no-files-found: error
 
   linux:
-    name: package (Linux — deb + AppImage)
-    runs-on: ubuntu-24.04
+    name: package (Linux ${{ matrix.arch }} — deb + AppImage)
+    runs-on: ${{ matrix.runner }}
+    # Build x64 AND arm64 as separate NATIVE builds — one runner per architecture — rather
+    # than cross-compiling. GitHub-hosted arm64 Linux runners (`ubuntu-24.04-arm`) are free
+    # for public repos, so each arch gets a true native binary, and linuxdeploy downloads the
+    # arch-matched AppImage tooling on each runner. Each leg uploads under its own artifact
+    # name (freecell-linux-<arch>, below), so the two never collide on the run page;
+    # cargo-packager additionally stamps the arch into the filenames themselves (…_amd64.deb /
+    # …_arm64.deb, …_x86_64.AppImage / …_aarch64.AppImage), so they stay distinct even if both
+    # artifacts are later unpacked into one directory. `fail-fast: false` keeps one arch's
+    # failure from cancelling the other. Both are REQUIRED (see the header note).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -103,10 +121,13 @@ jobs:
       - name: Build + package (app/scripts/package.sh)
         run: app/scripts/package.sh
 
+      # One artifact per architecture — upload-artifact@v4 requires unique artifact names,
+      # and arch-suffixed names (freecell-linux-x64 / freecell-linux-arm64) make the run page
+      # unambiguous about which build is which.
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
-          name: freecell-linux
+          name: freecell-linux-${{ matrix.arch }}
           path: |
             app/target/packages/*.deb
             app/target/packages/*.AppImage

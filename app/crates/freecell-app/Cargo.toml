@@ -26,9 +26,27 @@ description = "The FreeCell GPUI application (macOS + Linux): app shell, windows
 # ---------------------------------------------------------------------------------
 [package.metadata.packager]
 product-name = "FreeCell"
-identifier = "com.scosman.freecell"
+identifier = "net.scosman.freecell"
 category = "productivity"
-description = "A GPU-rendered, Excel-compatible spreadsheet — stupid-fast on huge sheets."
+# Short synopsis. cargo-packager writes this VERBATIM into the Debian `Description:`
+# synopsis and the `.desktop` `Comment=`, and it is the App Center one-liner. Keep it
+# ASCII: a Unicode em-dash here rendered as "??" in elementary App Center's package view
+# (the control file is UTF-8, but the App Center synopsis display mangled the glyph), so
+# use plain ASCII punctuation to stay portable across deb/AppImage/NSIS front-ends.
+description = "The open spreadsheet app"
+# Extended description (the deb `Description:` continuation lines). WITHOUT this,
+# cargo-packager writes the literal placeholder "(none)" — which is exactly what App
+# Center showed under "Description". Keep ASCII, same reason as the synopsis above.
+long-description = """
+FreeCell is a free, open-source desktop spreadsheet app. It opens and edits Excel (.xlsx) \
+files and supports 90% of Excel formulas, plus the text formatting, borders, fills, and \
+sizing you expect. It is a native app built in Rust (not Electron), so it is fast and \
+light, with GPU-rendered charts. Everything runs 100% locally: no cloud, no analytics, \
+completely private. FreeCell runs on Mac, Windows, and Linux.
+"""
+# Populates the Debian `Maintainer:` control field (absent otherwise, which lintian flags
+# and App Center shows as a blank developer) and the AppStream `<developer>` name.
+authors = ["scosman"]
 homepage = "https://github.com/scosman/freecell"
 # Final app icons. cargo-packager uses the .icns for the macOS bundle, the .ico for the
 # Windows installer, and the sized PNGs for Linux hicolor theme entries. Regenerate all
@@ -46,9 +64,41 @@ icons = [
     "packaging/icons/512x512.png",
 ]
 
+# ---------------------------------------------------------------------------------
+# Debian (.deb) specifics. Must come AFTER every key of [package.metadata.packager]
+# above — a new table header ends the previous table.
+#
+# - package-name: the `Package:` control field. cargo-packager defaults it to
+#   kebab-case(product-name) => "free-cell", which is what App Center showed as the
+#   title. Debian package names must be lowercase, so the best the raw name can be is
+#   "freecell" (nicer than "free-cell", and it's what `apt install freecell` expects).
+# - files: ship an AppStream metainfo file into /usr/share/metainfo. This is the real
+#   fix for the App Center TITLE ("FreeCell", not the package name), the LICENSE
+#   ("MIT OR Apache-2.0" instead of "unknown" — the Debian control file has no license
+#   field at all), and a rich description. App Center / GNOME Software prefer AppStream
+#   metadata when present. The `<launchable>` inside it points at cargo-packager's
+#   generated `freecell.desktop`. Source path is relative to THIS crate's manifest dir
+#   (cargo-packager cd's here), same as the icons above.
+# ---------------------------------------------------------------------------------
+[package.metadata.packager.deb]
+package-name = "freecell"
+files = { "packaging/linux/net.scosman.freecell.metainfo.xml" = "usr/share/metainfo/net.scosman.freecell.metainfo.xml" }
+
 [lib]
 name = "freecell_app"
 path = "src/lib.rs"
+
+# `build.rs` embeds the FreeCell app icon as executable resource ID 1 so the exe + window show the
+# FreeCell icon instead of the generic Windows icon (gpui's Windows backend loads the app icon from
+# that resource). A `[target.'cfg(...)'.build-dependencies]` table is selected by the compilation
+# TARGET — Cargo evaluates the `cfg` against `--target`, not the host — so `embed-resource` is pulled
+# in only when building FOR Windows, keeping it (and `cc`) off ordinary macOS/Linux target builds.
+# The packaging pipeline builds natively on `windows-latest` (host == target), so the dep is pulled
+# and the icon embedded. Note the embed is actually skipped by the HOST-based `#[cfg]` inside
+# build.rs, NOT by this gate: a Linux → Windows cross-compile would still pull `embed-resource` in
+# here, yet produce no icon (build.rs's `#[cfg]` is false on a non-Windows host). See build.rs.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3"
 
 [[bin]]
 name = "freecell"
@@ -99,6 +149,10 @@ tempfile.workspace = true
 # exact crate gpui's cosmic-text (Linux) text system uses. Pinned to the version already in the
 # lockfile via gpui, so this adds no new crate and matches the shipped backend's behavior.
 fontdb = "=0.23.0"
+# The demo-asset guard (`shell::demo` tests) unzips the embedded `demo.xlsx` in-memory to assert
+# its font references are our bundled Inter (never Arial, which isn't on all systems). `zip` +
+# `deflate` are already in the lockfile via IronCalc, so this adds no new crate.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

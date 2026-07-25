@@ -270,6 +270,12 @@ render_cases! {
     fill_handle_multicell, fill_drag_preview,
     // Hidden rows & columns (gaps_closing_7_15 §4): a hidden row + hidden col collapse to zero size.
     hidden_row_and_col,
+    // Freeze panes (freeze-panes `architecture.md §7`): the four-quadrant render — a pinned top row
+    // / row band, a pinned first column / column band, the full four-quadrant split, the frozen
+    // bands still showing VALUES with the body scrolled deep (the Phase-4 band-publishing proof),
+    // and the freeze divider drawn even unscrolled.
+    freeze_top_row, freeze_rows_band, freeze_first_col, freeze_cols_band,
+    freeze_four_quadrant, freeze_scrolled_body, freeze_divider,
     // In-grid charts (P8): the ChartLayer painted over cells — a line chart in place, the Degraded
     // corner badge, the Unsupported placeholder, and a scrolled/clipped chart.
     grid_chart_line, grid_chart_degraded_badge, grid_chart_unsupported_placeholder,
@@ -290,6 +296,9 @@ render_cases! {
     grid_chart_authored_inserted,
     // Editing feel (Phase 2): live mirror + in-cell editor overlay + its grow-right / grow-down
     cell_mirror_typing, incell_editor_open, incell_editor_grow_right, incell_editor_grow_wrap,
+    // Formula point-mode + range highlighting (formula-point-mode §4.1, §2): same-sheet reference
+    // highlights (fill + border) and the dashed point-drag preview marquee.
+    formula_ref_highlight_same_sheet, formula_ref_point_preview,
     // Fonts (Phase 5): family + size + row auto-grow
     font_family_serif, font_size_24_row_grown, font_missing_family_fallback,
     // Borders (Phase 6): edge paint, presets, shared-edge precedence

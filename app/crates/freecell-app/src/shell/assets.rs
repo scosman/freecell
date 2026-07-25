@@ -16,6 +16,13 @@
 //! the gpui-component bundle. FreeCell icon paths (`icons/<name>.svg`) are disjoint from the
 //! bundle's names, so no bundle asset is ever shadowed. The action bar renders each icon with
 //! gpui-component's `Icon` component via `Icon::empty().path("icons/<name>.svg")`.
+//!
+//! Beyond the tintable icons, [`AppAssets`] also serves FreeCell's **full-color brand art**
+//! (`assets/brand/*.svg` — the wordmark logotype + the app icon) under the disjoint `brand/`
+//! prefix. Unlike the icons these are **not** `currentColor` masks: they carry their own fills and
+//! are painted with `gpui::img(...)` (which rasterizes the SVG at its authored colors), so the
+//! welcome / About identity blocks render the real logo instead of a font approximation. They are
+//! deliberately kept out of [`FREECELL_ICONS`] (whose tintability the icon test enforces).
 
 use std::borrow::Cow;
 
@@ -164,6 +171,36 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
     ),
 ];
 
+/// FreeCell's full-color **brand art**, embedded by its bundle-relative asset path (the string
+/// passed to `gpui::img(...)`). Vendored under `assets/brand/`. Unlike [`FREECELL_ICONS`] these
+/// are painted at their authored colors (not `currentColor`-tinted), so they live in their own
+/// list under the disjoint `brand/` prefix and are validated by their own test — never folded into
+/// the tintable-icon set. Keep this list in sync with the files in `assets/brand/`.
+const FREECELL_BRAND: &[(&str, &[u8])] = &[
+    (
+        WORDMARK_ASSET,
+        include_bytes!("../../assets/brand/freecell-wordmark.svg"),
+    ),
+    (
+        ICON_ASSET,
+        include_bytes!("../../assets/brand/freecell-icon.svg"),
+    ),
+];
+
+/// The FreeCell wordmark logotype asset (`brand/freecell-wordmark.svg`) — the "FreeCell" logotype
+/// with its green accent, painted via `gpui::img`. Replaces the old font-rendered wordmark on the
+/// welcome + About identity blocks.
+pub(crate) const WORDMARK_ASSET: &str = "brand/freecell-wordmark.svg";
+
+/// The wordmark's intrinsic aspect ratio (`width / height`, from its `338×69` viewBox). Used to
+/// size the `img` by a target height without distorting it.
+pub(crate) const WORDMARK_ASPECT: f32 = 338.0 / 69.0;
+
+/// The FreeCell app icon asset (`brand/freecell-icon.svg`) — the Windows/Linux icon face (a dark
+/// rounded tile over a grayscale grid), square. Embedded independently of the cargo-packager
+/// packaging icons so the About window carries its own copy.
+pub(crate) const ICON_ASSET: &str = "brand/freecell-icon.svg";
+
 /// The app's asset source: FreeCell-vendored icons composed over the gpui-component bundle.
 ///
 /// A zero-sized handle (like `gpui_component_assets::Assets`) suitable for
@@ -172,10 +209,13 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
 pub struct AppAssets;
 
 impl AppAssets {
-    /// The embedded bytes for a FreeCell-vendored icon at `path`, if one exists.
-    fn freecell_icon(path: &str) -> Option<&'static [u8]> {
+    /// The embedded bytes for a FreeCell-owned asset at `path` (a vendored icon or a brand
+    /// asset), if one exists. The `icons/` and `brand/` prefixes are disjoint, so a single lookup
+    /// over both lists can never be ambiguous.
+    fn freecell_asset(path: &str) -> Option<&'static [u8]> {
         FREECELL_ICONS
             .iter()
+            .chain(FREECELL_BRAND)
             .find(|(p, _)| *p == path)
             .map(|(_, bytes)| *bytes)
     }
@@ -183,10 +223,11 @@ impl AppAssets {
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        // FreeCell-owned icons win, then fall back to the gpui-component bundle (which owns
-        // everything the bundled `IconName`s resolve, e.g. `Loader` / `ChevronDown`). The two
-        // namespaces are disjoint, so this order never shadows a bundle asset.
-        if let Some(bytes) = Self::freecell_icon(path) {
+        // FreeCell-owned assets (icons + brand art) win, then fall back to the gpui-component
+        // bundle (which owns everything the bundled `IconName`s resolve, e.g. `Loader` /
+        // `ChevronDown`). The FreeCell namespaces are disjoint from the bundle's, so this order
+        // never shadows a bundle asset.
+        if let Some(bytes) = Self::freecell_asset(path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
         gpui_component_assets::Assets.load(path)
@@ -197,6 +238,7 @@ impl AssetSource for AppAssets {
         items.extend(
             FREECELL_ICONS
                 .iter()
+                .chain(FREECELL_BRAND)
                 .filter(|(p, _)| p.starts_with(path))
                 .map(|(p, _)| SharedString::from(*p)),
         );
@@ -230,6 +272,34 @@ mod tests {
                 "{path} has a hardcoded fill that would override the theme tint"
             );
         }
+    }
+
+    /// Every brand asset resolves through `AppAssets` to non-empty SVG bytes, and the wordmark /
+    /// icon path constants the views render point at real entries. These are full-color art (not
+    /// `currentColor` masks), so — unlike the icons — they are asserted to load and be valid SVG,
+    /// NOT to be tintable. The wordmark viewBox is checked so [`WORDMARK_ASPECT`] can't silently
+    /// drift from the art it is meant to describe.
+    #[test]
+    fn brand_assets_load_as_svgs() {
+        for (path, _) in FREECELL_BRAND {
+            let bytes = AppAssets
+                .load(path)
+                .expect("load ok")
+                .unwrap_or_else(|| panic!("missing brand asset {path}"));
+            assert!(!bytes.is_empty(), "empty brand asset {path}");
+            let svg = std::str::from_utf8(&bytes).expect("utf8 svg");
+            assert!(svg.contains("<svg"), "{path} is not an SVG");
+        }
+        // The path constants the identity blocks pass to `img(...)` must resolve.
+        assert!(AppAssets.load(WORDMARK_ASSET).expect("load ok").is_some());
+        assert!(AppAssets.load(ICON_ASSET).expect("load ok").is_some());
+        // `WORDMARK_ASPECT` must match the wordmark's authored viewBox (338×69).
+        let wordmark = AppAssets.load(WORDMARK_ASSET).expect("load ok").unwrap();
+        let svg = std::str::from_utf8(&wordmark).expect("utf8 svg");
+        assert!(
+            svg.contains("width=\"338\"") && svg.contains("height=\"69\""),
+            "wordmark art no longer 338×69 — update WORDMARK_ASPECT"
+        );
     }
 
     /// The bundle still resolves through the combined source (regression guard for

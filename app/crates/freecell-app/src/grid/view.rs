@@ -2747,19 +2747,12 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            layout::cell_at_point(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-                content_w,
-                content_h,
-            )
+            // Frozen-pane cell_at_point (`freeze-panes §3.3/§4`): a point-mode drag past the
+            // divider lands on the band's cell, so the swept reference grows continuously across
+            // the boundary (matching the selection/fill drags). `M=K=0` reduces to the pre-freeze
+            // single-region geometry.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            pane.cell_at_point(local_x, local_y, &row_axis, &col_axis)
         };
         self.set_point_target_from_cell(cell, window, cx);
         self.maybe_start_autoscroll(window, cx);
@@ -3591,14 +3584,16 @@ impl GridView {
         // variant is used (`ref_slot_border(_, false)`); the `is_dark` seam stays for the future
         // theme-aware / in-editor styling control.
         for (target, slot) in &self.ref_highlights {
+            // Clip to THIS quadrant's visible ranges (like the selection overlay): a highlight
+            // straddling the divider paints its slice in each quadrant and they visually join.
             let rows =
-                target.start.row.max(frame.rows.start)..(target.end.row + 1).min(frame.rows.end);
+                target.start.row.max(quad.rows.start)..(target.end.row + 1).min(quad.rows.end);
             let cols =
-                target.start.col.max(frame.cols.start)..(target.end.col + 1).min(frame.cols.end);
+                target.start.col.max(quad.cols.start)..(target.end.col + 1).min(quad.cols.end);
             if rows.start >= rows.end || cols.start >= cols.end {
                 continue;
             }
-            let (x, y, w, h) = span_rect(rows, cols, frame);
+            let (x, y, w, h) = span_rect(rows, cols, frame, quad);
             let color = ref_slot_border(*slot, false);
             content_children.push(
                 rect_div(x, y, w, h)
@@ -3616,10 +3611,12 @@ impl GridView {
         // handles (DPM.7). The editor text already tracks the range (each move emitted an insert).
         if let Some(pd) = self.point_drag {
             let t = pd.last_range;
-            let rows = t.start.row.max(frame.rows.start)..(t.end.row + 1).min(frame.rows.end);
-            let cols = t.start.col.max(frame.cols.start)..(t.end.col + 1).min(frame.cols.end);
+            // Clip to THIS quadrant's visible ranges (like the selection overlay) so the dashed
+            // marquee slices join across the divider instead of drawing in body-relative coords.
+            let rows = t.start.row.max(quad.rows.start)..(t.end.row + 1).min(quad.rows.end);
+            let cols = t.start.col.max(quad.cols.start)..(t.end.col + 1).min(quad.cols.end);
             if rows.start < rows.end && cols.start < cols.end {
-                let (x, y, w, h) = span_rect(rows, cols, frame);
+                let (x, y, w, h) = span_rect(rows, cols, frame, quad);
                 content_children.push(
                     rect_div(x, y, w, h)
                         .border_2()
@@ -7769,6 +7766,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells: Vec::new(),
         };

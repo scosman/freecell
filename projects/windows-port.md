@@ -1,39 +1,39 @@
 # Windows Port
 
-**Status: Future (packaging wired 2026-07-05; app build not a real target yet).**
+**Status: Largely done (2026-07-24) — Windows compiles, packages, and gates CI; `.xlsx`/`.csv`
+file associations are wired. Remaining: a hardware smoke + signing.**
 
 ## Goal
 
-Make FreeCell build and run on Windows as a first-class platform, then promote the
-already-wired Windows packaging (NSIS installer) from experimental to supported.
+Make FreeCell build and run on Windows as a first-class platform, and promote the
+already-wired Windows packaging (NSIS installer) to supported. **Both are now done**; this
+note is retained to track the residual polish.
 
 ## Current state (what exists today)
 
-Windows is **out of scope** for the app (`README.md`, `app/README.md`,
-`architecture.md §1`). The GPUI platform config in `app/Cargo.toml` wires only macOS/Metal
-and Linux (`x11`/`wayland`); there is no Windows GPUI backend configured, so a Windows build
-is **not guaranteed to compile**.
+Windows is a **first-class, working target**: it compiles and packages (NSIS `.exe` via
+`scripts/package.ps1`), and the `release` workflow's Windows job is **required** — a packaging
+failure gates the release like macOS and Linux (`continue-on-error` was removed 2026-07-24;
+CI green + local build confirmed by the owner the same day). The platform-support statements
+in `app/README.md` and `specs/projects/mvp/architecture.md §1` were reconciled to match.
 
-The `cargo-packager` work (2026-07-05) added the *packaging* half so it's ready when the
-port lands: `scripts/package.ps1` builds an NSIS `.exe`, and the `release` workflow has a
-Windows job — kept **non-blocking** (`continue-on-error`) precisely because the build may
-fail. See `app/PACKAGING.md` ("Windows: what a real port needs").
+`.xlsx`/`.csv` **file associations are wired** — the shared cargo-packager
+`file-associations` block emits the Windows NSIS registry ProgId + `shell\open\command`, and
+the delivered path reaches the app through `main.rs::open_arg` → `FreeCellApp::open_path`
+(process argv: the Explorer double-click / Open-With / shell-arg flows). See
+`specs/projects/xlsx-file-association/` (Phase 1, commit `84785fa`) and `app/PACKAGING.md`
+("Windows").
 
-## Work when picked up
+## Work when picked up (residual)
 
-1. **GPUI DirectX backend.** Split `gpui`/`gpui_platform` deps with a
-   `[target.'cfg(windows)']` block selecting the DirectX backend + Windows features;
-   confirm the pinned known-good gpui / gpui-component rev pair supports it (bump the pair
-   together if not — never one alone, per `architecture.md §10`).
-2. **Platform code arms.** Add Windows branches to everything `#[cfg]`-gated to macOS/Linux
-   today: menus vs. no-menu-bar, `Cmd` vs `Ctrl`, native file dialogs, font registration,
-   the `--exit-after-ms` render valve. Expect to flush these out via compile errors.
-3. **System integration.** `.xlsx` file associations, per-monitor DPI, installed-app data
-   paths (NSIS `appdata-paths`), and a Windows smoke of open/edit/save.
-4. **Render/perf gates.** Decide whether the render-test + perf harness run on Windows or
+1. **Hardware smoke.** A Windows smoke of the installed NSIS build — open/edit/save plus the
+   file-association double-click / Open-With — complementary to the CI green build. This is
+   the non-blocking optional Windows leg of `specs/projects/xlsx-file-association` Phase 4.
+2. **Polish surfaced by a real run.** Per-monitor DPI and installed-app data paths (NSIS
+   `appdata-paths`) want a look once someone runs the app on Windows hardware.
+3. **Render/perf gates.** Decide whether the render-test + perf harness run on Windows or
    stay Linux/macOS-only.
-5. **Promote CI.** Once it compiles + smokes, drop `continue-on-error` from the Windows job
-   and update the platform-support statements in the READMEs + architecture.
+4. **Signing.** Authenticode (see below).
 
 ## Not needed for this
 

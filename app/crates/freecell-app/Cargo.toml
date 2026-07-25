@@ -65,6 +65,38 @@ icons = [
 ]
 
 # ---------------------------------------------------------------------------------
+# File associations. Register FreeCell as a CANDIDATE handler (not the default) for
+# spreadsheet files, so a Finder/Explorer/file-manager double-click, "Open With", drag-onto-
+# icon, or shell path-arg launches FreeCell with that file. Every path funnels into the app's
+# existing open logic (`FreeCellApp::open_path`): `.xlsx` opens/dedupes; `.csv` imports into a
+# fresh untitled workbook. See specs/projects/xlsx-file-association/. From these two entries
+# cargo-packager 0.11.8 emits, per format: macOS `.app` `CFBundleDocumentTypes`
+# (`CFBundleTypeExtensions`/`CFBundleTypeName`/`CFBundleTypeRole`); Linux `.deb` `.desktop`
+# `MimeType=<mime>;<mime>` + `Exec=… %F`; Windows NSIS registry ProgId + `shell\open\command`.
+#
+# These entries carry NO file paths, so the manifest-dir `cd` gotcha noted for `icons` above
+# does not apply. Array-of-tables must sit with the other `[package.metadata.packager.*]`
+# tables and BEFORE the `[package.metadata.packager.deb]` header below — a new table header
+# ends the packager table. NOTE the `role` value is lowercase `"editor"`: cargo-packager's
+# `CFBundleTypeRole` enum is camelCase + `deny_unknown_fields`, so `"Editor"` fails to
+# deserialize and would break packaging. `"editor"` is also the default. The `packaging_metadata`
+# tests in `lib.rs` guard both entries (and this casing).
+# ---------------------------------------------------------------------------------
+[[package.metadata.packager.file-associations]]
+extensions = ["xlsx"]
+mime-type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" # Linux .desktop MimeType
+description = "Excel Workbook"                                                  # Windows Explorer "Type" column
+name = "Excel Workbook"                                                         # macOS CFBundleTypeName
+role = "editor"                                                                 # macOS CFBundleTypeRole (default)
+
+[[package.metadata.packager.file-associations]]
+extensions = ["csv"]
+mime-type = "text/csv"
+description = "CSV Document"
+name = "CSV Document"
+role = "editor"
+
+# ---------------------------------------------------------------------------------
 # Debian (.deb) specifics. Must come AFTER every key of [package.metadata.packager]
 # above — a new table header ends the previous table.
 #
@@ -130,6 +162,22 @@ tracing.workspace = true
 # `<data_dir>/FreeCell/recents.json`. Already resolved at 6.0.0 in the lockfile (a transitive
 # dep), so pinning it as a direct dep adds no new crate to `Cargo.lock`.
 dirs = "6"
+# OS-delivered file opens (`shell::open_files`, xlsx-file-association project). `url` parses the
+# `file://` open-event URLs into paths (`file_url_to_path`, cfg-agnostic); `async-channel` bridges
+# gpui's cx-less macOS `on_open_urls` callback into the app task (macOS-only usage). Both are
+# already resolved in the lockfile (`url` 2.5.8, `async-channel` 2.5.0) as transitive deps, so
+# promoting them to direct deps adds no new crate to `Cargo.lock` (same pattern as `dirs` above).
+url = "2"
+async-channel = "2"
+
+# Default-handler detection on Windows (`shell::default_app`, xlsx-file-association Phase 5). The COM
+# `IApplicationAssociationRegistration` interface reports the current default app for an extension, so
+# the welcome screen can offer "Set as default" only when FreeCell is not already it. `windows` is
+# already resolved at 0.61.3 in the lockfile (gpui depends on it), so pinning `0.61` adds no new
+# crate; the features below union with gpui's. macOS uses raw CoreFoundation/CoreServices framework
+# FFI (no crate) and Linux shells out to `xdg-mime`, so this dep is Windows-only.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_UI_Shell", "Win32_System_Com"] }
 
 [dev-dependencies]
 # Phase 9 chrome interaction tests drive `ChromeView` through gpui's headless
@@ -153,6 +201,10 @@ fontdb = "=0.23.0"
 # its font references are our bundled Inter (never Arial, which isn't on all systems). `zip` +
 # `deflate` are already in the lockfile via IronCalc, so this adds no new crate.
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# The `packaging_metadata` tests (`lib.rs`) parse THIS `Cargo.toml` to assert the cargo-packager
+# `file-associations` block stays present + well-formed (xlsx-file-association project). `toml` is
+# already resolved at 0.8.23 in the lockfile (transitive), so pinning it adds no new crate.
+toml = "0.8"
 
 [lints]
 workspace = true

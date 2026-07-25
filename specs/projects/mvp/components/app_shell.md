@@ -66,6 +66,9 @@ struct WorkbookWindow {                  // root Entity per document window
 - Finder open-events (macOS) / CLI path argument + xdg association (Linux): wire
   `App::on_open_urls`/equivalent and argv handling if the pinned rev supports them;
   else skip (best-effort, record in DECISIONS_TO_REVIEW.md).
+  - **[Resolved — see `specs/projects/xlsx-file-association`]** both are wired: argv handling
+    (`main.rs::open_arg`) covers Windows/Linux/CLI, and a macOS Apple-Event bridge
+    (`shell/open_files.rs`) routes the cx-less `on_open_urls` through the `open_path` funnel.
 
 ### Menus & actions (single source of truth)
 

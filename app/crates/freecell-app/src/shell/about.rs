@@ -33,11 +33,11 @@ const FAINT_TEXT: u32 = 0x9A9A9A;
 const LINK: u32 = 0x2563EB;
 
 /// The app icon's rendered edge (`img`, square) — the app-icon face stacked above the wordmark.
-const ICON_SIZE: f32 = 56.0;
+const ICON_SIZE: f32 = 48.0;
 
 /// The rendered height of the wordmark logotype (`img`); its width derives from
 /// [`WORDMARK_ASPECT`]. Matched to the welcome window's wordmark for one consistent brand mark.
-const WORDMARK_H: f32 = 30.0;
+const WORDMARK_H: f32 = 24.0;
 
 /// The homepage repository — opened in the browser; shown as [`HOMEPAGE_LABEL`].
 const HOMEPAGE_URL: &str = "https://github.com/scosman/freecell";

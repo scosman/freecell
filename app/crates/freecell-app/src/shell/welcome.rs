@@ -34,7 +34,7 @@ const LEFT_PANE_WIDTH: f32 = 264.0;
 
 /// The rendered height of the wordmark logotype (`img`); its width derives from
 /// [`WORDMARK_ASPECT`]. Matched to the About window's wordmark for one consistent brand mark.
-const WORDMARK_H: f32 = 30.0;
+const WORDMARK_H: f32 = 28.0;
 
 /// A dialog the welcome window can host when there's no document window to own it. Only the
 /// app-level error dialog remains — the About screen is a standalone window now (`shell::about`).

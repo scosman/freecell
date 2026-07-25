@@ -11,12 +11,14 @@
 //! this view ready-to-render [`DisplayEntry`]s (built by the pure `freecell_core::recent`), so the
 //! view itself does no disk access or formatting.
 
-use gpui::{div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, Window};
+use gpui::{
+    div, img, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, Window,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_core::recent::DisplayEntry;
 
-use super::fonts::WORDMARK_FAMILY;
+use super::assets::{WORDMARK_ASPECT, WORDMARK_ASSET};
 use super::{titlebar, CloseWindow, FreeCellApp};
 
 // Shared chrome/titlebar palette tokens (`ui_design.md §0`) — mirrored here as the established
@@ -29,6 +31,10 @@ const MUTED_TEXT: u32 = 0x555555;
 
 /// The left pane's fixed width (`ui_design.md §1`).
 const LEFT_PANE_WIDTH: f32 = 264.0;
+
+/// The rendered height of the wordmark logotype (`img`); its width derives from
+/// [`WORDMARK_ASPECT`]. Matched to the About window's wordmark for one consistent brand mark.
+const WORDMARK_H: f32 = 28.0;
 
 /// A dialog the welcome window can host when there's no document window to own it. Only the
 /// app-level error dialog remains — the About screen is a standalone window now (`shell::about`).
@@ -207,15 +213,20 @@ impl WelcomeView {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(0.0))
+                    .gap(px(4.0))
                     .child(
-                        // Same Inter Display ExtraBold single-face family as the About wordmark —
-                        // one family name resolves it on every platform (brand consistency).
+                        // The FreeCell wordmark logotype, painted from the vendored brand SVG
+                        // (`brand/freecell-wordmark.svg`) — the same mark the About window shows,
+                        // replacing the old font-rendered "FreeCell". Sized by height; the width
+                        // derives from the art's aspect ratio so it never distorts. Wrapped in a
+                        // div carrying the `debug_selector` the render/view test looks up.
                         div()
-                            .font_family(WORDMARK_FAMILY)
-                            .text_size(px(28.0))
-                            .text_color(rgb(TEXT))
-                            .child("FreeCell"),
+                            .debug_selector(|| "welcome-wordmark".to_string())
+                            .child(
+                                img(WORDMARK_ASSET)
+                                    .h(px(WORDMARK_H))
+                                    .w(px(WORDMARK_H * WORDMARK_ASPECT)),
+                            ),
                     )
                     .child(
                         div()
@@ -555,6 +566,24 @@ mod tests {
         assert!(
             vcx.debug_bounds("welcome-demo-link").is_some(),
             "the welcome left pane paints the Open Demo Spreadsheet link"
+        );
+    }
+
+    #[gpui::test]
+    fn render_paints_the_wordmark(cx: &mut TestAppContext) {
+        // The left pane paints the brand wordmark image (the `img(WORDMARK_ASSET)` that replaced
+        // the old font-rendered "FreeCell"). We assert its wrapper's painted bounds resolve — the
+        // element is in the tree and laid out — via the `debug_selector` set on it.
+        cx.update(gpui_component::init);
+        let handle = cx.open_window(size(px(720.0), px(480.0)), |window, cx| {
+            let view = cx.new(|cx| WelcomeView::new(window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("welcome-wordmark").is_some(),
+            "the welcome left pane paints the brand wordmark image"
         );
     }
 

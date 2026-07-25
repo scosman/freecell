@@ -199,7 +199,20 @@ pub(crate) const WORDMARK_ASPECT: f32 = 338.0 / 69.0;
 /// The FreeCell app icon asset (`brand/freecell-icon.svg`) — the Windows/Linux icon face (a dark
 /// rounded tile over a grayscale grid), square. Embedded independently of the cargo-packager
 /// packaging icons so the About window carries its own copy.
+///
+/// **Intrinsic size matters for load cost.** `gpui::img` rasterizes an SVG at its declared
+/// `width`/`height` **× 2** (`SMOOTH_SVG_SCALE_FACTOR`), *not* at the on-screen display size. This
+/// file therefore declares a small `128×128` intrinsic size (its `viewBox` stays `0 0 1024 1024`,
+/// so the artwork is unchanged) → a 256×256 rasterization, ~40 ms and still crisp at the 48 px
+/// About display. Authored at its native `1024×1024` it rasterized 2048×2048 (~2.4 s in a debug
+/// build — a visible stall). Keep the declared size small; [`ICON_MAX_INTRINSIC_PX`] guards it.
 pub(crate) const ICON_ASSET: &str = "brand/freecell-icon.svg";
+
+/// Upper bound on the icon SVG's declared `width`/`height` (see [`ICON_ASSET`]) — large enough to
+/// stay crisp when the About icon is displayed at 2× on Retina, small enough that `gpui::img`'s
+/// intrinsic-size-driven rasterization is cheap. Enforced by `icon_intrinsic_size_stays_small`.
+#[cfg(test)]
+const ICON_MAX_INTRINSIC_PX: u32 = 256;
 
 /// The app's asset source: FreeCell-vendored icons composed over the gpui-component bundle.
 ///
@@ -300,6 +313,37 @@ mod tests {
             svg.contains("width=\"338\"") && svg.contains("height=\"69\""),
             "wordmark art no longer 338×69 — update WORDMARK_ASPECT"
         );
+    }
+
+    /// The icon SVG's declared intrinsic size stays small (see [`ICON_ASSET`]). `gpui::img`
+    /// rasterizes at `intrinsic × 2`, so re-vendoring the icon at its native 1024×1024 would
+    /// silently reintroduce a ~2.4 s (debug) rasterization stall when the About window opens. This
+    /// pins the declared `width`/`height` at or below [`ICON_MAX_INTRINSIC_PX`].
+    #[test]
+    fn icon_intrinsic_size_stays_small() {
+        let bytes = AppAssets.load(ICON_ASSET).expect("load ok").unwrap();
+        let svg = std::str::from_utf8(&bytes).expect("utf8 svg");
+
+        // Read the first `width="N"` / `height="N"` off the root <svg> (the intrinsic size gpui
+        // rasterizes from — distinct from the viewBox, which may stay large).
+        let attr = |name: &str| -> u32 {
+            let key = format!("{name}=\"");
+            let start = svg.find(&key).expect("attr present") + key.len();
+            let rest = &svg[start..];
+            let end = rest.find('"').expect("closing quote");
+            rest[..end]
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} not an int"))
+        };
+        for name in ["width", "height"] {
+            let px = attr(name);
+            assert!(
+                px <= ICON_MAX_INTRINSIC_PX,
+                "icon {name}={px} exceeds {ICON_MAX_INTRINSIC_PX}: gpui::img rasterizes at \
+                 intrinsic×2, so a large declared size stalls the About window — shrink the \
+                 declared width/height (keep the viewBox) as in brand/freecell-icon.svg"
+            );
+        }
     }
 
     /// The bundle still resolves through the combined source (regression guard for

@@ -469,8 +469,8 @@ mod tests {
         // Launch Services / xdg report ids in varying case + with surrounding whitespace.
         assert!(identifiers_match("freecell.desktop", " FreeCell.Desktop\n"));
         assert!(identifiers_match(
-            "com.scosman.freecell",
-            "COM.SCOSMAN.FREECELL"
+            "net.scosman.freecell",
+            "NET.SCOSMAN.FREECELL"
         ));
     }
 

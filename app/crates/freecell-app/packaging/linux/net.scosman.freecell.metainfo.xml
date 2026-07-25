@@ -12,10 +12,10 @@
     which is why App Center no longer shows License: unknown.
   - Keep <summary> in sync with the packager `description` in ../../Cargo.toml.
 
-  Validate after edits with:  appstreamcli validate com.scosman.freecell.metainfo.xml
+  Validate after edits with:  appstreamcli validate net.scosman.freecell.metainfo.xml
 -->
 <component type="desktop-application">
-  <id>com.scosman.freecell</id>
+  <id>net.scosman.freecell</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
   <name>FreeCell</name>
@@ -41,7 +41,7 @@
   <launchable type="desktop-id">freecell.desktop</launchable>
   <url type="homepage">https://github.com/scosman/freecell</url>
   <url type="bugtracker">https://github.com/scosman/freecell/issues</url>
-  <developer id="com.scosman">
+  <developer id="net.scosman">
     <name>scosman</name>
   </developer>
   <content_rating type="oars-1.1" />

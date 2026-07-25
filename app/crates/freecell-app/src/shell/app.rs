@@ -748,13 +748,16 @@ fn titlebar_options_for(macos_custom_titlebar: bool, is_windows: bool) -> Option
     }
 }
 
-/// The window `app_id` — Linux only (Wayland `app_id` / X11 `WM_CLASS`). Set to the packaged bundle
-/// identifier so a Wayland compositor associates the window with the installed
-/// `com.scosman.freecell` `.desktop` entry (and thus the FreeCell icon cargo-packager ships to the
-/// hicolor theme). `None` on macOS/Windows, which take their icon from the `.app` bundle / the
+/// The window `app_id` — Linux only (Wayland `app_id` / X11 `WM_CLASS`). Must equal the
+/// **desktop-entry id** cargo-packager installs, which it derives from the *binary name*
+/// (`freecell.desktop`, `Icon=freecell`) — NOT the reverse-DNS bundle `identifier`
+/// (`net.scosman.freecell`). GNOME maps a running window to its launcher (and thus the dock
+/// icon + app name) by this id; pointing it at the reverse-DNS identifier — which has no
+/// matching installed `.desktop` — is what made GNOME fall back to a generic icon labelled with
+/// the raw app_id. `None` on macOS/Windows, which take their icon from the `.app` bundle / the
 /// exe's embedded icon resource instead (so this never changes their behavior).
 fn window_app_id() -> Option<String> {
-    cfg!(target_os = "linux").then(|| "com.scosman.freecell".to_string())
+    cfg!(target_os = "linux").then(|| "freecell".to_string())
 }
 
 /// The document window options: ~1200×800, centered, resizable, macOS custom titlebar (§7.1)
@@ -2133,17 +2136,21 @@ mod tests {
         );
     }
 
-    /// The window `app_id` is set only on Linux (Wayland/X11 desktop-file association) and matches
-    /// the packaged bundle identifier; it stays `None` on macOS/Windows so their icon sources are
+    /// The window `app_id` is set only on Linux and must equal the desktop-entry id
+    /// cargo-packager installs — which it derives from the binary name (`freecell.desktop`,
+    /// `Icon=freecell`), NOT the reverse-DNS bundle identifier. GNOME associates a running window
+    /// with its launcher (and thus its dock icon + name) by this id; a mismatch shows a generic
+    /// icon labelled with the raw app_id. Stays `None` on macOS/Windows so their icon sources are
     /// untouched.
     #[test]
-    fn window_app_id_is_linux_only_and_matches_bundle_identifier() {
+    fn window_app_id_is_linux_only_and_matches_desktop_entry_id() {
         let app_id = window_app_id();
         if cfg!(target_os = "linux") {
             assert_eq!(
                 app_id.as_deref(),
-                Some("com.scosman.freecell"),
-                "Linux app_id must match the packaged .desktop bundle identifier"
+                Some("freecell"),
+                "Linux app_id must match cargo-packager's installed `freecell.desktop` id (the \
+                 binary name) so GNOME associates the window with its launcher icon + name"
             );
         } else {
             assert!(

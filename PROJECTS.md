@@ -148,6 +148,15 @@ registry: each entry is a short description plus a pointer to a design note unde
   engine-render guard test (`freecell-engine` `every_num_fmt_preset_code_renders_without_parse_error`)
   now covers the whole inventory so a re-add can't regress. → [`projects/fraction-number-format.md`](projects/fraction-number-format.md)
 
+- **Shared Remote Compile Cache (sccache + Cloudflare R2)** — *Implemented (2026-07-24),
+  dev containers only.* Fresh dev containers no longer recompile the pinned dep tree
+  (gpui/zed, gpui-component, ironcalc fork) from scratch: sccache (`RUSTC_WRAPPER`)
+  backed by the shared `freecell-dev` R2 bucket serves rustc outputs across sessions,
+  auto-activated per session by a `SessionStart` hook and degrading gracefully to
+  uncached builds when the R2 secrets are absent. **CI is deliberately untouched**
+  (keeps Swatinem/rust-cache). Design, limits, and R2 token rotation:
+  → [`projects/build-cache.md`](projects/build-cache.md)
+
 - **Adopt gpui-component menus app-wide (native flyout submenus)** — *Future (deferred from
   `gaps_closing_7_12` Phase 10.4, 2026-07-13).* The whole chrome uses **seven** hand-rolled
   `div().absolute()…occlude()` popover cards over a `backdrop()` (fill, text-color, borders,

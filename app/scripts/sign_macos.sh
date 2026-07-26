@@ -37,7 +37,10 @@
 #       xcrun notarytool store-credentials freecell-notary \
 #           --apple-id <you@example.com> --team-id <TEAMID> --password <app-specific-password>
 #   - network access: the secure timestamp server and two notarization round trips.
-#     Notarization typically takes a few minutes each; occasionally much longer.
+#     A round trip can be anywhere from seconds to many minutes — near-instant usually means
+#     Apple had already scanned that exact CDHash and re-used the result, which is fine.
+#     Proof that notarization really happened is the staple succeeding: `stapler` fetches the
+#     ticket from Apple and cannot attach one that was never issued.
 #
 # Env overrides:
 #   FREECELL_NOTARY_PROFILE   notarytool keychain profile name (default: freecell-notary)
@@ -325,7 +328,10 @@ assert_developer_id_signed "$app_path" app
 notarize_submit() {
     local target="$1"
 
-    echo "    submitting $(basename "$target") to the Apple notary service (this can take several minutes)…"
+    # Timing varies wildly: seconds when Apple has already scanned this exact CDHash (tickets
+    # are keyed by code directory hash, which excludes the timestamped signature blob, so a
+    # rebuild of identical code re-uses the earlier scan), up to many minutes otherwise.
+    echo "    submitting $(basename "$target") to the Apple notary service (--wait; anywhere from seconds to many minutes)…"
 
     local json status submission_id
     # Do not let a non-zero exit abort before we can fetch the log.

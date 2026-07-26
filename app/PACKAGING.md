@@ -194,8 +194,21 @@ scripts/sign_macos.sh              # extra args pass through to package.sh
 ```
 
 It will prompt you to pick from your *Developer ID Application* identities, then run
-unattended. Expect it to take a while: two notarization round trips, typically a few
-minutes each, occasionally much longer.
+unattended.
+
+It makes **two** notarization round trips — one for the `.app`, one for the `.dmg` — and
+each can take anywhere from seconds to many minutes. **A near-instant one is not a bug.**
+Notarization tickets are keyed by the **code directory hash**, which covers the code but not
+the timestamped signature blob, so re-submitting a rebuild of identical code re-uses the
+scan Apple already did. If you want to see the scan itself rather than infer it:
+
+```sh
+xcrun notarytool log <submission-id> --keychain-profile freecell-notary
+```
+
+Either way, **the staple succeeding is the proof**: `stapler` downloads the ticket from
+Apple and cannot attach one that was never issued, so *"The staple and validate action
+worked!"* means that exact build really is notarized.
 
 ### What it does, and why
 

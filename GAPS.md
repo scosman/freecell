@@ -482,6 +482,7 @@ Ordered roughly by how fast a new user hits the gap.
 | **External workbook links** (`[Book1.xlsx]Sheet1!A1`) | **NEW** | Rare at home, table stakes at banks — deliberately last. |
 | **Comments — authoring + threads** | **NEW** (view/preserve = v1.0) | |
 | **Session restore** (reopen last windows/files on launch) | **NEW** | |
+| **macOS universal binary** (Intel + Apple Silicon) | **NEW** (checked: the `release` macOS job runs on `macos-14` — Apple Silicon — and does a plain `cargo build --release`; the first notarization log reports a single `arm64` slice for both the bundle and its executable) | Platform reach, not feature coverage — tiered here by owner call (2026-07-26). The published `.dmg` is **arm64-only and cannot launch on an Intel Mac at all** (Rosetta translates x86_64 → arm64, never the reverse). Nothing chose this; it is what the runner architecture produced, and it contrasts with Linux, which deliberately builds x64 + arm64 as separate native jobs. **Apple-Silicon-only is accepted for now** (owner, 2026-07-26). When picked up: add the `x86_64-apple-darwin` target, `lipo -create` both slices before packaging, verify with `lipo -archs`, and check the GPUI/Metal stack actually builds clean for x86_64 (the main unknown). Signing needs **no** changes — `codesign` signs a universal binary once and the notary ticket covers every slice, so `scripts/sign_macos.sh` should work unmodified. |
 | **Localization pass** (locale number formats incl. date ids 14–22 (E3), decimal-comma locales, translated UI) | Above (E3) + partially NEW | Pairs with IME (v1.0); E3's residual numFmt ids land here. |
 | **Remaining accepted-deviation tails** (row/col font band for future cells; oneCell/absoluteAnchor chart resize C-P18-1; rotated-axis-title font C-P13-1; line-label offset C-FB1-1) | Above | All Mild, all currently non-manifesting or cosmetic. |
 
@@ -501,4 +502,17 @@ Ordered roughly by how fast a new user hits the gap.
   must keep macro parts intact so FreeCell never corrupts a macro workbook.
 - **Accessibility (screen readers)** — gated on gpui capabilities at the pinned rev;
   probe alongside any gpui bump.
+- **Render-test subsetting is broken for grid cases** (dev tooling, surfaced 2026-07-26
+  during `merged-cell-ui`) — `render_tests.sh test <prefix>` does **not** subset: the grid
+  suite's `check_case` reads a single `OnceLock` populated by `render_all(bin, &out, None)`
+  (`app/render-tests/tests/render_suite.rs`), so *any* case name renders the whole ~170-case
+  inventory. Only the `chart_` suite has its own `OnceLock`. Consequence: the "subset while
+  iterating" workflow in `CLAUDE.md` silently costs a full-suite run, blows the agent Bash
+  timeout under lavapipe, and has repeatedly parked agents mid-phase. **Workaround:**
+  `render_tests.sh generate --only <prefix>` *does* subset correctly (it reports
+  new/changed/unchanged and leaves baselines byte-identical when nothing moved) — that is
+  the reliable way to check a subset locally today. **Fix:** `render_all`/`render_charts`
+  already take an `only: Option<&str>`, so thread a `RENDER_ONLY`-style filter through
+  `check_case` (keying the `OnceLock` per filter); then correct the `CLAUDE.md`
+  render-tests section, which currently documents the non-working path.
 

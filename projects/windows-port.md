@@ -39,6 +39,5 @@ the delivered path reaches the app through `main.rs::open_arg` → `FreeCellApp:
 
 Authenticode signing of the core exe + installer via **Azure Trusted Signing** is wired
 (2026-07-20): `scripts/package.ps1` signs both when the signing env vars are set, otherwise a
-no-op unsigned build. It has not been run against a live Azure account yet (no CI secrets
-provisioned). See `app/PACKAGING.md` §Signing and
-`projects/release-signing-and-distribution.md`.
+no-op unsigned build. It runs green in the CI `release` job against the live Azure account. See
+`app/PACKAGING.md` (Windows signing) and `projects/release-signing-and-distribution.md`.

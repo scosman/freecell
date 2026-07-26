@@ -97,14 +97,14 @@ registry: each entry is a short description plus a pointer to a design note unde
   hardware smoke.
   → [`projects/windows-port.md`](projects/windows-port.md)
 
-- **Release Signing & Distribution** — *Future, required before publishing any binary.*
-  The `cargo-packager` pipeline ships **unsigned dev artifacts** (uploaded as CI run
-  artifacts, not GitHub Releases). **Windows Authenticode is now wired** (optional Azure
-  Trusted Signing of the core exe + installer, 2026-07-20); still outstanding are macOS
-  Developer-ID signing + notarization and the switch to attaching signed assets to a GitHub
-  Release. Hard-gated on the pre-distribution security audit above.
+- **Release Signing & Distribution** — *Signing done; distribution is the open half, gated on
+  the security audit.* macOS `.app`/`.dmg` are Developer-ID-signed + notarized via
+  `app/scripts/sign_macos.sh` (local/manual); Windows `.exe`s are Authenticode-signed via Azure
+  Trusted Signing in the CI `release` job (`app/scripts/sign-windows.ps1`, run green). Linux is
+  unsigned by design. What remains is **distribution** — switching the workflow from CI run
+  artifacts to attaching assets to a GitHub Release (plus optional macOS-in-CI automation) —
+  hard-gated on the pre-distribution security audit above.
   → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
-
 - **Rewrite chart `c:f` on sheet rename** — *Future (deferred from charts P10, 2026-07-10).*
   Chart save is source-first (charts/architecture §5): it byte-preserves / targeted-patches the
   retained chart XML, keeping each data reference's `c:f` **verbatim**. So after an in-session

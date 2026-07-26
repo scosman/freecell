@@ -265,6 +265,95 @@ fn save_through_worker_roundtrips() {
     assert_eq!(published_text(&client2, 0, 0), "hello");
 }
 
+/// A merge created **in-app** — via the real `Command::MergeCells` seam the UI uses — survives an
+/// xlsx save → reopen. Reopening through a **genuinely separate** worker/model restores the region
+/// with exact A1:B2 geometry in the resident merge cache, keeps the anchor value, and leaves the
+/// covered cell cleared. Teeth: it fails if merge xlsx persistence (write or re-read) regresses
+/// (merged-cell-ui `architecture.md §10`, `functional_spec.md F2`).
+#[test]
+fn in_app_created_merge_survives_xlsx_roundtrip() {
+    let area = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 1)); // A1:B2, 0-based FreeCell
+
+    // --- Session 1: seed A1 (anchor) + B2 (covered), merge A1:B2, save to xlsx. ---
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    client.send(set_input(sheet, 0, 0, "anchor"));
+    client.send(set_input(sheet, 1, 1, "covered"));
+    poll_until(
+        || published_text(&client, 0, 0) == "anchor" && published_text(&client, 1, 1) == "covered",
+        "the anchor + covered seeds should publish",
+    );
+
+    // B2 carries content, so this is a data-losing merge — send it CONFIRMED (the real UI's
+    // post-dialog re-send) so it applies rather than replying `MergeNeedsConfirm`.
+    client.send(Command::MergeCells {
+        sheet,
+        area,
+        confirmed: true,
+    });
+    // Confirm the merge actually took in-session BEFORE saving: the resident cache carries the
+    // region (exact geometry) and the covered cell has been cleared.
+    poll_until(
+        || {
+            let merged = client
+                .caches()
+                .read()
+                .get(sheet)
+                .map(|c| c.merges().to_vec() == vec![area])
+                .unwrap_or(false);
+            merged && published_text(&client, 1, 1).is_empty()
+        },
+        "the in-app merge should apply (region resident, covered cell cleared)",
+    );
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("merged.xlsx");
+    client.send(Command::Save {
+        path: path.clone(),
+        req_id: 1,
+    });
+    assert!(
+        wait_for(&rx, |e| matches!(e, WorkerEvent::Saved { req_id: 1, .. })).is_some(),
+        "the save should ack",
+    );
+    assert!(path.exists());
+
+    // --- Session 2: reopen the saved file through a GENUINELY SEPARATE worker/model. ---
+    let (client2, rx2, sheets2) = spawn(DocumentSource::OpenFile(path));
+    let sheet2 = sheets2[0].id;
+    client2.send(Command::SetViewport {
+        sheet: sheet2,
+        rows: 0..4,
+        cols: 0..4,
+    });
+    assert!(wait_for(&rx2, |e| matches!(e, WorkerEvent::Published)).is_some());
+
+    // The region survived with EXACT A1:B2 geometry (0-based) in the reopened resident merge cache.
+    let caches = client2.caches();
+    let guard = caches.read();
+    let cache = guard
+        .get(sheet2)
+        .expect("the reopened active sheet's cache is resident");
+    assert_eq!(
+        cache.merges(),
+        &[area],
+        "the in-app merge round-trips through xlsx with exact A1:B2 geometry",
+    );
+    drop(guard);
+
+    // The anchor value is retained; the covered cell stays cleared after the reopen.
+    assert_eq!(
+        published_text(&client2, 0, 0),
+        "anchor",
+        "the anchor value survives the xlsx round-trip",
+    );
+    assert_eq!(
+        published_text(&client2, 1, 1),
+        "",
+        "the covered cell remains cleared after reopen",
+    );
+}
+
 #[test]
 fn save_atomic_on_failure_leaves_destination_untouched() {
     let (client, rx, sheet) = spawn_new();

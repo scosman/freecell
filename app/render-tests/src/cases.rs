@@ -1646,6 +1646,135 @@ pub fn all() -> Vec<RenderCase> {
                 ),
             GRID_VP,
         ),
+        // ---- Merged cells (merged-cell-ui P2, `functional_spec.md F1`, `architecture.md §6`) ----
+        // Each merge is created through the REAL `Command::MergeCells` (`Scene::merge`), so the
+        // rebuilt cache carries the live merge list the grid renders as one box — the same resident
+        // state a file-loaded `<mergeCells>` produces, so these baselines cover both sources (F1).
+        //
+        // A 2×3 merge: the anchor's text is drawn once across the whole box, the interior gridlines
+        // are suppressed (the region reads as one cell), and the surrounding empty cells keep their
+        // gridlines. The must-have "render a merge as one box" proof.
+        RenderCase::new(
+            "merge_basic_box",
+            Scene::new()
+                .input(1, 1, "Merged region")
+                .merge(CellRange::new(CellRef::new(1, 1), CellRef::new(2, 3))),
+            GRID_VP,
+        ),
+        // A 2×2 merge showing the box takes the ANCHOR's fill (yellow) and the anchor's own centered
+        // alignment across the whole span (we do not add a "center on merge" behavior — the anchor's
+        // h/v-align governs).
+        RenderCase::new(
+            "merge_fill_center",
+            Scene::new()
+                .input(1, 1, "Center")
+                .fill(1, 1, 0xFFEB3B)
+                .align(1, 1, Align::Center)
+                .merge(CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2))),
+            GRID_VP,
+        ),
+        // A 1×4 horizontal "title bar" merge (bold, centered) at B1:E1 — the file-loaded merged-header
+        // look, and a horizontal span distinct from the multi-row cases. A1 stays the default active
+        // cell (outside the merge), so its 1×1 outline sits to the left of the header box.
+        RenderCase::new(
+            "merge_wide_header",
+            Scene::new()
+                .input(0, 1, "Quarterly Report")
+                .bold(0, 1)
+                .align(0, 1, Align::Center)
+                .merge(CellRange::new(CellRef::new(0, 1), CellRef::new(0, 4))),
+            GRID_VP,
+        ),
+        // A single selection ON a merge anchor (B2 of the B2:C3 region): the active-cell outline
+        // spans the WHOLE region box, and there is no translucent range fill (a lone selection on a
+        // region shows just the spanned outline). The fill handle sits at the region's bottom-right.
+        RenderCase::new(
+            "merge_active_outline",
+            Scene::new()
+                .input(1, 1, "Active")
+                .merge(CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2))),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (1, 1))),
+        // A range selection whose raw rectangle (A1:C3) CUTS a horizontal merge (B2:D2): the painted
+        // selection snaps out to whole regions, so the translucent fill + 2 px border span A1:D3 (one
+        // column wider than the raw drag) with no partial-region sliver. The active cell (A3) is a
+        // normal cell, so its outline stays 1×1.
+        RenderCase::new(
+            "merge_range_selection",
+            Scene::new()
+                .input(1, 1, "Merged")
+                .merge(CellRange::new(CellRef::new(1, 1), CellRef::new(1, 3))),
+            GRID_VP,
+        )
+        .selection(sel((0, 2), (2, 0))),
+        // A tall merge (rows 2–30) scrolled so its ANCHOR (row 2) is off-screen above the viewport:
+        // the region box still draws (keyed on `visible_merges`, not the anchor), and the anchor's
+        // content resolves from the off-screen anchor's snapshot — the visible bottom of the box
+        // shows it. Guards the scroll-boundary / off-screen-anchor path (`architecture.md §6`).
+        RenderCase::new(
+            "merge_scroll_boundary",
+            Scene::new()
+                .input(2, 1, "Tall merge anchor")
+                .merge(CellRange::new(CellRef::new(2, 1), CellRef::new(30, 2))),
+            GRID_VP,
+        )
+        .reveal(30, 1),
+        // ---- Merge × freeze interaction (merged-cell-ui × freeze-panes) ----------------------
+        // The two feature sets compose: `visible_merges` spans the quadrant UNION (not just the
+        // body), the region-box pass emits into every quadrant clipped to its `dest`, and a merge
+        // anchor above/left of a quadrant must not underflow the border-ownership helpers. These
+        // three guard the interaction the individual `merge_*` / `freeze_*` cases each miss.
+        //
+        // A merge INSIDE the frozen top band (B1:D1 under M=2), body scrolled deep: the title box
+        // stays pinned and renders as ONE box (not three cells with interior gridlines). Regression
+        // for the body-range-keyed `visible_merges` that could never match a band-confined region.
+        RenderCase::new(
+            "merge_in_frozen_band",
+            labeled(Scene::new(), 0, 30, 0, 8)
+                .input(0, 1, "Frozen title")
+                .align(0, 1, Align::Center)
+                .bold(0, 1)
+                .merge(CellRange::new(CellRef::new(0, 1), CellRef::new(0, 3)))
+                .frozen_rows(2),
+            GRID_VP,
+        )
+        .reveal(20, 0),
+        // A merge STRADDLING the horizontal freeze divider (A1:A6 across M=2): the box is split by
+        // the divider, its frozen slice pinned and its body slice scrolling, the two joining across
+        // the divider. Also covers the active-cell outline being drawn per-quadrant (a region
+        // outline anchored in the band must still draw its body-side slice).
+        RenderCase::new(
+            "merge_straddles_freeze_divider",
+            labeled(Scene::new(), 0, 24, 0, 8)
+                .input(0, 0, "Straddle")
+                .merge(CellRange::new(CellRef::new(0, 0), CellRef::new(5, 0)))
+                .frozen_rows(2),
+            GRID_VP,
+        )
+        .selection(sel((0, 0), (0, 0))),
+        // A BORDERED merge whose anchor sits above the body quadrant (A1:A6 with an explicit
+        // top+left border on the anchor, M=2): the region-box pass hands that off-quadrant anchor to
+        // the border-ownership helpers. Regression for the `u32` underflow panic that fired whenever
+        // `anchor.row == 0` while `quad.rows.start >= 1`.
+        RenderCase::new(
+            "merge_bordered_anchor_above_body",
+            labeled(Scene::new(), 0, 24, 0, 8)
+                .input(0, 0, "Bordered")
+                .border(
+                    0,
+                    0,
+                    BorderSpec {
+                        top: edge(2),
+                        left: edge(2),
+                        ..BorderSpec::NONE
+                    },
+                )
+                .merge(CellRange::new(CellRef::new(0, 0), CellRef::new(5, 0)))
+                .frozen_rows(2),
+            GRID_VP,
+        )
+        .reveal(12, 0),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

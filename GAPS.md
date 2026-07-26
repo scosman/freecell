@@ -37,7 +37,7 @@ these are presentation / entry-point behaviors consciously deferred. Each also a
 | 1 | **Type-based default cell alignment** — numbers/dates right, booleans/errors center | §3.6 | Moderate | ✅ **Resolved (mvp-gaps Phase 1)** — `PublishedCell.kind` is published and the grid aligns by type when no explicit alignment is set; explicit alignment still wins | `PublishedCell` carries only a display string, no value type | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
 | 2 | **`[Red]` number-format text color** | §3.6 | Mild | ✅ **Resolved (mvp-gaps Phase 1)** — the worker resolves per-cell `text_color` (explicit font colour → number-format colour); `[Red]` negatives render red | Worker doesn't publish resolved per-cell color | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
 | 3 | **Input-cap rejection message text** — "Formula too long / too deeply nested" popover | §3.3 | Mild | ✅ **Resolved (mvp-gaps Phase 1 + 2)** — a tooltip-style popover shows the length/depth reason under the **data row** (Phase 1) and the **in-cell editor** (Phase 2); dismisses on the next keystroke/focus change | `DataRowEffect::ShowCapError` was a no-op in the chrome; message-popover not built | *inline below* |
-| 4 | **macOS Finder open-file** — double-click / `open -a` / drag-onto-Dock | §2.1 | Moderate | Only the **CLI-argv** open path is wired; the primary-platform "double-click a file" flow does not open it | Pinned gpui rev's `on_open_urls` callback lacks a context (`cx`) arg | *inline below* |
+| 4 | **macOS Finder open-file** — double-click / `open -a` / drag-onto-Dock | §2.1 | Moderate | ✅ **Resolved (xlsx-file-association)** — an OS `file-associations` declaration registers `.xlsx`/`.csv`, and a macOS Apple-Event bridge (`shell/open_files.rs` `install_finder_open`) routes Finder opens through the existing `open_path` funnel; argv already covered Windows/Linux/CLI | Pinned gpui rev's `on_open_urls` callback lacks a context (`cx`) arg — bridged via an async channel + deferred dispatch | *inline below* |
 | 5 | **Bundled Inter font** — ship Inter via `add_fonts` at startup | §3.3/§3.6 | Nicety (not a functional gap) | ✅ **Resolved (2026-07-06)** — Inter (SIL OFL) vendored at `crates/freecell-app/assets/fonts/inter/` and registered at startup (`shell/fonts.rs`); grid + chrome render Inter on every platform, and baselines were regenerated on it | (was) Fonts not vendored; `register_fonts` was a documented no-op | [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md) |
 
 ### Detail for the two without a dedicated note
@@ -52,16 +52,19 @@ popover below the active editor with the reason string (length vs depth), on the
 change (`chrome/view.rs` `cap_error*` state + `cap_error_visible()`, tested via
 `edit_rejected_input_cap_flags_chrome_data_row` + the `input_cap.rs` unit tests).
 
-**#4 — macOS Finder open-file (§2.1).**
-`main.rs` wires only `xlsx_arg` (CLI argv). Opening a `.xlsx` from Finder
-(double-click, drag onto the Dock icon, `open -a FreeCell book.xlsx`) does nothing on
-macOS — the primary design target. The pinned gpui rev's `on_open_urls` callback
-signature lacks the `cx` needed to route the open through `FreeCellApp`. Work when
-picked up: this is likely a **spike** first — check whether a newer gpui rev gives
-`on_open_urls` a context arg (or an alternative hook), or bridge via an app-global +
-deferred dispatch; then map the incoming URLs through the existing `do_open_path`
-(canonicalize → dedupe → open) that CLI-argv already uses. Verify on real macOS
-(smoke item **M-15** in `specs/projects/mvp/smoke_checklist.md`).
+**#4 — macOS Finder open-file (§2.1). ✅ RESOLVED (`specs/projects/xlsx-file-association`).**
+Originally only `main.rs`'s CLI-argv path was wired, so opening a `.xlsx`/`.csv` from Finder
+(double-click, drag onto the Dock, `open -a FreeCell book.xlsx`) did nothing on macOS — the
+primary design target — because the pinned gpui rev's `App::on_open_urls` callback is
+`FnMut(Vec<String>)` with no `cx`. The xlsx-file-association project closed this in two commits:
+**Phase 1 (`84785fa`)** declares the OS association via a shared
+`[[package.metadata.packager.file-associations]]` block for `.xlsx` + `.csv`
+(`crates/freecell-app/Cargo.toml`), and **Phase 2 (`f2e72cc`)** adds the macOS Apple-Event
+bridge (`crates/freecell-app/src/shell/open_files.rs` — `install_finder_open` forwards the
+cx-less callback's URL strings onto an async channel that a spawned app task drains through the
+existing `FreeCellApp::open_path` funnel, honoring the no-welcome-flash startup requirement).
+Windows/Linux/CLI were already covered by `main.rs::open_arg` → `open_path`. A final macOS
+hardware smoke (item **M-15** in `specs/projects/mvp/smoke_checklist.md`) is non-blocking.
 
 ### Intentional MVP scope exclusions (NOT gaps — deliberate, listed for completeness)
 
@@ -76,9 +79,10 @@ deferred dispatch; then map the incoming URLs through the existing `do_open_path
 ### When picking these up
 
 Items **#1, #2, and #3 are RESOLVED** by the `specs/projects/mvp-gaps` build (Phases 1–2 —
-publication type/color + type-aware alignment + the cap-error popover), and **#5 (bundled
-Inter font) is RESOLVED** (vendored + registered 2026-07-06). **Still open:** #4 only
-(macOS Finder open-file — needs a gpui-capability spike before estimating).
+publication type/color + type-aware alignment + the cap-error popover), **#5 (bundled Inter
+font) is RESOLVED** (vendored + registered 2026-07-06), and **#4 (macOS Finder open-file) is
+RESOLVED** by `specs/projects/xlsx-file-association` (Phases 1–2, commits `84785fa` + `f2e72cc`).
+**None of the five remain open.**
 
 ---
 
@@ -286,6 +290,23 @@ a defect — the symmetric counterpart to that gated-border behavior.
 |---|---|---|---|---|
 | C-FB5-1 | **A recolored series' imported `<c:marker>/<c:spPr>` fill is left on its original color on save.** When a `SeriesColor` edit recolors an imported series, the save patch rewrites the series' `spPr/solidFill` (plus, for line/scatter, its `a:ln/solidFill`) — but **not** the per-marker fill nested in that series' `<c:marker><c:spPr>`. A third-party Excel reopen, which honors the marker's own `spPr`, then shows the data-point markers still painted the **imported** color while the line/fill shows the new one. | Mild — **third-party-Excel-only; FreeCell round-trips correct.** FreeCell's chart model carries no per-marker color, so the renderer paints markers in the **resolved series color** (`effective_series_color`): inside the app, and on any save→reopen through FreeCell's own loader, an edited series' markers recolor correctly. The residual is purely a cosmetic marker-vs-line color mismatch visible only when the saved `.xlsx` is opened in another app. Never affects FreeCell rendering or data. | In the series-color save arm (`patch_series_color` / `collect_chrome_edits`), also upsert the edited series' `<c:marker>/<c:spPr>` `solidFill` (and any marker `a:ln/solidFill`) to the new color, mirroring the shape-fill patch. Symmetric to the gated `a:ln` border fix (that one says "leave a filled type's border alone"; this says "also repaint the marker fill") — both close the same class of third-party-Excel-only imported-color drift. Deferred: cosmetic, third-party-only, and no committed fixture exercises a per-marker `spPr` on an edited series. |
 
+### Charts — `multiLvlStrRef` category axis ignored → supported chart shows "Unsupported" (2026-07-18)
+
+Surfaced tuning the bundled demo workbook: sheet 4's **area** chart (a fully supported type) rendered
+the **"Unsupported chart type" placeholder** solely because its category axis was encoded as
+`<c:multiLvlStrRef>`/`<c:multiLvlStrCache>` (hierarchical categories — a shape Excel and other tools
+emit for a normal single-level axis) instead of `<c:strRef>`/`<c:strCache>`. This is a **real engine
+loader gap**, not demo-specific: any real file whose category axis uses `multiLvlStrRef` loads with
+**empty categories**, and an **area or bar** plot builder then bails to the placeholder (a line chart
+degrades differently — missing category labels, not the placeholder). The demo asset was worked around
+with a **content edit** (rewrote its `<c:cat>` to a plain `strRef`); the engine fix below is tracked
+as **v0.5** (a normal chart in a real file showing "Unsupported" is a first-hour embarrassment).
+See the [v0.5 tier row](#v05--table-stakes-for-pretty-good-target-90-at-great-ux).
+
+| # | Item | Severity | Root cause / current behavior | Follow-up if needed |
+|---|---|---|---|---|
+| C-ML-1 | **A category axis encoded as `<c:multiLvlStrRef>`/`<c:multiLvlStrCache>` loads as empty categories, so an area or bar chart falls back to the "Unsupported chart type" placeholder.** `chart::load::cache_points` (used by `ref_categories`/`ref_strings`/`ref_numbers`) only searches for a `strCache`/`numCache` descendant under a `c:cat` holder; a `multiLvlStrCache` (whose points live one level deeper, under `<c:lvl>`) matches neither, so `ref_categories` returns `Vec::new()`. The chart still `parse_chart_xml`-parses (kind + series values are read), but with **empty categories** the app's plot builder bails: `AreaPlot::from_chart` (`freecell-app/src/chart/area.rs`) and `BarPlot::from_chart` (`bar.rs`) both return `None` on `categories.is_empty()` → the grid draws the placeholder. **Verified for area (the demo's case) and bar; the demo's fix is content-only.** A **line** chart has no such `is_empty` guard, so it would degrade differently (blank/absent category labels, not the placeholder) — its exact behavior is unverified here. **v0.5** — a normal area/bar chart in a real Excel/Numbers file reads as broken. | **Moderate** (a supported area/bar chart silently shows "Unsupported" whenever the file uses the hierarchical-category encoding; no data loss — save byte-preserves the source). | `cache_points` is single-level only; the OOXML `multiLvlStrCache` nests `<c:pt>` under one `<c:lvl>` per axis level (and its `ptCount` sits on the cache, not the level). No code path flattens or selects a level. | Teach `cache_points` (or `ref_categories`) to fall back to `multiLvlStrCache` when no `strCache`/`numCache` is present: read the innermost/most-specific `<c:lvl>`'s `<c:pt>` points (a single-level axis has exactly one `<c:lvl>`) and, ideally, read the referenced category cells for correct order (the cache can be malformed/reversed — the demo's was). Optionally join multiple levels for a genuinely hierarchical axis. Upstream in the fork per CLAUDE.md if the parse lives in IronCalc; here it is FreeCell's own chart loader. |
+
 ### `mvp-gaps` UI review — accepted limitations (owner-approved 2026-07-06)
 
 Two judgment calls from the post-Phase-8 **UI-review bug-fix round**, reviewed and accepted by
@@ -391,6 +412,7 @@ Ordered roughly by how fast a new user hits the gap.
 | **Status bar with selection stats** (Sum · Avg · Count, click for Min/Max) | **NEW** (checked: no status bar exists) | Hallmark great-UX cheap win — everyone totals a selection this way. Values are already in the published viewport; render-side only. |
 | **Number-format preset breadth** (thousands-separator style, currency-symbol choice, more date/time forms, scientific; **fraction deferred to v1.0** — engine can't render `?/?`) | **NEW** (checked: 7 presets + decimals ± only, `freecell-core/format_ui.rs:42`) | Engine renders arbitrary format codes already — this is purely widening the UI preset list. (Custom format-code **editor** = v1.0.) |
 | **Conditional formatting** (rules: cell-value, top/bottom, data bars, color scales; render + round-trip) | **First pass shipped** (`specs/projects/conditional-formatting`, 2026-07-17) — see the [Conditional Formatting deferred-behaviors section](#conditional-formatting--first-pass-shipped-deferred-behaviors-2026-07-17) | **Highlight (classic) rules + color scales** ship with **full rule management** (list/add/edit/delete/reorder), a right-docked sidebar (reusable `docked_sidebar` container + action-bar `split` button), **value-dependent live** grid render, and `.xlsx` round-trip — the bulk of this v0.5 row. **Data bars / icon sets / ratings** (each a new in-cell grid primitive) are deferred → **v1.0** (project phases P11–P13, gaps CF1–CF3); authoring/fidelity residuals CF4–CF8 are v1.0 polish. Engine side was already done in the IronCalc fork. |
+| **Charts — `multiLvlStrRef` category axis loads empty** (a supported **area or bar** chart shows the "Unsupported chart type" placeholder when a real file encodes its category axis as `multiLvlStrRef`/`multiLvlStrCache`) | **NEW** (2026-07-18, demo tuning) — see the [Charts multiLvlStrRef gap](#charts--multilvlstrref-category-axis-ignored--supported-chart-shows-unsupported-2026-07-18) | First-hour embarrassment: a normal area/bar chart in an opened Excel/Numbers file reads as **"Unsupported"** because `chart::load::cache_points` (→ `ref_categories`) only reads `strCache`/`numCache`, so a hierarchical `multiLvlStrCache` axis loads as **empty categories** and the area/bar plot builder bails to the placeholder (a line chart degrades differently — missing category labels, not the placeholder). Content-fixed in the bundled demo (`<c:cat>` rewritten to a plain `strRef`); the **engine fix** is small — fall back to `multiLvlStrCache` (read the innermost `<c:lvl>` points; ideally read the referenced category cells for correct order). |
 | **Paste values** (⌘⇧V minimum paste-special) | **NEW** (checked: Shift+V reserved but unbound, `grid/input.rs:66`) | "Paste without formatting / without formulas" is a daily op. Full paste-special dialog = v1.0. |
 | **CSV/TSV import + export** | **Shipped v0.5** (import-as-untitled + export-a-copy, comma-only, en-locale; `gaps_closing_7_15` Phase 2) | Opening a downloaded `.csv` is a top-3 home task. Import reuses TSV-paste-style user-input typing; export walks the used range writing raw stored values. Remaining: true csv save-in-place (v1.0). |
 | **CSV comma-decimal-locale delimiter** (localization follow-on) | **NEW** (latent; blocked by en-only locale today) | CSV export renders numbers with the workbook locale's decimal separator (`document.rs::export_cell_value`); in a comma-decimal locale (e.g. `de`) `0.5 → "0,5"` collides with the comma delimiter and re-imports as text. Fix in the **Localization pass** (below): switch the delimiter to `;` for comma-decimal locales, both directions. |
@@ -398,7 +420,7 @@ Ordered roughly by how fast a new user hits the gap.
 | **Formula range highlighting + point-mode** (colored refs while editing; click/drag a range to insert it) | **NEW** (checked: no reference-insert / highlight code) | The other half of formula-entry UX; without point-mode every formula must be typed by hand. Engine's public `Lexer`/`Parser` AST can drive tokenization. |
 | **Missing everyday scalar functions + TRIM bug** (SUMPRODUCT, TRANSPOSE, PROPER, REPLACE, CHAR, CODE, CLEAN, DOLLAR, ADDRESS, HYPERLINK-fn, PERCENTILE.INC, QUARTILE.INC, XMATCH; TRIM doesn't collapse internal runs) | Partially (round-2 SP3 findings; not previously in GAPS) | ~14 independently-implementable engine functions — clean one-per-PR upstream candidates per the fork policy. SUMPRODUCT/TRANSPOSE absence bites real home sheets. |
 | **Render-fidelity polish pair** (fill covers interior gridlines; full-row selection darkens row header) | Above (render-baseline eyeball 2026-07-06) | Both cheap, both instantly visible quality signals. |
-| **macOS Finder open-file** (double-click / drag-to-Dock) | Above (MVP #4) | Primary-platform basics; needs the gpui `on_open_urls` spike first. |
+| **macOS Finder open-file** (double-click / drag-to-Dock) | **Shipped** (`specs/projects/xlsx-file-association`, 2026-07-24 — commits `84785fa` + `f2e72cc`) | OS file associations for `.xlsx`/`.csv` (cargo-packager declaration) + a macOS Apple-Event bridge (`shell/open_files.rs`) routing Finder opens through `open_path`; argv already covered Windows/Linux/CLI. Final macOS hardware smoke (M-15) is non-blocking. |
 
 ### v1.0 — the 95% bar (home users fully happy)
 
@@ -431,6 +453,8 @@ Ordered roughly by how fast a new user hits the gap.
 | **Gridlines toggle** (per-sheet, persisted) | **NEW** (checked: gridlines unconditional in `grid/mod.rs`; engine models `set_show_grid_lines` + round-trips) | Small; engine-ready. |
 | **Entry shortcuts bundle** (F4 abs/rel reference cycling, Ctrl+Enter fill-selection, ⌘;/⌘⇧; date/time stamps) | **NEW** | Small individually; batch them like feature-gaps-7-11. |
 | **Show formulas toggle** (⌘`) | **NEW** | Cheap view mode; pairs with formula-UX work. |
+| **In-editor rich text formatting** — ref-token coloring, backgrounds, Excel/Numbers/Sheets-like styling — via a **FreeCell-owned styled text-input control** | **NEW** (split from `formula-point-mode`, 2026-07-18) | gpui-component's `InputState` is closed to external per-range styling (no public styling API, private layout, `code_editor` takes only a built-in language name) and we won't add a second maintained fork; needs our own text-input control over gpui primitives (re-homes autocomplete/cap-error/quick-edit/two-editor-sync; pixel-suite scope). The v0.5 `formula-point-mode` project already computes the token→color map this consumes. [`projects/styled-text-input-control.md`](projects/styled-text-input-control.md) |
+| **Cross-sheet point-mode insertion** — click another sheet's tab mid-formula, then a cell on that sheet, to insert a qualified `Sheet2!A1` reference | **NEW** (deferred from `formula-point-mode` v0.5, `specs/projects/formula-point-mode/functional_spec.md §6`) | v0.5 point-mode is **same-sheet only**: it inserts no sheet qualifier, and clicking a different sheet's tab mid-formula follows ordinary tab-switch behavior (no cross-sheet insert). **Asymmetry:** the shared token→color map still assigns a color to already-typed cross-sheet refs (`Sheet2!A1`) — consumed by the future in-editor styled text-input control — but v0.5 draws **no cross-sheet grid highlight** (the other sheet isn't on screen) and inserts **no** cross-sheet reference; only same-sheet insertion + same-sheet highlights ship. Needs mid-formula sheet-switch routing that keeps the edit open plus a qualified-ref insert path. |
 | **Cross-app file-fidelity defaults** (persist `sheetFormatPr` defaults + workbook font; Excel-like default column width on foreign files; Inter fallback for missing explicit fonts) | Above ("Engine defaults — cross-app fidelity") | Three known rows; fork + FreeCell halves already sketched. |
 | **Action-bar overflow** (small windows) + **TSV-paste empty-token clearing** | Above (accepted deviations) | Both small; fold into a polish batch. |
 | **Incremental / interruptible recalc** | **NEW as a logged gap** (plan-of-record caveat: every edit runs full-workbook `evaluate()`, ~2s at 1M cells, non-cancellable — round-2 synthesis "source of every caveat") | Orthogonal to feature coverage but core to the product promise ("stupid-fast on huge sheets") — a v1.0 quality bar. Engine-side (fork/upstream) dirty-graph or at least cancellable eval. |

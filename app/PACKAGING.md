@@ -6,8 +6,8 @@ FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-pack
 | Platform | Formats | Status |
 |---|---|---|
 | macOS | `.app` bundle + `.dmg` | **Supported** (primary target) |
-| Linux | `.deb` + `.AppImage` | **Supported** |
-| Windows | NSIS setup `.exe` | **Experimental / non-blocking** (see below) |
+| Linux | `.deb` + `.AppImage` | **Supported** (native **x64 + arm64**) |
+| Windows | NSIS setup `.exe` | **Supported** (see below) |
 
 > **All builds are UNSIGNED dev builds.** They are **not** for public distribution yet.
 > macOS Gatekeeper will block an unsigned `.app`/`.dmg` (right-click → **Open** to run
@@ -22,15 +22,37 @@ FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-pack
 The packager config is `[package.metadata.packager]` in
 [`crates/freecell-app/Cargo.toml`](crates/freecell-app/Cargo.toml). cargo-packager reads it
 via `cargo metadata`, so it auto-fills the version (workspace `0.1.0`) and auto-detects the
-`freecell` binary — the config only sets product name, bundle identifier
-(`com.scosman.freecell`), category, description, homepage, and the icon list.
+`freecell` binary — the config sets product name, bundle identifier
+(`net.scosman.freecell`), category, short + long description, authors (the deb
+`Maintainer:`), homepage, and the icon list.
 
 Package **formats are chosen per-OS by the scripts** (`--formats`), not pinned in the
 config, so the same config serves all platforms.
 
+**Linux App Center / GNOME Software metadata.** The `[package.metadata.packager.deb]`
+sub-table sets `package-name = "freecell"` (the `Package:` control field — cargo-packager's
+default kebab-cased it to `free-cell`) and ships an **AppStream metainfo** file,
+[`packaging/linux/net.scosman.freecell.metainfo.xml`](crates/freecell-app/packaging/linux/net.scosman.freecell.metainfo.xml),
+into `/usr/share/metainfo/`. App Center reads that metainfo in preference to the bare
+Debian control fields, which is what gives the store view the proper name (**FreeCell**),
+license (**MIT OR Apache-2.0** — a Debian control file has no license field), and rich
+description. Keep the metainfo `<summary>` in sync with the packager `description`; keep the
+description ASCII (a Unicode em-dash rendered as `??` in App Center's synopsis).
+
 **Gotcha worth knowing:** cargo-packager `cd`s into the crate manifest directory
 (`crates/freecell-app/`) before packaging, so the `icons` paths in the config are relative
 to *that* directory (`packaging/icons/...`), not the workspace root or your shell's CWD.
+
+**Linux window-icon gotcha.** cargo-packager derives the installed Linux **desktop-entry id
+and icon name from the *binary name*** — it ships `usr/share/applications/freecell.desktop`
+with `Icon=freecell` and hicolor icons named `freecell.png`, *not* from the reverse-DNS
+`identifier`. GNOME maps a running window to its launcher (and thus its dock icon + app name)
+by the window's `app_id` (Wayland) / `WM_CLASS` (X11). So the app sets its Linux `app_id` to
+**`freecell`** (`window_app_id()` in `shell/app.rs`) to match that desktop-entry id — *not*
+`net.scosman.freecell`. Pointing `app_id` at the reverse-DNS identifier (which has no matching
+installed `.desktop`) makes GNOME show a **generic icon labelled with the raw app_id** — even
+for a correctly-installed `.deb`. Keep `window_app_id()` equal to the binary name. (The
+reverse-DNS `identifier` is still the macOS/Windows bundle id, where that form is required.)
 
 Icons are final — see
 [`crates/freecell-app/packaging/icons/README.md`](crates/freecell-app/packaging/icons/README.md)
@@ -83,32 +105,33 @@ FREECELL_PACKAGE_OUT_DIR=/tmp/pkgs scripts/package.sh
 - a **version tag push** matching `v*` (e.g. `git tag v0.1.0 && git push --tags`), or
 - **manual dispatch** (Actions → *release* → *Run workflow*).
 
-It has three jobs — **macOS** and **Linux** (required), **Windows** (`continue-on-error`,
-never gates a release). Each installs the pinned toolchain + cargo-packager, then calls the
-**same** `scripts/package.*` used locally, and uploads the result as a workflow **artifact**
-(`freecell-macos` / `freecell-linux` / `freecell-windows`), downloadable from the run page.
-No GitHub Release object is created or attached.
+It has three job definitions — **macOS**, **Linux**, and **Windows** (all required); Linux
+fans out to two runners, so a run shows four job instances. The Linux job is a **matrix over two native runners** —
+`ubuntu-24.04` (x64) and `ubuntu-24.04-arm` (arm64) — so each architecture is a true native
+build, not a cross-compile. Each leg installs the pinned toolchain + cargo-packager, then
+calls the **same** `scripts/package.*` used locally, and uploads the result as a workflow
+**artifact** (`freecell-macos` / `freecell-linux-x64` / `freecell-linux-arm64` /
+`freecell-windows`), downloadable from the run page. No GitHub Release object is created or
+attached.
 
-## Windows: what a real port needs
+## Windows
 
-Windows is **out of scope** for the app today, and this task did **not** make it a real
-target — it wires the *packaging* so it's ready, but the build is not guaranteed to compile.
-Concretely, before Windows is real:
+Windows is a **first-class, working target**: it compiles, packages the NSIS `.exe` (via
+`scripts/package.ps1`), and its `release` CI job is **required** — a packaging failure gates
+the release exactly like macOS and Linux (CI green + local build confirmed 2026-07-24).
 
-1. **GPUI backend.** `app/Cargo.toml` pins `gpui_platform` with the `x11`, `wayland` (Linux)
-   and macOS/Metal backends only. Windows GPUI renders via **DirectX**; the platform crate
-   and its features must be configured for `target_os = "windows"` (a `[target.'cfg(...)']`
-   split of the `gpui`/`gpui_platform` deps), and the known-good gpui/gpui-component rev
-   pair must actually support the Windows backend at that pin.
-2. **Platform code paths.** Anything currently `#[cfg]`-gated to macOS/Linux (menus vs. no
-   menu bar, `Cmd` vs `Ctrl`, file dialogs, fonts, the `--exit-after-ms` render valve) needs
-   a Windows arm. Expect compile errors to flush these out one by one.
-3. **System integration.** File associations for `.xlsx`, per-monitor DPI, and the installed
-   app's data paths (the NSIS `appdata-paths` config) want a real look.
-4. **Then** flip the Windows CI job off `continue-on-error` and drop this section.
+**File associations are wired.** The shared
+[`[[package.metadata.packager.file-associations]]`](crates/freecell-app/Cargo.toml) block
+(two entries — `.xlsx`, `.csv`) makes cargo-packager emit the Windows NSIS registry ProgId +
+`shell\open\command`, and the delivered path reaches the app through `main.rs::open_arg` →
+`FreeCellApp::open_path` (process **argv** — the Explorer double-click / Open-With / shell-arg
+flows). See [`specs/projects/xlsx-file-association/`](../specs/projects/xlsx-file-association)
+(Phase 1, commit `84785fa`).
 
-The experimental Windows CI job + `scripts/package.ps1` exist so that, once the port
-compiles, producing an installer is already a solved problem. Tracked in
+What remains is not build work: a Windows **hardware smoke** of the installed NSIS build
+(double-click + Open-With), complementary to the CI green build, and Authenticode **signing**
+(deferred with the rest of signing — see below). Any residual per-monitor-DPI / installed-app
+data-path polish is tracked in
 [`projects/windows-port.md`](../projects/windows-port.md).
 
 ## Signing (deferred)
@@ -125,9 +148,9 @@ distribution blocker is already handled — replaced by permissively-licensed no
 
 ## Verification status
 
-**Verified locally (cargo-packager 0.11.8, built on Linux):**
+**Verified locally (cargo-packager 0.11.8, built on Linux x64):**
 
-- `.deb` — installs the binary, desktop entry, and all hicolor icon sizes (16→512 +
+- `.deb` (x64) — installs the binary, desktop entry, and all hicolor icon sizes (16→512 +
   `256x256@2`), with a correct control file.
 - macOS `.app` bundle — gets the `.icns` in `Contents/Resources` and a correct `Info.plist`
   (identifier, product name, `public.app-category.productivity`). *Built* on Linux; not yet
@@ -140,7 +163,11 @@ distribution blocker is already handled — replaced by permissively-licensed no
   validation env).
 - `.AppImage` (needs linuxdeploy + network; the Linux job installs `file`, `patchelf`, and
   `libfuse2t64` as FUSE insurance — see the caveat below).
-- NSIS `.exe` (Windows, experimental — see the Windows section).
+- The **arm64** `.deb` + `.AppImage` — same config, first built natively on the
+  `ubuntu-24.04-arm` matrix leg when the `release` workflow runs (never validated locally in
+  the x64 env above).
+- NSIS `.exe` (Windows — see the Windows section; first assembled when the `release` workflow
+  runs on Windows, or when you run `scripts/package.ps1` on Windows).
 
 So the first `v*` tag is the first time `.dmg` / `.AppImage` / `.exe` are actually
 assembled. The macOS + Linux jobs run under `set -euo pipefail`, so a format-tool failure

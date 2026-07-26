@@ -318,6 +318,16 @@ pub enum Command {
         end: u32,
         hidden: bool,
     },
+    /// Set the frozen-rows and/or frozen-columns count on `sheet` (`freeze-panes`
+    /// `architecture.md §2.1`). Each `Some` field rides the engine's undoable setter; the UI sends
+    /// exactly ONE axis per action (the other is `None`) so it is one undo step. Geometry-only (no
+    /// evaluation — freeze never changes values); the sheet cache is rebuilt (it re-reads the
+    /// worksheet's `frozen_rows`/`frozen_columns`).
+    SetFrozen {
+        sheet: SheetId,
+        rows: Option<u32>,
+        cols: Option<u32>,
+    },
     /// Insert `count` blank rows so new rows appear at 0-based `row` (`functional_spec.md §5.3`);
     /// content at/after `row` shifts down and formulas adjust. Undoable; needs evaluation. The
     /// worker **merge-guards** it first (a merge at/after `row` → [`EditRejectedReason::MergedCells`]

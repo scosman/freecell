@@ -46,10 +46,12 @@ pub use cond_fmt::{
     CfValueOp,
 };
 pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};
+pub use functions::is_reference_ready;
 pub use merge::{anchor_of, blocks_fill, expand_to_regions, region_at, regions_intersecting};
+pub use palette::assign_ref_colors;
 pub use publication::{CellKind, Publication, PublishedCell};
 pub use recent::{DisplayEntry, RecentEntry, RecentList};
-pub use refs::{CellRange, CellRef, FillAxis, SheetId};
+pub use refs::{CellRange, CellRef, FillAxis, RefToken, SheetId};
 pub use selection::{
     apply_motion, effective_range, format_selection_ref, is_full_column_selection,
     is_full_row_selection, resolve_edge, snap_cell, spans_all_cols, spans_all_rows, Direction,

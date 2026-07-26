@@ -23,7 +23,10 @@ pub mod titlebar;
 mod about;
 mod app;
 mod clipboard;
+mod default_app;
+mod demo;
 mod fonts;
+mod open_files;
 mod welcome;
 mod window;
 
@@ -34,6 +37,11 @@ use gpui::actions;
 pub use app::FreeCellApp;
 pub use assets::AppAssets;
 pub use fonts::register_fonts;
+// OS-delivered file opens (xlsx-file-association project): `file_url_to_path` is cfg-agnostic (and
+// unit-tested on Linux); `install_finder_open` is the macOS-only Apple-Event bridge.
+pub use open_files::file_url_to_path;
+#[cfg(target_os = "macos")]
+pub use open_files::install_finder_open;
 pub use welcome::WelcomeView;
 pub use window::WorkbookWindow;
 

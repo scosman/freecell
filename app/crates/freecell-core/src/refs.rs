@@ -315,6 +315,27 @@ impl CellRange {
     }
 }
 
+/// One complete reference token found in an in-progress formula (`architecture.md §1`).
+///
+/// Produced by `freecell_engine::lex_formula_refs` (the real IronCalc lexer); consumed by
+/// [`crate::palette::assign_ref_colors`] + the grid highlight pass (the `span` is also what the
+/// future v1.0 styled text-input control will use to color the token in-editor). gpui-free +
+/// IronCalc-free — plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefToken {
+    /// Byte span of the token text within the full edit text (leading `=` included).
+    pub span: std::ops::Range<usize>,
+    /// The resolved target rectangle, 0-based, normalized (single cell → 1×1 range).
+    pub target: CellRange,
+    /// The reference's sheet qualifier, if any (`Some("Sheet2")` for `Sheet2!A1`, else `None`).
+    /// Part of the color key so a same-target ref on another sheet gets its own color.
+    pub sheet: Option<String>,
+    /// Whether `target` resolves to the currently visible sheet (Q4): `sheet` is `None` or names
+    /// the active sheet. Only `same_sheet` tokens draw a grid highlight; the color map still
+    /// assigns every token a color (consumed by the future in-editor styling control).
+    pub same_sheet: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

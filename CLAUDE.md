@@ -76,10 +76,16 @@ FreeCell. This is the standing way of working, not a one-off.
   register it in `shell/assets.rs` (see that file's `AppAssets` composition). Don't introduce a
   second icon set.
 - **Commit + push regularly** — the working container is ephemeral.
-- **Build/check efficiency — scope the work; don't full-workspace everything.** A full `cargo
-  build`/`cargo test --workspace` on this GPUI workspace is **slow** (~15–25 min warm, worse
-  cold), and the pixel suite is slower still — so match the check to the change instead of
-  rebuilding the world each iteration:
+- **Build/check efficiency — scope the work; don't full-workspace everything.** Fresh web
+  containers are **cache-ready automatically**: a SessionStart hook runs
+  `app/scripts/setup_sccache.sh`, wiring sccache to a shared Cloudflare R2 bucket so rustc
+  outputs (including the huge pinned dep tree — gpui/zed, gpui-component, ironcalc fork) are
+  served from the remote cache instead of recompiled (design:
+  `projects/build-cache.md`; without the R2 secrets it no-ops → old cold-build timings apply).
+  That takes the worst "cold container rebuilds the world" pain away, but full-workspace runs
+  are **still not free** — linking, build scripts, and cargo orchestration aren't cached, first
+  compiles of *changed* code always run for real, and the pixel suite is slower still — so
+  keep matching the check to the change instead of rebuilding the world each iteration:
   - **Single-crate change → crate-scoped checks:** `cargo build -p <crate>` + `cargo test -p
     <crate> --lib` (add `-p freecell-engine` when the engine is touched) — minutes, not tens of
     minutes. Reserve `--workspace` build/test for genuinely cross-crate changes or a single

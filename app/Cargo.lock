@@ -2042,7 +2042,9 @@ name = "freecell-app"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-channel 2.5.0",
  "dirs",
+ "embed-resource",
  "fontdb",
  "freecell-chart-model",
  "freecell-core",
@@ -2053,8 +2055,12 @@ dependencies = [
  "gpui_platform",
  "parking_lot",
  "tempfile",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "windows 0.61.3",
+ "zip",
 ]
 
 [[package]]
@@ -3134,7 +3140,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -3406,7 +3412,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironcalc"
 version = "0.7.1"
-source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#b922df5e6f44555ee6d067f277e8165935779c3e"
+source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#cee2859dceda65ff64e52192be4ec47a259870e1"
 dependencies = [
  "bitcode",
  "chrono",
@@ -3422,7 +3428,7 @@ dependencies = [
 [[package]]
 name = "ironcalc_base"
 version = "0.7.1"
-source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#b922df5e6f44555ee6d067f277e8165935779c3e"
+source = "git+https://github.com/scosman/ironcalc?branch=freecell-fixes#cee2859dceda65ff64e52192be4ec47a259870e1"
 dependencies = [
  "bitcode",
  "chrono",

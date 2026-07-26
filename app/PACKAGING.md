@@ -155,10 +155,14 @@ secrets/variables):
 | Env var | Purpose |
 |---|---|
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` | Entra app-registration credentials (repo **secrets**) |
-| `AZURE_TRUSTED_SIGNING_ACCOUNT` | Trusted Signing account name (repo **variable**) |
-| `AZURE_TRUSTED_SIGNING_PROFILE` | certificate profile name (repo **variable**) |
-| `AZURE_TRUSTED_SIGNING_ENDPOINT` | optional; default `https://eus.codesigning.azure.net/` |
+| `AZURE_TRUSTED_SIGNING_ACCOUNT` | Trusted Signing account name (repo **secret or variable**) |
+| `AZURE_TRUSTED_SIGNING_PROFILE` | certificate profile name (repo **secret or variable**) |
+| `AZURE_TRUSTED_SIGNING_ENDPOINT` | optional; default `https://eus.codesigning.azure.net/` (repo secret or variable) |
 | `FREECELL_WINDOWS_SIGN_TOOL` | optional; default `trusted-signing-cli` (e.g. set to `artifact-signing-cli`, the renamed successor crate) |
+
+The workflow reads account/profile/endpoint as `secrets.X || vars.X`, so it does not matter
+whether you put them under **Settings → Secrets and variables → Actions → Secrets** or
+**→ Variables** — whichever tab holds a non-empty value wins.
 
 All five required values must be present or signing is skipped (a partial config warns and
 skips, so unfinished setup never silently ships an unsigned binary as if signed). Locally:

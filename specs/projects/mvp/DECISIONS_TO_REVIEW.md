@@ -759,6 +759,15 @@ Known placeholders the build will resolve (append the resolution here):
   MVP. **CLI `.xlsx` argv open IS wired** in `main.rs` (both platforms) — the Linux/CLI path the
   spec calls best-effort. macOS Finder double-click / xdg association is a follow-up.
   (`main.rs xlsx_arg`, `shell/app.rs` — no `on_open_urls` wiring)
+  - **[Resolved 2026-07-24] macOS Finder open-file is now wired** by
+    `specs/projects/xlsx-file-association` (Phases 1–2, commits `84785fa` + `f2e72cc`). Exactly
+    the app-global-channel bridge this entry anticipated: `shell/open_files.rs::install_finder_open`
+    forwards the cx-less `on_open_urls` callback's URL strings onto an async channel that a
+    spawned app task drains through the existing `FreeCellApp::open_path` funnel (no-flash startup
+    preserved), and a shared `[[package.metadata.packager.file-associations]]` block registers
+    `.xlsx`/`.csv` with the OS. `GAPS.md` #4 is closed; the macOS hardware smoke **M-15** is
+    non-blocking. (`crates/freecell-app/src/shell/open_files.rs`, `main.rs`,
+    `crates/freecell-app/Cargo.toml`)
 - [Phase 10] **Bundled Inter is NOT vendored yet; `register_fonts` is a best-effort hook.**
   `components/app_shell.md §Structure` / `ui_design.md §3.3` bundle Inter via `add_fonts` before
   any window opens. The four Inter TTFs are not committed (the Phase-6/7 render baselines were
@@ -1084,8 +1093,9 @@ tracked home (nothing silently lost); "MVP-scope" = intentional §8 omission.
 - Input-cap message-popover *text* (§3.3; Phase 9 post-CR) → danger border shown; popover text is
   chrome polish. Cell-unmodified + focus-kept behaviors ARE covered.
 - Bundled Inter (§3.3) → `projects/bundled-inter-font.md`.
-- macOS Finder open-file `on_open_urls` (§2.1; Phase 10) → CLI argv wired; macOS Finder assoc is a
-  documented gap.
+- macOS Finder open-file `on_open_urls` (§2.1; Phase 10) → ✅ **Resolved** by
+  `specs/projects/xlsx-file-association` (Phases 1–2, `84785fa` + `f2e72cc`): OS `.xlsx`/`.csv`
+  file associations + a macOS Apple-Event bridge route Finder opens through `open_path`.
 - GPL `ztracing` (**resolved 2026-07-09** — replaced by permissively-licensed no-op stubs via
   `[patch]`, `app/vendor/`; no GPL compiled/linked) + quick-xml DoS + bans/sources leniency →
   `projects/pre-distribution-security-audit.md` (MANDATORY pre-distribution).

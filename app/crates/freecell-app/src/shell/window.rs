@@ -192,11 +192,12 @@ impl WorkbookWindow {
     ) -> Self {
         let loading = match &source {
             DocumentSource::NewWorkbook => None,
-            // An open or a CSV import shows the "Opening <name>…" overlay until the worker emits
-            // `Loaded` (the import parse runs on the worker thread).
-            DocumentSource::OpenFile(p) | DocumentSource::ImportCsv(p) => {
-                Some(lifecycle::document_name(Some(p)))
-            }
+            // An open, a CSV import, or the demo shows the "Opening <name>…" overlay until the
+            // worker emits `Loaded` (the parse/load runs on the worker thread). The demo's temp
+            // file is named `Demo.xlsx`, so this briefly reads "Opening Demo.xlsx…".
+            DocumentSource::OpenFile(p)
+            | DocumentSource::ImportCsv(p)
+            | DocumentSource::OpenDemo(p) => Some(lifecycle::document_name(Some(p))),
         };
         let (client, receiver) = DocumentClient::spawn(source);
         Self::build(key, Rc::new(client), receiver, loading, path, window, cx)
@@ -1900,6 +1901,14 @@ fn make_grid_sink(
                 hidden: matches!(event, GridEvent::HideColumns { .. }),
             });
         }
+        // Freeze/Unfreeze (`freeze-panes`): the header menu emits the new count for exactly one
+        // axis; the worker rides the fork's undoable frozen-count setter (one undo step) and
+        // rebuilds the sheet cache → the grid re-reads the counts on the next frame.
+        GridEvent::SetFrozen { rows, cols } => client.send(Command::SetFrozen {
+            sheet: shared.active_sheet.get(),
+            rows: *rows,
+            cols: *cols,
+        }),
         // Chart manipulation (P18): move/resize (a new anchor) + delete route straight to the worker,
         // like the other grid-initiated structure ops. The worker resolves the `ChartId` to the
         // authored set or a loaded binding and republishes the chart snapshot.
@@ -1932,6 +1941,21 @@ fn make_grid_sink(
                 if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
                     chrome.update(cx, |c, cx| c.open_chart_panel(panel, window, cx));
                 }
+            }
+        }
+        // Point-mode: the grid clicked/dragged a reference into the active formula edit. Route it to
+        // the chrome (the single pending-edit owner), which splices it against the shared reducer
+        // (`formula-point-mode/architecture.md §3.2/§5`).
+        GridEvent::InsertReference {
+            a1,
+            replace_pending,
+        } => {
+            if let Some(chrome) = chrome_slot.get().and_then(|w| w.upgrade()) {
+                let a1 = a1.clone();
+                let replace_pending = *replace_pending;
+                chrome.update(cx, |c, cx| {
+                    c.insert_reference(&a1, replace_pending, window, cx)
+                });
             }
         }
     })
@@ -2021,6 +2045,9 @@ fn make_chrome_grid_sink(
                 quick_edit,
                 autocomplete,
                 sig_hint,
+                reference_ready,
+                pending_ref,
+                ref_highlights,
             } => {
                 // Deferred: the chrome may be emitting this from inside the grid's own `update`
                 // (a grid-originated type-to-replace / in-cell trigger), so touching the grid now
@@ -2031,6 +2058,9 @@ fn make_chrome_grid_sink(
                 let quick_edit = *quick_edit;
                 let autocomplete = autocomplete.clone();
                 let sig_hint = sig_hint.clone();
+                let reference_ready = *reference_ready;
+                let pending_ref = *pending_ref;
+                let ref_highlights = ref_highlights.clone();
                 window.defer(cx, move |_window, cx| {
                     if let Some(grid) = grid.upgrade() {
                         grid.update(cx, |g, cx| {
@@ -2041,6 +2071,9 @@ fn make_chrome_grid_sink(
                                 quick_edit,
                                 autocomplete,
                                 sig_hint,
+                                reference_ready,
+                                pending_ref,
+                                ref_highlights,
                                 cx,
                             )
                         });

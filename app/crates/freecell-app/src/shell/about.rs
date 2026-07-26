@@ -3,17 +3,20 @@
 //!
 //! A small, fixed-size, single-instance window that replaces the old About modal overlay. It is a
 //! `Render` + `Focusable` entity like [`WelcomeView`](super::WelcomeView) but **stateless** — pure
-//! static content: the FreeCell wordmark, the "The open spreadsheet" tagline, the build version
-//! (`env!("CARGO_PKG_VERSION")`), a hairline, then two label→value link rows (Homepage / Built
-//! with). Links open in the user's default browser via gpui's [`App::open_url`], with a pointer
-//! cursor (no hover underline). It registers **no document actions**, so Save / Undo / etc. are
-//! disabled while it is frontmost; the app opens/activates/tracks/closes it (`super::app`).
+//! static content: the app icon stacked above the FreeCell wordmark, the "The open spreadsheet"
+//! tagline, the build version (`env!("CARGO_PKG_VERSION")`), a hairline, then two label→value link
+//! rows (Homepage / Built with). The icon + wordmark are painted from vendored brand SVGs
+//! (`super::assets`), not font-rendered. Links open in the user's default browser via gpui's
+//! [`App::open_url`], with a pointer cursor (no hover underline). It registers **no document
+//! actions**, so Save / Undo / etc. are disabled while it is frontmost; the app
+//! opens/activates/tracks/closes it (`super::app`).
 
 use gpui::{
-    div, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, FontWeight, Window,
+    div, img, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, Window,
 };
 
-use super::fonts::{LINK_FAMILY, TAGLINE_FAMILY, WORDMARK_FAMILY};
+use super::assets::{ICON_ASSET, WORDMARK_ASPECT, WORDMARK_ASSET};
+use super::fonts::{LINK_FAMILY, TAGLINE_FAMILY};
 use super::{titlebar, CloseWindow};
 
 // Shared chrome/titlebar palette tokens (`ui_design.md §0`) — mirrored here as the established
@@ -21,7 +24,6 @@ use super::{titlebar, CloseWindow};
 // the one LINK accent below.
 const CHROME_BG: u32 = 0xF3F3F3; // window background (matches the mockup's light card)
 const HAIRLINE: u32 = 0xD9D9D9;
-const TEXT: u32 = 0x1F1F1F;
 const MUTED_TEXT: u32 = 0x555555;
 /// Tertiary text (the faint version line) — a step lighter than [`MUTED_TEXT`] (`ui_design.md §6`).
 const FAINT_TEXT: u32 = 0x9A9A9A;
@@ -29,6 +31,13 @@ const FAINT_TEXT: u32 = 0x9A9A9A;
 /// gpui-component's theme exposes none at the pinned rev, so a single blue constant serves every
 /// link (not the mockup's exact hex, and not per-link colors).
 const LINK: u32 = 0x2563EB;
+
+/// The app icon's rendered edge (`img`, square) — the app-icon face stacked above the wordmark.
+const ICON_SIZE: f32 = 48.0;
+
+/// The rendered height of the wordmark logotype (`img`); its width derives from
+/// [`WORDMARK_ASPECT`]. Matched to the welcome window's wordmark for one consistent brand mark.
+const WORDMARK_H: f32 = 24.0;
 
 /// The homepage repository — opened in the browser; shown as [`HOMEPAGE_LABEL`].
 const HOMEPAGE_URL: &str = "https://github.com/scosman/freecell";
@@ -112,8 +121,8 @@ impl Render for AboutView {
     }
 }
 
-/// The window body: a top-packed identity block (wordmark / tagline / version), a hairline, then
-/// the two label→value link rows (`ui_design.md §6`). Top-packed with a deliberate rhythm (not
+/// The window body: a top-packed identity block (icon / wordmark / tagline / version), a hairline,
+/// then the two label→value link rows (`ui_design.md §6`). Top-packed with a deliberate rhythm (not
 /// vertically centered) — the window height (`app.rs about_window_options`) is tuned so the bottom
 /// whitespace balances the top padding.
 fn render_body() -> impl IntoElement {
@@ -132,18 +141,23 @@ fn render_body() -> impl IntoElement {
                 .items_center()
                 .gap(px(5.0))
                 .child(
-                    // The wordmark rides the Inter **Display ExtraBold** single-face family — a
-                    // genuinely heavier & tighter cut than the RIBBI Bold, resolved by one family
-                    // name on every platform. gpui at the pinned rev exposes no letter-spacing API,
-                    // so the Display cut's built-in tight tracking stands in for the mockup's
-                    // -0.03em (the exact tracking isn't settable in code). The weight is stated for
-                    // intent; the lone face resolves regardless.
-                    div()
-                        .font_family(WORDMARK_FAMILY)
-                        .font_weight(FontWeight::EXTRA_BOLD)
-                        .text_size(px(30.0))
-                        .text_color(rgb(TEXT))
-                        .child("FreeCell"),
+                    // The app icon (the Windows/Linux icon face), stacked above the wordmark. A
+                    // little extra space below it (`mb`) sets the mark apart from the logotype
+                    // without loosening the tight wordmark→tagline→version rhythm below.
+                    img(ICON_ASSET)
+                        .size(px(ICON_SIZE))
+                        .mb(px(6.0))
+                        .debug_selector(|| "about-icon".to_string()),
+                )
+                .child(
+                    // The FreeCell wordmark logotype, painted from the vendored brand SVG
+                    // (`brand/freecell-wordmark.svg`) — the same mark the welcome window shows,
+                    // replacing the old font-rendered "FreeCell". Sized by height; the width
+                    // derives from the art's aspect ratio so it never distorts.
+                    img(WORDMARK_ASSET)
+                        .h(px(WORDMARK_H))
+                        .w(px(WORDMARK_H * WORDMARK_ASPECT))
+                        .debug_selector(|| "about-wordmark".to_string()),
                 )
                 .child(
                     div()
@@ -251,5 +265,28 @@ mod tests {
             assert_eq!(about.gpui_url(), "https://gpui.rs");
             assert_eq!(about.version(), env!("CARGO_PKG_VERSION"));
         });
+    }
+
+    #[gpui::test]
+    fn render_paints_the_stacked_icon_and_wordmark(cx: &mut TestAppContext) {
+        // The identity block paints the app icon stacked above the brand wordmark image (both
+        // `img(...)` elements that replaced the old font-rendered "FreeCell"). Asserting both
+        // painted bounds resolve — via their `debug_selector`s — proves the branding lockup is in
+        // the tree and lays out at the real About window size without panicking.
+        cx.update(gpui_component::init);
+        let handle = cx.open_window(size(px(400.0), px(352.0)), |window, cx| {
+            let view = cx.new(|cx| AboutView::new(window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("about-icon").is_some(),
+            "the About identity block paints the app icon"
+        );
+        assert!(
+            vcx.debug_bounds("about-wordmark").is_some(),
+            "the About identity block paints the brand wordmark image"
+        );
     }
 }

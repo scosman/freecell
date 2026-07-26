@@ -68,6 +68,14 @@ pub enum DocumentSource {
     /// (`functional_spec.md §2`, D2.1): parsed comma-delimited, each field applied as user
     /// input, opened with `path: None` so Save → Save-As-to-`.xlsx` and no `.back` backup.
     ImportCsv(PathBuf),
+    /// The bundled **demo** workbook, materialized to a temp `.xlsx` at `path` (the app writes the
+    /// embedded demo bytes there — the IronCalc loader is path-based). Loads exactly like
+    /// [`OpenFile`](Self::OpenFile) — a real `.xlsx` with charts we want to render + preserve, so
+    /// the worker treats its chart discovery like an open (not like a fresh/CSV workbook). It is
+    /// **the app** that opens the window untitled (`path: None`) so Save → Save-As-to-`.xlsx`, no
+    /// `.back` backup, and no dedupe — each demo open is a fresh untitled copy of the same static
+    /// file.
+    OpenDemo(PathBuf),
 }
 
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
@@ -254,6 +262,10 @@ impl WorkbookDocument {
             DocumentSource::NewWorkbook => Self::new_empty(),
             DocumentSource::OpenFile(path) => Self::open(path),
             DocumentSource::ImportCsv(path) => Self::import_csv(path),
+            // The demo is a real `.xlsx` (materialized from bundled bytes) — load it exactly like
+            // an open so its cells, styles, and charts come through. The untitled/save-as behavior
+            // is applied by the app opening the window with `path: None`, not here.
+            DocumentSource::OpenDemo(path) => Self::open(path),
         }
     }
 
@@ -837,6 +849,27 @@ impl WorkbookDocument {
         crate::instrument::record_engine_call();
         self.model
             .set_columns_hidden(sheet_idx, col_start as i32 + 1, col_end as i32 + 1, hidden)
+    }
+
+    /// Sets the frozen-rows count `M` — leading rows `0..M` pinned to the top (`freeze-panes`
+    /// `architecture.md §2.2`). One undoable diff (the fork's `set_frozen_rows_count`). Defensive
+    /// clamp: the fork's `Model::set_frozen_rows` **errors** at `count >= LAST_ROW`, i.e. its max
+    /// accepted count is all-but-one track — so a "freeze at the very last track" action degrades
+    /// to the engine max instead of erroring (`functional_spec.md §5.2` tolerates, never blocks).
+    pub(crate) fn set_frozen_rows(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let clamped = count.min(freecell_core::limits::MAX_ROWS - 1);
+        self.model.set_frozen_rows_count(sheet_idx, clamped as i32)
+    }
+
+    /// Sets the frozen-columns count `K` — leading columns `0..K` pinned to the left (the column
+    /// analog of [`set_frozen_rows`](Self::set_frozen_rows); the fork's
+    /// `set_frozen_columns_count`, clamped below its `LAST_COLUMN` guard).
+    pub(crate) fn set_frozen_columns(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
+        crate::instrument::record_engine_call();
+        let clamped = count.min(freecell_core::limits::MAX_COLS - 1);
+        self.model
+            .set_frozen_columns_count(sheet_idx, clamped as i32)
     }
 
     /// Inserts `count` blank rows so new rows appear at 0-based `row` (`InsertRows`); everything at/
@@ -2113,6 +2146,56 @@ mod tests {
     use crate::fixtures;
     use std::fs;
     use tempfile::tempdir;
+
+    /// End-to-end proof that FreeCell's IronCalc pin (`app/Cargo.toml`'s `[patch.crates-io]` →
+    /// the fork's `freecell-fixes` branch) actually carries the scalar-functions batch: each
+    /// function is set as a formula in A1 and its **computed, formatted** value is asserted. A
+    /// name the pinned engine doesn't know would return `#NAME?` (and a broken impl a wrong value
+    /// or `#VALUE!`/`#N/A`), so a literal-value match here is the regression guard that the batch
+    /// is present and correct through the real FreeCell engine seam — no FreeCell-side code beyond
+    /// the pin bump. Split into "presence" (the 9 functions verified already-present upstream) and
+    /// "fixes" (the 4 fork correctness fixes this batch actually landed:
+    /// `fix/trim-internal-runs`, `fix/dollar-negative-zero`, `fix/address-empty-sheet`,
+    /// `fix/xmatch-array-constant` — see `specs/projects/scalar-functions-batch/fork-fixes/`).
+    #[test]
+    fn scalar_functions_batch_computes_through_pinned_engine() {
+        // Set `formula` (a leading-`=` expression) into A1, evaluate, and return its formatted
+        // display value — the exact per-cell text FreeCell would paint.
+        fn eval(formula: &str) -> String {
+            let mut doc = WorkbookDocument::new_empty().unwrap();
+            doc.set_cell_input(0, CellRef::new(0, 0), formula).unwrap();
+            doc.evaluate();
+            doc.formatted_value(0, CellRef::new(0, 0)).unwrap()
+        }
+
+        // Presence: each function computes (not `#NAME?`) and returns its Excel value.
+        let presence = [
+            ("=SUMPRODUCT({1,2,3},{4,5,6})", "32"),
+            ("=PROPER(\"john smith\")", "John Smith"),
+            ("=REPLACE(\"abcdefg\",3,2,\"XY\")", "abXYefg"),
+            ("=CHAR(65)", "A"),
+            ("=CODE(\"A\")", "65"),
+            ("=CLEAN(\"Hello\"&CHAR(7)&\"World\")", "HelloWorld"),
+            ("=PERCENTILE.INC({1,2,3,4},0.5)", "2.5"),
+            ("=QUARTILE.INC({1,2,4,7,8,9,10,12},2)", "7.5"),
+            ("=XMATCH(30,{10,20,30,40,50})", "3"),
+        ];
+        // The four fork correctness fixes — prove the pin carries each landed branch.
+        let fixes = [
+            ("=TRIM(\"a    b\")", "a b"),           // fix/trim-internal-runs
+            ("=DOLLAR(-0.001,2)", "$0.00"),         // fix/dollar-negative-zero
+            ("=ADDRESS(1,1,1,TRUE,\"\")", "!$A$1"), // fix/address-empty-sheet
+            ("=XMATCH(\"ban*\",{\"apple\",\"banana\",\"cherry\"},2)", "2"), // fix/xmatch-array-constant
+        ];
+
+        for (formula, expected) in presence.iter().chain(fixes.iter()) {
+            assert_eq!(
+                eval(formula),
+                *expected,
+                "pinned engine mis-evaluated {formula} (expected {expected:?})"
+            );
+        }
+    }
 
     /// Every number-format preset code the dropdown can send must be renderable by the IronCalc
     /// formatter — a code the lexer can't parse renders `#VALUE!` in every cell (as bare `£`/`¥`

@@ -5,9 +5,10 @@ sheets (Excel-max = 1,048,576 × 16,384). Engine = IronCalc; UI = GPUI (custom g
 gpui-component chrome). See `../specs/projects/mvp/` for the specs and
 `../CLAUDE.md` for project conventions.
 
-**Platform support:** macOS (primary, Metal) + Linux (blade/Vulkan). Windows is out of
-scope. See `architecture.md §1` for the Linux MVP deltas (Ctrl for Cmd, no menu bar,
-GPUI paths-prompt).
+**Platform support:** macOS (primary, Metal) + Linux (blade/Vulkan) + Windows (NSIS
+installer) — all three compile and package, and all three are required `release` CI targets.
+See `architecture.md §1` for the Linux MVP deltas (Ctrl for Cmd, no menu bar, GPUI
+paths-prompt).
 
 ## Workspace layout
 
@@ -16,7 +17,7 @@ app/
 ├── crates/
 │   ├── freecell-core/    # GPUI-free, IronCalc-free foundation (builds/tests anywhere)
 │   ├── freecell-engine/  # IronCalc adapter + eval worker + caches + file I/O (headless)
-│   └── freecell-app/     # the GPUI application (macOS + Linux)
+│   └── freecell-app/     # the GPUI application (macOS + Linux + Windows)
 └── render-tests/         # cell-render snapshot suite (Phase 7)
 ```
 
@@ -35,10 +36,27 @@ so they build and test headless in Linux CI.
   (`xrefresh`), `imagemagick`.
 - **macOS:** the standard Xcode command-line tools (Metal stack).
 
+## Compile cache (sccache + Cloudflare R2) — dev only
+
+Dev builds can use [sccache](https://github.com/mozilla/sccache) backed by a shared
+Cloudflare R2 bucket, so fresh dev containers don't recompile the pinned dep tree
+(gpui/zed, gpui-component, ironcalc fork) from scratch:
+
+```sh
+source scripts/setup_sccache.sh   # installs sccache if missing + exports the env
+```
+
+Web dev sessions run this automatically via the repo's `SessionStart` hook
+(`.claude/hooks/session-start.sh`). The script needs the `R2_ACCESS_KEY_ID` /
+`R2_SECRET_ACCESS_KEY` secrets in the environment; **without them it no-ops** (leaves
+`RUSTC_WRAPPER` unset) and builds work as before, just uncached. CI is deliberately
+untouched (it uses Swatinem/rust-cache). Design + token rotation:
+[`../projects/build-cache.md`](../projects/build-cache.md).
+
 ## Build / run / test
 
 ```sh
-cargo build --workspace          # full build (freecell-app compiles on Linux + macOS)
+cargo build --workspace          # full build (freecell-app compiles on Linux, macOS + Windows)
 cargo run -p freecell-app        # launch FreeCell (opens the Welcome window)
 cargo run -p freecell-app -- Book.xlsx   # open a workbook directly (CLI argv path)
 cargo test --workspace           # core + engine + app logic tests (no display needed)
@@ -96,13 +114,13 @@ GitHub Actions live at the repo root (`../.github/workflows/`):
 - **perf-gates** (Linux, required): the perf harness with buffered thresholds.
 - **macos-verify** (manual/weekly, non-required): build + test + render smoke on macOS.
 - **release** (tag `v*` / manual dispatch): package the app with `cargo-packager` for
-  macOS + Linux (required) and Windows (experimental), uploading unsigned installers as run
+  macOS, Linux, and Windows (all required), uploading unsigned installers as run
   artifacts. See [`PACKAGING.md`](PACKAGING.md).
 
 ## Packaging / releases
 
 `cargo-packager` builds distributable bundles (macOS `.app`/`.dmg`, Linux `.deb`/`.AppImage`,
-experimental Windows NSIS `.exe`). Build them locally with the same scripts CI uses:
+Windows NSIS `.exe`). Build them locally with the same scripts CI uses:
 
 ```sh
 cargo install cargo-packager --locked --version 0.11.8   # one-time
@@ -111,6 +129,6 @@ scripts\package.ps1         # Windows (PowerShell)
 ```
 
 Builds are **unsigned dev builds** (not for distribution yet). Config, formats, prerequisites,
-the Windows-port requirements, and the signing deferral are documented in
+the Windows target status, and the signing deferral are documented in
 [`PACKAGING.md`](PACKAGING.md); the app icons in
 [`crates/freecell-app/packaging/icons/`](crates/freecell-app/packaging/icons/README.md).

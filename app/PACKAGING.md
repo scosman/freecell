@@ -3,18 +3,23 @@
 FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-packager)
 (pinned **0.11.8**). One config drives every platform; one script builds them.
 
-| Platform | Formats | Status |
-|---|---|---|
-| macOS | `.app` bundle + `.dmg` | **Supported** (primary target) |
-| Linux | `.deb` + `.AppImage` | **Supported** (native **x64 + arm64**) |
-| Windows | NSIS setup `.exe` | **Supported** (see below) |
+| Platform | Formats | Signing | Status |
+|---|---|---|---|
+| macOS | `.app` bundle + `.dmg` | **Developer ID + notarized** (local, opt-in — see below) | **Supported** (primary target) |
+| Linux | `.deb` + `.AppImage` | unsigned | **Supported** (native **x64 + arm64**) |
+| Windows | NSIS setup `.exe` | unsigned | **Supported** (see below) |
 
-> **All builds are UNSIGNED dev builds.** They are **not** for public distribution yet.
-> macOS Gatekeeper will block an unsigned `.app`/`.dmg` (right-click → **Open** to run
-> anyway); Windows SmartScreen will warn. Code signing + notarization, and publishing to a
-> GitHub Release, are deliberately **out of scope** here and gated behind
-> [`projects/pre-distribution-security-audit.md`](../projects/pre-distribution-security-audit.md)
-> and [`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md).
+> **`package.sh` / `package.ps1` output is UNSIGNED on every platform** — that is what CI
+> builds and uploads. macOS additionally has an **opt-in signed + notarized release path**,
+> [`scripts/sign_macos.sh`](#macos-signing--notarization), which you run locally with a
+> Developer ID certificate; it is **not** wired into CI (no secrets are stored in this
+> repo). Windows Authenticode and Linux signing remain future work.
+>
+> **None of this makes a build publicly distributable yet.** Publishing any binary is still
+> gated on
+> [`projects/pre-distribution-security-audit.md`](../projects/pre-distribution-security-audit.md),
+> with the remaining release plumbing in
+> [`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md).
 > That is why the CI workflow uploads packages as **run artifacts**, not Release assets.
 
 ## Config
@@ -77,6 +82,10 @@ The scripts build the release binary first (cargo-packager does **not** build fo
 the binary profile must match), then package. Output lands in **`app/target/packages/`**
 (git-ignored). Extra flags pass through (e.g. `scripts/package.sh --verbose`).
 
+These produce **unsigned** artifacts. For a real macOS release build, use
+[`scripts/sign_macos.sh`](#macos-signing--notarization) instead — it wraps `package.sh` and
+adds signing, notarization, and stapling.
+
 Overrides (both scripts honor these env vars):
 
 ```sh
@@ -134,17 +143,126 @@ What remains is not build work: a Windows **hardware smoke** of the installed NS
 data-path polish is tracked in
 [`projects/windows-port.md`](../projects/windows-port.md).
 
-## Signing (deferred)
+## macOS signing & notarization
 
-No signing is done here, by design — outputs are plain unsigned artifacts. macOS
-notarization and Windows Authenticode, and the switch to published GitHub Releases, are
-future work. See
-[`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md),
-and note the **mandatory**
+[`scripts/sign_macos.sh`](scripts/sign_macos.sh) is the macOS **release** path. It wraps
+`package.sh` and produces the distributable pair — both signed with your Developer ID,
+notarized by Apple, and stapled:
+
+```
+app/target/packages/FreeCell.app          signed + notarized + stapled
+app/target/packages/FreeCell 0.1.0.dmg    signed + notarized + stapled
+```
+
+It is **local and manual** by design: it prompts you to choose a signing identity, and no
+certificate or notary credential is stored in this repo or in CI.
+
+### One-time setup
+
+1. **Developer ID Application certificate** in your login keychain. This needs a paid Apple
+   Developer Program membership. An *Apple Development* certificate is **not** sufficient —
+   it cannot be notarized or distributed. Create/download one from
+   [developer.apple.com → Certificates](https://developer.apple.com/account/resources/certificates)
+   and double-click to install. Verify with:
+   ```sh
+   security find-identity -v -p codesigning | grep "Developer ID Application"
+   ```
+2. **create-dmg** — [`sindresorhus/create-dmg`](https://github.com/sindresorhus/create-dmg),
+   needs Node 20+:
+   ```sh
+   npm install --global create-dmg
+   ```
+3. **Notary credentials**, stored once in your keychain (the script never takes a password):
+   ```sh
+   xcrun notarytool store-credentials freecell-notary \
+       --apple-id <you@example.com> --team-id <TEAMID> --password <app-specific-password>
+   ```
+   Generate the app-specific password at [account.apple.com](https://account.apple.com) →
+   *Sign-In and Security* → *App-Specific Passwords*. Override the profile name with
+   `FREECELL_NOTARY_PROFILE`.
+4. Xcode command line tools (`xcode-select --install`) and network access.
+
+The script preflights all four **before** the slow release build, so a missing prerequisite
+costs seconds and prints the exact command to fix it.
+
+### Run it
+
+From `app/`:
+
+```sh
+scripts/sign_macos.sh              # extra args pass through to package.sh
+```
+
+It will prompt you to pick from your *Developer ID Application* identities, then run
+unattended. Expect it to take a while: two notarization round trips, typically a few
+minutes each, occasionally much longer.
+
+### What it does, and why
+
+1. **Packages the `.app` only** (`FREECELL_PACKAGE_FORMATS=app`). `package.sh`'s macOS
+   default is `app,dmg`, and that `.dmg` is built from the *unsigned* bundle — producing it
+   here would leave an unsigned `.dmg` sitting next to the signed one in the same directory.
+   The signed `.dmg` comes from create-dmg instead. (The script warns about any other `.dmg`
+   it finds in the output directory for exactly this reason.)
+2. **Signs nested Mach-O inner-out, then the bundle**, with
+   `--force --timestamp --options runtime`:
+   - `--force` is **required** — every arm64 Mach-O carries an ad-hoc signature applied by
+     the linker, so signing without it fails on Apple silicon.
+   - `--timestamp` and `--options runtime` (hardened runtime) are both **required for
+     notarization**; the notary service rejects a signature lacking either.
+   - **Not `--deep`** — Apple deprecated it and it silently mis-signs nested code. For a
+     pure-Rust bundle the nested loop usually finds nothing; it is insurance for the day a
+     dylib or helper binary appears.
+   - No entitlements by default; a GPUI/Metal app should not need any under the hardened
+     runtime. If a *signed* build crashes on launch where the unsigned one did not, that is
+     the tell — point `FREECELL_ENTITLEMENTS` at a plist.
+3. **Notarizes and staples both the `.app` and the `.dmg`.** Stapling the app as well as the
+   disk image is what Apple's documentation describes: the app then carries its own ticket,
+   so it launches even offline after being dragged out of the `.dmg`. The app is submitted as
+   a `ditto -c -k --keepParent` archive — `zip` mangles symlinks and extended attributes in a
+   bundle and the notary service rejects the result.
+4. **Verifies**: `stapler validate` on both, then `spctl --assess`, which must report
+   `accepted … source=Notarized Developer ID`. Anything else fails the run.
+
+If notarization comes back `Invalid`, the summary status alone is useless, so the script
+automatically fetches and prints `xcrun notarytool log <submission-id>`. The reason is
+almost always a missing hardened-runtime flag or an unsigned nested binary.
+
+### Verifying like a real downloader
+
+A locally-built app is never quarantined, so it launches even unsigned — passing `spctl`
+locally is necessary but not the whole story. To reproduce what someone downloading the
+`.dmg` actually experiences, copy it elsewhere and set the quarantine attribute by hand:
+
+```sh
+xattr -w com.apple.quarantine '0081;00000000;Safari;' "FreeCell 0.1.0.dmg"
+```
+
+Then mount it, drag the app out, and launch. A correctly notarized build opens with no
+Gatekeeper prompt at all.
+
+> Signing **without** notarization is not enough for distribution: a signed-but-unnotarized
+> download still gets *"Apple could not verify FreeCell is free of malware."* That is why
+> this script always notarizes rather than offering a sign-only mode.
+
+## Signing — what's still deferred
+
+- **CI.** The `release` workflow builds **unsigned** artifacts. Wiring the certificate and
+  notary credentials in as GitHub secrets is future work.
+- **Windows Authenticode** for the NSIS `.exe` (and the inner binary) — needs an OV/EV
+  code-signing certificate.
+- **Linux** — optional GPG-signed `.deb` / checksums / AppImage signing.
+- **Publishing.** Switching the workflow from artifact upload to attaching assets to a
+  GitHub Release.
+
+See
+[`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md).
+Note the **mandatory**
 [`projects/pre-distribution-security-audit.md`](../projects/pre-distribution-security-audit.md)
-(license/advisory re-audit) must be resolved before shipping any binary. The GPL `ztracing`
-distribution blocker is already handled — replaced by permissively-licensed no-op stubs via
-`[patch]` (`app/vendor/`), so no GPL code is compiled or linked.
+(license/advisory re-audit) must be resolved before shipping any binary — signing does not
+change that. The GPL `ztracing` distribution blocker is already handled — replaced by
+permissively-licensed no-op stubs via `[patch]` (`app/vendor/`), so no GPL code is compiled
+or linked.
 
 ## Verification status
 
@@ -168,6 +286,12 @@ distribution blocker is already handled — replaced by permissively-licensed no
   the x64 env above).
 - NSIS `.exe` (Windows — see the Windows section; first assembled when the `release` workflow
   runs on Windows, or when you run `scripts/package.ps1` on Windows).
+
+**Not yet run at all:** `scripts/sign_macos.sh`. It was written against Apple's documented
+`codesign`/`notarytool`/`stapler` behavior and `create-dmg`'s CLI, but signing and
+notarization cannot be exercised anywhere except a macOS machine holding a Developer ID
+certificate — so its first real run is its first validation. Update this note once it has
+produced a notarized build.
 
 So the first `v*` tag is the first time `.dmg` / `.AppImage` / `.exe` are actually
 assembled. The macOS + Linux jobs run under `set -euo pipefail`, so a format-tool failure

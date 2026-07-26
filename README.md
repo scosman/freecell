@@ -62,6 +62,10 @@ cd App
 ./scripts/package.sh
 ```
 
+### Issues, not Pull Requests
+
+Feels strange to type this, but I prefer high-quality Github issues over pull requests. This project is built with my [agentic engineering harness](https://github.com/scosman/vibe-crafting). It ensures consistency, enforces best practices, has code review gates, etc. Is your workflow/PR just as good? Maybe, maybe not -- but it's more work for me to validate than to implement from scratch.
+
 ### License
 
 Licensed under either of

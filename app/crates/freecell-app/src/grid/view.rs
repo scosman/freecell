@@ -3622,7 +3622,7 @@ impl GridView {
                 frame,
                 quad,
             );
-            let paint = self.resolve_cell_paint(anchor, &publication);
+            let paint = self.resolve_cell_paint(anchor, publication);
             // The box draws its own outer right/bottom gridlines (no same-fill suppression — a merge
             // always reads as one solid box, `ui_design.md §3`).
             content_children.push(cell_element(

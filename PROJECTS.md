@@ -96,13 +96,15 @@ registry: each entry is a short description plus a pointer to a design note unde
   (`continue-on-error` removed). Residual: a Windows hardware smoke + Authenticode signing.
   → [`projects/windows-port.md`](projects/windows-port.md)
 
-- **Release Signing & Distribution** — *Future, required before publishing any binary.*
-  The `cargo-packager` pipeline ships **unsigned dev artifacts** (uploaded as CI run
-  artifacts, not GitHub Releases) by deliberate scope decision — no signing config/hooks
-  exist. This adds macOS Developer-ID signing + notarization, Windows Authenticode, and the
-  switch to attaching signed assets to a GitHub Release. Hard-gated on the
-  pre-distribution security audit above. → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
-
+- **Release Signing & Distribution** — *In progress: macOS local signing + notarization
+  landed 2026-07-26; the rest still Future, and publishing any binary is still gated.*
+  `app/scripts/sign_macos.sh` wraps `package.sh` to produce a Developer-ID-signed,
+  notarized, stapled `.app` + `.dmg` — local and manual (prompts for the identity, no
+  secrets in the repo, not wired into CI). Everything CI builds is still unsigned, as are
+  Windows and Linux. Remaining: verify the script on a real Mac, CI secret plumbing,
+  Windows Authenticode, Linux checksums, and the switch to attaching assets to a GitHub
+  Release. Hard-gated on the pre-distribution security audit above.
+  → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
 - **Rewrite chart `c:f` on sheet rename** — *Future (deferred from charts P10, 2026-07-10).*
   Chart save is source-first (charts/architecture §5): it byte-preserves / targeted-patches the
   retained chart XML, keeping each data reference's `c:f` **verbatim**. So after an in-session

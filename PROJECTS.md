@@ -93,17 +93,17 @@ registry: each entry is a short description plus a pointer to a design note unde
 - **Windows Port** — *Largely done (2026-07-24): Windows compiles, packages, and gates CI;
   `.xlsx`/`.csv` file associations wired.* The build compiles + runs, `scripts/package.ps1`
   produces the NSIS installer, and the Windows `release` CI job is now **required**
-  (`continue-on-error` removed). Residual: a Windows hardware smoke + Authenticode signing.
+  (`continue-on-error` removed); optional Authenticode signing is wired. Residual: a Windows
+  hardware smoke.
   → [`projects/windows-port.md`](projects/windows-port.md)
 
-- **Release Signing & Distribution** — *In progress: macOS local signing + notarization
-  landed 2026-07-26; the rest still Future, and publishing any binary is still gated.*
-  `app/scripts/sign_macos.sh` wraps `package.sh` to produce a Developer-ID-signed,
-  notarized, stapled `.app` + `.dmg` — local and manual (prompts for the identity, no
-  secrets in the repo, not wired into CI). Everything CI builds is still unsigned, as are
-  Windows and Linux. Remaining: verify the script on a real Mac, CI secret plumbing,
-  Windows Authenticode, Linux checksums, and the switch to attaching assets to a GitHub
-  Release. Hard-gated on the pre-distribution security audit above.
+- **Release Signing & Distribution** — *Signing done; distribution is the open half, gated on
+  the security audit.* macOS `.app`/`.dmg` are Developer-ID-signed + notarized via
+  `app/scripts/sign_macos.sh` (local/manual); Windows `.exe`s are Authenticode-signed via Azure
+  Trusted Signing in the CI `release` job (`app/scripts/sign-windows.ps1`, run green). Linux is
+  unsigned by design. What remains is **distribution** — switching the workflow from CI run
+  artifacts to attaching assets to a GitHub Release (plus optional macOS-in-CI automation) —
+  hard-gated on the pre-distribution security audit above.
   → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
 - **Rewrite chart `c:f` on sheet rename** — *Future (deferred from charts P10, 2026-07-10).*
   Chart save is source-first (charts/architecture §5): it byte-preserves / targeted-patches the

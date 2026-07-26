@@ -1,7 +1,8 @@
 # Windows Port
 
 **Status: Largely done (2026-07-24) — Windows compiles, packages, and gates CI; `.xlsx`/`.csv`
-file associations are wired. Remaining: a hardware smoke + signing.**
+file associations are wired; optional Authenticode signing is wired (2026-07-20). Remaining: a
+hardware smoke.**
 
 ## Goal
 
@@ -33,9 +34,10 @@ the delivered path reaches the app through `main.rs::open_arg` → `FreeCellApp:
    `appdata-paths`) want a look once someone runs the app on Windows hardware.
 3. **Render/perf gates.** Decide whether the render-test + perf harness run on Windows or
    stay Linux/macOS-only.
-4. **Signing.** Authenticode (see below).
 
-## Not needed for this
+## Signing — wired (optional)
 
-Signing (Authenticode) is a separate deferral — see
-`projects/release-signing-and-distribution.md`.
+Authenticode signing of the core exe + installer via **Azure Trusted Signing** is wired
+(2026-07-20): `scripts/package.ps1` signs both when the signing env vars are set, otherwise a
+no-op unsigned build. It runs green in the CI `release` job against the live Azure account. See
+`app/PACKAGING.md` (Windows signing) and `projects/release-signing-and-distribution.md`.

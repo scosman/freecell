@@ -1,57 +1,54 @@
 # Release Signing & Distribution
 
-**Status: In progress — macOS local signing + notarization landed 2026-07-26
-(`app/scripts/sign_macos.sh`, untested until first run on a Mac with a Developer ID cert).
-CI, Windows, Linux, and the GitHub Release switch remain Future. Still required before
-publishing any binary (packaging wired unsigned 2026-07-05).**
+**Status: Signing done. macOS `.app`/`.dmg` are Developer-ID-signed + Apple-notarized
+(`app/scripts/sign_macos.sh`); Windows `.exe`s are Authenticode-signed via Azure Trusted
+Signing in the CI `release` job (`app/scripts/sign-windows.ps1`, run green). Linux is
+intentionally unsigned. What remains before *publishing* is distribution (the GitHub Release
+switch) and the mandatory pre-distribution security audit — not signing.**
 
 ## Goal
 
-Turn the current **unsigned dev artifacts** into signed, notarized, publicly distributable
-releases attached to a GitHub Release.
+Turn `cargo-packager`'s dev artifacts into signed, notarized, publicly distributable releases
+attached to a GitHub Release. **Signing is done** (below); distribution is the open half.
 
-## Current state
+## Signing — done
 
 `cargo-packager` produces macOS `.app`/`.dmg`, Linux `.deb`/`.AppImage`, and Windows NSIS
-`.exe`. `scripts/package.sh` / `package.ps1` output is **unsigned on every platform** — that
-is what CI builds and uploads, and no certificate or credential is stored in the repo.
+`.exe`. Bare `scripts/package.sh` / `package.ps1` output is unsigned; the signed paths are:
 
-**macOS has an opt-in signed path (done, 2026-07-26).**
-[`app/scripts/sign_macos.sh`](../app/scripts/sign_macos.sh) wraps `package.sh` to produce a
-Developer-ID-signed, Apple-notarized, stapled `.app` + `.dmg`. It is deliberately **local
-and manual**: it prompts for the signing identity, reads notary credentials from a
-`notarytool` keychain profile, and is not wired into CI. Documented in
-[`app/PACKAGING.md`](../app/PACKAGING.md#macos-signing--notarization).
+- **macOS — signed + notarized.**
+  [`app/scripts/sign_macos.sh`](../app/scripts/sign_macos.sh) wraps `package.sh` to produce a
+  Developer-ID-signed (hardened runtime + timestamp), Apple-notarized, stapled `.app` + `.dmg`.
+  It is **local/manual** by design — it prompts for the signing identity and reads notary
+  credentials from a `notarytool` keychain profile (no secrets in the repo, not in CI). See
+  [`app/PACKAGING.md`](../app/PACKAGING.md#macos-signing--notarization).
+- **Windows — signed (Authenticode).** `package.ps1` Authenticode-signs **both** the core
+  `freecell.exe` (before packaging, so the installer embeds the signed binary) and the NSIS
+  installer `.exe` via **Azure Trusted Signing** (`scripts/sign-windows.ps1`). Wired into the
+  CI `release` Windows job — it maps the `AZURE_*` creds/config from repo secrets/variables and
+  has run green. Opt-in: a no-op when the env is unset, so plain unsigned builds still work.
+  See [`app/PACKAGING.md`](../app/PACKAGING.md#windows-signing).
+- **Linux — unsigned by design.** GPG-signing the `.deb` / publishing checksums / AppImage
+  signing are out of scope; the `.deb`/`.AppImage` ship unsigned.
 
-Still unsigned:
+## Distribution — the open half
 
-- Windows: unsigned `.exe` triggers SmartScreen warnings.
-- Linux: unsigned `.deb`/`.AppImage`, no checksums published.
-- Every CI-produced artifact, including macOS.
+The `release` workflow uploads packages as **run artifacts**, not GitHub Release assets. To
+actually publish:
 
-The `release` workflow uploads packages as **run artifacts**, not GitHub Release assets,
-specifically because publishing unsigned binaries as releases would be wrong.
-
-## Work when picked up
-
-1. ~~**macOS:** Developer ID Application certificate → sign the `.app`, then **notarize** +
-   staple.~~ **Done locally** — `scripts/sign_macos.sh` signs (hardened runtime +
-   timestamp), notarizes, and staples both the `.app` and the `.dmg`. Remaining: verify it
-   on a real Mac, then wire cert + notary credentials as **CI secrets** so tagged releases
-   are signed without a human at a keyboard.
-2. **Windows:** Authenticode signing of the NSIS `.exe` (and ideally the inner binary) with
-   an OV/EV code-signing certificate.
-3. **Linux:** optional — GPG-sign the `.deb` / provide checksums; AppImage signing.
-4. **Distribution:** switch the workflow from artifact upload to **creating/attaching a
+1. **Switch to Releases.** Change the workflow from artifact upload to **creating/attaching a
    GitHub Release** on tag push (checksums + release notes).
-5. **Only after** [`pre-distribution-security-audit.md`](pre-distribution-security-audit.md)
-   is resolved — that audit (GPL `ztracing` transitive dep, quick-xml advisories, license
-   exceptions) is **mandatory before shipping any binary** and is the true gate on this.
-   Signing does not change that.
+2. **Gate:** nothing ships until
+   [`pre-distribution-security-audit.md`](pre-distribution-security-audit.md) is resolved (GPL
+   `ztracing` transitive dep, quick-xml advisories, license exceptions) — **mandatory before
+   shipping any binary**. Signing does not change that.
+
+Optional automation (not blocking): `sign_macos.sh` is local/manual; wiring the Developer ID
+cert + notary credentials as CI secrets would sign tagged macOS releases hands-free, matching
+how Windows already signs in CI.
 
 ## Related
 
-- `projects/pre-distribution-security-audit.md` — the hard prerequisite.
-- `projects/windows-port.md` — Windows must actually compile before its installer is worth
-  signing.
-- `app/PACKAGING.md` — current unsigned packaging.
+- `projects/pre-distribution-security-audit.md` — the hard prerequisite for publishing.
+- `projects/windows-port.md` — the Windows port (compiles, packages, signed installer).
+- `app/PACKAGING.md` — packaging + the macOS/Windows signing paths.

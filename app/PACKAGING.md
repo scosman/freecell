@@ -7,18 +7,21 @@ FreeCell is packaged with [`cargo-packager`](https://crates.io/crates/cargo-pack
 |---|---|---|---|
 | macOS | `.app` bundle + `.dmg` | **Developer ID + notarized** (local, opt-in — see below) | **Supported** (primary target) |
 | Linux | `.deb` + `.AppImage` | unsigned | **Supported** (native **x64 + arm64**) |
-| Windows | NSIS setup `.exe` | unsigned | **Supported** (see below) |
+| Windows | NSIS setup `.exe` | **Authenticode** via Azure Trusted Signing (CI, opt-in — see below) | **Supported** (see below) |
 
-> **`package.sh` / `package.ps1` output is UNSIGNED on every platform** — that is what CI
-> builds and uploads. macOS additionally has an **opt-in signed + notarized release path**,
-> [`scripts/sign_macos.sh`](#macos-signing--notarization), which you run locally with a
-> Developer ID certificate; it is **not** wired into CI (no secrets are stored in this
-> repo). Windows Authenticode and Linux signing remain future work.
+> **Bare `package.sh` / `package.ps1` output is UNSIGNED** — that is what the plain build
+> produces. Each platform that signs has its own path: **macOS** has an opt-in signed +
+> notarized release path, [`scripts/sign_macos.sh`](#macos-signing--notarization), run locally
+> with a Developer ID certificate (not in CI — no secrets are stored in this repo); **Windows**
+> Authenticode-signs the core exe + installer via Azure Trusted Signing ([Windows signing](#windows-signing))
+> when the `AZURE_*` env vars are set, and this one **is** wired into the CI `release` job;
+> **Linux** is unsigned by design. On macOS an unsigned `.app`/`.dmg` trips Gatekeeper
+> (right-click → **Open**); an unsigned Windows `.exe` trips SmartScreen.
 >
 > **None of this makes a build publicly distributable yet.** Publishing any binary is still
 > gated on
 > [`projects/pre-distribution-security-audit.md`](../projects/pre-distribution-security-audit.md),
-> with the remaining release plumbing in
+> with the remaining release plumbing (the GitHub Release switch) in
 > [`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md).
 > That is why the CI workflow uploads packages as **run artifacts**, not Release assets.
 
@@ -138,10 +141,44 @@ flows). See [`specs/projects/xlsx-file-association/`](../specs/projects/xlsx-fil
 (Phase 1, commit `84785fa`).
 
 What remains is not build work: a Windows **hardware smoke** of the installed NSIS build
-(double-click + Open-With), complementary to the CI green build, and Authenticode **signing**
-(deferred with the rest of signing — see below). Any residual per-monitor-DPI / installed-app
-data-path polish is tracked in
-[`projects/windows-port.md`](../projects/windows-port.md).
+(double-click + Open-With), complementary to the CI green build. Authenticode **signing** is
+already wired (optional Azure Trusted Signing of the core exe + installer — see
+[Windows signing](#windows-signing) below). Any residual per-monitor-DPI / installed-app data-path polish is
+tracked in [`projects/windows-port.md`](../projects/windows-port.md).
+
+## Windows signing
+
+**Azure Trusted Signing, wired into CI.** `package.ps1` Authenticode-signs **both** the core
+`freecell.exe` (before packaging, so cargo-packager embeds the signed binary in the installer)
+and the produced `*-setup.exe`, using
+[`trusted-signing-cli`](https://crates.io/crates/trusted-signing-cli) (`scripts/sign-windows.ps1`).
+It is **opt-in**: signing runs only when the signing env vars are set, and is otherwise a no-op
+that leaves the build unsigned — so unsigned local/CI builds keep working. Signing is driven
+*around* cargo-packager rather than via a Cargo.toml `sign_command`, so an unconfigured
+environment simply produces an unsigned build instead of failing.
+
+To enable it, set these (the CI `release` Windows job already maps them from repo
+secrets/variables):
+
+| Env var | Purpose |
+|---|---|
+| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` | Entra app-registration credentials (repo **secrets**) |
+| `AZURE_TRUSTED_SIGNING_ACCOUNT` | Trusted Signing account name (repo **secret or variable**) |
+| `AZURE_TRUSTED_SIGNING_PROFILE` | certificate profile name (repo **secret or variable**) |
+| `AZURE_TRUSTED_SIGNING_ENDPOINT` | optional; default `https://eus.codesigning.azure.net/` (repo secret or variable) |
+| `FREECELL_WINDOWS_SIGN_TOOL` | optional; default `trusted-signing-cli` (e.g. set to `artifact-signing-cli`, the renamed successor crate) |
+
+The workflow reads account/profile/endpoint as `secrets.X || vars.X`, so it does not matter
+whether you put them under **Settings → Secrets and variables → Actions → Secrets** or
+**→ Variables** — whichever tab holds a non-empty value wins.
+
+All five required values must be present or signing is skipped (a partial config warns and
+skips, so unfinished setup never silently ships an unsigned binary as if signed). Locally:
+`cargo install trusted-signing-cli --locked --version 0.11.0`, set the env vars, then run
+`scripts\package.ps1`. This runs green in CI against the live Azure Trusted Signing account,
+signing both the core `freecell.exe` and the installer — the app binary is signed *before*
+`makensis` packs it, so the installed `freecell.exe` carries the signature, not just the
+installer.
 
 ## macOS signing & notarization
 
@@ -307,15 +344,19 @@ Gatekeeper prompt at all.
 > download still gets *"Apple could not verify FreeCell is free of malware."* That is why
 > this script always notarizes rather than offering a sign-only mode.
 
-## Signing — what's still deferred
+## Signing — what's left
 
-- **CI.** The `release` workflow builds **unsigned** artifacts. Wiring the certificate and
-  notary credentials in as GitHub secrets is future work.
-- **Windows Authenticode** for the NSIS `.exe` (and the inner binary) — needs an OV/EV
-  code-signing certificate.
-- **Linux** — optional GPG-signed `.deb` / checksums / AppImage signing.
-- **Publishing.** Switching the workflow from artifact upload to attaching assets to a
-  GitHub Release.
+Signing itself is **done**: macOS `.app`/`.dmg` are Developer-ID-signed + notarized
+(`sign_macos.sh`), and Windows `.exe`s are Authenticode-signed in CI (above). What remains is
+distribution, not signing:
+
+- **macOS in CI (optional).** `sign_macos.sh` is local/manual; wiring the Developer ID cert +
+  notary credentials as GitHub secrets would sign tagged macOS releases hands-free, the way
+  Windows already does. Not required — the signed local path exists.
+- **Linux** — unsigned by design (GPG-signed `.deb` / checksums / AppImage signing are out of
+  scope).
+- **Publishing.** Switching the `release` workflow from artifact upload to attaching assets to
+  a GitHub Release.
 
 See
 [`projects/release-signing-and-distribution.md`](../projects/release-signing-and-distribution.md).

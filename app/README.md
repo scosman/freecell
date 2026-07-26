@@ -114,8 +114,9 @@ GitHub Actions live at the repo root (`../.github/workflows/`):
 - **perf-gates** (Linux, required): the perf harness with buffered thresholds.
 - **macos-verify** (manual/weekly, non-required): build + test + render smoke on macOS.
 - **release** (tag `v*` / manual dispatch): package the app with `cargo-packager` for
-  macOS, Linux, and Windows (all required), uploading unsigned installers as run
-  artifacts. See [`PACKAGING.md`](PACKAGING.md).
+  macOS, Linux, and Windows (all required), uploading installers as run artifacts. The
+  Windows job Authenticode-signs the exe + installer via Azure Trusted Signing when the
+  signing secrets are set. See [`PACKAGING.md`](PACKAGING.md).
 
 ## Packaging / releases
 
@@ -128,7 +129,9 @@ scripts/package.sh          # macOS / Linux  -> app/target/packages/
 scripts\package.ps1         # Windows (PowerShell)
 ```
 
-Builds are **unsigned dev builds** (not for distribution yet). Config, formats, prerequisites,
-the Windows target status, and the signing deferral are documented in
-[`PACKAGING.md`](PACKAGING.md); the app icons in
+Bare `package.*` output is **unsigned**; macOS has a signed + notarized path
+(`scripts/sign_macos.sh`) and Windows Authenticode-signs via Azure Trusted Signing in CI —
+though nothing is **distribution-ready** until the pre-distribution security audit clears.
+Config, formats, prerequisites, the Windows target status, and the signing paths are
+documented in [`PACKAGING.md`](PACKAGING.md); the app icons in
 [`crates/freecell-app/packaging/icons/`](crates/freecell-app/packaging/icons/README.md).

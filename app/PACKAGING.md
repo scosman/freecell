@@ -221,12 +221,58 @@ minutes each, occasionally much longer.
    so it launches even offline after being dragged out of the `.dmg`. The app is submitted as
    a `ditto -c -k --keepParent` archive — `zip` mangles symlinks and extended attributes in a
    bundle and the notary service rejects the result.
-4. **Verifies**: `stapler validate` on both, then `spctl --assess`, which must report
-   `accepted … source=Notarized Developer ID`. Anything else fails the run.
+4. **Verifies, by asserting on `codesign -d` output** — see below for why `--verify` alone
+   is not enough — then `stapler validate` on both artifacts and `spctl --assess`, which
+   must report `accepted … source=Notarized Developer ID`. Anything else fails the run.
 
 If notarization comes back `Invalid`, the summary status alone is useless, so the script
 automatically fetches and prints `xcrun notarytool log <submission-id>`. The reason is
 almost always a missing hardened-runtime flag or an unsigned nested binary.
+
+### Confirming the signature — why `codesign --verify` is not enough
+
+**`codesign --verify --strict` passes on an unsigned bundle.** Every arm64 Mach-O is
+ad-hoc signed by the linker, and an ad-hoc signature is a *valid* signature — so `--verify`
+reports success on a build that no one has signed. The only thing that distinguishes
+"has a valid signature" from "is signed by us, with the flags notarization needs" is the
+`codesign -d` display report, which is what the script asserts against.
+
+An **unsigned** bundle straight out of `package.sh`:
+
+```
+$ codesign -dv target/packages/FreeCell.app
+Identifier=freecell-b6e2e888c757f89d                                  # linker-generated
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20400 size=233688 flags=0x20002(adhoc,linker-signed)  # <- adhoc
+Signature=adhoc                                                       # <- adhoc
+Info.plist=not bound                                                  # <- bundle not sealed
+TeamIdentifier=not set                                                # <- no identity
+Sealed Resources=none                                                 # <- bundle not sealed
+```
+
+After `sign_macos.sh`, at `-dvv` (that verbosity is what adds the `Authority` chain and
+`Timestamp` lines):
+
+```
+$ codesign -dvv target/packages/FreeCell.app
+Identifier=net.scosman.freecell                                       # the real bundle id
+CodeDirectory v=20500 size=233688 flags=0x10000(runtime)              # hardened runtime
+Signature size=9061
+Authority=Developer ID Application: Your Name (TEAMID)                # the identity
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=...                                                         # secure timestamp
+Info.plist entries=24
+TeamIdentifier=TEAMID
+Sealed Resources version=2 rules=13 files=4
+```
+
+The script fails the run unless it sees, on the `.app`: no `adhoc`/`linker-signed`, an
+`Authority=Developer ID Application` line, `TeamIdentifier=` matching the certificate you
+picked, `Timestamp=` (a signature with `Signed Time=` instead has **no** secure timestamp
+and the notary service will reject it), `runtime` in the CodeDirectory flags, the correct
+`Identifier=`, and a sealed bundle. The `.dmg` gets the same checks minus the bundle-only
+ones — a disk image has no hardened runtime, Info.plist, or sealed resources.
 
 ### Verifying like a real downloader
 

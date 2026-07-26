@@ -224,9 +224,93 @@ echo "    nested code signed: $nested_count"
 
 codesign "${codesign_args[@]}" "$app_path"
 
-echo "    verifying…"
-codesign --verify --strict --verbose=2 "$app_path"
-codesign --display --verbose=4 "$app_path" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp|CodeDirectory)' || true
+# =================================================================================
+# Signature assertion.
+#
+# `codesign --verify --strict` is NOT sufficient on its own: an ad-hoc / linker-signed
+# binary — which is what EVERY arm64 Mach-O is before we touch it — verifies perfectly
+# cleanly. Only the `codesign -d` display output distinguishes "has a valid signature" from
+# "is signed by us, with the flags notarization needs". An unsigned bundle looks like this,
+# and every one of these lines is a failure we assert against below:
+#
+#   Identifier=freecell-b6e2e888c757f89d          <- linker-generated, not the bundle id
+#   CodeDirectory ... flags=0x20002(adhoc,linker-signed)
+#   Signature=adhoc
+#   Info.plist=not bound
+#   TeamIdentifier=not set
+#   Sealed Resources=none
+#
+# Reads $team_id and $bundle_id from the enclosing script.
+# =================================================================================
+assert_developer_id_signed() {
+    local target="$1" kind="$2"
+    local info
+
+    # codesign -d writes its report to stderr.
+    info="$(codesign --display --verbose=2 "$target" 2>&1)" \
+        || die "codesign could not read a signature from $target"
+    printf '%s\n' "$info" | sed 's/^/      /'
+
+    if printf '%s\n' "$info" | grep -qE 'Signature=adhoc|adhoc,linker-signed|linker-signed'; then
+        die "$target is AD-HOC signed, not Developer ID signed — 'codesign --force' did not take.
+(An ad-hoc signature passes 'codesign --verify' cleanly, which is why we check the display
+output. See the report above.)"
+    fi
+    if printf '%s\n' "$info" | grep -q 'Signature=none'; then
+        die "$target is NOT SIGNED at all. See the report above."
+    fi
+    if ! printf '%s\n' "$info" | grep -q 'Authority=Developer ID Application'; then
+        die "$target has no 'Developer ID Application' authority — it is signed by the wrong
+kind of certificate and cannot be notarized. See the report above."
+    fi
+    if ! printf '%s\n' "$info" | grep -q "TeamIdentifier=$team_id"; then
+        die "$target does not carry TeamIdentifier=$team_id (an unsigned bundle reports
+'TeamIdentifier=not set'). See the report above."
+    fi
+    # With --timestamp, codesign reports 'Timestamp=<date>'. WITHOUT a secure timestamp it
+    # reports 'Signed Time=<date>' instead, and the notary service rejects that.
+    if ! printf '%s\n' "$info" | grep -q '^Timestamp='; then
+        die "$target has no secure timestamp (look for 'Signed Time=' instead of
+'Timestamp=' in the report above). The Apple notary service rejects untimestamped
+signatures; this usually means the timestamp server was unreachable."
+    fi
+
+    # Bundle-only checks. A .dmg signature has no hardened runtime, no Info.plist, and no
+    # sealed resources, so these apply to the .app only.
+    if [[ "$kind" == "app" ]]; then
+        if ! printf '%s\n' "$info" | grep -qE 'flags=[^(]*\([^)]*runtime'; then
+            die "$target is signed WITHOUT the hardened runtime (no 'runtime' in the
+CodeDirectory flags above). Notarization requires it."
+        fi
+        if ! printf '%s\n' "$info" | grep -q "^Identifier=$bundle_id"; then
+            die "$target reports the wrong code signing identifier — expected
+'Identifier=$bundle_id' (an unsigned bundle shows a linker-generated id like
+'freecell-b6e2e888c757f89d'). See the report above."
+        fi
+        # Asserted as negatives on purpose. codesign spells these two inconsistently — the
+        # unsigned forms are 'Sealed Resources=none' / 'Info.plist=not bound', while the
+        # signed forms drop the '=' ('Sealed Resources version=2 rules=…', 'Info.plist
+        # entries=24'). Matching the failure text is exact; matching the success text would
+        # be guesswork.
+        if printf '%s\n' "$info" | grep -q 'Sealed Resources=none'; then
+            die "$target has no sealed resources — the BUNDLE was not signed, only its
+executable. See the report above."
+        fi
+        if printf '%s\n' "$info" | grep -q 'Info.plist=not bound'; then
+            die "$target's Info.plist is not bound into the signature — the BUNDLE was not
+signed, only its executable. See the report above."
+        fi
+    fi
+
+    echo "      ^ ok: Developer ID, team $team_id, timestamped$([[ "$kind" == "app" ]] && echo ", hardened runtime")"
+}
+
+bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist" 2>/dev/null || echo '')"
+[[ -n "$bundle_id" ]] || die "could not read CFBundleIdentifier from $app_path/Contents/Info.plist"
+
+echo "    verifying the signature…"
+codesign --verify --deep --strict --verbose=2 "$app_path"
+assert_developer_id_signed "$app_path" app
 
 # =================================================================================
 # Notarization helper.
@@ -309,6 +393,7 @@ echo "    built: $dmg_path"
 echo "    verifying the .dmg signature…"
 codesign --verify --strict --verbose=2 "$dmg_path" \
     || die "create-dmg produced an UNSIGNED (or badly signed) .dmg — check its output above."
+assert_developer_id_signed "$dmg_path" dmg
 
 # =================================================================================
 # 7. Notarize + staple the .dmg.
@@ -324,6 +409,10 @@ notarize "$dmg_path"
 #    ID" — anything else is a failed release build.
 # =================================================================================
 step "Verification"
+
+# Stapling writes the notarization ticket into the bundle. That is designed not to disturb
+# the seal, but re-verify rather than assume.
+codesign --verify --deep --strict --verbose=2 "$app_path"
 
 xcrun stapler validate "$app_path"
 xcrun stapler validate "$dmg_path"

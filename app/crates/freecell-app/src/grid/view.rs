@@ -47,9 +47,9 @@ use super::layout::{
 };
 use super::{
     GridEvent, GridEventSink, RowOrCol, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX,
-    CELL_H_PAD, CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, GRIDLINE,
-    GRID_FONT_FAMILY, HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE, HEADER_SELECTED_BG, HEADER_TEXT,
-    SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
+    CELL_H_PAD, CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, FREEZE_DIVIDER,
+    FREEZE_DIVIDER_PX, GRIDLINE, GRID_FONT_FAMILY, HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE,
+    HEADER_SELECTED_BG, HEADER_TEXT, SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
 };
 
 /// Half-width (px) of a divider resize hotspot (`ui_design.md §3`: a 6 px zone centered on the
@@ -145,6 +145,10 @@ struct HeaderMenu {
     /// (Unhide N; Hide counts the newly-hidden `run_len − hidden_in_run`), independent of the
     /// span width (`unhide_run` may be wider than the count when the hidden tracks are sparse).
     hidden_in_run: u32,
+    /// The current frozen count on the menu's axis (`M` for a row header, `K` for a column header),
+    /// read from the cache at open. Drives the Freeze/Unfreeze slot (`freeze-panes`
+    /// `architecture.md §4`): the item Unfreezes when `frozen == run.1 + 1`, else Freezes.
+    frozen: u32,
 }
 
 /// The open cell-area right-click context menu (`functional_spec.md §2`, cloned from
@@ -216,6 +220,16 @@ struct FillDrag {
     seed: CellRange,
     target: CellRange,
     axis: Option<FillAxis>,
+}
+
+/// An in-flight **point-mode** drag (`formula-point-mode/functional_spec.md §2`): sweeping a range
+/// into the active formula edit. `origin` is the merge-anchor-resolved cell the drag started on;
+/// `last_range` is the last (merge-expanded) range emitted as a reference, used both to dedupe
+/// per-cell re-emits and as the single-cell case when the drag releases on its origin.
+#[derive(Debug, Clone, Copy)]
+struct PointDrag {
+    origin: CellRef,
+    last_range: CellRange,
 }
 
 /// A right-click "Delete chart" context menu over a chart (P18, `ui_design §3.2` — the alternate
@@ -354,6 +368,21 @@ pub struct GridView {
     /// path (only ever `true` while an edit is live).
     quick_edit: bool,
 
+    // ---- Formula reference highlighting + point-mode (`formula-point-mode`) --------------------
+    /// The same-sheet reference highlights to paint while a formula edit is open
+    /// (`formula-point-mode/architecture.md §4.1`): each target range + its palette slot, pushed by
+    /// the chrome via [`set_edit_state`](Self::set_edit_state). Painted as a rich fill + border in
+    /// the overlay pass; empty while not editing a formula. Cleared on sheet switch.
+    ref_highlights: Vec<(CellRange, u8)>,
+    /// Whether the driving formula editor's caret is reference-ready (pushed by the chrome,
+    /// `formula-point-mode/architecture.md §3.1`). Consumed by [`mouse_down_cell`](Self::mouse_down_cell)
+    /// to branch point-insert vs commit.
+    reference_ready: bool,
+    /// Whether a just-pointed reference is pending (pushed by the chrome). Consumed by
+    /// [`mouse_down_cell`](Self::mouse_down_cell): a grid click while set replaces the pending ref
+    /// even when the caret is not reference-ready (the pending-ref override).
+    pending_ref: bool,
+
     /// The charts painted on each sheet's **ChartLayer** (P8/P11, `charts/architecture.md §4.2`,
     /// §5 challenge 5), keyed by sheet. See [`SheetChartLayer`]: the per-sheet spec list is **shared**
     /// with the engine's published snapshot (no app-side copy), and the per-frame scan reads only the
@@ -369,6 +398,11 @@ pub struct GridView {
     /// The in-flight drag of the selection's fill handle, if any (`gaps_closing_7_15 §3`;
     /// `None` = not fill-dragging). Drives the live preview rect + the committed fill on release.
     fill_drag: Option<FillDrag>,
+    /// The in-flight point-mode drag, if any (`formula-point-mode/functional_spec.md §2`;
+    /// `None` = not point-dragging). Armed by the [`mouse_down_cell`](Self::mouse_down_cell) point
+    /// branch when a reference-ready / pending grid click points; drives the live preview rect + the
+    /// per-cell `InsertReference` re-emits as the range grows.
+    point_drag: Option<PointDrag>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
     /// The open cell-area right-click context menu, if any (`functional_spec.md §2`).
@@ -490,6 +524,41 @@ impl AxisPreview {
     }
 }
 
+/// Which of the four freeze-pane quadrants a [`Quadrant`] describes, and its slot in
+/// [`Frame::quadrants`] (`freeze-panes/components/viewport_split.md §2`). `M=K=0` leaves only
+/// [`QuadKind::Body`] (the pre-freeze single viewport).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuadKind {
+    /// Frozen rows ∩ frozen cols — pinned in both directions.
+    Corner = 0,
+    /// Frozen rows × scrolling cols — pinned vertically, scrolls horizontally.
+    TopBand = 1,
+    /// Scrolling rows × frozen cols — pinned horizontally, scrolls vertically.
+    LeftBand = 2,
+    /// Scrolling rows × scrolling cols — scrolls both (the whole viewport when unfrozen).
+    Body = 3,
+}
+
+/// One freeze-pane quadrant sub-frame (`freeze-panes/components/viewport_split.md §2`): the visible
+/// row/col ranges painted into a single clipped div at `dest`, mapping each cell `(r,c)` to a
+/// **quadrant-relative** pixel via `qorigin_*` (the content-space pixel that lands at `dest`'s
+/// top-left): `qx = col_offset(c) - qorigin_x`, `qy = row_offset(r) - qorigin_y`.
+#[derive(Debug, Clone)]
+struct Quadrant {
+    rows: Range<u32>,
+    cols: Range<u32>,
+    /// Grid-local destination rect `(x0, y0, w, h)` for the clip div.
+    dest: (f32, f32, f32, f32),
+    qorigin_x: f64,
+    qorigin_y: f64,
+}
+
+impl Quadrant {
+    fn contains(&self, row: u32, col: u32) -> bool {
+        self.rows.contains(&row) && self.cols.contains(&col)
+    }
+}
+
 /// The per-frame geometry resolved under the (briefly held) caches read lock. `row_axis`/`col_axis`
 /// are the **committed** prefix-sum axes (never rebuilt per frame); an active resize is applied as
 /// a cheap [`AxisPreview`] delta through the `*_offset` / `*_size` accessors.
@@ -501,13 +570,77 @@ struct Frame {
     col_preview: Option<AxisPreview>,
     total_w: f64,
     total_h: f64,
+    /// The **body** visible row/col range (floored at `M`/`K`). Band ranges live on the quadrants.
     rows: Range<u32>,
     cols: Range<u32>,
     row_header_w: f32,
     content_w: f64,
     content_h: f64,
+    /// The **body-relative** scroll (`freeze-panes`: `0` = first non-frozen track at the divider).
+    /// Equals the absolute scroll when unfrozen.
     scroll_x: f64,
     scroll_y: f64,
+    /// Frozen band pixel extents: `col_axis.offset_of(K)` / `row_axis.offset_of(M)` (0 when that
+    /// axis is unfrozen). Drive the divider, the body sub-rect, and the scrollbar extent.
+    frozen_w: f64,
+    frozen_h: f64,
+    /// Frozen track COUNTS `M` (rows) / `K` (cols), clamped to the axis length. Drive the pinned
+    /// header-letter/number loops (the band's pixel extent is `frozen_w`/`frozen_h`).
+    frozen_rows: u32,
+    frozen_cols: u32,
+    /// The ≤4 quadrant sub-frames, indexed by [`QuadKind`]. `None` = that quadrant is absent
+    /// (empty range or zero-size dest). `M=K=0` leaves only [`QuadKind::Body`].
+    quadrants: [Option<Quadrant>; 4],
+}
+
+impl Frame {
+    /// The body quadrant, if present (absent only when the band fills the viewport).
+    fn body_quadrant(&self) -> Option<&Quadrant> {
+        self.quadrants[QuadKind::Body as usize].as_ref()
+    }
+    /// The frozen-pane split (`freeze-panes`) as a pure [`layout::PaneGeometry`], for the
+    /// scrollbar/clamp helpers. `scroll_x/scroll_y` are the body-relative scroll.
+    fn pane_geometry(&self) -> layout::PaneGeometry {
+        layout::PaneGeometry {
+            row_header_w: self.row_header_w,
+            frozen_w: self.frozen_w,
+            frozen_h: self.frozen_h,
+            content_w: self.content_w,
+            content_h: self.content_h,
+            body_sx: self.scroll_x,
+            body_sy: self.scroll_y,
+        }
+    }
+    /// Whether `(row, col)` falls in any present quadrant's visible range — the quadrant UNION the
+    /// published-cell index filters on (§2). `M=K=0` → the single body range, i.e. the old
+    /// `rows.contains && cols.contains`.
+    fn in_visible_union(&self, row: u32, col: u32) -> bool {
+        self.quadrants
+            .iter()
+            .flatten()
+            .any(|q| q.contains(row, col))
+    }
+    /// The quadrant that should host cell-anchored overlays (in-cell editor, fill handle) for
+    /// `cell`: the one whose range contains it, else the body (so a scrolled-out anchor still
+    /// renders, clipped, preserving focus — as before freeze).
+    fn overlay_host(&self, cell: CellRef) -> Option<usize> {
+        for (i, q) in self.quadrants.iter().enumerate() {
+            if let Some(q) = q {
+                if q.contains(cell.row, cell.col) {
+                    return Some(i);
+                }
+            }
+        }
+        self.quadrants[QuadKind::Body as usize]
+            .as_ref()
+            .map(|_| QuadKind::Body as usize)
+    }
+    /// The quadrant hosting `cell`'s anchored overlays (in-cell editor / autocomplete), resolved
+    /// from [`overlay_host`](Self::overlay_host).
+    fn overlay_quadrant(&self, cell: CellRef) -> Option<&Quadrant> {
+        self.overlay_host(cell)
+            .and_then(|i| self.quadrants[i].as_ref())
+    }
 }
 
 impl Frame {
@@ -634,12 +767,16 @@ impl GridView {
             incell_cap: None,
             incell_autocomplete: None,
             incell_sig_hint: None,
+            ref_highlights: Vec::new(),
+            reference_ready: false,
+            pending_ref: false,
             incell_geom: None,
             quick_edit: false,
             charts: HashMap::new(),
             selected_chart: None,
             chart_drag: None,
             fill_drag: None,
+            point_drag: None,
             chart_menu: None,
             cell_menu: None,
             wrap_cells: Vec::new(),
@@ -789,8 +926,11 @@ impl GridView {
     }
 
     /// Pushes the chrome's current edit state onto the grid (live mirror, in-cell overlay cell,
-    /// in-cell cap message). `None`s clear the corresponding overlay. Repaints so the mirror tracks
-    /// each keystroke (`components/edit_controller.md §4.3–4.4`).
+    /// in-cell cap message, autocomplete/sig-hint) plus the formula reference state
+    /// (`formula-point-mode/architecture.md §3.1`): `reference_ready` / `pending_ref` (stored for
+    /// the Phase-3 point-vs-commit branch) and `ref_highlights` (the same-sheet ranges painted in
+    /// the overlay pass). `None`s / empties clear the corresponding overlay. Repaints so the mirror
+    /// + highlights track each keystroke (`components/edit_controller.md §4.3–4.4`).
     #[allow(clippy::too_many_arguments)]
     pub fn set_edit_state(
         &mut self,
@@ -800,12 +940,18 @@ impl GridView {
         quick_edit: bool,
         autocomplete: Option<AutocompleteDisplay>,
         sig_hint: Option<SharedString>,
+        reference_ready: bool,
+        pending_ref: bool,
+        ref_highlights: Vec<(CellRange, u8)>,
         cx: &mut Context<Self>,
     ) {
         self.mirror = mirror;
         self.quick_edit = quick_edit;
         self.incell_autocomplete = autocomplete;
         self.incell_sig_hint = sig_hint;
+        self.reference_ready = reference_ready;
+        self.pending_ref = pending_ref;
+        self.ref_highlights = ref_highlights;
         // Opening the in-cell editor ends any grid selection drag at its root (BUG #2): a drag armed
         // before the editor opened must not survive into (or past) the editor's lifetime. The
         // overlay `.occlude()`s the follow-up mouse-up, so the grid would never clear such a drag,
@@ -898,6 +1044,12 @@ impl GridView {
         self.incell_cap = None;
         self.incell_autocomplete = None;
         self.incell_sig_hint = None;
+        // Reference highlights + point-mode signals are anchored to the previous sheet's formula
+        // edit — drop them so they can never leak onto the new sheet.
+        self.ref_highlights.clear();
+        self.reference_ready = false;
+        self.pending_ref = false;
+        self.point_drag = None;
         // Structural interactions are anchored to the previous sheet's geometry — drop them.
         self.resize_drag = None;
         self.resize_preview = None;
@@ -971,6 +1123,22 @@ impl GridView {
         cx.notify();
     }
 
+    /// Arms a point-drag preview state directly (render-test / debug hook), so a static capture can
+    /// show the dashed point-mode preview marquee without synthesizing a live mouse drag. `origin` is
+    /// the merge-anchor start cell, `last_range` (⊇ origin) the swept, merge-expanded range — exactly
+    /// the state the live [`set_point_target_from_cell`](Self::set_point_target_from_cell) builds
+    /// (`formula-point-mode/functional_spec.md §2`). The normal app never calls this (the point-drag
+    /// machine owns the state); it exists so the pixel suite can baseline the preview overlay.
+    pub fn set_point_drag_preview(
+        &mut self,
+        origin: CellRef,
+        last_range: CellRange,
+        cx: &mut Context<Self>,
+    ) {
+        self.point_drag = Some(PointDrag { origin, last_range });
+        cx.notify();
+    }
+
     /// Freezes the loading spinner to a static loader icon (render-test / debug hook). The
     /// animated `Spinner` rotates by wall-clock elapsed time, so a capture taken at an
     /// arbitrary moment (after `xrefresh`) would be non-deterministic; freezing makes the
@@ -1034,27 +1202,43 @@ impl GridView {
             col_preview.map_or((0.0, 0.0), |p| (p.grow_extent(), p.shrink_extent()));
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
 
-        // Compute visible ranges + gutter width for a given scroll (the gutter width depends
-        // on the deepest visible row, which depends on scroll — hence a small closure). The preview
-        // over-render (near + far) is folded into the queried start + extent so every previewed-
-        // visible track is fetched (`index_at` clamps a negative start to 0).
-        let ranges = |sx: f64, sy: f64| -> (Range<u32>, f32, f64, Range<u32>) {
+        // Freeze-pane split (`freeze-panes/components/viewport_split.md §1`): the leading-track
+        // counts off the resident cache and their preview-aware pixel band extents. `M=K=0` (the
+        // common case) leaves `frozen_w=frozen_h=0`, reducing every branch below to today's math.
+        let m = cache.frozen_rows().min(row_axis.count());
+        let k = cache.frozen_cols().min(col_axis.count());
+        let frozen_h =
+            row_preview.map_or_else(|| row_axis.offset_of(m), |p| p.offset(&row_axis, m));
+        let frozen_w =
+            col_preview.map_or_else(|| col_axis.offset_of(k), |p| p.offset(&col_axis, k));
+
+        // Compute the BODY visible ranges + gutter width for a given **body-relative** scroll. Body
+        // rows query against the re-based scroll (`frozen_h + body_sy`) over the body height, with
+        // the range start floored at `M` so overscan never pulls a frozen row into the body (§2).
+        // The gutter width tracks the deepest visible BODY row (frozen rows are shallow leading
+        // tracks). The preview over-render (near + far) is folded into the queried start + extent.
+        let ranges = |bsx: f64, bsy: f64| -> (Range<u32>, f32, f64, Range<u32>, f64, f64) {
+            let body_h = (content_h - frozen_h).max(0.0);
             let rows = row_axis.visible_range(
-                sy - row_near,
-                content_h + row_near + row_far,
+                frozen_h + bsy - row_near,
+                body_h + row_near + row_far,
                 RENDER_OVERSCAN,
             );
+            let rows = rows.start.max(m)..rows.end.max(m);
             let row_header_w = layout::row_header_width(rows.end.saturating_sub(1));
             let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            let body_w = (content_w - frozen_w).max(0.0);
             let cols = col_axis.visible_range(
-                sx - col_near,
-                content_w + col_near + col_far,
+                frozen_w + bsx - col_near,
+                body_w + col_near + col_far,
                 RENDER_OVERSCAN,
             );
-            (rows, row_header_w, content_w, cols)
+            let cols = cols.start.max(k)..cols.end.max(k);
+            (rows, row_header_w, content_w, cols, body_w, body_h)
         };
 
-        let (mut rows, mut row_header_w, mut content_w, mut cols) = ranges(scroll_x, scroll_y);
+        let (mut rows, mut row_header_w, mut content_w, mut cols, mut body_w, mut body_h) =
+            ranges(scroll_x, scroll_y);
 
         if let Some((rr, rc)) = reveal {
             // Size the reveal's content area with the gutter for the *target* row too:
@@ -1062,15 +1246,20 @@ impl GridView {
             // which would shrink the real content width. Using the wider of the current and
             // target-row gutters is conservative — it never over-estimates content width, so a
             // cell near the right/bottom edge is never revealed a few px short (the second-order
-            // edge this guards; drivers land in Phase 8).
+            // edge this guards; drivers land in Phase 8). Frozen-aware reveal (`freeze-panes §3.2`):
+            // a target on a frozen axis is a no-op (already pinned in the band), a body target aligns
+            // into the body sub-area below/right of the divider. `M=K=0` reduces to `scroll_to_reveal`.
             let reveal_gutter = row_header_w.max(layout::row_header_width(rr));
-            let area = ContentArea {
+            let pane = layout::PaneGeometry {
                 row_header_w: reveal_gutter,
-                width: (viewport_w - reveal_gutter as f64).max(0.0),
-                height: content_h,
+                frozen_w,
+                frozen_h,
+                content_w: (viewport_w - reveal_gutter as f64).max(0.0),
+                content_h,
+                body_sx: scroll_x,
+                body_sy: scroll_y,
             };
-            let (nx, ny) =
-                layout::scroll_to_reveal(rr, rc, &row_axis, &col_axis, area, scroll_x, scroll_y);
+            let (nx, ny) = pane.reveal(rr, rc, &row_axis, &col_axis);
             scroll_x = nx;
             scroll_y = ny;
             self.scroll.insert(active, (nx, ny));
@@ -1079,13 +1268,20 @@ impl GridView {
             row_header_w = r.1;
             content_w = r.2;
             cols = r.3;
+            body_w = r.4;
+            body_h = r.5;
         }
 
-        // Snapshot the visible cells' resolved styles (copied — `RenderStyle: Copy`), so the
-        // lock is released before any painting. Bounded by visible cell count.
+        // Snapshot the visible cells' resolved styles (copied — `RenderStyle: Copy`) over the
+        // quadrant UNION (frozen bands + body), so band cells resolve their fills/borders/fonts
+        // too (§2). The `0..M ∪ body_rows` × `0..K ∪ body_cols` cross-product is exactly the union
+        // of the four quadrant rectangles; `M=K=0` reduces to the body range (today). The lock is
+        // released before any painting. Bounded by visible-cell count (bands are few leading tracks).
+        // Both axes iterate a stack-only chained `Range` iterator (no per-frame heap allocation —
+        // `M=K=0` stays allocation-light, the `0..0` chain being just the body range).
         self.visible_styles.clear();
-        for r in rows.clone() {
-            for c in cols.clone() {
+        for r in (0..m).chain(rows.clone()) {
+            for c in (0..k).chain(cols.clone()) {
                 if let Some(style) = cache.render_style(r, c) {
                     self.visible_styles.insert((r, c), *style);
                 }
@@ -1103,6 +1299,65 @@ impl GridView {
         self.visible_border_specs = cache.border_specs().to_vec();
         drop(caches);
 
+        // Build the ≤4 quadrant sub-frames (§1/§2). Each maps a cell to a quadrant-relative pixel
+        // via `qorigin`; band quadrants use unscrolled origins, the body uses `frozen_* + body_s*`.
+        // A quadrant with an empty range or a zero-size dest is dropped. `M=K=0` → only the Body,
+        // whose dest = `(row_header_w, COL_HEADER_H, content_w, content_h)` and `qorigin =
+        // (scroll_x, scroll_y)` — byte-for-byte today.
+        let mut quadrants: [Option<Quadrant>; 4] = [None, None, None, None];
+        let non_empty = |r: &Range<u32>| r.start < r.end;
+        if m > 0 && k > 0 && frozen_w > 0.0 && frozen_h > 0.0 {
+            quadrants[QuadKind::Corner as usize] = Some(Quadrant {
+                rows: 0..m,
+                cols: 0..k,
+                dest: (row_header_w, COL_HEADER_H, frozen_w as f32, frozen_h as f32),
+                qorigin_x: 0.0,
+                qorigin_y: 0.0,
+            });
+        }
+        if m > 0 && frozen_h > 0.0 && non_empty(&cols) && body_w > 0.0 {
+            quadrants[QuadKind::TopBand as usize] = Some(Quadrant {
+                rows: 0..m,
+                cols: cols.clone(),
+                dest: (
+                    row_header_w + frozen_w as f32,
+                    COL_HEADER_H,
+                    body_w as f32,
+                    frozen_h as f32,
+                ),
+                qorigin_x: frozen_w + scroll_x,
+                qorigin_y: 0.0,
+            });
+        }
+        if k > 0 && frozen_w > 0.0 && non_empty(&rows) && body_h > 0.0 {
+            quadrants[QuadKind::LeftBand as usize] = Some(Quadrant {
+                rows: rows.clone(),
+                cols: 0..k,
+                dest: (
+                    row_header_w,
+                    COL_HEADER_H + frozen_h as f32,
+                    frozen_w as f32,
+                    body_h as f32,
+                ),
+                qorigin_x: 0.0,
+                qorigin_y: frozen_h + scroll_y,
+            });
+        }
+        if non_empty(&rows) && non_empty(&cols) && body_w > 0.0 && body_h > 0.0 {
+            quadrants[QuadKind::Body as usize] = Some(Quadrant {
+                rows: rows.clone(),
+                cols: cols.clone(),
+                dest: (
+                    row_header_w + frozen_w as f32,
+                    COL_HEADER_H + frozen_h as f32,
+                    body_w as f32,
+                    body_h as f32,
+                ),
+                qorigin_x: frozen_w + scroll_x,
+                qorigin_y: frozen_h + scroll_y,
+            });
+        }
+
         Some(Frame {
             row_axis,
             col_axis,
@@ -1117,6 +1372,11 @@ impl GridView {
             content_h,
             scroll_x,
             scroll_y,
+            frozen_w,
+            frozen_h,
+            frozen_rows: m,
+            frozen_cols: k,
+            quadrants,
         })
     }
 
@@ -1147,20 +1407,34 @@ impl GridView {
             let total_w = cache.total_width();
             let total_h = cache.total_height();
             let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+            // Freeze-pane band extents (`freeze-panes`): the stored scroll is body-relative, clamped
+            // against the non-frozen tracks over the body sub-rect. `M=K=0` → the pre-freeze clamp.
+            let m = cache.frozen_rows().min(row_axis.count());
+            let k = cache.frozen_cols().min(col_axis.count());
+            let frozen_h = row_axis.offset_of(m);
+            let frozen_w = col_axis.offset_of(k);
 
-            // Tentative new scroll, then clamp using the gutter width for the tentative rows.
+            // Tentative new body scroll, then clamp using the gutter width for the tentative body
+            // rows (queried against the re-based scroll over the body height).
+            let body_h = (content_h - frozen_h).max(0.0);
             let tentative_y = (sy0 - dy).max(0.0);
-            let tentative_rows = row_axis.visible_range(tentative_y, content_h, RENDER_OVERSCAN);
+            let tentative_rows =
+                row_axis.visible_range(frozen_h + tentative_y, body_h, RENDER_OVERSCAN);
             let row_header_w = layout::row_header_width(tentative_rows.end.saturating_sub(1));
             let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            let area = ContentArea {
+            let pane = layout::PaneGeometry {
                 row_header_w,
-                width: content_w,
-                height: content_h,
+                frozen_w,
+                frozen_h,
+                content_w,
+                content_h,
+                body_sx: sx0 - dx,
+                body_sy: sy0 - dy,
             };
-            let (nx, ny) = layout::clamp_scroll(sx0 - dx, sy0 - dy, total_w, total_h, area);
-            let rows = row_axis.visible_range(ny, content_h, RENDER_OVERSCAN);
-            let cols = col_axis.visible_range(nx, content_w, RENDER_OVERSCAN);
+            let (nx, ny) = pane.clamp(total_w, total_h);
+            let (body_w, _) = pane.body_area();
+            let rows = row_axis.visible_range(frozen_h + ny, body_h, RENDER_OVERSCAN);
+            let cols = col_axis.visible_range(frozen_w + nx, body_w, RENDER_OVERSCAN);
             (nx, ny, rows, cols)
         };
         let (nx, ny, rows, cols) = resolved;
@@ -1251,10 +1525,38 @@ impl GridView {
         (f32::from(position.x) - ox, f32::from(position.y) - oy)
     }
 
-    /// The row-header gutter width for the current scroll (matches the render path's sizing).
-    fn gutter_width(row_axis: &Axis, scroll_y: f64, content_h: f64) -> f32 {
-        let rows = row_axis.visible_range(scroll_y, content_h, RENDER_OVERSCAN);
-        layout::row_header_width(rows.end.saturating_sub(1))
+    /// The frozen-pane geometry ([`layout::PaneGeometry`]) for an INPUT event on `cache`, computed
+    /// exactly as [`resolve_frame`](Self::resolve_frame)'s non-preview path (`freeze-panes`): the
+    /// band extents from `M/K`, the gutter sized to the deepest visible **body** row, the
+    /// body-relative scroll. Threading every hit-test / cell_at_point / reveal / edge-scroll through
+    /// this keeps interactions byte-for-byte consistent with the rendered frame; `M=K=0` reduces to
+    /// the pre-freeze single-region geometry (the gutter sizing matches the render path's).
+    /// Interactions never run during a resize drag, so no [`AxisPreview`] is applied here.
+    fn input_pane_geometry(
+        cache: &freecell_core::cache::SheetCache,
+        viewport_w: f64,
+        content_h: f64,
+        scroll_x: f64,
+        scroll_y: f64,
+    ) -> layout::PaneGeometry {
+        let (row_axis, col_axis) = cache.axes();
+        let m = cache.frozen_rows().min(row_axis.count());
+        let k = cache.frozen_cols().min(col_axis.count());
+        let frozen_h = row_axis.offset_of(m);
+        let frozen_w = col_axis.offset_of(k);
+        let body_h = (content_h - frozen_h).max(0.0);
+        let rows = row_axis.visible_range(frozen_h + scroll_y, body_h, RENDER_OVERSCAN);
+        let row_header_w = layout::row_header_width(rows.end.max(m).saturating_sub(1));
+        let content_w = (viewport_w - row_header_w as f64).max(0.0);
+        layout::PaneGeometry {
+            row_header_w,
+            frozen_w,
+            frozen_h,
+            content_w,
+            content_h,
+            body_sx: scroll_x,
+            body_sy: scroll_y,
+        }
     }
 
     /// Mouse down: claim keyboard focus, hit-test, and act by region — a data cell sets/extends the
@@ -1268,8 +1570,8 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         // A hotspot already started a resize (and stopped propagation); defensively, never treat
-        // this as a selection click. Likewise a live fill drag owns the pointer.
-        if self.resize_drag.is_some() || self.fill_drag.is_some() {
+        // this as a selection click. Likewise a live fill drag or point-mode drag owns the pointer.
+        if self.resize_drag.is_some() || self.fill_drag.is_some() || self.point_drag.is_some() {
             return;
         }
         // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op) and
@@ -1293,8 +1595,13 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            // Frozen-pane geometry (`freeze-panes §3.3`): the hit-test region-routes through the
+            // bands. `M=K=0` → the pre-freeze single-region geometry (pane.row_header_w equals the
+            // old gutter width). Charts/fill stay body-anchored (a chart under a band is the known
+            // minor limitation), so they keep the body-relative content offset.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            let row_header_w = pane.row_header_w;
+            let content_w = pane.content_w;
             // A chart floats above the cells, so hit-test the ChartLayer first — but only in the
             // content area (a point over a header can't be over a clipped chart).
             let content_x = local_x - row_header_w;
@@ -1336,15 +1643,7 @@ impl GridView {
             } else {
                 false
             };
-            let hit = layout::hit_test(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-            );
+            let hit = pane.hit_test(local_x, local_y, &row_axis, &col_axis);
             (hit, chart_hit, fill_hit)
         };
         // A chart under the pointer wins over the cell beneath it (this is the left-button handler:
@@ -1466,6 +1765,36 @@ impl GridView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Point-mode branch (`formula-point-mode/architecture.md §3.2`): while a formula edit is
+        // reference-ready (or a ref is pending), a plain click INSERTS the clicked reference into
+        // the formula instead of committing + moving the selection. Shift-click is excluded (its
+        // range-extend selection semantics stay). Emits `InsertReference` — never `SelectionChanged`
+        // — so the grid selection is untouched, and arms a `point_drag` so a drag sweeps a range.
+        let point_ready = self.reference_ready || self.pending_ref;
+        if point_ready && !event.modifiers.shift {
+            let anchor = self.resolve_merge_anchor(row, col); // DPM.6: covered cell → merge anchor
+            let a1 = CellRange::single(anchor).to_a1();
+            self.events.emit(
+                &GridEvent::InsertReference {
+                    a1,
+                    replace_pending: self.pending_ref,
+                },
+                window,
+                cx,
+            );
+            self.point_drag = Some(PointDrag {
+                origin: anchor,
+                last_range: CellRange::single(anchor),
+            });
+            // Suppress gpui's built-in end-of-dispatch focus transfer to the grid root (it is gated
+            // on `!default_prevented()`). NOTE: this does NOT undo the explicit grid focus already
+            // taken at the top of `handle_mouse_down`; the chrome's `insert_reference` re-focuses the
+            // driving editor after the synchronous splice, and that focus survives because this
+            // `prevent_default` runs afterward.
+            window.prevent_default();
+            cx.notify();
+            return;
+        }
         let cell = CellRef::new(row, col);
         let selection = if event.modifiers.shift {
             // Shift-click extends the range from the existing anchor.
@@ -1600,6 +1929,13 @@ impl GridView {
             self.update_fill_drag(local_x, local_y, window, cx);
             return;
         }
+        // A live point-mode drag grows the swept reference range (checked BEFORE the `incell_open`
+        // guard: a point-drag armed during an in-cell formula edit must still extend — the in-cell
+        // overlay occludes only its own cell, so clicks on other cells reach the grid).
+        if self.point_drag.is_some() {
+            self.update_point_drag(local_x, local_y, window, cx);
+            return;
+        }
         // While the in-cell editor owns the pointer, the grid must not extend a selection drag: a
         // press+drag inside the editor is text selection, not a cell-range drag (BUG #2). This
         // guards any drag still live from before the editor opened; `mouse_down_cell` also refuses
@@ -1642,6 +1978,14 @@ impl GridView {
         }
         if let Some(fd) = self.fill_drag.take() {
             self.commit_fill_drag(fd, window, cx);
+            return;
+        }
+        // A point-mode drag needs no commit — every move already emitted the current range as an
+        // `InsertReference`, so the editor text already reflects the released rectangle. Just clear
+        // the drag and stop any auto-scroll loop (epoch bump, like the selection/fill drags).
+        if self.point_drag.take().is_some() {
+            self.autoscroll_epoch = self.autoscroll_epoch.wrapping_add(1);
+            cx.notify();
             return;
         }
         if self.drag.take().is_some() {
@@ -2030,19 +2374,10 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            let cell = layout::cell_at_point(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-                content_w,
-                content_h,
-            );
+            // Frozen-pane cell_at_point (`freeze-panes §3.3`): a header drag past the divider resolves
+            // the track in whatever region the pointer lands.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            let cell = pane.cell_at_point(local_x, local_y, &row_axis, &col_axis);
             (
                 Some(SheetDims::new(row_axis.count(), col_axis.count())),
                 cell,
@@ -2079,18 +2414,21 @@ impl GridView {
         let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
-        // Hit-test the ChartLayer + headers + read the merge list + hidden sets under one lock.
-        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims) = {
+        // Hit-test the ChartLayer + headers + read the merge list + hidden sets + frozen counts
+        // under one lock.
+        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims, frozen_rows, frozen_cols) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
+            // Frozen-pane geometry (`freeze-panes §3.3`): region-route the header/cell hit-test.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            let row_header_w = pane.row_header_w;
             let content_x = local_x - row_header_w;
             let content_y = local_y - COL_HEADER_H;
             let chart_hit = if content_x >= 0.0 && content_y >= 0.0 {
-                let content_w = (viewport_w - row_header_w as f64).max(0.0);
+                let content_w = pane.content_w;
                 let geom = AxisGeometry {
                     col_axis: &col_axis,
                     row_axis: &row_axis,
@@ -2104,15 +2442,7 @@ impl GridView {
             } else {
                 None
             };
-            let hit = layout::hit_test(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-            );
+            let hit = pane.hit_test(local_x, local_y, &row_axis, &col_axis);
             (
                 hit,
                 chart_hit,
@@ -2120,6 +2450,8 @@ impl GridView {
                 cache.hidden_rows().clone(),
                 cache.hidden_cols().clone(),
                 cache.dims(),
+                cache.frozen_rows(),
+                cache.frozen_cols(),
             )
         };
         // A right-click on a chart selects it and opens the "Delete chart" context menu (P18) — the
@@ -2199,6 +2531,10 @@ impl GridView {
             RowOrCol::Col => (&hidden_cols, dims.1),
         };
         let (hide_blocked, unhide_run, hidden_in_run) = hide_unhide_flags(run, hidden_set, total);
+        let frozen = match axis {
+            RowOrCol::Row => frozen_rows,
+            RowOrCol::Col => frozen_cols,
+        };
         self.cell_menu = None;
         self.header_menu = Some(HeaderMenu {
             axis,
@@ -2211,6 +2547,7 @@ impl GridView {
             hide_blocked,
             unhide_run,
             hidden_in_run,
+            frozen,
         });
         cx.notify();
     }
@@ -2293,19 +2630,10 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            layout::cell_at_point(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-                content_w,
-                content_h,
-            )
+            // Frozen-pane cell_at_point (`freeze-panes §3.3/§4`): a drag past the divider lands on
+            // the band's cell, so a selection/fill drag extends continuously across the boundary.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            pane.cell_at_point(local_x, local_y, &row_axis, &col_axis)
         };
         let selection = SelectionModel {
             anchor,
@@ -2336,19 +2664,10 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            layout::cell_at_point(
-                local_x,
-                local_y,
-                row_header_w,
-                scroll_x,
-                scroll_y,
-                &row_axis,
-                &col_axis,
-                content_w,
-                content_h,
-            )
+            // Frozen-pane cell_at_point (`freeze-panes §3.3/§4`): a drag past the divider lands on
+            // the band's cell, so a selection/fill drag extends continuously across the boundary.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            pane.cell_at_point(local_x, local_y, &row_axis, &col_axis)
         };
         self.set_fill_target_from_cell(cell);
         self.maybe_start_autoscroll(window, cx);
@@ -2409,6 +2728,94 @@ impl GridView {
         };
     }
 
+    /// Update a live point-mode drag from a grid-local pointer (`formula-point-mode §2`): resolve the
+    /// hovered cell, grow the swept range, and (past a viewport edge) kick the auto-scroll loop.
+    fn update_point_drag(
+        &mut self,
+        local_x: f32,
+        local_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active_sheet;
+        let (scroll_x, scroll_y) = self.scroll_of(active);
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let cell = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            // Frozen-pane cell_at_point (`freeze-panes §3.3/§4`): a point-mode drag past the
+            // divider lands on the band's cell, so the swept reference grows continuously across
+            // the boundary (matching the selection/fill drags). `M=K=0` reduces to the pre-freeze
+            // single-region geometry.
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            pane.cell_at_point(local_x, local_y, &row_axis, &col_axis)
+        };
+        self.set_point_target_from_cell(cell, window, cx);
+        self.maybe_start_autoscroll(window, cx);
+        cx.notify();
+    }
+
+    /// Recompute the point-drag's swept range for a pointer over `cell` and, when it changed, re-emit
+    /// it as a reference (`formula-point-mode/architecture.md §3.3`). The range is `origin..cell`
+    /// normalized then **expanded for merges** (DPM.6 — a swept rect touching a merge grows to the
+    /// whole span). Shared by the mouse-move and the auto-scroll tick. Every emit is
+    /// `replace_pending: true` — the grid's own prior insert is the pending ref, so the drag re-aims
+    /// locally without waiting on the deferred `EditState` round-trip (`architecture.md §10`). A
+    /// release on the origin cell keeps `single(origin)` → a single-cell ref (no degenerate range).
+    fn set_point_target_from_cell(
+        &mut self,
+        cell: CellRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = self.point_drag.as_ref().map(|pd| pd.origin) else {
+            return;
+        };
+        let expanded = self.expand_range_for_merges(CellRange::new(origin, cell));
+        let changed = match self.point_drag.as_mut() {
+            Some(pd) if pd.last_range != expanded => {
+                pd.last_range = expanded;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.events.emit(
+                &GridEvent::InsertReference {
+                    a1: expanded.to_a1(),
+                    replace_pending: true,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Resolve a clicked `(row, col)` to the reference to insert (DPM.6, Q6): the top-left **anchor**
+    /// of the merge covering it, or the cell itself when uncovered. Reads the same `cache.merges()`
+    /// the selection/render path uses — one source of truth for merge geometry.
+    fn resolve_merge_anchor(&self, row: u32, col: u32) -> CellRef {
+        let caches = self.sources.caches.read();
+        match caches.get(self.active_sheet) {
+            Some(cache) => resolve_merge_anchor_in(row, col, cache.merges()),
+            None => CellRef::new(row, col),
+        }
+    }
+
+    /// Expand a swept point-drag `range` so it never bisects a merge (DPM.6, Q6): union it with every
+    /// merge it touches, over the same `cache.merges()` list. Identity when no cache is resident.
+    fn expand_range_for_merges(&self, range: CellRange) -> CellRange {
+        let caches = self.sources.caches.read();
+        match caches.get(self.active_sheet) {
+            Some(cache) => expand_range_for_merges_in(range, cache.merges()),
+            None => range,
+        }
+    }
+
     /// Commit a fill drag on release (`gaps_closing_7_15 §3`): stop any auto-scroll loop, then — if
     /// the target actually extended past the seed along a decided axis — emit
     /// [`GridEvent::FillDrag`] and expand the selection to the filled region (Excel behavior). A
@@ -2447,22 +2854,19 @@ impl GridView {
         let pos = window.mouse_position();
         let (local_x, local_y) = self.event_local(pos);
         let active = self.active_sheet;
-        let (_, scroll_y) = self.scroll_of(active);
+        let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
         let caches = self.sources.caches.read();
         let Some(cache) = caches.get(active) else {
             return (0.0, 0.0);
         };
-        let (row_axis, _) = cache.axes();
-        let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-        let content_w = (viewport_w - row_header_w as f64).max(0.0);
-        layout::edge_autoscroll_delta(
+        // Auto-scroll fires only near the scrolling BODY's live edges, never over a frozen band
+        // (`freeze-panes §3.4`). `M=K=0` → the full content rect (today's behaviour).
+        let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+        pane.edge_delta(
             local_x,
             local_y,
-            row_header_w,
-            content_w,
-            content_h,
             EDGE_AUTOSCROLL_STEP_PX,
             EDGE_AUTOSCROLL_HOTZONE_PX,
         )
@@ -2472,8 +2876,11 @@ impl GridView {
     /// (a `spawn_in` timer, so it advances even while the pointer is held still with no
     /// mouse-move events — the "drag to the edge and wait" case).
     fn maybe_start_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Fires for a selection drag OR a fill drag (`gaps_closing_7_15 §3`) past a viewport edge.
-        if self.autoscrolling || (self.drag.is_none() && self.fill_drag.is_none()) {
+        // Fires for a selection drag, a fill drag (`gaps_closing_7_15 §3`), or a point-mode drag
+        // (`formula-point-mode §2`) past a viewport edge.
+        if self.autoscrolling
+            || (self.drag.is_none() && self.fill_drag.is_none() && self.point_drag.is_none())
+        {
             return;
         }
         let (dx, dy) = self.current_edge_delta(window);
@@ -2491,7 +2898,9 @@ impl GridView {
             let keep = this
                 .update_in(cx, |this, window, cx| {
                     if this.autoscroll_epoch != epoch
-                        || (this.drag.is_none() && this.fill_drag.is_none())
+                        || (this.drag.is_none()
+                            && this.fill_drag.is_none()
+                            && this.point_drag.is_none())
                     {
                         this.autoscrolling = false;
                         return false;
@@ -2510,7 +2919,7 @@ impl GridView {
     /// fill-drag target) to the hovered cell, and announce a debounced `ViewportChanged`. Returns
     /// whether to keep looping (`false` once the pointer returns inside the content).
     fn autoscroll_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.drag.is_none() && self.fill_drag.is_none() {
+        if self.drag.is_none() && self.fill_drag.is_none() && self.point_drag.is_none() {
             self.autoscrolling = false;
             return false;
         }
@@ -2530,40 +2939,37 @@ impl GridView {
             let (row_axis, col_axis) = cache.axes();
             let total_w = cache.total_width();
             let total_h = cache.total_height();
-            let row_header_w = Self::gutter_width(&row_axis, scroll_y0, content_h);
-            let content_w = (viewport_w - row_header_w as f64).max(0.0);
-            let (dx, dy) = layout::edge_autoscroll_delta(
+            // Frozen-pane auto-scroll (`freeze-panes §3.4`): the edge hotzone is the BODY sub-rect and
+            // the scroll is body-relative — a drag into a frozen band does not auto-scroll, and the
+            // body-relative scroll clamps against the non-frozen tracks. `M=K=0` → today's math.
+            let pane =
+                Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x0, scroll_y0);
+            let (dx, dy) = pane.edge_delta(
                 local_x,
                 local_y,
-                row_header_w,
-                content_w,
-                content_h,
                 EDGE_AUTOSCROLL_STEP_PX,
                 EDGE_AUTOSCROLL_HOTZONE_PX,
             );
             if dx == 0.0 && dy == 0.0 {
-                None // pointer back inside — stop
+                None // pointer back inside the body — stop
             } else {
-                let area = ContentArea {
-                    row_header_w,
-                    width: content_w,
-                    height: content_h,
+                // Clamp the moved body-relative scroll, then resolve the hovered cell + the body
+                // visible ranges at the clamped scroll through panes at that scroll.
+                let moved = layout::PaneGeometry {
+                    body_sx: scroll_x0 + dx,
+                    body_sy: scroll_y0 + dy,
+                    ..pane
                 };
-                let (nx, ny) =
-                    layout::clamp_scroll(scroll_x0 + dx, scroll_y0 + dy, total_w, total_h, area);
-                let cell = layout::cell_at_point(
-                    local_x,
-                    local_y,
-                    row_header_w,
-                    nx,
-                    ny,
-                    &row_axis,
-                    &col_axis,
-                    content_w,
-                    content_h,
-                );
-                let rows = row_axis.visible_range(ny, content_h, RENDER_OVERSCAN);
-                let cols = col_axis.visible_range(nx, content_w, RENDER_OVERSCAN);
+                let (nx, ny) = moved.clamp(total_w, total_h);
+                let at = layout::PaneGeometry {
+                    body_sx: nx,
+                    body_sy: ny,
+                    ..pane
+                };
+                let cell = at.cell_at_point(local_x, local_y, &row_axis, &col_axis);
+                let (body_w, body_h) = pane.body_area();
+                let rows = row_axis.visible_range(pane.frozen_h + ny, body_h, RENDER_OVERSCAN);
+                let cols = col_axis.visible_range(pane.frozen_w + nx, body_w, RENDER_OVERSCAN);
                 Some((nx, ny, cell, rows, cols))
             }
         };
@@ -2591,6 +2997,10 @@ impl GridView {
         } else if self.fill_drag.is_some() {
             // A fill drag auto-scrolls too: re-extend its previewed target to the hovered cell.
             self.set_fill_target_from_cell(cell);
+            changed = true;
+        } else if self.point_drag.is_some() {
+            // A point-mode drag auto-scrolls too: re-emit the swept reference for the hovered cell.
+            self.set_point_target_from_cell(cell, window, cx);
             changed = true;
         }
         let ranges = (rows, cols);
@@ -2627,25 +3037,36 @@ impl GridView {
                 return;
             };
             let (row_axis, col_axis) = cache.axes();
+            // Frozen-pane band extents (`freeze-panes §3.2`): the reveal is body-relative and no-ops
+            // on a frozen axis. `M=K=0` reduces to the pre-freeze `scroll_to_reveal`.
+            let m = cache.frozen_rows().min(row_axis.count());
+            let k = cache.frozen_cols().min(col_axis.count());
+            let frozen_h = row_axis.offset_of(m);
+            let frozen_w = col_axis.offset_of(k);
+            let body_h = (content_h - frozen_h).max(0.0);
             // Gutter wide enough for both the current view and the (possibly deeper) target row,
-            // matching `resolve_frame`'s conservative reveal sizing.
-            let cur_rows = row_axis.visible_range(scroll_y0, content_h, RENDER_OVERSCAN);
-            let reveal_gutter = layout::row_header_width(cur_rows.end.saturating_sub(1))
+            // matching `resolve_frame`'s conservative reveal sizing (body-relative query).
+            let cur_rows = row_axis.visible_range(frozen_h + scroll_y0, body_h, RENDER_OVERSCAN);
+            let reveal_gutter = layout::row_header_width(cur_rows.end.max(m).saturating_sub(1))
                 .max(layout::row_header_width(row));
-            let content_w = (viewport_w - reveal_gutter as f64).max(0.0);
-            let area = ContentArea {
+            let pane = layout::PaneGeometry {
                 row_header_w: reveal_gutter,
-                width: content_w,
-                height: content_h,
+                frozen_w,
+                frozen_h,
+                content_w: (viewport_w - reveal_gutter as f64).max(0.0),
+                content_h,
+                body_sx: scroll_x0,
+                body_sy: scroll_y0,
             };
-            let (nx, ny) = layout::scroll_to_reveal(
-                row, col, &row_axis, &col_axis, area, scroll_x0, scroll_y0,
-            );
-            // Recompute the visible ranges (and gutter/content) at the new scroll.
-            let rows = row_axis.visible_range(ny, content_h, RENDER_OVERSCAN);
+            let (nx, ny) = pane.reveal(row, col, &row_axis, &col_axis);
+            // Recompute the body visible ranges (and gutter/content) at the new body-relative scroll.
+            let rows = row_axis.visible_range(frozen_h + ny, body_h, RENDER_OVERSCAN);
+            let rows = rows.start.max(m)..rows.end.max(m);
             let content_w2 =
                 (viewport_w - layout::row_header_width(rows.end.saturating_sub(1)) as f64).max(0.0);
-            let cols = col_axis.visible_range(nx, content_w2, RENDER_OVERSCAN);
+            let body_w2 = (content_w2 - frozen_w).max(0.0);
+            let cols = col_axis.visible_range(frozen_w + nx, body_w2, RENDER_OVERSCAN);
+            let cols = cols.start.max(k)..cols.end.max(k);
             (nx, ny, rows, cols)
         };
 
@@ -2860,52 +3281,37 @@ impl GridView {
     /// perf harness's [`GridView::measure_frame`], so the measured build never drifts from the
     /// real render. When `timing` is `Some`, records the publication-scan duration + content-cell
     /// count (the perf harness's cell-load witness); `None` on the render path reads no clock.
-    fn build_grid_layers(
+    /// Builds one freeze-pane quadrant's content children (cells + borders + spill + selection +
+    /// fill + optionally the editor/handle), in **quadrant-relative** coordinates, for placement in
+    /// that quadrant's clipped `dest` div (`freeze-panes/components/viewport_split.md §2`). The loop
+    /// runs over `quad.rows × quad.cols` using [`cell_rect`]/[`span_rect`] against `quad.qorigin_*`,
+    /// so it is identical to the pre-freeze body loop when there is a single body quadrant
+    /// (`M=K=0`). `host_overlays` places the single-instance overlays (the active-cell border, the
+    /// grabbable fill handle, and the in-cell editor) in exactly one quadrant — the one containing
+    /// the active/edited cell. `collect_wrap` gates the auto-grow wrap-cell collection off the perf
+    /// path (mirrors the old `timing.is_none()` gate). Range/overlay/fill-preview highlights are
+    /// drawn (clipped) in **every** quadrant so a range straddling the divider joins across it.
+    #[allow(clippy::too_many_arguments)]
+    fn build_quadrant(
         &mut self,
         frame: &Frame,
-        mut timing: Option<&mut FrameTiming>,
+        quad: &Quadrant,
+        publication: &Publication,
+        covers_active: bool,
+        selection: &SelectionModel,
+        host_overlays: bool,
+        collect_wrap: bool,
     ) -> Vec<AnyElement> {
-        let mut root_children: Vec<AnyElement> = Vec::new();
-
-        let selection = *self.selection();
-        let publication = self.sources.publication.load_full();
-        let covers_active = publication.sheet == self.active_sheet;
-
-        // Rebuild the reused visible-cell index from the publication. The scan is over the
-        // published (non-empty) cells, which the worker caps at `MAX_PUBLISH_ROWS ×
-        // MAX_PUBLISH_COLS` (512×256) and are typically far fewer than that — not O(sheet).
-        // The publication has no spatial index, so a per-visible-cell lookup would need this
-        // map first; building it once per frame is the right structure given the flat `Vec`.
-        // PHASE 12: the perf harness times this scan and gates the frame p99 (`freecell_core::perf`).
-        let index_start = timing.as_ref().map(|_| std::time::Instant::now());
-        self.cell_index.clear();
-        if covers_active {
-            for (i, cell) in publication.cells.iter().enumerate() {
-                if frame.rows.contains(&cell.row) && frame.cols.contains(&cell.col) {
-                    self.cell_index.insert((cell.row, cell.col), i);
-                }
-            }
-        }
-        if let (Some(t), Some(start)) = (timing.as_mut(), index_start) {
-            t.cell_index_ns = start.elapsed().as_nanos() as u64;
-        }
-
-        // ---- Content layer: cells + selection, clipped to the content area ----------
         let mut content_children: Vec<AnyElement> = Vec::with_capacity(
-            ((frame.rows.end - frame.rows.start) * (frame.cols.end - frame.cols.start)) as usize
-                + 16,
+            ((quad.rows.end - quad.rows.start) * (quad.cols.end - quad.cols.start)) as usize + 16,
         );
         // Deferred text-spill paints (`functional_spec.md §2`); typically empty. Painted after
         // the cell + border layers so spilled text sits over the neighbours' fills/gridlines.
         let mut spill_plans: Vec<SpillPlan> = Vec::new();
-        // Reset the wrap-on-cell buffer the post-layout auto-grow pass reads (`functional_spec.md
-        // §3`). Only the real render path fills it; the perf harness (`timing` set) leaves it empty
-        // so its measurement is untouched.
-        self.wrap_cells.clear();
 
-        for r in frame.rows.clone() {
-            for c in frame.cols.clone() {
-                let (x, y, w, h) = cell_rect(r, c, frame);
+        for r in quad.rows.clone() {
+            for c in quad.cols.clone() {
+                let (x, y, w, h) = cell_rect(r, c, frame, quad);
                 let style = self.visible_styles.get(&(r, c)).copied();
                 let fill_color = style.and_then(|s| s.fill);
                 let fill = fill_color.map(to_rgba).unwrap_or_else(|| rgb(CELL_BG));
@@ -2958,8 +3364,8 @@ impl GridView {
                 // cell so the post-layout pass (which has the render thread's text system) can
                 // measure its wrapped height at the column width `w`. Mirrored (being-edited) cells
                 // carry `attr_style: None`, so the `.wrap` gate skips them; only the real render path
-                // collects (`timing.is_none()`) — the perf harness stays allocation-light.
-                if timing.is_none() {
+                // collects (`collect_wrap`) — the perf harness stays allocation-light.
+                if collect_wrap {
                     if let Some(s) = attr_style {
                         if s.wrap && !text.is_empty() {
                             self.wrap_cells.push(WrapCell {
@@ -2978,7 +3384,8 @@ impl GridView {
                 // Text spill (`functional_spec.md §2`): a committed, wrap-off TEXT cell whose text
                 // overflows its column spills over empty neighbours in its alignment direction.
                 // Numbers/dates/bools/errors and mirrored (being-edited) cells never spill; a
-                // fitting cell falls through to the unchanged render path (pixels untouched).
+                // fitting cell falls through to the unchanged render path (pixels untouched). The
+                // scan bounds are THIS quadrant's visible cols (a spill never crosses the divider).
                 let spill = if covers_active
                     && kind == CellKind::Text
                     && !text.is_empty()
@@ -2993,9 +3400,9 @@ impl GridView {
                         let span = layout::spill_span(
                             c,
                             layout::spill_direction(align),
-                            frame.cols.start,
-                            frame.cols.end.saturating_sub(1),
-                            |nc| self.neighbor_occupancy(r, nc, &publication),
+                            quad.cols.start,
+                            quad.cols.end.saturating_sub(1),
+                            |nc| self.neighbor_occupancy(r, nc, publication),
                         );
                         span.spills(c).then_some((span, align))
                     } else {
@@ -3057,13 +3464,13 @@ impl GridView {
         // effective edges; it draws its left/top only when no neighbour to the left/above will draw
         // that shared edge (the first visible track, or an unbordered neighbour that is skipped).
         // Effective edge = the heavier of the cell's own edge and the neighbour's opposing one.
-        for r in frame.rows.clone() {
-            for c in frame.cols.clone() {
+        for r in quad.rows.clone() {
+            for c in quad.cols.clone() {
                 let spec = self.border_spec_at(r, c);
                 if spec.is_none() {
                     continue;
                 }
-                let (x, y, w, h) = cell_rect(r, c, frame);
+                let (x, y, w, h) = cell_rect(r, c, frame, quad);
                 // Right edge (shared with the cell at c+1) — always drawn by this (left) cell.
                 if let Some(edge) = effective_edge(spec.right, self.border_spec_at(r, c + 1).left) {
                     push_vertical_edge(&mut content_children, x + w, y, h, edge);
@@ -3073,7 +3480,7 @@ impl GridView {
                     push_horizontal_edge(&mut content_children, x, y + h, w, edge);
                 }
                 // Left edge: only when the left neighbour won't draw it as its right edge.
-                if self.no_left_owner(r, c, frame) {
+                if self.no_left_owner(r, c, quad) {
                     let left_nbr = if c == 0 {
                         BorderSpec::NONE
                     } else {
@@ -3084,7 +3491,7 @@ impl GridView {
                     }
                 }
                 // Top edge: only when the top neighbour won't draw it as its bottom edge.
-                if self.no_top_owner(r, c, frame) {
+                if self.no_top_owner(r, c, quad) {
                     let top_nbr = if r == 0 {
                         BorderSpec::NONE
                     } else {
@@ -3107,6 +3514,7 @@ impl GridView {
                 plan.row..plan.row + 1,
                 plan.span.left..plan.span.right + 1,
                 frame,
+                quad,
             );
             content_children.push(spill_element(
                 sx,
@@ -3121,16 +3529,18 @@ impl GridView {
             ));
         }
 
-        // Selection: translucent overlay (range − active), range border, active border.
+        // Selection: translucent overlay (range − active), range border, active border. The overlay
+        // rects + range border are intersected/clipped to THIS quadrant, so a range straddling the
+        // divider paints its slice in each quadrant and they visually join (§2).
         let range = selection.range();
         for (rows, cols) in layout::range_overlay_rects(range, selection.active) {
-            // Clip to the visible ranges so the overlay divs stay viewport-sized.
-            let rows = rows.start.max(frame.rows.start)..rows.end.min(frame.rows.end);
-            let cols = cols.start.max(frame.cols.start)..cols.end.min(frame.cols.end);
+            // Clip to the quadrant's visible ranges so the overlay divs stay viewport-sized.
+            let rows = rows.start.max(quad.rows.start)..rows.end.min(quad.rows.end);
+            let cols = cols.start.max(quad.cols.start)..cols.end.min(quad.cols.end);
             if rows.start >= rows.end || cols.start >= cols.end {
                 continue;
             }
-            let (x, y, w, h) = span_rect(rows, cols, frame);
+            let (x, y, w, h) = span_rect(rows, cols, frame, quad);
             content_children.push(
                 rect_div(x, y, w, h)
                     .bg(rgb(ACCENT).opacity(SELECTION_FILL_ALPHA))
@@ -3138,10 +3548,13 @@ impl GridView {
             );
         }
         if !range.is_single() {
+            // The whole-range 2px outline; drawn in each quadrant and clipped, so only the perimeter
+            // falling in this quadrant shows (the slices join at the divider, no interior line).
             let (x, y, w, h) = span_rect(
                 range.start.row..range.end.row + 1,
                 range.start.col..range.end.col + 1,
                 frame,
+                quad,
             );
             content_children.push(
                 rect_div(x, y, w, h)
@@ -3150,8 +3563,9 @@ impl GridView {
                     .into_any_element(),
             );
         }
-        {
-            let (x, y, w, h) = cell_rect(selection.active.row, selection.active.col, frame);
+        // The active-cell border is a single-cell outline → drawn once, in its host quadrant.
+        if host_overlays {
+            let (x, y, w, h) = cell_rect(selection.active.row, selection.active.col, frame, quad);
             content_children.push(
                 rect_div(x, y, w, h)
                     .border_2()
@@ -3160,10 +3574,64 @@ impl GridView {
             );
         }
 
+        // Formula reference highlights (`formula-point-mode/architecture.md §4.1`): while a formula
+        // edit is open, each distinct same-sheet reference already typed is drawn as a rich colored
+        // fill + border in its assigned palette slot. Painted ABOVE the selection overlay and BELOW
+        // the fill handle / in-cell overlay, clipped to the visible frame exactly like the selection
+        // overlay — an off-screen ref clips to nothing (no visible highlight, by construction), and
+        // cross-sheet refs are excluded upstream (only the same-sheet subset reaches the grid). The
+        // grid renders on the white `CELL_BG` regardless of OS appearance, so the light palette
+        // variant is used (`ref_slot_border(_, false)`); the `is_dark` seam stays for the future
+        // theme-aware / in-editor styling control.
+        for (target, slot) in &self.ref_highlights {
+            // Clip to THIS quadrant's visible ranges (like the selection overlay): a highlight
+            // straddling the divider paints its slice in each quadrant and they visually join.
+            let rows =
+                target.start.row.max(quad.rows.start)..(target.end.row + 1).min(quad.rows.end);
+            let cols =
+                target.start.col.max(quad.cols.start)..(target.end.col + 1).min(quad.cols.end);
+            if rows.start >= rows.end || cols.start >= cols.end {
+                continue;
+            }
+            let (x, y, w, h) = span_rect(rows, cols, frame, quad);
+            let color = ref_slot_border(*slot, false);
+            content_children.push(
+                rect_div(x, y, w, h)
+                    .bg(rgb(color).opacity(REF_HIGHLIGHT_FILL_ALPHA))
+                    .border_2()
+                    .border_color(rgb(color))
+                    .into_any_element(),
+            );
+        }
+
+        // Point-mode drag preview (`formula-point-mode/functional_spec.md §2`): while a point drag is
+        // live, draw its swept range as a 2px **dashed** indigo marquee — visually distinct from the
+        // solid-blue selection rectangle and the colored reference highlights (three overlays can be
+        // on screen at once). Clipped to the visible frame like the selection overlay; no fill, no
+        // handles (DPM.7). The editor text already tracks the range (each move emitted an insert).
+        if let Some(pd) = self.point_drag {
+            let t = pd.last_range;
+            // Clip to THIS quadrant's visible ranges (like the selection overlay) so the dashed
+            // marquee slices join across the divider instead of drawing in body-relative coords.
+            let rows = t.start.row.max(quad.rows.start)..(t.end.row + 1).min(quad.rows.end);
+            let cols = t.start.col.max(quad.cols.start)..(t.end.col + 1).min(quad.cols.end);
+            if rows.start < rows.end && cols.start < cols.end {
+                let (x, y, w, h) = span_rect(rows, cols, frame, quad);
+                content_children.push(
+                    rect_div(x, y, w, h)
+                        .border_2()
+                        .border_dashed()
+                        .border_color(rgb(POINT_PREVIEW_BORDER))
+                        .into_any_element(),
+                );
+            }
+        }
+
         // Fill handle + drag preview (`gaps_closing_7_15 §3`). While a fill drag is live, draw its
-        // previewed target region (a 2px accent border, like the range border); otherwise — when not
-        // editing and no other drag is active — draw the grabbable handle square at the selection's
-        // bottom-right corner, clamped into the viewport (D3.4).
+        // previewed target region (a 2px accent border, like the range border) in each quadrant
+        // (clipped); otherwise — when not editing and no other drag is active — draw the grabbable
+        // handle square (once, in the host quadrant) at the selection's bottom-right corner, clamped
+        // into that quadrant's box (D3.4).
         if let Some(fd) = self.fill_drag {
             if fd.axis.is_some() {
                 let t = fd.target;
@@ -3171,6 +3639,7 @@ impl GridView {
                     t.start.row..t.end.row + 1,
                     t.start.col..t.end.col + 1,
                     frame,
+                    quad,
                 );
                 content_children.push(
                     rect_div(x, y, w, h)
@@ -3179,7 +3648,8 @@ impl GridView {
                         .into_any_element(),
                 );
             }
-        } else if self.incell_open.is_none()
+        } else if host_overlays
+            && self.incell_open.is_none()
             && self.drag.is_none()
             && self.resize_drag.is_none()
             && self.chart_drag.is_none()
@@ -3189,10 +3659,10 @@ impl GridView {
             let (hx, hy, hw, hh) = fill_handle_square(
                 right_x,
                 bottom_y,
-                frame.scroll_x,
-                frame.scroll_y,
-                frame.content_w,
-                frame.content_h,
+                quad.qorigin_x,
+                quad.qorigin_y,
+                quad.dest.2 as f64,
+                quad.dest.3 as f64,
             );
             content_children.push(
                 rect_div(hx, hy, hw, hh)
@@ -3203,28 +3673,101 @@ impl GridView {
             );
         }
 
-        // In-cell editor overlay (deferred → painted above the cells; `functional_spec.md §1.3`).
-        // Rendered even when the anchored cell is scrolled out of view — the content layer's
-        // `overflow_hidden` clips it, and keeping it in the tree preserves the input's focus.
-        if let (Some(cell), Some(input)) = (self.incell_open, self.incell_input.clone()) {
-            content_children.extend(self.in_cell_overlay_elements(cell, &input, frame));
+        // In-cell editor overlay (deferred → painted above the cells; `functional_spec.md §1.3`),
+        // hosted in the quadrant containing the edited cell. Rendered even when the anchored cell is
+        // scrolled out of the body view — the content div's `overflow_hidden` clips it and keeping
+        // it in the tree preserves the input's focus.
+        if host_overlays {
+            if let (Some(cell), Some(input)) = (self.incell_open, self.incell_input.clone()) {
+                content_children.extend(self.in_cell_overlay_elements(cell, &input, frame, quad));
+            }
+        }
+
+        content_children
+    }
+
+    fn build_grid_layers(
+        &mut self,
+        frame: &Frame,
+        mut timing: Option<&mut FrameTiming>,
+    ) -> Vec<AnyElement> {
+        let mut root_children: Vec<AnyElement> = Vec::new();
+
+        let selection = *self.selection();
+        let publication = self.sources.publication.load_full();
+        let covers_active = publication.sheet == self.active_sheet;
+
+        // Rebuild the reused visible-cell index from the publication. The scan is over the
+        // published (non-empty) cells, which the worker caps at `MAX_PUBLISH_ROWS ×
+        // MAX_PUBLISH_COLS` (512×256) and are typically far fewer than that — not O(sheet).
+        // The publication has no spatial index, so a per-visible-cell lookup would need this
+        // map first; building it once per frame is the right structure given the flat `Vec`.
+        // PHASE 12: the perf harness times this scan and gates the frame p99 (`freecell_core::perf`).
+        let index_start = timing.as_ref().map(|_| std::time::Instant::now());
+        self.cell_index.clear();
+        if covers_active {
+            // Filter over the quadrant UNION (bands + body), so a published band cell is indexed
+            // for its quadrant's lookup (§2). `M=K=0` → the single body quadrant, i.e. the old
+            // `frame.rows/cols` filter. The worker always publishes the leading `0..M` / `0..K`
+            // bands alongside the body window (Phase 4 band-publishing fix, `build_publication`), so
+            // a band cell's VALUE is present in `publication.cells` regardless of how deep the body
+            // is scrolled — the union filter then indexes it for its band quadrant.
+            for (i, cell) in publication.cells.iter().enumerate() {
+                if frame.in_visible_union(cell.row, cell.col) {
+                    self.cell_index.insert((cell.row, cell.col), i);
+                }
+            }
+        }
+        if let (Some(t), Some(start)) = (timing.as_mut(), index_start) {
+            t.cell_index_ns = start.elapsed().as_nanos() as u64;
+        }
+
+        // ---- Content layers: one clipped div per present freeze-pane quadrant (§2). `M=K=0`
+        // leaves a single Body quadrant whose dest + qorigin reproduce today's single content div
+        // byte-for-byte. Overlays anchored to one cell (active-cell border, grabbable fill handle,
+        // in-cell editor) are hosted in the quadrant containing the active cell (body fallback).
+        self.wrap_cells.clear();
+        let collect_wrap = timing.is_none();
+        let host = frame.overlay_host(selection.active);
+        let mut content_cells = 0u32;
+        for kind in [
+            QuadKind::Corner,
+            QuadKind::TopBand,
+            QuadKind::LeftBand,
+            QuadKind::Body,
+        ] {
+            let idx = kind as usize;
+            let Some(quad) = frame.quadrants[idx].clone() else {
+                continue;
+            };
+            let host_overlays = host == Some(idx);
+            let children = self.build_quadrant(
+                frame,
+                &quad,
+                &publication,
+                covers_active,
+                &selection,
+                host_overlays,
+                collect_wrap,
+            );
+            content_cells += children.len() as u32;
+            let (dx, dy, dw, dh) = quad.dest;
+            root_children.push(
+                div()
+                    .absolute()
+                    .left(px(dx))
+                    .top(px(dy))
+                    .w(px(dw))
+                    .h(px(dh))
+                    .overflow_hidden()
+                    .children(children)
+                    .into_any_element(),
+            );
         }
 
         if let Some(t) = timing.as_mut() {
-            t.content_cells = content_children.len() as u32;
+            t.content_cells = content_cells;
         }
-
-        root_children.push(
-            div()
-                .absolute()
-                .left(px(frame.row_header_w))
-                .top(px(COL_HEADER_H))
-                .w(px(frame.content_w as f32))
-                .h(px(frame.content_h as f32))
-                .overflow_hidden()
-                .children(content_children)
-                .into_any_element(),
-        );
 
         // ---- ChartLayer: charts painted OVER the cells, BELOW the header/chrome layers, clipped
         // to the content area (P8, `charts/architecture.md §4.2`, `ui_design.md §1`). Each chart's
@@ -3233,7 +3776,14 @@ impl GridView {
         // plot (+ a corner badge when Degraded) or the placeholder (Unsupported). A chart being
         // dragged (P18) paints at its live drag rect; the selected chart gets a selection outline +
         // resize handles overlaid. When the active sheet has no charts, nothing is pushed.
-        if let Some(layer) = self.charts.get(&self.active_sheet) {
+        // Charts are body-anchored (they scroll with the body), so the ChartLayer is clipped to the
+        // BODY quadrant's dest rect and positioned against the body's `qorigin` (`freeze-panes/
+        // functional_spec.md §4`; a chart anchored under a frozen band is the known minor
+        // limitation). Absent when the band fills the viewport. `M=K=0` → the full content rect.
+        if let (Some(layer), Some(body)) =
+            (self.charts.get(&self.active_sheet), frame.body_quadrant())
+        {
+            let (body_dx, body_dy, body_dw, body_dh) = body.dest;
             // The per-frame scan touches only the tiny `placements` (P11 "off-screen free", via
             // [`on_screen_charts`]): off-screen charts are culled without ever borrowing their heavy
             // render `Chart`; the shared `specs[i].chart()` is materialized only for the on-screen few
@@ -3241,10 +3791,10 @@ impl GridView {
             let visible = Self::visible_charts(
                 layer,
                 frame,
-                frame.scroll_x,
-                frame.scroll_y,
-                frame.content_w,
-                frame.content_h,
+                body.qorigin_x,
+                body.qorigin_y,
+                body_dw as f64,
+                body_dh as f64,
             );
             let mut chart_children: Vec<AnyElement> = Vec::with_capacity(visible.len());
             // The paint rect of the selected chart (for the outline + handles), if it is on-screen.
@@ -3298,10 +3848,10 @@ impl GridView {
                 root_children.push(
                     div()
                         .absolute()
-                        .left(px(frame.row_header_w))
-                        .top(px(COL_HEADER_H))
-                        .w(px(frame.content_w as f32))
-                        .h(px(frame.content_h as f32))
+                        .left(px(body_dx))
+                        .top(px(body_dy))
+                        .w(px(body_dw))
+                        .h(px(body_dh))
                         .overflow_hidden()
                         .children(chart_children)
                         .into_any_element(),
@@ -3310,10 +3860,16 @@ impl GridView {
         }
 
         // ---- Header layer (fixed, opaque, clipped to its strip) ---------------------
+        let range = selection.range();
         let (sel_r0, sel_r1) = (range.start.row, range.end.row);
         let (sel_c0, sel_c1) = (range.start.col, range.end.col);
 
-        // Column-header strip.
+        // Column-header strip. The SCROLLING column letters (body cols) scroll with the body — same
+        // formula as before freeze (`col_offset(c) - scroll_x`, where `scroll_x` is `body_sx`). The
+        // FROZEN column letters (`0..K`) are pinned at their natural offset and drawn LAST so their
+        // opaque cells cover any body letter that scrolls under the frozen band (`functional_spec.md
+        // §3.4`). `M=K=0` skips the frozen loop → byte-for-byte today.
+        let k = frame.frozen_cols;
         let mut col_children: Vec<AnyElement> = Vec::new();
         for c in frame.cols.clone() {
             let x = (frame.col_offset(c) - frame.scroll_x) as f32;
@@ -3328,14 +3884,29 @@ impl GridView {
                 selected,
             ));
         }
-        // Accent edge under the selected columns.
+        // Accent edge under the selected (body) columns.
         {
-            let (x, _y, w, _h) = span_rect(0..1, sel_c0..sel_c1 + 1, frame);
+            let x = (frame.col_offset(sel_c0) - frame.scroll_x) as f32;
+            let w = (frame.col_offset(sel_c1 + 1) - frame.col_offset(sel_c0)) as f32;
             col_children.push(
                 rect_div(x, COL_HEADER_H - 2.0, w, 2.0)
                     .bg(rgb(ACCENT))
                     .into_any_element(),
             );
+        }
+        // Pinned frozen column letters (on top).
+        for c in 0..k {
+            let x = frame.col_offset(c) as f32;
+            let w = frame.col_size(c);
+            let selected = c >= sel_c0 && c <= sel_c1;
+            col_children.push(header_element(
+                x,
+                0.0,
+                w,
+                COL_HEADER_H,
+                column_label(c),
+                selected,
+            ));
         }
         root_children.push(
             div()
@@ -3350,7 +3921,10 @@ impl GridView {
                 .into_any_element(),
         );
 
-        // Row-header gutter.
+        // Row-header gutter. Scrolling row numbers (body rows) scroll with the body; the frozen row
+        // numbers (`0..M`) are pinned at their natural offset and drawn LAST (opaque cover), exactly
+        // mirroring the column-header split above. `M=K=0` skips the frozen loop.
+        let m = frame.frozen_rows;
         let mut row_children: Vec<AnyElement> = Vec::new();
         for r in frame.rows.clone() {
             let y = (frame.row_offset(r) - frame.scroll_y) as f32;
@@ -3365,14 +3939,29 @@ impl GridView {
                 selected,
             ));
         }
-        // Accent edge beside the selected rows.
+        // Accent edge beside the selected (body) rows.
         {
-            let (_x, y, _w, h) = span_rect(sel_r0..sel_r1 + 1, 0..1, frame);
+            let y = (frame.row_offset(sel_r0) - frame.scroll_y) as f32;
+            let h = (frame.row_offset(sel_r1 + 1) - frame.row_offset(sel_r0)) as f32;
             row_children.push(
                 rect_div(frame.row_header_w - 2.0, y, 2.0, h)
                     .bg(rgb(ACCENT))
                     .into_any_element(),
             );
+        }
+        // Pinned frozen row numbers (on top).
+        for r in 0..m {
+            let y = frame.row_offset(r) as f32;
+            let h = frame.row_size(r);
+            let selected = r >= sel_r0 && r <= sel_r1;
+            row_children.push(header_element(
+                0.0,
+                y,
+                frame.row_header_w,
+                h,
+                (r + 1).to_string(),
+                selected,
+            ));
         }
         root_children.push(
             div()
@@ -3398,20 +3987,19 @@ impl GridView {
         );
 
         // ---- Overlay scrollbars -----------------------------------------------------
+        // The thumbs represent the SCROLLING region only: their extent is the non-frozen tracks
+        // against the body sub-rect, and they are drawn along the body sub-rect (offset past the
+        // frozen band). `M=K=0` → the full content rect + extent (byte-for-byte today).
         if self.scrollbars_visible || self.force_scrollbars {
-            if let Some(thumb) = layout::scrollbar_thumb(
-                frame.total_h,
-                frame.content_h,
-                frame.scroll_y,
-                frame.content_h as f32,
-            ) {
+            let pane = frame.pane_geometry();
+            if let Some(thumb) = pane.v_thumb(frame.total_h) {
                 let x = frame.row_header_w + frame.content_w as f32
                     - SCROLLBAR_THICKNESS
                     - SCROLLBAR_INSET;
                 root_children.push(
                     rect_div(
                         x,
-                        COL_HEADER_H + thumb.offset,
+                        COL_HEADER_H + frame.frozen_h as f32 + thumb.offset,
                         SCROLLBAR_THICKNESS,
                         thumb.length,
                     )
@@ -3420,17 +4008,12 @@ impl GridView {
                     .into_any_element(),
                 );
             }
-            if let Some(thumb) = layout::scrollbar_thumb(
-                frame.total_w,
-                frame.content_w,
-                frame.scroll_x,
-                frame.content_w as f32,
-            ) {
+            if let Some(thumb) = pane.h_thumb(frame.total_w) {
                 let y =
                     COL_HEADER_H + frame.content_h as f32 - SCROLLBAR_THICKNESS - SCROLLBAR_INSET;
                 root_children.push(
                     rect_div(
-                        frame.row_header_w + thumb.offset,
+                        frame.row_header_w + frame.frozen_w as f32 + thumb.offset,
                         y,
                         thumb.length,
                         SCROLLBAR_THICKNESS,
@@ -3440,6 +4023,34 @@ impl GridView {
                     .into_any_element(),
                 );
             }
+        }
+
+        // ---- Freeze divider(s) (`freeze-panes/functional_spec.md §2.1`) — drawn at the root over
+        // cells + headers so they never scroll, and only for an axis that is actually frozen. A
+        // heavier mid-grey than a gridline marks the pinned boundary; `M=K=0` draws neither.
+        if frame.frozen_h > 0.0 {
+            root_children.push(
+                rect_div(
+                    frame.row_header_w,
+                    COL_HEADER_H + frame.frozen_h as f32 - FREEZE_DIVIDER_PX / 2.0,
+                    frame.content_w as f32,
+                    FREEZE_DIVIDER_PX,
+                )
+                .bg(rgb(FREEZE_DIVIDER))
+                .into_any_element(),
+            );
+        }
+        if frame.frozen_w > 0.0 {
+            root_children.push(
+                rect_div(
+                    frame.row_header_w + frame.frozen_w as f32 - FREEZE_DIVIDER_PX / 2.0,
+                    COL_HEADER_H,
+                    FREEZE_DIVIDER_PX,
+                    frame.content_h as f32,
+                )
+                .bg(rgb(FREEZE_DIVIDER))
+                .into_any_element(),
+            );
         }
 
         // ---- Resize guide line + size tooltip (only during a live drag, `ui_design.md §3`) ----
@@ -3652,75 +4263,105 @@ impl GridView {
         let mut out: Vec<AnyElement> = Vec::new();
         let content_right = frame.row_header_w + frame.content_w as f32;
         let content_bottom = COL_HEADER_H + frame.content_h as f32;
-        // Column dividers (drag a column's RIGHT edge → resize that column).
+        // The freeze-line boundaries (`freeze-panes §5`): frozen-track dividers live in the band
+        // `[header, divider]`, body-track dividers in the scrolling region `(divider, content edge]`.
+        let divider_x = frame.row_header_w + frame.frozen_w as f32;
+        let divider_y = COL_HEADER_H + frame.frozen_h as f32;
+        // Frozen-column dividers: unscrolled band position (the divider follows a resize because
+        // `frozen_w` is preview-aware). Skip past the freeze line.
+        for c in 0..frame.frozen_cols {
+            let edge = frame.row_header_w + (frame.col_offset(c) + frame.col_size(c) as f64) as f32;
+            if edge <= frame.row_header_w || edge > divider_x {
+                continue;
+            }
+            out.push(self.col_resize_hotspot(edge, c, cx));
+        }
+        // Body-column dividers: scroll with the body (the `frozen_w` term cancels, so the formula is
+        // unchanged; only the lower clip moves to the freeze line).
         for c in frame.cols.clone() {
             let edge = frame.row_header_w
                 + (frame.col_offset(c) + frame.col_size(c) as f64 - frame.scroll_x) as f32;
-            if edge <= frame.row_header_w || edge > content_right {
-                continue; // divider off the visible header strip
+            if edge <= divider_x || edge > content_right {
+                continue; // divider off the body header strip (scrolled under a band or past the edge)
             }
-            out.push(
-                rect_div(
-                    edge - RESIZE_HOTSPOT_HALF,
-                    0.0,
-                    RESIZE_HOTSPOT_HALF * 2.0,
-                    COL_HEADER_H,
-                )
-                .cursor_col_resize()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        // A single press begins the drag-resize; the 2nd click of a double-click
-                        // autofits the column to its content (`functional_spec.md §7`) without
-                        // beginning a resize. The 3rd+ click of a rapid multi-click burst is ignored
-                        // so a triple-click neither re-autofits (a redundant same-width undo step) nor
-                        // starts a stray resize.
-                        match event.click_count {
-                            1 => this.begin_resize(RowOrCol::Col, c, event, window, cx),
-                            2 => this.autofit_column(c, window, cx),
-                            _ => {}
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .into_any_element(),
-            );
+            out.push(self.col_resize_hotspot(edge, c, cx));
         }
-        // Row dividers (drag a row's BOTTOM edge → resize that row).
+        // Frozen-row dividers (unscrolled band position), then body-row dividers past the freeze line.
+        for r in 0..frame.frozen_rows {
+            let edge = COL_HEADER_H + (frame.row_offset(r) + frame.row_size(r) as f64) as f32;
+            if edge <= COL_HEADER_H || edge > divider_y {
+                continue;
+            }
+            out.push(self.row_resize_hotspot(edge, r, frame.row_header_w, cx));
+        }
         for r in frame.rows.clone() {
             let edge = COL_HEADER_H
                 + (frame.row_offset(r) + frame.row_size(r) as f64 - frame.scroll_y) as f32;
-            if edge <= COL_HEADER_H || edge > content_bottom {
+            if edge <= divider_y || edge > content_bottom {
                 continue;
             }
-            out.push(
-                rect_div(
-                    0.0,
-                    edge - RESIZE_HOTSPOT_HALF,
-                    frame.row_header_w,
-                    RESIZE_HOTSPOT_HALF * 2.0,
-                )
-                .cursor_row_resize()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        // A single press begins the drag-resize; the 2nd click of a double-click
-                        // autofits the row to its content (`functional_spec.md §5`) without beginning a
-                        // resize. The 3rd+ click of a rapid multi-click burst is ignored so a
-                        // triple-click neither re-autofits (a redundant same-height undo step) nor
-                        // starts a stray resize. Mirrors the column hotspot above.
-                        match event.click_count {
-                            1 => this.begin_resize(RowOrCol::Row, r, event, window, cx),
-                            2 => this.autofit_row(r, window, cx),
-                            _ => {}
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .into_any_element(),
-            );
+            out.push(self.row_resize_hotspot(edge, r, frame.row_header_w, cx));
         }
         out
+    }
+
+    /// One column-resize hotspot: a `col-resize` zone centered on the divider at grid-x `edge` for
+    /// column `c` (`components/grid_structure.md §5.1`, region-placed by
+    /// [`resize_hotspots`](Self::resize_hotspots)). A single press begins the drag-resize; the 2nd
+    /// click of a double-click autofits the column (`functional_spec.md §7`); the 3rd+ click of a
+    /// rapid burst is ignored so a triple-click neither re-autofits (a redundant same-width undo
+    /// step) nor starts a stray resize.
+    fn col_resize_hotspot(&self, edge: f32, c: u32, cx: &mut Context<Self>) -> AnyElement {
+        rect_div(
+            edge - RESIZE_HOTSPOT_HALF,
+            0.0,
+            RESIZE_HOTSPOT_HALF * 2.0,
+            COL_HEADER_H,
+        )
+        .cursor_col_resize()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                match event.click_count {
+                    1 => this.begin_resize(RowOrCol::Col, c, event, window, cx),
+                    2 => this.autofit_column(c, window, cx),
+                    _ => {}
+                }
+                cx.stop_propagation();
+            }),
+        )
+        .into_any_element()
+    }
+
+    /// One row-resize hotspot: a `row-resize` zone centered on the divider at grid-y `edge` for row
+    /// `r` (the row twin of [`col_resize_hotspot`](Self::col_resize_hotspot); the 2nd click autofits
+    /// the row, `functional_spec.md §5`).
+    fn row_resize_hotspot(
+        &self,
+        edge: f32,
+        r: u32,
+        row_header_w: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        rect_div(
+            0.0,
+            edge - RESIZE_HOTSPOT_HALF,
+            row_header_w,
+            RESIZE_HOTSPOT_HALF * 2.0,
+        )
+        .cursor_row_resize()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                match event.click_count {
+                    1 => this.begin_resize(RowOrCol::Row, r, event, window, cx),
+                    2 => this.autofit_row(r, window, cx),
+                    _ => {}
+                }
+                cx.stop_propagation();
+            }),
+        )
+        .into_any_element()
     }
 
     /// The header insert/delete context menu overlay: a click-away backdrop + a small card of items
@@ -3807,6 +4448,29 @@ impl GridView {
             }
             None => items.push((format!("Unhide {unit}s"), false, unhide_ev(start, count))),
         }
+        // Freeze/Unfreeze (`freeze-panes` `architecture.md §4`, `functional_spec.md §1`): the
+        // boundary track is the run's last index `b`, so the implied count is `b + 1`. Unfreeze
+        // (set the axis to 0) when the current freeze already equals that boundary; else Freeze to
+        // `b + 1` — freezing the boundary track and everything above/left, moving the boundary if a
+        // different freeze existed. Always enabled (freeze hides nothing). The axis constructor puts
+        // the count on exactly the one axis the menu was opened on (one undo step).
+        let boundary_count = menu.run.1 + 1;
+        let (freeze_label, target) = if menu.frozen == boundary_count {
+            ("Unfreeze", 0)
+        } else {
+            ("Freeze", boundary_count)
+        };
+        let freeze_ev = match menu.axis {
+            RowOrCol::Row => GridEvent::SetFrozen {
+                rows: Some(target),
+                cols: None,
+            },
+            RowOrCol::Col => GridEvent::SetFrozen {
+                rows: None,
+                cols: Some(target),
+            },
+        };
+        items.push((format!("{freeze_label} {unit}s"), true, freeze_ev));
         items
     }
 
@@ -4192,14 +4856,14 @@ impl GridView {
     /// the SAME predicate the paint loop uses to decide whether that neighbour draws its right edge —
     /// so ownership and draw can never disagree (a `border != 0` that resolved to `NONE` under some
     /// future partial snapshot would be skipped by BOTH, not dropped between them).
-    fn no_left_owner(&self, row: u32, col: u32, frame: &Frame) -> bool {
-        col == frame.cols.start || self.border_spec_at(row, col - 1).is_none()
+    fn no_left_owner(&self, row: u32, col: u32, quad: &Quadrant) -> bool {
+        col == quad.cols.start || self.border_spec_at(row, col - 1).is_none()
     }
 
     /// Whether no cell *above* `(row, col)` will draw the shared top edge as its own bottom edge
     /// (the horizontal analogue of [`no_left_owner`](Self::no_left_owner); same shared predicate).
-    fn no_top_owner(&self, row: u32, col: u32, frame: &Frame) -> bool {
-        row == frame.rows.start || self.border_spec_at(row - 1, col).is_none()
+    fn no_top_owner(&self, row: u32, col: u32, quad: &Quadrant) -> bool {
+        row == quad.rows.start || self.border_spec_at(row - 1, col).is_none()
     }
 
     /// Phase-12 perf hook (`freecell_core::perf`): apply a scripted scroll to the active sheet,
@@ -4356,20 +5020,26 @@ fn hide_unhide_flags(
 /// A cell's px rectangle in **content-local** coordinates (origin at the content area's
 /// top-left, before the scroll offset is applied via the axis offsets). Reads through the frame's
 /// preview accessors, so a live resize reflows it with no axis rebuild.
-fn cell_rect(row: u32, col: u32, frame: &Frame) -> (f32, f32, f32, f32) {
-    let x = (frame.col_offset(col) - frame.scroll_x) as f32;
-    let y = (frame.row_offset(row) - frame.scroll_y) as f32;
+fn cell_rect(row: u32, col: u32, frame: &Frame, quad: &Quadrant) -> (f32, f32, f32, f32) {
+    let x = (frame.col_offset(col) - quad.qorigin_x) as f32;
+    let y = (frame.row_offset(row) - quad.qorigin_y) as f32;
     let w = frame.col_size(col);
     let h = frame.row_size(row);
     (x, y, w, h)
 }
 
-/// The px rectangle spanning an index range `[c0, c1) × [r0, r1)` in content-local coords.
-fn span_rect(rows: Range<u32>, cols: Range<u32>, frame: &Frame) -> (f32, f32, f32, f32) {
-    let x0 = frame.col_offset(cols.start) - frame.scroll_x;
-    let x1 = frame.col_offset(cols.end) - frame.scroll_x;
-    let y0 = frame.row_offset(rows.start) - frame.scroll_y;
-    let y1 = frame.row_offset(rows.end) - frame.scroll_y;
+/// The px rectangle spanning an index range `[c0, c1) × [r0, r1)` in **quadrant-relative** coords
+/// (origin at `quad.dest`'s top-left, via `quad.qorigin_*`).
+fn span_rect(
+    rows: Range<u32>,
+    cols: Range<u32>,
+    frame: &Frame,
+    quad: &Quadrant,
+) -> (f32, f32, f32, f32) {
+    let x0 = frame.col_offset(cols.start) - quad.qorigin_x;
+    let x1 = frame.col_offset(cols.end) - quad.qorigin_x;
+    let y0 = frame.row_offset(rows.start) - quad.qorigin_y;
+    let y1 = frame.row_offset(rows.end) - quad.qorigin_y;
     (x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
 }
 
@@ -4708,6 +5378,72 @@ fn rect_div(x: f32, y: f32, w: f32, h: f32) -> gpui::Div {
     div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h))
 }
 
+/// Translucency of a reference-highlight **fill** (`formula-point-mode/architecture.md §4.1`): a
+/// touch richer than the selection fill so a colored ref reads distinctly, yet still translucent so
+/// the cell content stays legible underneath.
+const REF_HIGHLIGHT_FILL_ALPHA: f32 = 0.16;
+
+/// The point-mode drag **preview** border color (`formula-point-mode/functional_spec.md §2`): an
+/// indigo distinct from the solid-blue selection rectangle (`ACCENT`) and from the reference-highlight
+/// palette, drawn dashed (marching-ants marquee) so the three overlays that can coexist — selection,
+/// ref highlights, point preview — stay visually distinct.
+const POINT_PREVIEW_BORDER: u32 = 0x4F46E5;
+
+/// Resolves a clicked `(row, col)` to the reference cell to insert (DPM.6, Q6): the top-left anchor
+/// of the first merge in `merges` that covers it, or the cell itself when uncovered. Pure over the
+/// merge list so it is unit-testable headless.
+fn resolve_merge_anchor_in(row: u32, col: u32, merges: &[CellRange]) -> CellRef {
+    let cell = CellRef::new(row, col);
+    merges
+        .iter()
+        .find(|m| m.contains(cell))
+        .map(|m| m.start)
+        .unwrap_or(cell)
+}
+
+/// Expands a swept point-drag `range` so it never bisects a merge (DPM.6, Q6): union it with every
+/// merge it intersects, iterating to a fixed point (an expansion can newly touch another merge).
+/// Pure over the merge list so it is unit-testable headless.
+fn expand_range_for_merges_in(range: CellRange, merges: &[CellRange]) -> CellRange {
+    let mut result = range;
+    loop {
+        let mut grew = false;
+        for m in merges {
+            if m.intersects(&result) {
+                let unioned = CellRange::new(
+                    CellRef::new(
+                        result.start.row.min(m.start.row),
+                        result.start.col.min(m.start.col),
+                    ),
+                    CellRef::new(result.end.row.max(m.end.row), result.end.col.max(m.end.col)),
+                );
+                if unioned != result {
+                    result = unioned;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    result
+}
+
+/// Resolves a reference-highlight palette slot to a concrete `0xRRGGBB` color for the current theme
+/// (`formula-point-mode/architecture.md §4.2`) — the highlight border color, and (via `.opacity`)
+/// its translucent fill. `is_dark` selects the palette's dark variant; the grid currently renders on
+/// the white `CELL_BG` regardless of OS appearance, so callers pass `false`, but the seam stays for
+/// the future theme-aware grid + the in-editor styling control that will reuse this one palette.
+fn ref_slot_border(slot: u8, is_dark: bool) -> u32 {
+    let color = freecell_core::palette::ref_color(slot as usize);
+    if is_dark {
+        color.dark.to_hex()
+    } else {
+        color.light.to_hex()
+    }
+}
+
 /// The live-resize size tooltip (`Width: N` / `Height: N`) anchored at grid-local `(x, y)`
 /// (`ui_design.md §3`). A small dark chip matching the app tooltip style.
 fn resize_tooltip(x: f32, y: f32, label: String) -> AnyElement {
@@ -4951,13 +5687,14 @@ impl GridView {
         &self,
         cell: CellRef,
         frame: &Frame,
+        quad: &Quadrant,
         window: &mut Window,
         cx: &App,
     ) -> Option<(f32, f32)> {
-        let (x, _y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let (x, _y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame, quad);
         let style = self.visible_styles.get(&(cell.row, cell.col)).copied();
         let wrap = style.map(|s| s.wrap).unwrap_or(false);
-        let content_w = frame.content_w as f32;
+        let content_w = quad.dest.2;
         // The editor's live text is the hosted input's own value (kept in sync with the mirror by the
         // chrome). Empty (or a missing input) simply keeps the base box.
         let text = self
@@ -5024,8 +5761,9 @@ impl GridView {
         cell: CellRef,
         input: &Entity<InputState>,
         frame: &Frame,
+        quad: &Quadrant,
     ) -> Vec<AnyElement> {
-        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame, quad);
         let wrap = self
             .visible_styles
             .get(&(cell.row, cell.col))
@@ -5151,6 +5889,7 @@ impl GridView {
     fn incell_autocomplete_elements(
         &self,
         frame: &Frame,
+        quad: &Quadrant,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         if self.incell_cap.is_some() {
@@ -5159,7 +5898,7 @@ impl GridView {
         let Some(cell) = self.incell_open else {
             return Vec::new();
         };
-        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame);
+        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame, quad);
         let (_, h) = self
             .incell_geom
             .unwrap_or((cell_w.max(IN_CELL_MIN_W), cell_h));
@@ -5309,9 +6048,10 @@ impl Render for GridView {
             // measuring needs the render thread's text system (`window`). Only the single editing
             // cell is measured, so this is O(1)/frame. `None` closes/clears it (the base cell-rect
             // size then applies). `visible_styles` was just populated by `resolve_frame`.
-            self.incell_geom = self
-                .incell_open
-                .and_then(|cell| self.measure_incell_geom(cell, &frame, window, cx));
+            self.incell_geom = self.incell_open.and_then(|cell| {
+                let quad = frame.overlay_quadrant(cell)?.clone();
+                self.measure_incell_geom(cell, &frame, &quad, window, cx)
+            });
             root_children.extend(self.build_grid_layers(&frame, None));
             // Wrap-driven row auto-grow (`functional_spec.md §3`): measure the just-laid-out wrap-on
             // cells and, for rows whose wrap inputs changed, ask the worker to grow/shrink them.
@@ -5323,8 +6063,10 @@ impl Render for GridView {
             // The in-cell completion list / signature hint (`gaps_closing_7_15 §1`) — rendered at
             // the root (not in `build_grid_layers`) so its rows can carry `cx.listener` click
             // handlers, like the header/cell context menus.
-            if self.incell_open.is_some() {
-                root_children.extend(self.incell_autocomplete_elements(&frame, cx));
+            if let Some(cell) = self.incell_open {
+                if let Some(quad) = frame.overlay_quadrant(cell).cloned() {
+                    root_children.extend(self.incell_autocomplete_elements(&frame, &quad, cx));
+                }
             }
         }
 
@@ -5547,6 +6289,14 @@ impl GridView {
         self.quick_edit
     }
 
+    /// Test seam: the grid's stored reference highlights (proves
+    /// [`set_edit_state`](Self::set_edit_state) threads `ref_highlights`, which the overlay pass
+    /// paints — `formula-point-mode/architecture.md §4.1`).
+    #[cfg(test)]
+    pub(crate) fn ref_highlights_for_test(&self) -> &[(CellRange, u8)] {
+        &self.ref_highlights
+    }
+
     /// The grid-local center of the current selection's fill handle for `window` — computed exactly
     /// as the render overlay + `handle_mouse_down` hit-test do (`gaps_closing_7_15 §3`), so a test
     /// can synthesize a mouse-down on the handle without hard-coding pixel geometry.
@@ -5559,8 +6309,9 @@ impl GridView {
         let caches = self.sources.caches.read();
         let cache = caches.get(active)?;
         let (row_axis, col_axis) = cache.axes();
-        let row_header_w = Self::gutter_width(&row_axis, scroll_y, content_h);
-        let content_w = (viewport_w - row_header_w as f64).max(0.0);
+        let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+        let row_header_w = pane.row_header_w;
+        let content_w = pane.content_w;
         let sel = self.selection().range();
         let right_x = col_axis.offset_of(sel.end.col + 1);
         let bottom_y = row_axis.offset_of(sel.end.row + 1);
@@ -6191,6 +6942,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells,
         };
@@ -6226,6 +6979,36 @@ mod tests {
             Root::new(g, window, cx)
         });
         (out.expect("grid built"), window, events)
+    }
+
+    /// Sources for a blank Excel-max sheet carrying the given frozen counts (`freeze-panes`) — the
+    /// header menu reads these into `HeaderMenu::frozen` to drive the Freeze/Unfreeze slot.
+    fn frozen_sources(frozen_rows: u32, frozen_cols: u32) -> GridDataSources {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::Publication;
+        let sheet = SheetId(0);
+        let cache = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .frozen_rows(frozen_rows)
+        .frozen_cols(frozen_cols)
+        .build();
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, cache);
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
+            generation: 1,
+            cells: vec![],
+        };
+        GridDataSources {
+            publication: Arc::new(ArcSwap::from_pointee(publication)),
+            caches: Arc::new(RwLock::new(caches)),
+        }
     }
 
     /// The heights carried by the single `AutoGrowRows` the recording captured, or `None`.
@@ -6385,6 +7168,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     events.borrow_mut().clear();
@@ -6412,7 +7198,18 @@ mod tests {
         window
             .update(cx, |_root, _window, cx| {
                 g.update(cx, |grid, cx| {
-                    grid.set_edit_state(None, Some(CellRef::new(0, 0)), None, true, None, None, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        true,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
                     assert!(
                         grid.quick_edit_for_test(),
                         "quick_edit must thread through set_edit_state"
@@ -6424,11 +7221,66 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     assert!(
                         !grid.quick_edit_for_test(),
                         "quick_edit clears when pushed false"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn set_edit_state_threads_ref_highlights(cx: &mut TestAppContext) {
+        // The chrome pushes the same-sheet reference highlights through the edit-state; the grid
+        // stores them for its overlay paint pass (`formula-point-mode/architecture.md §4.1`), and a
+        // later push (edit committed / cancelled) with an empty vec clears them.
+        let (g, window, _events) = grid_recording(cx);
+        let highlights = vec![
+            (CellRange::single(CellRef::new(0, 0)), 0u8),
+            (CellRange::new(CellRef::new(2, 2), CellRef::new(6, 4)), 1u8),
+        ];
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        Some(CellRef::new(0, 0)),
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        highlights.clone(),
+                        cx,
+                    );
+                    assert_eq!(
+                        grid.ref_highlights_for_test(),
+                        highlights.as_slice(),
+                        "ref_highlights must thread through set_edit_state"
+                    );
+                    // A commit/cancel pushes an empty vec → highlights clear.
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    assert!(
+                        grid.ref_highlights_for_test().is_empty(),
+                        "ref_highlights clear when an empty vec is pushed"
                     );
                 });
             })
@@ -6646,6 +7498,283 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    // ---- Point-mode routing (formula-point-mode Phase 3) ------------------------------------
+
+    /// The `InsertReference` targets emitted by a recording grid, in order.
+    fn inserted_refs(events: &Rc<RefCell<Vec<GridEvent>>>) -> Vec<(String, bool)> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GridEvent::InsertReference {
+                    a1,
+                    replace_pending,
+                } => Some((a1.clone(), *replace_pending)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A reference-ready formula edit turns a grid click into a point INSERT — it emits
+    /// `InsertReference` (never `SelectionChanged`) and leaves the grid selection untouched; a
+    /// pending-ref push makes the emit carry `replace_pending: true`.
+    #[gpui::test]
+    fn point_ready_click_inserts_not_selects(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let before = grid.selection().range();
+                    // Reference-ready formula edit → a click points instead of selecting.
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![("C3".to_string(), false)],
+                        "the click appends C3"
+                    );
+                    assert!(
+                        !events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "no SelectionChanged is emitted in point-mode"
+                    );
+                    assert_eq!(grid.selection().range(), before, "selection is untouched");
+
+                    // A pending ref makes the next click a REPLACE even at a not-ready caret.
+                    grid.point_drag = None;
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        true,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.mouse_down_cell(0, 0, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![("A1".to_string(), true)],
+                        "a pending ref makes the click replace"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// With no reference-ready / pending signal, a grid click behaves exactly as today: it emits
+    /// `SelectionChanged` (the commit path) and no `InsertReference`.
+    #[gpui::test]
+    fn not_ready_click_selects_as_today(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "a not-ready click commits via SelectionChanged"
+                    );
+                    assert!(
+                        inserted_refs(&events).is_empty(),
+                        "no reference is inserted"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// A point drag re-emits the swept range as it grows (dedupe per cell), and a release on the
+    /// origin cell yields a single-cell ref (`functional_spec.md §2` Drag details).
+    #[gpui::test]
+    fn point_drag_emits_expanded_range_and_dedupes(cx: &mut TestAppContext) {
+        let (g, window, events) = grid_recording(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    // Mouse-down at C3 → origin, emits "C3".
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    // Grow to E7 → "C3:E7"; a repeat is deduped; back to origin → "C3".
+                    grid.set_point_target_from_cell(CellRef::new(6, 4), window, cx);
+                    grid.set_point_target_from_cell(CellRef::new(6, 4), window, cx);
+                    grid.set_point_target_from_cell(CellRef::new(2, 2), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![
+                            ("C3".to_string(), false),
+                            ("C3:E7".to_string(), true),
+                            ("C3".to_string(), true),
+                        ],
+                        "grow, dedupe the repeat, collapse back to a single cell"
+                    );
+                    // Release clears the drag.
+                    grid.handle_mouse_up(&up_ev(), window, cx);
+                    assert!(grid.point_drag.is_none(), "release clears the point drag");
+                });
+            })
+            .unwrap();
+    }
+
+    /// A merged cache: a reference-ready click on a covered cell inserts the merge's anchor (DPM.6).
+    #[gpui::test]
+    fn point_click_on_merge_inserts_anchor(cx: &mut TestAppContext) {
+        let (g, window, events) = recording_over(cx, merged_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        true,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    events.borrow_mut().clear();
+                    // C3 (2,2) is covered by the merge B2:C3 → the anchor B2 is inserted.
+                    grid.mouse_down_cell(2, 2, &mouse_ev(MouseButton::Left, 0.0, 0.0), window, cx);
+                    assert_eq!(
+                        inserted_refs(&events),
+                        vec![("B2".to_string(), false)],
+                        "a click on a covered cell inserts the merge anchor"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The pure merge helpers: anchor resolution + fixed-point range expansion.
+    #[test]
+    fn merge_anchor_and_range_expansion() {
+        let merges = vec![CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2))]; // B2:C3
+        assert_eq!(
+            resolve_merge_anchor_in(2, 2, &merges),
+            CellRef::new(1, 1),
+            "a covered cell resolves to the anchor"
+        );
+        assert_eq!(
+            resolve_merge_anchor_in(5, 5, &merges),
+            CellRef::new(5, 5),
+            "an uncovered cell resolves to itself"
+        );
+        // A swept rect touching the merge grows to include the whole span (A1:B2 → A1:C3).
+        let swept = CellRange::new(CellRef::new(0, 0), CellRef::new(1, 1));
+        assert_eq!(
+            expand_range_for_merges_in(swept, &merges),
+            CellRange::new(CellRef::new(0, 0), CellRef::new(2, 2))
+        );
+        // Chained fixed-point: expanding via the first merge newly touches the second.
+        let chained = vec![
+            CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)), // B2:C3
+            CellRange::new(CellRef::new(2, 2), CellRef::new(4, 4)), // C3:E5
+        ];
+        assert_eq!(
+            expand_range_for_merges_in(CellRange::single(CellRef::new(1, 1)), &chained),
+            CellRange::new(CellRef::new(1, 1), CellRef::new(4, 4)),
+            "B2 → B2:C3 → B2:E5 (both merges folded in)"
+        );
+    }
+
+    /// A sheet switch drops any armed point drag so it can never leak onto the new sheet.
+    #[gpui::test]
+    fn set_active_sheet_clears_point_drag(cx: &mut TestAppContext) {
+        let (g, window, _events) = grid_recording(cx);
+        window
+            .update(cx, |_root, _window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.point_drag = Some(PointDrag {
+                        origin: CellRef::new(2, 2),
+                        last_range: CellRange::single(CellRef::new(2, 2)),
+                    });
+                    grid.set_active_sheet(SheetId(1), cx);
+                    assert!(
+                        grid.point_drag.is_none(),
+                        "point drag cleared on sheet switch"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Sources with a single merge B2:C3 (no published cells) for the point-on-merge test.
+    fn merged_sources() -> GridDataSources {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::Publication;
+        let sheet = SheetId(0);
+        let cache = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .merge(CellRange::new(CellRef::new(1, 1), CellRef::new(2, 2)))
+        .build();
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, cache);
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
+            generation: 1,
+            cells: Vec::new(),
+        };
+        GridDataSources {
+            publication: Arc::new(ArcSwap::from_pointee(publication)),
+            caches: Arc::new(RwLock::new(caches)),
+        }
     }
 
     #[test]
@@ -6885,6 +8014,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells: published,
         };
@@ -7092,6 +8223,8 @@ mod tests {
             sheet,
             rows: 0..40,
             cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
             generation: 1,
             cells: published,
         };
@@ -7318,6 +8451,377 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn header_menu_carries_axis_frozen_count(cx: &mut TestAppContext) {
+        // A sheet frozen at M = 2 rows, K = 1 column: the header menu must read the count of the
+        // axis it was opened on into `HeaderMenu::frozen` (`freeze-panes architecture.md §4`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 1));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // Row header: x inside the gutter (< 48), y past the column-header strip (> 24).
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 20.0, 60.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.header_menu.expect("a row header opens the menu");
+                    assert_eq!(menu.axis, RowOrCol::Row);
+                    assert_eq!(menu.frozen, 2, "row header carries M");
+                    // Column header: the column-header strip (y < 24) past the gutter.
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 60.0, 10.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.header_menu.expect("a column header opens the menu");
+                    assert_eq!(menu.axis, RowOrCol::Col);
+                    assert_eq!(menu.frozen, 1, "column header carries K");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn freeze_menu_item_emits_set_frozen(cx: &mut TestAppContext) {
+        // From an unfrozen sheet, the row header's Freeze item emits a one-axis `SetFrozen` — the
+        // end-to-end path from the opened menu through the recorded event.
+        let (g, window, events) = recording_over(cx, frozen_sources(0, 0));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.handle_right_mouse_down(
+                        &mouse_ev(MouseButton::Right, 20.0, 60.0),
+                        window,
+                        cx,
+                    );
+                    let menu = grid.header_menu.expect("a row header opens the menu");
+                    // The Freeze/Unfreeze slot is the last item; nothing frozen → it Freezes.
+                    let (label, enabled, event) = GridView::header_menu_items(&menu)
+                        .pop()
+                        .expect("the menu carries a Freeze/Unfreeze item");
+                    assert!(enabled && label.starts_with("Freeze"));
+                    grid.events.emit(&event, window, cx);
+                });
+            })
+            .unwrap();
+        let recorded = events.borrow();
+        assert!(
+            recorded.iter().any(|e| matches!(
+                e,
+                GridEvent::SetFrozen {
+                    rows: Some(_),
+                    cols: None
+                }
+            )),
+            "the row Freeze item records a rows-only SetFrozen, got {recorded:?}"
+        );
+    }
+
+    // ---- Freeze-pane viewport split (`components/viewport_split.md §7`, Phase 3) -----------
+
+    #[gpui::test]
+    fn resolve_frame_single_body_when_unfrozen(cx: &mut TestAppContext) {
+        // `M=K=0` must resolve exactly ONE quadrant (Body) reproducing the pre-freeze content div:
+        // dest = (row_header_w, COL_HEADER_H, content_w, content_h), qorigin = the stored scroll.
+        let (g, window, _events) = recording_over(cx, frozen_sources(0, 0));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, _cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame resolves");
+                    assert_eq!((frame.frozen_w, frame.frozen_h), (0.0, 0.0));
+                    assert!(frame.quadrants[QuadKind::Corner as usize].is_none());
+                    assert!(frame.quadrants[QuadKind::TopBand as usize].is_none());
+                    assert!(frame.quadrants[QuadKind::LeftBand as usize].is_none());
+                    let body = frame
+                        .quadrants
+                        .iter()
+                        .flatten()
+                        .next()
+                        .expect("exactly the body quadrant");
+                    assert_eq!(body.rows, frame.rows);
+                    assert_eq!(body.cols, frame.cols);
+                    assert_eq!(
+                        (body.qorigin_x, body.qorigin_y),
+                        (frame.scroll_x, frame.scroll_y)
+                    );
+                    assert_eq!(body.dest.0, frame.row_header_w);
+                    assert_eq!(body.dest.1, COL_HEADER_H);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn resolve_frame_four_quadrants_for_frozen(cx: &mut TestAppContext) {
+        // A sheet frozen at M=2 rows, K=2 cols resolves the four quadrants with the leading bands as
+        // their own ranges and the body floored past the bands (`§1/§2`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, _cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame resolves");
+                    assert!(frame.frozen_w > 0.0 && frame.frozen_h > 0.0);
+                    let corner = frame.quadrants[QuadKind::Corner as usize]
+                        .as_ref()
+                        .expect("corner");
+                    assert_eq!(corner.rows, 0..2);
+                    assert_eq!(corner.cols, 0..2);
+                    assert_eq!((corner.qorigin_x, corner.qorigin_y), (0.0, 0.0));
+                    assert_eq!(corner.dest.0, frame.row_header_w);
+                    assert_eq!(corner.dest.1, COL_HEADER_H);
+
+                    let top = frame.quadrants[QuadKind::TopBand as usize]
+                        .as_ref()
+                        .expect("top band");
+                    assert_eq!(top.rows, 0..2);
+                    assert_eq!(top.cols.start, 2);
+                    assert_eq!(top.qorigin_y, 0.0);
+
+                    let left = frame.quadrants[QuadKind::LeftBand as usize]
+                        .as_ref()
+                        .expect("left band");
+                    assert_eq!(left.cols, 0..2);
+                    assert_eq!(left.rows.start, 2);
+                    assert_eq!(left.qorigin_x, 0.0);
+
+                    let body = frame.quadrants[QuadKind::Body as usize]
+                        .as_ref()
+                        .expect("body");
+                    assert_eq!(body.rows.start, 2);
+                    assert_eq!(body.cols.start, 2);
+                    assert_eq!(body.qorigin_x, frame.frozen_w + frame.scroll_x);
+                    assert_eq!(body.qorigin_y, frame.frozen_h + frame.scroll_y);
+                    assert_eq!(body.dest.0, frame.row_header_w + frame.frozen_w as f32);
+                    assert_eq!(body.dest.1, COL_HEADER_H + frame.frozen_h as f32);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn frozen_bands_pinned_while_body_scrolls(cx: &mut TestAppContext) {
+        // With a body scroll applied, the frozen bands stay at their pinned origin (qorigin 0 on the
+        // frozen axis) while the body (and the band that scrolls in lockstep with it) moves (`§3.1`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, _cx| {
+                    let sheet = grid.active_sheet;
+                    grid.scroll.insert(sheet, (500.0, 400.0)); // body-relative scroll
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame resolves");
+
+                    let corner = frame.quadrants[QuadKind::Corner as usize].as_ref().unwrap();
+                    assert_eq!(corner.rows, 0..2, "corner rows pinned regardless of scroll");
+                    assert_eq!(corner.cols, 0..2, "corner cols pinned");
+                    assert_eq!((corner.qorigin_x, corner.qorigin_y), (0.0, 0.0));
+
+                    let top = frame.quadrants[QuadKind::TopBand as usize]
+                        .as_ref()
+                        .unwrap();
+                    assert_eq!(top.rows, 0..2, "top band vertically pinned");
+                    assert_eq!(top.qorigin_y, 0.0);
+                    assert_eq!(
+                        top.qorigin_x,
+                        frame.frozen_w + 500.0,
+                        "scrolls horizontally"
+                    );
+
+                    let left = frame.quadrants[QuadKind::LeftBand as usize]
+                        .as_ref()
+                        .unwrap();
+                    assert_eq!(left.cols, 0..2, "left band horizontally pinned");
+                    assert_eq!(left.qorigin_x, 0.0);
+                    assert_eq!(left.qorigin_y, frame.frozen_h + 400.0, "scrolls vertically");
+
+                    let body = frame.quadrants[QuadKind::Body as usize].as_ref().unwrap();
+                    assert_eq!(body.qorigin_x, frame.frozen_w + 500.0);
+                    assert_eq!(body.qorigin_y, frame.frozen_h + 400.0);
+                    // Bands scroll in lockstep with the body on their scrolling axis.
+                    assert_eq!(top.cols, body.cols, "top band cols track the body");
+                    assert_eq!(left.rows, body.rows, "left band rows track the body");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn divider_and_quadrants_gated_on_frozen_axis(cx: &mut TestAppContext) {
+        // A row-only freeze (M=1, K=0) yields a horizontal band extent (the divider's gate) and no
+        // vertical one, only the TopBand + Body quadrants, and still builds layers without panicking.
+        let (g, window, _events) = recording_over(cx, frozen_sources(1, 0));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, _cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("resolves");
+                    assert!(
+                        frame.frozen_h > 0.0,
+                        "row freeze → horizontal divider extent"
+                    );
+                    assert_eq!(frame.frozen_w, 0.0, "no col freeze → no vertical divider");
+                    assert!(frame.quadrants[QuadKind::Corner as usize].is_none());
+                    assert!(frame.quadrants[QuadKind::LeftBand as usize].is_none());
+                    assert!(frame.quadrants[QuadKind::TopBand as usize].is_some());
+                    assert!(frame.quadrants[QuadKind::Body as usize].is_some());
+                    let layers = grid.build_grid_layers(&frame, None);
+                    assert!(!layers.is_empty(), "a frozen sheet still builds layers");
+                });
+            })
+            .unwrap();
+    }
+
+    // ---- Phase 4: cross-boundary interactions (`components/viewport_split.md §3–§5`) --------
+
+    #[gpui::test]
+    fn click_in_top_band_selects_frozen_row_and_scrolled_col(cx: &mut TestAppContext) {
+        // With the body scrolled, a click in the top band (frozen row, scrolling col) region-routes
+        // through `pane.hit_test`: the row is a frozen band row, the column is a scrolled body column
+        // — the SAME column a body click at that x resolves. Validates the wired frozen hit-test.
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.scroll.insert(sheet, (500.0, 400.0)); // body-relative
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    let x_body = frame.row_header_w + frame.frozen_w as f32 + 1.0;
+                    let y_top = COL_HEADER_H + 1.0; // top band (frozen row)
+                    let y_body = COL_HEADER_H + frame.frozen_h as f32 + 1.0; // body
+
+                    grid.handle_mouse_down(&mouse_ev(MouseButton::Left, x_body, y_top), window, cx);
+                    let top = grid.selection().active;
+                    grid.handle_mouse_down(
+                        &mouse_ev(MouseButton::Left, x_body, y_body),
+                        window,
+                        cx,
+                    );
+                    let body = grid.selection().active;
+
+                    assert!(top.row < 2, "top-band click lands on a frozen row: {top:?}");
+                    assert!(
+                        top.col >= 2,
+                        "the column is a scrolled body column: {top:?}"
+                    );
+                    assert!(
+                        body.row >= 2,
+                        "body click lands on a scrolled body row: {body:?}"
+                    );
+                    assert_eq!(body.col, top.col, "same body column at the same x");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn drag_extends_selection_across_divider_into_band(cx: &mut TestAppContext) {
+        // A cell drag begun in the body and extended into the LEFT band (frozen col, scrolling row)
+        // lands on a frozen-column cell — a continuous drag across the divider (`§3.3/§4`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.scroll.insert(sheet, (500.0, 400.0));
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    let x_body = frame.row_header_w + frame.frozen_w as f32 + 1.0;
+                    let y_body = COL_HEADER_H + frame.frozen_h as f32 + 1.0;
+                    // Start a body cell drag.
+                    grid.handle_mouse_down(
+                        &mouse_ev(MouseButton::Left, x_body, y_body),
+                        window,
+                        cx,
+                    );
+                    let anchor = grid.selection().anchor;
+                    assert!(anchor.col >= 2, "drag anchor is a body cell");
+                    // Extend into the left band (x inside the frozen-col region, still a body row y).
+                    grid.extend_drag_to_point(anchor, frame.row_header_w + 1.0, y_body, window, cx);
+                    let sel = *grid.selection();
+                    assert_eq!(sel.anchor, anchor, "anchor preserved across the drag");
+                    assert!(
+                        sel.active.col < 2,
+                        "a drag into the left band selects a frozen column: {:?}",
+                        sel.active
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn reveal_frozen_row_is_noop_and_body_row_lands_below_divider(cx: &mut TestAppContext) {
+        // `pane.reveal` no-ops on a frozen axis (the band is already pinned) and reveals a deep body
+        // row into the body sub-area, never under the band (`§3.2`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(2, 0));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let sheet = grid.active_sheet;
+                    grid.scroll.insert(sheet, (0.0, 123.0));
+                    // Revealing a frozen row (row 1) does not move the body scroll.
+                    grid.reveal_and_announce(1, 0, window, cx);
+                    assert_eq!(
+                        grid.scroll_of(sheet).1,
+                        123.0,
+                        "revealing a frozen row is a no-op on the vertical axis"
+                    );
+                    // Revealing a deep body row scrolls it into the body quadrant (not under the band).
+                    grid.reveal_and_announce(500, 0, window, cx);
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    let body = frame.quadrants[QuadKind::Body as usize]
+                        .as_ref()
+                        .expect("body quadrant");
+                    assert!(
+                        body.rows.contains(&500),
+                        "the revealed body row is visible in the body: {:?}",
+                        body.rows
+                    );
+                    assert!(body.rows.start >= 2, "the body never shows a frozen row");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn frozen_col_resize_grows_band_and_hotspots_build(cx: &mut TestAppContext) {
+        // A live resize of a frozen column grows the frozen band (`frozen_w` is preview-aware), and
+        // `resize_hotspots` builds region-placed dividers without panicking (`§5`).
+        let (g, window, _events) = recording_over(cx, frozen_sources(0, 2));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let base = grid.resolve_frame(vw, vh).expect("frame");
+                    let base_frozen_w = base.frozen_w;
+                    let start_px = base.col_size(0);
+                    // Simulate a live resize of frozen column 0, +60 px.
+                    grid.resize_drag = Some(ResizeDrag {
+                        axis: RowOrCol::Col,
+                        index: 0,
+                        start_px,
+                        current_px: start_px + 60.0,
+                        run: (0, 0),
+                        origin_coord: 0.0,
+                    });
+                    let frame = grid.resolve_frame(vw, vh).expect("frame");
+                    assert!(
+                        frame.frozen_w > base_frozen_w + 50.0,
+                        "resizing a frozen column grows the band: {} vs {base_frozen_w}",
+                        frame.frozen_w
+                    );
+                    let hotspots = grid.resize_hotspots(&frame, cx);
+                    assert!(!hotspots.is_empty(), "frozen frame builds resize hotspots");
+                });
+            })
+            .unwrap();
+    }
+
     // ---- Cell-area right-click context menu (`functional_spec.md §2`, Phase 5) -------------
 
     /// A `CellMenu` over the B2:D4 (rows 1..=3, cols 1..=3) selection with nothing blocked, for the
@@ -7425,6 +8929,7 @@ mod tests {
         hide_blocked: bool,
         unhide_run: Option<(u32, u32)>,
         hidden_in_run: u32,
+        frozen: u32,
     ) -> HeaderMenu {
         HeaderMenu {
             axis,
@@ -7437,6 +8942,7 @@ mod tests {
             hide_blocked,
             unhide_run,
             hidden_in_run,
+            frozen,
         }
     }
 
@@ -7449,6 +8955,7 @@ mod tests {
             (2, 4),
             false,
             None,
+            0,
             0,
         ));
         assert!(matches!(
@@ -7468,6 +8975,7 @@ mod tests {
             false,
             Some((3, 3)),
             1,
+            0,
         ));
         assert!(matches!(
             &items[3],
@@ -7487,6 +8995,7 @@ mod tests {
             false,
             Some((3, 5)),
             2,
+            0,
         ));
         assert!(matches!(
             &items[4],
@@ -7500,10 +9009,53 @@ mod tests {
             true,
             None,
             0,
+            0,
         ));
         assert!(matches!(
             &items[3],
             (l, false, GridEvent::HideRows { at: 0, .. }) if l == "Hide 1048576 rows"
+        ));
+    }
+
+    #[test]
+    fn header_menu_items_include_freeze_and_unfreeze() {
+        // The Freeze/Unfreeze slot is the LAST item; its label/target flips on whether the current
+        // frozen count already equals the boundary `run.1 + 1` (`freeze-panes architecture.md §4`).
+        let freeze_item = |axis, run, frozen| {
+            GridView::header_menu_items(&header_menu_fixture(axis, run, false, None, 0, frozen))
+                .pop()
+                .expect("the menu always carries a Freeze/Unfreeze item")
+        };
+
+        // Row header, single track 1 (boundary 0), nothing frozen → Freeze rows to count 1.
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (0, 0), 0),
+            (l, true, GridEvent::SetFrozen { rows: Some(1), cols: None }) if l == "Freeze rows"
+        ));
+        // Same boundary already frozen (M == 1) → the slot flips to Unfreeze (set M to 0).
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (0, 0), 1),
+            (l, true, GridEvent::SetFrozen { rows: Some(0), cols: None }) if l == "Unfreeze rows"
+        ));
+        // A different existing freeze (M == 3) at boundary 4 (run 2..=4) → Freeze MOVES it to 5.
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (2, 4), 3),
+            (l, true, GridEvent::SetFrozen { rows: Some(5), cols: None }) if l == "Freeze rows"
+        ));
+        // The boundary 4 (count 5) already frozen → Unfreeze.
+        assert!(matches!(
+            freeze_item(RowOrCol::Row, (2, 4), 5),
+            (l, true, GridEvent::SetFrozen { rows: Some(0), cols: None }) if l == "Unfreeze rows"
+        ));
+
+        // Column symmetry: a column header drives the `cols` axis only, leaving `rows` None.
+        assert!(matches!(
+            freeze_item(RowOrCol::Col, (0, 0), 0),
+            (l, true, GridEvent::SetFrozen { rows: None, cols: Some(1) }) if l == "Freeze columns"
+        ));
+        assert!(matches!(
+            freeze_item(RowOrCol::Col, (1, 3), 4),
+            (l, true, GridEvent::SetFrozen { rows: None, cols: Some(0) }) if l == "Unfreeze columns"
         ));
     }
 
@@ -7935,6 +9487,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                 });
@@ -8021,6 +9576,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                 });
@@ -8104,6 +9662,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     grid.mouse_down_cell(
@@ -8161,6 +9722,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                     assert!(
@@ -8168,7 +9732,18 @@ mod tests {
                         "opening the in-cell editor clears the pre-armed drag"
                     );
                     // Close the editor; the drag must stay cleared (no move-gate applies now).
-                    grid.set_edit_state(None, None, None, false, None, None, cx);
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
                     assert!(
                         !grid.has_active_drag(),
                         "the drag stays cleared after the editor closes"
@@ -8367,6 +9942,9 @@ mod tests {
                         false,
                         None,
                         None,
+                        false,
+                        false,
+                        Vec::new(),
                         cx,
                     );
                 });
@@ -8379,7 +9957,18 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(CellRef::new(3, 3)),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8397,7 +9986,18 @@ mod tests {
                 )
             });
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(CellRef::new(3, 3)), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(CellRef::new(3, 3)),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8419,7 +10019,18 @@ mod tests {
         // Cancel closes the overlay — normal rendering resumes (no persistent overlay).
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             })
         });
         vcx.run_until_parked();
@@ -8441,7 +10052,18 @@ mod tests {
                 let input = cx.new(|cx| InputState::new(window, cx));
                 g.update(cx, |grid, cx| {
                     grid.set_incell_input(input.clone(), cx);
-                    grid.set_edit_state(None, Some(cell), None, false, None, None, cx);
+                    grid.set_edit_state(
+                        None,
+                        Some(cell),
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
                 });
                 input
             })
@@ -8451,7 +10073,18 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value("x", window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(cell),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8462,7 +10095,18 @@ mod tests {
         vcx.update(|window, cx| {
             input.update(cx, |i, cx| i.set_value(WRAP_LONG, window, cx));
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, Some(cell), None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    Some(cell),
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             });
         });
         vcx.run_until_parked();
@@ -8484,7 +10128,18 @@ mod tests {
         // Commit closes the overlay.
         vcx.update(|_window, cx| {
             g.update(cx, |grid, cx| {
-                grid.set_edit_state(None, None, None, false, None, None, cx)
+                grid.set_edit_state(
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Vec::new(),
+                    cx,
+                )
             })
         });
         vcx.run_until_parked();

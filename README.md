@@ -1,11 +1,10 @@
 <div align="center">
-<img width="96" height="96" alt="sourceMacOS-1024x1024@2x" src="https://github.com/user-attachments/assets/9a9f7d98-7155-47df-98d2-67daec184ee1" />
+<img width="263" height="71" alt="freecell logo mark" src="https://github.com/user-attachments/assets/7ac2febf-9839-4e4f-ace9-561edc909959" />
 
-# FreeCell
 ### The open spreadsheet app
 </div>
 
-- Free and OSS desktop spreadsheet app
+- Free and open-source desktop spreadsheet app
 - Supports XLSX format and 90% of Excel formulas
 - GPU rendering: bar graphs at 240fps
 - Insanely fast and light: Rust-based, 11MB app, launches in 60 milliseconds
@@ -22,16 +21,16 @@ It’s a spreadsheet. It has the most of the features you’d come to expect inc
 
 - Formulas: supports 90% of Excel formulas
 - Formatting: all the text formatting, borders, fills and sizing you expect
-- XLSX file support: open and edit Excel files (open OOXML format)
-- Speed: it’s ridiculously fast. Sheets that take 30s to open in Apple Numbers open in <1s in FreeCell.
+- XLSX file support: open and edit Excel files (OOXML format)
+- Speed: it’s ridiculously fast and lightweight.
 - 100% local software: no cloud, no analytics, completely private
 - Cross platform: works on Mac, Windows and Linux
-- Native: compiled desktop app, not Electron
+- Native: compiled desktop app, not Electron or web-views
 - Charts: GPU rendered charting
+- More: merged cells, frozen panes, conditional formatting, and much more
 
 What’s not included (yet):
 - Pivot tables
-- Merged cells
 - Dynamic arrays (UNIQUE/FILTER/SORT)
 - Clippy
 
@@ -62,6 +61,10 @@ cargo run -p freecell-app
 cd App
 ./scripts/package.sh
 ```
+
+### Issues, not Pull Requests
+
+Feels strange to type this, but I prefer high-quality Github issues over pull requests. This project is built with my [agentic engineering harness](https://github.com/scosman/vibe-crafting). It ensures consistency, enforces best practices, has code review gates, etc. Is your workflow/PR just as good? Maybe, maybe not -- but it's more work for me to validate than to implement from scratch.
 
 ### License
 

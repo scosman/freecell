@@ -37,7 +37,7 @@ these are presentation / entry-point behaviors consciously deferred. Each also a
 | 1 | **Type-based default cell alignment** — numbers/dates right, booleans/errors center | §3.6 | Moderate | ✅ **Resolved (mvp-gaps Phase 1)** — `PublishedCell.kind` is published and the grid aligns by type when no explicit alignment is set; explicit alignment still wins | `PublishedCell` carries only a display string, no value type | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
 | 2 | **`[Red]` number-format text color** | §3.6 | Mild | ✅ **Resolved (mvp-gaps Phase 1)** — the worker resolves per-cell `text_color` (explicit font colour → number-format colour); `[Red]` negatives render red | Worker doesn't publish resolved per-cell color | [`projects/type-aware-alignment.md`](projects/type-aware-alignment.md) |
 | 3 | **Input-cap rejection message text** — "Formula too long / too deeply nested" popover | §3.3 | Mild | ✅ **Resolved (mvp-gaps Phase 1 + 2)** — a tooltip-style popover shows the length/depth reason under the **data row** (Phase 1) and the **in-cell editor** (Phase 2); dismisses on the next keystroke/focus change | `DataRowEffect::ShowCapError` was a no-op in the chrome; message-popover not built | *inline below* |
-| 4 | **macOS Finder open-file** — double-click / `open -a` / drag-onto-Dock | §2.1 | Moderate | Only the **CLI-argv** open path is wired; the primary-platform "double-click a file" flow does not open it | Pinned gpui rev's `on_open_urls` callback lacks a context (`cx`) arg | *inline below* |
+| 4 | **macOS Finder open-file** — double-click / `open -a` / drag-onto-Dock | §2.1 | Moderate | ✅ **Resolved (xlsx-file-association)** — an OS `file-associations` declaration registers `.xlsx`/`.csv`, and a macOS Apple-Event bridge (`shell/open_files.rs` `install_finder_open`) routes Finder opens through the existing `open_path` funnel; argv already covered Windows/Linux/CLI | Pinned gpui rev's `on_open_urls` callback lacks a context (`cx`) arg — bridged via an async channel + deferred dispatch | *inline below* |
 | 5 | **Bundled Inter font** — ship Inter via `add_fonts` at startup | §3.3/§3.6 | Nicety (not a functional gap) | ✅ **Resolved (2026-07-06)** — Inter (SIL OFL) vendored at `crates/freecell-app/assets/fonts/inter/` and registered at startup (`shell/fonts.rs`); grid + chrome render Inter on every platform, and baselines were regenerated on it | (was) Fonts not vendored; `register_fonts` was a documented no-op | [`projects/bundled-inter-font.md`](projects/bundled-inter-font.md) |
 
 ### Detail for the two without a dedicated note
@@ -52,16 +52,19 @@ popover below the active editor with the reason string (length vs depth), on the
 change (`chrome/view.rs` `cap_error*` state + `cap_error_visible()`, tested via
 `edit_rejected_input_cap_flags_chrome_data_row` + the `input_cap.rs` unit tests).
 
-**#4 — macOS Finder open-file (§2.1).**
-`main.rs` wires only `xlsx_arg` (CLI argv). Opening a `.xlsx` from Finder
-(double-click, drag onto the Dock icon, `open -a FreeCell book.xlsx`) does nothing on
-macOS — the primary design target. The pinned gpui rev's `on_open_urls` callback
-signature lacks the `cx` needed to route the open through `FreeCellApp`. Work when
-picked up: this is likely a **spike** first — check whether a newer gpui rev gives
-`on_open_urls` a context arg (or an alternative hook), or bridge via an app-global +
-deferred dispatch; then map the incoming URLs through the existing `do_open_path`
-(canonicalize → dedupe → open) that CLI-argv already uses. Verify on real macOS
-(smoke item **M-15** in `specs/projects/mvp/smoke_checklist.md`).
+**#4 — macOS Finder open-file (§2.1). ✅ RESOLVED (`specs/projects/xlsx-file-association`).**
+Originally only `main.rs`'s CLI-argv path was wired, so opening a `.xlsx`/`.csv` from Finder
+(double-click, drag onto the Dock, `open -a FreeCell book.xlsx`) did nothing on macOS — the
+primary design target — because the pinned gpui rev's `App::on_open_urls` callback is
+`FnMut(Vec<String>)` with no `cx`. The xlsx-file-association project closed this in two commits:
+**Phase 1 (`84785fa`)** declares the OS association via a shared
+`[[package.metadata.packager.file-associations]]` block for `.xlsx` + `.csv`
+(`crates/freecell-app/Cargo.toml`), and **Phase 2 (`f2e72cc`)** adds the macOS Apple-Event
+bridge (`crates/freecell-app/src/shell/open_files.rs` — `install_finder_open` forwards the
+cx-less callback's URL strings onto an async channel that a spawned app task drains through the
+existing `FreeCellApp::open_path` funnel, honoring the no-welcome-flash startup requirement).
+Windows/Linux/CLI were already covered by `main.rs::open_arg` → `open_path`. A final macOS
+hardware smoke (item **M-15** in `specs/projects/mvp/smoke_checklist.md`) is non-blocking.
 
 ### Intentional MVP scope exclusions (NOT gaps — deliberate, listed for completeness)
 
@@ -76,9 +79,10 @@ deferred dispatch; then map the incoming URLs through the existing `do_open_path
 ### When picking these up
 
 Items **#1, #2, and #3 are RESOLVED** by the `specs/projects/mvp-gaps` build (Phases 1–2 —
-publication type/color + type-aware alignment + the cap-error popover), and **#5 (bundled
-Inter font) is RESOLVED** (vendored + registered 2026-07-06). **Still open:** #4 only
-(macOS Finder open-file — needs a gpui-capability spike before estimating).
+publication type/color + type-aware alignment + the cap-error popover), **#5 (bundled Inter
+font) is RESOLVED** (vendored + registered 2026-07-06), and **#4 (macOS Finder open-file) is
+RESOLVED** by `specs/projects/xlsx-file-association` (Phases 1–2, commits `84785fa` + `f2e72cc`).
+**None of the five remain open.**
 
 ---
 
@@ -416,7 +420,7 @@ Ordered roughly by how fast a new user hits the gap.
 | **Formula range highlighting + point-mode** (colored refs while editing; click/drag a range to insert it) | **NEW** (checked: no reference-insert / highlight code) | The other half of formula-entry UX; without point-mode every formula must be typed by hand. Engine's public `Lexer`/`Parser` AST can drive tokenization. |
 | **Missing everyday scalar functions + TRIM bug** (SUMPRODUCT, TRANSPOSE, PROPER, REPLACE, CHAR, CODE, CLEAN, DOLLAR, ADDRESS, HYPERLINK-fn, PERCENTILE.INC, QUARTILE.INC, XMATCH; TRIM doesn't collapse internal runs) | Partially (round-2 SP3 findings; not previously in GAPS) | ~14 independently-implementable engine functions — clean one-per-PR upstream candidates per the fork policy. SUMPRODUCT/TRANSPOSE absence bites real home sheets. |
 | **Render-fidelity polish pair** (fill covers interior gridlines; full-row selection darkens row header) | Above (render-baseline eyeball 2026-07-06) | Both cheap, both instantly visible quality signals. |
-| **macOS Finder open-file** (double-click / drag-to-Dock) | Above (MVP #4) | Primary-platform basics; needs the gpui `on_open_urls` spike first. |
+| **macOS Finder open-file** (double-click / drag-to-Dock) | **Shipped** (`specs/projects/xlsx-file-association`, 2026-07-24 — commits `84785fa` + `f2e72cc`) | OS file associations for `.xlsx`/`.csv` (cargo-packager declaration) + a macOS Apple-Event bridge (`shell/open_files.rs`) routing Finder opens through `open_path`; argv already covered Windows/Linux/CLI. Final macOS hardware smoke (M-15) is non-blocking. |
 
 ### v1.0 — the 95% bar (home users fully happy)
 
@@ -449,6 +453,8 @@ Ordered roughly by how fast a new user hits the gap.
 | **Gridlines toggle** (per-sheet, persisted) | **NEW** (checked: gridlines unconditional in `grid/mod.rs`; engine models `set_show_grid_lines` + round-trips) | Small; engine-ready. |
 | **Entry shortcuts bundle** (F4 abs/rel reference cycling, Ctrl+Enter fill-selection, ⌘;/⌘⇧; date/time stamps) | **NEW** | Small individually; batch them like feature-gaps-7-11. |
 | **Show formulas toggle** (⌘`) | **NEW** | Cheap view mode; pairs with formula-UX work. |
+| **In-editor rich text formatting** — ref-token coloring, backgrounds, Excel/Numbers/Sheets-like styling — via a **FreeCell-owned styled text-input control** | **NEW** (split from `formula-point-mode`, 2026-07-18) | gpui-component's `InputState` is closed to external per-range styling (no public styling API, private layout, `code_editor` takes only a built-in language name) and we won't add a second maintained fork; needs our own text-input control over gpui primitives (re-homes autocomplete/cap-error/quick-edit/two-editor-sync; pixel-suite scope). The v0.5 `formula-point-mode` project already computes the token→color map this consumes. [`projects/styled-text-input-control.md`](projects/styled-text-input-control.md) |
+| **Cross-sheet point-mode insertion** — click another sheet's tab mid-formula, then a cell on that sheet, to insert a qualified `Sheet2!A1` reference | **NEW** (deferred from `formula-point-mode` v0.5, `specs/projects/formula-point-mode/functional_spec.md §6`) | v0.5 point-mode is **same-sheet only**: it inserts no sheet qualifier, and clicking a different sheet's tab mid-formula follows ordinary tab-switch behavior (no cross-sheet insert). **Asymmetry:** the shared token→color map still assigns a color to already-typed cross-sheet refs (`Sheet2!A1`) — consumed by the future in-editor styled text-input control — but v0.5 draws **no cross-sheet grid highlight** (the other sheet isn't on screen) and inserts **no** cross-sheet reference; only same-sheet insertion + same-sheet highlights ship. Needs mid-formula sheet-switch routing that keeps the edit open plus a qualified-ref insert path. |
 | **Cross-app file-fidelity defaults** (persist `sheetFormatPr` defaults + workbook font; Excel-like default column width on foreign files; Inter fallback for missing explicit fonts) | Above ("Engine defaults — cross-app fidelity") | Three known rows; fork + FreeCell halves already sketched. |
 | **Action-bar overflow** (small windows) + **TSV-paste empty-token clearing** | Above (accepted deviations) | Both small; fold into a polish batch. |
 | **Incremental / interruptible recalc** | **NEW as a logged gap** (plan-of-record caveat: every edit runs full-workbook `evaluate()`, ~2s at 1M cells, non-cancellable — round-2 synthesis "source of every caveat") | Orthogonal to feature coverage but core to the product promise ("stupid-fast on huge sheets") — a v1.0 quality bar. Engine-side (fork/upstream) dirty-graph or at least cancellable eval. |

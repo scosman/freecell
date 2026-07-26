@@ -122,6 +122,16 @@ pub struct RenderCase {
     /// calls `GridView::set_fill_drag_preview` so the captured frame shows the drag's target-region
     /// preview rectangle. `None` (the default) for every other case (no baseline change).
     pub fill_drag: Option<(CellRange, CellRange, FillAxis)>,
+    /// Same-sheet formula reference highlights `(target, palette slot)`
+    /// (`formula-point-mode/architecture.md §4.1`) — the harness threads them into
+    /// `GridView::set_edit_state` (the same payload `refresh_edit_grid_state` pushes), so the captured
+    /// frame shows the rich fill + border overlay. Empty (the default) for every non-formula case (no
+    /// baseline change).
+    pub ref_highlights: Vec<(CellRange, u8)>,
+    /// An armed point-drag preview `(origin, last_range)` (`formula-point-mode/functional_spec.md §2`)
+    /// — the harness calls `GridView::set_point_drag_preview` so the captured frame shows the dashed
+    /// preview marquee. `None` (the default) for every other case (no baseline change).
+    pub point_drag: Option<(CellRef, CellRange)>,
 }
 
 impl RenderCase {
@@ -141,12 +151,28 @@ impl RenderCase {
             selected_chart: None,
             auto_grow: false,
             fill_drag: None,
+            ref_highlights: Vec::new(),
+            point_drag: None,
         }
     }
 
     /// Arms a fill-drag preview `(seed, target, axis)` on this case (`gaps_closing_7_15 §3`).
     fn fill_drag(mut self, seed: CellRange, target: CellRange, axis: FillAxis) -> Self {
         self.fill_drag = Some((seed, target, axis));
+        self
+    }
+
+    /// Installs same-sheet formula reference highlights `(target, slot)` on this case
+    /// (`formula-point-mode/architecture.md §4.1`).
+    fn ref_highlights(mut self, highlights: Vec<(CellRange, u8)>) -> Self {
+        self.ref_highlights = highlights;
+        self
+    }
+
+    /// Arms a point-drag preview `(origin, last_range)` on this case
+    /// (`formula-point-mode/functional_spec.md §2`).
+    fn point_drag(mut self, origin: CellRef, last_range: CellRange) -> Self {
+        self.point_drag = Some((origin, last_range));
         self
     }
 
@@ -524,6 +550,19 @@ fn in_grid_unsupported_spec(title: &str) -> ChartSpec {
         Vec::new(),
         chart_anchor(),
     )
+}
+
+/// Fills the half-open cell block `[r0, r1) × [c0, c1)` with short `r{R}c{C}` labels, so a freeze
+/// baseline shows exactly which track each visible cell belongs to — the frozen band cells keep
+/// their low indices while the scrolled body shows high ones, making a mis-pinned band or a blank
+/// (unpublished) band immediately obvious. Used only by the `freeze_*` cases.
+fn labeled(mut scene: Scene, r0: u32, r1: u32, c0: u32, c1: u32) -> Scene {
+    for r in r0..r1 {
+        for c in c0..c1 {
+            scene = scene.input(r, c, &format!("r{r}c{c}"));
+        }
+    }
+    scene
 }
 
 /// The whole initial suite (~45 cases). Rebuilt fresh on each call — the `render_scene` bin
@@ -1009,6 +1048,79 @@ pub fn all() -> Vec<RenderCase> {
                 .hide_col(1, 1),
             GRID_VP,
         ),
+        // ---- Freeze panes (freeze-panes `architecture.md §7`) ---------------------------
+        // The seven pixel proofs of the four-quadrant render. Each labels its cells `r{R}c{C}` so
+        // the frozen band (low indices, pinned) reads distinctly against the scrolled body (high
+        // indices). Driven through the real `SetFrozen` worker path (`Scene::frozen_rows/cols`).
+        //
+        // Freeze the top row (M=1): row 0's `r0c*` labels stay pinned at the top with the freeze
+        // divider beneath them while the body is scrolled down (its first visible rows are deep,
+        // not row 1) — the canonical "freeze header row" picture (`functional_spec.md §1`).
+        RenderCase::new(
+            "freeze_top_row",
+            labeled(Scene::new(), 0, 24, 0, 8).frozen_rows(1),
+            GRID_VP,
+        )
+        .reveal(16, 0),
+        // Freeze a 3-row band (M=3): rows 0–2 pinned as a block above the divider while the body
+        // scrolls beneath — proves a multi-row band pins as a unit, not just a single row.
+        RenderCase::new(
+            "freeze_rows_band",
+            labeled(Scene::new(), 0, 28, 0, 8).frozen_rows(3),
+            GRID_VP,
+        )
+        .reveal(20, 0),
+        // Freeze the first column (K=1): column 0's `r*c0` labels stay pinned at the left with the
+        // vertical divider to their right while the body is scrolled rightward (its first visible
+        // columns are deep) — the column analogue of `freeze_top_row`.
+        RenderCase::new(
+            "freeze_first_col",
+            labeled(Scene::new(), 0, 16, 0, 16).frozen_cols(1),
+            GRID_VP,
+        )
+        .reveal(0, 10),
+        // Freeze a 3-column band (K=3): columns 0–2 pinned as a block left of the divider while the
+        // body scrolls rightward — the column analogue of `freeze_rows_band`.
+        RenderCase::new(
+            "freeze_cols_band",
+            labeled(Scene::new(), 0, 16, 0, 18).frozen_cols(3),
+            GRID_VP,
+        )
+        .reveal(0, 12),
+        // Four-quadrant freeze (M=2, K=2): the corner block (rows 0–1 × cols 0–1) is pinned in
+        // both axes; the top band scrolls horizontally, the left band scrolls vertically, and the
+        // body scrolls both ways — with BOTH dividers meeting at the corner. The full split.
+        RenderCase::new(
+            "freeze_four_quadrant",
+            labeled(Scene::new(), 0, 28, 0, 18)
+                .frozen_rows(2)
+                .frozen_cols(2),
+            GRID_VP,
+        )
+        .reveal(18, 12),
+        // The band-publishing proof (Phase 4): with the body scrolled DEEP (row ~44, col ~13), the
+        // frozen top + left bands must still show their VALUES (`r0c*` / `r*c0`), not blank cells —
+        // the whole grid is labeled so a band cell rendered blank would be an unmistakable defect.
+        // Guards that the frozen bands are published/rendered regardless of body scroll depth.
+        RenderCase::new(
+            "freeze_scrolled_body",
+            labeled(Scene::new(), 0, 50, 0, 16)
+                .frozen_rows(2)
+                .frozen_cols(2),
+            GRID_VP,
+        )
+        .reveal(44, 13),
+        // The divider isolation case (M=1, K=1, body at the origin): with no scroll, the ONLY
+        // freeze-specific chrome is the two divider lines — horizontal beneath row 0, vertical
+        // right of column 0, meeting at the corner. Proves the divider draws whenever frozen, even
+        // unscrolled (the "divider present iff frozen" invariant, `components/viewport_split.md`).
+        RenderCase::new(
+            "freeze_divider",
+            labeled(Scene::new(), 0, 12, 0, 10)
+                .frozen_rows(1)
+                .frozen_cols(1),
+            GRID_VP,
+        ),
         // ---- In-grid charts (P8): the ChartLayer painted over cells at the anchor rect --------
         // A Faithful line chart floating over the data table (`charts/functional_spec.md §1`).
         RenderCase::new("grid_chart_line", chart_backing_scene(), CHART_GRID_VP)
@@ -1136,6 +1248,51 @@ pub fn all() -> Vec<RenderCase> {
             1,
             1,
             "wrap this text onto several visual lines while editing in place",
+        ),
+        // ---- Formula point-mode + range highlighting (formula-point-mode §4.1, §2) ------
+        // A same-sheet formula edit open over B2 with the mirror showing the raw formula, and the
+        // three reference highlights the chrome would push: A1 (single, slot 0), C3:E7 (range,
+        // slot 1), and B2 (a SELF-reference coinciding with the active cell, slot 2). Each is a
+        // rich translucent fill + colored border in its palette slot. Proves distinct slots, the
+        // single-vs-range shapes, and the z-order where a highlight coincides with the active cell
+        // — the self-ref highlight paints ABOVE the active-cell selection outline (overlay order:
+        // selection → highlights → in-cell/handle).
+        RenderCase::new(
+            "formula_ref_highlight_same_sheet",
+            Scene::new()
+                .input(0, 0, "A1")
+                .input(1, 1, "B2")
+                .input(2, 2, "C3")
+                .input(6, 4, "E7"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .mirror(1, 1, "=A1+SUM(C3:E7)+B2")
+        .ref_highlights(vec![
+            (CellRange::single(CellRef::new(0, 0)), 0),
+            (CellRange::new(CellRef::new(2, 2), CellRef::new(6, 4)), 1),
+            (CellRange::single(CellRef::new(1, 1)), 2),
+        ]),
+        // A formula edit open over B2 MID point-drag: all three coexisting overlays at once, each
+        // visually distinct — the solid-blue selection outline at B2, one orange reference highlight
+        // at A1 (slot 4, a hue far from both blues so the eyeball is unambiguous), and the dashed
+        // indigo point-preview marquee over the swept C3:E7 range. Proves the preview marquee is
+        // distinct from the selection rectangle and the colored highlights (POINT_PREVIEW_BORDER vs
+        // ACCENT vs palette).
+        RenderCase::new(
+            "formula_ref_point_preview",
+            Scene::new()
+                .input(0, 0, "A1")
+                .input(1, 1, "B2")
+                .input(2, 2, "C3"),
+            GRID_VP,
+        )
+        .selection(sel((1, 1), (1, 1)))
+        .mirror(1, 1, "=A1+C3:E7")
+        .ref_highlights(vec![(CellRange::single(CellRef::new(0, 0)), 4)])
+        .point_drag(
+            CellRef::new(2, 2),
+            CellRange::new(CellRef::new(2, 2), CellRef::new(6, 4)),
         ),
         // ---- Fonts (Phase 5): family + size + row auto-grow -----------------------------
         cell(

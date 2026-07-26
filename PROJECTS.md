@@ -90,11 +90,11 @@ registry: each entry is a short description plus a pointer to a design note unde
   FreeCell ships no binaries yet, so the documented posture is acceptable for now.
   → [`projects/pre-distribution-security-audit.md`](projects/pre-distribution-security-audit.md)
 
-- **Windows Port** — *Future (packaging wired 2026-07-05; app build not a real target).*
-  Make FreeCell compile + run on Windows (GPUI DirectX backend, `cfg(windows)` dep split,
-  Windows arms for the macOS/Linux-gated code paths), then promote the already-wired NSIS
-  installer + Windows CI job from experimental (`continue-on-error`) to supported. The
-  `cargo-packager` work added the packaging half; the app half is untouched.
+- **Windows Port** — *Largely done (2026-07-24): Windows compiles, packages, and gates CI;
+  `.xlsx`/`.csv` file associations wired.* The build compiles + runs, `scripts/package.ps1`
+  produces the NSIS installer, and the Windows `release` CI job is now **required**
+  (`continue-on-error` removed); optional Authenticode signing is wired. Residual: a Windows
+  hardware smoke.
   → [`projects/windows-port.md`](projects/windows-port.md)
 
 - **Release Signing & Distribution** — *Future, required before publishing any binary.*
@@ -150,6 +150,15 @@ registry: each entry is a short description plus a pointer to a design note unde
   engine-render guard test (`freecell-engine` `every_num_fmt_preset_code_renders_without_parse_error`)
   now covers the whole inventory so a re-add can't regress. → [`projects/fraction-number-format.md`](projects/fraction-number-format.md)
 
+- **Shared Remote Compile Cache (sccache + Cloudflare R2)** — *Implemented (2026-07-24),
+  dev containers only.* Fresh dev containers no longer recompile the pinned dep tree
+  (gpui/zed, gpui-component, ironcalc fork) from scratch: sccache (`RUSTC_WRAPPER`)
+  backed by the shared `freecell-dev` R2 bucket serves rustc outputs across sessions,
+  auto-activated per session by a `SessionStart` hook and degrading gracefully to
+  uncached builds when the R2 secrets are absent. **CI is deliberately untouched**
+  (keeps Swatinem/rust-cache). Design, limits, and R2 token rotation:
+  → [`projects/build-cache.md`](projects/build-cache.md)
+
 - **Adopt gpui-component menus app-wide (native flyout submenus)** — *Future (deferred from
   `gaps_closing_7_12` Phase 10.4, 2026-07-13).* The whole chrome uses **seven** hand-rolled
   `div().absolute()…occlude()` popover cards over a `backdrop()` (fill, text-color, borders,
@@ -161,3 +170,11 @@ registry: each entry is a short description plus a pointer to a design note unde
   doing it for one popover would make it the app's only gpui-component menu, diverging from its
   six siblings. So the flyout is only worth it as an app-wide unification (Phase 10 shipped a
   drill-in instead). → [`projects/gpui-component-menus.md`](projects/gpui-component-menus.md)
+
+- **Unary-minus boolean/text coercion (SUMPRODUCT `--` count idiom)** — *Future (deferred from
+  `scalar-functions-batch`, 2026-07-22).* The engine's unary-minus operator doesn't coerce a
+  boolean/text operand to a number before negating, so `=--TRUE` yields `TRUE` instead of `1` and
+  the classic `SUMPRODUCT(--(cond))` boolean-counting idiom returns `0`. SUMPRODUCT itself is
+  correct; the bug is operator-level, with a broad blast radius across every formula that negates a
+  non-number — out of the scalar-functions batch's function-local scope. Workarounds
+  `SUMPRODUCT(1*(cond))` and `SUMPRODUCT((A=x)*(B))` both work today. → [`projects/unary-minus-boolean-coercion.md`](projects/unary-minus-boolean-coercion.md)

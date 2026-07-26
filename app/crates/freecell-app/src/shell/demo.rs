@@ -154,4 +154,67 @@ mod tests {
             );
         }
     }
+
+    /// The demo workbook's fonts are exclusively our bundled **Inter**. None of the non-bundled
+    /// families this change removed — **Arial**, **Calibri** (the workbook's former default cell
+    /// font + theme minor), or **Cambria** (former theme major / headers) — may survive anywhere,
+    /// since the app bundles only Inter and would fall back to a mismatched system face for any of
+    /// them on a host that lacks them. Unzips the embedded asset and asserts two properties: no
+    /// forbidden family name appears in any part; and every part this change rewrote — the
+    /// cell-style table (`xl/styles.xml`), the theme (`xl/theme/theme1.xml`), and each chart
+    /// (`xl/charts/chart*.xml`) — positively names Inter. Guards a future asset re-export (e.g.
+    /// from Excel) from silently reintroducing a non-bundled font dependency.
+    #[test]
+    fn demo_fonts_are_inter_only() {
+        use std::collections::BTreeMap;
+        use std::io::{Cursor, Read};
+
+        // Families FreeCell does not bundle: any surviving reference would fall back to a system
+        // face on a host that lacks it (the exact problem this change removes).
+        const FORBIDDEN_FAMILIES: [&str; 3] = ["Arial", "Calibri", "Cambria"];
+
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(DEMO_XLSX)).expect("the demo asset is a valid .xlsx");
+
+        // Every part this change rewrote to Inter, each of which must positively name Inter after
+        // the swap. Seeded false, flipped true on the entry that carries an Inter reference.
+        let mut inter_named: BTreeMap<String, bool> = archive
+            .file_names()
+            .filter(|n| {
+                *n == "xl/styles.xml"
+                    || *n == "xl/theme/theme1.xml"
+                    || (n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
+            })
+            .map(|n| (n.to_string(), false))
+            .collect();
+        assert!(
+            !inter_named.is_empty(),
+            "expected the styles/theme/chart parts to exist in the demo asset"
+        );
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).expect("demo zip entry reads");
+            let name = entry.name().to_string();
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .expect("demo entry decompresses");
+            let text = String::from_utf8_lossy(&bytes);
+            for family in FORBIDDEN_FAMILIES {
+                assert!(
+                    !text.contains(family),
+                    "{name} still references {family}; the demo must use only bundled Inter"
+                );
+            }
+            if let Some(seen) = inter_named.get_mut(&name) {
+                // Zip entry names are unique, so this runs once per rewritten part; `|=` states the
+                // "any Inter occurrence proves the part names Inter" intent (never clobbered false).
+                *seen |= text.contains("Inter");
+            }
+        }
+
+        for (name, names_inter) in &inter_named {
+            assert!(names_inter, "{name} should name Inter as its font family");
+        }
+    }
 }

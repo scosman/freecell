@@ -501,4 +501,17 @@ Ordered roughly by how fast a new user hits the gap.
   must keep macro parts intact so FreeCell never corrupts a macro workbook.
 - **Accessibility (screen readers)** — gated on gpui capabilities at the pinned rev;
   probe alongside any gpui bump.
+- **Render-test subsetting is broken for grid cases** (dev tooling, surfaced 2026-07-26
+  during `merged-cell-ui`) — `render_tests.sh test <prefix>` does **not** subset: the grid
+  suite's `check_case` reads a single `OnceLock` populated by `render_all(bin, &out, None)`
+  (`app/render-tests/tests/render_suite.rs`), so *any* case name renders the whole ~170-case
+  inventory. Only the `chart_` suite has its own `OnceLock`. Consequence: the "subset while
+  iterating" workflow in `CLAUDE.md` silently costs a full-suite run, blows the agent Bash
+  timeout under lavapipe, and has repeatedly parked agents mid-phase. **Workaround:**
+  `render_tests.sh generate --only <prefix>` *does* subset correctly (it reports
+  new/changed/unchanged and leaves baselines byte-identical when nothing moved) — that is
+  the reliable way to check a subset locally today. **Fix:** `render_all`/`render_charts`
+  already take an `only: Option<&str>`, so thread a `RENDER_ONLY`-style filter through
+  `check_case` (keying the `OnceLock` per filter); then correct the `CLAUDE.md`
+  render-tests section, which currently documents the non-working path.
 

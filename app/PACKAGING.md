@@ -218,9 +218,12 @@ minutes each, occasionally much longer.
      the tell — point `FREECELL_ENTITLEMENTS` at a plist.
 3. **Notarizes and staples both the `.app` and the `.dmg`.** Stapling the app as well as the
    disk image is what Apple's documentation describes: the app then carries its own ticket,
-   so it launches even offline after being dragged out of the `.dmg`. The app is submitted as
-   a `ditto -c -k --keepParent` archive — `zip` mangles symlinks and extended attributes in a
-   bundle and the notary service rejects the result.
+   so it launches even offline after being dragged out of the `.dmg`. Note that what you
+   *submit* and what you *staple* are different files for the app: the notary service takes
+   an archive, made with `ditto -c -k --keepParent` (`zip` mangles symlinks and extended
+   attributes in a bundle and the submission is rejected), but the ticket goes on the bundle
+   — `stapler` refuses an archive outright with *"Stapler is incapable of working with ZIP
+   archive files."* The `.dmg`, by contrast, is submitted and stapled directly.
 4. **Verifies, by asserting on `codesign -d` output** — see below for why `--verify` alone
    is not enough — then `stapler validate` on both artifacts and `spctl --assess`, which
    must report `accepted … source=Notarized Developer ID`. Anything else fails the run.

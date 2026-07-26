@@ -313,13 +313,16 @@ codesign --verify --deep --strict --verbose=2 "$app_path"
 assert_developer_id_signed "$app_path" app
 
 # =================================================================================
-# Notarization helper.
+# Notarization helper — SUBMIT ONLY. Stapling is the caller's job, because what you submit
+# and what you staple are not always the same file: an .app is submitted as a .zip but the
+# ticket is stapled to the BUNDLE (`stapler` refuses a zip outright — "Stapler is incapable
+# of working with ZIP archive files"), while a .dmg is both submitted and stapled directly.
 #
 # `notarytool submit --wait` returns a terse status; when it is "Invalid" the summary tells
 # you nothing useful, so we always pull the full log for the submission — the real reason is
 # almost always a missing hardened-runtime flag or an unsigned nested binary.
 # =================================================================================
-notarize() {
+notarize_submit() {
     local target="$1"
 
     echo "    submitting $(basename "$target") to the Apple notary service (this can take several minutes)…"
@@ -343,8 +346,7 @@ notarize() {
         die "notarization failed for $(basename "$target") (status: ${status:-unknown})."
     fi
 
-    echo "    accepted (submission $submission_id); stapling…"
-    xcrun stapler staple "$target"
+    echo "    accepted (submission $submission_id)"
 }
 
 # =================================================================================
@@ -353,16 +355,21 @@ notarize() {
 #    Stapling the app as well as the dmg is what Apple's docs describe: the app then carries
 #    its own ticket, so it launches even offline after being dragged out of the disk image.
 #
-#    The archive MUST be made with `ditto -c -k --keepParent`. `zip` mangles symlinks and
-#    extended attributes inside a bundle and the notary service rejects the result.
+#    The notary service takes an ARCHIVE, not a bundle, and that archive MUST be made with
+#    `ditto -c -k --keepParent`: `zip` mangles the symlinks and extended attributes inside a
+#    bundle and the submission is rejected.
+#
+#    But the TICKET goes on the bundle, not on the archive — `stapler` rejects a zip
+#    outright ("Stapler is incapable of working with ZIP archive files"). So: submit the
+#    zip, staple the .app, throw the zip away.
 # =================================================================================
 step "Notarizing the .app"
 
 zip_path="$out_dir/FreeCell-notarize.zip"
 rm -f "$zip_path"
-ditto -c -k --keepParent "$app_path" "$zip_path"
-notarize "$zip_path"
-# The ticket is stapled to the bundle, not the zip we submitted.
+/usr/bin/ditto -c -k --keepParent "$app_path" "$zip_path"
+notarize_submit "$zip_path"
+echo "    stapling the ticket to the bundle…"
 xcrun stapler staple "$app_path"
 rm -f "$zip_path"
 
@@ -396,10 +403,13 @@ codesign --verify --strict --verbose=2 "$dmg_path" \
 assert_developer_id_signed "$dmg_path" dmg
 
 # =================================================================================
-# 7. Notarize + staple the .dmg.
+# 7. Notarize + staple the .dmg. Unlike the .app, a disk image is submitted and stapled
+#    directly — no archive step.
 # =================================================================================
 step "Notarizing the .dmg"
-notarize "$dmg_path"
+notarize_submit "$dmg_path"
+echo "    stapling the ticket to the .dmg…"
+xcrun stapler staple "$dmg_path"
 
 # =================================================================================
 # 8. Verify for real.

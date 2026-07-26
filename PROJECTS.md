@@ -105,17 +105,6 @@ registry: each entry is a short description plus a pointer to a design note unde
   Windows Authenticode, Linux checksums, and the switch to attaching assets to a GitHub
   Release. Hard-gated on the pre-distribution security audit above.
   → [`projects/release-signing-and-distribution.md`](projects/release-signing-and-distribution.md)
-
-- **macOS Universal Binary (Intel + Apple Silicon)** — *Future; a distribution decision,
-  spotted 2026-07-26.* The macOS `release` job runs on `macos-14` (Apple Silicon) and plain
-  `cargo build --release`, so the published `.dmg` is **arm64-only and cannot launch on an
-  Intel Mac at all** (Rosetta does not translate in that direction). Confirmed by the first
-  notarization log, which reports a single `arm64` slice. Nothing chose this — it is just
-  what the runner produced, and it contrasts with Linux, which deliberately builds both
-  arches natively. Either lipo a universal binary before packaging, or record an explicit
-  Apple-Silicon-only decision. Signing/notarization need no changes either way.
-  → [`projects/macos-universal-binary.md`](projects/macos-universal-binary.md)
-
 - **Rewrite chart `c:f` on sheet rename** — *Future (deferred from charts P10, 2026-07-10).*
   Chart save is source-first (charts/architecture §5): it byte-preserves / targeted-patches the
   retained chart XML, keeping each data reference's `c:f` **verbatim**. So after an in-session

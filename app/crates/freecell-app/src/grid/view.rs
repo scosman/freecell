@@ -33,9 +33,10 @@ use freecell_core::publication::{CellKind, Publication};
 use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
-    apply_motion, blocks_col_op, blocks_row_op, effective_edge, is_full_column_selection,
-    is_full_row_selection, spans_all_cols, spans_all_rows, Align, Axis, BorderSpec, CellRange,
-    CellRef, Edge, FillAxis, LinePattern, RenderStyle, SelectionModel, SheetDims, VAlign,
+    apply_motion, effective_edge, effective_range, expand_to_regions, is_full_column_selection,
+    is_full_row_selection, region_at, regions_intersecting, snap_cell, spans_all_cols,
+    spans_all_rows, Align, Axis, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern,
+    RenderStyle, SelectionModel, SheetDims, VAlign,
 };
 
 use crate::chrome::AutocompleteDisplay;
@@ -120,9 +121,10 @@ struct DragState {
     mode: DragMode,
 }
 
-/// The open insert/delete header context menu (`functional_spec.md §5.3`). Grid-owned (it holds
-/// the cache's merge list for the guard + renders overlays already). `x`/`y` are grid-local; the
-/// `*_blocked` flags disable the corresponding item when the op would displace a file-loaded merge.
+/// The open insert/delete + hide/unhide header context menu (`functional_spec.md §5.3`).
+/// Grid-owned (it renders overlays already). `x`/`y` are grid-local. Insert/delete items are always
+/// enabled — the engine displaces merges across structural edits, so the interim merge-block flags
+/// are retired (merged-cell-ui `architecture.md §5`).
 #[derive(Debug, Clone, Copy)]
 struct HeaderMenu {
     axis: RowOrCol,
@@ -130,9 +132,6 @@ struct HeaderMenu {
     run: (u32, u32),
     x: f32,
     y: f32,
-    insert_before_blocked: bool,
-    insert_after_blocked: bool,
-    delete_blocked: bool,
     /// Hide is disabled when hiding the run would leave **zero** visible tracks on the axis
     /// (reachable only via Select-All → Hide, since the axis is Excel-max; `gaps_closing_7_15 §4`).
     hide_blocked: bool,
@@ -157,21 +156,15 @@ struct HeaderMenu {
 /// rows/cols set the insert/delete span and it is itself the Clear-contents target. `paste_enabled`
 /// gates both Paste and Paste-values (the grid can't distinguish an internal vs foreign clipboard —
 /// that state lives in the window's `ClipboardCoordinator` — and Paste-values falls back to a TSV
-/// paste for a foreign clipboard anyway, `functional_spec.md §5`, so they share one gate). The
-/// `*_blocked` flags disable an insert/delete item when the op would displace a file-loaded merge,
-/// reusing the header menu's merge guard for each axis.
+/// paste for a foreign clipboard anyway, `functional_spec.md §5`, so they share one gate).
+/// (Insert/delete items are always enabled — the interim merge-block flags are retired,
+/// merged-cell-ui `architecture.md §5`.)
 #[derive(Debug, Clone, Copy)]
 struct CellMenu {
     x: f32,
     y: f32,
     range: CellRange,
     paste_enabled: bool,
-    insert_row_above_blocked: bool,
-    insert_row_below_blocked: bool,
-    delete_rows_blocked: bool,
-    insert_col_left_blocked: bool,
-    insert_col_right_blocked: bool,
-    delete_cols_blocked: bool,
 }
 
 /// A live row/column resize (`components/grid_structure.md §5.1`). `start_px` is the dragged
@@ -330,6 +323,11 @@ pub struct GridView {
     /// `RenderStyle::border` index resolves to a [`BorderSpec`] after the cache lock is released
     /// (`components/style_render.md §Border painting`). Index `0` = [`BorderSpec::NONE`].
     visible_border_specs: Vec<BorderSpec>,
+    /// Reused per-frame snapshot of the merged regions touching the viewport (`architecture.md §6`,
+    /// merged-cell-ui `functional_spec.md F1`) — `regions_intersecting(cache.merges(),
+    /// visible_range)`. Keyed on the visible range (not the anchors) so a region whose anchor
+    /// scrolled off-screen is still present; the region-box pass draws each entry as one span.
+    visible_merges: Vec<CellRange>,
     /// The grid element's real laid-out bounds, captured during paint (a `canvas` probe).
     /// `None` until the first paint. Used instead of `window.viewport_size()` so the grid's
     /// virtualization + hit-testing are correct once chrome wraps it (the grid is no longer
@@ -727,6 +725,19 @@ struct SpillPlan {
     font_family: Option<SharedString>,
 }
 
+/// A cell's fully-resolved paint inputs for [`cell_element`] — the merged-region box's content is
+/// the anchor's, resolved by the same rules the per-cell loop uses (mirror → publication →
+/// default), so a box paints exactly like the anchor would in a 1×1 cell.
+struct CellPaint {
+    text: String,
+    text_color: Rgba,
+    kind: CellKind,
+    /// The cell's own resolved style (`None` for a mirror/pending or unstyled cell).
+    style: Option<RenderStyle>,
+    font_family: Option<SharedString>,
+    fill: Rgba,
+}
+
 impl GridView {
     /// Builds the grid over `sources`, delivering [`GridEvent`]s to `events`. The active
     /// sheet defaults to the publication's sheet, at origin scroll with an A1 selection.
@@ -760,6 +771,7 @@ impl GridView {
             visible_styles: HashMap::new(),
             visible_font_families: Vec::new(),
             visible_border_specs: Vec::new(),
+            visible_merges: Vec::new(),
             bounds: None,
             mirror: None,
             incell_open: None,
@@ -1001,10 +1013,77 @@ impl GridView {
         if self.mirror_text_for(CellRef::new(row, col)).is_some()
             || !publication.covers(row, col)
             || self.cell_index.contains_key(&(row, col))
+            // A merged region's cell (anchor or covered) is Blocked: a normal cell never spills its
+            // text into a region (the box paints over it), and a covered cell — being skipped in the
+            // cell loop — never originates spill (`architecture.md §6` text-spill).
+            || region_at(&self.visible_merges, CellRef::new(row, col)).is_some()
         {
             layout::Occupancy::Blocked
         } else {
             layout::Occupancy::Empty
+        }
+    }
+
+    /// Resolves a cell's [`cell_element`] paint inputs from the per-frame state — the mirror (raw
+    /// pending text) → the publication index (`cell_index`) → the default — mirroring the per-cell
+    /// loop's resolution. The merged-region box uses this for the anchor, so a box paints exactly as
+    /// the anchor would in a 1×1 cell (`architecture.md §6`).
+    fn resolve_cell_paint(&self, cell: CellRef, publication: &Publication) -> CellPaint {
+        let style = self.visible_styles.get(&(cell.row, cell.col)).copied();
+        let fill = style
+            .and_then(|s| s.fill)
+            .map(to_rgba)
+            .unwrap_or_else(|| rgb(CELL_BG));
+        let (text, text_color, kind, attr_style) = match self.mirror_text_for(cell) {
+            Some(raw) => (raw.to_string(), rgb(CELL_TEXT), CellKind::Text, None),
+            None => match self.cell_index.get(&(cell.row, cell.col)) {
+                Some(&idx) => {
+                    let pc = &publication.cells[idx];
+                    let color = pc
+                        .text_color
+                        .or(style.and_then(|s| s.font_color))
+                        .map(to_rgba)
+                        .unwrap_or_else(|| rgb(CELL_TEXT));
+                    (pc.display_text.clone(), color, pc.kind, style)
+                }
+                None => (String::new(), rgb(CELL_TEXT), CellKind::Text, style),
+            },
+        };
+        let font_family = attr_style.and_then(|s| {
+            let idx = s.font_family as usize;
+            self.visible_font_families
+                .get(idx)
+                .filter(|name| !name.is_empty())
+                .cloned()
+        });
+        CellPaint {
+            text,
+            text_color,
+            kind,
+            style: attr_style,
+            font_family,
+            fill,
+        }
+    }
+
+    /// The content-local px rect a cell paints/selects/edits into: the whole merged-region box
+    /// (`span_rect`) when `cell` resolves into a region, else the 1×1 [`cell_rect`]. Drives the
+    /// active-cell outline and the in-cell editor base rect so both span a region (`ui_design.md
+    /// §4–5`).
+    fn region_or_cell_rect(
+        &self,
+        cell: CellRef,
+        frame: &Frame,
+        quad: &Quadrant,
+    ) -> (f32, f32, f32, f32) {
+        match region_at(&self.visible_merges, cell) {
+            Some(region) => span_rect(
+                region.start.row..region.end.row + 1,
+                region.start.col..region.end.col + 1,
+                frame,
+                quad,
+            ),
+            None => cell_rect(cell.row, cell.col, frame, quad),
         }
     }
 
@@ -1080,6 +1159,12 @@ impl GridView {
     /// `SelectionChanged` (the chrome-grid sink mirrors it into the chrome itself, avoiding a
     /// double fold), then reveals it (which announces the possibly-widened viewport so an
     /// off-screen match is published). The caller keeps the find field focused.
+    ///
+    /// Assumes `cell` is already non-covered: the only caller is Find, which matches non-empty
+    /// cells and a covered cell is always empty, so it never lands on one (unlike the grid's own
+    /// input paths, this one does not snap). A future name-box "go to cell" wiring, which *can*
+    /// name a covered cell, must snap it (`snap_selection`) before calling here to keep the
+    /// covered-cell invariant (`architecture.md §7`).
     pub fn select_and_reveal(
         &mut self,
         cell: CellRef,
@@ -1297,6 +1382,32 @@ impl GridView {
         // Snapshot the border side table (cheap — `BorderSpec` is `Copy`), so a cell's `border`
         // index (and its neighbours') resolves to a spec after the lock is dropped.
         self.visible_border_specs = cache.border_specs().to_vec();
+        // Snapshot the merged regions touching the viewport (`architecture.md §6`, merged-cell-ui
+        // `functional_spec.md F1`). Keyed on the visible range so a region whose anchor scrolled
+        // above/left of the viewport is still drawn; the region-box pass paints each as one span.
+        // The range spans the quadrant UNION, not just the body: `rows`/`cols` are floored at `M`/`K`
+        // (the body range, §2), so a region confined to a frozen band would otherwise never match.
+        // Mirrors how `visible_styles` above iterates `(0..m).chain(rows)` — a frozen axis widens the
+        // bounding range back to 0. Over-inclusion is harmless (the extra regions clip away in
+        // `build_quadrant`); `M=K=0` is exactly the body range as before.
+        let visible_range = CellRange::new(
+            CellRef::new(
+                if m > 0 { 0 } else { rows.start },
+                if k > 0 { 0 } else { cols.start },
+            ),
+            CellRef::new(rows.end.saturating_sub(1), cols.end.saturating_sub(1)),
+        );
+        self.visible_merges = regions_intersecting(cache.merges(), visible_range);
+        // Also snapshot each region anchor's resolved style, even when the anchor is off-screen, so
+        // the region-box pass can style a box whose anchor is scrolled out of the visible range.
+        for region in &self.visible_merges {
+            let anchor = region.start;
+            if let Some(style) = cache.render_style(anchor.row, anchor.col) {
+                self.visible_styles
+                    .entry((anchor.row, anchor.col))
+                    .or_insert(*style);
+            }
+        }
         drop(caches);
 
         // Build the ≤4 quadrant sub-frames (§1/§2). Each maps a cell to a quadrant-relative pixel
@@ -1497,6 +1608,34 @@ impl GridView {
         let cache = caches.get(self.active_sheet)?;
         let (row_axis, col_axis) = cache.axes();
         Some(SheetDims::new(row_axis.count(), col_axis.count()))
+    }
+
+    /// Runs `f` with the active sheet's merged regions (0-based) borrowed **under the cache read
+    /// guard** — the small merge slice the merge-aware selection/edit logic runs against
+    /// (`architecture.md §7`). Borrowing (rather than cloning to a `Vec`) keeps the per-keystroke /
+    /// per-mouse-move input path allocation-free; `f` returns an owned result so the guard drops
+    /// before any `&mut self` follow-up. Unlike [`Self::visible_merges`] (viewport-scoped, for
+    /// rendering) this is the whole sheet's list, so a motion touching a region scrolled off-screen
+    /// still snaps correctly. The slice is empty when the sheet has no cache yet or no merges — then
+    /// every `merge`/`selection` helper is the identity.
+    fn with_sheet_merges<R>(&self, f: impl FnOnce(&[CellRange]) -> R) -> R {
+        let caches = self.sources.caches.read();
+        let merges = caches
+            .get(self.active_sheet)
+            .map(|cache| cache.merges())
+            .unwrap_or(&[]);
+        f(merges)
+    }
+
+    /// Snaps both corners of `sel` to whole regions (a covered cell → its region anchor), enforcing
+    /// the no-covered-cell invariant (`architecture.md §7`) for a selection built **outside** the
+    /// grid's own input handlers — the async ⌘+arrow edge reply (`WorkerEvent::EdgeResolved`) the
+    /// window applies. Idempotent and an identity on a merge-free sheet.
+    pub fn snap_selection(&self, sel: SelectionModel) -> SelectionModel {
+        self.with_sheet_merges(|merges| SelectionModel {
+            anchor: snap_cell(merges, sel.anchor),
+            active: snap_cell(merges, sel.active),
+        })
     }
 
     /// The number of rows in the current viewport — the Page Up/Down step
@@ -1795,7 +1934,9 @@ impl GridView {
             cx.notify();
             return;
         }
-        let cell = CellRef::new(row, col);
+        // Snap the clicked cell to its region anchor: a click on any cell of a merge selects the
+        // whole region (`functional_spec.md F4`), and the anchor is the valid edit target.
+        let cell = self.with_sheet_merges(|m| snap_cell(m, CellRef::new(row, col)));
         let selection = if event.modifiers.shift {
             // Shift-click extends the range from the existing anchor.
             SelectionModel {
@@ -2414,9 +2555,9 @@ impl GridView {
         let (scroll_x, scroll_y) = self.scroll_of(active);
         let (viewport_w, viewport_h) = self.viewport_wh(window);
         let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
-        // Hit-test the ChartLayer + headers + read the merge list + hidden sets + frozen counts
-        // under one lock.
-        let (hit, chart_hit, merges, hidden_rows, hidden_cols, dims, frozen_rows, frozen_cols) = {
+        // Hit-test the ChartLayer + headers + read the hidden sets + dims + frozen counts under one
+        // lock.
+        let (hit, chart_hit, hidden_rows, hidden_cols, dims, frozen_rows, frozen_cols) = {
             let caches = self.sources.caches.read();
             let Some(cache) = caches.get(active) else {
                 return;
@@ -2446,7 +2587,6 @@ impl GridView {
             (
                 hit,
                 chart_hit,
-                cache.merges().to_vec(),
                 cache.hidden_rows().clone(),
                 cache.hidden_cols().clone(),
                 cache.dims(),
@@ -2482,14 +2622,7 @@ impl GridView {
             GridHit::Cell { row, col } => {
                 // A right-click on the cell body opens the cell-area context menu
                 // (`functional_spec.md §2`), adjusting the selection first (move-if-outside).
-                self.open_cell_menu(
-                    CellRef::new(row, col),
-                    local_x,
-                    local_y,
-                    &merges,
-                    window,
-                    cx,
-                );
+                self.open_cell_menu(CellRef::new(row, col), local_x, local_y, window, cx);
                 return;
             }
             GridHit::Corner => {
@@ -2525,7 +2658,6 @@ impl GridView {
             }
         }
         let run = self.resize_run_for(axis, index);
-        let (before, after, delete) = merge_block_flags(axis, run, &merges);
         let (hidden_set, total) = match axis {
             RowOrCol::Row => (&hidden_rows, dims.0),
             RowOrCol::Col => (&hidden_cols, dims.1),
@@ -2541,9 +2673,6 @@ impl GridView {
             run,
             x: local_x,
             y: local_y,
-            insert_before_blocked: before,
-            insert_after_blocked: after,
-            delete_blocked: delete,
             hide_blocked,
             unhide_run,
             hidden_in_run,
@@ -2562,26 +2691,25 @@ impl GridView {
     /// Opens the cell-area right-click context menu over cell `(row, col)` at grid-local `(x, y)`
     /// (`functional_spec.md §2`). Excel selection semantics: a right-click **outside** the current
     /// selection first collapses it to the clicked cell; a click **inside** keeps the (possibly
-    /// multi-cell) selection so the menu's ops span it. The insert/delete items reuse the header
-    /// menu's per-axis merge guard over the selection's row/column span; `paste_enabled` reflects
-    /// whether the system clipboard currently holds text (gating both Paste and Paste-values).
+    /// multi-cell) selection so the menu's ops span it. Insert/delete items are always enabled (the
+    /// interim merge guard is retired — the engine displaces merges, merged-cell-ui `architecture.md
+    /// §5`); `paste_enabled` reflects whether the system clipboard currently holds text (gating both
+    /// Paste and Paste-values).
     fn open_cell_menu(
         &mut self,
         cell: CellRef,
         x: f32,
         y: f32,
-        merges: &[CellRange],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.selection().range().contains(cell) {
-            self.set_selection_and_emit(SelectionModel::single(cell), window, cx);
+            // A right-click outside the selection collapses onto the clicked cell — snapped, so a
+            // right-click on a merge selects the whole region (`functional_spec.md F4`).
+            let snapped = self.with_sheet_merges(|m| snap_cell(m, cell));
+            self.set_selection_and_emit(SelectionModel::single(snapped), window, cx);
         }
         let range = self.selection().range();
-        let (insert_row_above_blocked, insert_row_below_blocked, delete_rows_blocked) =
-            merge_block_flags(RowOrCol::Row, (range.start.row, range.end.row), merges);
-        let (insert_col_left_blocked, insert_col_right_blocked, delete_cols_blocked) =
-            merge_block_flags(RowOrCol::Col, (range.start.col, range.end.col), merges);
         let paste_enabled = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
@@ -2592,12 +2720,6 @@ impl GridView {
             y,
             range,
             paste_enabled,
-            insert_row_above_blocked,
-            insert_row_below_blocked,
-            delete_rows_blocked,
-            insert_col_left_blocked,
-            insert_col_right_blocked,
-            delete_cols_blocked,
         });
         cx.notify();
     }
@@ -2635,9 +2757,11 @@ impl GridView {
             let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
             pane.cell_at_point(local_x, local_y, &row_axis, &col_axis)
         };
+        // Snap the drag endpoint so a range that reaches into a merge grabs the whole region
+        // (`functional_spec.md F4`); `effective_range` then widens the visible box.
         let selection = SelectionModel {
             anchor,
-            active: cell,
+            active: self.with_sheet_merges(|m| snap_cell(m, cell)),
         };
         if *self.selection() != selection {
             self.set_selection_and_emit(selection, window, cx);
@@ -2986,9 +3110,10 @@ impl GridView {
             changed = true;
         }
         if let Some(drag) = self.drag {
+            // Snap the auto-scrolled drag endpoint to whole regions, matching `extend_drag_to_point`.
             let selection = SelectionModel {
                 anchor: drag.anchor,
-                active: cell,
+                active: self.with_sheet_merges(|m| snap_cell(m, cell)),
             };
             if *self.selection() != selection {
                 self.set_selection_and_emit(selection, window, cx);
@@ -3170,7 +3295,10 @@ impl GridView {
         match command {
             GridKeyCommand::Motion(motion) => self.move_active(motion, window, cx),
             GridKeyCommand::ClearCells => {
-                let range = self.selection().range();
+                // Clear over the effective range so a selection touching a merge clears the whole
+                // region — i.e. its anchor content (`architecture.md §7`, `functional_spec.md F5`).
+                let sel = *self.selection();
+                let range = self.with_sheet_merges(|m| effective_range(m, sel));
                 self.events.emit(&GridEvent::ClearCells(range), window, cx);
             }
             // Copy/cut/paste route to the window's `ClipboardCoordinator`. Reaching here means the
@@ -3254,7 +3382,7 @@ impl GridView {
             );
             return;
         }
-        let selection = apply_motion(sel, motion, dims);
+        let selection = self.with_sheet_merges(|m| apply_motion(sel, motion, dims, m));
         if *self.selection() != selection {
             self.set_selection_and_emit(selection, window, cx);
             self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
@@ -3276,21 +3404,17 @@ impl GridView {
         self.reveal_and_announce(selection.active.row, selection.active.col, window, cx);
     }
 
-    /// Build the frame-dependent element layers (cells + selection, headers, scrollbars) from a
-    /// resolved [`Frame`] — the shared hot path used by both [`Render::render`] and the Phase-12
-    /// perf harness's [`GridView::measure_frame`], so the measured build never drifts from the
-    /// real render. When `timing` is `Some`, records the publication-scan duration + content-cell
-    /// count (the perf harness's cell-load witness); `None` on the render path reads no clock.
     /// Builds one freeze-pane quadrant's content children (cells + borders + spill + selection +
     /// fill + optionally the editor/handle), in **quadrant-relative** coordinates, for placement in
     /// that quadrant's clipped `dest` div (`freeze-panes/components/viewport_split.md §2`). The loop
     /// runs over `quad.rows × quad.cols` using [`cell_rect`]/[`span_rect`] against `quad.qorigin_*`,
     /// so it is identical to the pre-freeze body loop when there is a single body quadrant
-    /// (`M=K=0`). `host_overlays` places the single-instance overlays (the active-cell border, the
-    /// grabbable fill handle, and the in-cell editor) in exactly one quadrant — the one containing
-    /// the active/edited cell. `collect_wrap` gates the auto-grow wrap-cell collection off the perf
-    /// path (mirrors the old `timing.is_none()` gate). Range/overlay/fill-preview highlights are
-    /// drawn (clipped) in **every** quadrant so a range straddling the divider joins across it.
+    /// (`M=K=0`). `host_overlays` places the single-instance widgets (the grabbable fill handle and
+    /// the in-cell editor) in exactly one quadrant — the one containing the active/edited cell.
+    /// `collect_wrap` gates the auto-grow wrap-cell collection off the perf path (mirrors the old
+    /// `timing.is_none()` gate). Range/overlay/fill-preview highlights **and the active-cell
+    /// outline** are drawn (clipped) in **every** quadrant, so a range — or a merged region — that
+    /// straddles the divider joins across it.
     #[allow(clippy::too_many_arguments)]
     fn build_quadrant(
         &mut self,
@@ -3311,6 +3435,17 @@ impl GridView {
 
         for r in quad.rows.clone() {
             for c in quad.cols.clone() {
+                // A merged region's cells (anchor + covered) are painted once by the region-box
+                // pass below, so skip them here: this drops the covered content AND the covered /
+                // anchor cells' own right/bottom gridline edges, which is what makes the interior
+                // gridlines vanish (`functional_spec.md F1`, `architecture.md §6`).
+                if self
+                    .visible_merges
+                    .iter()
+                    .any(|m| m.contains(CellRef::new(r, c)))
+                {
+                    continue;
+                }
                 let (x, y, w, h) = cell_rect(r, c, frame, quad);
                 let style = self.visible_styles.get(&(r, c)).copied();
                 let fill_color = style.and_then(|s| s.fill);
@@ -3320,10 +3455,16 @@ impl GridView {
                 // gridline it shares with a right / bottom neighbour that resolves to the SAME fill;
                 // unfilled cells keep every gridline, and the block's outer boundary (a different
                 // fill, an unfilled cell, or an off-viewport neighbour — which reads as absent here)
-                // still draws. Explicit cell borders are a separate later pass and are unaffected.
+                // still draws. A merged neighbour never counts as same-fill, so the region's outer
+                // gridline is never suppressed by an adjacent same-coloured cell. Explicit cell
+                // borders are a separate later pass and are unaffected.
                 let same_fill = |nr: u32, nc: u32| {
                     fill_color.is_some()
                         && self.visible_styles.get(&(nr, nc)).and_then(|s| s.fill) == fill_color
+                        && !self
+                            .visible_merges
+                            .iter()
+                            .any(|m| m.contains(CellRef::new(nr, nc)))
                 };
                 let skip_right_gridline = same_fill(r, c + 1);
                 let skip_bottom_gridline = same_fill(r + 1, c);
@@ -3458,6 +3599,71 @@ impl GridView {
             }
         }
 
+        // ---- Merged-region boxes (`functional_spec.md F1`, `architecture.md §6`): each region
+        // touching the viewport paints as ONE box across its whole span. The per-cell loop skipped
+        // every region cell (anchor included), so the interior gridlines are already gone; this
+        // pass paints the anchor's fill + content once across the box and draws the box's own outer
+        // gridlines (`cell_element`) plus the anchor's explicit border at the box outer perimeter.
+        // Keyed on `visible_merges`, so a region whose anchor scrolled off-screen still draws (its
+        // style + published value were snapshotted for the off-screen anchor in `resolve_frame` /
+        // the per-frame index).
+        //
+        // Deliberately NOT filtered per quadrant: every region in `visible_merges` (which spans the
+        // quadrant union — bands included) is emitted into each quadrant at quadrant-relative coords
+        // and the `dest` div's `overflow_hidden` clips it. A region straddling the freeze divider
+        // therefore paints its anchor text in BOTH quadrants, each clipped to its own slice, which is
+        // what makes the box read as continuous across the divider. `anchor` may consequently sit
+        // above/left of `quad`'s start — `no_left_owner`/`no_top_owner` guard that with `checked_sub`.
+        for region in &self.visible_merges {
+            let anchor = region.start;
+            let (x, y, w, h) = span_rect(
+                region.start.row..region.end.row + 1,
+                region.start.col..region.end.col + 1,
+                frame,
+                quad,
+            );
+            let paint = self.resolve_cell_paint(anchor, publication);
+            // The box draws its own outer right/bottom gridlines (no same-fill suppression — a merge
+            // always reads as one solid box, `ui_design.md §3`).
+            content_children.push(cell_element(
+                x,
+                y,
+                w,
+                h,
+                paint.fill,
+                paint.text,
+                paint.text_color,
+                paint.kind,
+                paint.style,
+                paint.font_family,
+                false,
+                false,
+            ));
+            // The anchor's explicit borders at the box outer edge (per-cell stored styles only, no
+            // unified-border synthesis — `architecture.md §6`). Interior covered edges were dropped
+            // by the border pass's region skip below; right/bottom always draw; left/top only when
+            // no neighbour to the left/above owns the shared edge (mirrors the per-cell border pass).
+            let spec = self.border_spec_at(anchor.row, anchor.col);
+            if !spec.is_none() {
+                if let Some(edge) = spec.right {
+                    push_vertical_edge(&mut content_children, x + w, y, h, edge);
+                }
+                if let Some(edge) = spec.bottom {
+                    push_horizontal_edge(&mut content_children, x, y + h, w, edge);
+                }
+                if self.no_left_owner(anchor.row, anchor.col, quad) {
+                    if let Some(edge) = spec.left {
+                        push_vertical_edge(&mut content_children, x, y, h, edge);
+                    }
+                }
+                if self.no_top_owner(anchor.row, anchor.col, quad) {
+                    if let Some(edge) = spec.top {
+                        push_horizontal_edge(&mut content_children, x, y, w, edge);
+                    }
+                }
+            }
+        }
+
         // ---- Border edges: painted after every cell fill so they cover the gridline + any
         // neighbouring cell's fill (Excel look, `components/style_render.md §Border painting`).
         // Each shared edge is drawn exactly ONCE: a bordered cell always draws its right + bottom
@@ -3466,6 +3672,15 @@ impl GridView {
         // Effective edge = the heavier of the cell's own edge and the neighbour's opposing one.
         for r in quad.rows.clone() {
             for c in quad.cols.clone() {
+                // Region cells' interior explicit-border edges are suppressed here — the anchor's
+                // outer border is drawn once at the box perimeter in the region-box pass above.
+                if self
+                    .visible_merges
+                    .iter()
+                    .any(|m| m.contains(CellRef::new(r, c)))
+                {
+                    continue;
+                }
                 let spec = self.border_spec_at(r, c);
                 if spec.is_none() {
                     continue;
@@ -3529,30 +3744,35 @@ impl GridView {
             ));
         }
 
-        // Selection: translucent overlay (range − active), range border, active border. The overlay
-        // rects + range border are intersected/clipped to THIS quadrant, so a range straddling the
-        // divider paints its slice in each quadrant and they visually join (§2).
+        // Selection: translucent overlay (range − active), range border, active outline. `painted`
+        // snaps the raw selection to whole regions (`functional_spec.md F4`, `ui_design.md §4`) so
+        // the fill, border, handle, and header highlight span merges with no partial-region
+        // slivers. A lone selection on a region draws only the spanned active outline (no range
+        // fill/border), so the gate is on the RAW selection being single, not `painted`. The overlay
+        // rects + range border are clipped to THIS quadrant, so a range straddling the divider
+        // paints its slice in each quadrant and they visually join (freeze-panes §2).
         let range = selection.range();
-        for (rows, cols) in layout::range_overlay_rects(range, selection.active) {
-            // Clip to the quadrant's visible ranges so the overlay divs stay viewport-sized.
-            let rows = rows.start.max(quad.rows.start)..rows.end.min(quad.rows.end);
-            let cols = cols.start.max(quad.cols.start)..cols.end.min(quad.cols.end);
-            if rows.start >= rows.end || cols.start >= cols.end {
-                continue;
-            }
-            let (x, y, w, h) = span_rect(rows, cols, frame, quad);
-            content_children.push(
-                rect_div(x, y, w, h)
-                    .bg(rgb(ACCENT).opacity(SELECTION_FILL_ALPHA))
-                    .into_any_element(),
-            );
-        }
+        let painted = expand_to_regions(&self.visible_merges, range);
         if !range.is_single() {
+            for (rows, cols) in layout::range_overlay_rects(painted, selection.active) {
+                // Clip to the quadrant's visible ranges so the overlay divs stay viewport-sized.
+                let rows = rows.start.max(quad.rows.start)..rows.end.min(quad.rows.end);
+                let cols = cols.start.max(quad.cols.start)..cols.end.min(quad.cols.end);
+                if rows.start >= rows.end || cols.start >= cols.end {
+                    continue;
+                }
+                let (x, y, w, h) = span_rect(rows, cols, frame, quad);
+                content_children.push(
+                    rect_div(x, y, w, h)
+                        .bg(rgb(ACCENT).opacity(SELECTION_FILL_ALPHA))
+                        .into_any_element(),
+                );
+            }
             // The whole-range 2px outline; drawn in each quadrant and clipped, so only the perimeter
             // falling in this quadrant shows (the slices join at the divider, no interior line).
             let (x, y, w, h) = span_rect(
-                range.start.row..range.end.row + 1,
-                range.start.col..range.end.col + 1,
+                painted.start.row..painted.end.row + 1,
+                painted.start.col..painted.end.col + 1,
                 frame,
                 quad,
             );
@@ -3563,9 +3783,15 @@ impl GridView {
                     .into_any_element(),
             );
         }
-        // The active-cell border is a single-cell outline → drawn once, in its host quadrant.
-        if host_overlays {
-            let (x, y, w, h) = cell_rect(selection.active.row, selection.active.col, frame, quad);
+        // The active-cell outline spans the whole region box when `active` resolves into one
+        // (`ui_design.md §4`); otherwise it is the 1×1 active cell. Drawn in EVERY quadrant and
+        // clipped — like the range outline above — because a merged region can straddle the freeze
+        // divider: host-scoping it would drop the body-side slice of a region anchored in a frozen
+        // band. For a 1×1 active cell (or a region wholly inside one quadrant) the off-host slices
+        // clip away to nothing, so this is identical to the host-only draw (freeze-panes §2). The
+        // fill handle + in-cell editor below stay host-scoped (single-instance widgets).
+        {
+            let (x, y, w, h) = self.region_or_cell_rect(selection.active, frame, quad);
             content_children.push(
                 rect_div(x, y, w, h)
                     .border_2()
@@ -3654,8 +3880,8 @@ impl GridView {
             && self.resize_drag.is_none()
             && self.chart_drag.is_none()
         {
-            let right_x = frame.col_offset(range.end.col + 1);
-            let bottom_y = frame.row_offset(range.end.row + 1);
+            let right_x = frame.col_offset(painted.end.col + 1);
+            let bottom_y = frame.row_offset(painted.end.row + 1);
             let (hx, hy, hw, hh) = fill_handle_square(
                 right_x,
                 bottom_y,
@@ -3686,6 +3912,12 @@ impl GridView {
         content_children
     }
 
+    /// Build the frame-dependent element layers (cells + selection, headers, scrollbars) from a
+    /// resolved [`Frame`] — the shared hot path used by both [`Render::render`] and the Phase-12
+    /// perf harness's [`GridView::measure_frame`], so the measured build never drifts from the
+    /// real render. When `timing` is `Some`, records the publication-scan duration + content-cell
+    /// count (the perf harness's cell-load witness); `None` on the render path reads no clock.
+    /// The content layer is delegated per freeze-pane quadrant to [`build_quadrant`](Self::build_quadrant).
     fn build_grid_layers(
         &mut self,
         frame: &Frame,
@@ -3713,7 +3945,13 @@ impl GridView {
             // a band cell's VALUE is present in `publication.cells` regardless of how deep the body
             // is scrolled — the union filter then indexes it for its band quadrant.
             for (i, cell) in publication.cells.iter().enumerate() {
-                if frame.in_visible_union(cell.row, cell.col) {
+                // A merged region's anchor may be scrolled off-screen while the box is still
+                // visible; index it too so the region-box pass can read its published value.
+                let is_visible_anchor = self
+                    .visible_merges
+                    .iter()
+                    .any(|m| m.start.row == cell.row && m.start.col == cell.col);
+                if frame.in_visible_union(cell.row, cell.col) || is_visible_anchor {
                     self.cell_index.insert((cell.row, cell.col), i);
                 }
             }
@@ -3860,9 +4098,10 @@ impl GridView {
         }
 
         // ---- Header layer (fixed, opaque, clipped to its strip) ---------------------
-        let range = selection.range();
-        let (sel_r0, sel_r1) = (range.start.row, range.end.row);
-        let (sel_c0, sel_c1) = (range.start.col, range.end.col);
+        // The header shading reflects the region-snapped selection (`ui_design.md §4`).
+        let painted = expand_to_regions(&self.visible_merges, selection.range());
+        let (sel_r0, sel_r1) = (painted.start.row, painted.end.row);
+        let (sel_c0, sel_c1) = (painted.start.col, painted.end.col);
 
         // Column-header strip. The SCROLLING column letters (body cols) scroll with the body — same
         // formula as before freeze (`col_offset(c) - scroll_x`, where `scroll_x` is `body_sx`). The
@@ -4365,8 +4604,8 @@ impl GridView {
     }
 
     /// The header insert/delete context menu overlay: a click-away backdrop + a small card of items
-    /// (`functional_spec.md §5.3`). Items whose op would displace a merge are disabled + a footnote
-    /// explains why. Built in `render` (needs `cx` for the item listeners).
+    /// (`functional_spec.md §5.3`). Insert/delete items are always enabled (the engine displaces
+    /// merges, merged-cell-ui `architecture.md §5`). Built in `render` (needs `cx` for the listeners).
     /// The header context-menu item list — `(label, enabled, event)` — for the axis + run in `menu`
     /// (`functional_spec.md §2`, `gaps_closing_7_15 §4`): Insert before / Insert after / Delete, then
     /// **Hide** / **Unhide**. Pure (no gpui) so the mapping is unit-testable, mirroring
@@ -4408,17 +4647,17 @@ impl GridView {
         let mut items = vec![
             (
                 format!("Insert {count} {unit}{p} {before_word}"),
-                !menu.insert_before_blocked,
+                true,
                 insert_ev(start, count),
             ),
             (
                 format!("Insert {count} {unit}{p} {after_word}"),
-                !menu.insert_after_blocked,
+                true,
                 insert_ev(after_at, count),
             ),
             (
                 format!("Delete {count} {unit}{p}"),
-                !menu.delete_blocked,
+                true,
                 delete_ev(start, count),
             ),
             {
@@ -4476,21 +4715,16 @@ impl GridView {
 
     fn header_menu_elements(&self, menu: HeaderMenu, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let items = Self::header_menu_items(&menu);
-        // The "merged cells" footnote is about the insert/delete merge guard only — Hide/Unhide are
-        // never merge-blocked, so gate the note on the merge-guard flags, not every disabled item.
-        let any_blocked =
-            menu.insert_before_blocked || menu.insert_after_blocked || menu.delete_blocked;
 
         let mut card = div()
             .debug_selector(|| "header-menu-card".into())
             .absolute()
             .left(px(menu.x))
             .top(px(menu.y))
-            // Occlude the card so a mouse-down anywhere on it — the p(4) padding ring or the
-            // "Sheet has merged cells…" footnote row, neither of which carries a listener — can't
-            // fall through to the deferred dismiss backdrop and close the menu without acting (same
-            // backdrop-on-down bug as the action-bar popovers, BUG A/B). The item rows already
-            // `stop_propagation`; this covers the dead zones around them.
+            // Occlude the card so a mouse-down anywhere on it — the p(4) padding ring, which carries
+            // no listener — can't fall through to the deferred dismiss backdrop and close the menu
+            // without acting (same backdrop-on-down bug as the action-bar popovers, BUG A/B). The
+            // item rows already `stop_propagation`; this covers the dead zones around them.
             .occlude()
             .flex()
             .flex_col()
@@ -4526,17 +4760,6 @@ impl GridView {
                     );
             }
             card = card.child(item);
-        }
-        if any_blocked {
-            card = card.child(
-                div()
-                    .px(px(10.0))
-                    .py(px(3.0))
-                    .text_size(px(11.0))
-                    .text_color(rgb(HEADER_TEXT))
-                    .max_w(px(220.0))
-                    .child("Sheet has merged cells — not yet supported here."),
-            );
         }
 
         // A transparent full-grid backdrop closes the menu on any click outside it (and swallows
@@ -4643,9 +4866,10 @@ impl GridView {
     /// entry is a separator (`functional_spec.md §2` / D2.1 ordering). Split out from
     /// [`cell_menu_elements`](Self::cell_menu_elements) so the label/enable/event mapping is unit-
     /// testable without painting. Cut/Copy/Clear are always enabled (a selection is always ≥1 cell);
-    /// Paste + Paste-values share `paste_enabled`; Insert/Delete are gated by the per-axis merge
-    /// guard and reuse the header menu's row/column commands scoped to the selection's span. Clear
-    /// Formatting is omitted (no style-clear op exists this batch).
+    /// Paste + Paste-values share `paste_enabled`; Insert/Delete are always enabled (the interim
+    /// merge guard is retired — the engine displaces merges, merged-cell-ui `architecture.md §5`) and
+    /// reuse the header menu's row/column commands scoped to the selection's span. Clear Formatting is
+    /// omitted (no style-clear op exists this batch).
     ///
     /// **Full-line suppression (data safety):** a full-**column** selection is stored literally as
     /// `rows 0..=MAX_ROWS-1`, so its row-structural items would read "Delete 1048576 rows" and wipe
@@ -4689,7 +4913,7 @@ impl GridView {
             items.extend([
                 Some((
                     format!("Insert {rows} row{rp} above"),
-                    !menu.insert_row_above_blocked,
+                    true,
                     GridEvent::InsertRows {
                         at: start.row,
                         count: rows,
@@ -4697,7 +4921,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Insert {rows} row{rp} below"),
-                    !menu.insert_row_below_blocked,
+                    true,
                     GridEvent::InsertRows {
                         at: row_after,
                         count: rows,
@@ -4705,7 +4929,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Delete {rows} row{rp}"),
-                    !menu.delete_rows_blocked,
+                    true,
                     GridEvent::DeleteRows {
                         at: start.row,
                         count: rows,
@@ -4717,7 +4941,7 @@ impl GridView {
             items.extend([
                 Some((
                     format!("Insert {cols} column{cp} left"),
-                    !menu.insert_col_left_blocked,
+                    true,
                     GridEvent::InsertColumns {
                         at: start.col,
                         count: cols,
@@ -4725,7 +4949,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Insert {cols} column{cp} right"),
-                    !menu.insert_col_right_blocked,
+                    true,
                     GridEvent::InsertColumns {
                         at: col_after,
                         count: cols,
@@ -4733,7 +4957,7 @@ impl GridView {
                 )),
                 Some((
                     format!("Delete {cols} column{cp}"),
-                    !menu.delete_cols_blocked,
+                    true,
                     GridEvent::DeleteColumns {
                         at: start.col,
                         count: cols,
@@ -4856,14 +5080,25 @@ impl GridView {
     /// the SAME predicate the paint loop uses to decide whether that neighbour draws its right edge —
     /// so ownership and draw can never disagree (a `border != 0` that resolved to `NONE` under some
     /// future partial snapshot would be skipped by BOTH, not dropped between them).
+    /// `col` may be LESS than `quad.cols.start` — the region-box pass passes a merge anchor that can
+    /// sit above/left of this quadrant (straddling the freeze divider, or scrolled past) — so the
+    /// neighbour index is taken with `checked_sub`: at col 0 there is no left neighbour and this cell
+    /// owns the edge. (A raw `col - 1` underflows and panics under the dev profile's overflow checks.)
     fn no_left_owner(&self, row: u32, col: u32, quad: &Quadrant) -> bool {
-        col == quad.cols.start || self.border_spec_at(row, col - 1).is_none()
+        col == quad.cols.start
+            || col
+                .checked_sub(1)
+                .is_none_or(|c| self.border_spec_at(row, c).is_none())
     }
 
     /// Whether no cell *above* `(row, col)` will draw the shared top edge as its own bottom edge
-    /// (the horizontal analogue of [`no_left_owner`](Self::no_left_owner); same shared predicate).
+    /// (the horizontal analogue of [`no_left_owner`](Self::no_left_owner); same shared predicate,
+    /// same `checked_sub` underflow guard for an anchor above this quadrant).
     fn no_top_owner(&self, row: u32, col: u32, quad: &Quadrant) -> bool {
-        row == quad.rows.start || self.border_spec_at(row - 1, col).is_none()
+        row == quad.rows.start
+            || row
+                .checked_sub(1)
+                .is_none_or(|r| self.border_spec_at(r, col).is_none())
     }
 
     /// Phase-12 perf hook (`freecell_core::perf`): apply a scripted scroll to the active sheet,
@@ -4954,26 +5189,6 @@ impl GridView {
 /// Maps a core `Rgb` onto a gpui colour.
 fn to_rgba(c: Rgb) -> Rgba {
     rgb(c.to_hex())
-}
-
-/// The `(insert_before, insert_after, delete)` merge-guard block flags for a header run
-/// (`components/grid_structure.md §5.3`). Insert-before / delete affect the run's start index;
-/// insert-after affects one past the run's end. `true` = the op would displace a merge → disabled.
-fn merge_block_flags(axis: RowOrCol, run: (u32, u32), merges: &[CellRange]) -> (bool, bool, bool) {
-    let (start, end) = run;
-    let after = end.saturating_add(1);
-    match axis {
-        RowOrCol::Row => (
-            blocks_row_op(merges, start),
-            blocks_row_op(merges, after),
-            blocks_row_op(merges, start),
-        ),
-        RowOrCol::Col => (
-            blocks_col_op(merges, start),
-            blocks_col_op(merges, after),
-            blocks_col_op(merges, start),
-        ),
-    }
 }
 
 /// The `(hide_blocked, unhide_run, hidden_in_run)` header-menu flags for a run over an axis of
@@ -5691,7 +5906,9 @@ impl GridView {
         window: &mut Window,
         cx: &App,
     ) -> Option<(f32, f32)> {
-        let (x, _y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame, quad);
+        // Seed the grow measurement from the region box when `cell` is a merged anchor, so the
+        // editor's base matches what `in_cell_overlay_elements` paints (`ui_design.md §5`).
+        let (x, _y, cell_w, cell_h) = self.region_or_cell_rect(cell, frame, quad);
         let style = self.visible_styles.get(&(cell.row, cell.col)).copied();
         let wrap = style.map(|s| s.wrap).unwrap_or(false);
         let content_w = quad.dest.2;
@@ -5763,7 +5980,8 @@ impl GridView {
         frame: &Frame,
         quad: &Quadrant,
     ) -> Vec<AnyElement> {
-        let (x, y, cell_w, cell_h) = cell_rect(cell.row, cell.col, frame, quad);
+        // The editor spans the whole region box when `cell` is a merged anchor (`ui_design.md §5`).
+        let (x, y, cell_w, cell_h) = self.region_or_cell_rect(cell, frame, quad);
         let wrap = self
             .visible_styles
             .get(&(cell.row, cell.col))
@@ -7855,29 +8073,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn merge_block_flags_match_predicate() {
-        use freecell_core::{CellRange, CellRef};
-        // A merge over columns 2..=4 (0-based): a column op at/before 4 blocks, past 4 allows.
-        let merges = [CellRange::new(CellRef::new(0, 2), CellRef::new(0, 4))];
-        // Run (0,1): insert-before at 0 → blocked (merge extends to 4 >= 0); insert-after at 2 →
-        // blocked; delete at 0 → blocked.
-        assert_eq!(
-            merge_block_flags(RowOrCol::Col, (0, 1), &merges),
-            (true, true, true)
-        );
-        // Run (5,6): insert-before at 5 (past the merge) → allowed; after at 7 → allowed.
-        assert_eq!(
-            merge_block_flags(RowOrCol::Col, (5, 6), &merges),
-            (false, false, false)
-        );
-        // No merges → nothing blocked.
-        assert_eq!(
-            merge_block_flags(RowOrCol::Row, (0, 0), &[]),
-            (false, false, false)
-        );
-    }
-
     #[gpui::test]
     fn header_clicks_and_select_all(cx: &mut TestAppContext) {
         let (g, window, _events) = grid_recording(cx);
@@ -8441,8 +8636,6 @@ mod tests {
                         .header_menu
                         .expect("a header right-click opens the menu");
                     assert_eq!(menu.axis, RowOrCol::Col);
-                    // The demo sheet has no merges → nothing blocked.
-                    assert!(!menu.insert_before_blocked && !menu.delete_blocked);
                     // Escape closes it.
                     grid.handle_key_down(&key_ev("escape", None, false), window, cx);
                     assert!(grid.header_menu.is_none());
@@ -8515,6 +8708,112 @@ mod tests {
                 }
             )),
             "the row Freeze item records a rows-only SetFrozen, got {recorded:?}"
+        );
+    }
+
+    // ---- Merge × freeze interaction (merged-cell-ui × freeze-panes) -----------------------
+
+    /// Frozen `M×K` sources carrying `merges`, optionally giving the cell at `bordered_anchor` a
+    /// top+left border (so the region-box pass exercises `no_top_owner`/`no_left_owner`).
+    fn frozen_merge_sources(
+        m: u32,
+        k: u32,
+        merges: &[CellRange],
+        bordered_anchor: Option<CellRef>,
+    ) -> GridDataSources {
+        use freecell_core::border::{BorderSpec, Edge};
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::color::Rgb;
+        use freecell_core::publication::Publication;
+        use freecell_core::style::RenderStyle;
+        let sheet = SheetId(0);
+        let mut builder = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        );
+        for range in merges {
+            builder.push_merge(*range);
+        }
+        if let Some(cell) = bordered_anchor {
+            let border = builder.intern_border_spec(BorderSpec {
+                top: Some(Edge::new(1, Rgb::new(0, 0, 0))),
+                left: Some(Edge::new(1, Rgb::new(0, 0, 0))),
+                ..BorderSpec::NONE
+            });
+            builder.push_cell_style(
+                cell.row,
+                cell.col,
+                RenderStyle {
+                    border,
+                    ..RenderStyle::default()
+                },
+            );
+        }
+        let cache = builder.frozen_rows(m).frozen_cols(k).build();
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, cache);
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            frozen_rows: m,
+            frozen_cols: k,
+            generation: 1,
+            cells: vec![],
+        };
+        GridDataSources {
+            publication: Arc::new(ArcSwap::from_pointee(publication)),
+            caches: Arc::new(RwLock::new(caches)),
+        }
+    }
+
+    #[gpui::test]
+    fn visible_merges_include_regions_inside_the_frozen_bands(cx: &mut TestAppContext) {
+        // REGRESSION: `resolve_frame` floors `rows`/`cols` at `M`/`K` (the BODY range), so keying
+        // `regions_intersecting` off that range could never match a region confined to a frozen band
+        // — "freeze the top row, merge a title across it" silently rendered as unmerged cells. The
+        // bounding range must span the quadrant union (the same widening `visible_styles` does).
+        let band = CellRange::new(CellRef::new(0, 0), CellRef::new(0, 2)); // A1:C1, inside M=2/K=2
+        let body = CellRange::new(CellRef::new(9, 5), CellRef::new(10, 6)); // F10:G11, in the body
+        let (g, window, _events) =
+            recording_over(cx, frozen_merge_sources(2, 2, &[band, body], None));
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, _cx| {
+                    let (vw, vh) = grid.viewport_wh(window);
+                    let _ = grid.resolve_frame(vw, vh).expect("frame resolves");
+                    assert!(
+                        grid.visible_merges.contains(&band),
+                        "a merge inside the frozen bands must be visible; got {:?}",
+                        grid.visible_merges
+                    );
+                    assert!(
+                        grid.visible_merges.contains(&body),
+                        "the body merge must still be visible; got {:?}",
+                        grid.visible_merges
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn frame_builds_for_bordered_merge_anchored_above_the_body(cx: &mut TestAppContext) {
+        // REGRESSION: the region-box pass passes the merge ANCHOR to `no_left_owner`/`no_top_owner`,
+        // and that anchor can sit above/left of the quadrant (a region straddling the freeze divider).
+        // With `anchor.row == 0` and `quad.rows.start >= 1` the old `row - 1` underflowed → the dev
+        // profile's overflow checks panicked inside the render loop. Building the frame must not panic.
+        let straddling = CellRange::new(CellRef::new(0, 0), CellRef::new(5, 0)); // A1:A6 across M=2
+        let (g, _window, _events) = recording_over(
+            cx,
+            frozen_merge_sources(2, 0, &[straddling], Some(CellRef::new(0, 0))),
+        );
+        let (sample, _) = g.update(cx, |grid, _cx| {
+            grid.measure_frame(0.0, 0.0, 1200.0, 800.0, None)
+        });
+        assert!(
+            sample.elements > 0,
+            "the frame build must produce elements (and must not panic on the straddling anchor)"
         );
     }
 
@@ -8824,20 +9123,14 @@ mod tests {
 
     // ---- Cell-area right-click context menu (`functional_spec.md §2`, Phase 5) -------------
 
-    /// A `CellMenu` over the B2:D4 (rows 1..=3, cols 1..=3) selection with nothing blocked, for the
-    /// pure item-mapping test.
+    /// A `CellMenu` over the B2:D4 (rows 1..=3, cols 1..=3) selection, for the pure item-mapping
+    /// test.
     fn cell_menu_b2_d4(paste_enabled: bool) -> CellMenu {
         CellMenu {
             x: 0.0,
             y: 0.0,
             range: CellRange::new(CellRef::new(1, 1), CellRef::new(3, 3)),
             paste_enabled,
-            insert_row_above_blocked: false,
-            insert_row_below_blocked: false,
-            delete_rows_blocked: false,
-            insert_col_left_blocked: false,
-            insert_col_right_blocked: false,
-            delete_cols_blocked: false,
         }
     }
 
@@ -8894,14 +9187,11 @@ mod tests {
     }
 
     #[test]
-    fn cell_menu_items_single_cell_labels_and_paste_and_block_flags() {
+    fn cell_menu_items_single_cell_labels_and_paste_and_always_enabled_structure() {
         // A single-cell A1 selection singularizes the row/column labels.
         let single = CellMenu {
             range: CellRange::single(CellRef::new(0, 0)),
             paste_enabled: true,
-            // Block delete-rows + insert-column-left to prove the guard disables the right items.
-            delete_rows_blocked: true,
-            insert_col_left_blocked: true,
             ..cell_menu_b2_d4(true)
         };
         let items = GridView::cell_menu_items(&single);
@@ -8910,16 +9200,17 @@ mod tests {
         assert!(matches!(&items[3], Some((_, true, GridEvent::PasteValues))));
         assert!(matches!(
             &items[6],
-            Some((l, _, GridEvent::InsertRows { at: 0, count: 1 })) if l == "Insert 1 row above"
+            Some((l, true, GridEvent::InsertRows { at: 0, count: 1 })) if l == "Insert 1 row above"
         ));
-        // Blocked ops render disabled (enabled == false).
+        // The interim merge guard is retired: structural items are always enabled (the engine
+        // displaces merges, merged-cell-ui `architecture.md §5`).
         assert!(matches!(
             &items[8],
-            Some((l, false, GridEvent::DeleteRows { .. })) if l == "Delete 1 row"
+            Some((l, true, GridEvent::DeleteRows { .. })) if l == "Delete 1 row"
         ));
         assert!(matches!(
             &items[9],
-            Some((l, false, GridEvent::InsertColumns { .. })) if l == "Insert 1 column left"
+            Some((l, true, GridEvent::InsertColumns { .. })) if l == "Insert 1 column left"
         ));
     }
 
@@ -8936,9 +9227,6 @@ mod tests {
             run,
             x: 0.0,
             y: 0.0,
-            insert_before_blocked: false,
-            insert_after_blocked: false,
-            delete_blocked: false,
             hide_blocked,
             unhide_run,
             hidden_in_run,
@@ -9297,7 +9585,7 @@ mod tests {
                     };
                     grid.set_selection(b2_d4, cx);
                     events.borrow_mut().clear();
-                    grid.open_cell_menu(CellRef::new(2, 2), 0.0, 0.0, &[], window, cx);
+                    grid.open_cell_menu(CellRef::new(2, 2), 0.0, 0.0, window, cx);
                     let menu = grid.cell_menu.expect("the cell menu opened");
                     assert_eq!(*grid.selection(), b2_d4, "an inside click keeps B2:D4");
                     assert_eq!(
@@ -9611,6 +9899,150 @@ mod tests {
             click_count,
             first_mouse: false,
         }
+    }
+
+    fn shift_mouse_down_at(pos: gpui::Point<gpui::Pixels>) -> MouseDownEvent {
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            click_count: 1,
+            first_mouse: false,
+        }
+    }
+
+    // ---- Merge-aware selection & editing (merged-cell-ui `functional_spec.md F4–F5`) -----------
+
+    /// Sources over a sheet whose only merge is region `R` = rows 5..=7 × cols 3..=5 (anchor
+    /// `(5,3)`), so the input handlers exercise `snap_cell` / `effective_range`.
+    fn merge_sources() -> GridDataSources {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::Publication;
+        let cache = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .merge(CellRange::new(CellRef::new(5, 3), CellRef::new(7, 5)))
+        .build();
+        let mut caches = SheetCaches::new();
+        caches.insert(SheetId(0), cache);
+        let publication = Publication {
+            sheet: SheetId(0),
+            rows: 0..40,
+            cols: 0..20,
+            generation: 1,
+            cells: Vec::new(),
+            frozen_rows: 0,
+            frozen_cols: 0,
+        };
+        GridDataSources {
+            publication: Arc::new(ArcSwap::from_pointee(publication)),
+            caches: Arc::new(RwLock::new(caches)),
+        }
+    }
+
+    #[gpui::test]
+    fn mouse_down_on_covered_cell_selects_the_region_anchor(cx: &mut TestAppContext) {
+        // A plain click on a covered cell selects the whole region (its anchor is the active cell).
+        let (g, window, _events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.mouse_down_cell(
+                        6,
+                        4,
+                        &mouse_down_at(gpui::point(px(1.0), px(1.0)), 1),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        *grid.selection(),
+                        SelectionModel::single(CellRef::new(5, 3)),
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn shift_click_into_a_region_snaps_the_active_corner(cx: &mut TestAppContext) {
+        // Shift-click keeps the anchor and snaps the new active corner to the region anchor.
+        let (g, window, _events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_selection(SelectionModel::single(CellRef::new(0, 0)), cx);
+                    grid.mouse_down_cell(
+                        7,
+                        5,
+                        &shift_mouse_down_at(gpui::point(px(1.0), px(1.0))),
+                        window,
+                        cx,
+                    );
+                    let sel = *grid.selection();
+                    assert_eq!(sel.anchor, CellRef::new(0, 0), "anchor kept");
+                    assert_eq!(
+                        sel.active,
+                        CellRef::new(5, 3),
+                        "active snapped to the anchor"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn double_click_covered_cell_opens_editor_on_the_anchor(cx: &mut TestAppContext) {
+        // Double-clicking any cell of a merge edits the anchor — never a covered cell (which the
+        // engine would reject on commit).
+        let (g, window, events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.mouse_down_cell(
+                        6,
+                        4,
+                        &mouse_down_at(gpui::point(px(1.0), px(1.0)), 2),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        assert!(
+            events.borrow().iter().any(|e| matches!(
+                e,
+                GridEvent::OpenInCellEditor(c) if *c == CellRef::new(5, 3)
+            )),
+            "the in-cell editor opens on the region anchor: {:?}",
+            events.borrow()
+        );
+    }
+
+    #[gpui::test]
+    fn delete_over_a_region_clears_the_effective_range(cx: &mut TestAppContext) {
+        // Delete on a selection resolving into a region clears the whole region (its anchor).
+        let (g, window, events) = recording_over(cx, merge_sources());
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_selection(SelectionModel::single(CellRef::new(5, 3)), cx);
+                    grid.handle_key_down(&key_ev("delete", None, false), window, cx);
+                });
+            })
+            .unwrap();
+        assert!(
+            events.borrow().iter().any(|e| matches!(
+                e,
+                GridEvent::ClearCells(r)
+                    if *r == CellRange::new(CellRef::new(5, 3), CellRef::new(7, 5))
+            )),
+            "Delete clears the whole region via the effective range: {:?}",
+            events.borrow()
+        );
     }
 
     fn mouse_move_at(pos: gpui::Point<gpui::Pixels>) -> MouseMoveEvent {

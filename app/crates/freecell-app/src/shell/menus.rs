@@ -12,7 +12,8 @@ use freecell_core::recent::{RecentList, MENU_LIMIT};
 
 use super::{
     recents, About, ClearRecent, CloseWindow, ExportCsv, NewWorkbook, OpenFile, OpenFind,
-    OpenRecent, Quit, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleUnderline, Undo,
+    OpenRecent, Quit, Redo, Save, SaveAs, ToggleBold, ToggleItalic, ToggleMerge, ToggleUnderline,
+    Undo,
 };
 
 /// The primary modifier for the current platform: `cmd` on macOS, `ctrl` elsewhere.
@@ -40,6 +41,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(&key("b"), ToggleBold, None),
         KeyBinding::new(&key("i"), ToggleItalic, None),
         KeyBinding::new(&key("u"), ToggleUnderline, None),
+        // Merge cells — ⌃⌘M (Apple Numbers' merge shortcut; ⌘M alone is the system minimize on
+        // macOS). `key("ctrl-m")` yields `cmd-ctrl-m` (⌃⌘M) on macOS and `ctrl-ctrl-m` on Linux,
+        // which parses to Ctrl+M (a duplicate modifier is idempotent) — the platform's
+        // cmd→ctrl-mapped equivalent (`functional_spec.md §2.4`, merged-cell-ui `ui_design.md §2`).
+        KeyBinding::new(&key("ctrl-m"), ToggleMerge, None),
         KeyBinding::new(&key("f"), OpenFind, None),
         KeyBinding::new(&key("q"), Quit, None),
     ]);
@@ -80,6 +86,10 @@ pub fn build_menus(recents: &RecentList, now: i64) -> Vec<Menu> {
             MenuItem::action("Redo", Redo),
             MenuItem::separator(),
             MenuItem::action("Find…", OpenFind),
+            // Merge/Unmerge the selection (merged-cell-ui `ui_design.md §2`) — a static "Merge
+            // Cells" label after Find, dispatching the same `ToggleMerge` action as ⌃⌘M + the
+            // action-row button; standard enable/disable (handler-in-scope on the workbook window).
+            MenuItem::action("Merge Cells", ToggleMerge),
         ]),
     ]
 }
@@ -306,6 +316,23 @@ mod tests {
         assert_eq!(
             open_recent_paths(open_recent_submenu(&menus)),
             vec![dir.path().join("a.xlsx"), dir.path().join("b.xlsx")]
+        );
+    }
+
+    #[test]
+    fn edit_menu_has_merge_cells_after_find() {
+        // The "Merge Cells" item (merged-cell-ui `ui_design.md §2`) sits directly after "Find…" in
+        // the Edit menu, dispatching `ToggleMerge` (the same action as ⌃⌘M + the action-row button).
+        let menus = build_menus(&RecentList::default(), NOW);
+        let labels = action_labels(menu_named(&menus, "Edit"));
+        let find_idx = labels
+            .iter()
+            .position(|l| l == "Find…")
+            .expect("Find… item present");
+        assert_eq!(
+            labels.get(find_idx + 1).map(String::as_str),
+            Some("Merge Cells"),
+            "Merge Cells directly follows Find…: {labels:?}"
         );
     }
 

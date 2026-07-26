@@ -4,7 +4,7 @@
 ### The open spreadsheet app
 </div>
 
-- Free and OSS desktop spreadsheet app
+- Free and open-source desktop spreadsheet app
 - Supports XLSX format and 90% of Excel formulas
 - GPU rendering: bar graphs at 240fps
 - Insanely fast and light: Rust-based, 11MB app, launches in 60 milliseconds

@@ -5,9 +5,9 @@
 </div>
 
 - Free and open-source desktop spreadsheet app
-- Supports XLSX format and 90% of Excel formulas
-- GPU rendering: bar graphs at 240fps
-- Insanely fast and light: Rust-based, 11MB app, launches in 60 milliseconds
+- Supports XLSX format, 90% of Excel formulas, charts, and advanced formatting
+- GPU accelerated UI
+- Insanely fast and light: Rust-based, 8MB app, launches in 60ms
 - Cross platform: Mac, Windows and Linux
 
 <div align="center">
@@ -20,13 +20,13 @@
 It’s a spreadsheet. It has the most of the features you’d come to expect including:
 
 - Formulas: supports 90% of Excel formulas
-- Formatting: all the text formatting, borders, fills and sizing you expect
+- Formatting: text formatting, borders, fills and sizing
 - XLSX file support: open and edit Excel files (OOXML format)
 - Speed: it’s ridiculously fast and lightweight.
 - 100% local software: no cloud, no analytics, completely private
-- Cross platform: works on Mac, Windows and Linux
-- Native: compiled desktop app, not Electron or web-views
-- Charts: GPU rendered charting
+- Cross platform: Mac, Windows and Linux
+- Native: compiled desktop app, no Electron or web-views
+- Charts: 12 most common chart types supported
 - More: merged cells, frozen panes, conditional formatting, and much more
 
 What’s not included (yet):

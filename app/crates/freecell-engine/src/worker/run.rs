@@ -51,8 +51,8 @@ use std::path::Path;
 use super::charts::ChartSnapshot;
 use super::client::Shared;
 use super::protocol::{
-    ChartAxisKind, ChartChromeEdit, Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
-    WorkerEvent,
+    ChartAxisKind, ChartChromeEdit, Command, EditRejectedReason, FrozenAxis, PasteError, SheetMeta,
+    StyleAttr, WorkerEvent,
 };
 
 /// Whether the loop should keep running after a batch.
@@ -2199,6 +2199,28 @@ impl Worker {
             Command::FillDrag { sheet, target, .. } => {
                 self.fill_merge_guard(*sheet, |merges| blocks_fill(merges, *target))
             }
+            // Frozen-pane range check (B2, `functional_spec.md F1.2`). The header menu derives the
+            // count from the SELECTED header run, so Select-All → Freeze asks to pin the whole
+            // 1,048,576-row axis — two clicks to a publish loop that never returns. Rejected here,
+            // outside the panic guard, before it can reach the model. Both axes are checked (the UI
+            // sends one, the command permits both); `0` (Unfreeze) is always valid.
+            Command::SetFrozen { rows, cols, .. } => {
+                if let Some(n) = rows.filter(|n| *n > MAX_FROZEN_ROWS) {
+                    return Err(EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Rows,
+                        requested: n,
+                        max: MAX_FROZEN_ROWS,
+                    });
+                }
+                if let Some(n) = cols.filter(|n| *n > MAX_FROZEN_COLS) {
+                    return Err(EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Columns,
+                        requested: n,
+                        max: MAX_FROZEN_COLS,
+                    });
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -3239,15 +3261,28 @@ impl Worker {
                 // counts off the resident cache (0 when unfrozen, or not yet built on the very first
                 // publish — harmless, the band is inside the body window at scroll 0). The published
                 // set is the union of the ≤4 quadrant rectangles `(0..M ∪ body_rows) × (0..K ∪
-                // body_cols)`; O(visible) — the bands are a few leading tracks, never a sheet-size
-                // loop. Flooring the body ranges past the bands makes the chained iteration visit
-                // each cell exactly once.
+                // body_cols)`. Flooring the body ranges past the bands makes the chained iteration
+                // visit each cell exactly once.
+                //
+                // The band counts are CLAMPED here (B2, `functional_spec.md F1`). This loop's bound
+                // used to be asserted in prose — "the bands are a few leading tracks, never a
+                // sheet-size loop" — and that assertion was false: `M` comes from a header
+                // SELECTION, so Select-All → Freeze made it 1,048,576 and this loop never returned.
+                // The cache build clamps the same way, so this is a backstop rather than the only
+                // guard; it is written here anyway because this is the loop that depends on it, and
+                // an invariant with a mechanism is the only kind that holds. Worst case is now the
+                // constant `(64 + 512) × (32 + 256)` = 165,888 probes.
                 let (m, k) = self
                     .shared
                     .caches
                     .read()
                     .get(sheet)
-                    .map(|c| (c.frozen_rows(), c.frozen_cols()))
+                    .map(|c| {
+                        (
+                            c.frozen_rows().min(MAX_FROZEN_ROWS),
+                            c.frozen_cols().min(MAX_FROZEN_COLS),
+                        )
+                    })
                     .unwrap_or((0, 0));
                 let body_rows = vp.rows.start.max(m)..vp.rows.end.max(m);
                 let body_cols = vp.cols.start.max(k)..vp.cols.end.max(k);
@@ -3962,6 +3997,23 @@ const AUTO_GROW_EPS_PX: f32 = 0.5;
 /// these still keep margin over the actual overscan dimensions the grid requests.
 const MAX_PUBLISH_ROWS: u32 = 512;
 const MAX_PUBLISH_COLS: u32 = 256;
+
+/// The most leading rows / columns FreeCell will pin as a frozen pane (`functional_spec.md F1`).
+///
+/// The frozen band is published on EVERY publish, on top of the body window, so an unbounded band
+/// is an unbounded publish — `(0..M) × (0..K)` from a count the UI derives from a header
+/// **selection**, which Select-All makes `1_048_576`. It is also rendered by the grid as
+/// `for r in 0..frozen_rows`, so an unbounded band wedges the render thread too. Both consumers
+/// read the count off the resident cache, so the cache build clamps it there
+/// ([`crate::cache::build_sheet_cache`]) and [`Worker::build_publication`] clamps it again at the
+/// loop that depends on it.
+///
+/// Sized past any usable freeze — a band taller than the window makes the sheet unusable, and a 4K
+/// display shows on the order of 100 rows — while keeping the worst-case publish at
+/// `(MAX_FROZEN_ROWS + MAX_PUBLISH_ROWS) × (MAX_FROZEN_COLS + MAX_PUBLISH_COLS)` = 165,888 probe
+/// cells: a constant, which is the property the band loop's doc comment used to merely assert.
+pub(crate) const MAX_FROZEN_ROWS: u32 = 64;
+pub(crate) const MAX_FROZEN_COLS: u32 = 32;
 
 /// Clamp a requested viewport to the sheet bounds **and** a bounded overscan window. The
 /// viewport arrives pre-overscanned UI-side; the worker keeps the top-left anchor and truncates
@@ -7755,28 +7807,150 @@ mod tests {
     }
 
     #[test]
-    fn set_frozen_clamps_to_engine_max() {
-        // The fork's `Model::set_frozen_*` errors at count >= LAST_ROW/LAST_COLUMN, so the
-        // document wrapper clamps to all-but-one track — a "freeze at the very last track"
-        // action degrades to the engine max instead of erroring (`functional_spec.md §5.2`).
+    fn set_frozen_beyond_the_cap_is_rejected() {
+        // B2 (`engine-worker-hardening functional_spec.md F1.2`), SUPERSEDING the `freeze-panes`
+        // §5.2 behaviour this test used to assert (an out-of-range count silently degraded to the
+        // engine max). It can't: the published frozen band is iterated on EVERY publish, so a
+        // ⌘A → right-click → "Freeze rows" — which asks for the whole 1,048,576-row axis, because
+        // the menu derives the count from the selected header run — wedged the worker permanently.
+        // It is now rejected before it reaches the model, with the axis, request and cap named.
         let (mut worker, rx) = test_worker();
         let sheet = sheet0(&worker);
         worker.process_batch(vec![Command::SetFrozen {
             sheet,
-            rows: Some(u32::MAX),
-            cols: Some(limits::MAX_COLS),
+            rows: Some(limits::MAX_ROWS),
+            cols: None,
         }]);
         assert_eq!(
             frozen(&worker, sheet),
-            (limits::MAX_ROWS - 1, limits::MAX_COLS - 1),
-            "out-of-range counts clamp to the engine max, never error"
+            (0, 0),
+            "the rejected freeze left the sheet unfrozen"
         );
         let events = drain_events(&rx);
         assert!(
-            !events
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Rows,
+                        requested,
+                        max,
+                    }
+                } if *requested == limits::MAX_ROWS && *max == MAX_FROZEN_ROWS
+            )),
+            "the row axis reports its own cap + the request; got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, WorkerEvent::Published)),
+            "a rejected freeze publishes nothing"
+        );
+    }
+
+    #[test]
+    fn set_frozen_cols_beyond_the_cap_is_rejected() {
+        // The column axis has its own (smaller) cap and reports it independently.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: None,
+            cols: Some(MAX_FROZEN_COLS + 1),
+        }]);
+        assert_eq!(frozen(&worker, sheet), (0, 0));
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Columns,
+                        max,
+                        ..
+                    }
+                } if *max == MAX_FROZEN_COLS
+            )),
+            "the column axis reports FrozenAxis::Columns and MAX_FROZEN_COLS"
+        );
+    }
+
+    #[test]
+    fn set_frozen_at_the_cap_is_accepted() {
+        // The bound is INCLUSIVE — the cap itself is a legal freeze on both axes, so the
+        // rejection can't be off by one in the direction that breaks a legitimate freeze.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetFrozen {
+                sheet,
+                rows: Some(MAX_FROZEN_ROWS),
+                cols: None,
+            },
+            Command::SetFrozen {
+                sheet,
+                rows: None,
+                cols: Some(MAX_FROZEN_COLS),
+            },
+        ]);
+        assert_eq!(frozen(&worker, sheet), (MAX_FROZEN_ROWS, MAX_FROZEN_COLS));
+        assert!(
+            !drain_events(&rx)
                 .iter()
                 .any(|e| matches!(e, WorkerEvent::EditRejected { .. })),
-            "the clamp keeps the edit applied; got {events:?}"
+            "a freeze exactly at the cap is not rejected"
+        );
+    }
+
+    #[test]
+    fn publish_clamps_an_oversized_frozen_band() {
+        // The publish-site backstop (`functional_spec.md F1.4`). Seed the resident cache with a
+        // sheet-size band DIRECTLY, bypassing both the command guard and the cache-build clamp, and
+        // assert the publish still returns promptly with a clamped band. Under the pre-fix code
+        // this loop ran ~1M x 256 `formatted_value` calls and never returned, so the wall-clock
+        // assertion is the real subject of this test — a regression must fail, not hang.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..40,
+            cols: 0..10,
+        }]);
+        {
+            // `SheetCache` exposes the counts read-only, so install a hand-built cache carrying a
+            // sheet-size band. The publish loop reads nothing else off the cache.
+            let hostile =
+                freecell_core::cache::SheetCacheBuilder::new(limits::MAX_ROWS, limits::MAX_COLS)
+                    .frozen_rows(limits::MAX_ROWS - 1)
+                    .frozen_cols(limits::MAX_COLS - 1)
+                    .build();
+            worker.shared.caches.write().insert(sheet, hostile);
+        }
+
+        let started = Instant::now();
+        worker.publish();
+        let elapsed = started.elapsed();
+
+        let publication = worker.shared.publication.load_full();
+        assert_eq!(publication.frozen_rows, MAX_FROZEN_ROWS);
+        assert_eq!(publication.frozen_cols, MAX_FROZEN_COLS);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the clamped band publish must return promptly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn crafted_pane_element_opens_clamped() {
+        // The file path (`functional_spec.md F1.3`): a crafted `<pane ySplit="500000">` is clamped
+        // where the counts enter the read model, so BOTH the publish loop and the grid's
+        // `for r in 0..frozen_rows` band renderer see a bounded band. The sheet opens normally.
+        let dir = tempfile::tempdir().unwrap();
+        let path = pane_fixture_with(dir.path(), 500_000, 400_000);
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (worker, _rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+        assert_eq!(
+            frozen(&worker, sheet),
+            (MAX_FROZEN_ROWS, MAX_FROZEN_COLS),
+            "an oversized file pane clamps at cache build"
         );
     }
 
@@ -7784,6 +7958,12 @@ mod tests {
     /// saving a fresh workbook and injecting the pane element into its sheetView XML (the same
     /// zip-rewrite pattern as `merged_fixture`).
     fn pane_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        pane_fixture_with(dir, 1, 2)
+    }
+
+    /// [`pane_fixture`] with caller-chosen `xSplit`/`ySplit`, so the clamp test can craft a
+    /// sheet-size band the way a hostile file would.
+    fn pane_fixture_with(dir: &std::path::Path, x_split: u32, y_split: u32) -> std::path::PathBuf {
         use std::io::{Read, Write};
         let base = dir.join("base.xlsx");
         WorkbookDocument::new_empty().unwrap().save(&base).unwrap();
@@ -7801,11 +7981,13 @@ mod tests {
             if name.contains("worksheets/sheet1.xml") {
                 // The empty sheet's single <sheetView> carries one <selection …/>; put the pane
                 // element before it (the importer reads any state="frozen" <pane> in sheetView).
-                let s = String::from_utf8(content).unwrap().replace(
-                    "<selection ",
-                    "<pane xSplit=\"1\" ySplit=\"2\" topLeftCell=\"B3\" \
-                     activePane=\"bottomRight\" state=\"frozen\"/><selection ",
+                let pane = format!(
+                    "<pane xSplit=\"{x_split}\" ySplit=\"{y_split}\" topLeftCell=\"B3\" \
+                     activePane=\"bottomRight\" state=\"frozen\"/><selection "
                 );
+                let s = String::from_utf8(content)
+                    .unwrap()
+                    .replace("<selection ", &pane);
                 content = s.into_bytes();
             }
             writer.start_file(name, opts).unwrap();

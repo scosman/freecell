@@ -16,8 +16,8 @@ use freecell_chart_model::{Anchor, AnchorCell, ChartId, SeriesData};
 use freecell_core::{CellRange, CellRef, SheetId};
 use freecell_engine::{
     fixtures, ChartAxisKind, ChartChromeEdit, ChartInsertKind, ChartSnapshot, Command,
-    DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, SheetMeta, StyleAttr,
-    WorkerEvent, WorkerEventReceiver,
+    DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, FrozenAxis, SheetMeta,
+    StyleAttr, WorkerEvent, WorkerEventReceiver,
 };
 use tempfile::tempdir;
 
@@ -101,6 +101,49 @@ fn full_viewport(sheet: SheetId) -> Command {
         rows: 0..64,
         cols: 0..16,
     }
+}
+
+/// B2 (`functional_spec.md F1.2`) over the real seam: the ⌘A → "Freeze rows" gesture — which
+/// asks to pin the whole 1,048,576-row axis, because the header menu derives the count from the
+/// selected run — is rejected, and the worker keeps serving. Before the fix this command wedged
+/// the worker permanently: every later publish iterated a ~1M-row band.
+#[test]
+fn oversized_freeze_is_rejected_and_the_worker_keeps_serving() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+
+    client.send(Command::SetFrozen {
+        sheet,
+        rows: Some(1_048_576),
+        cols: None,
+    });
+    let rejected = wait_for(&rx, |e| matches!(e, WorkerEvent::EditRejected { .. }));
+    assert!(
+        matches!(
+            rejected,
+            Some(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::FrozenPaneTooLarge {
+                    axis: FrozenAxis::Rows,
+                    requested: 1_048_576,
+                    ..
+                }
+            })
+        ),
+        "got {rejected:?}"
+    );
+
+    // The seam is still live: a following edit publishes normally rather than never returning.
+    client.send(set_input(sheet, 0, 0, "alive"));
+    poll_until(
+        || published_text(&client, 0, 0) == "alive",
+        "the worker still serves edits after a rejected freeze",
+    );
+    assert_eq!(
+        client.publication().frozen_rows,
+        0,
+        "the rejected freeze left no band behind"
+    );
 }
 
 #[test]

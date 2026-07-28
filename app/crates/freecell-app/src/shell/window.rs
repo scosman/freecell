@@ -761,6 +761,28 @@ impl WorkbookWindow {
                     cx.notify();
                 }
             }
+            // The frozen-pane cap (engine-worker-hardening `functional_spec.md F1.2`): an OK-only
+            // dialog, nothing changed. The reachable case is Select-All → "Freeze rows", where the
+            // header menu derives the count from the whole 1,048,576-row selection — so the copy
+            // echoes the request as well as the cap, or the refusal reads as arbitrary.
+            EditRejectedReason::FrozenPaneTooLarge {
+                axis,
+                requested,
+                max,
+            } => {
+                if self.modal.is_none() {
+                    let noun = axis.noun();
+                    self.modal = Some(ActiveModal::Error {
+                        title: format!("Can't freeze that many {noun}").into(),
+                        detail: format!(
+                            "FreeCell can pin at most {max} {noun} (you asked for {requested}). \
+                             Select fewer {noun} and try again."
+                        ),
+                        close_window_on_dismiss: false,
+                    });
+                    cx.notify();
+                }
+            }
             EditRejectedReason::InvalidSheetName(_) | EditRejectedReason::Degraded => {}
         }
     }

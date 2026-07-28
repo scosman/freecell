@@ -24,5 +24,9 @@ pub use client::{DocumentClient, WorkerEventReceiver, WORKER_STACK_SIZE};
 pub use freecell_chart_model::{ChartId, ChartInsertKind};
 pub use protocol::{
     BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, Command, DataLabelToggles,
-    EditRejectedReason, PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent,
+    EditRejectedReason, FrozenAxis, PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent,
 };
+/// The frozen-pane band caps (B2, `functional_spec.md F1`). Crate-visible so
+/// [`crate::cache::build_sheet_cache`] clamps the counts it copies out of a worksheet to the same
+/// bound the publish loop enforces — the cache is what both the worker and the grid read.
+pub(crate) use run::{MAX_FROZEN_COLS, MAX_FROZEN_ROWS};

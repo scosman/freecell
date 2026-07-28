@@ -39,8 +39,9 @@ pub use formula_refs::lex_formula_refs;
 pub use instrument::{engine_call_count, reset_engine_call_count};
 pub use worker::{
     BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, ChartId, ChartInsertKind,
-    ChartSnapshot, Command, DataLabelToggles, DocumentClient, EditRejectedReason, PasteError,
-    SheetMeta, StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver, WORKER_STACK_SIZE,
+    ChartSnapshot, Command, DataLabelToggles, DocumentClient, EditRejectedReason, FrozenAxis,
+    PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver,
+    WORKER_STACK_SIZE,
 };
 
 /// Re-export of the pinned IronCalc workbook type the worker will own. `pub(crate)` — the

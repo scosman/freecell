@@ -35,6 +35,7 @@ use ironcalc_base::types::{
 };
 
 use crate::document::WorkbookDocument;
+use crate::worker::{MAX_FROZEN_COLS, MAX_FROZEN_ROWS};
 
 // These mirror the pinned engine's default row/col size (`ironcalc_base/src/constants.rs`) — the
 // reference our px conversion maps onto FreeCell's own defaults, and the sentinel that marks a
@@ -409,8 +410,17 @@ pub(crate) fn build_sheet_cache(
     // `frozen_rows`/`frozen_columns` (xlsx `<pane>`, or a `SetFrozen` edit) into the read model —
     // this is the "opening a file with `<pane>` shows the bands immediately" path. No geometry
     // effect (not fed to the axes); the fork's fields are `i32`, defensively floored at 0.
-    builder.set_frozen_rows(ws.frozen_rows.max(0) as u32);
-    builder.set_frozen_cols(ws.frozen_columns.max(0) as u32);
+    //
+    // CLAMPED to `MAX_FROZEN_ROWS` / `MAX_FROZEN_COLS` (B2, `functional_spec.md F1.3`). This is the
+    // one place a worksheet's frozen counts enter the read model, and BOTH consumers of the band —
+    // the worker's publish loop and the grid's `for r in 0..frozen_rows` band renderer — read them
+    // from here, so clamping here bounds the worker thread and the render thread alike. A crafted
+    // `<pane ySplit="500000" state="frozen"/>` would otherwise hang both. The model keeps the
+    // file's original count (so a save preserves the user's bytes); everything the user sees uses
+    // the clamped one. A `SetFrozen` command can't reach this path over the cap — `pre_validate`
+    // rejects it first — so in practice this only ever clamps a file.
+    builder.set_frozen_rows((ws.frozen_rows.max(0) as u32).min(MAX_FROZEN_ROWS));
+    builder.set_frozen_cols((ws.frozen_columns.max(0) as u32).min(MAX_FROZEN_COLS));
 
     // Merged regions: the resident `MergeMap` the grid renders + selects from (merged-cell-ui
     // `architecture.md §2/§3`). Read from the engine's normalized `merged_regions` (0-based) — not

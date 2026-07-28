@@ -332,6 +332,28 @@ fix so the fix is measurable and non-regressing.
 
 *C2, C3, C4 and D5 all sit behind this. If only one unit starts, start here.*
 
+**Outcome (v05-cleanup-1 P5, 2026-07-28): CONFIRMED — and the loss is bigger than the unit
+implied.** `app/crates/freecell-engine/tests/part_inventory.rs` opens each real fixture, saves
+through the **real app path** (worker + `Command::Save` — only the public `DocumentClient`
+surface, so `worker/*` is untouched), and diffs the OPC part inventories.
+
+`personal_monthly_budget.xlsx` **loses 27 parts**, headlined by **all twelve
+`xl/tables/tableN.xml` — every table (ListObject) definition**: banded formatting, header/total
+rows, filter buttons, structured references. Also all `customXml/*`, printer settings, and the
+sheet `_rels`. `docProps/custom.xml` is lost on *every* fixture; three smaller fixtures lose
+nothing.
+
+**The chart workbook is the counter-example and the template for C3:** through the bare
+serializer it loses all four chart parts + the drawing; through the app path it loses none.
+"IronCalc's writer + targeted re-injection" is already shipped and working — C3 is generalising
+it from charts to tables, not inventing a mechanism.
+
+Landed **green** rather than red: each fixture carries a committed, annotated drop-set baseline
+asserted in **both** directions, so a new drop fails the build and a fix cannot land without
+updating the record. A permanently-red required check gets disabled, and then the loss is
+invisible again for a different reason. `GAPS.md` updated with the measurements.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_5.md`.
+
 ### C2. Save-fidelity warning dialog
 **task · v0.5 · after C1 (required)**
 

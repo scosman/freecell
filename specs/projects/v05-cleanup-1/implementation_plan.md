@@ -22,10 +22,10 @@ Details live in [`functional_spec.md`](functional_spec.md) and
       precondition is checked against the post-A1 lock. (§2)
 - [x] **Phase 3 — A4: fork inventory, doc corrections, permanent-fork strategy.** Docs only;
       edits the manifest comment Phase 1 rewrote. (§3)
-- [ ] **Phase 4 — D1: render gate weekly on `main` + at release.** Triggers, concurrency key,
+- [x] **Phase 4 — D1: render gate weekly on `main` + at release.** Triggers, concurrency key,
       plus `render.yml` header, `checks.yml` header, `app/README.md` §CI and `CLAUDE.md`
       render section. Dispatch the workflow on the branch to prove it still runs. (§4)
-- [ ] **Phase 5 — C1 (keystone): part-inventory round-trip test.** New
+- [x] **Phase 5 — C1 (keystone): part-inventory round-trip test.** New
       `tests/part_inventory.rs` over the real Excel fixtures, both production save paths,
       committed drop baselines, `GAPS.md` updated with what it measures. (§5)
 - [ ] **Phase 6 — F3a: chart/cell number-format + colour agreement.** Differential corpus in

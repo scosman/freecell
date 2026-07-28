@@ -73,6 +73,36 @@ hardware smoke (item **M-15** in `specs/projects/mvp/smoke_checklist.md`) is non
   & robustness*, below). A **warn-before-strip** dialog was considered for v0.5 and
   **cut (2026-07-13)** — the backup covers the risk; full pass-through **preservation**
   stays v1.0 ([`projects/xlsx-preservation.md`](projects/xlsx-preservation.md)).
+
+  > **The strip is now MEASURED, not estimated (2026-07-28, unit C1).**
+  > `app/crates/freecell-engine/tests/part_inventory.rs` opens each real third-party fixture,
+  > saves it through the **real app save path** (worker + `Command::Save`), and diffs the OPC
+  > part inventory of the two zips. Before this, `tests/roundtrip.rs` only round-tripped
+  > workbooks FreeCell itself authored — a closed loop over IronCalc's own serializer, which is
+  > why the size of this loss had never been visible.
+  >
+  > On `personal_monthly_budget.xlsx` (a real Excel template) **27 parts are dropped**:
+  > - **all 12 `xl/tables/tableN.xml` — every table (ListObject) definition.** Banded
+  >   formatting, header/total rows, filter buttons and structured references. Save and reopen
+  >   in Excel and every table is now a plain range. This is the headline finding: it is not an
+  >   exotic feature, it is the structure of the template.
+  > - **all `customXml/*`** (3 items + rels + itemProps) — template data bindings / DMS metadata.
+  > - **`xl/printerSettings/*.bin`** — page setup.
+  > - the sheet `_rels` binding those parts, and `xl/calcChain.xml` (benign — a cache Excel
+  >   rebuilds).
+  >
+  > `docProps/custom.xml` (user-defined document properties) is dropped on **every** fixture
+  > measured. Three smaller fixtures (`dates`, `numbers_table`, `FONTS`) lose **nothing**.
+  >
+  > **Charts are the counter-example, and the template for the fix.** Through the bare
+  > serializer the chart workbook loses all four chart parts, its drawing and their
+  > relationships; through the app path it loses none of them. The existing "IronCalc writer +
+  > targeted re-injection" machinery already solves this class — C3 generalises it from charts
+  > to tables and the rest.
+  >
+  > The measured drop sets are committed as baselines in that test, so the loss is now
+  > **non-regressing**: dropping a new part fails the build. The fix is C3 (v1.0); the warning
+  > dialog is C2.
 - **Dynamic arrays / spill absent** (§8) — accepted absent for v1; the engine surfaces
   an error. Out of MVP scope by product call.
 
@@ -448,7 +478,7 @@ Ordered roughly by how fast a new user hits the gap.
 | **Print / export PDF** | **NEW** (checked: no print or PDF path) | Even home users occasionally print. Stage it: export-PDF (paginate the styled grid) first; real print dialogs later. Big; start design early. |
 | **Autosave + crash recovery** | **NEW** (checked: `.back` first-save backup exists; no periodic snapshot / reopen-after-crash) | We're alpha with a full-strip writer — periodic recovery snapshots close the data-loss window between explicit saves. |
 | **IME / international text input** (+ dead keys, decimal-comma entry) | [`projects/ime-text-input.md`](projects/ime-text-input.md) | Blocks CJK + many European users entirely; carries a cheap gpui probe first. |
-| **`.xlsx` unknown-part preservation** (zip-level pass-through) | [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md) | The v1.0 half of the save-fidelity story (v0.5 relies on the write-once `.back` backup, not a warn dialog — the warn-before-strip idea was cut 2026-07-13). Pass-through keeps charts we don't own, pivots, images, VBA… intact instead of stripped. |
+| **`.xlsx` unknown-part preservation** (zip-level pass-through) | [`projects/xlsx-preservation.md`](projects/xlsx-preservation.md) · **now MEASURED** — see the box below | The v1.0 half of the save-fidelity story (v0.5 relies on the write-once `.back` backup, not a warn dialog — the warn-before-strip idea was cut 2026-07-13). Pass-through keeps charts we don't own, pivots, images, VBA… intact instead of stripped. |
 | **Sheet management extras** (duplicate sheet, tab colors, hide/unhide sheets) | **NEW** (checked: no UI/commands; engine has `hide_sheet`/`unhide_sheet`/`set_sheet_color`; duplicate needs fork work) | Rounds out the tab bar; hide-sheets is common in template files. |
 | **Gridlines toggle** (per-sheet, persisted) | **NEW** (checked: gridlines unconditional in `grid/mod.rs`; engine models `set_show_grid_lines` + round-trips) | Small; engine-ready. |
 | **Entry shortcuts bundle** (F4 abs/rel reference cycling, Ctrl+Enter fill-selection, ⌘;/⌘⇧; date/time stamps) | **NEW** | Small individually; batch them like feature-gaps-7-11. |

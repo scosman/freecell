@@ -1,11 +1,20 @@
 //! The sheet tab bar (`components/app_shell.md §Sheet tab bar`, `ui_design.md §3.4`): the tab
-//! strip and its scroller, tab selection and add, the reorder drag and its drop indicator,
-//! inline rename with validation, and the right-click context menu plus delete confirmation.
+//! strip, tab selection and add, the reorder drag and its drop indicator, inline rename with
+//! validation, and the right-click context menu plus delete confirmation.
+//!
+//! The strip scrolls through the shared [`crate::chrome::h_scroller`]; its state lives on
+//! `ChromeView` and its overflow/chevron tests sit with the other scroller cases in
+//! [`super::shell`], so only the divider gating is owned here. The selection-stats readout
+//! pinned to the right of the strip is [`super::stats`].
 //!
 //! Moved verbatim out of the single-file `chrome/view.rs`
 //! (`specs/projects/chrome-view-split`).
 
 use super::*;
+
+use gpui::{CursorStyle, MouseMoveEvent, MouseUpEvent};
+
+use freecell_core::sheet_name::validate_sheet_name;
 
 /// A tab press that moves less than this (device px) is a click (select / rename), not a drag —
 /// only past it does the lift + drop indicator appear (`ui_design.md §3`).

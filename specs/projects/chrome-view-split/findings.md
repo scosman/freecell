@@ -103,18 +103,36 @@ for this reason.
 Worth knowing before the next split: it is not enough for an import to be used *somewhere in
 the file*.
 
-## 6a. `mod.rs`'s import block accumulated 41 single-child orphans — clippy cannot see them
+## 6a. `mod.rs`'s import block accumulated 45 single-child orphans — clippy cannot see them
 
 Architecture §3.3 predicted this and made it a **manual** per-phase check: "imports that end up
 used by only one child get moved into that child. This is checked per-phase precisely because
 it accumulates silently otherwise." That check was never run during the original pass. The
 phase-2 code review caught three instances; sweeping the whole block found the scale.
 
-At the point the phase-2 review landed, `mod.rs` imports **116** names, of which it uses **47**
-itself. Of the remaining 69: **41 are consumed by exactly one child** and belong in that child
-per §3.3; **26 are consumed by two or more** and correctly stay (`ClickEvent` and `Command`
-reach eight children each, `Button` and `WorkerEvent` seven — duplicating those into eight
-files would be strictly worse than the glob, which is what the shared block is *for*).
+At the point the phase-2 review landed, `mod.rs` imports **116** names. Of those, **45 are
+consumed by exactly one child** and belong in that child per §3.3; **32 are consumed by two or
+more** and correctly stay (`ClickEvent` and `Command` reach eight children each, `Button` seven,
+`WorkerEvent` five in code and six counting `formatting.rs`'s intra-doc link — duplicating
+those into eight files would be strictly worse than the glob, which is what the shared block is
+*for*); the remaining 38 `mod.rs` uses itself, plus the one `pub use` re-export
+(`ChartPanelSeries`), which is already in its child and cannot move.
+
+**The sweep has one trap, and it caught the first attempt.** `mod.rs`'s own module doc contains
+intra-doc links — `` [`validate_sheet_name`] ``, `` [`DataRow`] `` — and a scan that treats the
+whole file as "`mod.rs`'s body" reads those as real consumers, so the name looks used and never
+surfaces. Excluding `//!`, `///` and `//` lines before testing raised the count from 41 to 45;
+the four it hid were `BASIC_FORMATS`, `CfEditorState`, `NUM_FMT_GROUPS` and
+`validate_sheet_name`.
+
+The exclusion is **asymmetric**, which is easy to get wrong in the other direction: strip
+comments from `mod.rs`'s *own* body only. A doc mention there is not a reason to keep an import
+— you de-link it, as `validate_sheet_name` required when it moved to `tabs.rs` — but an
+intra-doc link in a *child* resolves only because the name is in scope there, so it genuinely
+counts as a consumer. `formatting.rs`'s `` [`WorkerEvent::MergeNeedsConfirm`] `` is the live
+example: it resolves only through the glob and would break if `WorkerEvent` moved. A plain
+`` `WorkerEvent::CondFmtUpdated` `` code span, as in `cf_sidebar.rs`, is *not* a consumer —
+that distinction is the difference between six and seven.
 
 The reason it accumulates invisibly is worth stating: a child's `use super::*;` re-globs
 `mod.rs`'s private imports, so every orphan still resolves and `clippy -D warnings` stays
@@ -122,17 +140,34 @@ green. There is no latent build failure and nothing is dead — a sweep found **
 no consumer at all. It is a locality problem, not a correctness one, which is why it was scored
 Mild.
 
-**Status: partially done.** Phase 2's three (`format_stat_count`, `format_stat_value` →
-`stats.rs`; `close_button` → `find.rs`) moved with that phase's CR fixes. The remaining 41 were
-created by phases 3–8 and are deferred to the **phase-8 CR**, where `mod.rs`'s residue is the
-subject — landing 40+ import moves caused by later phases inside a commit labelled "phase 2"
-would destroy exactly the per-phase attribution §4.1 exists to protect.
+**Status: being cleared per phase, with the CR of each phase.** Phase 2's three
+(`format_stat_count`, `format_stat_value` → `stats.rs`; `close_button` → `find.rs`) and phase
+3's four (`CursorStyle`, `MouseMoveEvent`, `MouseUpEvent`, `validate_sheet_name` → `tabs.rs`)
+have moved. The remaining 41 were created by phases 4–8 and move with those phases' reviews —
+landing them all in one commit labelled for an earlier phase would destroy exactly the
+per-phase attribution §4.1 exists to protect.
 
 Two things for whoever closes it out: apply the predicate as *two* parts (zero uses in
 `mod.rs`'s own body **and** exactly one child consumer — a name `mod.rs` itself uses stays
 regardless), and **assert** the zero-consumer class is empty rather than inferring it from a
 green clippy run, which proves nothing here. A one-line comment above the block saying it is
 consumed by children via `use super::*` would make the next reader's manual check tractable.
+
+## 6b. Five broken intra-doc links, pre-existing and inherited by the split
+
+`cargo doc -p freecell-app --no-deps --document-private-items` reports five warnings inside
+`chrome/view/`: `render_chart_menu`, `render_chart_type_row` and `open_chart_panel`
+(`charts.rs`), and `Self::accept_autocomplete` and `GridEvent::InsertReference` (`editing.rs`).
+
+**None is a split artifact.** All five doc lines moved verbatim from the pre-split file, and all
+five were already broken there: the three `charts.rs` ones link *bare* to inherent methods on
+`ChromeView`, which never resolves without a `Self::`/`ChromeView::` qualifier; `GridEvent`
+appears exactly once in the whole of the old `view.rs` — in that doc line — and was never
+imported; and the `editing.rs` one is a `private_intra_doc_links` warning whose two visibilities
+are unchanged by the move.
+
+Left alone deliberately: fixing them is a doc change to items this project only relocates, and
+CI has no `cargo doc` gate. Worth a follow-up sweep for whoever adds one.
 
 ## 7. Three test leaf names are duplicated crate-wide
 

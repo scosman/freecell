@@ -336,7 +336,6 @@ pub(super) fn multi_a1_a3() -> SelectionModel {
     }
 }
 
-/// A two-sheet workbook (Sheet1 active) — the fixture for anything that switches sheets.
 pub(super) fn two_sheets(cx: &mut TestAppContext) -> Harness {
     build(
         cx,

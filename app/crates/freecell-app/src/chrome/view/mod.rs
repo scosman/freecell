@@ -3,10 +3,10 @@
 //!
 //! Thin plumbing over the Phase-2 pure logic: the [`DataRow`] reducer drives the content
 //! field, the [`EvalIndicator`] drives the evaluating spinner, [`FILL_PALETTE`] the fill
-//! swatches, and [`validate_sheet_name`] the inline rename. Every user action is a plain
-//! method here (so it is unit-testable without pixel clicks); the widget handlers just call
-//! those methods, and the reducers' effects are performed as [`ChromeClient`] commands and
-//! [`ChromeGridRequest`]s.
+//! swatches, and [`freecell_core::sheet_name::validate_sheet_name`] the inline rename. Every
+//! user action is a plain method here (so it is unit-testable without pixel clicks); the widget
+//! handlers just call those methods, and the reducers' effects are performed as
+//! [`ChromeClient`] commands and [`ChromeGridRequest`]s.
 //!
 //! The fill popover, tab context menu, and delete-confirm modal are lightweight
 //! `ChromeView`-owned panels (controlled by view state) rather than the stock
@@ -44,9 +44,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
-    Focusable, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Rgba, SharedString, Window,
+    canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
@@ -65,7 +64,6 @@ use freecell_core::functions;
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
-use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
     effective_range, limits, region_at, regions_intersecting, Align, CellKind, CellRange, CellRef,
     CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind,

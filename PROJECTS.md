@@ -193,14 +193,13 @@ registry: each entry is a short description plus a pointer to a design note unde
   `engine-worker-hardening` Phase 1 review, 2026-07-28).* IronCalc grows a sheet's frozen boundary
   inside an insert's diff (`base/src/actions.rs:1051`, and the column twin at `:725`) with no upper
   bound. `insert_rows`' range check doesn't help: it bounds the **insert** against the *populated*
-  dimension, not the resulting boundary. The counts that overflow in one insert are exactly
-  `[LAST_ROW - frozen + 1, LAST_ROW - max_row]` — non-empty only while `frozen > max_row`, so with
-  FreeCell's 64-row cap it is a 63-count window on an empty sheet that **closes once the sheet
-  holds anything at row 64 or deeper**. On such a near-empty sheet it is one Insert (freeze 64,
-  then `count: 1_048_575` → `frozen_rows = 1,048,639`), and the count comes from the selected
-  header run — the same untrusted-selection pattern that caused B2. Repetition makes it *unbounded*
-  rather than merely out of range, and that half tolerates a populated sheet (insert below the data
-  but inside the band): three × `count: 1_000_000` reaches 3,000,001. Either survives save/reopen —
-  the writer emits `ySplit` verbatim and the reader takes it back unchecked. Belongs in the fork on
-  its own `fix/<slug>` branch as one upstream PR, **not** as a FreeCell workaround; FreeCell itself
-  stays bounded because the sheet-cache clamp holds. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)
+  dimension, not the resulting boundary, so the frozen count can end up past the last row of the
+  sheet — and it round-trips, because the writer emits `ySplit` verbatim and the reader takes it
+  back unchecked. Reaching it needs a **near-empty sheet** (with FreeCell's 64-row cap, nothing at
+  row 64 or deeper); on such a sheet it takes one Insert of a near-Select-All header run, or
+  repetition of ordinary ones to push the count arbitrarily high. Any data at row 64 or deeper
+  closes both. The count comes from the selected header run — the same untrusted-selection pattern
+  that caused B2. Belongs in the fork on its own `fix/<slug>` branch as one upstream PR, **not** as
+  a FreeCell workaround; FreeCell itself stays bounded because the sheet-cache clamp holds. The
+  note's measurements are observations at a pinned commit, not an envelope — re-derive before
+  relying on them. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)

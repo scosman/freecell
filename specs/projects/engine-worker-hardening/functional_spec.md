@@ -122,13 +122,20 @@ earlier — become body rows and scroll away. Excel would have grown the band to
 pinned; that is exactly what the model did and the clamp discarded. The change is immediate and
 large, and it is the price of the cap: past 64 rows there is no band to grow into.
 
-*The saved count is unbounded.* IronCalc's boundary adjustment (`base/src/actions.rs:1051`, and
-the column twin at `:725`) has no upper guard, and `insert_rows` range-checks only the
-**populated** dimension — which empty inserted rows do not grow. So the model's count is not
-merely "over the cap": freeze 1 row on a fresh sheet and insert 1,000,000 rows three times and it
-is 3,000,001 on a 1,048,576-row sheet, and it survives save → reopen. FreeCell writes a
-`<pane ySplit>` that is not a row of the sheet it describes, and another application reading that
-file gets a structurally invalid freeze rather than just a larger one.
+*The saved count is unbounded — on a near-empty sheet.* IronCalc's boundary adjustment
+(`base/src/actions.rs:1051`, and the column twin at `:725`) has no upper guard, and `insert_rows`
+range-checks only the **populated** dimension — which empty inserted rows do not grow. So on a
+sheet with nothing at or below the frozen band, the model's count is not merely "over the cap":
+freeze 1 row on a fresh sheet and insert 1,000,000 rows three times and it is 3,000,001 on a
+1,048,576-row sheet, and it survives save → reopen. FreeCell then writes a `<pane ySplit>` that is
+not a row of the sheet it describes, and another application reading that file gets a structurally
+invalid freeze rather than just a larger one.
+
+The near-empty precondition is load-bearing and applies to *every* variant of this: on a sheet
+holding data at or below the band, an insert shifts that data down, `max_row` grows, and the
+range check closes the window. An ordinary populated workbook stays merely over-cap, which is the
+first two costs above and not this one. Details and measurements:
+[`projects/frozen-pane-boundary-overflow.md`](../../../projects/frozen-pane-boundary-overflow.md).
 
 **How the divergence ends.** While the model's count stays *within the sheet* it is genuinely
 self-healing: deletes inside the band bring it down one deleted row at a time, and the boundary

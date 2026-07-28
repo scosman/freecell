@@ -1,22 +1,43 @@
-# Linux `render` — the MANUAL, required-before-merge pixel gate (architecture.md §9).
+# Linux `render` — the pixel gate (architecture.md §9).
 #
 # Renders the real grid over engine-produced scenes under Xvfb + Mesa lavapipe (software
-# Vulkan) and perceptual-diffs each case against a committed baseline. This was SPLIT OUT
-# of the fast `checks` job because software rendering is slow and occasionally flaky, and we
-# don't want it on the every-push critical path. Instead it is a deliberate "final check
-# before merge": trigger it by hand (Actions tab -> "render" -> Run workflow) on the PR's
-# branch once you're ready to merge.
+# Vulkan) and perceptual-diffs each case against a committed baseline. It is SPLIT OUT of the
+# fast `checks` job because software rendering is slow (many minutes), and it is deliberately
+# NOT on the PR path: most PRs cannot move a pixel, and the suite cannot earn its cost on them.
 #
-# BRANCH PROTECTION: because this is the pixel gate, it MUST be a required status check.
-# Add it to branch protection under the EXACT context name `render (Xvfb + lavapipe)` (the
-# job `name:` below). Keep that name stable — renaming it silently drops the requirement.
-# It is `workflow_dispatch`-only, so GitHub will not auto-run it; the merge is gated on a
-# green *manual* run of the current head commit.
+# THREE TRIGGERS, and why (D1 — projects/architecture-review-remediation.md):
 #
-# BOOTSTRAP NOTE: a `workflow_dispatch` workflow's "Run workflow" button (and the trigger
-# itself) only appear once this file exists on the DEFAULT branch (`main`). So the very PR
-# that introduces render.yml cannot dispatch this check on itself — merge it to `main` first
-# (or mark the check non-required temporarily), then it is dispatchable on later PRs.
+#   schedule  — WEEKLY ON `main`. This is the backstop. Before D1 this workflow was
+#               `workflow_dispatch`-only, and in its whole life it ran 29 times across 13
+#               feature branches and ZERO times on `main`, against 44 merged PRs — so `main`
+#               had never been render-verified. A weekly run catches whatever slipped through
+#               merges, at a cadence where a regression is still cheap to bisect. (A scheduled
+#               workflow only ever runs on the default branch, which is exactly what we want.)
+#
+#   workflow_call — invoked by `release.yml`, which makes its packaging jobs `needs:` this.
+#               Nothing ships without a green pixel suite. This is a BLOCKING gate: it adds
+#               the suite's wall-clock to the front of a release, which is an accepted cost on
+#               an infrequent, deliberate operation. See the flake note below for why blocking
+#               is defensible.
+#
+#   workflow_dispatch — unchanged, for the agent-driven case: an agent making a rendering
+#               change runs the relevant subset locally and dispatches the full suite on its
+#               branch when it wants confirmation. What D1 changed is that FORGETTING to do so
+#               no longer means nobody checked.
+#
+# NOT A REQUIRED PER-PR STATUS CHECK. The previous header claimed it "MUST be a required
+# status check" while the trigger made that impossible to satisfy — a dispatch-only workflow
+# reports no context on a PR, so a required check would simply block every merge. Owner
+# decision (2026-07-28): keep it off the PR path entirely. Bump-token, `paths` filter and a
+# per-PR gate were all considered and rejected as ceremony over a weekly backstop.
+#
+# FLAKE, measured rather than assumed: of the 29 dispatched runs, 26 succeeded, 1 was
+# cancelled, and 2 failed — both on the SAME branch on the SAME day, mid-development on a
+# chart-rendering change, i.e. the gate doing its job on genuinely-moved pixels. There is no
+# evidence of lavapipe infrastructure flake in 29 runs, which is what makes blocking a release
+# on it reasonable. If that changes, back the release gate off before weakening the schedule.
+#
+# NOTE: GitHub disables scheduled workflows in a repository with no activity for 60 days.
 #
 # The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
 
@@ -24,9 +45,18 @@ name: render
 
 on:
   workflow_dispatch:
+  workflow_call:
+  schedule:
+    # Weekly on `main`, Sunday 07:17 UTC — off-peak, and off the hour (GitHub's scheduler is
+    # heavily contended at :00, which delays runs).
+    - cron: "17 7 * * 0"
 
+# Keyed by EVENT as well as ref: without the event, a manual dispatch on `main` and the weekly
+# scheduled run share a group and would cancel each other (`cancel-in-progress`), silently
+# eating the backstop. Two dispatches on the same branch still supersede each other, which is
+# what an iterating agent wants.
 concurrency:
-  group: render-${{ github.ref }}
+  group: render-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:

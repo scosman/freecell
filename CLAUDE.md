@@ -124,14 +124,26 @@ FreeCell. This is the standing way of working, not a one-off.
     fixed per-session allowance; `target/` grows large (~25 GB) — deleting stale build dirs
     frees space immediately.
 
-## Render tests — agent-driven (no automatic every-push gate)
+## Render tests — off the PR path, with a weekly backstop
 
-The pixel render suite (Xvfb + Mesa **lavapipe**) is a **manual** gate: it runs only when
-the `render` workflow (`.github/workflows/render.yml`, required-check context
-`render (Xvfb + lavapipe)`) is dispatched — **not** on every push. The fast `checks` job
-compiles render-tests and runs its GPUI-free unit tests, but the actual **pixel diffs are
-not covered automatically**. So the **agent must decide when render coverage is needed and
-drive it** — there is no safety net.
+The pixel render suite (Xvfb + Mesa **lavapipe**) is **deliberately not on the PR path** —
+most PRs cannot move a pixel and the suite is far too slow to earn its cost on them. The fast
+`checks` job compiles render-tests and runs its GPUI-free unit tests, but **diffs no pixels**
+(the pixel cases self-skip without `FREECELL_RENDER`).
+
+`.github/workflows/render.yml` runs on **three** triggers (D1, 2026-07-28):
+
+| Trigger | When | What it's for |
+|---|---|---|
+| `schedule` | **weekly on `main`** | The backstop. Catches what slipped through merges, at a cadence where a regression is still cheap to bisect. |
+| `workflow_call` | **at release** | `release.yml`'s packaging jobs `needs:` it — nothing ships without a green suite. |
+| `workflow_dispatch` | on demand, any branch | **Yours.** Confirming a rendering change before merge. |
+
+**What this means for you:** dispatching is still your job when you change in-scope pixels, and
+the weekly run is a backstop, not a substitute — a regression you merge is found up to a week
+later by someone who has to bisect it. What changed is that forgetting no longer means *nobody*
+checked. It is **not** a required per-PR status check and never was one in practice: a
+dispatch-only workflow reports no context on a PR, so requiring it would just block every merge.
 
 **Scope — what the suite actually covers.** Most render cases are the real `GridView` rendered
 over an engine-driven scene: **cell / row / column / sheet rendering** (text, numbers, fonts,
@@ -174,14 +186,17 @@ If the change **intentionally** alters rendering, regenerate + **eyeball** basel
 Never land a rendering change without either a green local run or refreshed, eyeballed
 baselines.
 
-**2. Validate in CI before merge.** The required truth is the CI `render` gate. For any
-**in-scope** change (grid/cell/sheet or titlebar — see Scope) that could regress or alter
-rendering, get a green CI render run on the branch before merge:
+**2. Validate in CI before merge.** For any **in-scope** change (grid/cell/sheet, titlebar or
+chart-render — see Scope) that could regress or alter rendering, get a green CI render run on
+the branch before merge. The weekly `main` run does not cover you here: it fires after the
+merge, on someone else's watch.
 - **Preferred — the agent triggers it:** dispatch the `render` workflow on the branch
-  (GitHub Actions MCP, or `gh workflow run render.yml --ref <branch>`), poll to completion,
-  confirm it passed. (Dispatchable once `render.yml` is on `main`.)
+  (GitHub Actions MCP `actions_run_trigger` with `workflow_id: render.yml`, or
+  `gh workflow run render.yml --ref <branch>`), poll to completion, confirm it passed.
 - **Fallback:** if the agent can't dispatch, ask the user to kick off `render` and report
   the result back.
+- A run on a **feature branch** uses that branch's `render.yml`, so a change to the workflow
+  itself is testable before merge.
 
 **3. Bake it into plans as its OWN late phase.** When a plan makes **in-scope**
 (grid/cell/sheet or titlebar) rendering changes, put render validation in a **dedicated phase

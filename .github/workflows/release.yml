@@ -11,6 +11,10 @@
 # packaging failure on any of them gates the release. Linux fans out to native x64 AND arm64
 # builds (a runner per architecture). (app/PACKAGING.md).
 #
+# PIXEL GATE (D1): the `render` job below calls .github/workflows/render.yml and every packaging
+# job `needs:` it, so a red pixel diff produces no artifacts at all. The render suite is not on
+# the PR path — it runs weekly on `main` and here. See render.yml's header.
+#
 # The workspace lives in `app/`; the toolchain comes from `app/rust-toolchain.toml`.
 
 name: release
@@ -29,7 +33,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # D1: nothing ships without a green pixel suite. The render suite (Xvfb + lavapipe) is not on
+  # the PR path — it runs weekly on `main` and here, at release. The packaging jobs `needs:` this,
+  # so a red pixel diff means no artifacts are produced at all, rather than artifacts plus a red X
+  # somebody is expected to notice. It costs the suite's wall-clock at the front of a release; on
+  # an infrequent, deliberate operation that is the right trade. See render.yml's header for the
+  # measured flake data behind making this blocking.
+  render:
+    uses: ./.github/workflows/render.yml
+
   macos:
+    needs: render
     name: package (macOS — app + dmg)
     runs-on: macos-14
     steps:
@@ -65,6 +79,7 @@ jobs:
           if-no-files-found: error
 
   linux:
+    needs: render
     name: package (Linux ${{ matrix.arch }} — deb + AppImage)
     runs-on: ${{ matrix.runner }}
     # Build x64 AND arm64 as separate NATIVE builds — one runner per architecture — rather
@@ -133,6 +148,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    needs: render
     name: package (Windows — nsis)
     runs-on: windows-latest
     # Windows is a first-class target: it compiles and packages, so a failure here gates the

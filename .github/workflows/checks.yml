@@ -1,12 +1,15 @@
 # Linux `checks` — the fast required-green gate (architecture.md §9).
 #
 # Runs on every push/PR: format, clippy (-D warnings), full workspace build (freecell-app
-# compiles + links on Linux), workspace tests, and cargo-deny (licenses/advisories, incl.
-# the documented GPL ztracing exception). This job builds AND tests the WHOLE workspace
-# (render-tests included); only the slow, flaky render PIXEL suite (Xvfb + Mesa lavapipe)
-# was split into its own manual gate — see .github/workflows/render.yml. `cargo test
-# --workspace` here still runs render-tests' GPUI-free unit tests (the pixel cases self-skip
-# without FREECELL_RENDER), so the crate stays compiled + covered on every push.
+# compiles + links on Linux), workspace tests, and cargo-deny (licenses/advisories — the GPL
+# ztracing crates are no longer in the graph at all, see deny.toml). This job builds AND tests
+# the WHOLE workspace (render-tests included).
+#
+# It does NOT run the render PIXEL suite. `cargo test --workspace` here compiles render-tests
+# and runs its GPUI-free unit tests, but every pixel case self-skips without FREECELL_RENDER —
+# so the crate stays compiled + covered on every push while no pixel is ever diffed here. The
+# pixel suite is .github/workflows/render.yml: weekly on `main`, blocking at release, and
+# dispatchable on a branch. (An earlier version of this comment implied `checks` covered it.)
 #
 # The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
 

@@ -6,9 +6,16 @@ whole-codebase architecture review.
 Source: an 8-phase fresh-eyes architecture review of `app/` at `e4c7afa` (~99k LOC,
 five crates), run as independent sub-agents over crate boundaries, engine concurrency,
 UI architecture, charts, persistence, testing, and build/shipping posture, plus a
-synthesis verdict. Findings: **22 critical, 55 moderate, 39 mild.** The review
-artifacts live under `reviews/projects/codebase-architecture-review/`, which is
-git-ignored — so this document is written to stand alone.
+synthesis verdict. Findings: **22 critical, 55 moderate, 39 mild.**
+
+The full review — eight phase reports with per-finding `file:line` evidence, plus the
+consolidated summary and verdict — is committed at
+[`reviews/projects/codebase-architecture-review/`](../reviews/projects/codebase-architecture-review/)
+(force-added past `.gitignore` so the detail survives this branch; `reviews/` remains
+ignored for future runs). Start with
+[`phase_8_verdict.md`](../reviews/projects/codebase-architecture-review/phase_8_verdict.md).
+This document nonetheless stands alone — it inlines the load-bearing evidence for every
+unit.
 
 Reviewers were instructed to treat `specs/`, `experiments/`, `GAPS.md` and `CLAUDE.md`
 as evidence of *intent* only, never as justification.

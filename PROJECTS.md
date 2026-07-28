@@ -193,12 +193,14 @@ registry: each entry is a short description plus a pointer to a design note unde
   `engine-worker-hardening` Phase 1 review, 2026-07-28).* IronCalc grows a sheet's frozen boundary
   inside an insert's diff (`base/src/actions.rs:1051`, and the column twin at `:725`) with no upper
   bound. `insert_rows`' range check doesn't help: it bounds the **insert** against the *populated*
-  dimension, not the resulting boundary, so `frozen + count` clears `LAST_ROW` whenever
-  `frozen >= 2`. **Overflow takes one Insert** — freeze 64 (FreeCell's own cap), then
-  `InsertRows { count: 1_048_575 }` gives `frozen_rows = 1,048,639` on a 1,048,576-row sheet — and
-  the count comes from the selected header run, so any run of 1,048,513–1,048,575 headers does it
-  (Select-All exactly is the one size the check rejects). Repetition on an empty sheet makes it
-  *unbounded* rather than merely out of range: three × `count: 1_000_000` reaches 3,000,001. Either
-  survives save/reopen as an invalid `<pane ySplit>`. Same untrusted-selection pattern that caused
-  B2. Belongs in the fork on its own `fix/<slug>` branch as one upstream PR, **not** as a FreeCell
-  workaround; FreeCell itself stays bounded because the sheet-cache clamp holds. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)
+  dimension, not the resulting boundary. The counts that overflow in one insert are exactly
+  `[LAST_ROW - frozen + 1, LAST_ROW - max_row]` — non-empty only while `frozen > max_row`, so with
+  FreeCell's 64-row cap it is a 63-count window on an empty sheet that **closes once the sheet
+  holds anything at row 64 or deeper**. On such a near-empty sheet it is one Insert (freeze 64,
+  then `count: 1_048_575` → `frozen_rows = 1,048,639`), and the count comes from the selected
+  header run — the same untrusted-selection pattern that caused B2. Repetition makes it *unbounded*
+  rather than merely out of range, and that half tolerates a populated sheet (insert below the data
+  but inside the band): three × `count: 1_000_000` reaches 3,000,001. Either survives save/reopen —
+  the writer emits `ySplit` verbatim and the reader takes it back unchecked. Belongs in the fork on
+  its own `fix/<slug>` branch as one upstream PR, **not** as a FreeCell workaround; FreeCell itself
+  stays bounded because the sheet-cache clamp holds. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)

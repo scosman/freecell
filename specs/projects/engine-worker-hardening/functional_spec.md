@@ -7,7 +7,9 @@ status: complete
 Scope, behaviour and contracts for the four units in
 [`project_overview.md`](project_overview.md). Nothing here is user-facing *feature* work — three
 of the four units are invisible when they work. The observable surface is limited to two new
-error paths (F1, F2) and one changed event *ordering* (F5).
+error paths (F1, F2) and F4's one moved counter — a chart-only op now bumps the generation it
+announces. (An earlier draft of this line promised a changed event *ordering*, citing a
+non-existent "F5". No event's order or payload changes; see §F4.2.)
 
 ---
 
@@ -376,8 +378,10 @@ After this project, the following is true and testable:
 
 Note the direction: a surface may legitimately run **ahead** of the committed generation; what is
 forbidden is a surface running **behind** it. That is what a reader can act on, and it is what the
-ordering tests assert. Two writers sit outside the commit point on purpose, and both are
-forward-only:
+ordering tests assert.
+
+**Every writer of these four surfaces, and why each leaves the invariant standing.** Two sit
+outside the commit point inside the worker, on purpose, and both are forward-only:
 
 - **The load path.** Before the worker's loop starts, `load_and_run` seeds the publication, the
   active sheet's style cache and the CF map, and announces them with `Loaded` +
@@ -393,19 +397,49 @@ forward-only:
   the committed cache — it never rewinds the cache to a pre-commit state. So the cache runs at or
   ahead of the committed generation, which is legal, and never behind it.
 
+Two more live **outside the engine crate**, and are named here so this is a completeness claim
+rather than a scoped one:
+
+- **`DocumentClient::set_chart_snapshot`** stores a snapshot straight into the shared swap. It is
+  `#[cfg(feature = "test-support")]` and exists only so a headless window/view test can drive the
+  seam-fed chart install with no worker running — so there is no committed generation to be behind.
+- **`GridView::autogrow_measure_now`** (`freecell-app`) takes a write lock on the very
+  `Arc<RwLock<SheetCaches>>` the worker owns and writes measured wrap row heights into it. It is a
+  `pub fn` with **no** `cfg` gate — a real gap in the fence rather than a compile-time-impossible
+  one — but its only caller anywhere is the pixel render harness (`render-tests/src/render.rs`),
+  which renders a single static frame over a shut-down worker. It writes the same forward-only
+  geometry as wrap auto-grow above (and skips already-overridden rows), so the invariant survives.
+  Listed because a completeness claim a reviewer is asked to check has to name it.
+
 ### F4.2 What changes observably
 
-Event **ordering**, and only ordering:
+**Not the order of the events.** An earlier draft of this section promised that
+`StyleCacheUpdated` and `CondFmtUpdated` would arrive *before* their batch's `Published`. They do
+not, and they never did: every pre-project publishing site emitted `Published` first and the
+surface deltas after it — `run.rs` carried the comment *"Ordered after `Published` (unchanged event
+order)"* on that very line — and `commit`'s announce phase emits them in exactly the same order
+(`Published`, then `StyleCacheUpdated`, then `CondFmtUpdated`, then `SheetsChanged`; §A5.1's
+pseudocode always showed this, and `commit_emits_nothing_before_the_bump` pins it). **No event
+moved.** What moved is the *writes*.
 
-- `StyleCacheUpdated` and `CondFmtUpdated` for a batch now arrive **before** that batch's
-  `Published`, not after. (The surfaces are all already written by then; the events are pure
-  announcements.)
-- A chart-only op (insert / delete / move / resize / retype / re-range a chart) now bumps the
-  generation and republishes, instead of emitting `Published` with the counter standing still.
-  The UI already re-reads everything on `Published`, so the visible result is unchanged — but
-  the event stops lying.
+- **The surface writes now precede the bump, and therefore precede every announcement.** All four
+  surfaces are written before the single `Release` store of `generation`. Previously the value
+  commit stored the publication, bumped, emitted `Published`, and only *then* wrote the style cache
+  and the CF map — so `Published` announced a generation whose other surfaces were still being
+  assembled, and a reader sampling in that window saw generation-N values against
+  generation-(N−1) styles. Each event still follows its own surface's write, exactly as before;
+  what is new is that it also follows *all* of them.
+- **A chart-only op moves the counter.** Insert / delete / move / resize / retype / re-range a
+  chart used to emit `Published` with `Shared::generation` standing still. It now goes through the
+  commit, so the counter it announces actually advances. This is the one change a caller can read
+  off an API (`DocumentClient::generation()`); the UI already re-reads everything on `Published`,
+  so nothing on screen differs — the event just stops lying.
+- **A sheet activation coalesced with an edit publishes the right cells.** Such a batch used to
+  build the newly activated sheet's style cache *after* publishing, and the publication reads that
+  sheet's frozen-band counts off exactly that cache — so a frozen band came up empty until
+  something else republished. Both now ride the batch's one commit (§A5.1).
 
-No event is added or removed. No event's payload changes. Nothing the UI *reads* changes shape
+No event is added, removed, reordered or re-payloaded. Nothing the UI *reads* changes shape
 — `Publication`, `SheetCaches` and the CF map are untouched; `ChartSnapshot` gains one
 additive field (§F4.3) and keeps `version` with its exact current meaning.
 
@@ -468,4 +502,5 @@ from. The UI does not read it today; the ordering tests do.
   blocking `recv`, zero engine calls on the render path (the process-global counter with its
   negative control still guards that and must stay green).
 - **Behaviour freeze.** Phases 1–3 change no observable behaviour beyond F1's and F2's new
-  error paths. Phase 4 changes event ordering, and only ordering.
+  error paths. Phase 4 changes **no event's order or payload**: it moves the surface *writes* ahead
+  of the generation bump, and makes a chart-only op bump the counter it announces (§F4.2).

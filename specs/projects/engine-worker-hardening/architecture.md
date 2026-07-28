@@ -652,11 +652,10 @@ lists. That is the entire refactor: the work each does is unchanged, the emissio
 
 ### A5.2 Chart staging
 
-`reresolve_charts` already runs before `publish` at every site, and it must stay there — it
-reads the post-edit model to recompute chart values, so it belongs with the other staging. It
-keeps its current job (re-resolve, bump `version` iff something changed, store the snapshot).
-
-`reresolve_charts` does **not** store the snapshot itself; it calls `mark_charts_changed()`, and
+`reresolve_charts` already runs before the publication is staged at every site, and it must stay
+there — it reads the post-edit model to recompute chart values, so it belongs with the other
+staging. It keeps its job of re-resolving and bumping `version` iff something changed, but it does
+**not** store the snapshot: it calls `mark_charts_changed()`, and
 `commit` then calls `stamp_chart_snapshot(generation)`, which is the worker's **only** writer of
 `shared.chart_snapshot`. When the flag is set it builds the payload fresh from the live bindings and
 stamps it with `generation`; otherwise it re-stores the resident payload under the new generation —
@@ -724,10 +723,18 @@ build taken, if the resident publication is for a different sheet — belt-and-b
 `ensure_all_charts_discovered` runs from inside `save_workbook`. Committing there is correct
 (the snapshot really did change) and harmless (the save has not written anything yet). One
 consequence to name rather than discover: that call sits inside the **B1 save `catch_unwind`**, so
-the commit's publish path now runs under that guard too. An IronCalc panic in
-`build_publication` / `formatted_value` there surfaces as a `SaveError::EnginePanic` (and counts
-toward degrading the worker) instead of as a publish-path panic. Not a new panic source — every
-other publishing path already runs it unguarded — only a different label on the report.
+whatever the commit does now runs under that guard.
+
+Measured rather than assumed: on this path the commit makes **no engine call at all**. It is a
+`chart_only()` commit, so nothing is refreshed or rebuilt, `sheets_before` is `None` (so not even
+`sheet_metas()` runs), and `stage_publication` takes the restamp branch — unconditionally here,
+because `publication.sheet == active_sheet` is an invariant (`active_sheet` is only ever assigned in
+`load_and_run` and in the `SetViewport` routing arm, and every `SetViewport` commits). So the guard's
+blast radius is unchanged in practice; only the *fallback* `build_publication` would put
+`formatted_value` under the save guard, and that fallback is unreachable given the invariant. The
+conservative framing is kept because the fallback is real code: if it ever ran, an IronCalc panic in
+it would report as a `SaveError::EnginePanic` (and count toward degrading the worker) rather than as
+a publish-path panic.
 
 ### A5.4 The call sites
 
@@ -739,7 +746,7 @@ other publishing path already runs it unguarded — only a different label on th
 | `commit_replacements` (`:1236`) | ditto | one `commit` |
 | `commit_paste` (`:1563`) | ditto (+ `Pasted` after) | one `commit`, then `Pasted` |
 | `apply_set_font` (`:1708`) | publish, emit, refresh | one `commit` |
-| `ensure_sheet_charts_discovered` (`:2346`) | store snapshot, emit | store snapshot, `commit` |
+| `ensure_sheet_charts_discovered` (`:2346`) | store snapshot, emit | `mark_charts_changed`, then `commit(StagedCommit::chart_only())` — the snapshot store belongs to `commit` (§A5.2) |
 | `ensure_all_charts_discovered` (`:2411`) | ditto | ditto |
 | `commit_chart_op` (`:2932`) | ditto | ditto |
 | `ensure_active_cache_built` on sheet switch (`:631-636`) | build cache, emit | folded into the batch's `commit` — including a batch that coalesces the activation with an edit (`ensure_active_cache` rides that batch's `StagedCommit`) |
@@ -763,8 +770,9 @@ Two new tests in `worker_seam.rs`, both following `publish_before_bump_never_sho
 shape — a spinning reader thread, a violation counter, and a **non-zero sample assertion** so the
 test cannot pass by never observing the interleaving.
 
-**`all_surfaces_agree_at_a_generation`.** The reader loop, while the writer drives 200 edits that
-each touch values *and* styles *and* a bound chart on a CF sheet:
+**`all_surfaces_agree_at_a_generation`.** The reader loop, while the writer drives `ROUNDS` = 24
+serialized edits (one per commit — the loop awaits each round's `Published` so a coalesced batch
+cannot collapse several rounds into one generation):
 
 ```
 let gen  = client.generation();
@@ -783,15 +791,22 @@ Assertions: `violations == 0`, `samples > 0`, **and `advanced > 10`** — the la
 non-vacuity guard the overview asks for. A reader that never saw the counter move proves
 nothing, so the test fails rather than passing quietly.
 
-The style surface needs a generation-comparable value. The fixture makes each edit set the cell's
-text to `i` *and* its fill to a colour derived from `i`, so "the style cache is behind the
-publication" is directly observable as a fill that disagrees with the published text. That is
-the concrete form of the split-brain E1 describes, and it is what the test catches.
+The style surface carries no generation of its own, so it needs a generation-comparable value. Each
+round is a **number-format** edit: `SetStylePath { path: NumFmt, value: decimals(i) }` on A1, where
+`decimals(i)` has exactly `i` decimal places. One command moves the published display text of the
+seeded `1` (to `"1."` + `i` zeros) *and* the cached `num_fmt` code together, in one commit, and both
+encode `i` directly — so "the style cache is behind the publication" is directly observable as a
+decimal count that disagrees with the published text. A count that only ever grows makes "behind"
+checkable. That is the concrete form of the split-brain E1 describes, and it is what the test
+catches. (An earlier draft of this paragraph described a *fill colour* and "200 edits" — neither
+was ever the fixture, and the fill story contradicted this section's own description of the
+number-format assertion.) The workbook carries no chart and no CF rules; the chart snapshot is still
+checked, as an empty payload restamped by every commit.
 
-**`a_chart_op_bumps_the_generation`.** Send a chart op, await `Published`, assert
+**`a_chart_op_bumps_the_generation_it_announces`.** Send a chart op, await `Published`, assert
 `client.generation()` strictly increased and `chart_snapshot().generation == client.generation()`.
-This is the regression test for `commit_chart_op` — under today's code it fails, because the
-counter does not move.
+This is the regression test for `commit_chart_op` — against the pre-project code it fails, because
+the counter does not move.
 
 A third, cheap unit test in `run.rs` — `commit_emits_nothing_before_the_bump` — is the direct
 statement of the contract in A5.1, asserted **at the store itself**. `commit` fires a `#[cfg(test)]`
@@ -854,7 +869,7 @@ planned; if a phase turns out to alter published content, the relevant `render_t
 | Risk | Mitigation |
 |---|---|
 | The `pub(super)` field widening in A4.2 invites future coupling | It is confined to `mod worker` (three files). `Worker` itself stays `pub(super)`, so the type is invisible outside the module. |
-| Reordering `StyleCacheUpdated` before `Published` breaks a test asserting the old order | Surveyed: every affected test uses `.any(..)` over a drained event vector, not positional matching. Checked at `run.rs:4882, 5041, 6623, 7673, 8700` and `worker_seam.rs:635, 670`. |
+| Reordering `StyleCacheUpdated` before `Published` breaks a test asserting the old order | **Did not arise — no event moved.** The premise was wrong: every pre-project site already emitted `Published` first and the surface deltas after it, and `commit`'s announce phase reproduces that order exactly (§F4.2). The survey behind this row — every affected test uses `.any(..)` over a drained event vector, not positional matching, checked across `run.rs` and `worker_seam.rs` at the time — still holds and is now belt-and-braces; `commit_emits_nothing_before_the_bump` pins the order positively. |
 | Chart ops now republish, perturbing a chart-op perf path | `set_chart_anchor` was verified during Phase 4 to fire on drop, not per drag frame — but `SetChartChrome` is sent **live per keystroke** (`chrome/view.rs::on_chart_title_event`), so "a chart op is a discrete gesture" does not hold and a `build_publication` per op was the wrong trade. Resolved rather than absorbed: a chart op commits with `values_unchanged`, re-stamping the resident publication (A5.3) — no engine work per op. |
 | The load/save panic injection needs `test-support` surface that leaks | Both hooks are `#[cfg(feature = "test-support")]` / `#[cfg(test)]`, matching the existing `Command::TestPanic` precedent. If the surface grows beyond the bug, the seam test is dropped and the unit test of the guard stands alone — stated, not silently skipped. |
 | The frozen cap rejects a freeze a real user wanted | 64 rows is ~2/3 of a 4K display's visible rows and ~20× a normal header freeze. The rejection names the cap and the request, so it is self-explaining rather than mysterious. |

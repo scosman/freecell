@@ -815,14 +815,18 @@ impl Worker {
             // `loaded_anchor_edits`, `loaded_deletes`) are the last statements before `Ok`, after
             // every fallible step, so those cannot be half-applied.
             //
-            // What E1 added to this guard's blast radius, so the misattribution isn't a surprise:
-            // that sweep now `commit`s (it used to just emit `Published`), so `build_publication` /
-            // `formatted_value` run INSIDE this `catch_unwind`. An IronCalc panic in the publish
-            // path therefore surfaces as a `SaveError::EnginePanic` and counts toward degrading the
-            // worker, rather than as a publish-path panic. The commit is still the right thing to do
-            // — the snapshot really did change, and the save has written nothing yet — and the
-            // publish path is not a new panic source (every other publishing path already runs it
-            // unguarded); only the label on a panic that reaches the user changes.
+            // What E1 put under this guard, stated at its real size: that sweep now `commit`s (it
+            // used to just emit `Published`), so the commit runs inside this `catch_unwind`. In
+            // practice that adds nothing — it is a `chart_only()` commit, so no refresh, no
+            // rebuild, `sheets_before: None` (not even a `sheet_metas()` call), and
+            // `stage_publication` takes the restamp branch, which it always does here:
+            // `publication.sheet == active_sheet` is an invariant (`active_sheet` is assigned only
+            // in `load_and_run` and the `SetViewport` routing arm, and every `SetViewport` commits).
+            // So no engine call reaches this guard on this path. Only the *fallback*
+            // `build_publication` would, and it is unreachable given that invariant — but it is
+            // real code, so: if it ever ran, an IronCalc panic in `formatted_value` would report as
+            // a `SaveError::EnginePanic` and count toward degrading the worker, rather than as a
+            // publish-path panic. Named so the misattribution wouldn't be a surprise.
             let outcome = catch_unwind(AssertUnwindSafe(|| self.save_workbook(&path)));
             match outcome {
                 Ok(Ok(())) => self.emit(WorkerEvent::Saved {
@@ -2528,8 +2532,12 @@ impl Worker {
     ///   the committed cache; it never rewinds the cache to a pre-commit state. So the cache runs at
     ///   or ahead of the generation — legal — and never behind it.
     ///
-    /// (`DocumentClient::set_chart_snapshot` also stores a snapshot, but it is
-    /// `#[cfg(feature = "test-support")]` and only ever used by worker-less headless view tests.)
+    /// That enumeration is of **this crate**. Two writers of the same surfaces live outside it —
+    /// `DocumentClient::set_chart_snapshot` (`#[cfg(feature = "test-support")]`, worker-less view
+    /// tests) and `freecell_app::grid::GridView::autogrow_measure_now` (an ungated `pub fn` driven
+    /// only by the pixel render harness, over a shut-down worker, writing forward-only row
+    /// geometry). Both leave the invariant standing; `functional_spec.md` F4.1 lists all four in
+    /// one place.
     ///
     /// `commit_emits_nothing_before_the_bump` asserts step 3 at the store itself, via the
     /// `#[cfg(test)]` `COMMIT_STORE_PROBE` hook — and asserts step 1 there too, which is the half
@@ -2636,9 +2644,11 @@ impl Worker {
     /// already built — no engine call at all.
     ///
     /// The restamp is skipped (and a full build taken) if the resident publication is for another
-    /// sheet — belt-and-braces: `process_batch` handles `SetViewport` and commits the activation
-    /// before any chart op runs, so the resident publication already describes the active sheet and
-    /// its window.
+    /// sheet. That is belt-and-braces, not a live branch: `publication.sheet == active_sheet` is an
+    /// invariant — `active_sheet` is assigned only in `load_and_run` (which seeds the publication
+    /// immediately after) and in `process_batch`'s `SetViewport` arm (which always commits, before
+    /// any chart op in the same batch runs), so the resident publication always describes the active
+    /// sheet and its current window.
     fn stage_publication(&self, generation: u64, values_unchanged: bool) {
         let started = Instant::now();
         let current = self.shared.publication.load();

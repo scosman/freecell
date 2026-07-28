@@ -48,7 +48,6 @@ use gpui::{
     Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::checkbox::Checkbox;
 use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::spinner::Spinner;
@@ -66,8 +65,7 @@ use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
     effective_range, region_at, regions_intersecting, Align, CellKind, CellRange, CellRef,
-    CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind,
-    CfValueOp, RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
+    CfPreview, CfRuleView, RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -79,7 +77,7 @@ use freecell_engine::{
     WorkerEvent,
 };
 
-use super::cond_fmt::{CfEditorKind, CfEditorState, CondFmtPanel};
+use super::cond_fmt::CondFmtPanel;
 use super::h_scroller::{h_scroller, HScroller};
 use super::sidebar::{docked_sidebar, section};
 use super::{

@@ -87,7 +87,7 @@ lines). It is split at a real seam, not an arbitrary line number: the **sidebar*
 close, refresh, re-scope, the rules list, per-row raise/lower/delete) versus the **rule
 editor** (the modal editing state, its operand/format/scale controls, validation, and save).
 These are separate features in `components/cf_sidebar.md` — they shipped as separate phases
-(P4/P5 vs P6) and have separate test banner sections.
+(P4/P5 vs P6/P7) and have separate test banner sections.
 
 ### 3.2 Naming
 

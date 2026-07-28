@@ -347,9 +347,9 @@ pub(super) fn two_sheets(cx: &mut TestAppContext) -> Harness {
     )
 }
 
-/// A published CF rule row with a chosen storage `index`, `summary`, editability, and preview.
-/// `priority` is irrelevant to rendering (the client publishes the list already priority-sorted;
-/// the row order is the vec order), so it is fixed at 0.
+/// A published rule row with a chosen storage `index`, `summary`, editability, and preview.
+/// `priority` is irrelevant to rendering (the client publishes the list already
+/// priority-sorted; the row order is the vec order), so it is fixed at 0.
 pub(super) fn cf_view(
     index: u32,
     range: &str,

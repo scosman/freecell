@@ -1,6 +1,6 @@
 //! The conditional-formatting sidebar's **Editor mode** (`components/cf_sidebar.md §3, §5–§8`,
-//! P6): the rule editor's seeded inputs and inline dropdowns, the per-kind operands, the format
-//! editor, the colour-scale stop editor, and validation + save.
+//! P6/P7): the rule editor's seeded inputs and inline dropdowns, the per-kind operands, the
+//! format editor (P6), the colour-scale stop editor (P7), and validation + save.
 //!
 //! Opened from the rules list in [`super::cf_sidebar`], which is the same panel's other mode;
 //! the two are separate files because together they exceed the 2,000-line production ceiling
@@ -9,6 +9,14 @@
 
 use super::cf_sidebar::{cf_color, CF_SWATCH_H, CF_SWATCH_W};
 use super::*;
+
+use gpui_component::checkbox::Checkbox;
+
+use freecell_core::{
+    CfColorStop, CfFormat, CfPeriod, CfRuleSpec, CfTextOp, CfThresholdKind, CfValueOp,
+};
+
+use crate::chrome::cond_fmt::{CfEditorKind, CfEditorState};
 
 /// The tint behind an open CF-editor inline dropdown's option list (a faint grey wash so the
 /// expanded options read as a group under their trigger).

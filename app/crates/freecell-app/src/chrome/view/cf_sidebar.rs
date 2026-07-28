@@ -1,6 +1,7 @@
-//! The conditional-formatting sidebar's **List mode** (`components/cf_sidebar.md §5`, P4/P5):
-//! opening, closing, re-scoping and refreshing the right-docked panel, the rules list, and each
-//! row's preview swatch and raise / lower / delete controls.
+//! The conditional-formatting sidebar's **List mode** (`components/cf_sidebar.md §2, §4–§5`,
+//! P4/P5): opening, closing, re-scoping and refreshing the right-docked panel — including its
+//! mutual exclusion with the chart panel — the rules list, and each row's preview swatch and
+//! raise / lower / delete controls.
 //!
 //! The rule **editor** the rows open is [`super::cf_editor`] — the same panel's other mode,
 //! split out because the two together exceed the 2,000-line production ceiling
@@ -24,8 +25,12 @@ const CF_BADGE_BG: u32 = 0xEDEDED;
 /// pixel clicks, and [`render_cf_row`](ChromeView::render_cf_row) derives its `.disabled(...)`
 /// flags from the same source.
 pub(super) struct CfRowControls {
-    pub(super) move_up: bool,
-    pub(super) move_down: bool,
+    move_up: bool,
+    move_down: bool,
+    // `edit` and `delete` alone are read outside this file (`cf_editor`'s tests); the other two
+    // are local, so they stay private — `chrome-view-split/functional_spec.md` §5 item 1: widen
+    // only where the compiler demands it. (This comment is itself a deliberate exception to
+    // `architecture.md` §4 rule 4, recorded in that project's `findings.md` §6e.)
     pub(super) edit: bool,
     pub(super) delete: bool,
 }

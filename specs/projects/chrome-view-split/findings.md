@@ -110,13 +110,14 @@ used by only one child get moved into that child. This is checked per-phase prec
 it accumulates silently otherwise." That check was never run during the original pass. The
 phase-2 code review caught three instances; sweeping the whole block found the scale.
 
-At the point the phase-2 review landed, `mod.rs` imports **116** names. Of those, **45 are
-consumed by exactly one child** and belong in that child per §3.3; **32 are consumed by two or
-more** and correctly stay (`ClickEvent` and `Command` reach eight children each, `Button` seven,
-`WorkerEvent` five in code and six counting `formatting.rs`'s intra-doc link — duplicating
-those into eight files would be strictly worse than the glob, which is what the shared block is
-*for*); the remaining 38 `mod.rs` uses itself, plus the one `pub use` re-export
-(`ChartPanelSeries`), which is already in its child and cannot move.
+At the point the phase-2 review landed, `mod.rs` imports **120** names — 116 by name plus the
+four `as _` traits noted below. Of those, **45 are consumed by exactly one child** and belong in
+that child per §3.3; **32 are consumed by two or more** and correctly stay (`ClickEvent` and
+`Command` reach eight children each, `Button` seven, `WorkerEvent` five in code and six counting
+`formatting.rs`'s intra-doc link — duplicating those into eight files would be strictly worse
+than the glob, which is what the shared block is *for*); the remaining 38 `mod.rs` uses itself,
+plus the one `pub use` re-export (`ChartPanelSeries`), which is already in its child and cannot
+move.
 
 **The sweep has one trap, and it caught the first attempt.** `mod.rs`'s own module doc contains
 intra-doc links — `` [`validate_sheet_name`] ``, `` [`DataRow`] `` — and a scan that treats the
@@ -134,6 +135,11 @@ example: it resolves only through the glob and would break if `WorkerEvent` move
 `` `WorkerEvent::CondFmtUpdated` `` code span, as in `cf_sidebar.rs`, is *not* a consumer —
 that distinction is the difference between six and seven.
 
+A second trap, for anyone automating the "assert nothing has zero consumers" check: the four
+trait imports brought in `as _` (`ButtonVariants`, `Disableable`, `Selectable`, `Sizable`) have
+no name in code *by construction*, so a name-based scan reports them as consumer-less every
+time. They need an explicit carve-out or the assertion fires spuriously.
+
 The reason it accumulates invisibly is worth stating: a child's `use super::*;` re-globs
 `mod.rs`'s private imports, so every orphan still resolves and `clippy -D warnings` stays
 green. There is no latent build failure and nothing is dead — a sweep found **zero** names with
@@ -147,10 +153,11 @@ Mild.
 | 2 | `format_stat_count`, `format_stat_value` → `stats.rs`; `close_button` → `find.rs` |
 | 3 | `CursorStyle`, `MouseMoveEvent`, `MouseUpEvent`, `validate_sheet_name` → `tabs.rs` |
 | 4 | `AnchorCell`, `ChartAnchor`, `ChartAxisKind`, `ChartChromeEdit`, `DataLabelToggles`, `LegendPosition`, `limits` → `charts.rs` |
+| 5 | `Checkbox`, `CfColorStop`, `CfFormat`, `CfPeriod`, `CfRuleSpec`, `CfTextOp`, `CfThresholdKind`, `CfValueOp`, `CfEditorKind`, `CfEditorState` → `cf_editor.rs` |
 
-That leaves **34**, created by phases 5–8 and moving with those phases' reviews: 10 to
-`cf_editor.rs` (P5), 15 to `formatting.rs` (P6), 8 to `editing.rs` (P7), 1 to `shell.rs` (P8).
-`charts.rs`, `cf_sidebar.rs`, `find.rs`, `stats.rs` and `tabs.rs` are now clear. Landing them
+That leaves **24**, created by phases 6–8 and moving with those phases' reviews: 15 to
+`formatting.rs` (P6), 8 to `editing.rs` (P7), 1 to `shell.rs` (P8). `cf_editor.rs`,
+`cf_sidebar.rs`, `charts.rs`, `find.rs`, `stats.rs` and `tabs.rs` are now clear. Landing them
 all in one commit labelled for an earlier phase would destroy exactly the per-phase attribution
 §4.1 exists to protect.
 
@@ -176,10 +183,11 @@ are unchanged by the move.
 Left alone deliberately: fixing them is a doc change to items this project only relocates, and
 CI has no `cargo doc` gate. Worth a follow-up sweep for whoever adds one.
 
-## 6c. Two items were left behind by the phase that should have taken them
+## 6c. Three items did not land where the plan put them
 
-Both were caught later and are correct at HEAD; recorded so the per-phase diffs aren't read as
-tidier than they were.
+All three are recorded so the per-phase diffs aren't read as tidier than they were. The first
+two were relocated later and are where the plan wanted them at HEAD; the third was deliberately
+left where it landed, and the plan is what's out of date.
 
 - **`impl ChartPanel`** (holding the `#[cfg(test)] skeleton` constructor) stayed in `mod.rs`
   when P4 moved `ChartPanel` and `ChartPanelSeries`, leaving an inherent `impl` for a type its
@@ -188,9 +196,82 @@ tidier than they were.
   225–288 lists the `impl` alongside the two structs. Moved to `charts.rs` in P8 (`3475998`).
 - **`set_degraded`** drifted into `formatting.rs` in P6 and returned to `shell.rs` in P8 — see
   §3.
+- **`CF_SWATCH_W`, `CF_SWATCH_H`, `CF_BADGE_BG`** landed in `cf_sidebar.rs`, though
+  `architecture.md` §2.1 and §7.3 both assign the `CF_*` constants to `cf_editor.rs`. Left as
+  built — they exist for `render_cf_preview`, which is the sidebar's — but it is why
+  `cf_editor.rs` carries a cross-child `use super::cf_sidebar::{cf_color, CF_SWATCH_H,
+  CF_SWATCH_W}` that §7.3 doesn't predict.
 
-Both share a cause: the cut was driven by a banner section's extent rather than by the item
-list in §7, and a banner's extent changes as earlier phases remove the sections around it.
+The first two share a cause: the cut was driven by a banner section's extent rather than by the
+item list in §7, and a banner's extent changes as earlier phases remove the sections around it.
+The third is a different miss — the §7 mapping was simply not followed for three scalars whose
+doc comments point at the sidebar's preview swatch, and on review the constants are where they
+belong and §7 is what's wrong. Two lessons, then: cut from §7's item list rather than from
+whatever a banner happens to enclose at the time, and when the code disagrees with the mapping,
+check which one is right before moving anything.
+
+## 6d. Five of the ten child files break source order once; five don't
+
+`architecture.md` §4 rule 2 says items arrive in a module in the order they appeared in
+`view.rs`, so a reviewer can read the new file top-to-bottom and get the old file's sequence.
+Measured by anchoring every item to its definition line in the baseline and counting descents:
+
+| Child | Seams | Where |
+|---|---:|---|
+| `charts.rs`, `editing.rs`, `find.rs`, `stats.rs`, `tabs.rs` | 0 | — |
+| `cf_sidebar.rs` | 1 | `render_cf_preview` (8189) → `cond_fmt_open` (2298) |
+| `cf_editor.rs` | 1 | `cf_state_from_spec` (8050) → `cf_editor_open` (2420) |
+| `formatting.rs` | 1 | `format_size_pt` (4070) → `toggle_style` (1902) |
+| `shell.rs` | 1 | `backdrop` (5312) → `focus_handle` (4083) |
+| `test_support.rs` | 1 | `two_sheets` (14131) → `cf_view` (9935) |
+
+So **at most one** seam per file, not exactly one — and they are three different things, which
+matters if you are using this as a checklist:
+
+1. **Free items hoisted above the `impl`** (`cf_sidebar`, `cf_editor`, `formatting`) — the CF
+   free functions and the border-icon helpers sat *after* the impls in source. A file that put
+   free helpers 1,700 lines down would be worse, so the house shape wins.
+2. **Trait impls grouped after the inherent impl** (`shell`) — `impl Focusable`/`impl Render`
+   sat between the two original `impl ChromeView` blocks.
+3. **Late-arriving shared fixtures appended** (`test_support`) — the four helpers that phases
+   2/3/5 discovered to be cross-domain land after phase 1's harness, in phase order.
+   `architecture.md` §3.4 anticipated this.
+
+Not a defect in any case, but §4 rule 2 should be read as "within each block", and a reviewer
+diffing ranges should expect at most one seam and know which kind to expect where.
+
+## 6e. One deliberate exception to "body bytes are identical"
+
+`architecture.md` §4 rule 4 allows a moved item exactly two edits: a `pub(super)` prefix and
+whatever `cargo fmt` does. `cf_sidebar.rs`'s `CfRowControls` now carries four added `//` lines
+explaining why `edit`/`delete` are `pub(super)` while `move_up`/`move_down` are not.
+
+That is a rule-4 violation, and it landed in the same change that *restored* a doc comment for
+breaching the same rule (§6f). Kept anyway, for one reason: mixed visibility across a four-field
+POD reads as an oversight without it, and the next reader's instinct is to "fix" it by widening
+the other two — which is the exact over-widening review caught twice (here and `BodyStub` in
+P1). A comment that prevents a regression is worth more than byte-parity on a four-line struct.
+
+Recorded rather than left silent, because the value of rule 4 is that deviations are declared.
+
+## 6f. Two doc comments were edited during moves, both reverted
+
+`functional_spec.md` §5 permits `//!` module headers only; `architecture.md` §4 rule 1 says
+"never reflow a doc comment". Two moved items breached it, and neither was caught by a gate —
+only by review:
+
+- **P3** added a `///` to `two_sheets`, which had none. Reverted in `de47ded`.
+- **P5** reworded and re-wrapped `cf_view`'s ("A published rule row" → "A published **CF** rule
+  row"). Not rustfmt: `wrap_comments` is off, and the de-dent onto file scope can only shorten
+  lines, never force a rewrap.
+
+Both restored byte-for-byte. A comment-parity sweep of all eleven files against the baseline's
+comment set then found no others, so these were the only two.
+
+Worth naming because this is the one class of edit that defeats machine verification: to a
+normalised byte-comparison that strips comments, a reworded comment is invisible; to one that
+doesn't, it is indistinguishable from a deliberate change. The check that caught both was a
+comment-set diff against the pre-split file — worth running once per phase in any future split.
 
 ## 7. Three test leaf names are duplicated crate-wide
 
@@ -202,7 +283,7 @@ disambiguate), and noted only because the verification tripwire compares leaf-na
 ## 8. Files still over the F2 ceiling
 
 F2 will add a CI check at 2,000 **production** lines. Every file this project produced is
-under it (largest: `cf_editor.rs` at 1,786). A workspace-wide survey at the same commit finds
+under it (largest: `cf_editor.rs` at 1,794). A workspace-wide survey at the same commit finds
 **five** files that are not:
 
 | Production | Total | File | Owner |
@@ -219,7 +300,7 @@ Two things F2 should decide before it lands, neither of which this project can s
   with no `#[cfg(test)]` inside it — the whole file *is* the test. A rule that excludes
   `#[cfg(test)]` blocks but not `tests/` directories will flag it. Same for
   `view/test_support.rs` here (370 lines on this table's `wc -l`+1 convention, entirely a
-  `#[cfg(test)]` module, but the attribute
-  is on the `mod` declaration in the parent, not in the file).
+  `#[cfg(test)]` module, but the attribute is on the `mod` declaration in the parent, not in
+  the file).
 - **`grid/view.rs` at 6,575 needs its own unit before F2 can be enforced**, or an exemption.
   Filed as `projects/grid-view-split.md`.

@@ -1167,26 +1167,33 @@ impl WorkbookWindow {
     }
 
     /// Drops every piece of window state that is waiting for a reply the worker can no longer
-    /// send, and stands down any quit that is waiting on *this* window
+    /// send, and — if a quit is waiting on *this* window — stands that quit down
     /// (`functional_spec.md F2.3`).
     ///
     /// The close/quit follow-up is the load-bearing part. `close_after_save` fires only from the
     /// `Saved` arm and `pending_save_req` is only ever cleared by `Saved`/`SaveFailed`, so with the
-    /// worker gone both would stay armed forever: the window would never close and
-    /// `advance_quit` would sit on a prompt that can never resolve. `note_prompt_cancelled` aborts
-    /// the **whole** quit, not just this window's step — the same choice
+    /// worker gone both would stay armed forever: the window would never close and `advance_quit`
+    /// would sit on a prompt that can never resolve.
+    ///
+    /// The stand-down goes through [`note_quit_prompt_unanswerable`], **not** the unscoped
+    /// [`note_prompt_cancelled`] the user-driven paths use. A worker death is not a user gesture:
+    /// it can happen in a window the quit never included, and aborting the whole quit from there
+    /// would switch it off underneath the window actually being prompted. When the plan *is*
+    /// waiting on this window the whole quit does stand down — the user asked to quit with this
+    /// document's changes handled, and that is no longer possible — which is the same call
     /// [`abort_save_with_backup_error`](Self::abort_save_with_backup_error) and the `SaveFailed`
-    /// arm already make, and the honest one: the user asked to quit *with* this document's changes
-    /// handled, and that is no longer possible. It is a no-op when no quit is running.
+    /// arm make for their (always in-plan) windows.
     ///
     /// [`abort_save_with_backup_error`]: Self::abort_save_with_backup_error
+    /// [`note_quit_prompt_unanswerable`]: FreeCellApp::note_quit_prompt_unanswerable
+    /// [`note_prompt_cancelled`]: FreeCellApp::note_prompt_cancelled
     fn abandon_work_waiting_on_the_worker(&mut self, cx: &mut Context<Self>) {
         self.close_after_save = false;
         self.pending_save_req = None;
         self.pending_save_path = None;
         // Not load-bearing (an export gates nothing), but no reply is coming for it either.
         self.pending_export_req = None;
-        FreeCellApp::note_prompt_cancelled(cx);
+        FreeCellApp::note_quit_prompt_unanswerable(self.key, cx);
     }
 
     /// The OK-only notice explaining that an action was refused because the worker is gone. A
@@ -2611,6 +2618,63 @@ mod tests {
         assert!(
             cx.update(|cx| window.read(cx).is_degraded_for_test()),
             "the window is still degraded — the worker really is gone"
+        );
+    }
+
+    /// The stand-down is scoped to windows the quit is actually waiting on. Losing a worker in a
+    /// window the plan never included — a clean window, or one already resolved — must not silently
+    /// switch the quit off underneath the window being prompted: the user would answer that prompt,
+    /// its window would close, and nothing further would happen. Same rule (and the same
+    /// `QuitPlan::is_pending` check) `on_window_closed` already applies so an unrelated window
+    /// closing mid-quit doesn't disturb the prompt in flight.
+    #[gpui::test]
+    fn a_clean_windows_worker_death_leaves_someone_elses_quit_alone(cx: &mut TestAppContext) {
+        boot(cx);
+        let _dirty_sender = cx.update(FreeCellApp::open_detached_live_document);
+        let clean_sender = cx.update(FreeCellApp::open_detached_live_document);
+        let dirty = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        let dirty_handle = cx
+            .update(|cx| FreeCellApp::nth_window_handle(cx, 0))
+            .unwrap();
+        let clean = cx.update(|cx| FreeCellApp::nth_window(cx, 1)).unwrap();
+
+        cx.update(|cx| dirty.update(cx, |w, cx| w.set_dirty_for_test(true, cx)));
+        cx.update(FreeCellApp::request_quit);
+        assert!(
+            cx.update(|cx| dirty.read(cx).has_unsaved_modal()),
+            "the quit prompts the one dirty window"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            Some((1, false))
+        );
+
+        // The OTHER window — clean, never prompted, not in the plan — loses its worker.
+        drop(clean_sender);
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|cx| clean.read(cx).is_worker_lost_for_test()),
+            "precondition: the clean window really did lose its worker"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            Some((1, false)),
+            "a death in a window the quit was never waiting on leaves the quit running"
+        );
+
+        // And the prompt still drives it: discarding closes the prompted window and the quit
+        // proceeds (no window left dirty → it quits rather than sitting on a dead plan).
+        dirty_handle
+            .update(cx, |_root, window, appcx| {
+                dirty.update(appcx, |w, ctx| w.modal_dont_save_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "answering the prompt resolves the plan, rather than answering into a quit that was \
+             switched off behind the user's back"
         );
     }
 

@@ -85,6 +85,15 @@ pub enum DocumentSource {
 #[cfg(test)]
 pub(crate) const PANIC_SENTINEL: &str = "FREECELL_TEST_PANIC.xlsx";
 
+/// The chart-source file name that makes the worker's chart **bind** step
+/// ([`Worker::bind_discovered`](crate::worker::charts)) panic on purpose. Separate from
+/// [`PANIC_SENTINEL`] because the save-time sweep has two panic-prone steps per sheet — the parse
+/// and the bind — and its "mark the sheet only after BOTH returned" ordering needs a test for each
+/// (a parse-side injection alone passes under an ordering that marks between them). `#[cfg(test)]`;
+/// no real file is ever read or written under this name.
+#[cfg(test)]
+pub(crate) const CHART_BIND_PANIC_SENTINEL: &str = "FREECELL_TEST_BIND_PANIC.xlsx";
+
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
 /// underlying engine/OS message is preserved for the details line (`architecture.md §5`,
 /// `functional_spec.md §5.1`). `Clone` so it can ride the worker's `WorkerEvent::LoadFailed`.

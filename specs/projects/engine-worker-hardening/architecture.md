@@ -415,21 +415,31 @@ command, so no `Saved`/`SaveFailed` ever returns. Hence, gated on `worker_lost`:
 **Guarding the entry to a save is not sufficient**, and this was the round-1 gap. Those refusals
 only cover requests *starting* after the loss; they do nothing for a request already in flight —
 and the unguarded panic that kills the worker can happen mid-save, which is B1's own premise.
-`on_worker_lost` therefore performs the same teardown **unconditionally**
-(`abandon_work_waiting_on_the_worker`): `close_after_save`, `pending_save_req`,
-`pending_save_path` and `pending_export_req` are cleared, and `FreeCellApp::note_prompt_cancelled`
-is called (a no-op when no quit is running). Two orderings make it necessary, both reproduced as
-failing tests before the fix:
+`on_worker_lost` therefore performs the teardown **on every worker loss**, not only when a save
+was attempted afterwards (`abandon_work_waiting_on_the_worker`): `close_after_save`,
+`pending_save_req`, `pending_save_path` and `pending_export_req` are cleared, and the quit
+stand-down below runs. Two orderings make it necessary:
 
-| Ordering | Without the teardown |
+| Ordering (both reproduced as failing tests before the fix) | Without the teardown |
 |---|---|
 | Worker dies while the **quit prompt** is up | `on_worker_lost` swaps `UnsavedChanges` for the fatal `Error`, so `dismiss_modal`'s quit-abort branch — which only fires for `UnsavedChanges` — never runs. The plan stays pending on a window that can never answer: ⌘Q looks like a no-op, and closing some *other* dirty window later re-prompts this one out of nowhere. |
 | A save **already armed** when the worker dies | `close_after_save` + `pending_save_req` are only ever cleared by `Saved`/`SaveFailed`, neither of which can arrive. The window never closes and `advance_quit` waits on it forever — the round-1 failure mode, untouched by the entry guards. |
 
-`note_prompt_cancelled` aborts the **whole** quit, not just this window's step, matching
-`abort_save_with_backup_error` and the `SaveFailed` arm. `advance_quit` then takes
-`QuitStep::Aborted` and drops the plan entirely, so there is nothing left for a later window close
-to revive.
+**The stand-down is scoped to windows the plan is pending on.** It goes through
+`FreeCellApp::note_quit_prompt_unanswerable(self.key, cx)`, not the unscoped
+`note_prompt_cancelled` the user-driven paths call, because a worker death is not a user gesture:
+it can land in a window the quit never included. Aborting from there would switch the quit off
+underneath whichever window is being prompted — probed: two windows, only window 0 dirty, ⌘Q
+prompts it, then the clean window 1's worker dies and the plan is gone, so answering window 0's
+still-visible prompt closes that window and nothing further happens. The gate is
+`QuitPlan::is_pending`, the same check (for the same reason) `on_window_closed` already applies so
+an unrelated window *closing* mid-quit doesn't disturb the prompt in flight.
+
+When the plan **is** waiting on the dying window the whole quit stands down, not just that
+window's step — matching `abort_save_with_backup_error` and the `SaveFailed` arm. `advance_quit`
+then takes `QuitStep::Aborted` and drops the plan entirely, so there is nothing left for a later
+window close to revive. The window stays dirty, so a re-issued quit prompts it again in the
+Cancel / Close Without Saving form, both of which resolve.
 
 `on_edit_rejected` gains an arm for `FrozenPaneTooLarge` (exhaustive match), producing the F1.2
 dialog.
@@ -456,6 +466,8 @@ dialog.
 | `a_refused_save_keeps_a_terminal_load_dialog` | `window.rs` gpui test | ⌘S on a load-failed, worker-lost window does not swap the close-on-dismiss dialog for the refusal notice |
 | `worker_death_during_a_quit_prompt_stands_the_quit_down` | `window.rs` gpui test | ordering (a): the plan is abandoned, dismissing the report does not revive it, and a re-issued quit still prompts + resolves |
 | `worker_death_disarms_a_save_that_was_already_in_flight` | `window.rs` gpui test | ordering (b): a save armed before the death is cleared and the waiting quit stood down |
+| `a_clean_windows_worker_death_leaves_someone_elses_quit_alone` | `window.rs` gpui test | a death in a window the plan never included leaves the quit running and its prompt answerable |
+| `a_bind_panic_mid_sweep_also_leaves_the_sheet_re_discoverable` | `charts.rs` unit | the sweep marks a sheet only after the **bind** too — the ordering that marks between parse and bind fails this while passing the parse-side test |
 
 **Deviation from this section, recorded rather than left silent.** The plan above called for
 `worker_seam.rs` integration tests over a `#[cfg(feature = "test-support")]`

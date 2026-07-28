@@ -279,6 +279,32 @@ impl FreeCellApp {
         });
     }
 
+    /// `key`'s window can no longer answer a quit prompt (its worker died — B1,
+    /// `engine-worker-hardening functional_spec.md F2.3`) → stand the quit down, but **only if the
+    /// plan is actually waiting on that window**.
+    ///
+    /// The scope check is the point. A worker death is not a user gesture, so unlike
+    /// [`note_prompt_cancelled`](Self::note_prompt_cancelled) it can fire in a window that has
+    /// nothing to do with the quit — a clean window, or one already resolved. Aborting on that
+    /// would switch the quit off underneath whichever window is being prompted: the user answers
+    /// that prompt, its window closes, and nothing further happens. Same guard, for the same
+    /// reason, as [`on_window_closed`](Self::on_window_closed)'s `is_pending` check.
+    pub fn note_quit_prompt_unanswerable(key: WindowKey, cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| {
+            let waiting_on_this_window = app
+                .quit_plan
+                .as_ref()
+                .is_some_and(|plan| plan.is_pending(key));
+            if !waiting_on_this_window {
+                return;
+            }
+            if let Some(plan) = app.quit_plan.as_mut() {
+                plan.cancel();
+                app.advance_quit(cx);
+            }
+        });
+    }
+
     // ---- Internal (operate on the leased global) ------------------------------------------
 
     fn do_show_welcome(&mut self, cx: &mut App) {

@@ -31,12 +31,11 @@ change, so the unification is built on stable ground.
       - **Code-review follow-ups (B1 round 2):** a distinct `worker_lost` window state (no Save As
         in the bar, every save/export *entry* refuses, the unsaved-changes prompt drops its Save —
         round 3 below is what made that actually cover the in-flight cases); the save-time chart
-        sweep made
-        re-entrant across a caught panic (and the `AssertUnwindSafe` justification corrected in
-        `architecture.md §A3.3`); `WorkerExit::Running` joined off the UI thread instead of being
-        logged as a non-answer; the loading overlay cleared on a death before `Loaded`; the fatal
-        report no longer swallowed by a non-terminal modal; the CSV export guarded like the save;
-        `has_worker` split out of `shutdown_requested`.
+        sweep made re-entrant across a caught panic (and the `AssertUnwindSafe` justification
+        corrected in `architecture.md §A3.3`); `WorkerExit::Running` joined off the UI thread
+        instead of being logged as a non-answer; the loading overlay cleared on a death before
+        `Loaded`; the fatal report no longer swallowed by a non-terminal modal; the CSV export
+        guarded like the save; `has_worker` split out of `shutdown_requested`.
       - **Code-review follow-ups (B1 round 3):** guarding save *entry* left both in-flight
         orderings hanging — a worker dying under a quit prompt (the replaced modal skips
         `dismiss_modal`'s quit-abort branch) and a save armed before the death (only
@@ -48,6 +47,14 @@ change, so the unification is built on stable ground.
         opposite ordering is documented where a reader meets it; the `WorkerExit::Panicked` test
         uses the shared `quiet_panics` from the parent thread; the loading-overlay tests assert the
         grid half too.
+      - **Code-review follow-ups (B1 round 4):** round 3's teardown stood down *any* quit, including
+        one the dying window was never part of (probed: a clean window's death switched off the
+        quit prompting a different window). Scoped it via `QuitPlan::is_pending` —
+        `FreeCellApp::note_quit_prompt_unanswerable(key, cx)` — matching the check
+        `on_window_closed` already makes, with §F2.3 / §A3.5 / the doc comments reconciled to it.
+        Also: a bind-side `#[cfg(test)]` injection now gates "marked after parse **and** bind" (the
+        parse-side test alone passed under an ordering that marks between them); §F2.3 quotes the
+        export refusal's real wording.
 
 - [x] **Phase 3 — extract chart handling out of `run.rs`.** Move ≈1,180 production lines and
       the chart tests into `worker/charts.rs`. Behaviour-preserving; every existing test passes

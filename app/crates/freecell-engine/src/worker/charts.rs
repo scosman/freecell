@@ -295,6 +295,19 @@ impl Worker {
         sheet: SheetId,
         specs: crate::chart::load::SheetCharts,
     ) -> bool {
+        // Panic injection for the save sweep's re-entrancy gate (B1) — a chart source named
+        // `CHART_BIND_PANIC_SENTINEL` panics HERE, in the step *after* the parse. The sweep marks a
+        // sheet discovered only once this has returned too, and a parse-side injection alone cannot
+        // tell that ordering apart from one that marks between the two.
+        #[cfg(test)]
+        if self
+            .chart_source_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == crate::document::CHART_BIND_PANIC_SENTINEL)
+        {
+            panic!("injected test panic (chart bind)");
+        }
         let specs: crate::chart::load::SheetCharts = specs
             .into_iter()
             .filter(|(part, _)| !self.loaded_deletes.contains(part))
@@ -2401,5 +2414,67 @@ mod tests {
             "lazy discovery still reaches the panicked sheet after a caught save panic"
         );
         assert!(worker.discovered_chart_sheets.contains(&poisoned));
+    }
+
+    /// The other half of the sweep's ordering gate (B1): the sheet is marked only once the **bind**
+    /// has returned too, not merely the parse. Without this test the ordering
+    /// `parse; insert; match` — which marks a sheet *between* its parse and its bind — passes the
+    /// parse-side test above while still leaving a marked-but-unbound sheet behind, exactly the
+    /// state that disables lazy discovery for it forever.
+    #[test]
+    fn a_bind_panic_mid_sweep_also_leaves_the_sheet_re_discoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("two_sheet.xlsx");
+        crate::chart::authoring::write_two_sheet_fixture(&fixture).unwrap();
+        // The same bytes under the bind-sentinel name: the parse succeeds and returns real charts,
+        // then the bind panics — so the panic lands strictly between the two steps.
+        let bind_poisoned = dir.path().join(crate::document::CHART_BIND_PANIC_SENTINEL);
+        std::fs::copy(&fixture, &bind_poisoned).unwrap();
+        let data_part = crate::chart::workbook_sheet_parts(&fixture)
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == "Data")
+            .expect("fixture worksheet")
+            .1;
+
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.chart_source_path = Some(bind_poisoned);
+        worker.charts_fully_discovered = false;
+        worker.chart_sheet_parts = HashMap::from([(sheet, data_part)]);
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::Save {
+                path: dir.path().join("out.xlsx"),
+                req_id: 1,
+            }])
+        });
+
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::SaveFailed {
+                    req_id: 1,
+                    error: crate::document::SaveError::EnginePanic
+                }
+            )),
+            "the bind's panic is caught by the save guard and reported"
+        );
+        assert!(!worker.charts_fully_discovered);
+        assert!(
+            !worker.discovered_chart_sheets.contains(&sheet),
+            "a sheet whose BIND panicked must not be recorded as walked — its charts were parsed \
+             but never bound"
+        );
+        assert!(worker.charts.is_empty(), "nothing was bound");
+
+        // Not permanently disabled: with the bind working, lazy discovery still walks it.
+        worker.chart_source_path = Some(fixture);
+        worker.ensure_sheet_charts_discovered(sheet);
+        assert!(
+            !worker.charts.is_empty(),
+            "lazy discovery still reaches the sheet after a caught bind panic"
+        );
+        assert!(worker.discovered_chart_sheets.contains(&sheet));
     }
 }

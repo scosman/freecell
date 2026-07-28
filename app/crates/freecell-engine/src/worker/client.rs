@@ -3,14 +3,15 @@
 //! interface`, `architecture.md §2`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use freecell_core::{CfRuleView, Publication, SheetCaches, SheetId};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::document::DocumentSource;
 
@@ -66,12 +67,37 @@ impl Shared {
     }
 }
 
+/// How the worker thread ended (B1, `functional_spec.md F2.3`). Reported by
+/// [`DocumentClient::worker_exit`] so a window that loses its worker can say *how* it lost it
+/// rather than only *that* the event channel closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerExit {
+    /// The thread returned normally (a requested shutdown, a load failure, or a dropped command
+    /// channel). Also reported for the `test-support` worker-less client, which has no thread.
+    Clean,
+    /// The thread unwound out of `load_and_run` — a panic no guard caught.
+    Panicked,
+    /// The thread has not finished yet, so nothing was joined.
+    Running,
+}
+
 /// The window's handle to its worker: send commands, read the latest published snapshot,
 /// generation, committed-op count, and the resident cache. Cloning is intentionally **not**
 /// derived — one window owns one worker; the handle carries `Arc`s internally.
 pub struct DocumentClient {
     tx: Sender<Command>,
     shared: Arc<Shared>,
+    /// The worker thread's handle, **retained** (B1, `functional_spec.md F2.3`). It used to be
+    /// dropped at spawn, which is why a dead worker was indistinguishable from a quiet one: with
+    /// the handle gone and `send` swallowing `SendError` by design, nothing anywhere could tell
+    /// that the thread had unwound. Taken by the first [`worker_exit`](DocumentClient::worker_exit)
+    /// call; `None` for the worker-less test client.
+    join: Mutex<Option<JoinHandle<()>>>,
+    /// Set when the window itself asked the worker to stop, so an *expected* stream close is not
+    /// reported as a crash. Nothing sends `Shutdown` today — which is exactly why the window must
+    /// check the flag rather than assume, or an orderly shutdown added later would pop a false
+    /// alarm on every window close.
+    shutdown_requested: AtomicBool,
 }
 
 impl DocumentClient {
@@ -87,14 +113,19 @@ impl DocumentClient {
         let shared = Arc::new(Shared::new(SheetId(0)));
         let worker_shared = Arc::clone(&shared);
 
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("eval-worker".to_string())
             .stack_size(WORKER_STACK_SIZE)
             .spawn(move || Worker::load_and_run(source, worker_shared, event_tx, rx))
             .expect("spawn eval-worker thread");
 
         (
-            DocumentClient { tx, shared },
+            DocumentClient {
+                tx,
+                shared,
+                join: Mutex::new(Some(join)),
+                shutdown_requested: AtomicBool::new(false),
+            },
             WorkerEventReceiver { rx: event_rx },
         )
     }
@@ -110,15 +141,81 @@ impl DocumentClient {
         let (_event_tx, event_rx) = async_channel::unbounded::<WorkerEvent>(); // closed → recv None
         let shared = Arc::new(Shared::new(SheetId(0)));
         (
-            DocumentClient { tx, shared },
+            DocumentClient {
+                tx,
+                shared,
+                join: Mutex::new(None),
+                // Born "already shut down": this client has no worker at all, so its immediately
+                // closed event stream is expected rather than a death (B1,
+                // `functional_spec.md F2.3`). Without this every detached-client window test would
+                // trip the worker-lost dialog on its first frame. A test that WANTS to exercise
+                // that path uses [`detached_live`](Self::detached_live).
+                shutdown_requested: AtomicBool::new(true),
+            },
             WorkerEventReceiver { rx: event_rx },
+        )
+    }
+
+    /// A worker-less client whose event stream stays **open**, plus the sender that feeds it — so
+    /// a test can inject `WorkerEvent`s and, by dropping the sender, simulate the worker thread
+    /// dying without a requested shutdown (B1, `functional_spec.md F2.3`). Unlike
+    /// [`detached`](Self::detached) this client has *not* requested shutdown, so a stream close is
+    /// fatal exactly as it would be in production.
+    #[cfg(feature = "test-support")]
+    pub fn detached_live() -> (
+        DocumentClient,
+        WorkerEventReceiver,
+        async_channel::Sender<WorkerEvent>,
+    ) {
+        let (tx, _rx) = mpsc::channel::<Command>();
+        let (event_tx, event_rx) = async_channel::unbounded::<WorkerEvent>();
+        let shared = Arc::new(Shared::new(SheetId(0)));
+        (
+            DocumentClient {
+                tx,
+                shared,
+                join: Mutex::new(None),
+                shutdown_requested: AtomicBool::new(false),
+            },
+            WorkerEventReceiver { rx: event_rx },
+            event_tx,
         )
     }
 
     /// Sends a command to the worker. Non-blocking and infallible to the caller: if the worker
     /// is gone the send is dropped (the UI observes the closed event channel instead).
     pub fn send(&self, cmd: Command) {
+        if matches!(cmd, Command::Shutdown) {
+            self.shutdown_requested.store(true, Ordering::Release);
+        }
         let _ = self.tx.send(cmd);
+    }
+
+    /// Whether this window asked the worker to stop. The window checks it when the event stream
+    /// closes: a close it did not request means the worker died (B1, `functional_spec.md F2.3`).
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    /// How the worker thread ended. Only meaningful once the event stream has closed — the sender
+    /// is dropped as the thread leaves `load_and_run`, so by then the join returns immediately.
+    ///
+    /// Called from the **UI thread**, so it never parks: a thread somehow still running reports
+    /// [`WorkerExit::Running`] without joining. The handle is taken on the first call; later calls
+    /// report `Clean` (there is nothing left to join).
+    pub fn worker_exit(&self) -> WorkerExit {
+        let mut guard = self.join.lock();
+        match guard.take() {
+            None => WorkerExit::Clean,
+            Some(handle) if !handle.is_finished() => {
+                *guard = Some(handle);
+                WorkerExit::Running
+            }
+            Some(handle) => match handle.join() {
+                Ok(()) => WorkerExit::Clean,
+                Err(_) => WorkerExit::Panicked,
+            },
+        }
     }
 
     /// The latest published viewport snapshot — a wait-free `arc_swap` load (the render loop's
@@ -243,6 +340,40 @@ mod tests {
         }
     }
 
+    /// B1 (`functional_spec.md F2.3`): the window distinguishes "we asked the worker to stop"
+    /// from "the worker died", so only the latter is reported as fatal. `Shutdown` is the only
+    /// command that flips the flag.
+    #[test]
+    fn shutdown_requested_tracks_only_the_shutdown_command() {
+        let (client, _rx) = DocumentClient::spawn(DocumentSource::NewWorkbook);
+        assert!(!client.shutdown_requested(), "a fresh client has not asked");
+        client.send(Command::SetViewport {
+            sheet: SheetId(0),
+            rows: 0..8,
+            cols: 0..8,
+        });
+        assert!(
+            !client.shutdown_requested(),
+            "an ordinary command is not a shutdown request"
+        );
+        client.send(Command::Shutdown);
+        assert!(client.shutdown_requested());
+    }
+
+    /// The retained `JoinHandle` reports a clean exit after a requested shutdown. Before B1 the
+    /// handle was dropped at spawn, so there was nothing to ask.
+    #[test]
+    fn worker_exit_reports_clean_after_a_requested_shutdown() {
+        let (client, rx) = DocumentClient::spawn(DocumentSource::NewWorkbook);
+        assert!(rx.recv_timeout(Duration::from_secs(10)).is_some(), "Loaded");
+        client.send(Command::Shutdown);
+        // The worker drops its sender on the way out, so a closed stream means it has exited.
+        while rx.recv_timeout(Duration::from_secs(10)).is_some() {}
+        assert_eq!(client.worker_exit(), WorkerExit::Clean);
+        // The handle is taken by the first call; a second still answers rather than panicking.
+        assert_eq!(client.worker_exit(), WorkerExit::Clean);
+    }
+
     #[test]
     fn cond_fmt_rules_reads_published_map() {
         // A `DocumentClient` reads the CF rules the worker published into `Shared::cond_fmt`.
@@ -252,7 +383,12 @@ mod tests {
             .write()
             .insert(SheetId(7), vec![sample_rule()]);
         let (tx, _rx) = mpsc::channel();
-        let client = DocumentClient { tx, shared };
+        let client = DocumentClient {
+            tx,
+            shared,
+            join: Mutex::new(None),
+            shutdown_requested: AtomicBool::new(false),
+        };
 
         let rules = client.cond_fmt_rules(SheetId(7));
         assert_eq!(rules.len(), 1);

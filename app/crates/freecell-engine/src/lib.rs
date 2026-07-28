@@ -40,7 +40,7 @@ pub use instrument::{engine_call_count, reset_engine_call_count};
 pub use worker::{
     BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, ChartId, ChartInsertKind,
     ChartSnapshot, Command, DataLabelToggles, DocumentClient, EditRejectedReason, FrozenAxis,
-    PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver,
+    PasteError, SheetMeta, StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver, WorkerExit,
     WORKER_STACK_SIZE,
 };
 

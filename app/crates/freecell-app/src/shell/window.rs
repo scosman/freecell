@@ -218,6 +218,23 @@ impl WorkbookWindow {
         Self::build(key, Rc::new(client), receiver, None, path, window, cx)
     }
 
+    /// Test-only constructor over a worker-less client whose event stream stays **open**, handing
+    /// the test the sender that feeds it. Dropping that sender closes the stream with no requested
+    /// shutdown — exactly what a dead worker looks like from the window's side — so this is how the
+    /// worker-lost path is exercised (B1, `functional_spec.md F2.3`).
+    #[cfg(test)]
+    pub(crate) fn new_detached_live_for_test(
+        key: WindowKey,
+        path: Option<PathBuf>,
+        sender_slot: &mut Option<async_channel::Sender<WorkerEvent>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (client, receiver, sender) = DocumentClient::detached_live();
+        *sender_slot = Some(sender);
+        Self::build(key, Rc::new(client), receiver, None, path, window, cx)
+    }
+
     /// Shared construction for [`new`](Self::new) and the detached test constructor: wires the
     /// event task, builds + cross-links the grid + chrome, sets loading/title.
     fn build(
@@ -355,10 +372,51 @@ impl WorkbookWindow {
                     })
                     .is_ok();
                 if !alive {
-                    break; // the window is gone
+                    return; // the window is gone — nothing to report to
                 }
             }
+            // The stream ended rather than the window going away: the worker thread is gone
+            // (B1, `functional_spec.md F2.3`). `update_in` is a no-op if the window has since
+            // closed, so this only ever reports to a live window.
+            let _ = this.update_in(cx, |this, window, cx| this.on_worker_lost(window, cx));
         })
+    }
+
+    /// The worker→UI event stream closed. Unless this window asked for it, the worker thread is
+    /// gone and this document can no longer be edited or saved — say so
+    /// (B1, `functional_spec.md F2.3`).
+    ///
+    /// This is the fix for the **silent zombie**: with the `JoinHandle` discarded at spawn and
+    /// `DocumentClient::send` swallowing `SendError` by design, a dead worker used to leave the
+    /// window rendering its last publication forever — edits vanished, Save did nothing, and there
+    /// was no dialog, no degraded bar and no log line anywhere.
+    ///
+    /// The window deliberately stays **open**: closing it would take the last readable copy of the
+    /// user's data off the screen. It does not pretend a Save might work either — the degraded
+    /// state disables the mutating controls, and the dialog says the changes are lost.
+    fn on_worker_lost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.client.shutdown_requested() {
+            return; // an orderly stop we asked for
+        }
+        let exit = self.client.worker_exit();
+        tracing::error!(?exit, "worker thread ended without a requested shutdown");
+
+        self.degraded = Some("the calculation engine stopped".to_string());
+        self.chrome.update(cx, |c, cx| c.set_degraded(true, cx));
+        // A dialog already up is not stomped (the `:736` convention). This matters concretely: a
+        // failed load emits `LoadFailed` and *then* returns, closing the stream — the accurate
+        // "Couldn't open the workbook" dialog must survive this generic one.
+        if self.modal.is_none() {
+            self.modal = Some(ActiveModal::Error {
+                title: "The calculation engine stopped".into(),
+                detail: "This window can't be edited or saved any more. Its unsaved changes are \
+                         lost. Open the file again to keep working."
+                    .into(),
+                close_window_on_dismiss: false,
+            });
+        }
+        let _ = window;
+        cx.notify();
     }
 
     /// Installs the worker's live-bound charts into the grid's **ChartLayer** from the publication
@@ -1305,6 +1363,13 @@ impl WorkbookWindow {
         }
     }
 
+    /// Test seam: whether the window is in the degraded state (the degraded bar + disabled
+    /// mutating controls).
+    #[cfg(test)]
+    pub(crate) fn is_degraded_for_test(&self) -> bool {
+        self.degraded.is_some()
+    }
+
     /// Test seam: the `(sheet, area)` the merge confirm modal carries — the exact merge that its
     /// **Merge** button re-sends with `confirmed: true`; `None` when no confirm modal is showing.
     #[cfg(test)]
@@ -2176,6 +2241,78 @@ pub(super) fn open_panel_options() -> PathPromptOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+
+    /// Boots gpui-component + the app global in a fresh test app, with recents isolated from the
+    /// real per-user data dir (mirrors `app.rs`'s own `boot`, which is private to its test module).
+    fn boot(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            FreeCellApp::init(cx);
+            FreeCellApp::reset_recents_for_test(None, cx);
+        });
+    }
+
+    /// B1 (`functional_spec.md F2.3`): the worker→UI event stream closing without a shutdown this
+    /// window requested means the worker thread is gone. It used to `break` silently — the window
+    /// kept rendering its last publication forever while edits vanished and Save did nothing.
+    #[gpui::test]
+    fn worker_death_degrades_the_window_and_says_so(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let window = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        assert!(
+            !cx.update(|cx| window.read(cx).is_degraded_for_test()),
+            "a live worker is not degraded"
+        );
+
+        // The worker thread dying = its sender dropped, closing the event stream.
+        drop(sender);
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|cx| window.read(cx).is_degraded_for_test()),
+            "a lost worker degrades the window (bar up, mutating controls off)"
+        );
+        assert_eq!(
+            cx.update(|cx| window.read(cx).error_modal_title()),
+            Some("The calculation engine stopped".to_string()),
+            "and it says so, rather than rendering a stale document forever"
+        );
+        assert_eq!(
+            cx.update(|cx| window.read(cx).error_modal_closes_window_on_dismiss()),
+            Some(false),
+            "the window stays open — closing it would take the last readable copy off the screen"
+        );
+    }
+
+    /// A failed load emits `LoadFailed` and *then* returns, closing the stream — so the worker-lost
+    /// path fires right behind it. The accurate open-failure dialog must survive.
+    #[gpui::test]
+    fn worker_death_after_a_load_failure_keeps_the_load_dialog(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let window = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+
+        sender
+            .send_blocking(WorkerEvent::LoadFailed {
+                error: freecell_engine::LoadError::EnginePanic,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        drop(sender);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| window.read(cx).error_modal_title()),
+            Some("Couldn't open the workbook".to_string()),
+            "the specific load-failure dialog is not stomped by the generic crash one"
+        );
+        assert!(
+            cx.update(|cx| window.read(cx).is_degraded_for_test()),
+            "the window is still degraded — the worker really is gone"
+        );
+    }
 
     /// The macOS custom titlebar (§7.1 / `ui_design.md §1`) shows the edited state **textually**
     /// and **always** — its distinguishing contract vs the native window title, which drops the

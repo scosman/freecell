@@ -78,6 +78,13 @@ pub enum DocumentSource {
     OpenDemo(PathBuf),
 }
 
+/// The file name that makes [`WorkbookDocument::from_source`] and
+/// [`crate::worker`]'s save path panic on purpose, so the `catch_unwind` guards around them can be
+/// exercised at their real call sites (B1, `functional_spec.md F2`). `#[cfg(test)]` — it cannot
+/// reach a release build, and no real file is ever read or written under this name.
+#[cfg(test)]
+pub(crate) const PANIC_SENTINEL: &str = "FREECELL_TEST_PANIC.xlsx";
+
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
 /// underlying engine/OS message is preserved for the details line (`architecture.md §5`,
 /// `functional_spec.md §5.1`). `Clone` so it can ride the worker's `WorkerEvent::LoadFailed`.
@@ -106,6 +113,14 @@ pub enum LoadError {
     /// malformed record (`functional_spec.md §2`, D2.5). The message is the dialog detail.
     #[error("This CSV can't be imported: {0}")]
     BadCsv(String),
+    /// The calculation engine **panicked** while opening the file, and the worker caught it
+    /// (`engine-worker-hardening functional_spec.md F2.1`). Distinct from [`Corrupt`](Self::Corrupt):
+    /// the importer didn't return an error, it unwound.
+    #[error(
+        "The calculation engine crashed while opening this file. The file may use a feature \
+         FreeCell can't read yet."
+    )]
+    EnginePanic,
 }
 
 /// A typed save failure. Because saves are atomic (temp file + rename), any failure leaves
@@ -119,6 +134,16 @@ pub enum SaveError {
     /// IronCalc's xlsx writer failed to serialize the model.
     #[error("The workbook couldn't be written: {0}")]
     Serialize(String),
+    /// The calculation engine **panicked** while writing the file, and the worker caught it
+    /// (`engine-worker-hardening functional_spec.md F2.2`). This is not hypothetical: the pinned
+    /// exporter still carries `panic!("Model needs to be evaluated before saving!")` on an
+    /// unevaluated formula cell (`xlsx/src/export/worksheets.rs`, upstream-flagged `// TODO: We
+    /// should NOT panic here.`). The save is atomic, so the destination file is untouched.
+    #[error(
+        "The calculation engine crashed while writing the file. Your work is still open and \
+         unchanged — try Save As to a new file."
+    )]
+    EnginePanic,
 }
 
 /// A cell read (formatted value / raw content / style) hit an invalid sheet or coordinate.
@@ -258,6 +283,17 @@ impl WorkbookDocument {
 
     /// Builds a document from a [`DocumentSource`] (Phase-4 `spawn` entry point).
     pub fn from_source(source: &DocumentSource) -> Result<Self, LoadError> {
+        // Panic injection for the load guard's test (B1, `functional_spec.md F2.1`), keyed off a
+        // sentinel file name rather than a new `DocumentSource` variant so no test-only shape
+        // reaches the public source enum. `#[cfg(test)]`, mirroring `Command::TestPanic`.
+        #[cfg(test)]
+        if matches!(
+            source,
+            DocumentSource::OpenFile(p) | DocumentSource::ImportCsv(p) | DocumentSource::OpenDemo(p)
+                if p.file_name().is_some_and(|n| n == PANIC_SENTINEL)
+        ) {
+            panic!("injected test panic (load catch_unwind recovery)");
+        }
         match source {
             DocumentSource::NewWorkbook => Self::new_empty(),
             DocumentSource::OpenFile(path) => Self::open(path),

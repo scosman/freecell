@@ -45,7 +45,7 @@ use crate::chart::binding::{
     ChartBindings, RemovedChart, SheetResolver,
 };
 use crate::chart::write::{AuthoredChart, SeriesRefs};
-use crate::document::{DocumentSource, FontFlag, SaveError, WorkbookDocument};
+use crate::document::{DocumentSource, FontFlag, LoadError, SaveError, WorkbookDocument};
 use std::path::Path;
 
 use super::charts::ChartSnapshot;
@@ -366,10 +366,24 @@ impl Worker {
         event_tx: async_channel::Sender<WorkerEvent>,
         cmd_rx: Receiver<Command>,
     ) {
-        let doc = match WorkbookDocument::from_source(&source) {
-            Ok(doc) => doc,
-            Err(error) => {
+        // GUARDED (B1, `functional_spec.md F2.1`). The file path was the one mutation-adjacent
+        // region outside `catch_unwind`, and IronCalc's importer is as panic-prone as its
+        // evaluator. An unguarded panic here unwinds out of the thread entry point, which drops
+        // `event_tx` — so the window sees the event stream close with no event explaining it, i.e.
+        // a silent zombie. `AssertUnwindSafe` is sound for the same reason as the six existing
+        // guards: the closure touches only the immutable `source` and the not-yet-built document,
+        // which is dropped on unwind.
+        let doc = match catch_unwind(AssertUnwindSafe(|| WorkbookDocument::from_source(&source))) {
+            Ok(Ok(doc)) => doc,
+            Ok(Err(error)) => {
                 let _ = event_tx.try_send(WorkerEvent::LoadFailed { error });
+                return;
+            }
+            Err(_) => {
+                tracing::error!("worker: caught panic in from_source; reporting LoadFailed");
+                let _ = event_tx.try_send(WorkerEvent::LoadFailed {
+                    error: LoadError::EnginePanic,
+                });
                 return;
             }
         };
@@ -755,12 +769,33 @@ impl Worker {
         }
 
         for (path, req_id) in saves {
-            match self.save_workbook(&path) {
-                Ok(()) => self.emit(WorkerEvent::Saved {
+            // GUARDED (B1, `functional_spec.md F2.2`). The pinned exporter panics outright on an
+            // unevaluated formula cell, and an unguarded panic here kills the worker thread with no
+            // event to explain it: the window keeps rendering the last publication while edits
+            // vanish and Save silently does nothing.
+            //
+            // `AssertUnwindSafe` over `&mut self` is sound here rather than merely asserted:
+            // `save_workbook`'s only mutations of `self` (`chart_source_path`, `loaded_anchor_edits`,
+            // `loaded_deletes`) are its last statements, after every fallible step, so a panic
+            // cannot leave them half-applied.
+            let outcome = catch_unwind(AssertUnwindSafe(|| self.save_workbook(&path)));
+            match outcome {
+                Ok(Ok(())) => self.emit(WorkerEvent::Saved {
                     req_id,
                     ops_seen: self.ops_seen,
                 }),
-                Err(error) => self.emit(WorkerEvent::SaveFailed { req_id, error }),
+                Ok(Err(error)) => self.emit(WorkerEvent::SaveFailed { req_id, error }),
+                Err(_) => {
+                    tracing::error!("worker: caught panic in save_workbook; reporting SaveFailed");
+                    self.emit(WorkerEvent::SaveFailed {
+                        req_id,
+                        error: SaveError::EnginePanic,
+                    });
+                    // The poisoning policy WITHOUT the edit path's `EditRejected` — `SaveFailed`
+                    // has already told the user, and one failed save is not by itself a reason to
+                    // condemn a model that still answers.
+                    self.note_caught_panic();
+                }
             }
         }
 
@@ -2144,6 +2179,21 @@ impl Worker {
     /// probe the model; if it still responds and this is the first panic, reject the edit and
     /// keep serving; on a second panic or an unresponsive probe, degrade and stop taking edits.
     fn handle_caught_panic(&mut self) {
+        if !self.note_caught_panic() {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::EnginePanic,
+            });
+        }
+    }
+
+    /// The poisoning policy *without* the edit path's `EditRejected` announcement: count the panic,
+    /// probe the model, and degrade (emitting `WorkerDegraded`) on a second panic or an
+    /// unresponsive probe. Returns whether the worker is now degraded.
+    ///
+    /// Split out of [`handle_caught_panic`](Self::handle_caught_panic) so the **save** path can
+    /// share the identical count/probe/threshold without also claiming an edit was rejected — a
+    /// caught save panic reports itself through `SaveFailed` (B1, `functional_spec.md F2.2`).
+    fn note_caught_panic(&mut self) -> bool {
         self.panic_count += 1;
         let responsive = self.probe_model();
         if self.panic_count >= 2 || !responsive {
@@ -2151,10 +2201,9 @@ impl Worker {
             self.emit(WorkerEvent::WorkerDegraded {
                 reason: "the calculation engine hit an unrecoverable error".to_string(),
             });
+            true
         } else {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::EnginePanic,
-            });
+            false
         }
     }
 
@@ -2456,6 +2505,17 @@ impl Worker {
     /// before**. On success the just-saved file becomes the chart source for the next save (it is a
     /// self-contained superset). A missing target part surfaces as a [`SaveError`] (fail loudly).
     fn save_workbook(&mut self, path: &Path) -> Result<(), SaveError> {
+        // Panic injection for the save guard's test (B1, `functional_spec.md F2.2`) — see
+        // `document::PANIC_SENTINEL`. Placed at the top so it stands in for the pinned exporter's
+        // `panic!("Model needs to be evaluated before saving!")`, and exercises the guard at its
+        // real call site inside `process_batch`.
+        #[cfg(test)]
+        if path
+            .file_name()
+            .is_some_and(|n| n == crate::document::PANIC_SENTINEL)
+        {
+            panic!("injected test panic (save catch_unwind recovery)");
+        }
         // Charts are discovered lazily per painted sheet (P11), so before a save force a full sweep
         // — otherwise a chart on a sheet the user never scrolled to would be silently dropped by the
         // chart-less writer.
@@ -4417,6 +4477,118 @@ mod tests {
         assert_eq!(
             worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
             "7"
+        );
+    }
+
+    /// B1 (`functional_spec.md F2.1`): `from_source` was the one document-building call outside
+    /// every `catch_unwind`. An unguarded panic there unwound out of the thread entry point and
+    /// dropped `event_tx`, so the window saw the stream close with **no event** explaining it — a
+    /// silent zombie. It now reports a typed `LoadFailed`, like any other load failure.
+    #[test]
+    fn load_panic_is_caught_and_reported_as_load_failed() {
+        let (tx, rx) = async_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared::new(SheetId(0)));
+        let source = DocumentSource::OpenFile(
+            std::path::PathBuf::from("/nonexistent").join(crate::document::PANIC_SENTINEL),
+        );
+
+        quiet_panics(|| Worker::load_and_run(source, shared, tx, cmd_rx));
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::LoadFailed {
+                    error: LoadError::EnginePanic
+                }
+            )),
+            "a caught load panic reports LoadFailed{{EnginePanic}}; got {events:?}"
+        );
+    }
+
+    /// B1 (`functional_spec.md F2.2`): the pinned exporter still panics outright on an unevaluated
+    /// formula cell, and `save_workbook` ran outside every guard. The panic is now caught and
+    /// reported as `SaveFailed`, the worker keeps serving, and — unlike the edit path — no
+    /// `EditRejected` rides along, because `SaveFailed` has already told the user.
+    #[test]
+    fn save_panic_is_caught_and_reported_as_save_failed() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let dir = tempfile::tempdir().unwrap();
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::Save {
+                path: dir.path().join(crate::document::PANIC_SENTINEL),
+                req_id: 1,
+            }])
+        });
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::SaveFailed {
+                    req_id: 1,
+                    error: SaveError::EnginePanic
+                }
+            )),
+            "a caught save panic reports SaveFailed{{EnginePanic}}; got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::EditRejected { .. })),
+            "a save failure must not also claim an edit was rejected; got {events:?}"
+        );
+        assert!(
+            !worker.degraded,
+            "one caught save panic over a healthy model must not degrade the worker"
+        );
+
+        // The worker is still live: a following edit applies and a real save succeeds.
+        worker.process_batch(vec![set_input(sheet, 0, 0, "7")]);
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "7"
+        );
+        worker.process_batch(vec![Command::Save {
+            path: dir.path().join("real.xlsx"),
+            req_id: 2,
+        }]);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Saved { req_id: 2, .. })),
+            "a real save after a caught save panic still succeeds"
+        );
+    }
+
+    /// The `handle_caught_panic` split must not move the poisoning threshold: a save panic counts
+    /// toward the same budget, so a save panic followed by an edit panic degrades exactly as two
+    /// edit panics would.
+    #[test]
+    fn a_save_panic_counts_toward_the_degrade_threshold() {
+        let (mut worker, rx) = test_worker();
+        let dir = tempfile::tempdir().unwrap();
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::Save {
+                path: dir.path().join(crate::document::PANIC_SENTINEL),
+                req_id: 1,
+            }]);
+            assert!(!worker.degraded, "the first panic does not degrade");
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(
+            worker.degraded,
+            "a save panic then an edit panic degrades, same as two edit panics"
+        );
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::WorkerDegraded { .. })),
+            "the degrade is announced"
         );
     }
 

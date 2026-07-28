@@ -163,6 +163,38 @@ impl FreeCellApp {
         });
     }
 
+    /// Test-only: opens a worker-less document window whose event stream stays **open**, and
+    /// returns the sender feeding it. Dropping the sender simulates the worker thread dying without
+    /// a requested shutdown (B1, `functional_spec.md F2.3`).
+    #[cfg(test)]
+    pub(crate) fn open_detached_live_document(
+        cx: &mut App,
+    ) -> async_channel::Sender<freecell_engine::WorkerEvent> {
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let filled = std::rc::Rc::clone(&slot);
+        cx.update_global::<FreeCellApp, _>(move |app, cx| {
+            let key = app.registry.register(None);
+            app.install_document_window(
+                key,
+                move |window, cx| {
+                    let mut sender = None;
+                    let w = WorkbookWindow::new_detached_live_for_test(
+                        key,
+                        None,
+                        &mut sender,
+                        window,
+                        cx,
+                    );
+                    *filled.borrow_mut() = sender;
+                    w
+                },
+                cx,
+            );
+        });
+        let sender = slot.borrow_mut().take();
+        sender.expect("the detached-live window handed back its event sender")
+    }
+
     /// Test-only mirror of [`open_path`](Self::open_path): same canonicalize + dedupe, but the
     /// opened window is worker-less (so the required suite stays deterministic).
     #[cfg(test)]

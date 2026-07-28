@@ -92,9 +92,11 @@ pub(super) fn dlbls_element(c: &str, labels: &DataLabels) -> String {
     s
 }
 
-/// The **five toggle** children of `c:dLbls`, in `CT_DLbls` order. Always written (a `show*` flag
-/// is meaningful in both states, so an absent one is not the same as a `val="0"` one).
-pub(super) const DLBLS_FLAGS: [&str; 5] = [
+/// The **five toggle** children of `c:dLbls`, in `CT_DLbls` order. Always built (a `show*` flag
+/// is meaningful in both states, so a fresh element spells all five out). Private: only
+/// [`dlbls_children`] uses it — the patcher orders against `DLBLS_CHILD_ORDER` in
+/// [`super::save`], and a test there asserts the two spellings agree.
+const DLBLS_FLAGS: [&str; 5] = [
     "showLegendKey",
     "showVal",
     "showCatName",
@@ -112,8 +114,12 @@ pub(super) const DLBLS_FLAGS: [&str; 5] = [
 ///   `c:showLeaderLines`/`c:leaderLines` survive an edit instead of being replaced wholesale.
 ///
 /// An entry is absent when the model carries no value for it (`numFmt` / `dLblPos` / `separator`
-/// are `Option`s); the patcher reads that as "remove this child", which is the correct meaning of
-/// clearing a number format on a label.
+/// are `Option`s). The patcher does **not** read a bare absence as "remove this child": it diffs
+/// this list for the *file's* labels against this list for the *new* labels, so a child is removed
+/// only when the model actually **dropped** a value it used to carry. That distinction matters
+/// because the model cannot represent every legal value — `c:dLblPos val="bestFit"` (what Excel
+/// writes for pie labels) and `c:numFmt formatCode="General"` both parse to `None` — and those must
+/// survive an unrelated edit rather than be mistaken for a user's clear.
 pub(super) fn dlbls_children(c: &str, labels: &DataLabels) -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = Vec::new();
     if let Some(code) = &labels.number_format {

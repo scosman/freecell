@@ -11,7 +11,9 @@
 //!
 //! Phase 4 adds the **eval worker seam** ([`worker`]): [`DocumentClient::spawn`] runs the
 //! `UserModel` on a dedicated 64 MiB-stack thread and drives the drain-coalesce → apply →
-//! publish-then-bump loop, the viewport [`Publication`](freecell_core::Publication) build,
+//! stage-every-surface-then-bump loop (E1, `functional_spec.md F4`; it was publish-then-bump, with
+//! the style cache, chart snapshot and CF map written after the bump), the viewport
+//! [`Publication`](freecell_core::Publication) build,
 //! the worker-side input-cap re-check, `catch_unwind` + degraded policy, and dirty-op
 //! accounting.
 //!

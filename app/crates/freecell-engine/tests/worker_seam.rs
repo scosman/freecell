@@ -707,6 +707,11 @@ fn all_surfaces_agree_at_a_generation() {
         })
     };
 
+    // Drain the seed batches' events first: the three sends above queued their own `Published`s,
+    // and `poll_until` reads the publication rather than the channel, so without this the first
+    // rounds below would be satisfied by a STALE `Published` and run on before their own commit
+    // landed — making "each round is its own commit" only mostly true.
+    while rx.try_recv().is_some() {}
     for i in 2..=ROUNDS {
         client.send(Command::SetStylePath {
             sheet,

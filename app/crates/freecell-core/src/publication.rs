@@ -1,8 +1,10 @@
 //! `Publication` / `PublishedCell` — the engine-free value snapshot read model.
 //!
 //! The worker builds a `Publication` for the active sheet's overscanned viewport after
-//! each evaluation, swaps it into an `Arc`, then bumps the generation counter
-//! (publish-then-bump, `architecture.md §2`). The grid reads it per frame — one atomic
+//! each evaluation and swaps it into an `Arc` — one of the four shared surfaces its single
+//! `commit` stages before bumping the generation counter (`architecture.md §2`,
+//! `engine-worker-hardening/functional_spec.md F4`; the counter used to be bumped by the publish
+//! itself, ahead of the other three surfaces). The grid reads it per frame — one atomic
 //! load, no engine call. Display text and its optional colour come pre-formatted from the
 //! engine's formatted-value API; FreeCell adds no number-format logic (round-3 B,
 //! `functional_spec.md §3.6`).

@@ -208,7 +208,7 @@ impl Worker {
 
         if changed {
             self.chart_version += 1;
-            self.store_chart_snapshot();
+            self.mark_charts_changed();
         }
     }
 
@@ -281,8 +281,10 @@ impl Worker {
             Ok(specs) => {
                 if self.bind_discovered(sheet, specs) {
                     self.chart_version += 1;
-                    self.store_chart_snapshot();
-                    self.commit(StagedCommit::default());
+                    self.mark_charts_changed();
+                    // Chart-only, like `commit_chart_op`: the generation moves, the publication is
+                    // re-stamped rather than rebuilt (nothing here touches a cell value).
+                    self.commit(StagedCommit::chart_only());
                 }
             }
             Err(err) => tracing::warn!(%part, "lazy chart discovery failed: {err:#}"),
@@ -391,8 +393,9 @@ impl Worker {
         self.charts_fully_discovered = true;
         if added {
             self.chart_version += 1;
-            self.store_chart_snapshot();
-            self.commit(StagedCommit::default());
+            self.mark_charts_changed();
+            // Chart-only (see `commit_chart_op`): re-stamp the publication rather than rebuild it.
+            self.commit(StagedCommit::chart_only());
         }
     }
 
@@ -823,18 +826,23 @@ impl Worker {
     ///
     /// It goes through [`commit`](Worker::commit) rather than emitting `Published` directly (E1).
     /// It used to do the latter, which left `Shared::generation` standing still — a `Published` that
-    /// announced a generation that never happened. The cost is one `build_publication` over the
-    /// current viewport per chart gesture: the same cost class as a single scroll republish, and a
-    /// chart op is a discrete user action (`ChartAnchorChanged` fires on mouse-up, not per drag
-    /// frame), so it is not close.
+    /// announced a generation that never happened.
+    ///
+    /// A chart op changes no cell value, so it commits with
+    /// [`values_unchanged`](StagedCommit::values_unchanged): the generation moves (the point of the
+    /// exercise) but the publication is **re-stamped**, not rebuilt. Rebuilding would have been the
+    /// wrong trade — a chart op is not reliably a discrete gesture. `SetChartAnchor` is
+    /// (`ChartAnchorChanged` fires on mouse-up, not per drag frame), but `SetChartChrome` is sent
+    /// **live per keystroke** while a chart or axis title is typed, and chart ops commit one-by-one,
+    /// so a rebuild per op would put a full-viewport republish behind every character.
     pub(super) fn commit_chart_op(&mut self) {
         self.ops_seen += 1;
         self.shared
             .committed_ops
             .store(self.ops_seen, Ordering::Release);
         self.chart_version += 1;
-        self.store_chart_snapshot();
-        self.commit(StagedCommit::default());
+        self.mark_charts_changed();
+        self.commit(StagedCommit::chart_only());
     }
 
     /// Push a chart op onto the unified undo timeline (charts feedback item 4) and clear the redo
@@ -1045,43 +1053,55 @@ impl Worker {
         }
     }
 
-    /// Store the current bound charts as the published [`ChartSnapshot`] (charts/architecture §4.1),
-    /// riding the same wait-free `arc_swap` container as the cell publication. Merges the loaded
-    /// (live-bound) charts with the **authored** ones (P17) into per-sheet groups.
-    pub(super) fn store_chart_snapshot(&self) {
-        let sheets = if self.authored_charts.is_empty() {
-            // Fast path (no authored charts): share the worker's `Arc<[ChartSpec]>` allocations
-            // directly (P11 "off-screen free" — no per-publish deep copy of the loaded specs).
-            self.charts.specs_by_sheet()
-        } else {
-            self.charts_by_sheet_with_authored()
-        };
-        // Stamped with the generation currently committed; the `commit` that follows re-stamps it
-        // with the new one (E1). Truthful at every instant either way.
-        self.shared.chart_snapshot.store(Arc::new(ChartSnapshot {
-            version: self.chart_version,
-            generation: self.shared.generation.load(Ordering::Acquire),
-            sheets,
-        }));
+    /// Record that the bound chart set moved, so the next [`Worker::commit`] publishes a freshly
+    /// built [`ChartSnapshot`] (charts/architecture §4.1) stamped with the generation it commits at.
+    ///
+    /// The store itself belongs to `commit` and to nothing else (E1). This used to store the
+    /// snapshot on the spot, stamped with the generation *currently* committed, and then `commit`
+    /// re-stored a structurally identical value one generation later — two `ArcSwap` stores per
+    /// chart op, the first announcing a generation the charts did not belong to. Nothing is deferred
+    /// beyond the same statement sequence: every path that sets this flag runs a `commit` before it
+    /// returns to the loop (the three chart-commit sites here, and `reresolve_charts`, whose four
+    /// callers each commit unconditionally right after it).
+    pub(super) fn mark_charts_changed(&mut self) {
+        self.chart_snapshot_dirty = true;
     }
 
-    /// Re-store the current snapshot stamped with `generation` — the chart surface's half of the
-    /// single commit (E1, `functional_spec.md F4.3`). Called by [`Worker::commit`] immediately
-    /// before the generation bump, so a reader that observes generation `N` finds a chart snapshot
-    /// at `N` (or later), never behind it.
+    /// Publish the chart snapshot for `generation` — the chart surface's half of the single commit
+    /// (E1, `functional_spec.md F4.3`). Called by [`Worker::commit`] immediately before the
+    /// generation bump, so a reader that observes generation `N` finds a chart snapshot at `N` (or
+    /// later), never behind it. It is the ONLY writer of `shared.chart_snapshot` in the worker.
     ///
-    /// Cheap when the charts didn't move: `sheets` is a `Vec<(SheetId, Arc<[ChartSpec]>)>`, so the
-    /// clone is a handful of refcount bumps, not a copy of any chart. [`version`](ChartSnapshot::version)
-    /// is carried through untouched, so this never triggers a UI re-install.
-    pub(super) fn stamp_chart_snapshot(&self, generation: u64) {
-        let current = self.shared.chart_snapshot.load();
-        if current.generation == generation {
-            return;
-        }
+    /// When [`mark_charts_changed`](Self::mark_charts_changed) flagged the set, the payload is
+    /// rebuilt from the live bindings — merging the loaded (live-bound) charts with the **authored**
+    /// ones (P17) into per-sheet groups — and carries the caller's fresh `chart_version`. Otherwise
+    /// the resident payload is re-stamped: `sheets` is a `Vec<(SheetId, Arc<[ChartSpec]>)>`, so that
+    /// clone is a handful of refcount bumps, not a copy of any chart, and
+    /// [`version`](ChartSnapshot::version) is carried through untouched so a plain republish never
+    /// triggers a UI re-install.
+    ///
+    /// It always stores. A "the stamp is already `generation`" early-return would be dead code: the
+    /// snapshot is only ever stamped by this function, `generation` is always
+    /// `shared.generation + 1`, and nothing else bumps — so the two can agree only if a previous
+    /// `commit` stamped and then panicked before its store.
+    pub(super) fn stamp_chart_snapshot(&mut self, generation: u64) {
+        let (version, sheets) = if std::mem::take(&mut self.chart_snapshot_dirty) {
+            let sheets = if self.authored_charts.is_empty() {
+                // Fast path (no authored charts): share the worker's `Arc<[ChartSpec]>` allocations
+                // directly (P11 "off-screen free" — no per-publish deep copy of the loaded specs).
+                self.charts.specs_by_sheet()
+            } else {
+                self.charts_by_sheet_with_authored()
+            };
+            (self.chart_version, sheets)
+        } else {
+            let current = self.shared.chart_snapshot.load();
+            (current.version, current.sheets.clone())
+        };
         self.shared.chart_snapshot.store(Arc::new(ChartSnapshot {
-            version: current.version,
+            version,
             generation,
-            sheets: current.sheets.clone(),
+            sheets,
         }));
     }
 

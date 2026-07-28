@@ -502,7 +502,8 @@ Into `worker/charts.rs`, which already holds `ChartSnapshot` and is the natural 
   `delete_chart`, `set_chart_range`, `bind_authored_range_at`, `set_chart_type`,
   `set_chart_chrome`, `resolve_authored_chart`, `reresolve_authored`, `commit_chart_op`,
   `push_chart_undo`, `undo_chart_op`, `redo_chart_op`, `undo_chart_entry`, `redo_chart_entry`,
-  `store_chart_snapshot`, `charts_by_sheet_with_authored`.
+  `store_chart_snapshot` (since split into `mark_charts_changed` + `stamp_chart_snapshot`, §A5.2),
+  `charts_by_sheet_with_authored`.
 - **Free functions:** `apply_chrome_edit`, `existing_chart_parts`, `source_ranges_from_refs`,
   `next_chart_part`.
 - **Tests:** the chart-only `#[test]`s from `run.rs`'s test module, into a test module in
@@ -586,8 +587,9 @@ A single method replaces the eight open-coded sequences:
 ///   3. every event announcing N is emitted AFTER the store.
 ///
 /// A UI reader that observes `generation == N` therefore sees all four surfaces at N or later.
-/// Nothing may write a shared surface after step 2 or emit before it — the eight call sites
-/// that used to do exactly that are what this project exists to remove.
+/// The invariant is directional: no surface may ever be BEHIND the committed generation; one
+/// running ahead is legal. Two forward-only writers stay outside this function on purpose —
+/// the load path and wrap auto-grow (`functional_spec.md F4.1`).
 fn commit(&mut self, staged: StagedCommit) { … }
 ```
 
@@ -609,8 +611,22 @@ struct StagedCommit {
     cf_after_recompute: bool,
     /// Sheets whose published CF rule list must be reconciled.
     cf_sheets: Vec<SheetId>,
+    /// Build the active sheet's cache if it isn't resident yet (a sheet activation).
+    ensure_active_cache: bool,
+    /// The batch changed no cell value — a chart-only commit. `stage_publication` re-stamps the
+    /// resident `Publication` with the new generation instead of rebuilding it (A5.3).
+    values_unchanged: bool,
 }
 ```
+
+A batch that coalesces a `SetViewport` **and** an edit passes `ensure_active_cache: true` into the
+edit batch's own `StagedCommit` — the activation's cache build is staged into that one commit, not
+performed after it. (Phase 4 first fixed only the pure-viewport branch and left the mixed one
+committing with `ensure_active_cache: false` and building the cache after the `Release` store. That
+also made the committed publication wrong, not just late: `build_publication` reads the frozen-band
+counts off the very cache that had not been built yet, so the publication claimed `frozen_rows = 0`
+and omitted the band's values. Regression test:
+`a_batched_sheet_switch_and_edit_commit_the_new_sheets_cache_together`.)
 
 `commit`'s body, in order:
 
@@ -640,10 +656,19 @@ lists. That is the entire refactor: the work each does is unchanged, the emissio
 reads the post-edit model to recompute chart values, so it belongs with the other staging. It
 keeps its current job (re-resolve, bump `version` iff something changed, store the snapshot).
 
-`commit` then calls `stamp_chart_snapshot(generation)`, which re-stores the current snapshot
-with `generation` set. When the charts did not change this is one `ArcSwap` store of a
-structurally identical value — cheap, and it keeps the stamp truthful for every generation
-rather than only the ones charts moved on.
+`reresolve_charts` does **not** store the snapshot itself; it calls `mark_charts_changed()`, and
+`commit` then calls `stamp_chart_snapshot(generation)`, which is the worker's **only** writer of
+`shared.chart_snapshot`. When the flag is set it builds the payload fresh from the live bindings and
+stamps it with `generation`; otherwise it re-stores the resident payload under the new generation —
+one `ArcSwap` store of a structurally identical value (a `Vec` of `Arc<[ChartSpec]>`, so refcount
+bumps, not chart copies). Either way the stamp is truthful for every generation rather than only the
+ones charts moved on.
+
+The flag exists to keep it to **one** store: the chart paths used to store the snapshot on the spot,
+stamped with the generation *currently* committed, and then `commit` immediately re-stored a
+structurally identical value one generation later. `stamp_chart_snapshot` has no "already at this
+generation" early-return, because it would be dead code — nothing else stamps, and `generation` is
+always `shared.generation + 1`.
 
 `ChartSnapshot`:
 
@@ -671,18 +696,38 @@ fn commit_chart_op(&mut self) {
     self.ops_seen += 1;
     self.shared.committed_ops.store(self.ops_seen, Ordering::Release);
     self.chart_version += 1;
-    self.store_chart_snapshot();
-    self.commit(StagedCommit::default());   // was: self.emit(Published)
+    self.mark_charts_changed();
+    self.commit(StagedCommit::chart_only());   // was: self.emit(Published)
 }
 ```
 
 Same for the two lazy-discovery sites (`ensure_sheet_charts_discovered`,
-`ensure_all_charts_discovered`). Each now costs one extra `build_publication` over the current
-viewport. That is the same cost class as one scroll republish — already incurred per scroll
-event, already measured — and a chart op is a discrete user gesture, so the trade is not close.
+`ensure_all_charts_discovered`).
+
+**Cost, corrected.** The first cut had every chart op pay a full `build_publication` over the
+current viewport, justified as "the same cost class as one scroll republish, and a chart op is a
+discrete user gesture". The second half of that is **false for one of the six chart commands**:
+`SetChartAnchor` is discrete (`ChartAnchorChanged` fires on mouse-up, not per drag frame — verified),
+but **`SetChartChrome` is sent live per keystroke** while a chart or axis title is typed
+(`chrome/view.rs::on_chart_title_event`), and chart ops are processed one-by-one — so five
+characters would have been five full-viewport rebuilds (≈20k engine probes each, 165,888 worst
+case) where they used to be five `emit`s.
+
+So a chart op commits with `StagedCommit::chart_only()` (`values_unchanged: true`): the generation
+still moves — the whole point — but `stage_publication` **re-stamps** the resident `Publication`
+under the new generation instead of rebuilding it. A chart op provably changes no cell value, and
+the viewport cannot have moved since the last commit (`process_batch` handles `SetViewport` and
+commits the activation before any chart op runs), so the re-stamp is exact. It costs one clone of
+an already-built cell vector and no engine call at all. The restamp path is skipped, and a full
+build taken, if the resident publication is for a different sheet — belt-and-braces.
 
 `ensure_all_charts_discovered` runs from inside `save_workbook`. Committing there is correct
-(the snapshot really did change) and harmless (the save has not written anything yet).
+(the snapshot really did change) and harmless (the save has not written anything yet). One
+consequence to name rather than discover: that call sits inside the **B1 save `catch_unwind`**, so
+the commit's publish path now runs under that guard too. An IronCalc panic in
+`build_publication` / `formatted_value` there surfaces as a `SaveError::EnginePanic` (and counts
+toward degrading the worker) instead of as a publish-path panic. Not a new panic source — every
+other publishing path already runs it unguarded — only a different label on the report.
 
 ### A5.4 The call sites
 
@@ -697,8 +742,16 @@ event, already measured — and a chart op is a discrete user gesture, so the tr
 | `ensure_sheet_charts_discovered` (`:2346`) | store snapshot, emit | store snapshot, `commit` |
 | `ensure_all_charts_discovered` (`:2411`) | ditto | ditto |
 | `commit_chart_op` (`:2932`) | ditto | ditto |
-| `load_and_run` first publish / cache build (`:432-437`) | build cache, publish, emit | one `commit` |
-| `ensure_active_cache_built` on sheet switch (`:631-636`) | build cache, emit | folded into the batch's `commit` |
+| `ensure_active_cache_built` on sheet switch (`:631-636`) | build cache, emit | folded into the batch's `commit` — including a batch that coalesces the activation with an edit (`ensure_active_cache` rides that batch's `StagedCommit`) |
+| `load_and_run` first publish / cache build (`:432-437`) | build cache, publish, emit | **unchanged — deliberately not converted** |
+
+The load path is the one site that stays open-coded, and the reason belongs in the record rather
+than in the omission: routing it through `commit` would emit a `Published` **ahead of** `Loaded`,
+which F4.2 forbids (no event added, removed or reordered). It is sound on a different argument —
+the `Loaded` channel send is the happens-before edge for those writes — and every surface it
+touches is at generation 0, the committed generation, so nothing is left behind. `functional_spec.md`
+F4.1 states the exception; so does `commit`'s doc comment, alongside the second sanctioned
+forward-only writer (`apply_auto_grow`).
 
 `Pasted`, `ReplacedCount`, `EvalStarted` / `EvalFinished`, `EditRejected` and the read replies
 are **not** commit events — they are replies to a specific command and keep their current
@@ -740,9 +793,25 @@ the concrete form of the split-brain E1 describes, and it is what the test catch
 This is the regression test for `commit_chart_op` — under today's code it fails, because the
 counter does not move.
 
-A third, cheap unit test in `run.rs` — `commit_emits_no_event_before_the_bump` — asserts on a
-headless worker that the event queue is empty at the moment of the store, by draining before and
-after. It is the direct statement of the contract in A5.1.
+A third, cheap unit test in `run.rs` — `commit_emits_nothing_before_the_bump` — is the direct
+statement of the contract in A5.1, asserted **at the store itself**. `commit` fires a `#[cfg(test)]`
+thread-local hook (`COMMIT_STORE_PROBE`, the same house style as `Command::TestPanic` /
+`document::PANIC_SENTINEL`) immediately before its `Release` store; the test installs a probe that
+drains the event queue there and reads all four surfaces.
+
+At that instant it asserts (a) no commit announcement — `Published` / `StyleCacheUpdated` /
+`CondFmtUpdated` / `SheetsChanged` — is queued, and (b) every surface already carries the generation
+about to be stored: the publication holds this batch's value, the chart snapshot is stamped, and the
+style cache holds this batch's number format.
+
+**(b) is the half that discriminates, and the reason the hook exists.** The first version of this
+test compared positions in the drained event vector only, and that is vacuous: hoist
+`stage_publication` + the store + `emit(Published)` back to the top of `commit` — the pre-Phase-4
+shape, where the style cache and CF map are written after the bump — and the drained order is
+unchanged, so the test stayed green against the very regression it names. Draining at the store does
+not discriminate either (the pre-Phase-4 shape also stores before it emits). Only reading the
+surfaces at the store does; verified by reverting the ordering and watching the number-format
+assertion fail.
 
 ### A5.6 What this does not do
 
@@ -786,6 +855,6 @@ planned; if a phase turns out to alter published content, the relevant `render_t
 |---|---|
 | The `pub(super)` field widening in A4.2 invites future coupling | It is confined to `mod worker` (three files). `Worker` itself stays `pub(super)`, so the type is invisible outside the module. |
 | Reordering `StyleCacheUpdated` before `Published` breaks a test asserting the old order | Surveyed: every affected test uses `.any(..)` over a drained event vector, not positional matching. Checked at `run.rs:4882, 5041, 6623, 7673, 8700` and `worker_seam.rs:635, 670`. |
-| Chart ops now republish, perturbing a chart-op perf path | Measured cost class equals one scroll republish (already per-scroll-event). `set_chart_anchor` is verified during Phase 4 to fire on drop, not per drag frame; if it is per-frame the finding is reported rather than absorbed. |
+| Chart ops now republish, perturbing a chart-op perf path | `set_chart_anchor` was verified during Phase 4 to fire on drop, not per drag frame — but `SetChartChrome` is sent **live per keystroke** (`chrome/view.rs::on_chart_title_event`), so "a chart op is a discrete gesture" does not hold and a `build_publication` per op was the wrong trade. Resolved rather than absorbed: a chart op commits with `values_unchanged`, re-stamping the resident publication (A5.3) — no engine work per op. |
 | The load/save panic injection needs `test-support` surface that leaks | Both hooks are `#[cfg(feature = "test-support")]` / `#[cfg(test)]`, matching the existing `Command::TestPanic` precedent. If the surface grows beyond the bug, the seam test is dropped and the unit test of the guard stands alone — stated, not silently skipped. |
 | The frozen cap rejects a freeze a real user wanted | 64 rows is ~2/3 of a 4K display's visible rows and ~20× a normal header freeze. The rejection names the cap and the request, so it is self-explaining rather than mysterious. |

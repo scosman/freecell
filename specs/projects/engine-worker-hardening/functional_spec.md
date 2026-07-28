@@ -374,6 +374,25 @@ After this project, the following is true and testable:
 > No surface write for generation N happens after the bump to N, and no event announcing
 > generation N is emitted before the bump.**
 
+Note the direction: a surface may legitimately run **ahead** of the committed generation; what is
+forbidden is a surface running **behind** it. That is what a reader can act on, and it is what the
+ordering tests assert. Two writers sit outside the commit point on purpose, and both are
+forward-only:
+
+- **The load path.** Before the worker's loop starts, `load_and_run` seeds the publication, the
+  active sheet's style cache and the CF map, and announces them with `Loaded` +
+  `StyleCacheUpdated`, with `generation` never leaving 0. It is **not** routed through the commit,
+  because a commit there would emit `Published` *ahead of* `Loaded` — and F4.2 fixes the event set
+  (nothing added, nothing removed, nothing reordered against `Loaded`). Its soundness rests on a
+  different argument from the one above: the **`Loaded` channel send** is the happens-before edge,
+  so a UI that has seen `Loaded` has seen those writes. Every surface is at generation 0, the
+  committed generation, so none is behind.
+- **Wrap-driven row auto-grow** (`AutoGrowRowHeights`, §3.4) writes row heights straight into the
+  resident cache and emits a bare `StyleCacheUpdated` with no commit and no bump. It is a
+  cache-only geometry update that rides no undo stack, applying a fresh UI measurement **on top of**
+  the committed cache — it never rewinds the cache to a pre-commit state. So the cache runs at or
+  ahead of the committed generation, which is legal, and never behind it.
+
 ### F4.2 What changes observably
 
 Event **ordering**, and only ordering:
@@ -436,8 +455,12 @@ from. The UI does not read it today; the ordering tests do.
 - **Performance.** No path may get slower. The publish bound grows from 131,072 to a
   worst-case 165,888 probe cells (F1.4) and is otherwise unchanged. The commit unification
   moves work, it does not add any: the same surfaces are written the same number of times per
-  batch. Routing chart ops through the full commit adds one `build_publication` per chart
-  gesture — the same cost class as one scroll republish, which is already per-frame.
+  batch — one `ArcSwap` store of the chart snapshot per commit, not the two the first cut made.
+  Routing chart ops through the full commit adds **no** `build_publication`: a chart op changes no
+  cell value, so its commit re-stamps the resident publication under the new generation instead of
+  rebuilding it (`architecture.md §A5.3`). That matters because `SetChartChrome` is **not** a
+  discrete gesture — it is sent live per keystroke while a chart or axis title is typed — so a
+  rebuild per op would have put a full-viewport republish behind every character.
 - **Compatibility.** No file-format change. A workbook saved by FreeCell before and after this
   project is byte-identical for the same edits.
 - **Threading.** The seam's existing invariants are preserved without exception: one thread

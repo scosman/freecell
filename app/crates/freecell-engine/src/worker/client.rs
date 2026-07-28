@@ -28,13 +28,22 @@ pub const WORKER_STACK_SIZE: usize = 64 << 20;
 /// The read-surfaces shared between the worker (writer) and the UI (reader). All lock-free or
 /// briefly-locked so the render loop never blocks on the worker (`architecture.md §2`).
 pub(super) struct Shared {
-    /// The latest published viewport snapshot (swapped before the generation bump). Held
+    /// The latest published viewport snapshot (stored before the generation bump). Held
     /// behind its own `Arc` so the window can hand the exact swap container to the grid's
     /// `GridDataSources` (the grid loads it wait-free each frame).
     pub(super) publication: Arc<ArcSwap<Publication>>,
-    /// Bumped strictly **after** the publication swap — a bump always has fresh data behind
-    /// it (SP1's publish-then-bump ordering fix). Read via [`DocumentClient::generation`]; the
-    /// grid does not poll it (it re-reads the publication + repaints on `Published`).
+    /// **The commit stamp for all four shared surfaces**, not just the publication
+    /// (`functional_spec.md F4`). SP1 only promised half of this — a bump always has a fresh
+    /// publication behind it — and the other three surfaces were written *after* the bump, so
+    /// "what does the UI see at generation N" had no answer. Every one of them
+    /// ([`publication`](Self::publication), [`caches`](Self::caches),
+    /// [`chart_snapshot`](Self::chart_snapshot), [`cond_fmt`](Self::cond_fmt)) is now written before
+    /// this store and announced after it, by the single `Worker::commit` — so a reader that observes
+    /// `generation == N` sees all four at N or later. Never behind; a surface may legitimately run
+    /// ahead (see `commit`'s doc for the two sanctioned forward-only writers).
+    ///
+    /// Read via [`DocumentClient::generation`]; the grid does not poll it (it re-reads the
+    /// publication + repaints on `Published`).
     pub(super) generation: AtomicU64,
     /// The count of committed undoable ops (dirty tracking; `architecture.md §2`). The UI's
     /// dirty flag = `committed_ops > last_saved_op`.
@@ -43,8 +52,10 @@ pub(super) struct Shared {
     /// worker owns the writes, the grid reads per frame).
     pub(super) caches: Arc<RwLock<SheetCaches>>,
     /// The latest published live-bound charts (P9). Rides the same wait-free `arc_swap` path as
-    /// [`publication`](Self::publication); stored by the worker before the `Published` bump and
-    /// installed UI-side on a version change (charts/architecture §4.1).
+    /// [`publication`](Self::publication); stored by `Worker::commit` before the generation bump and
+    /// installed UI-side on a version change (charts/architecture §4.1). Carries a
+    /// `ChartSnapshot::generation` stamp so this surface, too, is answerable at a generation
+    /// (`functional_spec.md F4.3`).
     pub(super) chart_snapshot: Arc<ArcSwap<ChartSnapshot>>,
     /// The published conditional-formatting rule list per sheet (`architecture.md §4.5`,
     /// `components/engine_cf.md §5`). The worker writes `document.cond_fmt_rules(sheet)` here after

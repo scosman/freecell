@@ -7,7 +7,8 @@
 //! ```text
 //! recv() (park when idle) → [first] + try_iter()   // DRAIN = coalescing
 //!   → apply the coalesced edit batch under one paused/evaluate() recompute
-//!   → publish the viewport snapshot, THEN bump the generation (publish-then-bump)
+//!   → stage EVERY shared surface (publication, style cache, chart snapshot, CF map),
+//!     THEN bump the generation, THEN emit the events — the one `commit` point (E1)
 //!   → handle reads / saves / shutdown
 //! ```
 //!
@@ -224,6 +225,12 @@ pub(super) struct Worker {
     /// The published [`ChartSnapshot`] version — bumped on load (when charts exist) and on each
     /// dirty re-resolve, so the UI installs charts only when they actually change.
     pub(super) chart_version: u64,
+    /// Set by [`mark_charts_changed`](Self::mark_charts_changed) when the bound chart set moved, and
+    /// consumed by the next [`commit`](Self::commit) — which is the only writer of the shared
+    /// `ChartSnapshot`. The chart paths used to `store` the snapshot themselves and have `commit`
+    /// immediately re-store a structurally identical value one generation later: two `ArcSwap`
+    /// stores per chart op, the first of them stamped with a generation it did not belong to.
+    pub(super) chart_snapshot_dirty: bool,
     /// The file whose chart machinery (drawings, chart parts, content-type overrides) a
     /// chart-preserving save re-injects into the model body (P10, charts/architecture §4.1/§5):
     /// the opened path on load, then the last path successfully saved (a chart-preserving save
@@ -283,6 +290,85 @@ pub(super) struct StagedCommit {
     cf_after_recompute: bool,
     /// Build the active sheet's cache if it isn't resident yet (a sheet activation).
     ensure_active_cache: bool,
+    /// The batch changed **no** published value, format or viewport — set only by the chart-op
+    /// commits, whose whole mutation lives in the chart snapshot. `Worker::stage_publication` then
+    /// re-stamps the resident [`Publication`] with the new generation instead of rebuilding it, so
+    /// the generation stays honest without a viewport rebuild the batch cannot have invalidated.
+    ///
+    /// Defaults to `false` (rebuild), so a new call site is safe by construction: the only cost of
+    /// getting it wrong that way round is the rebuild the code did anyway.
+    values_unchanged: bool,
+}
+
+impl StagedCommit {
+    /// A commit whose entire mutation is the chart snapshot: no cell value, format, geometry, sheet
+    /// or CF rule moved, so the publication is re-stamped rather than rebuilt
+    /// (see [`values_unchanged`](StagedCommit::values_unchanged)). The constructor exists so the
+    /// chart module can express this without the fields leaving `mod run`.
+    pub(super) fn chart_only() -> Self {
+        Self {
+            values_unchanged: true,
+            ..Self::default()
+        }
+    }
+}
+
+// Test-only observation point, fired by `Worker::commit` at the exact instant of its `Release`
+// store — every shared surface for the new generation written, nothing about it announced yet
+// (`architecture.md §A5.5`).
+//
+// It exists because the contract is a statement about that *instant*, and no after-the-fact drain
+// can see it. Draining once the batch has returned shows the same event order under the pre-Phase-4
+// shape (store + `Published` first, style cache and CF map written only afterwards) as under this
+// one, so a test built on the drained order alone cannot fail when the ordering is reverted — which
+// is exactly what the first version of `commit_emits_nothing_before_the_bump` did. A probe fired
+// *at* the store can check the surfaces.
+//
+// `#[cfg(test)]`, the same house style as `Command::TestPanic` / `document::PANIC_SENTINEL`: it does
+// not exist in a release build. Thread-local because the headless test worker runs on the test's own
+// thread, so no field has to be threaded through `Worker`'s construction sites (nor made `Send` for
+// the real spawned worker).
+#[cfg(test)]
+thread_local! {
+    static COMMIT_STORE_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a `COMMIT_STORE_PROBE` for the guard's lifetime.
+#[cfg(test)]
+pub(super) struct CommitStoreProbe;
+
+#[cfg(test)]
+impl CommitStoreProbe {
+    pub(super) fn install(probe: impl Fn() + 'static) -> Self {
+        COMMIT_STORE_PROBE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(
+                slot.is_none(),
+                "a commit-store probe is already installed on this thread"
+            );
+            *slot = Some(Box::new(probe));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CommitStoreProbe {
+    fn drop(&mut self) {
+        COMMIT_STORE_PROBE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Fire the installed probe, if any. The slot stays borrowed for the call, so a probe must not
+/// install or remove one (nor drive a `commit` of its own).
+#[cfg(test)]
+fn fire_commit_store_probe() {
+    COMMIT_STORE_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow().as_ref() {
+            probe();
+        }
+    });
 }
 
 /// A clamped, half-open viewport window on the active sheet.
@@ -343,6 +429,7 @@ impl Worker {
             loaded_anchor_edits: HashMap::new(),
             loaded_deletes: HashSet::new(),
             chart_version: 0,
+            chart_snapshot_dirty: false,
             chart_source_path: match &source {
                 // An open and the demo both carry a real `.xlsx` whose charts we render + preserve
                 // — their source file is re-read lazily (on paint) and on save (chart re-inject).
@@ -565,32 +652,30 @@ impl Worker {
         }
 
         // Edits first (they carry the coalesced eval + a fresh publish). The publish uses the
-        // viewport already updated above, so a batch of {scroll, edit} publishes once.
+        // viewport already updated above, so a batch of {scroll, edit} publishes once — and the
+        // activation's cache build is staged INTO that one commit (`viewport_changed` is threaded
+        // in), not bolted on after it.
         let published = if edits.is_empty() {
             false
         } else {
-            self.apply_edit_batch(edits)
+            self.apply_edit_batch(edits, viewport_changed)
         };
 
         // A pure viewport change (no edit) still republishes current values (no eval), and a
         // viewport switch to a new sheet builds that sheet's style/geometry cache on first visit
         // (`components/style_cache.md §Lifecycle`). Both are staged through the one commit point, so
         // the cache the scroll's `Published` refers to is already in place when it fires (E1).
-        if viewport_changed {
-            if published {
-                // The edit batch already committed this batch's publication; the activation still
-                // has to build + announce its cache.
-                if self.ensure_active_cache_built() {
-                    self.emit(WorkerEvent::StyleCacheUpdated {
-                        sheet: self.active_sheet,
-                    });
-                }
-            } else {
-                self.commit(StagedCommit {
-                    ensure_active_cache: true,
-                    ..StagedCommit::default()
-                });
-            }
+        //
+        // Skipped when the edit batch already committed: it carried this batch's activation itself.
+        // The mixed {activate, edit} batch used to take a second path that built the cache AFTER the
+        // `Release` store — which left the publication's frozen band read off a cache that did not
+        // exist yet (regression test:
+        // `a_batched_sheet_switch_and_edit_commit_the_new_sheets_cache_together`).
+        if viewport_changed && !published {
+            self.commit(StagedCommit {
+                ensure_active_cache: true,
+                ..StagedCommit::default()
+            });
         }
 
         // Lazy chart discovery (P11, charts/architecture §5 challenge 5): the first time a sheet is
@@ -729,6 +814,15 @@ impl Worker {
             // (or a lazy per-sheet discovery) completes. The late mutations (`chart_source_path`,
             // `loaded_anchor_edits`, `loaded_deletes`) are the last statements before `Ok`, after
             // every fallible step, so those cannot be half-applied.
+            //
+            // What E1 added to this guard's blast radius, so the misattribution isn't a surprise:
+            // that sweep now `commit`s (it used to just emit `Published`), so `build_publication` /
+            // `formatted_value` run INSIDE this `catch_unwind`. An IronCalc panic in the publish
+            // path therefore surfaces as a `SaveError::EnginePanic` and counts toward degrading the
+            // worker, rather than as a publish-path panic. The commit is still the right thing to do
+            // — the snapshot really did change, and the save has written nothing yet — and the
+            // publish path is not a new panic source (every other publishing path already runs it
+            // unguarded); only the label on a panic that reaches the user changes.
             let outcome = catch_unwind(AssertUnwindSafe(|| self.save_workbook(&path)));
             match outcome {
                 Ok(Ok(())) => self.emit(WorkerEvent::Saved {
@@ -807,10 +901,18 @@ impl Worker {
     }
 
     /// Apply a coalesced edit batch: pre-validate (cap / name) outside the panic guard, then
-    /// apply the survivors under one `catch_unwind`-guarded paused recompute, then
-    /// publish-then-bump. Returns whether it published. Emits the SP1 observable timings
-    /// (apply / eval / publish) at `debug` — Phase 12's perf harness reads these.
-    fn apply_edit_batch(&mut self, edits: Vec<Command>) -> bool {
+    /// apply the survivors under one `catch_unwind`-guarded paused recompute, then stage everything
+    /// through the one [`commit`](Self::commit). Returns whether it committed. Emits the SP1
+    /// observable timings (apply / eval / publish) at `debug` — Phase 12's perf harness reads these.
+    ///
+    /// `viewport_changed` says the same drained batch also activated a sheet, so this batch's commit
+    /// owns the activation's cache build too (E1). [`active_sheet`](Self::active_sheet) is already
+    /// the new sheet — `process_batch`'s routing loop sets it before any edit runs — and
+    /// `commit` runs `ensure_active_cache_built` *after* the edits have applied, so the build sees
+    /// post-edit state, exactly as the pure-viewport batch's commit does. When this returns `false`
+    /// (nothing valid, degraded, a no-op batch, or a caught panic) nothing was committed and
+    /// `process_batch` still commits the activation on its own.
+    fn apply_edit_batch(&mut self, edits: Vec<Command>, viewport_changed: bool) -> bool {
         // Clean rejects (no panic risk): input cap + sheet-name re-check + fill merge-guard.
         let mut valid: Vec<Command> = Vec::new();
         for edit in edits {
@@ -984,14 +1086,18 @@ impl Worker {
                 self.reresolve_charts(&refresh, &rebuild);
 
                 // One commit point (E1): every surface — publication, style cache, chart snapshot,
-                // CF map — is written before the generation bump, and every event after it.
+                // CF map — is written before the generation bump, and every event after it. That
+                // includes a sheet activation coalesced into this same batch (`viewport_changed`):
+                // its cache build has to be staged here, because `build_publication` reads the
+                // published sheet's frozen-band counts off exactly that cache.
                 self.commit(StagedCommit {
                     refresh,
                     rebuild,
                     cf_sheets,
                     sheets_before: Some(sheets_before),
                     cf_after_recompute: needs_eval,
-                    ensure_active_cache: false,
+                    ensure_active_cache: viewport_changed,
+                    ..StagedCommit::default()
                 });
                 true
             }
@@ -1181,7 +1287,7 @@ impl Worker {
                     // (a replace recomputes values; empty-map gated, so a non-CF workbook is
                     // unaffected) both land before the generation bump this `Published` announces.
                     self.commit(StagedCommit {
-                        refresh: touched.clone(),
+                        refresh: touched,
                         cf_after_recompute: true,
                         ..StagedCommit::default()
                     });
@@ -1207,8 +1313,10 @@ impl Worker {
     }
 
     /// Shared post-replace bookkeeping for a single-cell replace (`ReplaceOne`): count the op,
-    /// re-resolve any charts the change touched, publish, push one undo touch entry, and refresh the
-    /// touched cache cell. (`ReplaceAll` inlines the single-entry, multi-range variant.)
+    /// re-resolve any charts the change touched, push one undo touch entry, then stage the touched
+    /// cache cell + the CF refresh and commit them with the publication in one bump (E1 — the
+    /// refresh used to run *after* the publish and its `Published`). (`ReplaceAll` inlines the
+    /// single-entry, multi-range variant.)
     fn commit_replacements(&mut self, touched: &[(SheetId, CellRange)]) {
         self.eval_count += 1;
         self.ops_seen += 1;
@@ -2366,8 +2474,10 @@ impl Worker {
             self.undo_chart_op();
         } else {
             // `Cell` top or empty → the IronCalc undo path (degraded-guarded inside; the empty case
-            // is a no-op, identical to before charts joined the timeline).
-            self.apply_edit_batch(vec![Command::Undo]);
+            // is a no-op, identical to before charts joined the timeline). `viewport_changed: false`
+            // — undo/redo run one-by-one AFTER `process_batch`'s viewport handling, so any sheet the
+            // batch activated has already been committed with its cache.
+            self.apply_edit_batch(vec![Command::Undo], false);
         }
     }
 
@@ -2377,7 +2487,7 @@ impl Worker {
         if matches!(self.redo_stack.last(), Some(UndoEntry::Chart(_))) {
             self.redo_chart_op();
         } else {
-            self.apply_edit_batch(vec![Command::Redo]);
+            self.apply_edit_batch(vec![Command::Redo], false);
         }
     }
 
@@ -2398,8 +2508,32 @@ impl Worker {
     /// generation-(N−1) styles. Chart-only ops were worse still: they emitted `Published` without
     /// publishing anything, so the counter did not move at all.
     ///
-    /// **Nothing may write a shared surface after step 2, or emit before it.** That is the whole
-    /// invariant; `commit_emits_nothing_before_the_bump` asserts it directly.
+    /// **The invariant, stated in the direction F4.1 actually needs: no surface may ever be *behind*
+    /// the committed generation. A surface running *ahead* of it is legal.** That is what a reader
+    /// checks and what the ordering tests assert; "nothing writes a shared surface outside this
+    /// function" would be a stronger claim, and it is **not** true. Two sanctioned writers sit
+    /// outside, both forward-only:
+    ///
+    /// - [`load_and_run`](Self::load_and_run) seeds the publication, the active sheet's cache and
+    ///   the CF map before the loop starts, and announces them with `Loaded` + `StyleCacheUpdated`
+    ///   while `generation` never leaves 0. It is not routed through `commit` because a `commit`
+    ///   there would emit `Published` *ahead of* `Loaded`, and F4.2 fixes the event set: no event
+    ///   added, none removed, none reordered relative to `Loaded`. It is sound on a different
+    ///   argument from the one above — the `Loaded` **channel send** is the happens-before edge, so
+    ///   a UI that has seen `Loaded` has seen those writes. Every surface is at generation 0, the
+    ///   committed generation, so nothing is behind.
+    /// - [`apply_auto_grow`](Self::apply_auto_grow) writes row heights into the resident cache and
+    ///   emits a bare `StyleCacheUpdated` with no commit and no bump. It is a cache-only geometry
+    ///   update that rides no undo/touch stack (§3.4), applying a fresh UI measurement **on top of**
+    ///   the committed cache; it never rewinds the cache to a pre-commit state. So the cache runs at
+    ///   or ahead of the generation — legal — and never behind it.
+    ///
+    /// (`DocumentClient::set_chart_snapshot` also stores a snapshot, but it is
+    /// `#[cfg(feature = "test-support")]` and only ever used by worker-less headless view tests.)
+    ///
+    /// `commit_emits_nothing_before_the_bump` asserts step 3 at the store itself, via the
+    /// `#[cfg(test)]` `COMMIT_STORE_PROBE` hook — and asserts step 1 there too, which is the half
+    /// that a drained event order cannot see.
     pub(super) fn commit(&mut self, staged: StagedCommit) {
         // ---- stage: every shared-surface write for this generation ------------------------------
         let generation = self.shared.generation.load(Ordering::Acquire) + 1;
@@ -2462,10 +2596,14 @@ impl Worker {
             None => None,
         };
 
-        self.stage_publication(generation);
+        self.stage_publication(generation, staged.values_unchanged);
         self.stamp_chart_snapshot(generation);
 
         // ---- commit: one Release store, and it is the whole ordering guarantee ------------------
+        // Test-only observation point (§A5.5): fires with every surface for `generation` written and
+        // nothing about it announced — the instant the contract is a statement about.
+        #[cfg(test)]
+        fire_commit_store_probe();
         self.shared.generation.store(generation, Ordering::Release);
 
         // ---- announce: nothing above this line may move below it, and vice versa ----------------
@@ -2486,9 +2624,32 @@ impl Worker {
     /// release edge that makes this publication, the style cache, the chart snapshot and the CF map
     /// visible together. Logs the publish timing at `debug` (an SP1 observable; every publishing
     /// path routes through here).
-    fn stage_publication(&self, generation: u64) {
+    ///
+    /// `values_unchanged` (a chart-op commit, `StagedCommit::values_unchanged`) takes the **restamp**
+    /// path: the resident publication is re-stored under the new generation instead of rebuilt. The
+    /// generation still moves — that is the whole point of routing chart ops through `commit` — but
+    /// a commit that provably changed no cell doesn't pay a viewport rebuild for it. That matters
+    /// because a chart op is **not** always a discrete gesture: `SetChartChrome` is sent live per
+    /// keystroke while a chart/axis title is typed (`chrome/view.rs::on_chart_title_event`), and
+    /// chart ops commit one-by-one, so five characters would otherwise be five full-viewport
+    /// rebuilds (≈20k engine probes each, 165,888 worst case). The restamp is a `Vec` clone of cells
+    /// already built — no engine call at all.
+    ///
+    /// The restamp is skipped (and a full build taken) if the resident publication is for another
+    /// sheet — belt-and-braces: `process_batch` handles `SetViewport` and commits the activation
+    /// before any chart op runs, so the resident publication already describes the active sheet and
+    /// its window.
+    fn stage_publication(&self, generation: u64, values_unchanged: bool) {
         let started = Instant::now();
-        let publication = self.build_publication(generation);
+        let current = self.shared.publication.load();
+        let publication = if values_unchanged && current.sheet == self.active_sheet {
+            Publication {
+                generation,
+                ..(**current).clone()
+            }
+        } else {
+            self.build_publication(generation)
+        };
         let cells = publication.cells.len();
         self.shared.publication.store(Arc::new(publication));
         tracing::debug!(
@@ -3227,6 +3388,7 @@ pub(super) mod testutil {
             loaded_anchor_edits: HashMap::new(),
             loaded_deletes: HashSet::new(),
             chart_version: 0,
+            chart_snapshot_dirty: false,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),
             charts_fully_discovered: true,
@@ -3560,15 +3722,39 @@ mod tests {
         );
     }
 
-    /// E1 (`functional_spec.md F4.1`), stated directly: `commit` must not announce a generation
-    /// before it exists. The old code emitted `Published` and *then* wrote the style cache and the
-    /// CF map, so an event could reach the UI describing a state that was still being assembled.
+    /// E1 (`functional_spec.md F4.1`), stated directly at the instant it is about: when `commit`
+    /// performs its `Release` store, every shared surface for the new generation is already written
+    /// and nothing announcing that generation has been emitted.
     ///
-    /// Asserted structurally rather than by racing: `Shared::generation` is read at the moment the
-    /// first event of the commit is observed, so if any event were emitted before the store, the
-    /// counter would still be at its pre-commit value.
+    /// **Why it needs the `COMMIT_STORE_PROBE` hook rather than a drained event order.** The first
+    /// version of this test only compared positions in the drained event vector, and that is
+    /// *vacuous*: hoist `stage_publication` + the store + `emit(Published)` back to the top of
+    /// `commit` — the pre-Phase-4 shape, where the style cache and CF map were written after the
+    /// bump — and the drained order is unchanged (`Published` still precedes `StyleCacheUpdated`),
+    /// so the test stayed green against the very regression it names. The half that discriminates is
+    /// step 1 of the contract, and it is only observable *at* the store: hence the probe. Reverting
+    /// the ordering fails this test on the number-format assertion below.
     #[test]
     fn commit_emits_nothing_before_the_bump() {
+        use std::sync::Mutex;
+
+        /// What the probe saw at the `Release` store.
+        #[derive(Debug)]
+        struct AtStore {
+            /// The counter itself — still the *previous* generation; the store is what moves it.
+            generation: u64,
+            /// The events sitting in the queue at that instant (drained, so the post-commit drain
+            /// below sees only what the announce phase adds). `EvalStarted` / `EvalFinished` are
+            /// expected here — they are replies to the command, not commit announcements.
+            queued: Vec<WorkerEvent>,
+            publication_generation: u64,
+            published_text: Option<String>,
+            chart_generation: u64,
+            /// The resident style cache's number-format code for A1 — the style surface's
+            /// generation-comparable value (the same device the seam test uses).
+            num_fmt: Option<String>,
+        }
+
         let (mut worker, rx) = test_worker();
         let sheet = sheet0(&worker);
         worker.process_batch(vec![Command::SetViewport {
@@ -3579,17 +3765,102 @@ mod tests {
         drain_events(&rx);
         let before = worker.shared.generation.load(Ordering::Acquire);
 
-        worker.process_batch(vec![set_input(sheet, 0, 0, "1")]);
+        let seen: Arc<Mutex<Vec<AtStore>>> = Arc::new(Mutex::new(Vec::new()));
+        let guard = {
+            let seen = Arc::clone(&seen);
+            let shared = Arc::clone(&worker.shared);
+            let rx = rx.clone();
+            CommitStoreProbe::install(move || {
+                let publication = shared.publication.load_full();
+                seen.lock().unwrap().push(AtStore {
+                    generation: shared.generation.load(Ordering::Acquire),
+                    queued: drain_events(&rx),
+                    publication_generation: publication.generation,
+                    published_text: publication
+                        .cells
+                        .iter()
+                        .find(|c| c.row == 0 && c.col == 0)
+                        .map(|c| c.display_text.clone()),
+                    chart_generation: shared.chart_snapshot.load().generation,
+                    num_fmt: shared.caches.read().get(sheet).and_then(|c| {
+                        c.render_style(0, 0)
+                            .map(|rs| c.num_fmt_code(rs.num_fmt).to_string())
+                    }),
+                });
+            })
+        };
 
+        // One batch that moves the VALUE and the STYLE of the same cell, so both surfaces carry a
+        // value that says which generation they are at ("1.000" / "0.000" only exist after it).
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "1"),
+            Command::SetStylePath {
+                sheet,
+                range: CellRange::single(CellRef::new(0, 0)),
+                path: StylePath::NumFmt,
+                value: "0.000".to_string(),
+            },
+        ]);
+        drop(guard);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the batch is exactly one commit; got {seen:?}"
+        );
+        let at = &seen[0];
         let after = worker.shared.generation.load(Ordering::Acquire);
         assert!(after > before, "the edit committed a new generation");
+        assert_eq!(
+            at.generation, before,
+            "the probe fires at the store, so the counter has not moved yet"
+        );
+
+        // STEP 3 — nothing announcing this generation had been emitted at the store. (`EvalStarted`
+        // / `EvalFinished` are replies to the command and keep their positions, §A5.4.)
+        assert!(
+            !at.queued.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Published
+                    | WorkerEvent::StyleCacheUpdated { .. }
+                    | WorkerEvent::CondFmtUpdated { .. }
+                    | WorkerEvent::SheetsChanged { .. }
+            )),
+            "no commit announcement may be queued before the bump; got {:?}",
+            at.queued
+        );
+
+        // STEP 1 — every surface was already written for the generation about to be stored. This is
+        // the half the drained order cannot see, and the half a revert breaks.
+        assert_eq!(
+            at.publication_generation,
+            before + 1,
+            "the publication is staged before the store"
+        );
+        assert_eq!(
+            at.published_text.as_deref(),
+            Some("1.000"),
+            "and it carries this batch's value under this batch's number format"
+        );
+        assert_eq!(
+            at.num_fmt.as_deref(),
+            Some("0.000"),
+            "the STYLE cache is written before the store too — reverting the ordering (store + \
+             Published hoisted above the cache write) leaves 'general' here"
+        );
+        assert_eq!(
+            at.chart_generation,
+            before + 1,
+            "and so is the chart snapshot's stamp"
+        );
+
+        // The announce phase, after the store: `Published` first, the style delta after it.
         let events = drain_events(&rx);
         let published_at = events
             .iter()
             .position(|e| matches!(e, WorkerEvent::Published))
             .expect("the edit published");
-        // Every surface-announcing event of this commit rides AFTER the bump, so `Published` is the
-        // first of them and the style delta follows it rather than preceding the write it refers to.
         let style_at = events
             .iter()
             .position(|e| matches!(e, WorkerEvent::StyleCacheUpdated { .. }));
@@ -3606,6 +3877,91 @@ mod tests {
             worker.shared.chart_snapshot.load().generation,
             after,
             "and so is the chart snapshot — every surface answers 'what does the UI see at N'"
+        );
+    }
+
+    /// E1 regression (`functional_spec.md F4.1`): a drained batch holding **both** a `SetViewport`
+    /// that activates a not-yet-resident sheet **and** an edit must stage the activation's cache
+    /// build inside the batch's ONE commit — exactly as the pure-viewport batch does.
+    ///
+    /// It used to not: `apply_edit_batch` committed with `ensure_active_cache: false`, and
+    /// `process_batch` then built the cache *after* the `Release` store and emitted a
+    /// `StyleCacheUpdated` for a generation already announced. Two things broke, and the second is
+    /// user-visible: at generation N the published sheet's style cache was absent, and
+    /// [`build_publication`](Worker::build_publication) reads the frozen counts off that very cache
+    /// — so the committed publication claimed `frozen_rows = 0` and omitted the band's values while
+    /// the cache (built a moment later) said 2. The grid renders the band off the cache, so the user
+    /// got a two-row frozen band of EMPTY cells until something else republished.
+    #[test]
+    fn a_batched_sheet_switch_and_edit_commit_the_new_sheets_cache_together() {
+        // A two-sheet file whose SECOND sheet carries a 2-row frozen band with a value in it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two-sheets.xlsx");
+        {
+            let (mut worker, _rx) = test_worker();
+            worker.process_batch(vec![Command::AddSheet]);
+            let s2 = worker.sheet_metas()[1].id;
+            worker.process_batch(vec![
+                Command::SetFrozen {
+                    sheet: s2,
+                    rows: Some(2),
+                    cols: None,
+                },
+                set_input(s2, 0, 0, "HDR"),
+            ]);
+            worker.process_batch(vec![Command::Save {
+                path: path.clone(),
+                req_id: 1,
+            }]);
+        }
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (mut worker, _rx) = worker_over(doc);
+        let s1 = worker.sheet_metas()[0].id;
+        let s2 = worker.sheet_metas()[1].id;
+        // Sheet 1 is active and painted; sheet 2 has never been painted, so its cache is absent —
+        // the state a real open leaves behind (build-on-activation).
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: s1,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        assert!(
+            !worker.shared.caches.read().contains(s2),
+            "sheet 2 must start non-resident for this to test anything"
+        );
+
+        // ONE drained batch: activate sheet 2 (scrolled deep past its band) AND edit sheet 1.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet: s2,
+                rows: 490..520,
+                cols: 0..8,
+            },
+            set_input(s1, 5, 5, "x"),
+        ]);
+
+        let published = worker.shared.publication.load_full();
+        assert_eq!(
+            published.sheet, s2,
+            "the batch published the activated sheet"
+        );
+        assert_eq!(
+            published.frozen_rows, 2,
+            "the activation's cache build is staged BEFORE the publication is built, so the \
+             committed publication carries the band count the cache holds"
+        );
+        assert!(
+            published
+                .cells
+                .iter()
+                .any(|c| c.row == 0 && c.col == 0 && c.display_text == "HDR"),
+            "and therefore the band's VALUES ride the same commit; got {:?}",
+            published.cells
+        );
+        assert_eq!(
+            frozen(&worker, s2).0,
+            2,
+            "the cache and the publication agree at the committed generation"
         );
     }
 
@@ -6895,6 +7251,7 @@ mod tests {
             loaded_anchor_edits: HashMap::new(),
             loaded_deletes: HashSet::new(),
             chart_version: 0,
+            chart_snapshot_dirty: false,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),
             charts_fully_discovered: true,

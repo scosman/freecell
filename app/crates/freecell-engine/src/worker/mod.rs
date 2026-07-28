@@ -2,15 +2,17 @@
 //!
 //! One worker per window owns the IronCalc `UserModel` (via [`WorkbookDocument`]) on a
 //! dedicated 64 MiB-stack thread and implements the validated SP1 seam carried to
-//! `UserModel` by round-3 A: drain-coalesce commands → apply one recompute → publish the
-//! viewport snapshot → bump the generation → notify the UI. The UI holds only a
+//! `UserModel` by round-3 A: drain-coalesce commands → apply one recompute → **stage every shared
+//! surface** (publication, style cache, chart snapshot, CF map) → bump the generation → notify the
+//! UI (E1, `functional_spec.md F4` — it used to publish, bump, notify, and only then write the other
+//! three surfaces). The UI holds only a
 //! [`DocumentClient`] and reads published snapshots + the resident cache; **no IronCalc type
 //! crosses this boundary** (`architecture.md §2`).
 //!
 //! - [`protocol`] — the engine-free `Command` / `WorkerEvent` contract.
 //! - [`client`] — [`DocumentClient`] + the shared read-surfaces + [`WorkerEventReceiver`].
-//! - `run` — the worker's loop (coalescing, publish-then-bump, catch_unwind + degraded
-//!   policy, dirty-op accounting), the publication, and the save.
+//! - `run` — the worker's loop (coalescing, the one `commit` point + its stage-then-bump ordering,
+//!   catch_unwind + degraded policy, dirty-op accounting), the publication, and the save.
 //! - [`charts`] — the chart half: the published [`ChartSnapshot`], the authored-chart store, the
 //!   chart undo timeline, and every chart command (F1 — extracted from `run.rs`, which carried
 //!   1,048 production lines of chart machinery beside this module's 39; see `charts.rs`'s own

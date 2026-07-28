@@ -103,6 +103,37 @@ for this reason.
 Worth knowing before the next split: it is not enough for an import to be used *somewhere in
 the file*.
 
+## 6a. `mod.rs`'s import block accumulated 41 single-child orphans — clippy cannot see them
+
+Architecture §3.3 predicted this and made it a **manual** per-phase check: "imports that end up
+used by only one child get moved into that child. This is checked per-phase precisely because
+it accumulates silently otherwise." That check was never run during the original pass. The
+phase-2 code review caught three instances; sweeping the whole block found the scale.
+
+At the point the phase-2 review landed, `mod.rs` imports **116** names, of which it uses **47**
+itself. Of the remaining 69: **41 are consumed by exactly one child** and belong in that child
+per §3.3; **26 are consumed by two or more** and correctly stay (`ClickEvent` and `Command`
+reach eight children each, `Button` and `WorkerEvent` seven — duplicating those into eight
+files would be strictly worse than the glob, which is what the shared block is *for*).
+
+The reason it accumulates invisibly is worth stating: a child's `use super::*;` re-globs
+`mod.rs`'s private imports, so every orphan still resolves and `clippy -D warnings` stays
+green. There is no latent build failure and nothing is dead — a sweep found **zero** names with
+no consumer at all. It is a locality problem, not a correctness one, which is why it was scored
+Mild.
+
+**Status: partially done.** Phase 2's three (`format_stat_count`, `format_stat_value` →
+`stats.rs`; `close_button` → `find.rs`) moved with that phase's CR fixes. The remaining 41 were
+created by phases 3–8 and are deferred to the **phase-8 CR**, where `mod.rs`'s residue is the
+subject — landing 40+ import moves caused by later phases inside a commit labelled "phase 2"
+would destroy exactly the per-phase attribution §4.1 exists to protect.
+
+Two things for whoever closes it out: apply the predicate as *two* parts (zero uses in
+`mod.rs`'s own body **and** exactly one child consumer — a name `mod.rs` itself uses stays
+regardless), and **assert** the zero-consumer class is empty rather than inferring it from a
+green clippy run, which proves nothing here. A one-line comment above the block saying it is
+consumed by children via `use super::*` would make the next reader's manual check tractable.
+
 ## 7. Three test leaf names are duplicated crate-wide
 
 `point_count_matches_data`, `shared_domains_cover_all_points` and

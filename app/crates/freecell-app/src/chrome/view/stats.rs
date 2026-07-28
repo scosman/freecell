@@ -2,10 +2,16 @@
 //! (`functional_spec.md §1`): the debounced worker query behind it, the session-only Min/Max
 //! expand toggle, and the readout's own rendering.
 //!
+//! The worker reply that feeds it (`WorkerEvent::SelectionStats`) is routed by
+//! [`super::shell`]'s `on_worker_event`, and the readout is placed by [`super::tabs`]'s
+//! `render_tab_bar` — this module owns the query, the state and the readout itself.
+//!
 //! Moved verbatim out of the single-file `chrome/view.rs`
 //! (`specs/projects/chrome-view-split`).
 
 use super::*;
+
+use freecell_core::{format_stat_count, format_stat_value};
 
 impl ChromeView {
     /// Re-request the selection-stats readout — the window calls this on `WorkerEvent::Published`

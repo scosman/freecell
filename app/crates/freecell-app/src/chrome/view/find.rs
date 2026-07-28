@@ -2,10 +2,16 @@
 //! renders below the data row and pushes the grid down, plus match stepping, the two match
 //! toggles, and replace/replace-all.
 //!
+//! The worker reply that drives the match set (`WorkerEvent::FindResults`) is routed by
+//! [`super::shell`]'s `on_worker_event`; this module owns the query, the match cursor and the
+//! bar itself.
+//!
 //! Moved verbatim out of the single-file `chrome/view.rs`
 //! (`specs/projects/chrome-view-split`).
 
 use super::*;
+
+use crate::chrome::sidebar::close_button;
 
 /// The find/replace bar's two text fields' width (`ui_design.md §1`: ~220 px each).
 const FIND_FIELD_W: f32 = 220.0;

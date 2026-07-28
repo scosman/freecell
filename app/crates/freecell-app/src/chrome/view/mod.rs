@@ -67,10 +67,9 @@ use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::{
-    effective_range, format_stat_count, format_stat_value, limits, region_at, regions_intersecting,
-    Align, CellKind, CellRange, CellRef, CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec,
-    CfRuleView, CfTextOp, CfThresholdKind, CfValueOp, RenderStyle, Rgb, SelectionModel,
-    SelectionStats, SheetId, VAlign,
+    effective_range, limits, region_at, regions_intersecting, Align, CellKind, CellRange, CellRef,
+    CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind,
+    CfValueOp, RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -84,7 +83,7 @@ use freecell_engine::{
 
 use super::cond_fmt::{CfEditorKind, CfEditorState, CondFmtPanel};
 use super::h_scroller::{h_scroller, HScroller};
-use super::sidebar::{close_button, docked_sidebar, section};
+use super::sidebar::{docked_sidebar, section};
 use super::{
     AutocompleteDisplay, AutocompleteRow, ChromeClient, ChromeGridRequest, ChromeGridSink,
     EditController, EditOrigin, SheetTab,

@@ -10,7 +10,10 @@
 //! - [`protocol`] — the engine-free `Command` / `WorkerEvent` contract.
 //! - [`client`] — [`DocumentClient`] + the shared read-surfaces + [`WorkerEventReceiver`].
 //! - `run` — the worker's loop (coalescing, publish-then-bump, catch_unwind + degraded
-//!   policy, dirty-op accounting).
+//!   policy, dirty-op accounting), the publication, and the save.
+//! - [`charts`] — the chart half: the published [`ChartSnapshot`], the authored-chart store, the
+//!   chart undo timeline, and every chart command (F1 — extracted from `run.rs`, which carried
+//!   ~1,000 production lines of chart machinery beside this module's 39).
 //!
 //! [`WorkbookDocument`]: crate::WorkbookDocument
 

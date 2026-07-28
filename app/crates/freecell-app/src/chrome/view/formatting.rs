@@ -3,10 +3,27 @@
 //! number format (including the basics-first drill-in), font family and size, and the borders
 //! pen popover — with the popovers they render and the toggle-state accessors they read.
 //!
+//! One resident is not formatting: `commit_pending_edit` is an editing method that the
+//! formatting and chart controls call before they act — `charts.rs` reaches it through
+//! `pub(super)` — and it lives here only because it sat under the formatting banner (that
+//! project's `findings.md` §2).
+//! The five private free functions above the `impl` (border-icon drawing, `Hsla` conversion,
+//! font-size labelling) *are* formatting; they are just free rather than methods.
+//!
 //! Moved verbatim out of the single-file `chrome/view.rs`
 //! (`specs/projects/chrome-view-split`).
 
 use super::*;
+
+use gpui::Hsla;
+use gpui_component::color_picker::{ColorPicker, ColorPickerEvent};
+
+use freecell_core::format_ui::{
+    adjust_decimals_cell, displayed_decimals, font_size_display, is_more_only_num_fmt,
+    num_fmt_category, toggle_thousands, Category, BASIC_FORMATS, NUM_FMT_GROUPS,
+};
+use freecell_core::{effective_range, region_at, regions_intersecting};
+use freecell_engine::StylePath;
 
 /// The fixed font-size dropdown list in points (`functional_spec.md §3.2`).
 const FONT_SIZES: [f64; 12] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 24., 28., 36.];

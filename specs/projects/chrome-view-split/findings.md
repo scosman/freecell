@@ -52,10 +52,11 @@ boundary, and any future attempt to move a test section will hit the same thing.
 
 ## 2. `commit_pending_edit` is an editing method living in the formatting section
 
-It sits under the `// ---- Action row: formatting` banner and moved to `formatting.rs` with
-it, but it is called from formatting, charts **and** conditional formatting — every mutating
-control commits a pending edit first and bails if the commit is blocked. It is now
-`pub(super)`.
+It sits under the `// ---- Action row: formatting` banner and moved to `formatting.rs` with it,
+but `charts.rs` calls it too — four sites against formatting's six — because those controls
+commit a pending edit first and bail if the commit is blocked. It is now `pub(super)`.
+(Conditional formatting does *not* call it, in either the split tree or the pre-split file; an
+earlier draft of this note claimed it did.)
 
 The banner placement is historical (formatting shipped first). If the domains are ever
 tightened, this is the method to look at first: it is the one piece of editing behaviour that
@@ -103,7 +104,7 @@ for this reason.
 Worth knowing before the next split: it is not enough for an import to be used *somewhere in
 the file*.
 
-## 6a. `mod.rs`'s import block accumulated 45 single-child orphans — clippy cannot see them
+## 6a. `mod.rs`'s import block accumulated 47 single-child orphans — clippy cannot see them
 
 Architecture §3.3 predicted this and made it a **manual** per-phase check: "imports that end up
 used by only one child get moved into that child. This is checked per-phase precisely because
@@ -111,13 +112,13 @@ it accumulates silently otherwise." That check was never run during the original
 phase-2 code review caught three instances; sweeping the whole block found the scale.
 
 At the point the phase-2 review landed, `mod.rs` imports **120** names — 116 by name plus the
-four `as _` traits noted below. Of those, **45 are consumed by exactly one child** and belong in
-that child per §3.3; **32 are consumed by two or more** and correctly stay (`ClickEvent` and
+four `as _` traits noted below. Of those, **47 are consumed by exactly one child** and belong in
+that child per §3.3; **31 are consumed by two or more** and correctly stay (`ClickEvent` and
 `Command` reach eight children each, `Button` seven, `WorkerEvent` five in code and six counting
 `formatting.rs`'s intra-doc link — duplicating those into eight files would be strictly worse
-than the glob, which is what the shared block is *for*); the remaining 38 `mod.rs` uses itself,
+than the glob, which is what the shared block is *for*); the remaining 37 `mod.rs` uses itself,
 plus the one `pub use` re-export (`ChartPanelSeries`), which is already in its child and cannot
-move.
+move. (47 + 31 + 37 + 1 = 116.)
 
 **The sweep has one trap, and it caught the first attempt.** `mod.rs`'s own module doc contains
 intra-doc links — `` [`validate_sheet_name`] ``, `` [`DataRow`] `` — and a scan that treats the
@@ -134,6 +135,19 @@ counts as a consumer. `formatting.rs`'s `` [`WorkerEvent::MergeNeedsConfirm`] ``
 example: it resolves only through the glob and would break if `WorkerEvent` moved. A plain
 `` `WorkerEvent::CondFmtUpdated` `` code span, as in `cf_sidebar.rs`, is *not* a consumer —
 that distinction is the difference between six and seven.
+
+The child side needs the same care, and a naive word-boundary match over the whole child file
+gets it wrong in **both** directions. `EditRejectedReason` looked multi-child — hits in
+`cf_editor.rs`, `shell.rs` and `tabs.rs` — but `cf_editor.rs`'s is a plain code span in a doc
+comment and `tabs.rs`'s is written `freecell_engine::EditRejectedReason::…`, fully qualified and
+so independent of `mod.rs`'s import. Only `shell.rs` actually consumes it, which makes it a
+single-child orphan the first sweep missed. A correct sweep strips comments from the child too,
+and ignores fully-qualified paths.
+
+And **string literals**, which is how `Category` hid: `mod.rs` contains `.placeholder("Category
+axis")`, so a raw scan sees a use and keeps the import. It has no code use in `mod.rs` at all —
+its only consumer is `formatting.rs`'s `num_fmt_category` return type. Three trap variants now,
+all the same shape: the scan must see *code*, on both sides, and nothing else.
 
 A second trap, for anyone automating the "assert nothing has zero consumers" check: the four
 trait imports brought in `as _` (`ButtonVariants`, `Disableable`, `Selectable`, `Sizable`) have
@@ -154,10 +168,10 @@ Mild.
 | 3 | `CursorStyle`, `MouseMoveEvent`, `MouseUpEvent`, `validate_sheet_name` → `tabs.rs` |
 | 4 | `AnchorCell`, `ChartAnchor`, `ChartAxisKind`, `ChartChromeEdit`, `DataLabelToggles`, `LegendPosition`, `limits` → `charts.rs` |
 | 5 | `Checkbox`, `CfColorStop`, `CfFormat`, `CfPeriod`, `CfRuleSpec`, `CfTextOp`, `CfThresholdKind`, `CfValueOp`, `CfEditorKind`, `CfEditorState` → `cf_editor.rs` |
+| 6 | `BASIC_FORMATS`, `Category`, `ColorPicker`, `ColorPickerEvent`, `Hsla`, `NUM_FMT_GROUPS`, `StylePath`, `adjust_decimals_cell`, `displayed_decimals`, `effective_range`, `font_size_display`, `is_more_only_num_fmt`, `num_fmt_category`, `region_at`, `regions_intersecting`, `toggle_thousands` → `formatting.rs` |
 
-That leaves **24**, created by phases 6–8 and moving with those phases' reviews: 15 to
-`formatting.rs` (P6), 8 to `editing.rs` (P7), 1 to `shell.rs` (P8). `cf_editor.rs`,
-`cf_sidebar.rs`, `charts.rs`, `find.rs`, `stats.rs` and `tabs.rs` are now clear. Landing them
+That leaves **10**, created by phases 7–8: 8 to `editing.rs` (P7) and 2 to `shell.rs` (P8)
+(`EditRejectedReason`, `Focusable`). Every other child is now clear. Landing them
 all in one commit labelled for an earlier phase would destroy exactly the per-phase attribution
 §4.1 exists to protect.
 
@@ -239,6 +253,19 @@ matters if you are using this as a checklist:
 
 Not a defect in any case, but §4 rule 2 should be read as "within each block", and a reviewer
 diffing ranges should expect at most one seam and know which kind to expect where.
+
+## 6d1. One banner could not follow its section, because the section was split four ways
+
+`architecture.md` §4 rule 3 promises the `// ----` banners become the new files' section
+headers, and they do — except for `// ---- Read accessors (tests + render)`. That block was
+grouped by *shape* rather than domain, so its 33 accessors were distributed across four files
+(§7.2): `formatting.rs` 19, `editing.rs` 7, `tabs.rs` 6, `shell.rs` 1. The banner stayed with the
+remainder and is in `shell.rs`; the 19 that went to `formatting.rs` therefore arrive with no
+header, running straight on from `on_border_color_picker_event`.
+
+Noted so a reviewer doesn't read the missing banner as a lost section. It is the one place the
+"banners are the evidence a section arrived intact" rule cannot apply, because there was no
+single destination for it to arrive at.
 
 ## 6e. One deliberate exception to "body bytes are identical"
 

@@ -45,27 +45,23 @@ use std::time::Duration;
 
 use gpui::{
     canvas, div, prelude::*, px, rgb, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
+    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Rgba, SharedString, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
+use gpui_component::color_picker::ColorPickerState;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::spinner::Spinner;
 use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
 
 use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
 use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
-use freecell_core::format_ui::{
-    adjust_decimals_cell, displayed_decimals, font_size_display, is_more_only_num_fmt,
-    num_fmt_category, toggle_thousands, Category, BASIC_FORMATS, NUM_FMT_GROUPS,
-};
 use freecell_core::functions;
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
-    effective_range, region_at, regions_intersecting, Align, CellKind, CellRange, CellRef,
-    CfPreview, CfRuleView, RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
+    Align, CellKind, CellRange, CellRef, CfPreview, CfRuleView, RenderStyle, Rgb, SelectionModel,
+    SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
@@ -73,8 +69,7 @@ use crate::grid::caret_intent_modifiers;
 use freecell_chart_model::ChartId;
 
 use freecell_engine::{
-    BorderLine, BorderPreset, ChartInsertKind, Command, EditRejectedReason, StyleAttr, StylePath,
-    WorkerEvent,
+    BorderLine, BorderPreset, ChartInsertKind, Command, EditRejectedReason, StyleAttr, WorkerEvent,
 };
 
 use super::cond_fmt::CondFmtPanel;
@@ -241,10 +236,11 @@ pub struct ChromeView {
     /// The number-format dropdown's open state (a `ChromeView`-owned menu panel).
     num_fmt_open: bool,
     /// The number-format dropdown's **drill-in** state (`functional_spec.md §10.1`, D10.1). `false`
-    /// = the basics-first view (the 7 [`BASIC_FORMATS`] flat + a trailing "More ▸" row); `true` =
-    /// the full grouped [`NUM_FMT_GROUPS`] view (with a "◂ Back" row). Reset to `false` at every
-    /// popover-close so the dropdown always reopens basics-first (except when it opens directly onto
-    /// a More-only active format — see [`toggle_num_fmt_popover`](Self::toggle_num_fmt_popover)).
+    /// = the basics-first view (the 7 [`freecell_core::format_ui::BASIC_FORMATS`] flat + a trailing
+    /// "More ▸" row); `true` = the full grouped [`freecell_core::format_ui::NUM_FMT_GROUPS`] view
+    /// (with a "◂ Back" row). Reset to `false` at every popover-close so the dropdown always
+    /// reopens basics-first (except when it opens directly onto a More-only active format — see
+    /// [`toggle_num_fmt_popover`](Self::toggle_num_fmt_popover)).
     num_fmt_more_open: bool,
     /// The chart-insert menu's open state (the action-bar chart-type glyph menu, P17). Like the
     /// other formatting popovers it closes on click-away / a type pick / degrade.

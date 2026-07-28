@@ -119,21 +119,22 @@ Size is **task** (small, one phase) or **project** (multi-phase). Targets follow
 | C2 | Save-fidelity warning dialog | task | v0.5 | **C1** |
 | C3 | Default-carry / explicit-drop preservation model | project | v1.0 | **C1** |
 | C4 | Comment write-back | task | v1.0 | C1 (pref) |
-| D1 | Render gate: bump-token trigger | task | v0.5 | **design ↓** |
+| D1 | Render gate weekly on `main` + at release | task | v0.5 | — |
 | D2 | Tighten pixel tolerance; add exact-match text cases | task | v0.5 | D1 (pref) |
-| D3 | Platform-gated code has no PR compile check | task | v1.0 | — |
+| ~~D3~~ | ~~Platform-gated PR compile check~~ | — | **dropped** | — |
 | D4 | Measure real frame cost, not element construction | project | v1.0 | — |
 | D5 | Scale tests on the I/O path | project | v1.0 | C3 (pref) |
-| E1 | One commit point for the four shared surfaces | project | v1.0 | **discuss ↓** |
-| E2 | Single source of truth for UI state | project | v1.0 | **discuss ↓** · F1 |
+| E1 | One commit point for the four shared surfaces | project | **v0.5** | — |
+| E2 | Single source of truth for UI state | project | v1.0 | F1 (strong pref) |
 | F1 | Split `chrome/view.rs` and `worker/run.rs` | project (small) | v0.5 | — |
 | F2 | Production-line ceiling in CI (2,000) | task | v0.5 | **F1** |
-| F3 | Fold `freecell-chart-model` onto `freecell-core` | project | v1.0 | **discuss ↓** |
+| F3a | Chart-axis number formatting must agree with cells | task | **v0.5** | — |
+| F3 | Fold `freecell-chart-model` onto `freecell-core` | project | v1.0 | F3a · coord. G3 |
 | F4 | Collapse the worker protocol | project | v2.0 | E2 (pref) |
 | G1 | Detect multi-group (combo) charts | task | v0.5 | — |
 | G1b | Combo / dual-axis chart support | project | v2.0 | G1 |
 | G2 | Thread the workbook theme into charts | task | v1.0 | — |
-| G3 | Fidelity classifier off the text scanner | project | v1.0 or v2.0 | **discuss ↓** · G1 |
+| G3 | Fidelity classifier off the text scanner (in the engine) | project | v1.0 | **G1** |
 | G5 | `dLbls` overrides + chart-insert collisions | task | v0.5 / v1.0 | — |
 | H1 | Invariant-enforcement sweep | project | v0.5 | B2, F1 (pref) |
 | H3 | Update `CLAUDE.md` to prevent this class of defect | task | v0.5 | H1 (pref) |
@@ -142,14 +143,16 @@ Size is **task** (small, one phase) or **project** (multi-phase). Targets follow
 see the unit body.
 
 *Retired from earlier drafts:* **A3** (GPL reintroduction guard — already covered by
-`cargo deny`); **G4** (theme parsing — folded into G2); **H2** (doc reconciliation —
-folded into the units that make each doc wrong, per below).
+`cargo deny`); **D3** (platform-gated PR compile check — not worth the CI weight); **G4**
+(theme parsing — already done; folded into G2); **H2** (doc reconciliation — folded into
+the units that make each doc wrong, per below).
 
 **Doc corrections are not a unit.** Every unit that invalidates a doc claim fixes that
 claim as part of its own scope: D1 fixes `app/README.md` §CI and the `checks.yml` header
 plus the `CLAUDE.md` render process; G1 fixes the `GAPS.md` combo row; G2 fixes the
 `chart/style.rs` comment; A4 fixes the manifest comment and the upstreaming status
-table; A2 fixes the `deny.toml` header's stale GPL-exception reference.
+table; A2 fixes the `deny.toml` header's stale GPL-exception reference; H3 picks up the
+orphan from dropped D3 (the "macOS (primary)" claims, which should read as cross-platform).
 
 ---
 
@@ -324,46 +327,33 @@ if comments end up carried as parts.
 
 ## D. Verification integrity
 
-### D1. Render gate: bump-token trigger
-**task · v0.5 · design open — see below**
+### D1. Run the render gate weekly on `main` and at release
+**task · v0.5 · no dependencies**
 
 `render.yml`'s own header says it "MUST be a required status check"; its trigger is
-`workflow_dispatch:`-only. 29 dispatched runs across 13 branches, **zero on `main`,
-ever**, against 44 merged PRs — while failing on 7% of the runs it did get. The only
-automated gate on the product's core differentiator is a convention in a markdown file.
+`workflow_dispatch:`-only. 29 dispatched runs across 13 branches, **zero on `main`, ever**,
+against 44 merged PRs — while failing on 7% of the runs it did get. So `main` has never
+been render-verified.
 
-**But the suite is genuinely expensive** (software lavapipe, many minutes) and running it
-on every PR would slow the main loop down for no benefit on the many PRs that cannot move
-a pixel. So the fix is not "make it required on every PR."
+The suite is genuinely expensive (software lavapipe, many minutes), and it cannot be worth
+that cost on the many PRs that can't move a pixel. **Decided (owner, 2026-07-28): keep it
+off the PR path entirely.** Add two triggers instead:
 
-**Proposed mechanism — a bump token.** A tracked file (e.g.
-`app/render-tests/epoch.yml`) holds an integer. A cheap always-on CI job compares the PR
-against its base:
+- a **weekly schedule on `main`** — catches anything that slipped through merges, at a
+  cadence where a regression is still cheap to bisect
+- a **run at release** — nothing ships without a green pixel suite
 
-| render-relevant paths changed? | epoch bumped? | outcome |
-|---|---|---|
-| no | no | **pass instantly** (the common case) |
-| yes | yes | **run the full suite** |
-| yes | no | **fail fast**: "render-relevant code changed; bump the epoch or record why not" |
-| no | yes | run the suite anyway (cheap escape hatch for harness/baseline-only changes) |
+Keep `workflow_dispatch` for the agent-driven case: an agent making a rendering change
+still runs the relevant subset locally and can dispatch the full suite on its branch when
+it wants confirmation. What changes is that forgetting no longer means *nobody* checked.
 
-The third row is what makes this different from today. The current design and the naive
-version of your idea both fail *silently* when someone forgets — which is the exact
-pattern this whole review is about. Making "you changed render code and didn't bump" a
-loud, instant failure keeps the expensive run off unrelated PRs while removing "the agent
-must remember" from the safety path.
+No bump-token, no `paths` filter, no per-PR gate — those were considered and rejected as
+ceremony that buys little over a weekly backstop.
 
-Open questions to settle before implementing — see the discussion notes at the end of this
-document:
-- What counts as a render-relevant path, and does a `paths` filter alone make the epoch
-  redundant?
-- Does the escape hatch need to be auditable (a required justification line), or is trust
-  fine?
-- Does this also want to run on `main` post-merge as a backstop?
-
-Also in scope once settled: fix `app/README.md` §CI and the `checks.yml` header (both
-claim `checks` runs the render suite — it doesn't), and replace the multi-paragraph
-"the agent must decide when to run it" process in `CLAUDE.md` with the real mechanism.
+Also in scope: fix `app/README.md` §CI and the `checks.yml` header (both claim `checks` runs
+the render suite — it doesn't), and rewrite the multi-paragraph "the agent must decide when
+to run it" process in `CLAUDE.md` to describe the real mechanism, including that `main` is
+now covered by a schedule.
 
 ### D2. Tighten pixel tolerance; add exact-match text cases
 **task · v0.5 · after D1 (preferred)**
@@ -380,32 +370,22 @@ demonstrated stability, and `diff.rs`'s own comment says to tighten when it does
 back off rather than fighting it — a flaky gate is worse than a loose one. Land whatever
 tightening holds cleanly, record the rest in `GAPS.md`, and stop.
 
-### D3. Platform-gated code has no PR compile check
-**task · v1.0 · no dependencies**
+### D3. ~~Platform-gated code has no PR compile check~~ — DROPPED
+**retired 2026-07-28 (owner call)**
 
-**Reframed after verification (2026-07-28).** The review's "macOS is the stated primary
-platform" argument is dropped — FreeCell is cross-platform, per the owner. Note that the
-*repo* still says otherwise in four places (`app/README.md:8` "macOS (primary, Metal)",
-`specs/projects/mvp/architecture.md:53`, `functional_spec.md:21`, and the
-`macos-verify.yml` header); correcting those to a cross-platform statement is part of this
-unit.
+The review's premise ("macOS is the stated primary platform, gated weekly") is dropped:
+FreeCell is cross-platform, and Linux CI is the better default gate.
 
-The argument that survives is narrower and platform-agnostic: **no PR compiles the
-macOS-gated code at all.** `checks.yml` runs only on `ubuntu-24.04`; `macos-verify.yml` is
-`workflow_dispatch` + a weekly cron and is non-required; `release.yml` fires only on `v*`
-tags. Roughly **250 lines** sit behind attribute-form `#[cfg(target_os = "macos")]` —
-concentrated in `shell/default_app.rs:138-300` (hand-rolled CoreFoundation/LaunchServices
-FFI with raw `*const c_void` and manual retain/release) and `shell/open_files.rs:50-124`
-(the Finder Apple-Event bridge). Unsafe FFI is precisely the category that breaks silently
-on a dependency bump, and today the first signal would be a release build.
+The narrower version — that ~250 lines behind `#[cfg(target_os = "macos")]`
+(`shell/default_app.rs` CoreFoundation/LaunchServices FFI, `shell/open_files.rs` Apple-Event
+bridge) are compiled by no PR — was considered and **rejected as not worth the cost**:
+platform-specific branches are expected to be exercised when the PR that touches them is
+written and merged, and release builds cover all three OSes. Adding CI weight to 99.9% of
+PRs that contain no platform code is the wrong trade.
 
-Most other macOS references are `cfg!(...)` *expressions* (`titlebar.rs`, `menus.rs`,
-`window.rs`), which compile on Linux and are already covered — so the exposure is small but
-sharp.
-
-**Proposed shape:** not a macOS `cargo check --workspace` on every PR — over-priced for 250
-lines. Either a targeted cross-`check` of `freecell-app`, or make the existing weekly macOS
-job trigger on PRs touching `shell/`. Pick whichever is cheaper to maintain.
+*The one residue is a doc fix: the repo still calls macOS "primary" in four places
+(`app/README.md:8`, `specs/projects/mvp/architecture.md:53`, `functional_spec.md:21`, the
+`macos-verify.yml` header). Folded into H3.*
 
 ### D4. Measure real frame cost, not element construction
 **project · v1.0 · no hard dependencies**
@@ -432,12 +412,12 @@ on a model about to change.
 
 ## E. State & consistency architecture
 
-> **Timing for both E units is an open question** — the owner's instinct is that these are
-> core quality fixes that belong earlier than v1.0. See the discussion notes at the end.
-
 ### E1. One commit point for the four shared worker→UI surfaces
-**project · v1.0 (timing under discussion) · after B3 if B3 happens (it is now v3+, so no
-blocker)**
+**project · v0.5 · no blockers**
+
+**Promoted to v0.5 (2026-07-28).** This is not a scale problem, it is a correctness problem
+reachable today, and it gets cheaper the sooner it happens — every additional shared surface
+is one more thing to unify later.
 
 The `ArcSwap` publication was designed as a seam; the style cache, chart snapshot and CF
 map were each added beside it with their own primitive and their own (or no) version
@@ -448,7 +428,7 @@ to reason about this seam at all. Unify under one generation counter and one com
 add ordering tests with non-zero-sample assertions.
 
 ### E2. Single source of truth for UI state
-**project · v1.0 (timing under discussion) · after F1 (strongly preferred)**
+**project · v1.0 · after F1 (strongly preferred)**
 
 Selection lives in three places (`GridView.selection`, `ChromeView.selection`,
 `SinkShared.last_selection`), active sheet in four, pending-edit text in four
@@ -461,7 +441,9 @@ both views read dissolves the mirrors, `SinkShared`, the setter and most of the 
 class at once.
 
 ***Freeze rule while it waits: no new mirrored fields.*** This unit gets strictly harder
-every phase that adds one.
+every phase that adds one — there are already ten, and the v1.0 tier is only defensible if
+that number stops growing. If the freeze can't hold, promote this to v0.5, because waiting
+will only cost more.
 
 ---
 
@@ -493,17 +475,41 @@ on per-file **production** line count (excluding `#[cfg(test)]` blocks — sever
 every file actually lands under it; anything that can't be split cleanly gets an explicit,
 listed exemption rather than a raised global ceiling.
 
+### F3a. Make chart-axis number formatting agree with cells
+**task · v0.5 · no dependencies**
+
+**Split out of F3 (2026-07-28)** — the user-visible bug shouldn't wait on the structural
+refactor.
+
+`chart-model/src/numfmt.rs` is a 383-line reimplementation of OOXML number formatting that
+exists only because `chart-model` must stay ironcalc-free. It races IronCalc's
+implementation, so the *same format code* can produce two different strings: `#,##0.00` on a
+chart axis and on the cells that chart plots go through different code. Users see the
+disagreement.
+
+Same class, same unit: the drifted `rgb_to_hsl` copies between `core` and `chart-model`
+(`.rem_euclid` vs `%` — they disagree on negative hues), and the two definitions of the
+Office palette.
+
+Fix the *agreement*, not the architecture — a shared implementation, a delegation, or at
+minimum a differential test over a format-code corpus asserting the two agree. The crate
+merge that removes the duplication for good is F3.
+
+*Confirm first: the review asserted the divergence from reading both implementations, not
+from running them. Build the differential test before deciding how big the fix is — it may
+turn out they agree everywhere that matters, in which case the test is the deliverable.*
+
 ### F3. Fold `freecell-chart-model` onto `freecell-core`
-**project · v1.0 (v0.5 under discussion) · coordinate with G3**
+**project · v1.0 · after F3a · coordinate with G3**
 
-Two zero-dependency foundation crates that do not know each other exist. This has already
-produced a byte-identical duplicate `Color`/`Rgb`, drifted `rgb_to_hsl` copies
-(`.rem_euclid` vs `%` — they disagree on negatives), two definitions of the Office palette,
-and a **383-line reimplementation of OOXML number formatting** racing IronCalc's, so
-`#,##0.00` on a chart axis and on the cells it plots go through two different
-implementations. A purity boundary is not free: it charges rent in reimplementation.
+Two zero-dependency foundation crates that do not know each other exist, which produced the
+byte-identical duplicate `Color`/`Rgb`, the drifted `rgb_to_hsl`, the two Office palettes and
+the duplicate number formatter behind F3a. A purity boundary is not free: it charges rent in
+reimplementation.
 
-See the discussion notes at the end on whether this is v0.5.
+This is the structural fix that stops the class from recurring. Sequenced after F3a (which
+removes the user-visible pain) and coordinated with G3 (which moves the classifier *out* of
+`chart-model` and may shrink what's left to fold).
 
 ### F4. Collapse the worker protocol
 **project · v2.0 · after E2 (preferred)**
@@ -581,17 +587,21 @@ What is actually true at HEAD:
 *Absorbs the former G4 (theme parsing), which turned out to be already done.*
 
 ### G3. Fidelity classifier off the text scanner
-**project · v1.0 or v2.0 — see discussion · after G1 (required)**
+**project · v1.0 · after G1 (required)**
 
 `fidelity.rs` is 1,272 lines including ~130 lines of hand-rolled XML lexing, in that form
 solely so `chart-model` can stay dependency-free. As a whole-part *text scanner* it cannot
 bind an element to its enclosing chart group — which is precisely why it is structurally
-incapable of catching G1, the thing it exists to catch. It should derive from a real DOM
-instead.
+incapable of catching G1, the thing it exists to catch. Rebuild it to derive from the DOM
+the loader already builds.
 
-**Open question — where it lands.** The review said "move it into the engine." The owner
-raises pushing it into IronCalc instead, which changes both the tier and the shape. See the
-discussion notes at the end.
+**Decided (2026-07-28): it lands in the engine, not IronCalc.** "How much of this chart did
+*FreeCell* fail to represent?" is not a fact about the workbook — it is a fact about the gap
+between the file and FreeCell's renderer, so it is not a concept IronCalc should carry, and
+it would not survive the single-fix-PR upstreaming model. If the engine turns out not to see
+enough of the parsed chart to classify properly, *that* gap is a legitimate upstream
+capability request and becomes its own `fix/` branch — which fits the fork workflow far
+better than shipping a FreeCell concept upstream.
 
 ### G5. `dLbls` overrides + chart-insert collisions
 **task · v0.5 (dLbls) / v1.0 (insert) · no dependencies**
@@ -641,6 +651,10 @@ Also worth encoding the review-hygiene rule from the top of this document: **a p
 hypothesis; confirm the root cause before implementing the fix, and push back when it isn't
 there.**
 
+Also picks up the orphan doc fix from dropped D3: `app/README.md:8`,
+`specs/projects/mvp/architecture.md:53`, `functional_spec.md:21` and the `macos-verify.yml`
+header all call macOS the "primary" platform. FreeCell is cross-platform; make them say so.
+
 *Keep to rules that changed because of this review. A wholesale rewrite would bury the ones
 that matter in a document that is already long and — per D1/G1/G2 — currently wrong in
 several places about what CI protects and what shipped.*
@@ -649,43 +663,41 @@ several places about what CI protects and what shipped.*
 
 ## Suggested waves
 
-**Wave 0 — parallel, no dependencies (10 units).**
-A1 · A2 · A4 · B1 · B2 · C1 · F1 · G1 · G5 · *(start the H3 convention)*
+**Wave 0 — parallel, no dependencies (12 units).**
+A1 · A2 · A4 · B1 · B2 · C1 · D1 · F1 · F3a · G1 · G5 · *(start the H3 convention)*
 
 Most criticals are missing *enforcers*, not missing designs, which is why this wave is wide
 and shallow. These can be run by independent agents.
 
 **Wave 1 — unblocked by Wave 0.**
-C2 · D1 *(after design settles)* · D2 · F2 · H1 · H3
+C2 · D2 · E1 · F2 · H1 · H3
 
 **Wave 2 — the real projects.**
-C3 · C4 · D3 · D4 · G2 · G3 · E1 *(timing TBD)* · F3 *(timing TBD)*
+C3 · C4 · D4 · F3 · G2 · G3
 
 **Wave 3 — after the ground is stable.**
 E2 · D5
 
 **Later.** B4 · F4 · G1b *(v2.0)* · B3 *(v3+)*
 
+**v0.5 scope** is therefore: A1 · A2 · A4 · B1 · B2 · C1 · C2 · D1 · D2 · E1 · F1 · F2 ·
+F3a · G1 · G5(dLbls) · H1 · H3.
+
 ---
 
-## Open questions for discussion
+## Decisions log
 
-Recorded so they don't get lost; none blocks Wave 0.
+Open questions raised during owner review, and how they were settled.
 
-1. **D1 — render gate trigger.** Is the bump-token + fail-fast-on-unbumped design right, or
-   does a plain `paths` filter get most of it with none of the ceremony? Does it also want a
-   post-merge run on `main` as a backstop?
-2. **E1 / E2 — timing.** Both are tiered v1.0 on scale grounds, but both are arguably core
-   quality fixes that get more expensive every feature phase. E2 in particular has a
-   ratchet: every new mirrored field raises the cost.
-3. **F3 — is folding `chart-model` a v0.5?** The duplicate number formatter can visibly
-   disagree with the cell formatter today, which argues for earlier.
-4. **G3 — does the fidelity classifier belong in IronCalc rather than the engine?** If yes,
-   it becomes a fork/upstream project and the tier moves to v2.0.
-
-*Resolved: **D3** (macOS is not primary — reframed around uncompiled `cfg` code, and the
-repo's own "primary" claims get corrected); **G2** (verified — display-fidelity bug, not
-file corruption; downgraded to v1.0).*
+| Question | Decision (2026-07-28) |
+|---|---|
+| **D1** — bump-token trigger, `paths` filter, or per-PR gate? | **None of them.** Weekly on `main` + at release. Keep it off the PR path; `workflow_dispatch` stays for agent-driven runs. |
+| **D3** — add a macOS compile check to PRs? | **Dropped.** Platform branches are expected to be tested when their PR is written; release covers all three OSes. Not worth taxing 99.9% of PRs. Doc fix folded into H3. |
+| **E1** — is the shared-surface commit point v0.5? | **Yes, promoted.** Correctness problem reachable today, and it gets cheaper the sooner it lands. |
+| **E2** — is the UI view-model v0.5? | **No, stays v1.0** — genuinely multi-week and competes with everything ahead of it. Conditional on the no-new-mirrored-fields freeze holding. |
+| **F3** — is folding `chart-model` v0.5? | **Split.** The user-visible half (formatter disagreement) becomes F3a at v0.5; the crate merge stays v1.0. |
+| **G2** — is the theme claim real? | **Verified and downgraded.** Theme is parsed and wired for cells; save is a change-gated splice, so no file corruption. Display-fidelity bug at v1.0. |
+| **G3** — classifier into IronCalc or the engine? | **The engine.** Fidelity is a fact about FreeCell's rendering gap, not about the workbook, so it doesn't belong upstream. Stays v1.0. |
 
 ---
 

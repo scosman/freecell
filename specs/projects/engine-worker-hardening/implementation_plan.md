@@ -7,6 +7,34 @@ status: complete
 Phase order is fixed by the overview: the two small safety fixes land before the structural
 change, so the unification is built on stable ground.
 
+## Code review
+
+**The `[x]` marks below mean "implemented **and** reviewed clean."** They did not originally: all
+five were ticked when the phases were first written, before any code review had run — treating
+"the tests pass" as "the phase is done", which is exactly the gap the review loop exists to close.
+Every phase was subsequently taken through the full `/spec implement` CR loop (review → fix →
+re-review, until clean) and the boxes are re-earned rather than inherited.
+
+What that loop found, in code that had already been committed and reported as complete:
+
+| Phase | Rounds | Worst finding |
+|---|---|---|
+| 1 (B2) | 6 | An ordinary Insert Rows grows the model's frozen count past the cap; the clamp then hides it. Accepted and documented rather than re-clamped (a second undo diff would break the one-action-one-undo contract). |
+| 2 (B1) | 5 | **Critical.** A lost worker still rendered a "Save As to keep your work" bar whose button silently did nothing — and a dirty window's quit prompt parked the `QuitPlan` forever. Fixed twice: guarding save *entry* left both in-flight orderings hanging. |
+| 3 (F1) | 2 | The move itself was verified mechanically clean (zero production statements changed). Residue only: stranded test banners, wrong line-count arithmetic, a silently-skipped `testutil` module. |
+| 4 (E1) | 2 | **Critical.** A batch containing both a sheet activation and an edit wrote the cache *after* the bump and published `frozen_rows: 0` — a frozen band rendered with empty cells. One branch had been fixed and its twin left in the pre-Phase-4 state. |
+
+Two failure modes recurred across every phase and are worth carrying forward:
+
+1. **Prose asserting more than the code holds.** It appeared in all four phases, in both directions
+   (code doing less *and* more than described), and three times *inside a correction pass*. The
+   most consequential instance: §F4.2 claimed Phase 4 reordered `StyleCacheUpdated` before
+   `Published`. No event ever moved — the *writes* did. That claim survived the original spec, a
+   commit message, a full review round and a fix pass that rewrote four adjacent sections.
+2. **Tests named after an invariant that assert nothing.** `commit_emits_nothing_before_the_bump`
+   passed with the ordering fully reverted, and the replacement design `architecture.md §A5.5`
+   specified would have been vacuous too. Only reading the *style cache* at the store discriminates.
+
 ## Phases
 
 - [x] **Phase 1 — B2: bound the frozen-pane band.** `MAX_FROZEN_ROWS` / `MAX_FROZEN_COLS`;
@@ -118,15 +146,30 @@ re-measured with it rather than carried forward from an earlier draft.
 | After Phase 2 (B1) | `0f4ddd1` | 4,096 | +60 |
 | After Phase 3 — chart extraction | `bccd033` | **3,048** | **−1,048** |
 | After Phase 4 (E1) | `167d144` | 3,148 | +100 |
-| **As of this commit** (Phase 1/2 CR rounds) | — | **3,192** | +44 |
+| After the Phase 1/2 CR rounds | `fe55dd3` | 3,192 | +44 |
+| **At project close** (Phase 3/4 CR rounds) | `2f5f367` | **3,363** | +171 |
 
-So `3,984 + 52 + 60 − 1,048 + 100 + 44 = 3,192`. The chart extraction removed **1,048** lines
-(not the ~1,000/1,010 earlier drafts of this note claimed), and `worker/charts.rs` production
-landed at **1,113** at `bccd033`.
+So `3,984 + 52 + 60 − 1,048 + 100 + 44 + 171 = 3,363`. The chart extraction removed **1,048**
+lines (not the ~1,000/1,010 earlier drafts of this note claimed), and `worker/charts.rs`
+production landed at **1,113** at `bccd033` (**1,231** at project close).
 
-**The reported figure is 3,192, measured as of this commit.** It will move again as later work
-lands — Phase 4's CR round in particular — so a future re-measure that differs is an update, not
-a contradiction of this note.
+**The final figure is 3,363**, measured at `2f5f367` after every code-review round. The CR rounds
+added 215 lines net across the project — regression tests, the `worker_lost` state, the scoped
+quit teardown, `StagedCommit::values_unchanged`, and the commit-store probe.
+
+### A measurement trap F2 must avoid
+
+Every figure above uses **"lines before the first top-level `#[cfg(test)]` that is immediately
+followed by a `mod` declaration"**. The naive rule — *lines before the first `#[cfg(test)]`* —
+reproduced these numbers for most of the project's life and **silently stopped working** at
+`9ef0eed`, which added the `COMMIT_STORE_PROBE` machinery as five inline `#[cfg(test)]` blocks at
+`run.rs:331-365`. Under the naive rule `run.rs` now measures **330** production lines instead of
+3,363 — a file 68% over the ceiling would read as 84% under it.
+
+F2's CI check must exclude `#[cfg(test)]` *blocks* wherever they appear, not truncate at the first
+one. `run.rs` is the file that proves the difference, so it is worth using as F2's own test case.
+(The 3,363 figure also still counts those ~40 inline test-only lines as production, which is
+conservative in the right direction — it can only overstate, never hide, a ceiling breach.)
 
 **Prediction vs outcome.** `architecture.md` §A4.4 and `functional_spec.md` §F3 predicted the
 extraction would remove ≈1,180 and land `run.rs` at ≈2,800. It removed **1,048** and landed at
@@ -142,7 +185,7 @@ items' spans; the real total was ~130 lines smaller. The ≈2,800 landing point 
 assumed the 3,984 baseline, but Phases 1–2 had already added 112 lines before the cut, which
 accounts for the rest of the ~250 gap (4,096 − 1,048 = 3,048, vs 3,984 − 1,180 = 2,804).
 
-**F2 next round should size off 3,192 and −1,048, not off 2,800 and −1,180.**
+**F2 next round should size off 3,363 and −1,048, not off 2,800 and −1,180.**
 
 That is **still over the 2,000-line ceiling F2 will enforce**, and the chart extraction was the
 only move F1 scoped for this file.

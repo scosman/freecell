@@ -65,18 +65,18 @@ use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
-    effective_range, limits, region_at, regions_intersecting, Align, CellKind, CellRange, CellRef,
+    effective_range, region_at, regions_intersecting, Align, CellKind, CellRange, CellRef,
     CfColorStop, CfFormat, CfPeriod, CfPreview, CfRuleSpec, CfRuleView, CfTextOp, CfThresholdKind,
     CfValueOp, RenderStyle, Rgb, SelectionModel, SelectionStats, SheetId, VAlign,
 };
 
 use crate::grid::caret_intent_modifiers;
 
-use freecell_chart_model::{Anchor as ChartAnchor, AnchorCell, ChartId, LegendPosition};
+use freecell_chart_model::ChartId;
 
 use freecell_engine::{
-    BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, ChartInsertKind, Command,
-    DataLabelToggles, EditRejectedReason, StyleAttr, StylePath, WorkerEvent,
+    BorderLine, BorderPreset, ChartInsertKind, Command, EditRejectedReason, StyleAttr, StylePath,
+    WorkerEvent,
 };
 
 use super::cond_fmt::{CfEditorKind, CfEditorState, CondFmtPanel};

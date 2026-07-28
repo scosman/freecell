@@ -140,12 +140,19 @@ green. There is no latent build failure and nothing is dead — a sweep found **
 no consumer at all. It is a locality problem, not a correctness one, which is why it was scored
 Mild.
 
-**Status: being cleared per phase, with the CR of each phase.** Phase 2's three
-(`format_stat_count`, `format_stat_value` → `stats.rs`; `close_button` → `find.rs`) and phase
-3's four (`CursorStyle`, `MouseMoveEvent`, `MouseUpEvent`, `validate_sheet_name` → `tabs.rs`)
-have moved. The remaining 41 were created by phases 4–8 and move with those phases' reviews —
-landing them all in one commit labelled for an earlier phase would destroy exactly the
-per-phase attribution §4.1 exists to protect.
+**Status: being cleared per phase, with the CR of each phase.** Moved so far:
+
+| Phase | Orphans returned to their owner |
+|---|---|
+| 2 | `format_stat_count`, `format_stat_value` → `stats.rs`; `close_button` → `find.rs` |
+| 3 | `CursorStyle`, `MouseMoveEvent`, `MouseUpEvent`, `validate_sheet_name` → `tabs.rs` |
+| 4 | `AnchorCell`, `ChartAnchor`, `ChartAxisKind`, `ChartChromeEdit`, `DataLabelToggles`, `LegendPosition`, `limits` → `charts.rs` |
+
+That leaves **34**, created by phases 5–8 and moving with those phases' reviews: 10 to
+`cf_editor.rs` (P5), 15 to `formatting.rs` (P6), 8 to `editing.rs` (P7), 1 to `shell.rs` (P8).
+`charts.rs`, `cf_sidebar.rs`, `find.rs`, `stats.rs` and `tabs.rs` are now clear. Landing them
+all in one commit labelled for an earlier phase would destroy exactly the per-phase attribution
+§4.1 exists to protect.
 
 Two things for whoever closes it out: apply the predicate as *two* parts (zero uses in
 `mod.rs`'s own body **and** exactly one child consumer — a name `mod.rs` itself uses stays
@@ -168,6 +175,22 @@ are unchanged by the move.
 
 Left alone deliberately: fixing them is a doc change to items this project only relocates, and
 CI has no `cargo doc` gate. Worth a follow-up sweep for whoever adds one.
+
+## 6c. Two items were left behind by the phase that should have taken them
+
+Both were caught later and are correct at HEAD; recorded so the per-phase diffs aren't read as
+tidier than they were.
+
+- **`impl ChartPanel`** (holding the `#[cfg(test)] skeleton` constructor) stayed in `mod.rs`
+  when P4 moved `ChartPanel` and `ChartPanelSeries`, leaving an inherent `impl` for a type its
+  own module no longer defined — legal, but exactly the "code in the wrong place" this project
+  exists to remove, and a deviation from `architecture.md` §7.1, whose mapping row for source
+  225–288 lists the `impl` alongside the two structs. Moved to `charts.rs` in P8 (`3475998`).
+- **`set_degraded`** drifted into `formatting.rs` in P6 and returned to `shell.rs` in P8 — see
+  §3.
+
+Both share a cause: the cut was driven by a banner section's extent rather than by the item
+list in §7, and a banner's extent changes as earlier phases remove the sections around it.
 
 ## 7. Three test leaf names are duplicated crate-wide
 
@@ -195,7 +218,8 @@ Two things F2 should decide before it lands, neither of which this project can s
 - **`tests/worker_seam.rs` counts as 2,914 production lines** because it is a `tests/` file
   with no `#[cfg(test)]` inside it — the whole file *is* the test. A rule that excludes
   `#[cfg(test)]` blocks but not `tests/` directories will flag it. Same for
-  `view/test_support.rs` here (371 lines, entirely a `#[cfg(test)]` module, but the attribute
+  `view/test_support.rs` here (370 lines on this table's `wc -l`+1 convention, entirely a
+  `#[cfg(test)]` module, but the attribute
   is on the `mod` declaration in the parent, not in the file).
 - **`grid/view.rs` at 6,575 needs its own unit before F2 can be enforced**, or an exemption.
   Filed as `projects/grid-view-split.md`.

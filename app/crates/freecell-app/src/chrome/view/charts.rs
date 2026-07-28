@@ -8,6 +8,10 @@
 
 use super::*;
 
+use freecell_chart_model::{Anchor as ChartAnchor, AnchorCell, LegendPosition};
+use freecell_core::limits;
+use freecell_engine::{ChartAxisKind, ChartChromeEdit, DataLabelToggles};
+
 /// The default footprint (in cells) of a chart inserted from the action bar — a typical Excel
 /// default chart size (~8 columns × 15 rows), anchored at the active cell (`ui_design §3.1`).
 const CHART_INSERT_COLS: u32 = 8;

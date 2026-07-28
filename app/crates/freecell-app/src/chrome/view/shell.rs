@@ -11,6 +11,8 @@
 
 use super::*;
 
+use freecell_engine::EditRejectedReason;
+
 impl ChromeView {
     /// Installs the grid as the chrome's body (the Phase-11 window calls this once), so the
     /// chrome renders action-row → data-row → grid (flex-fill) → tab-bar in one stack.
@@ -39,6 +41,8 @@ impl ChromeView {
         self.default_font_size_pt = self.client.default_font_size_pt(self.active_sheet);
         cx.notify();
     }
+
+    // ---- Selection + data-row plumbing ----------------------------------------------------
 
     /// The grid's selection changed: refresh the ref box + toggle states, and drive the
     /// content field's fetch/disable via the reducer.

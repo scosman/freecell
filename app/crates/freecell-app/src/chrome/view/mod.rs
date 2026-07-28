@@ -17,11 +17,13 @@
 //!
 //! The implementation is split across this directory by feature domain
 //! (`specs/projects/chrome-view-split`). This file owns the [`ChromeView`] struct itself, its
-//! constructor, and the constants shared across domains; each child module holds one domain's
-//! `impl ChromeView` methods and that domain's tests. Children are *descendants* of this
-//! module, so they reach every private field here without any visibility change; items they
-//! need from each other are `pub(super)`, which scopes them to this subtree exactly as
-//! private-to-`view.rs` did before the split.
+//! constructor, the constants shared across domains, [`Anchor`], and `action_divider` — whose
+//! visibility a child module cannot express at all: it is `pub(super)` *for `chrome`*, and a
+//! child's `pub(super)` would mean "visible in `view`" and break `chrome::h_scroller`. Each
+//! child module holds one domain's `impl ChromeView` methods and that domain's tests. Children
+//! are *descendants* of this module, so they reach every private field here without any
+//! visibility change; items they need from each other are `pub(super)`, which scopes them to
+//! this subtree exactly as private-to-`view.rs` did before the split.
 
 mod cf_editor;
 mod cf_sidebar;
@@ -65,9 +67,7 @@ use freecell_core::{
 
 use freecell_chart_model::ChartId;
 
-use freecell_engine::{
-    BorderLine, BorderPreset, ChartInsertKind, Command, EditRejectedReason, StyleAttr, WorkerEvent,
-};
+use freecell_engine::{BorderLine, BorderPreset, ChartInsertKind, Command, StyleAttr, WorkerEvent};
 
 use super::cond_fmt::CondFmtPanel;
 use super::h_scroller::{h_scroller, HScroller};
@@ -560,8 +560,6 @@ impl ChromeView {
             _subscriptions: subscriptions,
         }
     }
-
-    // ---- Selection + data-row plumbing ----------------------------------------------------
 }
 
 /// A vertical divider between action-row control groups (`ui_design.md §2`, existing styling).

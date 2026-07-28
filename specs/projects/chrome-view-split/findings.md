@@ -146,8 +146,19 @@ and ignores fully-qualified paths.
 
 And **string literals**, which is how `Category` hid: `mod.rs` contains `.placeholder("Category
 axis")`, so a raw scan sees a use and keeps the import. It has no code use in `mod.rs` at all —
-its only consumer is `formatting.rs`'s `num_fmt_category` return type. Three trap variants now,
-all the same shape: the scan must see *code*, on both sides, and nothing else.
+its only consumer is `formatting.rs`'s `num_fmt_category` return type.
+
+The fourth trap runs the other way, and is the only one that can break a build. A **trait
+imported by name whose sole use is method resolution** has no textual occurrence at its call
+sites at all, so the sweep reports it as consumer-less and "safe" to move. `Focusable` is the
+live case: this document previously listed it as a `shell.rs` orphan, and acting on that would
+have produced two `E0599`s — `mod.rs:465` and `find.rs:202` both call
+`InputState::focus_handle(cx)`, which exists only through `impl Focusable for InputState`, and
+`Focusable` is not in `gpui::prelude`. The `as _` carve-out does not help: `Focusable` is
+imported by name, so it passes the carve-out and still looks unused.
+
+So: the scan must see *code*, on both sides, and nothing else — and for any **trait**, the
+absence of textual hits proves nothing. Verify a trait move by compiling it, never by grepping.
 
 A second trap, for anyone automating the "assert nothing has zero consumers" check: the four
 trait imports brought in `as _` (`ButtonVariants`, `Disableable`, `Selectable`, `Sizable`) have
@@ -170,10 +181,14 @@ Mild.
 | 5 | `Checkbox`, `CfColorStop`, `CfFormat`, `CfPeriod`, `CfRuleSpec`, `CfTextOp`, `CfThresholdKind`, `CfValueOp`, `CfEditorKind`, `CfEditorState` → `cf_editor.rs` |
 | 6 | `BASIC_FORMATS`, `Category`, `ColorPicker`, `ColorPickerEvent`, `Hsla`, `NUM_FMT_GROUPS`, `StylePath`, `adjust_decimals_cell`, `displayed_decimals`, `effective_range`, `font_size_display`, `is_more_only_num_fmt`, `num_fmt_category`, `region_at`, `regions_intersecting`, `toggle_thousands` → `formatting.rs` |
 | 7 | `AutocompleteDisplay`, `AutocompleteRow`, `DataRowEffect`, `EvalEffect`, `Motion`, `Position`, `caret_intent_modifiers`, `functions` → `editing.rs` |
+| 8 | `EditRejectedReason` → `shell.rs` |
 
-That leaves **2**, both `shell.rs`'s (`EditRejectedReason`, `Focusable`), for the phase-8 review.
-Every other child is now clear. Clearing them per phase rather than in one sweep keeps the
-per-phase attribution §4.1 exists to protect.
+The ledger is now **closed**: `mod.rs` imports 74 names — **38** it uses itself (including
+`Focusable`, whose only use is method resolution and which therefore has *no* textual hit), 31
+reach two or more children, 4 are `as _` trait imports, 1 is the `pub use` re-export, and
+**none is a single-child orphan**. The
+zero-consumer class is empty — asserted, not inferred from a green clippy run. Clearing them per
+phase rather than in one sweep kept the per-phase attribution §4.1 exists to protect.
 
 Two things for whoever closes it out: apply the predicate as *two* parts (zero uses in
 `mod.rs`'s own body **and** exactly one child consumer — a name `mod.rs` itself uses stays
@@ -278,18 +293,23 @@ Three **test** sections split too, each donating one or two shared fixtures to `
 
 Two consequences worth knowing before diffing ranges:
 
-- **`editing.rs`, `stats.rs` and `shell.rs` all open with header-less preludes.** Items that
-  arrived from a split section have no banner above them; in `formatting.rs` that is 19
-  accessors running straight on from `on_border_color_picker_event`.
+- **`editing.rs` and `stats.rs` open with header-less preludes.** Items that arrived from a
+  split section have no banner above them; in `formatting.rs` the same applies mid-file, where
+  19 accessors run straight on from `on_border_color_picker_event`. (`shell.rs` did too, until
+  the phase-8 review relocated this section's banner into it — see below.)
 - **`set_degraded` now sits under the wrong banner.** It landed in `shell.rs:194`, beneath
   `Read accessors`, while its own `SetBorders` banner went to `formatting.rs`. It is in the
   right *module* (§3, §6c); it is under the wrong *heading*.
 
-**And one banner survives as a header for nothing.** `// ---- Selection + data-row plumbing` is
-still at `mod.rs:564`, immediately followed by the `impl` block's closing brace — P8 took
-`on_selection_changed` out from under it and left the header behind. A dangling section header
-is exactly the artifact rule 3 exists to prevent, and it is `mod.rs` residue, so it belongs to
-the phase-8 review.
+**One banner was left dangling, and has been moved.** `// ---- Selection + data-row plumbing`
+sat at `mod.rs:564` immediately before the `impl` block's closing brace — P8 took
+`on_selection_changed` out from under it and left the header behind, heading nothing. The
+phase-8 review relocated it to `shell.rs:45`, immediately above `on_selection_changed`, the item
+it introduced in the baseline — not above `set_grid_body`/`refresh_active_style`, which preceded
+it in source and were never under it. That is rule 3 being *completed* rather than a comment being edited: the section
+moved and the banner had simply failed to travel with it, and the comment multiset across the
+tree is unchanged (44 banners in the baseline, 44 now). Row 2 of the table above reads
+"nowhere" for the state P8 left; it is `shell.rs` today.
 
 ## 6e. One deliberate exception to "body bytes are identical"
 
@@ -305,7 +325,7 @@ P1). A comment that prevents a regression is worth more than byte-parity on a fo
 
 Recorded rather than left silent, because the value of rule 4 is that deviations are declared.
 
-## 6f. Two doc comments were edited during moves, both reverted
+## 6f. Three doc comments were edited during moves; two reverted, one kept
 
 `functional_spec.md` §5 permits `//!` module headers only; `architecture.md` §4 rule 1 says
 "never reflow a doc comment". Two moved items breached it, and neither was caught by a gate —
@@ -316,8 +336,18 @@ only by review:
   row"). Not rustfmt: `wrap_comments` is off, and the de-dent onto file scope can only shorten
   lines, never force a rewrap.
 
-Both restored byte-for-byte. A comment-parity sweep of all eleven files against the baseline's
-comment set then found no others, so these were the only two.
+Both restored byte-for-byte.
+
+A **third** breach exists and was deliberately kept: `mod.rs`'s `num_fmt_more_open` field doc had
+its `` [`BASIC_FORMATS`] `` and `` [`NUM_FMT_GROUPS`] `` links re-qualified to full paths and the
+paragraph re-wrapped, when those two imports moved to `formatting.rs` in the phase-6 review.
+Reverting it would leave two dangling intra-doc links, so the edit is the lesser evil — but it
+*is* a rule-1 breach, and it went unrecorded for a commit because the sweep that found the first
+two was run before it existed. Recording it here rather than pretending the count is two.
+
+(This is a different call from §6b, which leaves five *pre-existing* broken links alone: those
+were broken before the split and fixing them is outside a move's remit. This one the split
+itself would have created.)
 
 Worth naming because this is the one class of edit that defeats machine verification: to a
 normalised byte-comparison that strips comments, a reworded comment is invisible; to one that
@@ -338,6 +368,25 @@ concrete instance of §1's thesis — "the tests under this banner" was never a 
 and because a future reader looking for the multiselect-disable behaviour will not find its
 test next to the code.
 
+## 6h. Nine single-domain constants stayed in `mod.rs`, deliberately
+
+`architecture.md` §2.1's rule is that `mod.rs` keeps "the chrome look constants … used by more
+than one domain". Nine are not: `SPINNER_DELAY`, `TOOLTIP_BG`, `TOOLTIP_TEXT`, `AUTOCOMPLETE_HL_BG` and
+`AUTOCOMPLETE_MIN_W` (editing only), `STATS_DEBOUNCE` (stats only), and `TARGET_ICON_PX`,
+`TARGET_ICON_GREY`, `TARGET_ICON_DARK` (formatting only — they exist for
+`border_target_icon`).
+
+They stayed because §2.1 contradicts itself here — its own parenthetical names `TOOLTIP_*` as a
+`mod.rs` resident, and §7.1 routes the 76–122 constant range to `mod.rs` (seven of the nine;
+`SPINNER_DELAY` and `STATS_DEBOUNCE` sit just above it, at baseline 70 and 74). With the plan
+ambiguous and `mod.rs` at 571 lines, splitting a coherent look-constant block to satisfy one
+reading of a rule that also says the opposite is not worth a diff.
+
+Recorded rather than silently left, because the phase-7 review set the opposite precedent for
+`REF_BOX_W`/`DATA_ROW_FIELD_H`/`DATA_ROW_CONTENT_LEFT` — there §2.1 and §7.1 agreed, so the
+constants moved. The distinction is whether the plan is self-consistent, not whether the
+constant is single-domain.
+
 ## 7. Three test leaf names are duplicated crate-wide
 
 `point_count_matches_data`, `shared_domains_cover_all_points` and
@@ -349,22 +398,23 @@ disambiguate), and noted only because the verification tripwire compares leaf-na
 
 F2 will add a CI check at 2,000 **production** lines. Every file this project produced is
 under it (largest: `cf_editor.rs` at 1,794). A workspace-wide survey at the same commit finds
-**five** files that are not:
+**five** files that are not. Both columns are `wc -l`; production is the line before the file's
+first top-level `#[cfg(test)]`:
 
 | Production | Total | File | Owner |
 |---:|---:|---|---|
-| 6,575 | 10,628 | `freecell-app/src/grid/view.rs` | unowned — see `projects/grid-view-split.md` |
-| 3,984 | 9,289 | `freecell-engine/src/worker/run.rs` | **engine-worker-hardening** (parallel project) |
-| 2,914 | 2,914 | `freecell-engine/tests/worker_seam.rs` | an integration test file — all "production" by the metric |
-| 2,153 | 2,185 | `freecell-app/src/shell/window.rs` | unowned |
-| 2,142 | 3,834 | `freecell-engine/src/document.rs` | unowned |
+| 6,575 | 10,627 | `freecell-app/src/grid/view.rs` | unowned — see `projects/grid-view-split.md` |
+| 3,984 | 9,288 | `freecell-engine/src/worker/run.rs` | **engine-worker-hardening** (parallel project) |
+| 2,913 | 2,913 | `freecell-engine/tests/worker_seam.rs` | an integration test file — all "production" by the metric |
+| 2,153 | 2,184 | `freecell-app/src/shell/window.rs` | unowned |
+| 2,142 | 3,833 | `freecell-engine/src/document.rs` | unowned |
 
 Two things F2 should decide before it lands, neither of which this project can settle:
 
 - **`tests/worker_seam.rs` counts as 2,914 production lines** because it is a `tests/` file
   with no `#[cfg(test)]` inside it — the whole file *is* the test. A rule that excludes
   `#[cfg(test)]` blocks but not `tests/` directories will flag it. Same for
-  `view/test_support.rs` here (370 lines on this table's `wc -l`+1 convention, entirely a
+  `view/test_support.rs` here (369 lines, entirely a
   `#[cfg(test)]` module, but the attribute is on the `mod` declaration in the parent, not in
   the file).
 - **`grid/view.rs` at 6,575 needs its own unit before F2 can be enforced**, or an exemption.

@@ -9,7 +9,7 @@ done) and §F2 (the CI production-line ceiling, which this blocks).
 ## What
 
 `app/crates/freecell-app/src/grid/view.rs` — the custom virtualized spreadsheet grid — is
-**10,627 lines: 6,575 production + 4,052 inline test** (measured at `3475998`). That is
+**10,627 lines (`wc -l`): 6,575 production + 4,052 inline test** (measured at `3475998`). That is
 **3.3×** the 2,000-line production ceiling F2 will enforce, and the largest single file in the
 workspace by production lines.
 
@@ -43,7 +43,7 @@ the real method inventory, and the actual domain boundaries.
 
 **Check first whether `grid/view.rs` is banner-sectioned the way `chrome/view.rs` was.** That
 single property is what made the chrome split mechanical rather than a judgement call: 17
-production banners and 29 test banners whose names *agreed*, so each production section mapped
+production banners and 27 test banners whose names *agreed*, so each production section mapped
 to its test section by name and every cut was a contiguous range. If `grid/view.rs` has the
 same structure, expect a comparable cost. If it does not, the domain boundaries have to be
 derived, and the estimate goes up.
@@ -60,8 +60,20 @@ The full procedure is in `specs/projects/chrome-view-split/architecture.md` — 
 3. One domain per phase, cut on item boundaries with doc comments and banners intact, in
    source order, bodies byte-identical. Tests move with the code they test.
 4. Gate **every** phase: build, tests with a test-name multiset check against a baseline
-   captured before the first move, `fmt --check`, and `clippy --all-targets -D warnings`
-   (a split strands imports, and CI gates on warnings).
+   captured before the first move, `fmt --check`, and `clippy --all-targets -D warnings`.
+5. Run **two checks no gate performs**, per phase. These are the ones the chrome split's code
+   review had to catch after the fact, and they are the highest-value part of this procedure:
+   - a **comment-set diff against the pre-split file**. Three item-level doc comments were
+     edited mid-move and no gate noticed; a byte-comparison that strips comments is blind to
+     exactly this, and one that doesn't cannot tell a reworded comment from a moved one.
+   - a **single-child import sweep** of the parent module. `use super::*` in the children keeps
+     orphaned imports resolving, so `clippy -D warnings` cannot see them; 47 accumulated before
+     anyone looked. Strip comments *and* string literals on both sides, ignore fully-qualified
+     paths, exempt `as _` traits — and never conclude a **trait** is unused from a grep, because
+     a trait used only for method resolution has no textual hits at its call sites.
+
+Read `specs/projects/chrome-view-split/findings.md` before starting: §6a–§6h are that project's
+post-mortem, and most of them are traps this one will hit too.
 
 ## Scope discipline
 

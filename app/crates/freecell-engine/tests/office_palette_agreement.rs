@@ -77,6 +77,11 @@ fn the_cell_fill_palette_and_the_chart_theme_palette_are_the_same_colours() {
 /// compile-time constant 10, so it was a tautology that could never fail. Adding a variant to
 /// `ThemeSlot` now fails to **compile** here until someone decides, explicitly, whether it is a
 /// fill swatch or not.
+///
+/// The slot list it is swept over is `ThemeSlot::ALL`, **owned by the type's own crate**. It was a
+/// hand-written array in this file, which made the sweep exhaustive only over what someone
+/// remembered to type here — a new variant could be classified by the `match` above and then never
+/// swept, because the local list had not grown.
 #[test]
 fn every_theme_slot_is_either_a_fill_swatch_or_a_declared_non_swatch() {
     /// Exhaustive over `ThemeSlot` — no wildcard arm, so a new variant is a compile error.
@@ -105,21 +110,16 @@ fn every_theme_slot_is_either_a_fill_swatch_or_a_declared_non_swatch() {
              says it has none",
         );
     }
-    let all_slots = [
-        ThemeSlot::Light1,
-        ThemeSlot::Dark1,
-        ThemeSlot::Light2,
-        ThemeSlot::Dark2,
-        ThemeSlot::Accent1,
-        ThemeSlot::Accent2,
-        ThemeSlot::Accent3,
-        ThemeSlot::Accent4,
-        ThemeSlot::Accent5,
-        ThemeSlot::Accent6,
-        ThemeSlot::Hyperlink,
-        ThemeSlot::FollowedHyperlink,
-    ];
-    for slot in all_slots {
+    // `ThemeSlot::ALL` must itself be complete for this sweep to mean anything: no repeats, and one
+    // entry per slot the classification knows about.
+    for (i, slot) in ThemeSlot::ALL.iter().enumerate() {
+        assert!(
+            !ThemeSlot::ALL[..i].contains(slot),
+            "{slot:?} appears twice in ThemeSlot::ALL — the sweep below would then skip whichever \
+             slot was displaced",
+        );
+    }
+    for slot in ThemeSlot::ALL {
         assert_eq!(
             is_ui_fill_swatch(slot),
             EXPECTED.iter().any(|(_, mapped)| *mapped == slot),

@@ -1,6 +1,9 @@
 # Phase 6 — F3a: chart-axis / cell number-format and colour agreement
 
-> **This record was rewritten on 2026-07-28 after code review.** The first version's headline was
+> **This record was rewritten on 2026-07-28 after code review, and again after a second and a third
+> review round.** Round 3's findings are in the **Round 3** section at the end; where they
+> contradict the text above, the later section wins and says so.
+> The first version's headline was
 > *"mostly DISPROVED as stated — every divergence is IronCalc's, not chart-model's."* **That
 > conclusion was false.** It was produced by a test whose carve-outs were too broad and whose corpus
 > was missing a whole format family; once both were tightened, three real `chart-model` defects fell
@@ -72,6 +75,9 @@ Reference: `ironcalc_base::formatter::format::format_number(v, code, locale("en"
 the *exact* call the cell path makes — `model.rs:2815` `get_formatted_cell_value`, whose
 `format_number(value, &format, self.locale).text` call is at **`:2826`**.
 
+**Round 3 replaced the hand-written corpus with a generated one** — see the Round 3 section. The
+counts in this section are the round-2 numbers and are kept as the record of that round.
+
 ### The three `chart-model` defects
 
 **1. Negative zero.** `apply_number_format` chose the sign from `scaled < 0.0` *before*
@@ -89,7 +95,9 @@ every label**.
 
 *Remedy chosen: **(a) fix `chart-model`.*** `functional_spec.md` §F3a and architecture §6 bless
 either fixing the formatter or making `renders_faithfully` reject the code. (a) was chosen because
-it turned out to be both contained and *provably* right rather than corpus-fitted:
+it turned out to be contained, and matched across the corpus plus probed neighbours — **not**
+"provably right", as this line claimed until round 3 probed 28 `#`-family codes outside the corpus
+and found three residuals (see Round 3):
 
 - `FormatSpec` gained `min_decimals` (placeholders up to the last required `0`) alongside
   `decimals` (all placeholders); `format_magnitude` rounds at `decimals` and trims trailing zeros
@@ -116,7 +124,8 @@ rendered `"1"` where the cell renders `"1 "`. Only the General/empty test trims 
 fork fix (`CLAUDE.md` §Engine: one `fix/` branch, one upstream PR). But the *rule* was wrong. The
 first pass recorded `|value| < 1.5 × 10^-decimals`; that expression is correct **only at
 `decimals = 0`**. The mechanism is `is_negative = value < -(10^-precision)` (`format.rs:481`)
-evaluated **after** the `to_precision` pre-round at `:437`, so the real threshold is
+evaluated **after** the `to_precision` pre-round at `:438` (`:437` is the comment line above it),
+so the real threshold is
 **≈`10^-decimals`** — exactly `10^-d + 5×10^-(2d+1)`. Measured by bisection: `0` → **1.5**,
 `0.0` → **0.105**, `0.00` → **0.01005**, `0.000` → **0.0010005**, `0%` → **0.015**. The old reading
 overstated the two-decimal band by a factor of ten; a fix written against it would have tested the
@@ -126,10 +135,18 @@ wrong boundary.
 everywhere except 0.5, where it alone rounds up." IronCalc is **not half-to-even** and 0.5 is **not
 the only affected value**. `format.rs` rounds in pieces:
 
-1. pre-round: `to_precision(value, precision + integer_digits)` — significant digits, via `{:.*e}`,
+1. pre-round (`format.rs:438`; `:437` is the comment above it):
+   `to_precision(value, precision + integer_digits)` — significant digits, via `{:.*e}`,
    half-to-**even**;
 2. render: `value_abs.round()` at `precision == 0` (half **away from zero**), else `floor()` plus a
    separately rounded fractional string.
+
+**Round 3 correction: this "two corruptions" reading is still narrower than the mechanism.** The
+mechanism is one thing — for `|v| < 1` the integer part is `"0"`, so the pre-round keeps
+`decimals + 1` **significant** digits and the render rounds *again* to `decimals` decimals: a plain
+double round, corrupting anything that ties or crosses a tie at the intermediate precision. For
+`|v| >= 1` nothing is corrupted. The two items below are sub-cases of that, and 886 corpus pairs
+matched neither of them. See Round 3.
 
 Two corruptions, **both reachable on positives**:
 
@@ -224,7 +241,10 @@ including the `lt1`=Background 1 / `dk1`=Text 1 pairing. Merging them is F3.
 
 The slot-coverage test was `assert_eq!(FILL_PALETTE.len(), EXPECTED.len())` — both sides the
 compile-time constant `10`, so it was a tautology. It is now an exhaustive `match` over `ThemeSlot`:
-adding a variant fails to **compile** until someone classifies it as a fill swatch or not.
+adding a variant fails to **compile** until someone classifies it as a fill swatch or not. The list
+the match is swept over was still hand-written *in the test* until round 3, which made the round-trip
+half exhaustive only over what someone remembered to type there; it is `ThemeSlot::ALL`, owned by
+`chart-model`, now.
 
 ## Verification
 
@@ -241,3 +261,117 @@ optional-`#` fractional run or an all-`#` integer run, neither carries whitespac
 scene value is a small negative — so none of the three changed behaviours is reachable from a
 baseline. Colour output is unchanged and pinned. The pixel subset was therefore not run, per the
 round's working agreement.
+
+## Round 3 — the corpus now derives from the predicate
+
+A third review found **two more Criticals of the same class** as round 2's, plus unresolved items.
+The class is what matters: each round, `renders_faithfully` accepted a format shape that
+`chart-model` rendered wrong, unbadged, and the corpus did not contain it. Round 1: `#` optional
+digits. Round 2: nothing new in the corpus, but the sign carve-out was hiding a chart-side bug.
+Round 3: a quoted or `\`-escaped `%`, and required leading zeros.
+
+### The root fix: generate the corpus from the predicate
+
+The invariant quantifies over *every* code `renders_faithfully` accepts, so a hand-written list can
+only sample it — and "add the family we just found" had been the remedy three times running.
+
+`generated_shape_space_agrees_with_the_cell` now enumerates the shape space directly: 13 integer runs
+× 10 fractional runs × 6 percent forms × 6 affix forms × 2 paddings = **9 360 codes**, of which
+**7 480** are accepted by the predicate, crossed with 30 values covering sign, zero, ties, and the
+grouping and `|v| < 1` boundaries — **224 400 asserted pairs**, against 960 for the grounded corpus.
+The hand-written `FIXTURE_CODES`/`COMMON_CODES` corpus stays as the readable, real-file half; it is
+no longer the boundary of what is checked.
+
+Widening the predicate now widens what must agree. That is the property the phase's own annotation
+asked for and did not have.
+
+### Every family the generated corpus surfaced, and the choice made
+
+| Family | What the cell showed | Choice | Where |
+|---|---|---|---|
+| **Literal `%`** — `0" %"`, `0\%`, `0.00"%"` | `12 %` / `1%` / `0.25%`; the chart scaled by 100 (`1250 %`) | **Fix `chart-model`.** The percent *scale* is counted on the control body (quotes, brackets, `\`-escapes stripped) — the same stripping `control_body_is_unrenderable` already did. One stripper, both callers. | `numfmt.rs` |
+| **`%` position / count** — `0% `, `%0`, `0%%` | `100% ` / `%100` / `10000%%`; the chart appended one `%` at the very end | **Fix `chart-model`.** A `%` is a literal rendered *where it stands* that also multiplies by 100 per occurrence — which is literally what IronCalc's `Token::Percent` does (push `Literal('%')`, `percent += 1`). | `numfmt.rs` |
+| **Required leading zeros** — `000`, `0000`, `00.0`, `#,#00.0#` | `007` / `0042` / `01.0` / `01.0`; the chart dropped the padding | **Fix `chart-model`.** `min_integer_digits` (count of `0` in the integer run) left-pads the integer part — symmetric with the fractional side. | `numfmt.rs` |
+| **Mixed fractional runs** — `0.#0`, `#.0#0` | `1.0` / `1.00`; the chart padded to `1.00` / `1.000` | **Fix `chart-model`.** The single `min_decimals` count took the *last* `0`. Replaced by the per-placeholder kinds: drop the rounded fraction's trailing zeros, then re-add one `0` per **required** placeholder past what survived — IronCalc's `get_fract_part` + per-token padding, and Excel's rule. | `numfmt.rs` |
+| **Grouping with ≥5 integer digit tokens** — `##,##0`, `##,##0.###` | `1234.5` (no separator!) where Excel and the chart give `1,234.5` | **Narrow the predicate** (badge). IronCalc positions the separator from the *token* index, not the digit index, so it drops it whenever `3 < ln < digit_count`. Filed as `GAPS.md` **E8**. `chart-model` is correct and must not be "fixed" to match. | `numfmt.rs` + `GAPS.md` E8 |
+| **Grouping + ≥4 required zeros** — `0,000` | `0005` where Excel and the chart give `0,005` | **Narrow the predicate** (badge). Same E8 defect, second half: IronCalc never groups the zeros it padded in. | `numfmt.rs` + `GAPS.md` E8 |
+| **Doubled quote** — `0"a""b"`, `#.0"%"" kg"` | `a"b` — IronCalc's `consume_string` reads `""` as an escaped quote; the chart reads two adjacent literals | **Narrow the predicate** (badge). The grammar is genuinely ambiguous and ECMA-376 does not settle it. Filed as `GAPS.md` **E9**, to be raised upstream as a question before a fix. | `numfmt.rs` + `GAPS.md` E9 |
+| **Literal inside the digit run** — `0 0`, `%` between placeholders | rendered in place by the cell; the applier only has a prefix and a suffix | **Narrow the predicate** (badge). The numeric run must be `0`/`#`/`,`/`.` only. | `numfmt.rs` |
+| **Positional required digits** — `0#0`, `00#` | required digits are per-token, not a minimum width | **Narrow the predicate** (badge). The integer run must be `#`…`0`…, the shape a minimum width can express. | `numfmt.rs` |
+| **No integer placeholder** — `.00` | the cell hangs the minus sign off the first *integer* digit token, so `-0.5` shows `.50` unsigned | **Narrow the predicate** (badge). | `numfmt.rs` |
+| **Bracketed currency out of head position / multi-char** — `0[$€-407]`, `[$USD-409]#,##0` | IronCalc hoists the currency to the front of the string, and its lexer reads exactly one symbol char (rejecting `USD` outright) | **Narrow the predicate** (badge). | `numfmt.rs` |
+
+After the fixes and the narrowings: **0 unexplained disagreements** over the whole generated space
+(and 0 over the grounded corpus), with only the E6 and E7 carve-outs firing.
+
+### The `#` claim, corrected
+
+Round 2 called the `#` remedy "provably right rather than corpus-fitted". Probing 28 `#`-family codes
+outside the corpus found three residuals, all now resolved: `0.#0` and `#.0#0` were **`chart-model`
+bugs** (fixed above, the `min_decimals` → per-placeholder-kinds change), and `##,##0.###` is
+**IronCalc's** grouping defect (E8, badged). The claim is now: *matched across the corpus plus the
+generated shape space, with the residuals resolved as fixes or badges.*
+
+### E7, characterised properly
+
+Round 2's write-up named two bands. Over 21 corpus codes × 14 001 values, **886 pairs disagreed and
+matched neither**, and a decimal-exact reference showed **chart-only-wrong = 0** for them — so they
+were IronCalc's, and the predicate was incomplete, not the implementation.
+
+The mechanism, stated once: **for `|v| < 1` the integer part is `"0"`, so the pre-round
+`to_precision(value, precision + 1)` keeps `decimals + 1` significant digits and the render rounds
+again to `decimals` decimals — a plain double round; anything that ties or crosses a tie at the
+intermediate precision is corrupted. For `|v| >= 1` nothing is.** The `[0.45, 0.5]` band and the
+lost-carry case are sub-cases.
+
+`is_ironcalc_rounding_defect` is derived from that: it reconstructs the sub-unit pipeline and fires
+only when the reconstruction reproduces the cell **byte for byte**. Because the reconstruction is
+rendered through `chart-model` itself, it can only match when `chart-model`'s presentation is already
+identical to IronCalc's and the rounding is the sole difference — so a chart-side presentation bug
+makes the carve-out *stop* firing and the gate fail. It cannot fire at all for `|v| >= 1`.
+Representative values (`0.855`, `0.0495`, `-0.8745`, `-0.98765`) are in `VALUES` so the predicate is
+forced to stay honest, alongside the E6 thresholds (`1.5`, `0.105`, `0.01005`, `-0.0101`).
+
+### The other round-3 items
+
+- **The test's own E6 numbers** still said `|value| <= 10^-decimals` with `0` → ~1.05 and
+  `0.00` → ~0.0101 — self-contradictory at `d = 0` — while the other four documents had been
+  corrected. The doc comment now carries the measured thresholds (`0` → **1.5**, `0.0` → **0.105**,
+  `0.00` → **0.01005**, `0.000` → **0.0010005**, `0%` → **0.015**; closed form
+  `10^-d + 5×10^-(2d+1)`), and those values are in `VALUES`.
+- **`general_differs_from_the_cell_only_by_rounding`** reached its assertions for 3 of 21 values.
+  `0.1234567` and `-0.98765` were added, and the test now **asserts its own reach** (`>= 5`), so it
+  cannot silently go back to constraining nothing.
+- **`office_palette_agreement.rs`'s `all_slots`** was a hand-written list in the test. It is
+  `ThemeSlot::ALL`, a const on the type in `chart-model`, with a duplicate check.
+- **`format.rs:437`** is the comment line; the `to_precision` call is at **`:438`**. Corrected in
+  `GAPS.md`, this file and `projects/ironcalc-negative-sign-display.md`.
+
+### Carve-out counts after round 3
+
+| Carve-out | Grounded corpus (960 pairs) | Generated space (224 400 pairs) |
+|---|---|---|
+| `is_ironcalc_sign_bug` (E6) | **48** | **5 236** |
+| `is_ironcalc_rounding_defect` (E7) | **61** | **8 008** |
+| `is_empty_code_artifact` | **30** | 0 (the generator emits no empty code) |
+| agreeing | 821 | 211 156 |
+
+`the_carve_outs_suppress_only_a_handful_of_pairs` now runs over **both** corpora and still fails if a
+predicate stops firing or runs past a quarter of the pairs; the empty-code pin is asserted directly
+so it cannot go dead again.
+
+### Verification (round 3)
+
+- `cargo test -p freecell-engine --test numfmt_agreement --test office_palette_agreement` — 6 + 2 passed
+- `cargo test -p freecell-chart-model --lib` — 109 passed
+- `cargo test -p freecell-app --lib chart::palette` — 4 passed
+- `cargo clippy --locked -p freecell-engine -p freecell-chart-model --all-targets -- -D warnings` — clean
+- `cargo fmt --all --check` — clean
+
+**Render impact, checked rather than assumed.** `apply_number_format` changed again, so the
+`chart_*` baselines' format codes were re-inspected: `render-tests/src/chart_scene.rs` uses only
+`"$#,##0"` and `"0%"`, on positive values. `"$#,##0"` has no fractional run, no required leading zero
+beyond the single trailing `0`, four integer digit tokens (so the E8 narrowing does not touch it) and
+no literal `%`; `"0%"` has a single trailing percent control, which renders in the same position
+before and after the change. Neither reaches any changed behaviour, so no baseline can move and the
+pixel subset was not run.

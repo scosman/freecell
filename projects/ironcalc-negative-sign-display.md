@@ -4,9 +4,10 @@
 (`specs/projects/v05-cleanup-1`). Needs a fork fix per `CLAUDE.md` §Engine — one `fix/<slug>`
 branch, one clean upstream PR.
 
-Tracked in `GAPS.md` as **E6** (and **E7** for the rounding outlier) under
-*Engine (fork) — negative numbers display without their minus sign*, and listed in the
-**v0.5 release tier**.
+Tracked in `GAPS.md` as **E6** (with **E7** rounding, **E8** grouping and **E9** doubled-quote
+lexing) under *Engine (fork) — number-format rendering defects*, and listed in the
+**v0.5 release tier**. Each is **its own `fix/` branch and its own upstream PR**; they are written up
+together because they live in the same two files.
 
 ## The bug
 
@@ -36,7 +37,8 @@ displayed:                    ["1", "1",  "1",  "-1,234", "1"]
 let is_negative = value < -(10.0_f64.powf(-(p.precision as f64)));
 ```
 
-The subtlety is *when*: `value` was already overwritten a few lines earlier (`format.rs:437`) by
+The subtlety is *when*: `value` was already overwritten a few lines earlier (`format.rs:438` — line
+`:437` is the comment above it) by
 
 ```rust
 value = to_precision(value, (p.precision as usize) + format!("{}", value.abs().floor()).len());
@@ -108,32 +110,44 @@ don't triage it as a repeat of the DOLLAR decision.
 
 ## Related, same function — and also mischaracterised at first (GAPS E7)
 
-> **Corrected 2026-07-28.** This section originally said `format_number` is "half-to-even everywhere
-> except 0.5". **It is not half-to-even, and 0.5 is not the only affected value.** The corrected
-> account is below; the old one would have sent a fix at a single data point.
+> **Corrected twice.** This section first said `format_number` is "half-to-even everywhere except
+> 0.5". It then said "two bands". **Both were narrower than the mechanism**, and a fix written
+> against either would leave most of the corruption in place. The mechanism is one thing:
 
 `format_number` does not implement one rounding rule. It rounds in pieces:
 
-1. **pre-round**, `format.rs:437`: `to_precision(value, precision + integer_digits)` — that many
-   *significant* digits, through Rust's `{:.*e}`, which is half-to-**even**;
+1. **pre-round**, `format.rs:438` (`:437` is the comment line above it):
+   `to_precision(value, precision + integer_digits)` — that many *significant* digits, through
+   Rust's `{:.*e}`, which is half-to-**even**;
 2. **render**, `format.rs:459-468`: `value_abs.round()` when `precision == 0` (half **away from
    zero**), otherwise `value_abs.floor()` plus a *separately rounded* fractional string from
    `get_fract_part`.
 
-Two corruptions fall out, **both reachable on positive values**:
+> **The mechanism, stated once.** For `|v| < 1` the integer part is `"0"`, so `integer_digits` is
+> **1** and step 1 pre-rounds to `decimals + 1` **significant** digits; step 2 then rounds *again* to
+> `decimals` decimals. That is a plain **double round**, and anything that ties or crosses a tie at
+> the intermediate precision comes out wrong. For `|v| >= 1` the pre-round lands at exactly the
+> rendered precision and nothing is corrupted.
 
-- **Double rounding — `decimals == 0`, `|v| < 1`.** `floor(|v|)` prints as `"0"`, so step 1 keeps
-  only **one** significant digit. Every value in `|v| ∈ [0.45, 0.5]` becomes `0.5`, which step 2
-  then rounds away from zero to `"1"`. Correct answer: `"0"`.
+The two "bands" the earlier write-ups named are **sub-cases** of that, not its extent:
+
+- **Double rounding at `decimals == 0`.** Only one significant digit survives, so every value in
+  `|v| ∈ [0.45, 0.5]` becomes `0.5`, which step 2 rounds away from zero to `"1"`. Correct: `"0"`.
   Measured: `0.45 → "1"`, `0.46 → "1"`, `0.49 → "1"`, `-0.46 → "1"` (the sign additionally lost to
-  the E6 bug above). `0.5 → "1"` — the value the old write-up singled out — is just the top endpoint
-  of this band, and is in fact the one value in it where IronCalc's answer *matches Excel*.
-- **Lost fractional carry — `decimals ≥ 1`, `|v| < 1`.** The integer part is `floor(|v|) = 0` while
-  `get_fract_part` rounds the fraction on its own and slices the result as `"0.ddd"[2..]`. When the
-  fraction rounds up to `1.0` the slice is empty and the carry is thrown away:
-  **`0.96` under `"0.0"` displays `"0.0"`**, and `-0.96` displays `"-0.0"`.
+  E6). `0.5` — the value the *first* write-up singled out — is just the top endpoint, and the one
+  value in the band where IronCalc's answer matches Excel.
+- **Lost fractional carry at `decimals >= 1`.** `get_fract_part` rounds the fraction on its own and
+  slices the result as `"0.ddd"[2..]`. When the fraction rounds up to `1.0` the slice is empty and
+  the carry is thrown away: **`0.96` under `"0.0"` displays `"0.0"`**, and `-0.96` displays `"-0.0"`.
 
-Separately, for `|v| ≥ 1` the pre-round happens at exactly the rendered precision, so IronCalc lands
+Neither sub-case explains, for example, `0.855` under `"0.0"` (cell `0.8`, chart `0.9`), `0.0495`
+under `"0.0"` (cell `0.1`, chart `0.0`) or `-0.8745` under `"0.00"` (cell `-0.88`, chart `-0.87`).
+Over the round-2 corpus **886 pairs matched neither**; a decimal-exact reference put `chart-model` on
+the correct side of every one of them, so they are IronCalc's, and the sub-case predicate was simply
+incomplete. **A fix must repair the double round itself** — pre-rounding at the rendered precision
+and rounding once — not the two named bands.
+
+Separately, for `|v| >= 1` the pre-round happens at exactly the rendered precision, so IronCalc lands
 on half-to-**even** (`2.5 → "2"`, `4.5 → "4"`, `1234.5 → "1234"`) where **Excel is
 half-away-from-zero** (`3`, `5`, `1235`). Wrong, but consistently so — and it is the reason
 `chart-model`'s formatter deliberately uses half-to-even too, so the axis label matches the cell
@@ -144,14 +158,45 @@ Lower severity than the sign bug; worth folding into the same investigation but 
 branch and PR** if it turns out to be an independent defect. (Both live in the same
 `ParsePart::Number` arm of `format.rs`, so independence is not obvious.)
 
+## Two more from the same formatter (GAPS E8, E9)
+
+Found in round 3 by *generating* format codes across the shape space the chart's faithfulness
+predicate accepts, instead of listing codes from memory.
+
+**E8 — thousands grouping is positioned from the token index.** In the `ln <= digit_count` branch the
+separator test is `use_group_separator(p.use_thousands, ln - digit_index, …)`, where `digit_index`
+counts integer digit **tokens** consumed — including leading `#` tokens that print nothing — while
+`ln` is the value's actual digit count. They coincide only when `ln == digit_count`, so **`##,##0` on
+1234.5 renders `1234.5`** where Excel renders `1,234.5`. The same branch emits padded zeros for
+required `0` tokens without consulting the separator at all, so **`0,000` on 5 renders `0005`** where
+Excel renders `0,005`. Everyday grouping codes (`#,##0`, `#,###`, `$#,##0.00`, `#,#00`) are out of
+reach of both: four integer digit tokens, at most three required zeros.
+
+**E9 — a doubled quote is read as an escaped quote.** `consume_string` treats `""` the CSV way, so
+`0"a""b"` lexes as one literal `a"b` rather than two adjacent literals `ab`. ECMA-376 does not define
+the escape and Excel's convention is not settleable from the spec, so this one should be raised
+upstream as a grammar question before a fix is written.
+
+Neither is carved out of the differential gate. `renders_faithfully` **rejects** the shapes instead,
+so a chart carrying one is badged ⚠ rather than quietly disagreeing with the cells — `chart-model`
+renders both the way Excel does, and must not be "fixed" to match the engine.
+
 ## Guard already in place
 
-`app/crates/freecell-engine/tests/numfmt_agreement.rs` carves both behaviours out explicitly, with
-predicates named `is_ironcalc_sign_bug` and `is_ironcalc_rounding_defect` (the latter renamed from
-`is_ironcalc_half_up_outlier`, which tested `|v| == 0.5` and covered one point of one of the two
-bands). The corpus now contains values inside both bands (`0.45`, `-0.46`, `0.96`) so the defect is
-exercised, not merely described. When the fork carries the fix, **delete the carve-out** — the
-differential gate then tightens by itself and will fail if the bug ever returns.
+`app/crates/freecell-engine/tests/numfmt_agreement.rs` carves E6 and E7 out explicitly, with
+predicates named `is_ironcalc_sign_bug` and `is_ironcalc_rounding_defect`. The latter is now derived
+**from the mechanism above** rather than from the enumerated sub-cases: it reconstructs the sub-unit
+pipeline (pre-round to `decimals + 1` significant digits, then the separate fraction round with the
+carry dropped) and fires only when that reconstruction reproduces the cell **byte for byte**. Because
+the reconstruction is rendered through `chart-model` itself, it can only match when `chart-model`'s
+presentation already equals IronCalc's and the rounding is the sole difference — so it cannot hide a
+chart-side defect the way its predecessors did. It cannot fire at all for `|v| >= 1`.
+
+The corpus is **generated** from the faithfulness predicate (about 7 500 codes × 30 values), and
+`VALUES` carries the E6 thresholds (1.5, 0.105, 0.01005, -0.0101) and E7 representatives across the
+mechanism (0.45, -0.46, 0.96, 0.855, 0.0495, -0.8745, -0.98765) so both defects are exercised, not
+merely described. When the fork carries a fix, **delete the carve-out** — the differential gate then
+tightens by itself and will fail if the bug ever returns.
 
 ## One thing the carve-out was hiding
 

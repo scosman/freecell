@@ -57,6 +57,33 @@ pub use stroke::LineStroke;
 // a guard test.
 pub use theme::{hsl_to_rgb, rgb_to_hsl, ChartColor, ThemePalette, ThemeSlot};
 
+impl ThemeSlot {
+    /// **Every** theme slot, in canonical OOXML `clrScheme` order (`dk1`, `lt1`, `dk2`, `lt2`, the
+    /// six accents, `hlink`, `folHlink`).
+    ///
+    /// It lives here, on the type, because the cross-crate guard that needs it —
+    /// `freecell-engine`'s `tests/office_palette_agreement.rs`, which asserts that every slot is
+    /// either a cell-fill swatch or a declared non-swatch — cannot enumerate the enum itself. That
+    /// test used to carry its own copy of this list, which made the "exhaustive" half of it
+    /// exhaustive only over what someone remembered to type. A **new variant must be added here**;
+    /// the compile-time trip-wire is the wildcard-free `match` in that test, which stops building
+    /// until the variant is classified, and this list is what it is then checked against.
+    pub const ALL: [ThemeSlot; 12] = [
+        ThemeSlot::Dark1,
+        ThemeSlot::Light1,
+        ThemeSlot::Dark2,
+        ThemeSlot::Light2,
+        ThemeSlot::Accent1,
+        ThemeSlot::Accent2,
+        ThemeSlot::Accent3,
+        ThemeSlot::Accent4,
+        ThemeSlot::Accent5,
+        ThemeSlot::Accent6,
+        ThemeSlot::Hyperlink,
+        ThemeSlot::FollowedHyperlink,
+    ];
+}
+
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
 ///
 /// This is the concrete resolved color. Theme-slot references (`<a:schemeClr>`) and their

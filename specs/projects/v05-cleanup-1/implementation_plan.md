@@ -28,7 +28,7 @@ Details live in [`functional_spec.md`](functional_spec.md) and
 - [x] **Phase 5 — C1 (keystone): part-inventory round-trip test.** New
       `tests/part_inventory.rs` over the real Excel fixtures, both production save paths,
       committed drop baselines, `GAPS.md` updated with what it measures. (§5)
-- [ ] **Phase 6 — F3a: chart/cell number-format + colour agreement.** Differential corpus in
+- [x] **Phase 6 — F3a: chart/cell number-format + colour agreement.** Differential corpus in
       `freecell-engine`; fix or honestly-degrade any disagreement inside the faithful subset;
       resolve the `rgb_to_hsl` and Office-palette duplication claims. (§6)
 - [ ] **Phase 7 — G1: detect multi-group (combo) charts.** Group counting in

@@ -117,6 +117,38 @@ mod tests {
         }
     }
 
+    /// **F3a duplication guard.** `freecell-chart-model::theme` carries its own `rgb_to_hsl` /
+    /// `hsl_to_rgb`, and the architecture review flagged the two copies as *drifted*: this file
+    /// writes `((g - b) / d) % 6.0` where chart-model writes `.rem_euclid(6.0)`, which the review
+    /// read as "they disagree on negative hues".
+    ///
+    /// **They do not.** Both functions normalise with `.rem_euclid(360.0)` on the way out, which
+    /// maps the negative intermediate onto the identical hue — verified here over the whole
+    /// reachable input space (every base colour, every lap), not just the round-trip.
+    ///
+    /// The duplication is real even though the divergence is not, so this test pins the agreement:
+    /// if either copy is edited, it fails. Actually removing the duplicate means merging the crates
+    /// (unit F3) — out of scope here, and not worth risking a chart-render baseline move for a
+    /// difference that produces no different pixel.
+    #[test]
+    fn hsl_helpers_agree_with_the_chart_model_copy() {
+        for base in BASE {
+            let mine = rgb_to_hsl(base);
+            let theirs = freecell_chart_model::rgb_to_hsl(base);
+            assert_eq!(mine, theirs, "rgb_to_hsl drifted for {base:?}");
+
+            // Every hue this palette actually produces: the base plus each lap's rotation.
+            for lap in 0..8 {
+                let h = (mine.0 + 137.0 * lap as f64) % 360.0;
+                assert_eq!(
+                    hsl_to_rgb(h, mine.1, mine.2),
+                    freecell_chart_model::hsl_to_rgb(h, mine.1, mine.2),
+                    "hsl_to_rgb drifted at hue {h} (base {base:?}, lap {lap})",
+                );
+            }
+        }
+    }
+
     #[test]
     fn hsl_round_trip_is_close() {
         for base in BASE {

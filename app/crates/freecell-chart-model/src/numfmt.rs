@@ -65,7 +65,7 @@ pub fn apply_number_format(code: &str, value: f64) -> String {
 /// scientific, fractions). The check is deliberately stricter than [`FormatSpec::parse`], which
 /// accepts several of these and renders them wrong — being *called* Faithful is what would hide the
 /// mis-render, so this gate rejects them even though the applier still produces (approximate) output.
-pub(crate) fn renders_faithfully(code: &str) -> bool {
+pub fn renders_faithfully(code: &str) -> bool {
     let code = code.trim();
     if code.is_empty() || code.eq_ignore_ascii_case("General") {
         return true;
@@ -253,6 +253,13 @@ fn literal(fragment: &str) -> String {
 /// Format a non-negative magnitude with `decimals` fractional digits and optional thousands
 /// grouping of the integer part.
 fn format_magnitude(value: f64, decimals: usize, grouping: bool) -> String {
+    // Rounding is `{:.n}`'s — half to EVEN — and that is deliberate, not an oversight. Unit F3a's
+    // differential test (`freecell-engine/tests/numfmt_agreement.rs`) swept every half-way value in
+    // the corpus against IronCalc, which formats the cells these labels sit beside: the two agree
+    // on 2.5→"2", 4.5→"4", 10.5→"10", 1234.5→"1234", 0.125→"0.12", 2.675→"2.67" — everywhere
+    // except 0.5-at-zero-decimals, where IronCalc alone rounds up (inconsistently with its own
+    // 2.5→"2"). Switching this to half-away-from-zero was tried and made agreement strictly
+    // WORSE, breaking every case in that list to fix one. Leave it.
     let fixed = format!("{value:.decimals$}");
     let (int_part, frac_part) = match fixed.split_once('.') {
         Some((i, f)) => (i, Some(f)),

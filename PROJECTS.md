@@ -64,11 +64,19 @@ registry: each entry is a short description plus a pointer to a design note unde
   insert/delete rows/cols that would displace merges.
   → [`projects/merged-cells.md`](projects/merged-cells.md)
 
-- **IronCalc — move to a released pin** — *Future (follow-up tail of `ironcalc-upstreaming`).*
-  That project upgrades FreeCell onto the fork's git-`main` + our E2/E5 fixes (migrating to the
-  new `Color`-enum API and deleting `open_fixups`/`open_repair` + `roxmltree`/`zip`). This tail
-  swaps the temporary `[patch.crates-io]` git pin for a **released** IronCalc version once one
-  ships with all five fixes, and re-validates. → [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md)
+- **IronCalc — keeping the fork current** — *Ongoing (standing maintenance).*
+  The fork is **permanent**: we keep it, keep upstreaming fixes as clean single-fix PRs, and keep
+  re-syncing from upstream `main`. 6 of the 11 changes on `freecell-fixes` are already merged
+  upstream; 5 are fork-only, including merged cells (a whole feature upstream lacks). Moving to a
+  released crates.io pin is a hypothetical simplification, not a goal.
+  → [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md)
+
+- **IronCalc drops the minus sign on small negatives** — *Filed, unfixed — needs a fork fix.*
+  A cell formatted `#,##0` holding **-1 displays "1"**: `format_number` returns an unsigned string
+  whenever `|value| < 1.5 × 10^-decimals`. Silent numeric misinformation on the primary display
+  surface, worst on the most common format. Found by unit F3a's chart-vs-cell differential test and
+  reproduced end-to-end through the app.
+  → [`projects/ironcalc-negative-sign-display.md`](projects/ironcalc-negative-sign-display.md)
 
 - **Viewport Value Cache** — *Future, optional scroll-perf push.*
   Delta-load only newly-exposed cells' *values* on scroll (styles/geometry come from the

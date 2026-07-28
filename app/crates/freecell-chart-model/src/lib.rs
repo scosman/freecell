@@ -42,12 +42,19 @@ pub use downsample::{
 pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
 pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};
-pub use numfmt::apply_number_format;
+// `renders_faithfully` is exported alongside the applier because it is the CONTRACT on it: it
+// says whether the chart is claiming to render a code exactly, which is what makes a disagreement
+// with the cell a bug rather than a disclosed approximation. `freecell-engine`'s
+// `tests/numfmt_agreement.rs` (unit F3a) asserts against exactly that boundary.
+pub use numfmt::{apply_number_format, renders_faithfully};
 pub use spec::{
     Anchor, AnchorCell, CfRange, ChartBody, ChartId, ChartSpec, Origin, SourcePart, SourceXml,
 };
 pub use stroke::LineStroke;
-pub use theme::{ChartColor, ThemePalette, ThemeSlot};
+// `rgb_to_hsl` / `hsl_to_rgb` are exported so `freecell-app`'s series-colour cycle, which keeps
+// its own copy of both, can PIN their agreement in a test (unit F3a). Removing the duplicate
+// outright means merging the crates (unit F3).
+pub use theme::{hsl_to_rgb, rgb_to_hsl, ChartColor, ThemePalette, ThemeSlot};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
 ///

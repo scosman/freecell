@@ -569,6 +569,37 @@ merge that removes the duplication for good is F3.
 from running them. Build the differential test before deciding how big the fix is — it may
 turn out they agree everywhere that matters, in which case the test is the deliverable.*
 
+**Outcome (v05-cleanup-1 P6, 2026-07-28): mostly DISPROVED as stated — the test is the
+deliverable, and it found a serious IronCalc bug instead.**
+
+*numfmt:* `chart-model`'s formatter is a **bounded subset** with a `renders_faithfully` predicate
+that already degrades out-of-subset codes, so the testable invariant is agreement *inside* that
+subset. `tests/numfmt_agreement.rs` (engine crate — preserves the ironcalc-free boundary) sweeps
+every `formatCode` in the repo's fixtures × sign/rounding/magnitude-boundary values. **Every
+divergence found is IronCalc's, not chart-model's.**
+
+**⚠ The big one: IronCalc renders negative numbers WITHOUT their minus sign** when
+`|value| < 1.5 × 10^-decimals` — a cell formatted `#,##0` holding **-1 displays "1"**. Reproduced
+end-to-end through the real app (worker + `SetStylePath(NumFmt)` + publication). Filed as
+[`projects/ironcalc-negative-sign-display.md`](ironcalc-negative-sign-display.md); needs a fork fix
+(one `fix/` branch, one upstream PR) and is more severe than the unit that found it. Also found:
+IronCalc rounds `0.5→"1"` but `2.5→"2"`, `1234.5→"1234"` — inconsistent with Excel and itself.
+
+Changing `chart-model` to round half-away-from-zero was tried and made agreement **strictly
+worse**; reverted, with the reason recorded in the code so it is not retried. `General` diverges by
+design (a tick-label formatter vs Excel's ~9 significant digits) — pinned in shape, filed as a
+data-label gap rather than "fixed" by putting `0.333333333` on an axis.
+
+*`rgb_to_hsl`:* **DISPROVED.** The copies are in `freecell-app/src/chart/palette.rs` and
+`chart-model/src/theme.rs` (not `core`), and the `%` vs `.rem_euclid` difference is **normalised
+away** — both end with `.rem_euclid(360.0)`. Verified identical over the whole reachable input
+space. Guard test added; deduplication is F3.
+
+*Office palette:* **CONFIRMED** — `core::palette::FILL_PALETTE` and
+`chart_model::ThemePalette::office_default()` really are two definitions of the same ten colours.
+They agree; `tests/office_palette_agreement.rs` now enforces it slot by slot.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_6.md`.
+
 ### F3. Fold `freecell-chart-model` onto `freecell-core`
 **project · v1.0 · after F3a · coordinate with G3**
 

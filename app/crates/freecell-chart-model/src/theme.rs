@@ -195,7 +195,7 @@ impl From<Color> for ChartColor {
 
 /// Convert an sRGB [`Color`] to `(hue°, saturation, luminance)` in HSL, all in `0..=1` except hue
 /// in `0..360`.
-fn rgb_to_hsl(c: Color) -> (f64, f64, f64) {
+pub fn rgb_to_hsl(c: Color) -> (f64, f64, f64) {
     let r = c.r as f64 / 255.0;
     let g = c.g as f64 / 255.0;
     let b = c.b as f64 / 255.0;
@@ -222,7 +222,7 @@ fn rgb_to_hsl(c: Color) -> (f64, f64, f64) {
 }
 
 /// Inverse of [`rgb_to_hsl`].
-fn hsl_to_rgb(h: f64, s: f64, l: f64) -> Color {
+pub fn hsl_to_rgb(h: f64, s: f64, l: f64) -> Color {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = h / 60.0;
     let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());

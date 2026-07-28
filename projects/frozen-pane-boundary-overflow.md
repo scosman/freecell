@@ -23,20 +23,36 @@ let last_row = self.workbook.worksheet(sheet)?.dimension().max_row + row_count;
 if last_row > LAST_ROW { return Err(…); }
 ```
 
-— and inserting *empty* rows does not grow `max_row`, so an empty (or lightly populated) sheet
-accepts an arbitrarily large `row_count`.
+Two things follow from that, and they are different:
 
-Reproduced: freeze 1 row, then three × `InsertRows { row: 0, count: 1_000_000 }` leaves
-`frozen_rows = 3_000_001` on a sheet whose last row is 1,048,576. It survives save → reopen, so
+- **A single whole-axis insert is always rejected.** `dimension()` returns `max_row = 1` even for
+  an empty sheet (`worksheet.rs:721-730`), so `InsertRows { count: LAST_ROW }` fails everywhere.
+  The overflow is not reachable in one gesture.
+- **Repeated inserts are unbounded on a sheet with no populated cells below the insertion
+  point.** `insert_rows` shifts populated cells down, so on a sheet with data `max_row` grows with
+  each insert and the check eventually bites. On an **empty** sheet `sheet_data` stays empty,
+  `max_row` stays 1, and the headroom never shrinks — so the inserts can be repeated forever while
+  `frozen_rows` accumulates. (Growing the band requires inserting at/above its top, which is above
+  any data, so "insert below the data instead" is not an escape.)
+
+Reproduced: on an empty sheet, freeze 1 row, then three × `InsertRows { row: 0, count: 1_000_000 }`
+leaves `frozen_rows = 3_000_001` where the last row is 1,048,576. It survives save → reopen, so
 the writer emits a structurally invalid `<pane ySplit="3000001">` — a count that is not a row of
 the sheet it describes. Both axes are affected (`frozen_columns += column_count` at `:725`).
 
 ## Why it is reachable by gesture, not just by API
 
 The insert count is not a constant the app chooses — the header menu derives it from the
-**selected header run**, exactly like the freeze count that caused B2
-(`specs/projects/engine-worker-hardening/functional_spec.md` §0). Select a large block of row
-headers, choose Insert, repeat. This is the same untrusted-selection pattern, one command over.
+**selected header run** (`grid/view.rs`, `header_menu_items`: `count = run.1 - run.0 + 1`),
+exactly like the freeze count that caused B2
+(`specs/projects/engine-worker-hardening/functional_spec.md` §0). This is the same
+untrusted-selection pattern, one command over.
+
+It is not a *one-gesture* exploit, though, and the note should not imply otherwise: Select-All →
+Insert asks for 1,048,576 rows and the dimension check rejects it. What works is selecting a large
+sub-run (say 500,000 headers) on an **empty** sheet and repeating Insert — each call passes the
+check, and `frozen_rows` accumulates across them. So: a handful of ordinary gestures on a blank
+sheet, not one.
 
 ## Where the fix belongs: the fork, not FreeCell
 
@@ -46,9 +62,18 @@ FreeCell"), this is an engine defect and gets an engine fix:
 - Its **own** `fix/<slug>` branch off the fork's `main` (e.g. `fix/clamp-frozen-pane-boundary`),
   with upstream-style tests, as one focused single-feature PR. It must **not** be folded into
   `fix/structural-edits-adjust-frozen-pane` (already upstreamed) or into any FreeCell phase.
-- The change itself is small: clamp the adjusted boundary to the sheet dimension at all four
-  adjust sites — `actions.rs:725` / `:1051` (insert, both axes) and, for symmetry, the
-  `:857` / `:1131` decrements. `LAST_ROW` / `LAST_COLUMN` are already in scope there.
+- The change itself is small, and it is **only the two increment sites** — `actions.rs:1051`
+  (rows) and `:725` (columns): clamp the adjusted boundary to `LAST_ROW` / `LAST_COLUMN`, both
+  already in scope there.
+
+  The two **decrement** sites (`:857`, `:1131`) need nothing. Under their `row <= frozen` guard,
+  with `row >= 1` and `row_count >= 1` already validated, `deleted_in_band =
+  min(last_deleted, frozen) - row + 1` is provably in `1..=frozen`, so the subtraction can neither
+  underflow nor leave the result outside the dimension. Including them "for symmetry" would ask a
+  reviewer to accept a no-op, which is exactly the kind of thing that gets an upstream PR sent
+  back. They are worth *mentioning* in the PR only as the reason an overflowed count is not
+  permanent: a delete inside the band is the one operation that reduces it, at up to `LAST_ROW`
+  per call (measured: 3,000,001 → 1,951,425 → 902,849 → 0 over three whole-axis deletes).
 - Worth raising with it: whether `insert_rows` should range-check the **requested shift** rather
   than only the populated dimension. That is a larger behavioural question and probably a second
   PR, not a rider on this one.
@@ -72,8 +97,11 @@ why this is backlog and not a phase.
 ## Acceptance
 
 - Fork: inserting rows/columns into or above a frozen band can never leave the boundary outside
-  `0..=LAST_ROW` / `0..=LAST_COLUMN`, with a test that inserts far more tracks than the sheet has.
+  `0..=LAST_ROW` / `0..=LAST_COLUMN`. The test has to be the **repeated** insert on an empty sheet
+  (a single oversized insert is rejected by the dimension check before it reaches the boundary
+  adjustment, so it would pass for the wrong reason).
 - FreeCell: re-pin `freecell-fixes`, then extend
   `structural_edit_past_the_cap_diverges_model_from_the_clamped_cache` (`worker/run.rs`) with the
-  million-row insert, and tighten `engine-worker-hardening/functional_spec.md` §F1.3's statement
-  of the cost — the saved count becomes bounded-but-over-cap instead of unbounded.
+  repeated million-row insert, and tighten `engine-worker-hardening/functional_spec.md` §F1.3 —
+  the saved count becomes bounded-but-over-cap instead of unbounded, so its "How the divergence
+  ends" paragraph collapses to the self-healing case.

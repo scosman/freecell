@@ -6102,8 +6102,6 @@ pub(super) mod tests {
             worker.commit(StagedCommit::default());
             let publication = worker.shared.publication.load_full();
             let _ = done_tx.send((publication.frozen_rows, publication.frozen_cols));
-            // Hold the worker alive until the receiver has its answer.
-            drop(worker);
         });
         let (frozen_rows, frozen_cols) =
             match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
@@ -6327,7 +6325,10 @@ pub(super) mod tests {
         // Insert's one-undo-step contract. So two ordinary gestures move the model's count past the
         // cap while the cache — which is what the publish loop, the grid band and the header menu
         // all read — stays clamped. That is the deal: the model (and a save) keeps the larger
-        // count; everything the user sees is bounded; Unfreeze resolves it.
+        // count, while every loop over the band stays bounded by the cap. Note what that does NOT
+        // buy — the band's CONTENTS still shift, so rows drop out of the pinned region instead of
+        // the boundary growing to keep them (F1.3, "content silently falls out"). This test pins
+        // the boundary half; the content half is a rendering consequence, documented not asserted.
         let (mut worker, _rx) = test_worker();
         let sheet = sheet0(&worker);
         worker.process_batch(vec![
@@ -6373,10 +6374,11 @@ pub(super) mod tests {
             "the published band is bounded even though the model is over the cap"
         );
 
-        // The cost of the divergence, pinned exactly (`functional_spec.md F1.3`): while the model
-        // is OVER the cap, further band-affecting gestures move the model and leave the visible
-        // boundary standing still. The band starts tracking again only once the model comes back
-        // under. `model_then_cache` walks the sequence a user would actually produce.
+        // The boundary half of the cost (`functional_spec.md F1.3`): while the model is OVER the
+        // cap, further band-affecting gestures move the model and leave the visible BOUNDARY
+        // standing still — the number, not the view; the rows inside the band shift as usual. The
+        // boundary tracks again as soon as the model drops back under the cap (last step below).
+        // `model_then_cache` walks the sequence a user would actually produce.
         let model_then_cache = |worker: &Worker| {
             let idx = worker.resolve(sheet).expect("sheet is live");
             (
@@ -6392,7 +6394,7 @@ pub(super) mod tests {
         assert_eq!(
             model_then_cache(&worker),
             (80, MAX_FROZEN_ROWS),
-            "a second insert moves the model again; the band does not move"
+            "a second insert moves the model again; the boundary does not move"
         );
         worker.process_batch(vec![Command::DeleteRows {
             sheet,
@@ -6402,7 +6404,7 @@ pub(super) mod tests {
         assert_eq!(
             model_then_cache(&worker),
             (72, MAX_FROZEN_ROWS),
-            "deleting back down is invisible too, while the model is still over the cap"
+            "deleting back down leaves the boundary put too, while the model is over the cap"
         );
         worker.process_batch(vec![Command::DeleteRows {
             sheet,
@@ -6422,10 +6424,13 @@ pub(super) mod tests {
         assert_eq!(
             model_then_cache(&worker),
             (56, 56),
-            "under the cap the band tracks the model again — the divergence is not sticky"
+            "under the cap the boundary tracks the model again — the divergence is not sticky"
         );
 
-        // Unfreeze is the user's way out, and it clears BOTH sides.
+        // Unfreeze clears BOTH sides in one step, from any count. That matters because a delete
+        // only reduces the count by the rows it removes, so an OVERFLOWED count (see
+        // `projects/frozen-pane-boundary-overflow.md`) needs several whole-axis deletes to walk
+        // down — reachable, but not a recovery path anyone would take.
         worker.process_batch(vec![Command::SetFrozen {
             sheet,
             rows: Some(0),

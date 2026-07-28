@@ -427,8 +427,10 @@ pub(crate) fn build_sheet_cache(
     // `worker/run.rs::structural_edit_past_the_cap_diverges_model_from_the_clamped_cache`). We do
     // NOT re-clamp the model afterwards: that would be a second undo diff, breaking both
     // `SetFrozen`'s and Insert's documented one-undo-step contract, which is the worse trade. So
-    // the model — and a saved file's `<pane>` — can record a count above the cap while every
-    // surface the user touches stays bounded; Unfreeze resolves it.
+    // the model — and a saved file's `<pane>` — can record a count above the cap while every loop
+    // over the band stays bounded. Bounded is not unchanged: the band's contents still shift with
+    // the sheet, so rows fall out of the pinned region instead of the boundary growing to keep
+    // them (F1.3 spells the cost out). Unfreeze is the way out that always works.
     builder.set_frozen_rows((ws.frozen_rows.max(0) as u32).min(MAX_FROZEN_ROWS));
     builder.set_frozen_cols((ws.frozen_columns.max(0) as u32).min(MAX_FROZEN_COLS));
 

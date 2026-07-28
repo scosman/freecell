@@ -193,9 +193,10 @@ registry: each entry is a short description plus a pointer to a design note unde
   `engine-worker-hardening` Phase 1 review, 2026-07-28).* IronCalc grows a sheet's frozen boundary
   inside an insert's diff (`base/src/actions.rs:1051`, and the column twin at `:725`) with no upper
   bound, and `insert_rows` only range-checks the **populated** dimension — which empty inserted rows
-  don't grow. So freeze 1 row + three `InsertRows { count: 1_000_000 }` leaves `frozen_rows =
-  3,000,001` on a 1,048,576-row sheet, and it survives save/reopen as an invalid
-  `<pane ySplit="3000001">`. Reachable by gesture, because the insert count comes from the selected
-  header run — the same untrusted-selection pattern that caused B2. Belongs in the fork on its own
+  don't grow. So on an empty sheet, freeze 1 row + three `InsertRows { count: 1_000_000 }` leaves
+  `frozen_rows = 3,000,001` on a 1,048,576-row sheet, and it survives save/reopen as an invalid
+  `<pane ySplit="3000001">`. Reachable by repeated gesture (not one — Select-All → Insert is
+  rejected), because the insert count comes from the selected header run — the same
+  untrusted-selection pattern that caused B2. Belongs in the fork on its own
   `fix/<slug>` branch as one upstream PR, **not** as a FreeCell workaround; FreeCell itself stays
   bounded because the sheet-cache clamp holds. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)

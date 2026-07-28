@@ -93,50 +93,71 @@ Insert's alike — one Undo would no longer revert one gesture. Trading a docume
 user-visible undo contract for the tidiness of two numbers agreeing is the worse deal. The
 divergence is the cheaper defect, so it is chosen rather than discovered.
 
-**What the divergence actually costs.** Two things, both real.
+**What the divergence actually costs.** Three things, all real.
 
-*The band stops responding to structural edits until the model comes back under the cap.* Every
-surface stays bounded and safe — the band, the hit-testing, the header-menu label and the
-publication all read the clamped cache, and the publish loop's bound (§F1.4) holds — but "bounded"
-is not "unaffected". Walked from a legal freeze at 64:
+*The band **boundary** stops moving, while the band's contents do not.* Every surface stays
+bounded and safe — the band, the hit-testing, the header-menu label and the publication all read
+the clamped cache, and the publish loop's bound (§F1.4) holds. What is pinned is the **number**,
+not the view. Walked from a legal freeze at 64:
 
-| Gesture | Model | Band the user sees |
+| Gesture | Model | Band boundary the user sees |
 |---|---|---|
 | freeze 64 rows | 64 | 64 |
-| insert 8 rows above the band | 72 | 64 — no change |
-| insert 8 more | 80 | 64 — no change |
-| delete 8 rows in the band | 72 | 64 — no change |
+| insert 8 rows above the band | 72 | 64 — unmoved |
+| insert 8 more | 80 | 64 — unmoved |
+| delete 8 rows in the band | 72 | 64 — unmoved |
 | delete 8 more | 64 | 64 |
 | delete 8 more | 56 | **56** |
 
-So four consecutive band-affecting gestures produce no visible change at all, and the fifth
-moves the band. That is a genuinely confusing few seconds for a user who freezes at exactly the
-cap and then reorganises rows. It is bounded, self-healing (the band tracks normally again the
-moment the model drops under the cap) and never wrong about safety — but it is not invisible,
-and this spec should not have said it was.
+Four consecutive band-affecting gestures leave the boundary at 64, and the fifth moves it. Read
+the middle column and nothing appears to happen; that is the confusing part for a user who
+freezes at exactly the cap and then reorganises rows.
+
+*Content silently falls out of the pinned region.* This is the visible consequence the row above
+does **not** cover, and the one a support report would actually describe. The band renders sheet
+rows `0..64` off the clamped publication, and the publication is rebuilt from the *shifted*
+sheet. So inserting 8 rows at the top of a 64-row frozen header leaves the band showing 8 blank
+rows followed by the first 56 header rows, while the last 8 header rows — pinned a moment
+earlier — become body rows and scroll away. Excel would have grown the band to 72 and kept them
+pinned; that is exactly what the model did and the clamp discarded. The change is immediate and
+large, and it is the price of the cap: past 64 rows there is no band to grow into.
 
 *The saved count is unbounded.* IronCalc's boundary adjustment (`base/src/actions.rs:1051`, and
 the column twin at `:725`) has no upper guard, and `insert_rows` range-checks only the
 **populated** dimension — which empty inserted rows do not grow. So the model's count is not
-merely "over the cap": freeze 1 row and insert 1,000,000 rows three times and it is 3,000,001 on
-a 1,048,576-row sheet, and it survives save → reopen. FreeCell writes a `<pane ySplit>` that is
-not a row of the sheet it describes, and another application reading that file gets a
-structurally invalid freeze rather than just a larger one.
+merely "over the cap": freeze 1 row on a fresh sheet and insert 1,000,000 rows three times and it
+is 3,000,001 on a 1,048,576-row sheet, and it survives save → reopen. FreeCell writes a
+`<pane ySplit>` that is not a row of the sheet it describes, and another application reading that
+file gets a structurally invalid freeze rather than just a larger one.
 
-That second cost is an **engine** defect, not a FreeCell one, and it is not fixed here: per
+**How the divergence ends.** While the model's count stays *within the sheet* it is genuinely
+self-healing: deletes inside the band bring it down one deleted row at a time, and the boundary
+starts tracking again the moment it drops under the cap — the table's last row is exactly that
+moment.
+
+Once the count is over the sheet's own height the word no longer fits, though the reason is not
+that recovery is impossible. A single delete is bounded by the sheet (`delete_rows` rejects
+`row + count - 1 > LAST_ROW`), so an over-height count comes down at most 1,048,576 per gesture:
+measured, 3,000,001 → 1,951,425 → 902,849 → 0 over three whole-axis deletes, each of which also
+destroys a sheet's worth of rows. Reachable, but not a recovery path anyone would take. The
+one-step escape hatch is **Unfreeze** — offered on the boundary row's context menu, sending
+`SetFrozen { rows: Some(0) }` — which clears both sides at once from any count. Reopening the
+file in FreeCell also takes path 1 and clamps the view again, though it does not repair the
+model.
+
+That third cost is an **engine** defect, not a FreeCell one, and it is not fixed here: per
 `CLAUDE.md` a fork bug gets its own `fix/<slug>` branch and one focused upstream PR, never a
 compensating workaround in FreeCell and never folded into an unrelated phase. It is captured in
 `PROJECTS.md` → [`projects/frozen-pane-boundary-overflow.md`](../../../projects/frozen-pane-boundary-overflow.md).
 FreeCell stays bounded regardless, because the cache clamp is what every consumer reads. Once
-the fork clamps the boundary to the sheet dimension, this paragraph reduces to
-"bounded-but-over-cap".
+the fork clamps the boundary to the sheet dimension, the count becomes bounded-but-over-cap and
+the self-healing case above becomes the only case.
 
-Reopening such a file in FreeCell takes path 1 and clamps again. Right-clicking the boundary row
-offers "Unfreeze", which sends `SetFrozen { rows: Some(0) }` and clears both sides.
-
-Pinned by `structural_edit_past_the_cap_diverges_model_from_the_clamped_cache`
-(`worker/run.rs`) — which walks the table above assertion by assertion — so the behaviour cannot
-drift back into being an accident.
+The **boundary** table above is pinned row by row by
+`structural_edit_past_the_cap_diverges_model_from_the_clamped_cache` (`worker/run.rs`), so that
+half cannot drift back into being an accident. The content-falls-out effect is not pinned by a
+test — it is a rendering consequence of the clamped count, and the pixel suite has no
+over-cap-freeze fixture — so it is documented here rather than asserted anywhere.
 
 ### F1.4 Bound
 
@@ -149,19 +170,20 @@ that claimed the property without enforcing it.
 
 Telling the user that a freeze was clamped. The clamp stays silent, but **not** on the grounds
 first written here ("a case only a crafted file reaches") — §F1.3 path 2 shows an ordinary
-insert reaches it too, so that justification is retired. The reason it stays silent is that
-there is nothing actionable to say: the band the user is looking at is the correct, usable one,
-the freeze they asked for was never possible to render, and the escape hatch (Unfreeze) is
-already one right-click away in the same header menu. A banner would report a state the user
-cannot act on differently.
+insert reaches it too, so that justification is retired. The reason it stays silent is weaker
+than "nothing happened" and should be stated as such: the band on screen is the largest one
+FreeCell can render, the count it was clamped from could not have been rendered at all, and the
+two controls that change the situation — Freeze at a smaller boundary, and Unfreeze — are
+already in the header menu the user right-clicks to reach a freeze. A banner would add a
+sentence, not an option.
 
-What that *does* buy are the two surprises §F1.3 spells out: gestures that do not move the band
-while the model is over the cap, and a workbook saved with a `<pane>` count FreeCell itself will
-not display (today, an unbounded one). If either bites in practice — a support report of "my
-freeze stopped following my inserts", or "my freeze changed when I opened it in Excel" — the
-answers are respectively a **band-level** hint and a **save-time** notice, not a load-time
-banner, and both belong in `PROJECTS.md` rather than here. The unbounded half of the second is
-already tracked there as an engine fix.
+What that *does* buy are the surprises §F1.3 spells out: while the model is over the cap the band
+**boundary** does not move and rows drop out of the pinned region instead, and a workbook can be
+saved with a `<pane>` count FreeCell itself will not display (today, an unbounded one). If either
+bites in practice — a support report of "my frozen header lost its bottom rows after an insert",
+or "my freeze changed when I opened it in Excel" — the answers are respectively a **band-level**
+hint and a **save-time** notice, not a load-time banner, and both belong in `PROJECTS.md` rather
+than here. The unbounded half of the second is already tracked there as an engine fix.
 
 ---
 

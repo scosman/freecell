@@ -135,6 +135,13 @@ places about what CI protects.
 
 ## Working agreement
 
+- **Process — follow the `/spec` loop exactly as defined. Do not improvise a faster one.**
+  `/spec implement` puts you in a **manager** role: per phase you spawn a coding sub-agent,
+  validate its attestation, spawn a *fresh* CR sub-agent, route feedback back and re-review
+  until clean, resume the coding agent to commit, then verify with `git status`. Every code
+  change — CR fixes included — needs a clean CR before commit. Do not write the code or run
+  the review inline yourself, and do not skip the CR loop because a change looks small.
+  "Autonomous" below means **no human sign-off**; it does not mean a shortened process.
 - **Autonomy:** run the full spec + implement flow in one pass. Do not stop for sign-off
   between spec phases. Ask only if a real unknown surfaces — for this round, the plausible one
   is C2's P1/P2 boundary if the part inventory turns out to be unusable for a user-facing

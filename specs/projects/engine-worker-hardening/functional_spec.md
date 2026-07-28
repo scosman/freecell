@@ -218,6 +218,13 @@ A panic inside `save_workbook` is caught and reported as a typed save failure:
 - The window stays open. Saves are atomic (temp + rename), so the destination file is
   untouched — the existing `SaveError` contract still holds.
 
+**CSV export is guarded on the same terms.** `Command::ExportCsv` walks the same engine over
+every cell of a sheet, two statements below the save in the same batch, so a panic there is the
+same class of failure and gets the same treatment: caught, reported as `CsvExportFailed` with the
+typed `SaveError::EnginePanic` (dialog title: **"Couldn't export the CSV"**), counted toward the
+poisoning budget, with no `EditRejected` riding along. The export is atomic, so no partial `.csv`
+is left behind, and the document is untouched either way (an export never changes dirty/path).
+
 After a caught save panic the worker probes the model. If the model is now unresponsive the
 worker degrades (existing `WorkerDegraded` path: the degraded bar appears and mutating controls
 are disabled). If the model still answers, the worker carries on — one failed save is not a
@@ -234,20 +241,55 @@ abort-adjacent unwind, a future unguarded path — the window must say so. The r
 
 On that condition the window:
 
-1. logs at `error` (with the thread's join result: panicked vs. exited cleanly),
+1. logs at `error` how the thread ended. The stream closes when the worker's frame drops its
+   event sender, which happens *before* the thread has finished unwinding the rest of the
+   `Worker`, so a UI-thread probe at that instant usually answers "still running" and says
+   nothing about the cause. The window therefore takes the join handle and joins it on the
+   **background** executor, logging the real outcome (panicked vs. clean) when it lands. The UI
+   thread never parks.
 2. enters the existing **degraded** state — degraded bar visible, mutating controls disabled,
-3. shows an OK-only dialog:
+3. clears any "Opening <name>…" loading state (window flag + grid overlay). A worker can die
+   *before* `Loaded` — everything after the guarded `from_source` still runs unguarded on
+   freshly parsed input — and an overlay left up would spin forever behind the dialog,
+4. shows an OK-only dialog:
    - Title: **"The calculation engine stopped"**
    - Detail: *"This window can't be edited or saved any more. Its unsaved changes are lost.
      Open the file again to keep working."*
-4. stays open, so the last rendered data is still readable.
+
+   This report fires **once**, with no re-arm, so it replaces whatever modal is showing —
+   *except* a dialog that is itself a terminal report (a load failure, which closes the window
+   on dismiss). A load failure is emitted and *then* the thread returns, so the accurate
+   "Couldn't open the workbook" dialog survives; an unsaved-changes prompt or a merge confirm
+   does not, because it is offering choices that can no longer be carried out.
+5. stays open, so the last rendered data is still readable.
 
 The window is honest rather than tidy here: it does not close itself and it does not pretend a
-Save might work.
+Save might work. Concretely, in the worker-lost state:
+
+- **No save path runs.** `Save`, `Save As`, the unsaved-changes prompt's Save, and **Export as
+  CSV** all refuse with an OK-only notice ("This workbook can't be saved from this window any
+  more. Open the file again to keep working."). Nothing is sent, nothing is armed, and no
+  close/quit follow-up is left standing. This is not defensive tidiness: `DocumentClient::send`
+  drops a command when the worker is gone, so a save that *looked* accepted would never receive
+  `Saved` or `SaveFailed` — the native panel would pick a file that is never written.
+- **The bar carries no Save As button.** The degraded bar's "Save As to keep your work" is an
+  offer only a *live* worker can honour, so the lost-worker state renders its own bar: "The
+  calculation engine stopped. This window is read-only and its unsaved changes can't be saved —
+  open the file again to keep working." Same look, no button, and no contradiction with the
+  dialog on top of it.
+- **The close and quit paths still resolve.** Closing a dirty window whose worker is gone prompts
+  with **Cancel** and **Close Without Saving** only (title: "Unsaved changes can't be saved").
+  Both resolve: Cancel aborts an in-progress quit, Close Without Saving closes the window and
+  lets the quit continue. Offering Save here would arm a close-after-save that could never fire,
+  leaving the window open and an in-progress quit parked on it forever.
+
+This is a *distinct* state from the degraded worker of F2.2, not a second reason for it: a
+degraded worker is alive and answering, so its bar's Save As really writes the file.
 
 Today nothing sends `Command::Shutdown`, so in practice *every* stream close is fatal. The
 window still checks the flag rather than assuming, so an orderly shutdown added later doesn't
-pop a false alarm.
+pop a false alarm. It separately checks whether it *has* a worker at all, so the worker-less
+test client's closed-from-birth stream is not reported as a death.
 
 ### F2.4 Out of scope
 
@@ -344,7 +386,8 @@ from. The UI does not read it today; the ordering tests do.
 | Panic in `from_source` | No, for that window | `LoadFailed` → dialog, window closes on dismiss (F2.1) |
 | Panic in `save_workbook`, model still healthy | Yes | `SaveFailed` → dialog, window continues (F2.2) |
 | Panic in `save_workbook`, model poisoned | No | `SaveFailed` dialog **and** `WorkerDegraded` bar (F2.2) |
-| Worker thread dies | No, for that window | `error!` log + degraded bar + dialog (F2.3) |
+| Panic in the CSV export | Yes | `CsvExportFailed` → "Couldn't export the CSV" dialog (F2.2) |
+| Worker thread dies | No, for that window | `error!` log (join off the UI thread) + worker-lost bar (no Save As) + dialog; save/export refused; the close prompt drops its Save (F2.3) |
 
 ---
 

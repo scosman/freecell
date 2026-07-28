@@ -21,6 +21,21 @@ change, so the unification is built on stable ground.
       poisoning policy without the edit-path event; retain the `JoinHandle` and track a
       requested shutdown; make the window treat a stream close it did not ask for as fatal.
       → `architecture.md §A3`
+      - **Deviation from §A3.6, recorded per its own instruction:** the load/save panic hooks are
+        `#[cfg(test)]` sentinel **file names** (`document::PANIC_SENTINEL`), not the planned
+        `test-support` `DocumentSource::TestPanic` + `Command::TestPanicOnSave`. Better trade —
+        no test-only shape reaches the public `DocumentSource`/`Command` — but `#[cfg(test)]`
+        items are invisible to an integration-test build, so the guard tests live in the `run.rs`
+        / `charts.rs` / `client.rs` unit modules instead of `worker_seam.rs`. They still exercise
+        the guards at their real call sites.
+      - **Code-review follow-ups (B1 round 2):** a distinct `worker_lost` window state (no Save As
+        in the bar, every save/export path refuses, the unsaved-changes prompt drops its Save so a
+        dirty lost-worker window can't park a `QuitPlan`); the save-time chart sweep made
+        re-entrant across a caught panic (and the `AssertUnwindSafe` justification corrected in
+        `architecture.md §A3.3`); `WorkerExit::Running` joined off the UI thread instead of being
+        logged as a non-answer; the loading overlay cleared on a death before `Loaded`; the fatal
+        report no longer swallowed by a non-terminal modal; the CSV export guarded like the save;
+        `has_worker` split out of `shutdown_requested`.
 
 - [x] **Phase 3 — extract chart handling out of `run.rs`.** Move ≈1,180 production lines and
       the chart tests into `worker/charts.rs`. Behaviour-preserving; every existing test passes

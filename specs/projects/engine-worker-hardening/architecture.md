@@ -247,11 +247,32 @@ fn handle_caught_panic(&mut self) {
 Behaviour for the six existing call sites is bit-identical — the same count, the same probe, the
 same threshold, the same events.
 
-`save_workbook` takes `&mut self` and mutates `chart_source_path` / `loaded_anchor_edits` /
-`loaded_deletes` late in the function, after every fallible step. A panic before those lines
-leaves them untouched; a panic cannot occur after them (they are the last statements before the
-`Ok`). So the `AssertUnwindSafe` here is genuinely safe rather than merely asserted, and that
-reasoning is recorded in a comment at the call site.
+**What `AssertUnwindSafe` over `&mut self` actually costs here.** The first version of this
+section claimed `save_workbook`'s only `self` mutations are its last statements, so a panic could
+leave nothing half-applied. **That was wrong**, and the code has been changed rather than the
+comment: `save_workbook`'s *first* statement is `ensure_all_charts_discovered()`, which binds
+charts, bumps `chart_version`, and (since Phase 4) commits — and inside its loop it called
+`discover_and_parse_for_part`, a zip/XML parse of user-supplied bytes and the most panic-prone
+call on the save path.
+
+So a caught save panic *can* leave part of that sweep applied. The sweep is therefore made
+**re-entrant** instead of assumed atomic: a sheet is recorded in `discovered_chart_sheets` only
+after its parse has returned, so what survives a panic is a prefix of correctly bound sheets plus
+`charts_fully_discovered == false` — a partially-swept worker that the next save, or a lazy
+per-sheet discovery, completes. Marking *before* the parse (the original order) left sheets
+flagged "walked" whose charts were never bound: `ensure_sheet_charts_discovered` then returned
+early for them forever while `charts_fully_discovered` stayed `false`, so their charts silently
+went missing until some later save re-ran the whole sweep.
+
+The late mutations (`chart_source_path`, `loaded_anchor_edits`, `loaded_deletes`) *are* the last
+statements before the `Ok`, after every fallible step, so those genuinely cannot be half-applied.
+The call-site comment states both halves.
+
+**The CSV export is guarded the same way** (`Command::ExportCsv`, two statements below the save
+in the same batch): the same engine over every cell of a sheet, reported as `CsvExportFailed`
+with `SaveError::EnginePanic` and counted through `note_caught_panic`. Its `AssertUnwindSafe` is
+unconditionally sound — the closure takes only shared borrows and mutates no worker state — which
+is cheaper to establish than an argument for leaving it out.
 
 ### A3.4 Retaining the handle and surfacing death
 
@@ -280,6 +301,12 @@ join: Mutex<Option<JoinHandle<()>>>,
 /// reported as a crash. Nothing sends `Shutdown` today; the flag keeps the check honest for
 /// when something does.
 shutdown_requested: AtomicBool,
+/// Whether this client was built over a real worker thread at all — `false` only for the
+/// worker-less `detached()` test client, whose stream is closed from birth. Deliberately NOT
+/// folded into `shutdown_requested`: that flag answers "did we ask the worker to stop", and
+/// storing `true` into it from a constructor that never had a worker is a lie the moment
+/// anything else reads it.
+has_worker: bool,
 ```
 
 with:
@@ -293,16 +320,32 @@ pub fn send(&self, cmd: Command) {
 }
 
 pub fn shutdown_requested(&self) -> bool { … }
+pub fn has_worker(&self) -> bool { … }
 
-/// Join the worker thread and report how it ended. Only meaningful once the event stream has
-/// closed (which happens as the thread drops its sender on the way out), so it never blocks in
-/// practice; if the thread is somehow still running it returns `Running` WITHOUT joining rather
-/// than parking the caller — this is called from the UI thread.
+/// How the worker thread ended, WITHOUT ever blocking — this is called from the UI thread. A
+/// thread that has not finished reports `Running` and keeps its handle.
 pub fn worker_exit(&self) -> WorkerExit { … }
+
+/// Takes the retained handle so the caller can join it OFF the UI thread.
+pub fn take_worker_handle(&self) -> Option<JoinHandle<()>> { … }
+
+/// Joins a taken handle and reports the outcome. BLOCKS — background executor only.
+pub fn join_worker(handle: JoinHandle<()>) -> WorkerExit { … }
 ```
 
+`Running` is the **common** answer at the moment the stream closes, not a rare one — the
+first draft of this section ("by then the join returns immediately") was wrong. The stream
+closes when the worker's frame drops `event_tx`, and the thread then still has to unwind the
+whole `Worker` (the `UserModel`, the caches, the chart bindings) before it is finished — a
+structural ordering, not a race that happens to be lost sometimes. (The code review that found
+this measured 159/200 runs answering `Running` over ~8 MB of worker state; a real workbook is
+heavier.) So
+`Running` must not be a dead end: the window takes the handle and `join_worker`s it on the
+background executor, logging the real outcome when it lands.
+
 `DocumentClient::detached()` (the `test-support` constructor) sets `join: Mutex::new(None)`,
-which `worker_exit` reports as `Clean`.
+which `worker_exit` reports as `Clean`, and `has_worker: false`, which is what stops its
+closed-from-birth stream being read as a death.
 
 Using `parking_lot::Mutex` (already a dependency, already used for `Shared::caches`) keeps this
 lock-poison-free.
@@ -324,29 +367,42 @@ cx.spawn_in(window, async move |this, cx| {
 /// gone and this document can no longer be edited or saved (`functional_spec.md F2.3`) — log
 /// it, enter the degraded state, and say so. Called once, when the event loop's `recv()`
 /// yields `None`.
-fn on_worker_lost(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    if self.client.shutdown_requested() { return; }
-    let exit = self.client.worker_exit();
-    tracing::error!(?exit, "worker thread ended without a requested shutdown");
+fn on_worker_lost(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    if !self.client.has_worker() || self.client.shutdown_requested() { return; }
+    self.report_worker_exit(cx);          // `Running` → take the handle, join in the background
+    self.worker_lost = true;              // the state that takes every save path out of service
     self.degraded = Some("the calculation engine stopped".to_string());
     self.chrome.update(cx, |c, cx| c.set_degraded(true, cx));
-    if self.modal.is_none() {
-        self.modal = Some(ActiveModal::Error {
-            title: "The calculation engine stopped".into(),
-            detail: "This window can't be edited or saved any more. Its unsaved changes are \
-                     lost. Open the file again to keep working.".into(),
-            close_window_on_dismiss: false,
-        });
-    }
+    self.loading = None;                  // a death before `Loaded` must not leave the overlay up
+    self.grid.update(cx, |g, cx| g.set_loading(None, cx));
+    if !current_modal_is_a_terminal_report { self.modal = Some(ActiveModal::Error { … }); }
     cx.notify();
 }
 ```
 
-The `if self.modal.is_none()` guard matches the existing convention at `:736` — a dialog already
-up (e.g. `LoadFailed`, which is itself followed by the thread exiting) is not stomped. That case
-matters: a failed load emits `LoadFailed` and then returns, closing the stream. `on_worker_lost`
-would otherwise replace the accurate "Couldn't open the workbook" dialog with a generic crash
-one. The degraded state is still entered — correctly, the worker really is gone.
+**Which modal survives.** Only one that is *itself* a terminal report — the load-failure error
+with `close_window_on_dismiss: true`. That case is the reason the guard exists: a failed load
+emits `LoadFailed` and *then* returns, closing the stream, and its accurate "Couldn't open the
+workbook" must not be replaced by the generic crash one. A blanket `modal.is_none()` guard (the
+first draft) went further than that reason supports: it also suppressed the report behind an
+`UnsavedChanges` prompt or a merge `Confirm`, and since `on_worker_lost` runs **once** with no
+re-arm, dismissing that prompt left the user with the bar and no notice at all — the F2.3 report
+lost entirely. Those modals are replaced.
+
+**`worker_lost` is a separate field, not a `degraded` string.** The two states differ in exactly
+what the degraded bar offers. A degraded worker is alive and answering, so its "Save As to keep
+your work" button works. A *lost* worker cannot write anything: `DocumentClient::send` drops the
+command, so no `Saved`/`SaveFailed` ever returns. Hence, gated on `worker_lost`:
+
+- `save()` / `send_save()` (and `export_csv`) refuse with an OK-only notice, never arming
+  `close_after_save` or a `pending_save_req`, and cancel any in-flight quit prompt
+  (`note_prompt_cancelled`, as a `SaveFailed` does). `send_save` is checked as well as `save`
+  because the native panel is async — the worker can die while it is open.
+- the bar renders without the `Save As…` button, with copy matching the dialog.
+- the unsaved-changes prompt drops its **Save** button (Cancel / Close Without Saving only). Both
+  remaining choices resolve, so a dirty window whose worker died can no longer park a `QuitPlan`
+  forever — the old prompt's Save armed `close_after_save`, sent into the void, and the window
+  never closed, leaving `advance_quit` waiting on a window that would never resolve.
 
 `on_edit_rejected` gains an arm for `FrozenPaneTooLarge` (exhaustive match), producing the F1.2
 dialog.
@@ -355,20 +411,31 @@ dialog.
 
 | Test | Location | Asserts |
 |---|---|---|
-| `load_panic_reports_load_failed` | `worker_seam.rs` | a source that panics in `from_source` yields `LoadFailed { EnginePanic }` and the thread does not take the process down |
-| `save_panic_reports_save_failed` | `worker_seam.rs` | a save that panics yields `SaveFailed { EnginePanic }`, the worker keeps answering a subsequent edit, and no `EditRejected` rides along |
-| `note_caught_panic_degrades_on_second` | `run.rs` unit | the split preserves the 2-panic / failed-probe threshold exactly |
-| `shutdown_requested_tracks_the_command` | `client.rs` unit | `send(Shutdown)` sets the flag; other commands do not |
-| `worker_exit_reports_clean_after_shutdown` | `worker_seam.rs` | a real worker sent `Shutdown` joins `Clean` |
-| `worker_death_shows_the_fatal_dialog` | `window.rs` gpui test | drop the sender behind a detached client's event channel → the window is degraded and shows the fatal modal |
-| `worker_death_after_load_failure_keeps_the_load_dialog` | `window.rs` gpui test | `LoadFailed` then stream close → the "Couldn't open the workbook" dialog survives |
+| `load_panic_is_caught_and_reported_as_load_failed` | `run.rs` unit | a source that panics in `from_source` yields `LoadFailed { EnginePanic }` and the thread does not take the process down |
+| `save_panic_is_caught_and_reported_as_save_failed` | `run.rs` unit | a save that panics yields `SaveFailed { EnginePanic }`, the worker keeps answering a subsequent edit + a real save, and no `EditRejected` rides along |
+| `export_panic_is_caught_and_reported_as_export_failed` | `run.rs` unit | the same for `ExportCsv` → `CsvExportFailed { EnginePanic }`, worker still serving |
+| `a_save_panic_mid_sweep_leaves_the_sheet_re_discoverable` | `charts.rs` unit | a save on a workbook that really has charts to discover, panicking inside the sweep's parse: no sheet is marked walked, and lazy discovery still binds that sheet's chart afterwards |
+| `a_save_panic_counts_toward_the_degrade_threshold` | `run.rs` unit | the split preserves the 2-panic / failed-probe threshold exactly |
+| `shutdown_requested_tracks_only_the_shutdown_command` | `client.rs` unit | `send(Shutdown)` sets the flag; other commands do not; a spawned client reports `has_worker` |
+| `worker_exit_reports_clean_after_a_requested_shutdown` | `client.rs` unit | a real worker sent `Shutdown` joins `Clean` |
+| `worker_exit_reports_a_thread_that_unwound` | `client.rs` unit | the `Err(_) => Panicked` arm — a thread that unwound out of its entry point |
+| `a_running_worker_reports_running_and_stays_joinable` | `client.rs` unit | `Running` does **not** consume the handle; `take_worker_handle` + `join_worker` then report the real outcome |
+| `the_worker_less_client_reports_no_worker_rather_than_a_shutdown` | `client.rs` unit (`test-support`) | `detached()` is `has_worker: false`, *not* a fake shutdown request |
+| `worker_death_degrades_the_window_and_says_so` | `window.rs` gpui test | drop the sender behind a detached-live client's event channel → the window is degraded and shows the fatal modal |
+| `worker_death_after_a_load_failure_keeps_the_load_dialog` | `window.rs` gpui test | `LoadFailed` then stream close → the "Couldn't open the workbook" dialog survives |
+| `worker_death_replaces_a_non_terminal_modal` | `window.rs` gpui test | an `UnsavedChanges` prompt showing at death is replaced by the fatal report, not swallowed by it |
+| `worker_death_clears_the_loading_overlay` | `window.rs` gpui test | a death before `Loaded` clears "Opening …" instead of spinning behind the dialog |
+| `a_lost_worker_refuses_to_save` | `window.rs` gpui test | `save` on a lost worker writes nothing, arms no `pending_save_req`, disarms `close_after_save`, and explains itself |
 
-Injecting a load/save panic needs a hook. `Command::TestPanic` already exists behind `#[cfg(test)]`
-for the edit path; the same treatment is used — a `#[cfg(feature = "test-support")]`
-`DocumentSource::TestPanic` variant and a `Command::TestPanicOnSave` flag — so nothing reaches a
-release build. If either turns out to need more surface area than the bug is worth, the unit test
-of the guard's `Err` arm stands alone and the seam test is dropped, with that noted in the phase
-plan rather than left silent.
+**Deviation from this section, recorded rather than left silent.** The plan above called for
+`worker_seam.rs` integration tests over a `#[cfg(feature = "test-support")]`
+`DocumentSource::TestPanic` variant plus a `Command::TestPanicOnSave` flag. The implementation
+instead keys the injections off a `#[cfg(test)]` sentinel **file name**
+(`document::PANIC_SENTINEL`), which adds no public shape at all — a better trade, and the one
+kept. The consequence is that the panic hooks are invisible outside the crate's own unit tests
+(`#[cfg(test)]` items do not exist for an integration-test build), so these tests live in the
+`run.rs` / `charts.rs` / `client.rs` unit modules rather than in `worker_seam.rs`. The guards are
+exercised at their real call sites (`process_batch`, `load_and_run`) either way.
 
 ---
 

@@ -717,10 +717,17 @@ impl Worker {
             // event to explain it: the window keeps rendering the last publication while edits
             // vanish and Save silently does nothing.
             //
-            // `AssertUnwindSafe` over `&mut self` is sound here rather than merely asserted:
-            // `save_workbook`'s only mutations of `self` (`chart_source_path`, `loaded_anchor_edits`,
-            // `loaded_deletes`) are its last statements, after every fallible step, so a panic
-            // cannot leave them half-applied.
+            // What `AssertUnwindSafe` over `&mut self` costs here, stated accurately rather than
+            // waved through: `save_workbook` DOES mutate `self` before it can panic — its first
+            // statement is `ensure_all_charts_discovered`, which binds charts, bumps
+            // `chart_version` and commits. So a caught panic can leave the worker with *some* of
+            // this save's chart discovery applied. That state is deliberately made re-entrant
+            // rather than assumed away: the sweep marks a sheet discovered only after its parse +
+            // bind returned (see `charts.rs`), so what survives a panic is a prefix of correctly
+            // bound sheets plus `charts_fully_discovered == false` — a partially-swept worker,
+            // which the next save (or a lazy per-sheet discovery) completes. The late mutations
+            // (`chart_source_path`, `loaded_anchor_edits`, `loaded_deletes`) are the last
+            // statements before `Ok`, after every fallible step, so those cannot be half-applied.
             let outcome = catch_unwind(AssertUnwindSafe(|| self.save_workbook(&path)));
             match outcome {
                 Ok(Ok(())) => self.emit(WorkerEvent::Saved {
@@ -744,16 +751,50 @@ impl Worker {
 
         // CSV exports (pure reads — no dirty change). An unresolvable sheet (deleted mid-flight)
         // fails cleanly rather than writing a wrong sheet.
+        //
+        // GUARDED (B1, `functional_spec.md F2.2`) on the same grounds as the save two statements
+        // up: this walks the engine over every cell of a sheet, so it is the same engine on the
+        // same kind of user data, and an unguarded panic here kills the worker thread with no event
+        // to explain it. `AssertUnwindSafe` is unconditionally sound for this closure — it takes
+        // only shared borrows (`resolve`, `doc.export_csv`) and mutates no worker state at all, so
+        // there is nothing a panic could tear.
         for (sheet, path, req_id) in exports {
-            let result = match self.resolve(sheet) {
-                Some(idx) => self.doc.export_csv(idx, &path),
-                None => Err(crate::document::SaveError::Io(
-                    "the sheet no longer exists".to_string(),
-                )),
-            };
-            match result {
-                Ok(()) => self.emit(WorkerEvent::CsvExported { req_id }),
-                Err(error) => self.emit(WorkerEvent::CsvExportFailed { req_id, error }),
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // Panic injection for this guard's test — see `document::PANIC_SENTINEL`.
+                #[cfg(test)]
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == crate::document::PANIC_SENTINEL)
+                {
+                    panic!("injected test panic (export catch_unwind recovery)");
+                }
+                match self.resolve(sheet) {
+                    Some(idx) => self.doc.export_csv(idx, &path),
+                    None => Err(crate::document::SaveError::Io(
+                        "the sheet no longer exists".to_string(),
+                    )),
+                }
+            }));
+            match outcome {
+                Ok(Ok(())) => self.emit(WorkerEvent::CsvExported { req_id }),
+                Ok(Err(error)) => self.emit(WorkerEvent::CsvExportFailed { req_id, error }),
+                Err(_) => {
+                    tracing::error!(
+                        "worker: caught panic in export_csv; reporting CsvExportFailed"
+                    );
+                    // The same typed error the save path reports (`SaveError::EnginePanic`) — the
+                    // export dialog names the CSV, and the shared sentence "the calculation engine
+                    // crashed while writing the file" is exactly what happened. Any partially
+                    // written file is a temp that never got renamed (`export_csv` is atomic).
+                    self.emit(WorkerEvent::CsvExportFailed {
+                        req_id,
+                        error: SaveError::EnginePanic,
+                    });
+                    // The poisoning policy WITHOUT the edit path's `EditRejected`, as for a save:
+                    // `CsvExportFailed` has already told the user, and a model that still answers
+                    // is not condemned by one failed export.
+                    self.note_caught_panic();
+                }
             }
         }
 
@@ -2226,10 +2267,16 @@ impl Worker {
     /// before**. On success the just-saved file becomes the chart source for the next save (it is a
     /// self-contained superset). A missing target part surfaces as a [`SaveError`] (fail loudly).
     fn save_workbook(&mut self, path: &Path) -> Result<(), SaveError> {
+        // Charts are discovered lazily per painted sheet (P11), so before a save force a full sweep
+        // — otherwise a chart on a sheet the user never scrolled to would be silently dropped by the
+        // chart-less writer.
+        self.ensure_all_charts_discovered();
+
         // Panic injection for the save guard's test (B1, `functional_spec.md F2.2`) — see
-        // `document::PANIC_SENTINEL`. Placed at the top so it stands in for the pinned exporter's
-        // `panic!("Model needs to be evaluated before saving!")`, and exercises the guard at its
-        // real call site inside `process_batch`.
+        // `document::PANIC_SENTINEL`. Placed **after** the chart sweep so it sits where the pinned
+        // exporter's `panic!("Model needs to be evaluated before saving!")` really is: downstream
+        // of the sweep, with whatever that sweep mutated already applied. Exercises the guard at
+        // its real call site inside `process_batch`.
         #[cfg(test)]
         if path
             .file_name()
@@ -2237,10 +2284,6 @@ impl Worker {
         {
             panic!("injected test panic (save catch_unwind recovery)");
         }
-        // Charts are discovered lazily per painted sheet (P11), so before a save force a full sweep
-        // — otherwise a chart on a sheet the user never scrolled to would be silently dropped by the
-        // chart-less writer.
-        self.ensure_all_charts_discovered();
 
         // Mode 1/2 (loaded re-inject) applies only to a workbook opened from a file that still
         // carries loaded charts; mode 3 (authored write-from-model) applies to any inserted chart.
@@ -3665,6 +3708,63 @@ pub(super) mod tests {
                 .any(|e| matches!(e, WorkerEvent::Saved { req_id: 2, .. })),
             "a real save after a caught save panic still succeeds"
         );
+    }
+
+    /// B1 (`functional_spec.md F2.2`): the CSV export walks the same engine over every cell of a
+    /// sheet, two statements below the guarded save, and was left unguarded. A panic there is now
+    /// caught and reported as a typed `CsvExportFailed`, the worker keeps serving, and — like the
+    /// save — no `EditRejected` rides along.
+    #[test]
+    fn export_panic_is_caught_and_reported_as_export_failed() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let dir = tempfile::tempdir().unwrap();
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::ExportCsv {
+                sheet,
+                path: dir.path().join(crate::document::PANIC_SENTINEL),
+                req_id: 1,
+            }])
+        });
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::CsvExportFailed {
+                    req_id: 1,
+                    error: SaveError::EnginePanic
+                }
+            )),
+            "a caught export panic reports CsvExportFailed{{EnginePanic}}; got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::EditRejected { .. })),
+            "an export failure must not also claim an edit was rejected; got {events:?}"
+        );
+        assert!(
+            !worker.degraded,
+            "one caught export panic over a healthy model must not degrade the worker"
+        );
+
+        // The worker is still live: a following edit applies and a real export succeeds.
+        worker.process_batch(vec![set_input(sheet, 0, 0, "7")]);
+        let out = dir.path().join("real.csv");
+        worker.process_batch(vec![Command::ExportCsv {
+            sheet,
+            path: out.clone(),
+            req_id: 2,
+        }]);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::CsvExported { req_id: 2 })),
+            "a real export after a caught export panic still succeeds"
+        );
+        assert!(out.exists(), "and it wrote the file");
     }
 
     /// The `handle_caught_panic` split must not move the poisoning threshold: a save panic counts

@@ -304,6 +304,16 @@ impl Worker {
     /// [`add_missing`](ChartBindings::add_missing), so charts already bound lazily (and their
     /// live-resolved values) are kept untouched. A discovery failure is logged (the save then
     /// proceeds with whatever was already bound, rather than aborting the user's save).
+    ///
+    /// **Re-entrant across a panic** (B1, `functional_spec.md F2.2`). This runs inside the save's
+    /// `catch_unwind`, and its per-sheet `discover_and_parse_for_part` is a zip/XML parse of
+    /// user-supplied bytes — the most panic-prone call on the save path. A sheet is therefore
+    /// recorded in [`discovered_chart_sheets`](Self::discovered_chart_sheets) only **after** its
+    /// parse returned; a panic mid-sweep leaves every unprocessed sheet still eligible for lazy
+    /// discovery. Marking before the parse (as this did) left sheets flagged "walked" whose charts
+    /// were never bound: [`ensure_sheet_charts_discovered`](Self::ensure_sheet_charts_discovered)
+    /// then returned early for them forever while `charts_fully_discovered` stayed `false`, so
+    /// their charts silently went missing until some later save re-ran the whole sweep.
     pub(super) fn ensure_all_charts_discovered(&mut self) {
         if self.charts_fully_discovered {
             return;
@@ -321,8 +331,24 @@ impl Worker {
             .collect();
         let mut added = false;
         for (sheet, part) in sheet_parts {
+            // Panic injection for this sweep's re-entrancy test (B1) — a chart source named
+            // `PANIC_SENTINEL` panics HERE, standing in for a zip/XML parse that blows up on
+            // hostile bytes. Placed at the parse call because that is what the loop has to be
+            // re-entrant across; `#[cfg(test)]`, like `document::PANIC_SENTINEL`'s other uses.
+            #[cfg(test)]
+            if path
+                .file_name()
+                .is_some_and(|n| n == crate::document::PANIC_SENTINEL)
+            {
+                panic!("injected test panic (save-time chart discovery sweep)");
+            }
+            let parsed = crate::chart::discover_and_parse_for_part(&path, &part);
+            // Marked only once the parse has RETURNED (either way): a panic inside it must leave
+            // this sheet re-discoverable — see the re-entrancy note on this function. A parse that
+            // failed cleanly is still marked, so the lazy path does not re-attempt (and re-log) a
+            // failure that is a property of the file.
             self.discovered_chart_sheets.insert(sheet);
-            match crate::chart::discover_and_parse_for_part(&path, &part) {
+            match parsed {
                 Ok(specs) if !specs.is_empty() => {
                     if self.bind_discovered(sheet, specs) {
                         added = true;
@@ -2267,5 +2293,79 @@ mod tests {
             title_before,
             "the chart is untouched when degraded"
         );
+    }
+
+    /// B1 (`functional_spec.md F2.2`): the save-time sweep runs INSIDE the save's `catch_unwind`
+    /// and its per-sheet `discover_and_parse_for_part` parses user-supplied zip/XML — the most
+    /// panic-prone call on the save path. A panic there must leave the unswept sheets
+    /// **re-discoverable**: before the fix the sheet was marked "walked" *before* its parse, so a
+    /// caught panic left a sheet flagged discovered whose charts were never bound —
+    /// `ensure_sheet_charts_discovered` then returned early for it forever (while
+    /// `charts_fully_discovered` stayed `false`), silently dropping its charts until some later
+    /// save re-ran the whole sweep.
+    #[test]
+    fn a_save_panic_mid_sweep_leaves_the_sheet_re_discoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("two_sheet.xlsx");
+        crate::chart::authoring::write_two_sheet_fixture(&good).unwrap();
+        // The same fixture under the sentinel name: the sweep panics parsing it (the stand-in for
+        // a zip/XML parse that blows up), while the identical bytes under `good` parse normally.
+        let poisoned = dir.path().join(crate::document::PANIC_SENTINEL);
+        std::fs::copy(&good, &poisoned).unwrap();
+        let data_part = crate::chart::workbook_sheet_parts(&good)
+            .unwrap()
+            .into_iter()
+            .find(|(name, _)| name == "Data")
+            .expect("the fixture's chart-carrying worksheet")
+            .1;
+
+        // A worker that still has charts to discover — the state a freshly opened `.xlsx` is in
+        // before any sheet has been painted, and the state `test_worker()` alone never reaches
+        // (a `NewWorkbook` is born `charts_fully_discovered`).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.chart_source_path = Some(poisoned);
+        worker.charts_fully_discovered = false;
+        worker.chart_sheet_parts = HashMap::from([(sheet, data_part)]);
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::Save {
+                path: dir.path().join("out.xlsx"),
+                req_id: 1,
+            }])
+        });
+
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::SaveFailed {
+                    req_id: 1,
+                    error: crate::document::SaveError::EnginePanic
+                }
+            )),
+            "the sweep's panic is caught by the save guard and reported"
+        );
+        assert!(
+            !worker.charts_fully_discovered,
+            "the sweep did not finish, so it must not claim it did"
+        );
+        assert!(
+            !worker.discovered_chart_sheets.contains(&sheet),
+            "a sheet whose parse panicked must NOT be recorded as walked"
+        );
+        assert!(
+            worker.charts.is_empty(),
+            "nothing was bound — the panic was the parse itself"
+        );
+
+        // The proof that discovery is not permanently disabled: with the same workbook parsing
+        // normally, the lazy per-sheet path still walks this sheet and binds its chart.
+        worker.chart_source_path = Some(good);
+        worker.ensure_sheet_charts_discovered(sheet);
+        assert!(
+            !worker.charts.is_empty(),
+            "lazy discovery still reaches the sheet after a caught save panic"
+        );
+        assert!(worker.discovered_chart_sheets.contains(&sheet));
     }
 }

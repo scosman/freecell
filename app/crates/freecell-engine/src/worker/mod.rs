@@ -23,7 +23,7 @@ pub mod protocol;
 mod run;
 
 pub use charts::ChartSnapshot;
-pub use client::{DocumentClient, WorkerEventReceiver, WorkerExit, WORKER_STACK_SIZE};
+pub use client::{join_worker, DocumentClient, WorkerEventReceiver, WorkerExit, WORKER_STACK_SIZE};
 pub use freecell_chart_model::{ChartId, ChartInsertKind};
 pub use protocol::{
     BorderLine, BorderPreset, ChartAxisKind, ChartChromeEdit, Command, DataLabelToggles,

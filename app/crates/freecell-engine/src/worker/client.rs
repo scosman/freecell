@@ -77,8 +77,24 @@ pub enum WorkerExit {
     Clean,
     /// The thread unwound out of `load_and_run` — a panic no guard caught.
     Panicked,
-    /// The thread has not finished yet, so nothing was joined.
+    /// The thread has not finished yet, so nothing was joined. Expected right after the event
+    /// stream closes: the stream closes when the thread's frame drops `event_tx`, which happens
+    /// *before* the thread finishes unwinding the rest of the `Worker` (the `UserModel`, the
+    /// caches, the chart bindings) and marks itself finished — so a UI-thread probe at that moment
+    /// usually lands here. The caller joins off the UI thread
+    /// ([`take_worker_handle`](DocumentClient::take_worker_handle) + [`join_worker`]) to learn the
+    /// real outcome.
     Running,
+}
+
+/// Joins a worker thread taken with [`DocumentClient::take_worker_handle`] and reports how it
+/// ended. **Blocks** until the thread has finished unwinding, so it must not be called on the UI
+/// thread — that is the whole reason the handle is handed out rather than joined in place.
+pub fn join_worker(handle: JoinHandle<()>) -> WorkerExit {
+    match handle.join() {
+        Ok(()) => WorkerExit::Clean,
+        Err(_) => WorkerExit::Panicked,
+    }
 }
 
 /// The window's handle to its worker: send commands, read the latest published snapshot,
@@ -98,6 +114,12 @@ pub struct DocumentClient {
     /// check the flag rather than assume, or an orderly shutdown added later would pop a false
     /// alarm on every window close.
     shutdown_requested: AtomicBool,
+    /// Whether this client was built over a real worker thread at all. `false` only for the
+    /// worker-less [`detached`](Self::detached) test client, whose event stream is closed from
+    /// birth. Kept **separate** from [`shutdown_requested`](Self::shutdown_requested): that flag
+    /// answers "did we ask the worker to stop", and having the worker-less constructor store
+    /// `true` into it (as it briefly did) was a lie the moment anything else consulted it.
+    has_worker: bool,
 }
 
 impl DocumentClient {
@@ -125,6 +147,7 @@ impl DocumentClient {
                 shared,
                 join: Mutex::new(Some(join)),
                 shutdown_requested: AtomicBool::new(false),
+                has_worker: true,
             },
             WorkerEventReceiver { rx: event_rx },
         )
@@ -145,12 +168,14 @@ impl DocumentClient {
                 tx,
                 shared,
                 join: Mutex::new(None),
-                // Born "already shut down": this client has no worker at all, so its immediately
-                // closed event stream is expected rather than a death (B1,
-                // `functional_spec.md F2.3`). Without this every detached-client window test would
-                // trip the worker-lost dialog on its first frame. A test that WANTS to exercise
-                // that path uses [`detached_live`](Self::detached_live).
-                shutdown_requested: AtomicBool::new(true),
+                shutdown_requested: AtomicBool::new(false),
+                // This client has no worker at all, so its immediately closed event stream is
+                // expected rather than a death (B1, `functional_spec.md F2.3`) — without this every
+                // detached-client window test would trip the worker-lost dialog on its first frame.
+                // It is recorded HERE rather than as a fake "we asked for a shutdown", so the two
+                // questions stay separable. A test that WANTS to exercise the worker-lost path uses
+                // [`detached_live`](Self::detached_live), which does have `has_worker: true`.
+                has_worker: false,
             },
             WorkerEventReceiver { rx: event_rx },
         )
@@ -159,8 +184,8 @@ impl DocumentClient {
     /// A worker-less client whose event stream stays **open**, plus the sender that feeds it — so
     /// a test can inject `WorkerEvent`s and, by dropping the sender, simulate the worker thread
     /// dying without a requested shutdown (B1, `functional_spec.md F2.3`). Unlike
-    /// [`detached`](Self::detached) this client has *not* requested shutdown, so a stream close is
-    /// fatal exactly as it would be in production.
+    /// [`detached`](Self::detached) this client claims a worker (`has_worker: true`) and has not
+    /// requested shutdown, so a stream close is fatal exactly as it would be in production.
     #[cfg(feature = "test-support")]
     pub fn detached_live() -> (
         DocumentClient,
@@ -176,6 +201,7 @@ impl DocumentClient {
                 shared,
                 join: Mutex::new(None),
                 shutdown_requested: AtomicBool::new(false),
+                has_worker: true,
             },
             WorkerEventReceiver { rx: event_rx },
             event_tx,
@@ -197,12 +223,23 @@ impl DocumentClient {
         self.shutdown_requested.load(Ordering::Acquire)
     }
 
-    /// How the worker thread ended. Only meaningful once the event stream has closed — the sender
-    /// is dropped as the thread leaves `load_and_run`, so by then the join returns immediately.
+    /// Whether this client was built over a real worker thread. `false` only for the worker-less
+    /// [`detached`](Self::detached) test client — whose event stream is closed from birth, so the
+    /// window must not read that close as a death.
+    pub fn has_worker(&self) -> bool {
+        self.has_worker
+    }
+
+    /// How the worker thread ended, **without ever blocking** — this is called from the UI thread.
     ///
-    /// Called from the **UI thread**, so it never parks: a thread somehow still running reports
-    /// [`WorkerExit::Running`] without joining. The handle is taken on the first call; later calls
-    /// report `Clean` (there is nothing left to join).
+    /// A thread that has not finished reports [`WorkerExit::Running`] and keeps its handle. That is
+    /// the *common* answer right after the event stream closes, not a rare one: the stream closes
+    /// when the thread's frame drops `event_tx`, and the thread then still has to unwind the whole
+    /// `Worker` before it is finished. Callers that want the real outcome take the handle
+    /// ([`take_worker_handle`](Self::take_worker_handle)) and [`join_worker`] it off the UI thread.
+    ///
+    /// The handle is consumed once the thread has finished; later calls report `Clean` (there is
+    /// nothing left to join).
     pub fn worker_exit(&self) -> WorkerExit {
         let mut guard = self.join.lock();
         match guard.take() {
@@ -211,11 +248,17 @@ impl DocumentClient {
                 *guard = Some(handle);
                 WorkerExit::Running
             }
-            Some(handle) => match handle.join() {
-                Ok(()) => WorkerExit::Clean,
-                Err(_) => WorkerExit::Panicked,
-            },
+            Some(handle) => join_worker(handle),
         }
+    }
+
+    /// Takes the retained join handle so the caller can [`join_worker`] it **off** the UI thread.
+    /// `None` once it has been taken (or for the worker-less test clients). Used by the window when
+    /// [`worker_exit`](Self::worker_exit) answers [`WorkerExit::Running`]: the thread is by
+    /// construction already on its way out (its event sender is dropped), so the join lands
+    /// promptly — but it is still a park, and the UI thread must not take it.
+    pub fn take_worker_handle(&self) -> Option<JoinHandle<()>> {
+        self.join.lock().take()
     }
 
     /// The latest published viewport snapshot — a wait-free `arc_swap` load (the render loop's
@@ -347,6 +390,7 @@ mod tests {
     fn shutdown_requested_tracks_only_the_shutdown_command() {
         let (client, _rx) = DocumentClient::spawn(DocumentSource::NewWorkbook);
         assert!(!client.shutdown_requested(), "a fresh client has not asked");
+        assert!(client.has_worker(), "a spawned client has a worker thread");
         client.send(Command::SetViewport {
             sheet: SheetId(0),
             rows: 0..8,
@@ -374,6 +418,96 @@ mod tests {
         assert_eq!(client.worker_exit(), WorkerExit::Clean);
     }
 
+    /// Waits (bounded) for `handle` to finish, so a `worker_exit` assertion about a *finished*
+    /// thread isn't racing the thread's own unwind.
+    fn wait_finished(handle: &JoinHandle<()>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.is_finished(), "the thread did not finish in 10s");
+    }
+
+    fn client_over(join: Option<JoinHandle<()>>) -> DocumentClient {
+        let (tx, _rx) = mpsc::channel();
+        DocumentClient {
+            tx,
+            shared: Arc::new(Shared::new(SheetId(0))),
+            join: Mutex::new(join),
+            shutdown_requested: AtomicBool::new(false),
+            has_worker: true,
+        }
+    }
+
+    /// B1 (`functional_spec.md F2.3`): the `Err(_) => Panicked` arm — the one this type exists for
+    /// — was never asserted before. Every panic site inside `load_and_run` is guarded today, so
+    /// the reachable route to it is a *future* unguarded region; a thread that unwinds stands in
+    /// for exactly that, and exercises the same join.
+    #[test]
+    fn worker_exit_reports_a_thread_that_unwound() {
+        let handle = std::thread::spawn(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let r = std::panic::catch_unwind(|| panic!("stand-in for an unguarded worker panic"));
+            std::panic::set_hook(prev);
+            // Re-raise outside the hook swap so the thread really unwinds out of its entry point.
+            std::panic::resume_unwind(r.unwrap_err());
+        });
+        wait_finished(&handle);
+        let client = client_over(Some(handle));
+        assert_eq!(client.worker_exit(), WorkerExit::Panicked);
+    }
+
+    /// A thread that has not finished reports `Running` **and keeps its handle**, so the caller can
+    /// take it and join off the UI thread. This is the normal answer at the moment the event stream
+    /// closes (the sender drops before the thread finishes unwinding), which is why `Running` must
+    /// not be a dead end.
+    #[test]
+    fn a_running_worker_reports_running_and_stays_joinable() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let client = client_over(Some(handle));
+
+        assert_eq!(
+            client.worker_exit(),
+            WorkerExit::Running,
+            "a thread still running is reported, not waited on"
+        );
+
+        let handle = client
+            .take_worker_handle()
+            .expect("Running must not consume the handle");
+        assert!(
+            client.take_worker_handle().is_none(),
+            "the handle is taken exactly once"
+        );
+        let _ = release_tx.send(());
+        assert_eq!(
+            join_worker(handle),
+            WorkerExit::Clean,
+            "joining off the UI thread reports the real outcome"
+        );
+    }
+
+    /// The worker-less test client has no thread, and says so **without** claiming a shutdown was
+    /// requested — the two questions the window asks are separate flags. Gated on `test-support`
+    /// with the constructors it asserts about (`cargo test --all-features`).
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn the_worker_less_client_reports_no_worker_rather_than_a_shutdown() {
+        let (client, _rx) = DocumentClient::detached();
+        assert!(!client.has_worker());
+        assert!(!client.shutdown_requested());
+        let (client, _rx, _tx) = DocumentClient::detached_live();
+        assert!(
+            client.has_worker(),
+            "detached_live simulates a real worker, so its stream close is fatal"
+        );
+        assert!(!client.shutdown_requested());
+    }
+
     #[test]
     fn cond_fmt_rules_reads_published_map() {
         // A `DocumentClient` reads the CF rules the worker published into `Shared::cond_fmt`.
@@ -388,6 +522,7 @@ mod tests {
             shared,
             join: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
+            has_worker: true,
         };
 
         let rules = client.cond_fmt_rules(SheetId(7));

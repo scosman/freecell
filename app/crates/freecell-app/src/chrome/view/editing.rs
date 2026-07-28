@@ -1,14 +1,39 @@
 //! Editing: the data row (formula bar) and the in-cell editor as one surface
 //! (`components/edit_controller.md`, `functional_spec.md §5`). Covers the pending edit — typed
-//! entry, quick-edit mode, commit/cancel, Tab, and the cross-editor mirror — plus function
-//! autocomplete and signature hints, the reducer/effect plumbing behind the content field, and
-//! the data row, cap-error, autocomplete and signature-hint rendering.
+//! entry, quick-edit mode, commit/cancel, Tab, and the cross-editor mirror — function
+//! autocomplete and signature hints, **formula point mode and reference highlighting**
+//! (`insert_reference`, `recompute_formula_edit_state`), the reducer/effect plumbing behind the
+//! content field, and the data row, cap-error, autocomplete and signature-hint rendering.
+//!
+//! The worker replies this domain depends on — `CellContent` above all — are routed by
+//! [`super::shell`]'s `on_worker_event`, which was deliberately left behind in the middle of
+//! this module's source range because it fans out to every domain, not just this one.
 //!
 //! The reducer itself is [`freecell_core::data_row::DataRow`] and the cross-editor sync is
 //! [`crate::chrome::EditController`]; this module is the GPUI plumbing over both. Moved
 //! verbatim out of the single-file `chrome/view.rs` (`specs/projects/chrome-view-split`).
 
 use super::*;
+
+use gpui_component::input::Position;
+
+use freecell_core::data_row::DataRowEffect;
+use freecell_core::eval_indicator::EvalEffect;
+use freecell_core::functions;
+use freecell_core::selection::Motion;
+
+use crate::chrome::{AutocompleteDisplay, AutocompleteRow};
+use crate::grid::caret_intent_modifiers;
+
+/// The formula-bar content entry's height: [`DATA_ROW_H`] minus 2 px breathing room above **and**
+/// below (BUG C), so the row's `items_center` insets the entry within the bar without changing the
+/// bar height. gpui-component's single-line `Input` otherwise renders at its fixed control height
+/// (`Size::Medium` → 32 px) and fills the row edge-to-edge, which reads as cramped.
+const DATA_ROW_FIELD_H: f32 = DATA_ROW_H - 4.0;
+const REF_BOX_W: f32 = 72.0;
+/// The content field's left edge inside the data row = padding + ref box + gap + divider +
+/// gap (`render_data_row` layout); the cap-error popover anchors here.
+const DATA_ROW_CONTENT_LEFT: f32 = 8.0 + REF_BOX_W + 8.0 + 1.0 + 8.0;
 
 impl ChromeView {
     /// The grid asks the field to commit a pending edit before a click-away selection change

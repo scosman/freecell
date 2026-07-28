@@ -49,22 +49,19 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::color_picker::ColorPickerState;
-use gpui_component::input::{Input, InputEvent, InputState, Position};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::spinner::Spinner;
 use gpui_component::{Disableable as _, Icon, Selectable as _, Sizable as _};
 
-use freecell_core::data_row::{DataRow, DataRowEffect, DataRowEvent, FieldMode};
-use freecell_core::eval_indicator::{EvalEffect, EvalEvent, EvalIndicator};
-use freecell_core::functions;
+use freecell_core::data_row::{DataRow, DataRowEvent, FieldMode};
+use freecell_core::eval_indicator::{EvalEvent, EvalIndicator};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::palette::FILL_PALETTE;
-use freecell_core::selection::{Direction, Motion};
+use freecell_core::selection::Direction;
 use freecell_core::{
     Align, CellKind, CellRange, CellRef, CfPreview, CfRuleView, RenderStyle, Rgb, SelectionModel,
     SelectionStats, SheetId, VAlign,
 };
-
-use crate::grid::caret_intent_modifiers;
 
 use freecell_chart_model::ChartId;
 
@@ -76,8 +73,7 @@ use super::cond_fmt::CondFmtPanel;
 use super::h_scroller::{h_scroller, HScroller};
 use super::sidebar::{docked_sidebar, section};
 use super::{
-    AutocompleteDisplay, AutocompleteRow, ChromeClient, ChromeGridRequest, ChromeGridSink,
-    EditController, EditOrigin, SheetTab,
+    ChromeClient, ChromeGridRequest, ChromeGridSink, EditController, EditOrigin, SheetTab,
 };
 
 /// The 250 ms no-flash delay for both the content-fetch and evaluating spinners
@@ -146,16 +142,7 @@ impl Anchor {
 // `DATA_ROW_H` / `TAB_BAR_H` are `pub(crate)` so the shared docked-sidebar container
 // (`chrome::sidebar`) can dock the card between the data row and the tab bar.
 pub(crate) const DATA_ROW_H: f32 = 32.0;
-/// The formula-bar content entry's height: [`DATA_ROW_H`] minus 2 px breathing room above **and**
-/// below (BUG C), so the row's `items_center` insets the entry within the bar without changing the
-/// bar height. gpui-component's single-line `Input` otherwise renders at its fixed control height
-/// (`Size::Medium` → 32 px) and fills the row edge-to-edge, which reads as cramped.
-const DATA_ROW_FIELD_H: f32 = DATA_ROW_H - 4.0;
 pub(crate) const TAB_BAR_H: f32 = 30.0;
-const REF_BOX_W: f32 = 72.0;
-/// The content field's left edge inside the data row = padding + ref box + gap + divider +
-/// gap (`render_data_row` layout); the cap-error popover anchors here.
-const DATA_ROW_CONTENT_LEFT: f32 = 8.0 + REF_BOX_W + 8.0 + 1.0 + 8.0;
 
 /// The chrome around the grid: action row + data row + sheet tab bar.
 pub struct ChromeView {

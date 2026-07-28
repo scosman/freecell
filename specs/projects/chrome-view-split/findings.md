@@ -169,11 +169,11 @@ Mild.
 | 4 | `AnchorCell`, `ChartAnchor`, `ChartAxisKind`, `ChartChromeEdit`, `DataLabelToggles`, `LegendPosition`, `limits` → `charts.rs` |
 | 5 | `Checkbox`, `CfColorStop`, `CfFormat`, `CfPeriod`, `CfRuleSpec`, `CfTextOp`, `CfThresholdKind`, `CfValueOp`, `CfEditorKind`, `CfEditorState` → `cf_editor.rs` |
 | 6 | `BASIC_FORMATS`, `Category`, `ColorPicker`, `ColorPickerEvent`, `Hsla`, `NUM_FMT_GROUPS`, `StylePath`, `adjust_decimals_cell`, `displayed_decimals`, `effective_range`, `font_size_display`, `is_more_only_num_fmt`, `num_fmt_category`, `region_at`, `regions_intersecting`, `toggle_thousands` → `formatting.rs` |
+| 7 | `AutocompleteDisplay`, `AutocompleteRow`, `DataRowEffect`, `EvalEffect`, `Motion`, `Position`, `caret_intent_modifiers`, `functions` → `editing.rs` |
 
-That leaves **10**, created by phases 7–8: 8 to `editing.rs` (P7) and 2 to `shell.rs` (P8)
-(`EditRejectedReason`, `Focusable`). Every other child is now clear. Landing them
-all in one commit labelled for an earlier phase would destroy exactly the per-phase attribution
-§4.1 exists to protect.
+That leaves **2**, both `shell.rs`'s (`EditRejectedReason`, `Focusable`), for the phase-8 review.
+Every other child is now clear. Clearing them per phase rather than in one sweep keeps the
+per-phase attribution §4.1 exists to protect.
 
 Two things for whoever closes it out: apply the predicate as *two* parts (zero uses in
 `mod.rs`'s own body **and** exactly one child consumer — a name `mod.rs` itself uses stays
@@ -254,18 +254,42 @@ matters if you are using this as a checklist:
 Not a defect in any case, but §4 rule 2 should be read as "within each block", and a reviewer
 diffing ranges should expect at most one seam and know which kind to expect where.
 
-## 6d1. One banner could not follow its section, because the section was split four ways
+## 6d1. Five production banner sections lost the item-to-header relationship rule 3 promises
 
-`architecture.md` §4 rule 3 promises the `// ----` banners become the new files' section
-headers, and they do — except for `// ---- Read accessors (tests + render)`. That block was
-grouped by *shape* rather than domain, so its 33 accessors were distributed across four files
-(§7.2): `formatting.rs` 19, `editing.rs` 7, `tabs.rs` 6, `shell.rs` 1. The banner stayed with the
-remainder and is in `shell.rs`; the 19 that went to `formatting.rs` therefore arrive with no
-header, running straight on from `on_border_color_picker_event`.
+`architecture.md` §4 rule 3 says the `// ----` banners move with their sections and become the
+new files' section headers — the evidence that a section arrived intact. That works whenever a
+section had one destination. Five production sections did not:
 
-Noted so a reviewer doesn't read the missing banner as a lost section. It is the one place the
-"banners are the evidence a section arrived intact" rule cannot apply, because there was no
-single destination for it to arrive at.
+| Section (baseline banner line) | Items went to | Banner ended up |
+|---|---|---|
+| `Read accessors (tests + render)` (3726) | `formatting.rs` 19, `editing.rs` 7, `tabs.rs` 6, `shell.rs` 1 | `shell.rs:189` |
+| `Selection + data-row plumbing` (773) | `shell.rs` 1, `stats.rs` 5, `editing.rs` 3 | **nowhere** — see below |
+| `Action row: SetBorders` (3207) | `formatting.rs` 13, plus `set_degraded` → `shell.rs` | `formatting.rs:501` |
+| `Function autocomplete + signature hints` (1375) | `editing.rs` 20, plus `on_worker_event` → `shell.rs` | `editing.rs:499` |
+| `Conditional-formatting sidebar (P4)` (2294) | `cf_editor.rs` 32, `cf_sidebar.rs` 10, `charts.rs` 2 | `cf_sidebar.rs:143` |
+
+Row 5 is the one where the banner's extent overshot the *planned* cut: §7.3 divides CF between
+the sidebar and the editor, but the section also swept up `set_chart_type_from_panel` and
+`apply_chart_range_from_selection`, which §7.1 sends to `charts.rs` — a third destination §7.3
+never contemplated.
+
+Three **test** sections split too, each donating one or two shared fixtures to `test_support.rs`
+(§1 covers them): `Selection stats` (8615), `CF rules list` (9922), `Sheet tab bar` (14129).
+
+Two consequences worth knowing before diffing ranges:
+
+- **`editing.rs`, `stats.rs` and `shell.rs` all open with header-less preludes.** Items that
+  arrived from a split section have no banner above them; in `formatting.rs` that is 19
+  accessors running straight on from `on_border_color_picker_event`.
+- **`set_degraded` now sits under the wrong banner.** It landed in `shell.rs:194`, beneath
+  `Read accessors`, while its own `SetBorders` banner went to `formatting.rs`. It is in the
+  right *module* (§3, §6c); it is under the wrong *heading*.
+
+**And one banner survives as a header for nothing.** `// ---- Selection + data-row plumbing` is
+still at `mod.rs:564`, immediately followed by the `impl` block's closing brace — P8 took
+`on_selection_changed` out from under it and left the header behind. A dangling section header
+is exactly the artifact rule 3 exists to prevent, and it is `mod.rs` residue, so it belongs to
+the phase-8 review.
 
 ## 6e. One deliberate exception to "body bytes are identical"
 
@@ -299,6 +323,20 @@ Worth naming because this is the one class of edit that defeats machine verifica
 normalised byte-comparison that strips comments, a reworded comment is invisible; to one that
 doesn't, it is indistinguishable from a deliberate change. The check that caught both was a
 comment-set diff against the pre-split file — worth running once per phase in any future split.
+
+## 6g. One test is filed under the wrong domain, by the plan rather than by accident
+
+`multiselect_disables_field` lives in `shell.rs` (`:1087`), among the horizontal-scroller cases.
+It asserts `data_mode()`, `content_text()` and `ref_box_text()` — three accessors that are now
+`editing.rs`'s — and touches nothing about the scroller. It is there because it was the last
+test under the `// ---- Horizontal scroller` banner in the old file, so `architecture.md` §7.4's
+range mapping sent it to `shell.rs`, and the phase followed the mapping correctly.
+
+Left where it is: moving a test across modules on a domain judgement is not a pure move, and
+this project's whole premise is that it doesn't make those. Recorded because it is the sharpest
+concrete instance of §1's thesis — "the tests under this banner" was never a real boundary —
+and because a future reader looking for the multiselect-disable behaviour will not find its
+test next to the code.
 
 ## 7. Three test leaf names are duplicated crate-wide
 

@@ -685,6 +685,52 @@ F3a · G1 · G5(dLbls) · H1 · H3.
 
 ---
 
+## Rollout — how to invoke this
+
+The 17 v0.5 units are grouped into **five projects, invoked in two waves.** Grouping is by
+*file ownership*, not by theme: the three Wave 1 projects touch disjoint sets of files, so
+they can run as parallel agents without merge conflicts.
+
+Each project has a **complete `project_overview.md` already written** (`status: complete`),
+so an agent should go straight to functional spec → architecture → implementation plan →
+implement, without re-asking what the project is.
+
+### Wave 1 — three parallel agents, then merge all three
+
+| Project | Units | Owns these files |
+|---|---|---|
+| [`v05-cleanup-1`](../specs/projects/v05-cleanup-1/project_overview.md) | A1, A2, A4, C1, D1, F3a, G1, G5 | `Cargo.toml`, workflows, `deny.toml`, docs, `engine/tests/`, `engine/chart/`, `chart-model/` |
+| [`chrome-view-split`](../specs/projects/chrome-view-split/project_overview.md) | F1 (app half) | `app/src/chrome/view.rs` → `chrome/view/` |
+| [`engine-worker-hardening`](../specs/projects/engine-worker-hardening/project_overview.md) | B2, B1, F1 (engine half), E1 | `engine/src/worker/*`, `core/publication.rs`, `app/src/shell/window.rs` |
+
+**Why these three don't collide:** cleanup-1 deliberately excludes `worker/run.rs` and
+`chrome/view.rs`; the two structural projects each own exactly one of them. B1/B2 live with
+E1 rather than in cleanup-1 for this reason — all three edit `run.rs`.
+
+**Merge all three before starting Wave 2.** Wave 2 measures against the post-split file sizes
+and the new tests.
+
+### Wave 2 — two parallel agents
+
+| Project | Units | Needs from Wave 1 |
+|---|---|---|
+| [`v05-cleanup-2`](../specs/projects/v05-cleanup-2/project_overview.md) | C2, D2, F2, H3 | C1 (C2 must not regress it), D1 (D2 tightens it), both splits (F2's ceiling) |
+| [`invariant-enforcement`](../specs/projects/invariant-enforcement/project_overview.md) | H1 | B2 as the worked example; the splits, so the sweep isn't wasted |
+
+These two overlap only in `CLAUDE.md`: H3 writes the *rule*, H1 does the *sweep*. Whichever
+lands second cites the first — noted in both overviews.
+
+### After v0.5
+
+The v1.0 units — C3, C4, D4, D5, E2, F3, G2, G3 — are **deliberately not specced yet.**
+Several will change shape based on what Wave 1 finds: C1's part inventory determines C3's real
+scope, F3a may shrink or dissolve F3, and G3 depends on what G1 exposes about the parser. Spec
+them once v0.5 has landed and the facts are in.
+
+Later still: B4 and F4 (v2.0), G1b (v2.0), B3 (v3+).
+
+---
+
 ## Decisions log
 
 Open questions raised during owner review, and how they were settled.

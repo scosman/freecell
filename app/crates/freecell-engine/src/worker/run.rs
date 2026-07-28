@@ -722,12 +722,13 @@ impl Worker {
             // statement is `ensure_all_charts_discovered`, which binds charts, bumps
             // `chart_version` and commits. So a caught panic can leave the worker with *some* of
             // this save's chart discovery applied. That state is deliberately made re-entrant
-            // rather than assumed away: the sweep marks a sheet discovered only after its parse +
-            // bind returned (see `charts.rs`), so what survives a panic is a prefix of correctly
-            // bound sheets plus `charts_fully_discovered == false` — a partially-swept worker,
-            // which the next save (or a lazy per-sheet discovery) completes. The late mutations
-            // (`chart_source_path`, `loaded_anchor_edits`, `loaded_deletes`) are the last
-            // statements before `Ok`, after every fallible step, so those cannot be half-applied.
+            // rather than assumed away: the sweep walks sheets in `SheetId` order and marks each
+            // discovered only after BOTH its parse and its bind have returned (see `charts.rs`),
+            // so what survives a panic is a deterministic prefix of fully bound sheets plus
+            // `charts_fully_discovered == false` — a partially-swept worker, which the next save
+            // (or a lazy per-sheet discovery) completes. The late mutations (`chart_source_path`,
+            // `loaded_anchor_edits`, `loaded_deletes`) are the last statements before `Ok`, after
+            // every fallible step, so those cannot be half-applied.
             let outcome = catch_unwind(AssertUnwindSafe(|| self.save_workbook(&path)));
             match outcome {
                 Ok(Ok(())) => self.emit(WorkerEvent::Saved {

@@ -6507,6 +6507,14 @@ impl GridView {
         self.quick_edit
     }
 
+    /// Test seam: whether the file-open loading overlay is up. This is the half a user actually
+    /// sees spinning — the window's own `loading` flag drives the title/state, this drives the
+    /// paint — so the lifecycle tests that assert an overlay was cleared assert on this too.
+    #[cfg(test)]
+    pub(crate) fn is_loading_for_test(&self) -> bool {
+        self.loading.is_some()
+    }
+
     /// Test seam: the grid's stored reference highlights (proves
     /// [`set_edit_state`](Self::set_edit_state) threads `ref_highlights`, which the overlay pass
     /// paints — `formula-point-mode/architecture.md §4.1`).

@@ -709,6 +709,17 @@ impl FreeCellApp {
             .map(|w| w.handle)
     }
 
+    /// The in-progress quit plan, as `(pending prompt count, aborted)` — `None` when no quit is
+    /// running (tests). A plan that is neither gone nor aborted is a quit still waiting on a
+    /// window's prompt, which is exactly the state a lost worker must not be able to leave behind.
+    #[cfg(test)]
+    pub(crate) fn quit_plan_for_test(cx: &App) -> Option<(usize, bool)> {
+        cx.global::<FreeCellApp>()
+            .quit_plan
+            .as_ref()
+            .map(|plan| (plan.pending_count(), plan.aborted()))
+    }
+
     /// The stored recent-files paths, most-recent-first (tests).
     #[cfg(test)]
     pub(crate) fn recents_paths(cx: &App) -> Vec<PathBuf> {
@@ -1498,14 +1509,25 @@ mod tests {
         // window constructs with loading = None, which would make it vacuous).
         handle
             .update(cx, |_root, _window, appcx| {
-                entity.update(appcx, |w, _ctx| {
+                entity.update(appcx, |w, ctx| {
                     w.set_loading_for_test(Some("Budget.xlsx".into()));
+                    // The overlay half too — that is what actually paints the spinner.
+                    w.grid_for_test()
+                        .update(ctx, |g, ctx| g.set_loading(Some("Budget.xlsx".into()), ctx));
                 });
             })
             .unwrap();
         assert!(
             cx.update(|cx| entity.read(cx).is_loading()),
             "precondition: the window is loading before the failure"
+        );
+        assert!(
+            cx.update(|cx| entity
+                .read(cx)
+                .grid_for_test()
+                .read(cx)
+                .is_loading_for_test()),
+            "precondition: the grid overlay is up before the failure"
         );
 
         handle
@@ -1534,6 +1556,14 @@ mod tests {
         assert!(
             !cx.update(|cx| entity.read(cx).is_loading()),
             "the loading state is cleared on load failure"
+        );
+        assert!(
+            !cx.update(|cx| entity
+                .read(cx)
+                .grid_for_test()
+                .read(cx)
+                .is_loading_for_test()),
+            "including the grid overlay, which would otherwise spin behind the dialog"
         );
     }
 

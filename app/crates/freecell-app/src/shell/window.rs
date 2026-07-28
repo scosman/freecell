@@ -416,6 +416,11 @@ impl WorkbookWindow {
         self.worker_lost = true;
         self.degraded = Some("the calculation engine stopped".to_string());
         self.chrome.update(cx, |c, cx| c.set_degraded(true, cx));
+        // Everything that was waiting on a worker reply is abandoned HERE, unconditionally. The
+        // refusals on `save` / `send_save` / `export_csv` only guard the *entry* to a new request;
+        // they cannot help a request that was already in flight when the worker died — which is the
+        // premise of B1, since the unguarded panic that kills the worker can happen mid-save.
+        self.abandon_work_waiting_on_the_worker(cx);
         // A worker that dies before `Loaded` leaves the "Opening X…" overlay up — everything after
         // the guarded `from_source` (`sheet_metas`, the cache build, the CF publish) runs on
         // freshly parsed input and is still unguarded. Clear it as the `Loaded` and `LoadFailed`
@@ -1153,10 +1158,7 @@ impl WorkbookWindow {
     /// `SaveFailed` does — otherwise an in-progress Quit would park its plan on a window whose
     /// save can never resolve), and the same notice the worker-lost report shows explains why.
     fn refuse_save_worker_lost(&mut self, cx: &mut Context<Self>) {
-        self.close_after_save = false;
-        self.pending_save_req = None;
-        self.pending_save_path = None;
-        FreeCellApp::note_prompt_cancelled(cx);
+        self.abandon_work_waiting_on_the_worker(cx);
         self.show_worker_lost_notice(
             "This workbook can't be saved from this window any more. Open the file again to keep \
              working.",
@@ -1164,8 +1166,45 @@ impl WorkbookWindow {
         );
     }
 
-    /// The OK-only notice explaining that an action was refused because the worker is gone.
+    /// Drops every piece of window state that is waiting for a reply the worker can no longer
+    /// send, and stands down any quit that is waiting on *this* window
+    /// (`functional_spec.md F2.3`).
+    ///
+    /// The close/quit follow-up is the load-bearing part. `close_after_save` fires only from the
+    /// `Saved` arm and `pending_save_req` is only ever cleared by `Saved`/`SaveFailed`, so with the
+    /// worker gone both would stay armed forever: the window would never close and
+    /// `advance_quit` would sit on a prompt that can never resolve. `note_prompt_cancelled` aborts
+    /// the **whole** quit, not just this window's step — the same choice
+    /// [`abort_save_with_backup_error`](Self::abort_save_with_backup_error) and the `SaveFailed`
+    /// arm already make, and the honest one: the user asked to quit *with* this document's changes
+    /// handled, and that is no longer possible. It is a no-op when no quit is running.
+    ///
+    /// [`abort_save_with_backup_error`]: Self::abort_save_with_backup_error
+    fn abandon_work_waiting_on_the_worker(&mut self, cx: &mut Context<Self>) {
+        self.close_after_save = false;
+        self.pending_save_req = None;
+        self.pending_save_path = None;
+        // Not load-bearing (an export gates nothing), but no reply is coming for it either.
+        self.pending_export_req = None;
+        FreeCellApp::note_prompt_cancelled(cx);
+    }
+
+    /// The OK-only notice explaining that an action was refused because the worker is gone. A
+    /// **terminal** report already showing (the load failure, which closes the window on dismiss)
+    /// is not replaced — same rule as `on_worker_lost`, and reachable the same way: a window whose
+    /// load failed is showing that dialog and is also worker-lost, so a ⌘S (which routes to `save`
+    /// whatever modal is up) would otherwise swap it for a non-terminal notice and the window would
+    /// stop closing on dismiss.
     fn show_worker_lost_notice(&mut self, detail: &str, cx: &mut Context<Self>) {
+        if matches!(
+            self.modal,
+            Some(ActiveModal::Error {
+                close_window_on_dismiss: true,
+                ..
+            })
+        ) {
+            return;
+        }
         self.modal = Some(ActiveModal::Error {
             title: "The calculation engine stopped".into(),
             detail: detail.into(),
@@ -1310,6 +1349,12 @@ impl WorkbookWindow {
     #[cfg(test)]
     pub(crate) fn dismiss_modal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_modal(window, cx);
+    }
+
+    /// Test seam: the unsaved-changes prompt's **Don't Save** / **Close Without Saving** button.
+    #[cfg(test)]
+    pub(crate) fn modal_dont_save_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal_dont_save(window, cx);
     }
 
     /// Test seam: fold a synthesized [`WorkerEvent`] directly, with no live-worker
@@ -2569,6 +2614,166 @@ mod tests {
         );
     }
 
+    /// Ordering (a): the worker dies while the **quit prompt** is up. Replacing the prompt with the
+    /// fatal report is not enough on its own — dismissing that report runs `dismiss_modal`, whose
+    /// quit-abort branch only fires for an `UnsavedChanges` modal, so the `QuitPlan` was left
+    /// pending on a window that will never resolve. ⌘Q then looked like it did nothing, and worse:
+    /// closing some *other* dirty window later re-prompted this one out of nowhere.
+    #[gpui::test]
+    fn worker_death_during_a_quit_prompt_stands_the_quit_down(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        let handle = cx
+            .update(|cx| FreeCellApp::nth_window_handle(cx, 0))
+            .unwrap();
+
+        cx.update(|cx| entity.update(cx, |w, cx| w.set_dirty_for_test(true, cx)));
+        cx.update(FreeCellApp::request_quit);
+        assert!(
+            cx.update(|cx| entity.read(cx).has_unsaved_modal()),
+            "the quit prompts the dirty window"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            Some((1, false))
+        );
+
+        drop(sender);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "losing the worker under a quit prompt stands the quit down — the window can no \
+             longer answer it, so the plan is abandoned rather than left pending"
+        );
+
+        // Dismissing the fatal report leaves nothing armed, and the quit stays stood down.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.dismiss_modal_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "and dismissing it does not revive the quit"
+        );
+
+        // The window is *still dirty* (losing the worker doesn't change the op accounting), so a
+        // fresh ⌘Q prompts it again — with the worker-lost variant, whose Cancel / Close Without
+        // Saving both resolve. Nothing is wedged; the quit simply has to be re-issued.
+        cx.update(FreeCellApp::request_quit);
+        assert!(
+            cx.update(|cx| entity.read(cx).is_dirty()),
+            "the document is still dirty after the loss"
+        );
+        assert!(
+            cx.update(|cx| entity.read(cx).has_unsaved_modal()),
+            "a re-issued quit still prompts this window"
+        );
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.modal_dont_save_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::window_count(cx)),
+            0,
+            "Close Without Saving closes it, which is how the re-issued quit resolves"
+        );
+    }
+
+    /// Ordering (b): a save was **already in flight** when the worker died — the unsaved-changes
+    /// Save armed `close_after_save` + `pending_save_req` and sent, and *then* an unguarded panic
+    /// took the worker down, which is the premise of B1. No `Saved`/`SaveFailed` can arrive, so
+    /// both flags stayed armed forever: the window never closed and the quit never resolved. The
+    /// entry guards on `save`/`send_save` cannot cover this; the teardown in `on_worker_lost` does.
+    #[gpui::test]
+    fn worker_death_disarms_a_save_that_was_already_in_flight(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+
+        cx.update(|cx| entity.update(cx, |w, cx| w.set_dirty_for_test(true, cx)));
+        cx.update(FreeCellApp::request_quit);
+        // What the prompt's **Save** button does: arm the close-after-save follow-up and send.
+        cx.update(|cx| {
+            entity.update(cx, |w, _| {
+                w.arm_pending_save_for_test(PathBuf::from("/never/written.xlsx"), 7, true)
+            })
+        });
+        assert!(cx.update(|cx| entity.read(cx).will_close_after_save()));
+
+        drop(sender);
+        cx.run_until_parked();
+
+        assert!(
+            !cx.update(|cx| entity.read(cx).has_pending_save_for_test()),
+            "a save that can never be answered must not stay armed"
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).will_close_after_save()),
+            "and it must not leave the window waiting to close on that answer"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "the quit that was waiting on that save is stood down rather than parked"
+        );
+    }
+
+    /// A refused save must not stomp a **terminal** report either. Reachable: the load fails (its
+    /// dialog closes the window on dismiss) and the thread then exits, so the window is also
+    /// worker-lost; ⌘S routes to `save` whatever modal is up, and the refusal notice would replace
+    /// the terminal dialog with a non-terminal one — after which dismissing no longer closes the
+    /// window. Same rule as `on_worker_lost`, applied at the other end.
+    #[gpui::test]
+    fn a_refused_save_keeps_a_terminal_load_dialog(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        let handle = cx
+            .update(|cx| FreeCellApp::nth_window_handle(cx, 0))
+            .unwrap();
+
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::LoadFailed {
+                            error: freecell_engine::LoadError::EnginePanic,
+                        },
+                        window,
+                        ctx,
+                    )
+                });
+            })
+            .unwrap();
+        drop(sender);
+        cx.run_until_parked();
+        assert!(cx.update(|cx| entity.read(cx).is_worker_lost_for_test()));
+
+        // ⌘S on the failed window.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.save(false, window, ctx));
+            })
+            .unwrap();
+
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("Couldn't open the workbook".to_string()),
+            "the terminal load-failure dialog survives a refused save"
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_closes_window_on_dismiss()),
+            Some(true),
+            "and it still closes the window on dismiss"
+        );
+    }
+
     /// The fatal report fires **once**, with no re-arm, so a modal that is not itself a terminal
     /// report must not swallow it: an unsaved-changes prompt showing when the worker dies is
     /// offering a Save that can no longer happen, and dismissing it would otherwise leave the user
@@ -2611,6 +2816,7 @@ mod tests {
             })
         });
         assert!(cx.update(|cx| entity.read(cx).is_loading()));
+        assert!(cx.update(|cx| entity.read(cx).grid.read(cx).is_loading_for_test()));
 
         drop(sender);
         cx.run_until_parked();
@@ -2618,6 +2824,10 @@ mod tests {
         assert!(
             !cx.update(|cx| entity.read(cx).is_loading()),
             "a lost worker is never going to finish opening the file"
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).grid.read(cx).is_loading_for_test()),
+            "including the overlay the user actually sees spinning"
         );
     }
 

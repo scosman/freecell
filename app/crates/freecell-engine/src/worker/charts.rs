@@ -249,6 +249,19 @@ impl Worker {
     /// (via [`chart_sheet_parts`](Self::chart_sheet_parts)), NOT its live name, so a sheet renamed
     /// before it is painted still resolves to its charts (P11 CR fix). A no-op once the sheet has been
     /// walked, once every sheet has been discovered, or for a non-file / in-session-added sheet.
+    ///
+    /// **Why this marks the sheet BEFORE parsing, unlike
+    /// [`ensure_all_charts_discovered`](Self::ensure_all_charts_discovered)** — the asymmetry is
+    /// deliberate, not an oversight:
+    /// - This path is **not** inside any `catch_unwind` (it runs from `process_batch`'s viewport
+    ///   handling), so a panic in the parse takes the worker thread down outright. There is no
+    ///   surviving worker whose bookkeeping could be torn — which is the whole hazard the save-time
+    ///   sweep's re-entrancy guards against.
+    /// - Marking up front is also what stops a *clean* parse failure being retried on every paint
+    ///   of the sheet: the failure is a property of the file, and the `Err` arm below only logs.
+    ///
+    /// So the insert doubles as this function's "walk each sheet at most once" gate. If this ever
+    /// moves inside a guard, it has to adopt the sweep's ordering.
     pub(super) fn ensure_sheet_charts_discovered(&mut self, sheet: SheetId) {
         if self.charts_fully_discovered {
             return;
@@ -309,8 +322,10 @@ impl Worker {
     /// `catch_unwind`, and its per-sheet `discover_and_parse_for_part` is a zip/XML parse of
     /// user-supplied bytes — the most panic-prone call on the save path. A sheet is therefore
     /// recorded in [`discovered_chart_sheets`](Self::discovered_chart_sheets) only **after** its
-    /// parse returned; a panic mid-sweep leaves every unprocessed sheet still eligible for lazy
-    /// discovery. Marking before the parse (as this did) left sheets flagged "walked" whose charts
+    /// parse *and* its bind have returned; a panic anywhere in either leaves that sheet, and every
+    /// sheet after it, still eligible for lazy discovery. The sweep walks sheets in `SheetId` order
+    /// so which prefix survives a panic is deterministic rather than hash order.
+    /// Marking before the parse (as this did) left sheets flagged "walked" whose charts
     /// were never bound: [`ensure_sheet_charts_discovered`](Self::ensure_sheet_charts_discovered)
     /// then returned early for them forever while `charts_fully_discovered` stayed `false`, so
     /// their charts silently went missing until some later save re-ran the whole sweep.
@@ -324,31 +339,26 @@ impl Worker {
         }
         let path = self.chart_source_path.clone().expect("checked Some above");
         // Snapshot the stable map so we don't borrow `self` while binding into `self.charts`.
-        let sheet_parts: Vec<(SheetId, String)> = self
+        let mut sheet_parts: Vec<(SheetId, String)> = self
             .chart_sheet_parts
             .iter()
             .map(|(id, part)| (*id, part.clone()))
             .collect();
+        // Sorted so a sweep cut short by a panic leaves a DETERMINISTIC prefix behind (the map's
+        // own order is hash order). Nothing else depends on the order — each sheet binds
+        // independently.
+        sheet_parts.sort_by_key(|(id, _)| id.0);
         let mut added = false;
         for (sheet, part) in sheet_parts {
-            // Panic injection for this sweep's re-entrancy test (B1) — a chart source named
+            // Panic injection for this sweep's re-entrancy test (B1) — a worksheet part named
             // `PANIC_SENTINEL` panics HERE, standing in for a zip/XML parse that blows up on
             // hostile bytes. Placed at the parse call because that is what the loop has to be
             // re-entrant across; `#[cfg(test)]`, like `document::PANIC_SENTINEL`'s other uses.
             #[cfg(test)]
-            if path
-                .file_name()
-                .is_some_and(|n| n == crate::document::PANIC_SENTINEL)
-            {
+            if part.ends_with(crate::document::PANIC_SENTINEL) {
                 panic!("injected test panic (save-time chart discovery sweep)");
             }
-            let parsed = crate::chart::discover_and_parse_for_part(&path, &part);
-            // Marked only once the parse has RETURNED (either way): a panic inside it must leave
-            // this sheet re-discoverable — see the re-entrancy note on this function. A parse that
-            // failed cleanly is still marked, so the lazy path does not re-attempt (and re-log) a
-            // failure that is a property of the file.
-            self.discovered_chart_sheets.insert(sheet);
-            match parsed {
+            match crate::chart::discover_and_parse_for_part(&path, &part) {
                 Ok(specs) if !specs.is_empty() => {
                     if self.bind_discovered(sheet, specs) {
                         added = true;
@@ -357,6 +367,11 @@ impl Worker {
                 Ok(_) => {}
                 Err(err) => tracing::warn!(%part, "chart discovery for save failed: {err:#}"),
             }
+            // Marked only once the parse AND the bind have returned: a panic in either must leave
+            // this sheet re-discoverable — see the re-entrancy note on this function. A parse that
+            // failed *cleanly* is still marked, so the lazy path does not re-attempt (and re-log) a
+            // failure that is a property of the file.
+            self.discovered_chart_sheets.insert(sheet);
         }
         self.charts_fully_discovered = true;
         if added {
@@ -2297,36 +2312,45 @@ mod tests {
 
     /// B1 (`functional_spec.md F2.2`): the save-time sweep runs INSIDE the save's `catch_unwind`
     /// and its per-sheet `discover_and_parse_for_part` parses user-supplied zip/XML — the most
-    /// panic-prone call on the save path. A panic there must leave the unswept sheets
-    /// **re-discoverable**: before the fix the sheet was marked "walked" *before* its parse, so a
-    /// caught panic left a sheet flagged discovered whose charts were never bound —
+    /// panic-prone call on the save path. A panic partway through must leave a coherent **prefix**:
+    /// the sheets already parsed and bound stay bound and marked, and the sheet that blew up (plus
+    /// any after it) stays re-discoverable. Before the fix the sheet was marked "walked" *before*
+    /// its parse, so a caught panic left a sheet flagged discovered whose charts were never bound —
     /// `ensure_sheet_charts_discovered` then returned early for it forever (while
     /// `charts_fully_discovered` stayed `false`), silently dropping its charts until some later
     /// save re-ran the whole sweep.
     #[test]
-    fn a_save_panic_mid_sweep_leaves_the_sheet_re_discoverable() {
+    fn a_save_panic_mid_sweep_keeps_the_prefix_and_leaves_the_rest_re_discoverable() {
         let dir = tempfile::tempdir().unwrap();
-        let good = dir.path().join("two_sheet.xlsx");
-        crate::chart::authoring::write_two_sheet_fixture(&good).unwrap();
-        // The same fixture under the sentinel name: the sweep panics parsing it (the stand-in for
-        // a zip/XML parse that blows up), while the identical bytes under `good` parse normally.
-        let poisoned = dir.path().join(crate::document::PANIC_SENTINEL);
-        std::fs::copy(&good, &poisoned).unwrap();
-        let data_part = crate::chart::workbook_sheet_parts(&good)
-            .unwrap()
-            .into_iter()
-            .find(|(name, _)| name == "Data")
-            .expect("the fixture's chart-carrying worksheet")
-            .1;
+        let fixture = dir.path().join("two_sheet.xlsx");
+        crate::chart::authoring::write_two_sheet_fixture(&fixture).unwrap();
+        let parts = crate::chart::workbook_sheet_parts(&fixture).unwrap();
+        let part_of = |name: &str| {
+            parts
+                .iter()
+                .find(|(n, _)| n == name)
+                .expect("fixture worksheet")
+                .1
+                .clone()
+        };
 
         // A worker that still has charts to discover — the state a freshly opened `.xlsx` is in
-        // before any sheet has been painted, and the state `test_worker()` alone never reaches
-        // (a `NewWorkbook` is born `charts_fully_discovered`).
+        // before any sheet has been painted, and one `test_worker()` alone never reaches (a
+        // `NewWorkbook` is born `charts_fully_discovered`). Two sheets: the first parses normally,
+        // the second's part is the sentinel that panics at the parse. The sweep runs in `SheetId`
+        // order, so "first" and "second" are not hash order.
         let (mut worker, rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.chart_source_path = Some(poisoned);
+        let good = sheet0(&worker);
+        let poisoned = SheetId(good.0 + 1);
+        worker.chart_source_path = Some(fixture.clone());
         worker.charts_fully_discovered = false;
-        worker.chart_sheet_parts = HashMap::from([(sheet, data_part)]);
+        worker.chart_sheet_parts = HashMap::from([
+            (good, part_of("Data")),
+            (
+                poisoned,
+                format!("xl/worksheets/{}", crate::document::PANIC_SENTINEL),
+            ),
+        ]);
 
         quiet_panics(|| {
             worker.process_batch(vec![Command::Save {
@@ -2349,23 +2373,33 @@ mod tests {
             !worker.charts_fully_discovered,
             "the sweep did not finish, so it must not claim it did"
         );
-        assert!(
-            !worker.discovered_chart_sheets.contains(&sheet),
-            "a sheet whose parse panicked must NOT be recorded as walked"
-        );
-        assert!(
-            worker.charts.is_empty(),
-            "nothing was bound — the panic was the parse itself"
-        );
 
-        // The proof that discovery is not permanently disabled: with the same workbook parsing
-        // normally, the lazy per-sheet path still walks this sheet and binds its chart.
-        worker.chart_source_path = Some(good);
-        worker.ensure_sheet_charts_discovered(sheet);
+        // The prefix survived: the sheet processed before the panic is bound AND marked.
+        assert!(
+            worker.discovered_chart_sheets.contains(&good),
+            "a sheet parsed + bound before the panic stays marked"
+        );
         assert!(
             !worker.charts.is_empty(),
-            "lazy discovery still reaches the sheet after a caught save panic"
+            "and its chart really is bound — the prefix is not just bookkeeping"
         );
-        assert!(worker.discovered_chart_sheets.contains(&sheet));
+        // The sheet that blew up did not: marking it would disable its lazy discovery forever.
+        assert!(
+            !worker.discovered_chart_sheets.contains(&poisoned),
+            "a sheet whose parse panicked must NOT be recorded as walked"
+        );
+
+        // The proof that its discovery is not permanently disabled: point it at a part that parses
+        // and the lazy per-sheet path still walks it, binding that sheet's chart too.
+        let sheets_bound_before = worker.charts.specs_by_sheet().len();
+        worker
+            .chart_sheet_parts
+            .insert(poisoned, part_of("Summary"));
+        worker.ensure_sheet_charts_discovered(poisoned);
+        assert!(
+            worker.charts.specs_by_sheet().len() > sheets_bound_before,
+            "lazy discovery still reaches the panicked sheet after a caught save panic"
+        );
+        assert!(worker.discovered_chart_sheets.contains(&poisoned));
     }
 }

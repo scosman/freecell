@@ -29,13 +29,25 @@ change, so the unification is built on stable ground.
         / `charts.rs` / `client.rs` unit modules instead of `worker_seam.rs`. They still exercise
         the guards at their real call sites.
       - **Code-review follow-ups (B1 round 2):** a distinct `worker_lost` window state (no Save As
-        in the bar, every save/export path refuses, the unsaved-changes prompt drops its Save so a
-        dirty lost-worker window can't park a `QuitPlan`); the save-time chart sweep made
+        in the bar, every save/export *entry* refuses, the unsaved-changes prompt drops its Save —
+        round 3 below is what made that actually cover the in-flight cases); the save-time chart
+        sweep made
         re-entrant across a caught panic (and the `AssertUnwindSafe` justification corrected in
         `architecture.md §A3.3`); `WorkerExit::Running` joined off the UI thread instead of being
         logged as a non-answer; the loading overlay cleared on a death before `Loaded`; the fatal
         report no longer swallowed by a non-terminal modal; the CSV export guarded like the save;
         `has_worker` split out of `shutdown_requested`.
+      - **Code-review follow-ups (B1 round 3):** guarding save *entry* left both in-flight
+        orderings hanging — a worker dying under a quit prompt (the replaced modal skips
+        `dismiss_modal`'s quit-abort branch) and a save armed before the death (only
+        `Saved`/`SaveFailed` clear it). `on_worker_lost` now tears down the pending save/export and
+        stands the quit down unconditionally; both orderings are pinned by tests that were
+        confirmed failing first. Also: the refusal notice no longer stomps a terminal load dialog;
+        the sweep marks a sheet after parse **and** bind, in `SheetId` order, so the surviving
+        prefix is deterministic (test now panics on the second of two sheets); the lazy path's
+        opposite ordering is documented where a reader meets it; the `WorkerExit::Panicked` test
+        uses the shared `quiet_panics` from the parent thread; the loading-overlay tests assert the
+        grid half too.
 
 - [x] **Phase 3 — extract chart handling out of `run.rs`.** Move ≈1,180 production lines and
       the chart tests into `worker/charts.rs`. Behaviour-preserving; every existing test passes

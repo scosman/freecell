@@ -268,20 +268,36 @@ Save might work. Concretely, in the worker-lost state:
 
 - **No save path runs.** `Save`, `Save As`, the unsaved-changes prompt's Save, and **Export as
   CSV** all refuse with an OK-only notice ("This workbook can't be saved from this window any
-  more. Open the file again to keep working."). Nothing is sent, nothing is armed, and no
-  close/quit follow-up is left standing. This is not defensive tidiness: `DocumentClient::send`
-  drops a command when the worker is gone, so a save that *looked* accepted would never receive
-  `Saved` or `SaveFailed` — the native panel would pick a file that is never written.
+  more. Open the file again to keep working."), sending nothing and arming nothing. This is not
+  defensive tidiness: `DocumentClient::send` drops a command when the worker is gone, so a save
+  that *looked* accepted would never receive `Saved` or `SaveFailed` — the native panel would pick
+  a file that is never written. The notice does not replace a *terminal* dialog: on a window whose
+  load failed, the close-on-dismiss report stays up (⌘S still routes to Save whatever modal is
+  showing, and swapping that dialog would stop the window closing on dismiss).
+- **Anything already in flight is abandoned, not left waiting.** Refusing new saves is not enough
+  — the worker can die *during* one, which is this whole section's premise. So on worker loss the
+  window also clears the armed save (`close_after_save`, the pending save request and path, the
+  pending export request) and stands down any quit that was waiting on it. Without that, two
+  orderings hung: a worker dying while the quit prompt was up left the plan pending on a window
+  that could never answer (⌘Q looked like a no-op, and closing another dirty window later
+  re-prompted this one), and a save armed before the death stayed armed forever, so the window
+  never closed and the quit never finished.
 - **The bar carries no Save As button.** The degraded bar's "Save As to keep your work" is an
   offer only a *live* worker can honour, so the lost-worker state renders its own bar: "The
   calculation engine stopped. This window is read-only and its unsaved changes can't be saved —
   open the file again to keep working." Same look, no button, and no contradiction with the
   dialog on top of it.
-- **The close and quit paths still resolve.** Closing a dirty window whose worker is gone prompts
-  with **Cancel** and **Close Without Saving** only (title: "Unsaved changes can't be saved").
-  Both resolve: Cancel aborts an in-progress quit, Close Without Saving closes the window and
-  lets the quit continue. Offering Save here would arm a close-after-save that could never fire,
-  leaving the window open and an in-progress quit parked on it forever.
+- **The close prompt offers only choices that can be honoured.** Closing a dirty window whose
+  worker is gone prompts with **Cancel** and **Close Without Saving** only (title: "Unsaved
+  changes can't be saved"). Offering Save would arm a close-after-save that could never fire,
+  leaving the window open forever.
+- **Losing a worker mid-quit stands the whole quit down**, rather than skipping that one window.
+  The user asked to quit with this document's changes *handled*, and that is no longer possible,
+  so the honest answer is to stop and let them decide — the same choice a failed save and a failed
+  `.back` backup already make. The document stays **dirty** (losing the worker changes no op
+  accounting), so a re-issued ⌘Q prompts this window again, now with the Cancel / Close Without
+  Saving form; discarding closes it and the quit runs on. Nothing is wedged — the quit just has to
+  be asked for again.
 
 This is a *distinct* state from the degraded worker of F2.2, not a second reason for it: a
 degraded worker is alive and answering, so its bar's Save As really writes the file.

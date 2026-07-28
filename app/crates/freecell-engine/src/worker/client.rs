@@ -445,15 +445,14 @@ mod tests {
     /// for exactly that, and exercises the same join.
     #[test]
     fn worker_exit_reports_a_thread_that_unwound() {
-        let handle = std::thread::spawn(|| {
-            let prev = std::panic::take_hook();
-            std::panic::set_hook(Box::new(|_| {}));
-            let r = std::panic::catch_unwind(|| panic!("stand-in for an unguarded worker panic"));
-            std::panic::set_hook(prev);
-            // Re-raise outside the hook swap so the thread really unwinds out of its entry point.
-            std::panic::resume_unwind(r.unwrap_err());
+        // The panic hook is process-global, so it is swapped from the PARENT thread with the
+        // shared `quiet_panics` helper, around both the spawn and the wait — a hook swapped
+        // inside the spawned thread would race every other test's panics.
+        let handle = super::super::run::tests::quiet_panics(|| {
+            let handle = std::thread::spawn(|| panic!("stand-in for an unguarded worker panic"));
+            wait_finished(&handle);
+            handle
         });
-        wait_finished(&handle);
         let client = client_over(Some(handle));
         assert_eq!(client.worker_exit(), WorkerExit::Panicked);
     }

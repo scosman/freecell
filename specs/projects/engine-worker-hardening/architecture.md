@@ -256,13 +256,22 @@ charts, bumps `chart_version`, and (since Phase 4) commits — and inside its lo
 call on the save path.
 
 So a caught save panic *can* leave part of that sweep applied. The sweep is therefore made
-**re-entrant** instead of assumed atomic: a sheet is recorded in `discovered_chart_sheets` only
-after its parse has returned, so what survives a panic is a prefix of correctly bound sheets plus
-`charts_fully_discovered == false` — a partially-swept worker that the next save, or a lazy
-per-sheet discovery, completes. Marking *before* the parse (the original order) left sheets
-flagged "walked" whose charts were never bound: `ensure_sheet_charts_discovered` then returned
-early for them forever while `charts_fully_discovered` stayed `false`, so their charts silently
-went missing until some later save re-ran the whole sweep.
+**re-entrant** instead of assumed atomic: it walks sheets in `SheetId` order (so the survivors are
+deterministic rather than hash order) and records a sheet in `discovered_chart_sheets` only after
+**both** its parse and its bind have returned — the `insert` is the last statement of the loop
+body, below the whole `match`, so a panic anywhere in either step leaves that sheet unmarked. What
+survives a panic is therefore a prefix of *fully bound* sheets plus `charts_fully_discovered ==
+false` — a partially-swept worker that the next save, or a lazy per-sheet discovery, completes.
+Marking *before* the parse (the original order) left sheets flagged "walked" whose charts were
+never bound: `ensure_sheet_charts_discovered` then returned early for them forever while
+`charts_fully_discovered` stayed `false`, so their charts silently went missing until some later
+save re-ran the whole sweep.
+
+The **lazy** sibling `ensure_sheet_charts_discovered` keeps the opposite order (mark, then parse),
+and its doc comment now says why rather than leaving the asymmetry to look like an oversight: it
+does not run inside any guard, so a panic there takes the thread down outright and there is no
+surviving worker to leave torn — and marking up front is what stops a cleanly-failing parse being
+re-attempted on every paint. If it ever moves inside a guard it must adopt the sweep's order.
 
 The late mutations (`chart_source_path`, `loaded_anchor_edits`, `loaded_deletes`) *are* the last
 statements before the `Ok`, after every fallible step, so those genuinely cannot be half-applied.
@@ -394,15 +403,33 @@ what the degraded bar offers. A degraded worker is alive and answering, so its "
 your work" button works. A *lost* worker cannot write anything: `DocumentClient::send` drops the
 command, so no `Saved`/`SaveFailed` ever returns. Hence, gated on `worker_lost`:
 
-- `save()` / `send_save()` (and `export_csv`) refuse with an OK-only notice, never arming
-  `close_after_save` or a `pending_save_req`, and cancel any in-flight quit prompt
-  (`note_prompt_cancelled`, as a `SaveFailed` does). `send_save` is checked as well as `save`
-  because the native panel is async — the worker can die while it is open.
+- `save()` / `send_save()` (and `export_csv`) refuse with an OK-only notice. `send_save` is
+  checked as well as `save` because the native panel is async — the worker can die while it is
+  open. The notice does **not** replace a terminal report: a window whose load failed is showing
+  the close-on-dismiss dialog *and* is worker-lost, and ⌘S routes to `save` regardless of the
+  modal, so without that guard the refusal would swap a terminal dialog for a non-terminal one and
+  the window would stop closing on dismiss.
 - the bar renders without the `Save As…` button, with copy matching the dialog.
-- the unsaved-changes prompt drops its **Save** button (Cancel / Close Without Saving only). Both
-  remaining choices resolve, so a dirty window whose worker died can no longer park a `QuitPlan`
-  forever — the old prompt's Save armed `close_after_save`, sent into the void, and the window
-  never closed, leaving `advance_quit` waiting on a window that would never resolve.
+- the unsaved-changes prompt drops its **Save** button (Cancel / Close Without Saving only).
+
+**Guarding the entry to a save is not sufficient**, and this was the round-1 gap. Those refusals
+only cover requests *starting* after the loss; they do nothing for a request already in flight —
+and the unguarded panic that kills the worker can happen mid-save, which is B1's own premise.
+`on_worker_lost` therefore performs the same teardown **unconditionally**
+(`abandon_work_waiting_on_the_worker`): `close_after_save`, `pending_save_req`,
+`pending_save_path` and `pending_export_req` are cleared, and `FreeCellApp::note_prompt_cancelled`
+is called (a no-op when no quit is running). Two orderings make it necessary, both reproduced as
+failing tests before the fix:
+
+| Ordering | Without the teardown |
+|---|---|
+| Worker dies while the **quit prompt** is up | `on_worker_lost` swaps `UnsavedChanges` for the fatal `Error`, so `dismiss_modal`'s quit-abort branch — which only fires for `UnsavedChanges` — never runs. The plan stays pending on a window that can never answer: ⌘Q looks like a no-op, and closing some *other* dirty window later re-prompts this one out of nowhere. |
+| A save **already armed** when the worker dies | `close_after_save` + `pending_save_req` are only ever cleared by `Saved`/`SaveFailed`, neither of which can arrive. The window never closes and `advance_quit` waits on it forever — the round-1 failure mode, untouched by the entry guards. |
+
+`note_prompt_cancelled` aborts the **whole** quit, not just this window's step, matching
+`abort_save_with_backup_error` and the `SaveFailed` arm. `advance_quit` then takes
+`QuitStep::Aborted` and drops the plan entirely, so there is nothing left for a later window close
+to revive.
 
 `on_edit_rejected` gains an arm for `FrozenPaneTooLarge` (exhaustive match), producing the F1.2
 dialog.
@@ -414,7 +441,7 @@ dialog.
 | `load_panic_is_caught_and_reported_as_load_failed` | `run.rs` unit | a source that panics in `from_source` yields `LoadFailed { EnginePanic }` and the thread does not take the process down |
 | `save_panic_is_caught_and_reported_as_save_failed` | `run.rs` unit | a save that panics yields `SaveFailed { EnginePanic }`, the worker keeps answering a subsequent edit + a real save, and no `EditRejected` rides along |
 | `export_panic_is_caught_and_reported_as_export_failed` | `run.rs` unit | the same for `ExportCsv` → `CsvExportFailed { EnginePanic }`, worker still serving |
-| `a_save_panic_mid_sweep_leaves_the_sheet_re_discoverable` | `charts.rs` unit | a save on a workbook that really has charts to discover, panicking inside the sweep's parse: no sheet is marked walked, and lazy discovery still binds that sheet's chart afterwards |
+| `a_save_panic_mid_sweep_keeps_the_prefix_and_leaves_the_rest_re_discoverable` | `charts.rs` unit | a save on a two-sheet workbook that really has charts to discover, panicking on the **second** sheet's parse: the first stays bound + marked, the second is not marked, and lazy discovery still binds it afterwards |
 | `a_save_panic_counts_toward_the_degrade_threshold` | `run.rs` unit | the split preserves the 2-panic / failed-probe threshold exactly |
 | `shutdown_requested_tracks_only_the_shutdown_command` | `client.rs` unit | `send(Shutdown)` sets the flag; other commands do not; a spawned client reports `has_worker` |
 | `worker_exit_reports_clean_after_a_requested_shutdown` | `client.rs` unit | a real worker sent `Shutdown` joins `Clean` |
@@ -426,6 +453,9 @@ dialog.
 | `worker_death_replaces_a_non_terminal_modal` | `window.rs` gpui test | an `UnsavedChanges` prompt showing at death is replaced by the fatal report, not swallowed by it |
 | `worker_death_clears_the_loading_overlay` | `window.rs` gpui test | a death before `Loaded` clears "Opening …" instead of spinning behind the dialog |
 | `a_lost_worker_refuses_to_save` | `window.rs` gpui test | `save` on a lost worker writes nothing, arms no `pending_save_req`, disarms `close_after_save`, and explains itself |
+| `a_refused_save_keeps_a_terminal_load_dialog` | `window.rs` gpui test | ⌘S on a load-failed, worker-lost window does not swap the close-on-dismiss dialog for the refusal notice |
+| `worker_death_during_a_quit_prompt_stands_the_quit_down` | `window.rs` gpui test | ordering (a): the plan is abandoned, dismissing the report does not revive it, and a re-issued quit still prompts + resolves |
+| `worker_death_disarms_a_save_that_was_already_in_flight` | `window.rs` gpui test | ordering (b): a save armed before the death is cleared and the waiting quit stood down |
 
 **Deviation from this section, recorded rather than left silent.** The plan above called for
 `worker_seam.rs` integration tests over a `#[cfg(feature = "test-support")]`

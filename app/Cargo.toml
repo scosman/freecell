@@ -42,7 +42,12 @@ freecell-engine = { path = "crates/freecell-engine" }
 # the perf harness (Phase 12) depend on it to render the real grid over fixtures.
 freecell-app = { path = "crates/freecell-app" }
 
-# Engine (exact pin — the number all experiment results are comparable against)
+# Engine. These are NOT the version that ships: `[patch.crates-io]` at the bottom of this file
+# redirects both crates to our fork, so nothing is ever resolved from crates.io under this
+# requirement. The `=0.7.1` requirement is what the patch ATTACHES to — cargo only applies a
+# `[patch]` entry whose replacement version satisfies the requirement it replaces, so the pin has
+# to stay and has to keep matching the fork's declared version. Read it as "the fork's base
+# version", not as "we ship IronCalc 0.7.1"; the code that actually builds is the `rev` below.
 ironcalc = "=0.7.1"
 ironcalc_base = "=0.7.1"
 
@@ -101,15 +106,26 @@ opt-level = 3
 opt-level = 3
 
 # ---------------------------------------------------------------------------------
-# IronCalc upstreaming (specs/projects/ironcalc-upstreaming): build against our fork's
-# `freecell-fixes` branch — upstream `main` (which already fixes E1 theme / E4 xfId / the
-# tint bug) plus our E2 (num-fmt table) and E5 (<indexedColors> override) fixes. This is
-# what lets the local import workarounds (open_fixups/open_repair) be removed. TEMPORARY:
-# revert to a released crates.io pin once the fixes ship (projects/ironcalc-upgrade.md).
+# IronCalc upstreaming (specs/projects/ironcalc-upstreaming): build against our fork
+# `scosman/ironcalc`, pinned BY SHA to a commit on its `freecell-fixes` integration branch.
+#
+# WHY A `rev`, NOT A `branch`: `freecell-fixes` is maintained by REBASING onto upstream `main`
+# (CLAUDE.md §Engine), and it is rewritten and reverted in place. A `branch =` pin means the
+# commit a given FreeCell revision builds against is decided by whatever the branch points at
+# when the lock is next regenerated — so an old FreeCell commit is not reproducible, and one
+# force-push + GC makes it unbuildable. Every other git dependency here (the four zed/
+# gpui-component pins) is `rev`-pinned; this is now consistent with them.
+#
+# BUMPING THE FORK is a deliberate one-line edit of both revs below, followed by
+# `cargo update -p ironcalc -p ironcalc_base`. It is a real change to what ships and belongs in
+# its own commit — never a drive-by. Confirm the workspace tests still pass: the fork's branch
+# tip has diverged from this pin before (see specs/projects/v05-cleanup-1/phase_plans/phase_1.md
+# — the tip at the time of pinning reverted `fix/dollar-negative-zero`, which
+# `freecell-engine::document`'s scalar-function tests assert).
 # ---------------------------------------------------------------------------------
 [patch.crates-io]
-ironcalc = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
-ironcalc_base = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
+ironcalc = { git = "https://github.com/scosman/ironcalc", rev = "cee2859dceda65ff64e52192be4ec47a259870e1" }
+ironcalc_base = { git = "https://github.com/scosman/ironcalc", rev = "cee2859dceda65ff64e52192be4ec47a259870e1" }
 
 # ---------------------------------------------------------------------------------
 # GPL ship blocker (zed#55470). gpui pulls `sum_tree` -> `ztracing` -> `zlog` +

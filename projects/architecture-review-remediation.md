@@ -175,6 +175,18 @@ Also check the `ironcalc = "=0.7.1"` version line while in the file: FreeCell mi
 the post-0.7.1 style-colour API, so if that pin is still there it is inert at best and
 misleading at worst.
 
+**Outcome (v05-cleanup-1 P1, 2026-07-28): CONFIRMED — and the hazard was already live.**
+Both patch entries now pin `rev = "cee2859d…"`. When the pin was made, the fork's
+`freecell-fixes` tip had **already moved past the locked commit** and reverted
+`fix/dollar-negative-zero`, which `freecell-engine/src/document.rs:2186` asserts
+(`=DOLLAR(-0.001,2)` → `"$0.00"`) — so a `cargo update` would have silently turned a
+committed test red. Pinned the *locked* SHA, not the tip, so the unit changes how the
+dependency is addressed and not what it resolves to; adopting the fork's revert is now a
+deliberate one-line decision. The `=0.7.1` lines are **not** inert and must not be deleted —
+cargo only applies a `[patch]` whose replacement version satisfies the requirement being
+replaced, so they are the patch's attachment point; the comment now says so.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_1.md`.
+
 ### A2. `--locked` on every cargo invocation in CI
 **task · v0.5 · no dependencies**
 

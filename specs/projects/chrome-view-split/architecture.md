@@ -74,7 +74,7 @@ chrome/
     │                      delete confirm
     ├── find.rs            find/replace bar + behaviour
     ├── stats.rs           selection-stats readout
-    └── test_support.rs    #[cfg(test)] Harness · build helpers · the 15 test seams
+    └── test_support.rs    #[cfg(test)] Harness · 12 shared helpers · 2 body stubs · 15 seams
 ```
 
 Every module except `mod.rs` and `test_support.rs` contributes `impl ChromeView { … }` blocks
@@ -173,14 +173,24 @@ just gains one more level of nesting.
 
 ### 3.4 Test support
 
-The current test module is one flat `mod tests` (lines 8380–16099) whose 254 tests share nine
-helpers and a `Harness` struct, plus 15 `#[cfg(test)]` test seams on `ChromeView` at
-8249–8379 (`test_type`, `test_press_enter`, `test_find_type`, `incell_text`, `anchor_x_of`, …).
+The current test module is one flat `mod tests` (lines 8380–16099): **254 tests, 44 helper
+functions, and three structs** (`Harness`, `BodyStub`, `ShortBodyStub`) interleaved with
+nothing marking which is fixture and which is test. On top of that sit 15 `#[cfg(test)]` test
+seams on `ChromeView` at 8249–8379 (`test_type`, `test_press_enter`, `test_find_type`,
+`incell_text`, `anchor_x_of`, …).
 
-These become `chrome/view/test_support.rs`, declared `#[cfg(test)] mod test_support;`. Its
-items — `Harness` (and its fields), `cell`, `build`, `build_win`, `build_sized`, `one_sheet`,
-`tall_sheet`, `upd`, `tick` — and the 15 seam methods all take `pub(super)`, by the same rule
-and for the same reason as §3.2.
+Most of those 44 helpers belong to exactly one banner section and move with it. The ones used
+from **more than one** section become `chrome/view/test_support.rs`, declared
+`#[cfg(test)] mod test_support;`. Phase 1 moves the window harness — `Harness` (and its
+fields), `cell`, `build`, `build_win`, `build_sized`, `one_sheet`, `BodyStub`,
+`ShortBodyStub`, `tall_sheet`, `upd`, `tick` (source order, per §4 rule 2) — and the 15 seam
+methods. Four more (`numeric_stats`, `multi_a1_a3`, `two_sheets`, `cf_view`) turn out to be
+shared and land here in later phases, for **12 helpers** in the delivered file.
+
+Items a sibling module actually reaches take `pub(super)`, by the same rule and for the same
+reason as §3.2 — but only those: `ShortBodyStub` is constructed by `charts.rs` and takes it,
+while `BodyStub` is used solely inside `test_support.rs` and stays private. The rule is
+"whatever the compiler demands", not "everything in this file".
 
 Each domain's `mod tests` then opens with:
 
@@ -357,7 +367,7 @@ banner comments as the cut points (functional spec §2.1).
 | Test source range | Section | → |
 |---|---|---|
 | 8249–8379 | the 15 `#[cfg(test)]` test seams | `test_support.rs` |
-| 8380–8518 | `Harness`, `cell`, `build`, `build_win`, `build_sized`, `one_sheet`, `tall_sheet`, `upd`, `tick` | `test_support.rs` |
+| 8380–8518 | `Harness`, `cell`, `build`, `build_win`, `build_sized`, `one_sheet`, `BodyStub`, `ShortBodyStub`, `tall_sheet`, `upd`, `tick` | `test_support.rs` |
 | 8519–8614 | Data row: fetch / reply / disable | `editing.rs` |
 | 8615–8810 | Selection stats | `stats.rs` |
 | 8811–9134 | Horizontal scroller (action bar + tab strip) | `shell.rs` |

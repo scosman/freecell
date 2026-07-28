@@ -19,9 +19,9 @@ Details live in `architecture.md` §7 (the source-range → destination mapping)
 ## Phases
 
 - [x] **Phase 1: Directory + test support.** `git mv view.rs view/mod.rs` as its own commit
-      (arch §4.1), then extract `test_support.rs` — the `Harness`, the nine build helpers, and
-      the 15 `#[cfg(test)]` seams. Proves the `pub(super)` + `use super::*` mechanics (arch
-      §3) on a small surface before any production code moves.
+      (arch §4.1), then extract `test_support.rs` — the `Harness`, eight harness helpers,
+      two body stubs, and the 15 `#[cfg(test)]` seams. Proves the `pub(super)` + `use super::*`
+      mechanics (arch §3) on a small surface before any production code moves.
 - [x] **Phase 2: `stats.rs` and `find.rs`.** The two smallest, least-coupled domains (~110 and
       ~410 production lines). First phase to move production code *and* its tests together;
       validates the banner-to-banner cut end to end.

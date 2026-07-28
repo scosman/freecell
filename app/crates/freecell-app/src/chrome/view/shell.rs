@@ -780,8 +780,8 @@ impl Render for ChromeView {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::*;
     use super::*;
+    use crate::chrome::view::test_support::*;
     use freecell_core::SelectionModel;
     use freecell_engine::WorkerEvent;
     use gpui::{Modifiers, TestAppContext};

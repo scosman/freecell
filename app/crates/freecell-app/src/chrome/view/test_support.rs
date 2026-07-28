@@ -4,9 +4,16 @@
 //!
 //! Moved verbatim out of the single-file `chrome/view.rs`
 //! (`specs/projects/chrome-view-split`). The whole module is `#[cfg(test)]`, so the items
-//! below carry no inner `#[cfg(test)]` of their own; they are `pub(super)` so every domain
-//! module's `mod tests` can reach them, which is the visibility they already had when the
-//! tests were one flat module in one file.
+//! below carry no inner `#[cfg(test)]` of their own, and those a sibling's `mod tests` reaches
+//! are `pub(super)` — scoped to the `view` subtree, never wider.
+//!
+//! Two different starting points, worth keeping straight: the 15 `ChromeView` seams were
+//! private methods in a module-level `impl ChromeView` block of `view.rs`, and method privacy
+//! is module-scoped — so their reach was `chrome::view` then, and `pub(super)` restores
+//! *exactly* that now. The harness and its fixtures were private to `view::tests`, which is
+//! narrower — they genuinely widen from that one test module to the `view` subtree, the cost of
+//! sharing them across per-domain test modules (`architecture.md §3.4`). Anything used only
+//! inside this file stays private.
 
 use super::*;
 
@@ -256,7 +263,7 @@ pub(super) fn one_sheet(cx: &mut TestAppContext) -> Harness {
 /// backdrop really spans the window height — the condition under which BUG A/B bites. With a
 /// bodyless chrome the backdrop is only ~3 rows tall and the dropdown items lay out *below* it,
 /// never overlapping it, so the regression would hide.
-pub(super) struct BodyStub;
+struct BodyStub;
 impl gpui::Render for BodyStub {
     fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // A concrete-height body so the chrome content — and thus the popover backdrop, which is

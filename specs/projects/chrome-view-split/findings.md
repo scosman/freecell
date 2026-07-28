@@ -15,10 +15,12 @@ owed.
 
 ## 1. The flat test module hid cross-domain coupling — four shared fixtures
 
-The 254 tests lived in one `mod tests` with 29 banner sections, so a helper defined under one
+The 254 tests lived in one `mod tests` with 27 banner sections, so a helper defined under one
 banner could be used from any other with nothing marking it as shared. Splitting forced each
-one into the open. Four turned out to be genuinely cross-domain and now live in
-`view/test_support.rs`:
+one into the open. Of the module's 44 helpers, eight were the global harness that Phase 1
+lifted wholesale and 32 stayed inside a single destination module. **Four more** turned out to
+be cross-domain only once the sections were pulled apart, and joined the harness in
+`view/test_support.rs` (which holds 12 helpers in total):
 
 | Fixture | Defined under | Also used by |
 |---|---|---|
@@ -26,6 +28,24 @@ one into the open. Four turned out to be genuinely cross-domain and now live in
 | `multi_a1_a3` | Selection stats | Horizontal scroller (`shell`) |
 | `two_sheets` | Sheet tab bar | Editing (cross-sheet in-cell seeding) |
 | `cf_view` | CF rules list | CF rule editor |
+
+More crossed banner lines without crossing module lines, and they make the point more
+strongly than the four that had to move. Of the 36 helpers defined *under* a banner, **sixteen**
+are used from a section other than their own; eleven of those also serve their own section, and
+**five never do**.
+
+The clearest case: the `// ---- Function autocomplete + signature hints` **test** section
+(orig. 15600–15631) contains **no tests at all** — only four helper definitions
+(`last_edit_state_autocomplete`, `last_edit_state_ref_highlights`,
+`last_edit_state_reference_ready`, `a1`), each serving one of the two sections after it.
+`last_edit_state_quick` has the same shape: defined under "Editing feel", called only under
+"Quick-edit". At the other end `select_single` is called from five sections of what is now
+`formatting.rs`, and three of the eight prelude helpers ahead of the first banner are used
+almost everywhere — `upd` from **26 of the 27** banner sections (it misses only the helper-only
+autocomplete section above), `one_sheet` from 25, `cell` from 23. The other five prelude
+helpers are narrower: `build` and `tall_sheet` reach 5 sections each, `tick` 3, `build_win` and
+`build_sized` 1 each (all on the same banner-section basis; `build`, `build_win`, `build_sized`
+and `upd` are additionally called from the prelude itself, outside any banner).
 
 Not a defect — but worth knowing that "the tests under this banner" was never a real
 boundary, and any future attempt to move a test section will hit the same thing.
@@ -93,7 +113,7 @@ disambiguate), and noted only because the verification tripwire compares leaf-na
 ## 8. Files still over the F2 ceiling
 
 F2 will add a CI check at 2,000 **production** lines. Every file this project produced is
-under it (largest: `cf_editor.rs` at 1,787). A workspace-wide survey at the same commit finds
+under it (largest: `cf_editor.rs` at 1,786). A workspace-wide survey at the same commit finds
 **five** files that are not:
 
 | Production | Total | File | Owner |
@@ -109,7 +129,7 @@ Two things F2 should decide before it lands, neither of which this project can s
 - **`tests/worker_seam.rs` counts as 2,914 production lines** because it is a `tests/` file
   with no `#[cfg(test)]` inside it — the whole file *is* the test. A rule that excludes
   `#[cfg(test)]` blocks but not `tests/` directories will flag it. Same for
-  `view/test_support.rs` here (364 lines, entirely a `#[cfg(test)]` module, but the attribute
+  `view/test_support.rs` here (371 lines, entirely a `#[cfg(test)]` module, but the attribute
   is on the `mod` declaration in the parent, not in the file).
 - **`grid/view.rs` at 6,575 needs its own unit before F2 can be enforced**, or an exemption.
   Filed as `projects/grid-view-split.md`.

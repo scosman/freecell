@@ -42,12 +42,13 @@ The file has **not** moved since the review. Structure at HEAD:
 - **7573–8248** — CF free functions and constant tables (labels, validation, spec building).
 - **8249–8379** — `#[cfg(test)] impl ChromeView` — 15 test seams.
 - **8380–16099** — a single flat `mod tests` — 254 tests (245 `#[gpui::test]`, 9 `#[test]`)
-  plus nine shared helpers and the `Harness` struct.
+  plus **44 helper functions**, three structs (`Harness` and two grid-body stubs) and one type
+  alias, with nothing marking which items are fixtures and which are tests.
 
 ### 2.1 The finding that makes this cheap
 
 **The file is already sectioned, and the two halves agree.** Production carries 17 `// ----`
-banner comments; the test module carries 29. The section names line up — `// ---- Action
+banner comments; the test module carries 27. The section names line up — `// ---- Action
 row: SetBorders (pen popover)` exists in both halves, as does `// ---- Sheet-tab reorder
 drag`, `// ---- Conditional-formatting rules list (P5)`, and so on.
 
@@ -59,7 +60,8 @@ than a per-method triage.
 
 ## 3. Target structure
 
-Nine production modules plus a test-support module, under `chrome/view/`:
+Ten production files — `mod.rs` plus nine domain modules — and a test-support module, under
+`chrome/view/`:
 
 | File | Domain | Prod lines (est.) | Test lines (est.) |
 |---|---|---:|---:|
@@ -73,7 +75,7 @@ Nine production modules plus a test-support module, under `chrome/view/`:
 | `tabs.rs` | sheet tab bar, reorder drag, rename, context menu, delete | ~695 | ~405 |
 | `find.rs` | find/replace bar + behaviour | ~410 | ~350 |
 | `stats.rs` | selection-stats readout | ~110 | ~195 |
-| `test_support.rs` | `Harness`, build helpers, the 15 `#[cfg(test)]` test seams | 0 | ~270 |
+| `test_support.rs` | `Harness` + the cross-domain helpers + 2 body stubs, the 15 test seams | 0 | ~370 |
 
 Every production count is under the 2,000 ceiling that F2 will enforce, with the largest
 (`cf_editor.rs`, ~1,730) having ~270 lines of headroom. **No exemption is requested.**

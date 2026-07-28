@@ -99,15 +99,15 @@ jobs:
 
       - name: Clippy (-D warnings)
         working-directory: app
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Build workspace
         working-directory: app
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       - name: Test workspace
         working-directory: app
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       # The REQUIRED render pixel suite (Xvfb + Mesa lavapipe) is NOT here — it runs as a
       # separate manual gate (.github/workflows/render.yml). `cargo test --workspace` above
@@ -124,4 +124,4 @@ jobs:
 
       - name: cargo-deny
         working-directory: app
-        run: cargo deny check
+        run: cargo deny --locked check

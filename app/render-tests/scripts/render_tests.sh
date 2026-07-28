@@ -29,6 +29,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # app/
 mode="${1:-test}"
 export FREECELL_RENDER=1
 
+# `--locked` in CI only (A2 — projects/architecture-review-remediation.md). CI must prove it
+# built the committed lockfile (the one cargo-deny audited); a local iteration run must not
+# fail just because you are mid-dependency-edit. The render workflow sets CARGO_LOCKED=--locked.
+cargo_locked="${CARGO_LOCKED:-}"
+
 # Assert the capture stack is present BEFORE invoking cargo. Setting FREECELL_RENDER=1 means the
 # operator wants the real pixel gate; if the tooling is missing we must fail loudly rather than let
 # the suite skip to green (a "required" gate that tests zero pixels). This mirrors the hard-failure
@@ -58,16 +63,16 @@ case "$mode" in
     test)
         require_tools
         shift || true   # drop the "test" arg; forward any remaining as a cargo test name filter
-        exec cargo test --manifest-path "$here/Cargo.toml" -p render-tests "$@"
+        exec cargo test $cargo_locked --manifest-path "$here/Cargo.toml" -p render-tests "$@"
         ;;
     generate)
         require_tools
         shift || true
         # `cargo run --bin generate_baselines` does not build its sibling render_scene,
         # which it shells out to — build both bins first.
-        cargo build --manifest-path "$here/Cargo.toml" -p render-tests \
+        cargo build $cargo_locked --manifest-path "$here/Cargo.toml" -p render-tests \
             --bin render_scene --bin generate_baselines
-        exec cargo run --manifest-path "$here/Cargo.toml" -p render-tests \
+        exec cargo run $cargo_locked --manifest-path "$here/Cargo.toml" -p render-tests \
             --bin generate_baselines -- "$@"
         ;;
     *)

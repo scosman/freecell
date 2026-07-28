@@ -202,6 +202,25 @@ replaced with `exceptions = []`. Fix the comment.
 and PR under an `app/**` paths filter, with GPL absent from `allow` and `exceptions = []`,
 so a reappearing GPL crate fails the license gate. No extra guard needed.*
 
+**Outcome (v05-cleanup-1 P2, 2026-07-28): `--locked` CONFIRMED · `deny.toml` header
+DISPROVED.**
+
+*`--locked`:* confirmed and demonstrated — pinning `anyhow` off the locked version made
+`cargo metadata --locked` exit 101 while the bare command **silently rewrote** the lock
+(1.0.103 → 1.0.99). `--locked` added to `checks.yml` (clippy/build/test, and
+`cargo deny --locked check`), `macos-verify.yml`, `roundtrip.yml`, and — the signed-binary
+path the unit named — `app/scripts/package.{sh,ps1}`, which is what `release.yml` actually
+invokes. `render.yml` / `perf-gates.yml` reach cargo through wrapper scripts, so those scripts
+forward `${CARGO_LOCKED:-}` and the workflows set it; local iteration runs stay unstrict on
+purpose. Precondition checked: the committed lock is current
+(`cargo metadata --locked` + `cargo deny --locked check` both clean at HEAD).
+
+*`deny.toml` header:* **the claim is wrong.** The header does not reference a surviving GPL
+exception — it says *"There is therefore NO license exception here"*, and the block above
+`exceptions = []` says *"No per-crate license exceptions."* Both were updated together in
+`19195b2` when the vendored no-op stubs landed. No change made.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_2.md`.
+
 ### A4. Correct the fork docs; state the real fork strategy
 **task · v0.5 · no dependencies**
 

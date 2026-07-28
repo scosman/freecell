@@ -44,7 +44,7 @@ require_tools() {
 require_tools
 
 # Build the harness in release (the perf numbers must be optimized — CLAUDE.md).
-cargo build --manifest-path "$here/Cargo.toml" -p render-tests --release --bin perf_harness
+cargo build ${CARGO_LOCKED:-} --manifest-path "$here/Cargo.toml" -p render-tests --release --bin perf_harness
 
 bin="$here/target/release/perf_harness"
 

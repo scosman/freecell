@@ -17,7 +17,7 @@ Details live in [`functional_spec.md`](functional_spec.md) and
 - [x] **Phase 1 — A1: pin the IronCalc fork by SHA.** `branch` → `rev` on both patch entries,
       lock regenerated with the resolved SHA unchanged, `=0.7.1` comment corrected.
       (`architecture.md` §1)
-- [ ] **Phase 2 — A2: `--locked` across CI + `deny.toml` header.** Sweep workflows *and*
+- [x] **Phase 2 — A2: `--locked` across CI + `deny.toml` header.** Sweep workflows *and*
       scripts; verify the committed lock is current first. Runs after Phase 1 so the
       precondition is checked against the post-A1 lock. (§2)
 - [ ] **Phase 3 — A4: fork inventory, doc corrections, permanent-fork strategy.** Docs only;

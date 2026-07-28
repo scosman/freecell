@@ -31,6 +31,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A2: CI must prove it built the COMMITTED lockfile (the one cargo-deny audits), so the
+  # wrapper script forwards this to its cargo invocations. Unset locally, where a mid-edit
+  # lock must not fail an iteration run.
+  CARGO_LOCKED: "--locked"
   # Same CI-only build trims as checks.yml so render's own build stays disk-lean:
   # no incremental artifacts, and line-tables-only debug info (keeps file:line in
   # backtraces but drops the heavy DWARF that dominated target/ + the link step).

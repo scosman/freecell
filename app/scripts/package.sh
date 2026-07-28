@@ -57,7 +57,7 @@ fi
 
 # --- build the release binary (profile MUST match the packager's --release) -------
 echo "package.sh: building freecell (release)…"
-cargo build --release -p freecell-app --bin freecell
+cargo build --locked --release -p freecell-app --bin freecell
 
 # --- package ----------------------------------------------------------------------
 mkdir -p "$out_dir"

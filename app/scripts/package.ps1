@@ -39,7 +39,7 @@ if (-not (Get-Command cargo-packager -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host "package.ps1: building freecell (release)…"
-cargo build --release -p freecell-app --bin freecell
+cargo build --locked --release -p freecell-app --bin freecell
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Optional Azure Trusted Signing (no-op unless the signing env is configured — see

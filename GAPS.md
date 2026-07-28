@@ -175,6 +175,28 @@ critical path.
 | **Render-time fallback to Inter for unavailable *explicit* fonts** | Mild | A cell with an **explicit** non-default font the OS lacks (e.g. `Calibri` off-Windows) is passed straight to GPUI, which substitutes an arbitrary system font instead of our bundled Inter. (The common case — the *workbook default* font — already renders Inter via `GRID_FONT_FAMILY`, so this is only explicit non-default fonts.) | **FreeCell-side, small.** At the grid render site, resolve the family via `text_system().all_font_names()` and fall back to `GRID_FONT_FAMILY` (Inter) when absent; keep the real name in the model for round-trip. |
 | **Opened xlsx (from another app) renders wider columns than the source app** | Mild (cosmetic; values, charts, and layout logic all correct) | A file created in Excel/Numbers with **no explicit `<col width>`** opens in FreeCell using FreeCell's *wider* default column width, so the same sheet — and its cell-anchored charts — read wider than in the originating app (same column *count*, wider columns). Surfaced comparing a real chart workbook's Excel vs FreeCell render during the charts project (P4–P11, 2026-07-10). | **FreeCell-side, deferred (design TBD; NOT a charts-project fix).** For columns lacking an explicit width, adopt a default closer to Excel's (~8.43 char ≈ 64px). Open question the owner flagged: change FreeCell's default width **everywhere**, or apply an Excel-like default only to files we *open* that look Excel-originated (they omit widths). Inverse/pair of the export-direction row above (`persist sheet/workbook defaults`). |
 
+## Engine (fork) — negative numbers display without their minus sign (2026-07-28)
+
+**v0.5. Needs a fork fix** (`CLAUDE.md` §Engine: one `fix/<slug>` branch, one clean upstream PR —
+**not** a compensating patch in FreeCell's display path). Full write-up + investigation starting
+point: [`projects/ironcalc-negative-sign-display.md`](projects/ironcalc-negative-sign-display.md).
+
+Found by unit F3a's chart-vs-cell differential test
+(`app/crates/freecell-engine/tests/numfmt_agreement.rs`) and then reproduced **end to end through
+the shipped app** — real worker, `SetStylePath(NumFmt)`, real publication — not just against the
+formatter in isolation.
+
+| # | Bug (IronCalc) | Symptom | Our status |
+|---|----------------|---------|------------|
+| E6 | **`formatter::format::format_number` returns an UNSIGNED string when `\|value\| < 1.5 × 10^(-decimals)`.** For a single-section format it selects `parts[0]` and leaves `value` negative (the 2/3/4-section arms explicitly negate), so the sign is lost further down, in the digit-rendering path, once the rounded magnitude falls below the format's precision. `get_formatted_cell_value` (`model.rs`) calls exactly this, so it is what every cell shows. | **A cell formatted `#,##0` holding −1 displays `1`.** Measured: `#,##0` / `0` drop the sign for −0.0001…−1.49 (−1.5 correctly gives `-2`); `0.00` / `$#,##0.00` / `0%` drop it for −0.0001…−0.01; `General` is unaffected (a separate code path). Silent numeric misinformation on the **primary display surface**, worst on the most common format in a spreadsheet — a variance column of small negatives reads as if every value were positive, while formulas over the same cells stay correct. | **Filed, unfixed.** Carved out of the differential gate by a named predicate (`is_ironcalc_sign_bug`) so the disagreement is recorded rather than hidden — `chart-model` is **correct** here, so the chart must not be "fixed" to match the cell. Deleting that carve-out when the fork lands the fix tightens the gate automatically. |
+| E7 | **Same function rounds `0.5` at zero decimals inconsistently with itself** — `0.5 → "1"` but `2.5 → "2"`, `4.5 → "4"`, `10.5 → "10"`, `1234.5 → "1234"`. Half-to-even everywhere except that one value; Excel is half-away-from-zero throughout, so IronCalc disagrees with both Excel and itself. | A lone half-way value rounds the other way from every other half-way value. | **Filed, unfixed.** Lower severity than E6. Its own `fix/` branch + PR if it proves independent. Carved out as `is_ironcalc_half_up_outlier`. |
+
+**Not the `fix/dollar-negative-zero` case that was reverted.** That one was the `DOLLAR` *worksheet
+function* and the parenthesised-negative convention at the rounds-to-zero boundary — a judgement
+call, deliberately backed out (fork PR #2). E6 is a different function, on every cell rather than
+one function, and its worst case is not a rounds-to-zero case at all: **−1 does not round to zero**,
+and it still loses its sign.
+
 ## Data safety & robustness
 
 | Gap | Severity | Why it matters | Sketch |
@@ -431,6 +453,7 @@ Ordered roughly by how fast a new user hits the gap.
 
 | Gap | Logged? | Readiness / notes |
 |---|---|---|
+| **Negative numbers display without their minus sign** (engine) — a cell formatted `#,##0` holding **−1 shows `1`** | Above ([Engine (fork) — negative sign dropped](#engine-fork--negative-numbers-display-without-their-minus-sign-2026-07-28), E6/E7) | **Correctness, not a feature gap — arguably the first thing on this list.** `format_number` drops the sign whenever `\|value\| < 1.5 × 10^-decimals`, so the most common format in a spreadsheet shows the wrong number with no indication. **Fork fix** (one `fix/` branch, one upstream PR); do **not** patch FreeCell's display path. A differential test already pins it and will tighten automatically when the fix lands. |
 | **Grid lacks keyboard focus on initial load** — a freshly opened workbook renders **A1 selected** (correct), but **typing does nothing** until you click the grid once to focus it | **NEW** (owner-reported 2026-07-16) | **Focus-on-mount bug** (literally the *first* thing a user does — high embarrassment for the "nothing embarrassing in the first hour" bar). The grid's `FocusHandle` isn't focused when the window opens, so key events don't route to the grid until a click focuses it. Fix: focus the grid on window/grid mount (`window.focus(&grid_focus_handle)` after the view mounts), and likewise after Welcome→New/Open opens a document window. Small, FreeCell-side; verify the in-cell editor / data-row focus hand-off still works. |
 | **Cell-area right-click context menu** (cut/copy/paste/clear, insert/delete rows/cols, format…) | Above (Post-MVP survey) | First thing users try; header + chart menus exist, the cell body has none (`grid/view.rs` `handle_right_mouse_down` just dismisses). Cheap now that range clipboard is in. |
 | **Fill down/right (⌘D/⌘R) + drag fill handle + series autofill** (1,2,3… / Jan,Feb…) | Above (Post-MVP survey) | Engine ready & undoable: `UserModel::auto_fill_rows/auto_fill_columns` incl. sequence detection. The fill handle is *the* signature spreadsheet affordance; its absence reads instantly as "not a real spreadsheet". |

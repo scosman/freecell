@@ -66,16 +66,16 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 - **IronCalc — keeping the fork current** — *Ongoing (standing maintenance).*
   The fork is **permanent**: we keep it, keep upstreaming fixes as clean single-fix PRs, and keep
-  re-syncing from upstream `main`. 6 of the 11 changes on `freecell-fixes` are already merged
-  upstream; 5 are fork-only, including merged cells (a whole feature upstream lacks). Moving to a
+  re-syncing from upstream `main`. 6 of the 10 changes on `freecell-fixes` are already merged
+  upstream; 4 are fork-only, including merged cells (a whole feature upstream lacks). Moving to a
   released crates.io pin is a hypothetical simplification, not a goal.
   → [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md)
 
-- **IronCalc drops the minus sign on small negatives** — *Filed, unfixed — needs a fork fix.*
+- **IronCalc drops the minus sign on small negatives** — *v0.5. Filed, unfixed — needs a fork fix.*
   A cell formatted `#,##0` holding **-1 displays "1"**: `format_number` returns an unsigned string
   whenever `|value| < 1.5 × 10^-decimals`. Silent numeric misinformation on the primary display
   surface, worst on the most common format. Found by unit F3a's chart-vs-cell differential test and
-  reproduced end-to-end through the app.
+  reproduced end-to-end through the app. `GAPS.md` E6/E7 + the v0.5 release tier.
   → [`projects/ironcalc-negative-sign-display.md`](projects/ironcalc-negative-sign-display.md)
 
 - **Viewport Value Cache** — *Future, optional scroll-perf push.*

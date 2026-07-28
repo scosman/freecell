@@ -1,8 +1,12 @@
 # IronCalc drops the minus sign on small negative numbers
 
-**Status: Filed, unfixed. Found 2026-07-28 by unit F3a's differential test
-(`specs/projects/v05-cleanup-1`).** Needs a fork fix per `CLAUDE.md` §Engine — one
-`fix/<slug>` branch, one clean upstream PR.
+**Status: Filed, unfixed — targeted at v0.5.** Found 2026-07-28 by unit F3a's differential test
+(`specs/projects/v05-cleanup-1`). Needs a fork fix per `CLAUDE.md` §Engine — one `fix/<slug>`
+branch, one clean upstream PR.
+
+Tracked in `GAPS.md` as **E6** (and **E7** for the rounding outlier) under
+*Engine (fork) — negative numbers display without their minus sign*, and listed in the
+**v0.5 release tier**.
 
 ## The bug
 

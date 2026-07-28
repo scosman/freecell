@@ -359,8 +359,10 @@ fn general_differs_from_the_cell_only_by_rounding() {
         );
 
         // 3. Never a signed zero: `-0` is not "the same number with fewer digits".
+        // Read as "if it is signed, it must carry a non-zero digit" — clippy rejects the
+        // literal `!(signed && !has_digit)` spelling as a non-minimal boolean.
         assert!(
-            !(chart.starts_with('-') && !chart.contains(|c: char| c.is_ascii_digit() && c != '0')),
+            !chart.starts_with('-') || chart.contains(|c: char| c.is_ascii_digit() && c != '0'),
             "General on the chart rendered {value} as {chart:?} — a magnitude that rounds away to \
              zero must print unsigned (cell shows {cell:?})",
         );

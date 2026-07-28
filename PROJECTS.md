@@ -16,6 +16,16 @@ registry: each entry is a short description plus a pointer to a design note unde
 > below are the *design notes* for gaps tracked there (type-aware alignment, bundled
 > Inter, pre-distribution audit).
 
+- **Architecture-Review Remediation** — *Proposed (2026-07-28) — plan of record.*
+  The 30-unit remediation plan closing the findings of the whole-codebase architecture
+  review of `app/` at `e4c7afa` (22 critical / 55 moderate / 39 mild). Each unit is
+  sized (task vs project), tiered (v0.5 / v1.0 / v2.0) and ordered, so they can be
+  picked up independently — 13 of them have no dependencies at all. Includes the
+  root-cause finding behind most of the criticals: the project consistently mistakes
+  having *reasoned about* an invariant for having *enforced* it. Keystone unit is **C1**
+  (a part-inventory round-trip test), which four other units sit behind.
+  → [`projects/architecture-review-remediation.md`](projects/architecture-review-remediation.md)
+
 - **All-Styles Resident Cache (grid geometry + styling)** — *Near-MVP.*
   An always-resident cache of the full resolved style for the sheet — **all** row/col
   sizes (geometry) + fills/lines/bold/number-format — **not** viewport-based. Needed to

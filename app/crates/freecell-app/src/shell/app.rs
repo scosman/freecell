@@ -2108,6 +2108,7 @@ mod tests {
         // 1) A v1 snapshot with one chart installs on the next Published.
         client.set_chart_snapshot(ChartSnapshot {
             version: 1,
+            generation: 1,
             sheets: vec![(sheet, std::sync::Arc::from(vec![chart_spec_for_test()]))],
         });
         inject_published(cx);
@@ -2121,6 +2122,7 @@ mod tests {
         // re-install would have cleared the sheet.
         client.set_chart_snapshot(ChartSnapshot {
             version: 1,
+            generation: 1,
             sheets: Vec::new(),
         });
         inject_published(cx);
@@ -2133,6 +2135,7 @@ mod tests {
         // 3) A higher version that drops the sheet clears its charts (the dropped-sheet branch).
         client.set_chart_snapshot(ChartSnapshot {
             version: 2,
+            generation: 2,
             sheets: Vec::new(),
         });
         inject_published(cx);

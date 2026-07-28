@@ -34,7 +34,7 @@ use crate::chart::binding::{
 use crate::chart::write::{AuthoredChart, SeriesRefs};
 
 use super::protocol::{ChartAxisKind, ChartChromeEdit, EditRejectedReason, WorkerEvent};
-use super::run::{resolve_idx, UndoEntry, Worker};
+use super::run::{resolve_idx, StagedCommit, UndoEntry, Worker};
 
 /// The published set of live-bound charts, grouped by the sheet they're anchored on. Each
 /// [`ChartSpec`]'s `chart` field carries the **current** (live-resolved) values; the rest of the
@@ -45,7 +45,19 @@ pub struct ChartSnapshot {
     /// Bumped **only** when the bound charts change (on load, and on each dirty re-resolve). The UI
     /// installs into the grid iff this differs from what it last installed. The empty initial
     /// snapshot is version `0`; a file with charts publishes version `1` on load.
+    ///
+    /// Deliberately **not** the generation: making it one would re-install every chart on every
+    /// scroll republish and destroy the "off-screen free" property (charts/architecture §5
+    /// challenge 5).
     pub version: u64,
+    /// The generation this snapshot was committed at (E1, `functional_spec.md F4.3`) — the chart
+    /// surface's answer to "what does the UI see at generation N".
+    ///
+    /// It needs its own stamp because, unlike the style cache and the CF map, this surface is an
+    /// [`ArcSwap`](arc_swap::ArcSwap): a reader takes no lock, so there is no release edge to reason
+    /// from except the one the payload carries. Written by [`Worker::commit`] before the bump; read
+    /// by the ordering tests, not by the UI (which gates on [`version`](Self::version)).
+    pub generation: u64,
     /// Charts to paint, keyed by their anchor [`SheetId`]. Each per-sheet list is an
     /// `Arc<[ChartSpec]>` so the UI installs it into `GridView::set_sheet_charts` by **sharing the
     /// same allocation** (a refcount bump, not a deep copy) — the grid holds no independent copy of
@@ -255,7 +267,7 @@ impl Worker {
                 if self.bind_discovered(sheet, specs) {
                     self.chart_version += 1;
                     self.store_chart_snapshot();
-                    self.emit(WorkerEvent::Published);
+                    self.commit(StagedCommit::default());
                 }
             }
             Err(err) => tracing::warn!(%part, "lazy chart discovery failed: {err:#}"),
@@ -324,7 +336,7 @@ impl Worker {
         if added {
             self.chart_version += 1;
             self.store_chart_snapshot();
-            self.emit(WorkerEvent::Published);
+            self.commit(StagedCommit::default());
         }
     }
 
@@ -748,10 +760,17 @@ impl Worker {
     }
 
     /// Shared post-mutation bookkeeping for a chart op: count the committed op (dirty + savable),
-    /// bump the chart version, re-store the snapshot, and publish. Deliberately does **not** touch
+    /// bump the chart version, re-store the snapshot, and commit. Deliberately does **not** touch
     /// the undo/redo stacks — the caller (a forward op via [`push_chart_undo`](Self::push_chart_undo),
     /// or an undo/redo via [`undo_chart_op`](Self::undo_chart_op)) owns the timeline — so it is reused
     /// verbatim by both the forward chart ops and the chart undo/redo republish.
+    ///
+    /// It goes through [`commit`](Worker::commit) rather than emitting `Published` directly (E1).
+    /// It used to do the latter, which left `Shared::generation` standing still — a `Published` that
+    /// announced a generation that never happened. The cost is one `build_publication` over the
+    /// current viewport per chart gesture: the same cost class as a single scroll republish, and a
+    /// chart op is a discrete user action (`ChartAnchorChanged` fires on mouse-up, not per drag
+    /// frame), so it is not close.
     pub(super) fn commit_chart_op(&mut self) {
         self.ops_seen += 1;
         self.shared
@@ -759,7 +778,7 @@ impl Worker {
             .store(self.ops_seen, Ordering::Release);
         self.chart_version += 1;
         self.store_chart_snapshot();
-        self.emit(WorkerEvent::Published);
+        self.commit(StagedCommit::default());
     }
 
     /// Push a chart op onto the unified undo timeline (charts feedback item 4) and clear the redo
@@ -981,9 +1000,32 @@ impl Worker {
         } else {
             self.charts_by_sheet_with_authored()
         };
+        // Stamped with the generation currently committed; the `commit` that follows re-stamps it
+        // with the new one (E1). Truthful at every instant either way.
         self.shared.chart_snapshot.store(Arc::new(ChartSnapshot {
             version: self.chart_version,
+            generation: self.shared.generation.load(Ordering::Acquire),
             sheets,
+        }));
+    }
+
+    /// Re-store the current snapshot stamped with `generation` — the chart surface's half of the
+    /// single commit (E1, `functional_spec.md F4.3`). Called by [`Worker::commit`] immediately
+    /// before the generation bump, so a reader that observes generation `N` finds a chart snapshot
+    /// at `N` (or later), never behind it.
+    ///
+    /// Cheap when the charts didn't move: `sheets` is a `Vec<(SheetId, Arc<[ChartSpec]>)>`, so the
+    /// clone is a handful of refcount bumps, not a copy of any chart. [`version`](ChartSnapshot::version)
+    /// is carried through untouched, so this never triggers a UI re-install.
+    pub(super) fn stamp_chart_snapshot(&self, generation: u64) {
+        let current = self.shared.chart_snapshot.load();
+        if current.generation == generation {
+            return;
+        }
+        self.shared.chart_snapshot.store(Arc::new(ChartSnapshot {
+            version: current.version,
+            generation,
+            sheets: current.sheets.clone(),
         }));
     }
 

@@ -17,7 +17,7 @@ use freecell_core::{CellRange, CellRef, SheetId};
 use freecell_engine::{
     fixtures, ChartAxisKind, ChartChromeEdit, ChartInsertKind, ChartSnapshot, Command,
     DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, FrozenAxis, SheetMeta,
-    StyleAttr, WorkerEvent, WorkerEventReceiver,
+    StyleAttr, StylePath, WorkerEvent, WorkerEventReceiver,
 };
 use tempfile::tempdir;
 
@@ -614,6 +614,178 @@ fn publish_before_bump_never_shows_a_stale_generation() {
     // The reader thread's Arc clone was released at join; dropping this last one closes the
     // command channel so the worker exits cleanly.
     drop(client);
+}
+
+/// E1 (`functional_spec.md F4`): a reader that observes `generation == N` must see **all four**
+/// shared surfaces at N or later. Before the unification the worker published the values, bumped
+/// the counter, emitted `Published`, and only *then* wrote the style cache and the CF map — so
+/// "what does the UI see at generation N" had no answer, and the grid could paint generation-N
+/// values against generation-(N−1) styles.
+///
+/// The style cache carries no generation of its own, so the batch is driven by a **number-format**
+/// edit: one command that moves the published display text *and* the cached `num_fmt` together, in
+/// one commit. `commit` writes the cache before the publication, so the cache may legitimately run
+/// *ahead* — never behind. A decimal count that only ever grows makes "behind" checkable.
+#[test]
+fn all_surfaces_agree_at_a_generation() {
+    const ROUNDS: usize = 24;
+    /// `"0.0"`, `"0.00"`, … — `decimals(i)` has exactly `i` decimal places, so the published text
+    /// of `1` under it is `"1."` + `i` zeros, and both surfaces encode `i` directly.
+    fn decimals(i: usize) -> String {
+        format!("0.{}", "0".repeat(i))
+    }
+    fn decimals_of_text(text: &str) -> Option<usize> {
+        text.split_once('.').map(|(_, frac)| frac.len())
+    }
+
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    client.send(set_input(sheet, 0, 0, "1"));
+    client.send(Command::SetStylePath {
+        sheet,
+        range: CellRange::single(CellRef::new(0, 0)),
+        path: StylePath::NumFmt,
+        value: decimals(1),
+    });
+    poll_until(
+        || decimals_of_text(&published_text(&client, 0, 0)) == Some(1),
+        "the seed number format reached the publication",
+    );
+
+    let client = Arc::new(client);
+    let caches = client.caches();
+    let stop = Arc::new(AtomicBool::new(false));
+    let violations = Arc::new(AtomicU64::new(0));
+    let samples = Arc::new(AtomicU64::new(0));
+    let advanced = Arc::new(AtomicU64::new(0));
+
+    let reader = {
+        let client = Arc::clone(&client);
+        let stop = Arc::clone(&stop);
+        let violations = Arc::clone(&violations);
+        let samples = Arc::clone(&samples);
+        let advanced = Arc::clone(&advanced);
+        thread::spawn(move || {
+            let mut last_gen = 0;
+            while !stop.load(Ordering::Relaxed) {
+                // Read the counter FIRST, then each surface: whatever the surfaces show must be at
+                // least as new as the generation already observed.
+                let gen = client.generation();
+                let pubn = client.publication();
+                let snap = client.chart_snapshot();
+                let cached = caches.read().get(sheet).and_then(|c| {
+                    c.render_style(0, 0)
+                        .map(|rs| c.num_fmt_code(rs.num_fmt).to_string())
+                });
+
+                if pubn.generation < gen {
+                    violations.fetch_add(1, Ordering::Relaxed);
+                }
+                if snap.generation < gen {
+                    violations.fetch_add(1, Ordering::Relaxed);
+                }
+                // The style cache must never be BEHIND the values the UI is being told to paint.
+                // This is the split-brain E1 describes, in its directly observable form.
+                if let (Some(code), Some(published)) = (
+                    cached.as_deref().and_then(decimals_of_text),
+                    pubn.cells
+                        .iter()
+                        .find(|c| c.row == 0 && c.col == 0)
+                        .and_then(|c| decimals_of_text(&c.display_text)),
+                ) {
+                    if code < published {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                samples.fetch_add(1, Ordering::Relaxed);
+                if gen != last_gen {
+                    advanced.fetch_add(1, Ordering::Relaxed);
+                    last_gen = gen;
+                }
+            }
+        })
+    };
+
+    for i in 2..=ROUNDS {
+        client.send(Command::SetStylePath {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+            path: StylePath::NumFmt,
+            value: decimals(i),
+        });
+        // Serialize the rounds so each is its own commit (a coalesced batch would collapse several
+        // rounds into one generation and starve the `advanced` count below).
+        assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    }
+    thread::sleep(Duration::from_millis(50));
+    stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+
+    // NON-VACUITY: a reader that never sampled, or never caught the counter moving, proves nothing
+    // about an interleaving. Both are hard failures, not silent passes.
+    assert!(samples.load(Ordering::Relaxed) > 0, "the reader sampled");
+    assert!(
+        advanced.load(Ordering::Relaxed) > 10,
+        "the reader must observe the generation actually advancing (saw {})",
+        advanced.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        violations.load(Ordering::Relaxed),
+        0,
+        "every surface must be at the observed generation or later"
+    );
+    drop(client);
+}
+
+/// E1: a chart-only op used to emit `Published` **without publishing** — `commit_chart_op` bumped
+/// the chart version, stored the snapshot and fired the event while `Shared::generation` stood
+/// still. The event announced a generation that never happened. It now goes through the one commit
+/// point, so the counter moves and the snapshot is stamped with it.
+#[test]
+fn a_chart_op_bumps_the_generation_it_announces() {
+    let (client, rx, sheet) = spawn_new();
+    client.send(full_viewport(sheet));
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+    let before = client.generation();
+
+    client.send(Command::InsertChart {
+        sheet,
+        kind: ChartInsertKind::Column,
+        anchor: Anchor {
+            from: AnchorCell {
+                col: 1,
+                row: 1,
+                col_off_emu: 0,
+                row_off_emu: 0,
+            },
+            to: AnchorCell {
+                col: 6,
+                row: 12,
+                col_off_emu: 0,
+                row_off_emu: 0,
+            },
+        },
+        data: None,
+    });
+    assert!(wait_for(&rx, |e| matches!(e, WorkerEvent::Published)).is_some());
+
+    let after = client.generation();
+    assert!(
+        after > before,
+        "a chart op's Published must have a generation bump behind it ({before} -> {after})"
+    );
+    let snap = client.chart_snapshot();
+    assert_eq!(
+        snap.generation, after,
+        "and the chart snapshot is stamped with the generation it was committed at"
+    );
+    assert!(
+        snap.sheets
+            .iter()
+            .any(|(s, specs)| *s == sheet && !specs.is_empty()),
+        "the inserted chart really is in the committed snapshot"
+    );
 }
 
 #[test]

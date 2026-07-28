@@ -264,6 +264,27 @@ pub(super) struct Worker {
     pub(super) wrap_heights: HashMap<SheetId, BTreeMap<u32, f32>>,
 }
 
+/// What one batch has to commit through [`Worker::commit`] (E1, `functional_spec.md F4`). Every
+/// field is cheap to leave empty — a pure-scroll republish stages nothing but the publication —
+/// so the eight publishing paths all read the same way regardless of how much they touch.
+#[derive(Default)]
+pub(super) struct StagedCommit {
+    /// Cells whose style-cache entries must be re-read.
+    refresh: Vec<(SheetId, CellRange)>,
+    /// Sheets whose style caches must be rebuilt wholesale.
+    rebuild: Vec<SheetId>,
+    /// Sheets whose published CF rule list must be reconciled. Also the "already rebuilt this
+    /// batch" set for the post-recompute CF refresh.
+    cf_sheets: Vec<SheetId>,
+    /// The sheet list as it was before the batch; drives the caches/CF-map reconcile and the
+    /// `SheetsChanged` event. `None` when the batch cannot change the sheet set.
+    sheets_before: Option<Vec<SheetMeta>>,
+    /// Re-run the value-dependent CF cache refresh (a recompute happened).
+    cf_after_recompute: bool,
+    /// Build the active sheet's cache if it isn't resident yet (a sheet activation).
+    ensure_active_cache: bool,
+}
+
 /// A clamped, half-open viewport window on the active sheet.
 #[derive(Debug, Clone)]
 pub(super) struct Viewport {
@@ -551,18 +572,25 @@ impl Worker {
             self.apply_edit_batch(edits)
         };
 
-        // A pure viewport change (no edit) still republishes current values (no eval).
-        if !published && viewport_changed {
-            self.publish();
-            self.emit(WorkerEvent::Published);
-        }
-
-        // Activating a sheet (a viewport switch to it) builds its style/geometry cache on first
-        // visit, then stays resident (`components/style_cache.md §Lifecycle`).
-        if viewport_changed && self.ensure_active_cache_built() {
-            self.emit(WorkerEvent::StyleCacheUpdated {
-                sheet: self.active_sheet,
-            });
+        // A pure viewport change (no edit) still republishes current values (no eval), and a
+        // viewport switch to a new sheet builds that sheet's style/geometry cache on first visit
+        // (`components/style_cache.md §Lifecycle`). Both are staged through the one commit point, so
+        // the cache the scroll's `Published` refers to is already in place when it fires (E1).
+        if viewport_changed {
+            if published {
+                // The edit batch already committed this batch's publication; the activation still
+                // has to build + announce its cache.
+                if self.ensure_active_cache_built() {
+                    self.emit(WorkerEvent::StyleCacheUpdated {
+                        sheet: self.active_sheet,
+                    });
+                }
+            } else {
+                self.commit(StagedCommit {
+                    ensure_active_cache: true,
+                    ..StagedCommit::default()
+                });
+            }
         }
 
         // Lazy chart discovery (P11, charts/architecture §5 challenge 5): the first time a sheet is
@@ -907,59 +935,22 @@ impl Worker {
                 // The rebuilt-sheet set is the CF-relevant one: a CF mutation, a structural CF-range
                 // shift, and the undo/redo of either land here (all map to `AppliedOp::Rebuild` /
                 // `Touch::Rebuild`). Captured before `rebuild` is consumed by `apply_cache_refresh`.
-                let mut cf_sheets = rebuild.clone();
-                // Re-resolve any charts whose source ranges the edit touched, BEFORE publishing, so
+                let cf_sheets = rebuild.clone();
+                // Re-resolve any charts whose source ranges the edit touched, BEFORE the commit, so
                 // the edit's single `Published` carries fresh cells AND fresh charts (P9,
                 // charts/architecture §4.1). Only intersecting charts recompute.
                 self.reresolve_charts(&refresh, &rebuild);
 
-                self.publish();
-                self.emit(WorkerEvent::Published);
-
-                // Mirror the applied ops into the style/geometry cache (re-read touched cells) and
-                // ship `StyleCacheUpdated` deltas. Ordered after `Published` (unchanged event order).
-                self.apply_cache_refresh(refresh, rebuild, &sheets_before);
-
-                // Value-dependent conditional formatting: a recompute can change cell values, which
-                // flips CF results (a threshold crosses, a Top-N/average cell enters or leaves the
-                // set, a color scale re-interpolates) with NO CF command. Rebuild the affected CF
-                // sheets' style caches via the extended path — only on a recompute, and short-circuited
-                // for a non-CF workbook by the empty-map gate inside. `cf_sheets` (this batch's full
-                // rebuilds) is passed so a CF/structural op already rebuilt above isn't rebuilt twice.
-                if needs_eval {
-                    self.refresh_cf_caches_after_recompute(&cf_sheets);
-                }
-
-                // Republish the CF rule list for any rebuilt sheet whose rules actually changed, and
-                // notify the window (`components/engine_cf.md §5`). Gated inside so a non-CF sheet is
-                // free; deduped so a coalesced multi-CF batch reconciles each sheet once.
-                cf_sheets.sort_unstable();
-                cf_sheets.dedup();
-                self.reconcile_published_cond_fmt(&cf_sheets);
-
-                // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the
-                // tab bar. Compared by value so undo/redo of a sheet op is caught too.
-                let sheets_after = self.sheet_metas();
-                if sheets_after != sheets_before {
-                    // Reconcile the CF map with the changed sheet SET. Removed sheets (delete /
-                    // undo-of-add) are dropped so the map never outlives its sheet. Sheets that
-                    // REAPPEARED (undo-of-delete restores the worksheet + its CF rules) are
-                    // reconciled so a returning CF sheet republishes its rules + emits
-                    // `CondFmtUpdated` — that undo pushes `Touch::Sheets`, not `Touch::Rebuild`, so
-                    // the returning sheet never entered `cf_sheets` above.
-                    let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
-                    let ids_after: HashSet<SheetId> = sheets_after.iter().map(|m| m.id).collect();
-                    self.shared
-                        .cond_fmt
-                        .write()
-                        .retain(|id, _| ids_after.contains(id));
-                    let appeared: Vec<SheetId> =
-                        ids_after.difference(&ids_before).copied().collect();
-                    self.reconcile_published_cond_fmt(&appeared);
-                    self.emit(WorkerEvent::SheetsChanged {
-                        sheets: sheets_after,
-                    });
-                }
+                // One commit point (E1): every surface — publication, style cache, chart snapshot,
+                // CF map — is written before the generation bump, and every event after it.
+                self.commit(StagedCommit {
+                    refresh,
+                    rebuild,
+                    cf_sheets,
+                    sheets_before: Some(sheets_before),
+                    cf_after_recompute: needs_eval,
+                    ensure_active_cache: false,
+                });
                 true
             }
             Err(_) => {
@@ -1141,17 +1132,17 @@ impl Worker {
                         .committed_ops
                         .store(self.ops_seen, Ordering::Release);
                     self.reresolve_charts(&touched, &[]);
-                    self.publish();
-                    self.emit(WorkerEvent::Published);
                     self.undo_stack
                         .push(UndoEntry::Cell(Touch::Ranges(touched.clone())));
                     self.redo_stack.clear();
-                    for s in self.refresh_cache_cells(&touched) {
-                        self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
-                    }
-                    // A replace recomputes values → re-evaluate CF on the resident CF sheets
-                    // (empty-map gated, so a non-CF workbook is unaffected).
-                    self.refresh_cf_caches_after_recompute(&[]);
+                    // One commit (E1): the touched cells' styles and the value-dependent CF refresh
+                    // (a replace recomputes values; empty-map gated, so a non-CF workbook is
+                    // unaffected) both land before the generation bump this `Published` announces.
+                    self.commit(StagedCommit {
+                        refresh: touched.clone(),
+                        cf_after_recompute: true,
+                        ..StagedCommit::default()
+                    });
                 }
                 self.emit(WorkerEvent::ReplacedCount { n });
             }
@@ -1183,8 +1174,6 @@ impl Worker {
             .committed_ops
             .store(self.ops_seen, Ordering::Release);
         self.reresolve_charts(touched, &[]);
-        self.publish();
-        self.emit(WorkerEvent::Published);
         for (sheet, range) in touched {
             self.undo_stack.push(UndoEntry::Cell(Touch::Cells {
                 sheet: *sheet,
@@ -1192,11 +1181,13 @@ impl Worker {
             }));
         }
         self.redo_stack.clear();
-        for sheet in self.refresh_cache_cells(touched) {
-            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
-        }
-        // A replace recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
-        self.refresh_cf_caches_after_recompute(&[]);
+        // One commit (E1). A replace recomputes values → the CF caches refresh here too, before the
+        // bump rather than after the `Published` that used to precede them.
+        self.commit(StagedCommit {
+            refresh: touched.to_vec(),
+            cf_after_recompute: true,
+            ..StagedCommit::default()
+        });
     }
 
     /// Copy (or cut) `range` to the engine clipboard slot and reply with the system-clipboard
@@ -1510,19 +1501,18 @@ impl Worker {
         // Re-resolve any charts the pasted values touched, before the publish (P9) — a paste into a
         // source range re-renders the chart on the same `Published`.
         self.reresolve_charts(&touched, &[]);
-        self.publish();
-        self.emit(WorkerEvent::Published);
 
         // One paste = one engine undo entry → one touch-entry (possibly multi-range), and a
         // fresh edit invalidates the redo stack.
         self.undo_stack
             .push(UndoEntry::Cell(Touch::Ranges(touched.clone())));
         self.redo_stack.clear();
-        for sheet in self.refresh_cache_cells(&touched) {
-            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
-        }
-        // A paste recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
-        self.refresh_cf_caches_after_recompute(&[]);
+        // One commit (E1); a paste recomputes values, so the CF caches refresh with it.
+        self.commit(StagedCommit {
+            refresh: touched,
+            cf_after_recompute: true,
+            ..StagedCommit::default()
+        });
 
         self.emit(WorkerEvent::Pasted {
             sheet: dest,
@@ -1655,8 +1645,6 @@ impl Worker {
                 self.shared
                     .committed_ops
                     .store(self.ops_seen, Ordering::Release);
-                self.publish();
-                self.emit(WorkerEvent::Published);
                 // One touch per committed diff-list (all covering the clamped range — re-reading it
                 // syncs both the styles and the row heights), and a fresh edit clears the redo side.
                 for _ in 0..diff_lists {
@@ -1666,9 +1654,12 @@ impl Worker {
                     }));
                 }
                 self.redo_stack.clear();
-                for s in self.refresh_cache_cells(&[(sheet, clamped)]) {
-                    self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
-                }
+                // One commit (E1): a font change IS a style change, so the cache mirror landing
+                // after `Published` was the split-brain in its purest form.
+                self.commit(StagedCommit {
+                    refresh: vec![(sheet, clamped)],
+                    ..StagedCommit::default()
+                });
             }
             // A clean engine error (near-unreachable for valid input): nothing committed → no touch.
             Ok((Err(msg), _)) => self.emit(WorkerEvent::EditRejected {
@@ -1753,29 +1744,33 @@ impl Worker {
 
     /// Mirror a batch's edited cells into the resident cache (`components/style_cache.md
     /// §Lifecycle`): reconcile the caches map when the sheet set changed, re-read the touched cells,
-    /// and emit `StyleCacheUpdated` per changed sheet. Consumes the `(refresh, rebuild)` from
-    /// [`collect_edited_ranges`](Self::collect_edited_ranges). Runs after the eval + publish (styles
-    /// don't depend on the recompute).
-    fn apply_cache_refresh(
+    /// rebuild what a per-cell mirror can't express, and **return** the sheets whose cache changed.
+    /// Consumes the `(refresh, rebuild)` from
+    /// [`collect_edited_ranges`](Self::collect_edited_ranges).
+    ///
+    /// Returns rather than emits (E1): the `StyleCacheUpdated` announcements belong after
+    /// [`commit`](Self::commit)'s generation bump, and this write must happen before it. Previously
+    /// this ran *after* `Published` had already told the UI to repaint.
+    fn stage_cache_refresh(
         &mut self,
         refresh: Vec<(SheetId, CellRange)>,
         mut rebuild: Vec<SheetId>,
-        sheets_before: &[SheetMeta],
-    ) {
+        sheets_before: Option<&[SheetMeta]>,
+    ) -> Vec<SheetId> {
         // When the sheet-id SET changed (delete, or undo-of-add), drop caches for absent sheets.
         // A returning sheet (undo-of-delete) rebuilds lazily on its next activation.
-        let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
-        let ids_after: HashSet<SheetId> = self.sheet_metas().iter().map(|m| m.id).collect();
-        if ids_before != ids_after {
-            self.shared
-                .caches
-                .write()
-                .retain(|id| ids_after.contains(&id));
+        if let Some(before) = sheets_before {
+            let ids_before: HashSet<SheetId> = before.iter().map(|m| m.id).collect();
+            let ids_after: HashSet<SheetId> = self.sheet_metas().iter().map(|m| m.id).collect();
+            if ids_before != ids_after {
+                self.shared
+                    .caches
+                    .write()
+                    .retain(|id| ids_after.contains(&id));
+            }
         }
 
-        for sheet in self.refresh_cache_cells(&refresh) {
-            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
-        }
+        let mut changed = self.refresh_cache_cells(&refresh);
 
         // Full rebuilds for resize / insert / delete (and their undo/redo). Only resident sheets
         // rebuild — an absent sheet rebuilds lazily on its next activation. Deduped so a batch that
@@ -1784,9 +1779,10 @@ impl Worker {
         rebuild.dedup();
         for sheet in rebuild {
             if self.shared.caches.read().contains(sheet) && self.build_and_store_cache(sheet) {
-                self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+                changed.push(sheet);
             }
         }
+        changed
     }
 
     /// Re-evaluate conditional formatting for the resident CF sheets after a recompute may have
@@ -1796,16 +1792,17 @@ impl Worker {
     /// (its result at one cell depends on the whole range), the touched-cell mirror is insufficient,
     /// so each affected CF sheet's whole style cache is rebuilt via the extended path
     /// ([`build_and_store_cache`](Self::build_and_store_cache) → `build_sheet_cache(cf = true)`) and a
-    /// `StyleCacheUpdated` emitted. This is the one new coupling in FreeCell: value publish → style
-    /// refresh.
+    /// the changed sheets **returned** (E1: the announcement belongs after `commit`'s bump). This is
+    /// the one new coupling in FreeCell: value publish → style refresh.
     ///
     /// **Fast gate (the perf invariant):** the published CF map is empty ⟺ no sheet carries a rule
     /// (P2 maintains it), so a non-CF workbook returns here immediately — no resident scan, no
     /// `has_cond_fmt` reads, no rebuilds. `already_rebuilt` names sheets the caller has just fully
     /// rebuilt this batch (a CF-rule mutation or a structural op), so they are not rebuilt twice.
-    fn refresh_cf_caches_after_recompute(&mut self, already_rebuilt: &[SheetId]) {
+    fn stage_cf_caches_after_recompute(&mut self, already_rebuilt: &[SheetId]) -> Vec<SheetId> {
+        let mut changed = Vec::new();
         if self.shared.cond_fmt.read().is_empty() {
-            return; // no CF anywhere → nothing value-dependent to refresh (non-CF fast path)
+            return changed; // no CF anywhere → nothing value-dependent to refresh (non-CF fast path)
         }
         // Snapshot the resident ids (bounded by the few activated sheets) so the read lock is
         // released before the per-sheet `&mut` rebuild below.
@@ -1821,9 +1818,10 @@ impl Worker {
                 continue; // a non-CF sheet's cache is value-independent → leave it untouched
             }
             if self.build_and_store_cache(sheet) {
-                self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+                changed.push(sheet);
             }
         }
+        changed
     }
 
     /// Re-read every cell in `refresh` and update its cache entry (the mirror primitive), for the
@@ -2339,17 +2337,116 @@ impl Worker {
         }
     }
 
-    /// Publish the active sheet's viewport snapshot, THEN bump the generation — a bump always
-    /// has fresh data behind it (SP1's publish-then-bump; the render loop reads generation
-    /// then the publication, safe either order). Logs the publish timing at `debug` (an SP1
-    /// observable; both the edit and the pure-scroll republish paths route through here).
-    pub(super) fn publish(&self) {
-        let started = Instant::now();
+    /// The **one commit point** for the four worker→UI shared surfaces (E1,
+    /// `functional_spec.md F4`).
+    ///
+    /// Ordering contract — the reason this is a single function rather than eight open-coded
+    /// sequences:
+    ///
+    /// 1. every shared-surface write for generation `N` happens **here**, before the bump;
+    /// 2. `Shared::generation` is stored (`Release`) exactly once, and *that store is the commit*;
+    /// 3. every event announcing `N` is emitted **after** the store.
+    ///
+    /// So a UI reader that observes `generation == N` sees all four surfaces at `N` or later, and
+    /// "what does the UI see at generation N" finally has an answer. It did not before: the value
+    /// commit bumped and emitted `Published`, and only *then* did the style cache and CF map get
+    /// written — a real window in which the grid painted generation-N values against
+    /// generation-(N−1) styles. Chart-only ops were worse still: they emitted `Published` without
+    /// publishing anything, so the counter did not move at all.
+    ///
+    /// **Nothing may write a shared surface after step 2, or emit before it.** That is the whole
+    /// invariant; `commit_emits_nothing_before_the_bump` asserts it directly.
+    pub(super) fn commit(&mut self, staged: StagedCommit) {
+        // ---- stage: every shared-surface write for this generation ------------------------------
         let generation = self.shared.generation.load(Ordering::Acquire) + 1;
+
+        let mut style_sheets: Vec<SheetId> = Vec::new();
+        // Activating a sheet builds its style/geometry cache on first visit, then it stays resident
+        // (`components/style_cache.md §Lifecycle`).
+        if staged.ensure_active_cache && self.ensure_active_cache_built() {
+            style_sheets.push(self.active_sheet);
+        }
+        // Mirror the batch's edited cells into the resident cache (re-read touched cells, rebuild
+        // whole sheets where a per-cell mirror can't express the change).
+        style_sheets.extend(self.stage_cache_refresh(
+            staged.refresh,
+            staged.rebuild,
+            staged.sheets_before.as_deref(),
+        ));
+        // Value-dependent conditional formatting: a recompute can change cell values, which flips CF
+        // results (a threshold crosses, a Top-N/average cell enters or leaves the set, a color scale
+        // re-interpolates) with NO CF command. Only on a recompute, and short-circuited for a
+        // non-CF workbook by the empty-map gate inside. `cf_sheets` (this batch's full rebuilds) is
+        // passed so a sheet already rebuilt above isn't rebuilt twice.
+        if staged.cf_after_recompute {
+            style_sheets.extend(self.stage_cf_caches_after_recompute(&staged.cf_sheets));
+        }
+        // Republish the CF rule list for any rebuilt sheet whose rules actually changed
+        // (`components/engine_cf.md §5`). Gated inside so a non-CF sheet is free; deduped so a
+        // coalesced multi-CF batch reconciles each sheet once.
+        let mut cf_sheets = staged.cf_sheets;
+        cf_sheets.sort_unstable();
+        cf_sheets.dedup();
+        let mut cf_updated = self.stage_cond_fmt(&cf_sheets);
+
+        // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the tab bar.
+        // Compared by value so undo/redo of a sheet op is caught too.
+        let sheets_changed = match &staged.sheets_before {
+            Some(before) => {
+                let after = self.sheet_metas();
+                if after == *before {
+                    None
+                } else {
+                    // Reconcile the CF map with the changed sheet SET. Removed sheets (delete /
+                    // undo-of-add) are dropped so the map never outlives its sheet. Sheets that
+                    // REAPPEARED (undo-of-delete restores the worksheet + its CF rules) are
+                    // reconciled so a returning CF sheet republishes its rules + emits
+                    // `CondFmtUpdated` — that undo pushes `Touch::Sheets`, not `Touch::Rebuild`, so
+                    // the returning sheet never entered `cf_sheets` above.
+                    let ids_before: HashSet<SheetId> = before.iter().map(|m| m.id).collect();
+                    let ids_after: HashSet<SheetId> = after.iter().map(|m| m.id).collect();
+                    self.shared
+                        .cond_fmt
+                        .write()
+                        .retain(|id, _| ids_after.contains(id));
+                    let appeared: Vec<SheetId> =
+                        ids_after.difference(&ids_before).copied().collect();
+                    cf_updated.extend(self.stage_cond_fmt(&appeared));
+                    Some(after)
+                }
+            }
+            None => None,
+        };
+
+        self.stage_publication(generation);
+        self.stamp_chart_snapshot(generation);
+
+        // ---- commit: one Release store, and it is the whole ordering guarantee ------------------
+        self.shared.generation.store(generation, Ordering::Release);
+
+        // ---- announce: nothing above this line may move below it, and vice versa ----------------
+        self.emit(WorkerEvent::Published);
+        for sheet in style_sheets {
+            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+        for sheet in cf_updated {
+            self.emit(WorkerEvent::CondFmtUpdated { sheet });
+        }
+        if let Some(sheets) = sheets_changed {
+            self.emit(WorkerEvent::SheetsChanged { sheets });
+        }
+    }
+
+    /// Store the active sheet's viewport snapshot for `generation` — **without** bumping the
+    /// counter. The bump is [`commit`](Self::commit)'s job and its alone (E1): it is the single
+    /// release edge that makes this publication, the style cache, the chart snapshot and the CF map
+    /// visible together. Logs the publish timing at `debug` (an SP1 observable; every publishing
+    /// path routes through here).
+    fn stage_publication(&self, generation: u64) {
+        let started = Instant::now();
         let publication = self.build_publication(generation);
         let cells = publication.cells.len();
         self.shared.publication.store(Arc::new(publication));
-        self.shared.generation.store(generation, Ordering::Release);
         tracing::debug!(
             generation,
             cells,
@@ -2437,14 +2534,16 @@ impl Worker {
     }
 
     /// Reconcile the published CF rule map for each of `sheets` against the document's current
-    /// rules, emitting [`WorkerEvent::CondFmtUpdated`] only when a sheet's published list actually
-    /// changed (`architecture.md §4.5`, `components/engine_cf.md §5`).
+    /// rules, **returning** the sheets whose published list actually changed
+    /// (`architecture.md §4.5`, `components/engine_cf.md §5`). The caller announces them with
+    /// [`WorkerEvent::CondFmtUpdated`] after [`commit`](Self::commit)'s bump (E1).
     ///
     /// Gated so a non-CF workbook pays nothing: a sheet with no CF rule **and** no published entry is
     /// skipped before any list read. A rule change (add / update / delete / reorder, or a structural
     /// range shift) or the undo/redo of one flips `has_cond_fmt` / the list contents, so it is
     /// reconciled. The map holds no entry for a sheet with zero rules (so the client reads empty).
-    fn reconcile_published_cond_fmt(&self, sheets: &[SheetId]) {
+    fn stage_cond_fmt(&self, sheets: &[SheetId]) -> Vec<SheetId> {
+        let mut updated = Vec::new();
         for &sheet in sheets {
             let Some(idx) = self.resolve(sheet) else {
                 continue; // sheet deleted out from under the touch-set — pruned by the caller
@@ -2485,8 +2584,9 @@ impl Worker {
                     map.insert(sheet, rules);
                 }
             }
-            self.emit(WorkerEvent::CondFmtUpdated { sheet });
+            updated.push(sheet);
         }
+        updated
     }
 
     /// Populate the published CF map once on open for every sheet that carries rules
@@ -3401,6 +3501,55 @@ pub(super) mod tests {
         assert_eq!(
             worker.eval_count, 30,
             "un-coalesced edits must each cost an eval (the metric can register failure)"
+        );
+    }
+
+    /// E1 (`functional_spec.md F4.1`), stated directly: `commit` must not announce a generation
+    /// before it exists. The old code emitted `Published` and *then* wrote the style cache and the
+    /// CF map, so an event could reach the UI describing a state that was still being assembled.
+    ///
+    /// Asserted structurally rather than by racing: `Shared::generation` is read at the moment the
+    /// first event of the commit is observed, so if any event were emitted before the store, the
+    /// counter would still be at its pre-commit value.
+    #[test]
+    fn commit_emits_nothing_before_the_bump() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        drain_events(&rx);
+        let before = worker.shared.generation.load(Ordering::Acquire);
+
+        worker.process_batch(vec![set_input(sheet, 0, 0, "1")]);
+
+        let after = worker.shared.generation.load(Ordering::Acquire);
+        assert!(after > before, "the edit committed a new generation");
+        let events = drain_events(&rx);
+        let published_at = events
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::Published))
+            .expect("the edit published");
+        // Every surface-announcing event of this commit rides AFTER the bump, so `Published` is the
+        // first of them and the style delta follows it rather than preceding the write it refers to.
+        let style_at = events
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::StyleCacheUpdated { .. }));
+        assert!(
+            style_at.is_none_or(|i| i > published_at),
+            "StyleCacheUpdated announces a cache already written at the committed generation; got {events:?}"
+        );
+        assert_eq!(
+            worker.shared.publication.load().generation,
+            after,
+            "the publication behind the bump is the one this generation names"
+        );
+        assert_eq!(
+            worker.shared.chart_snapshot.load().generation,
+            after,
+            "and so is the chart snapshot — every surface answers 'what does the UI see at N'"
         );
     }
 
@@ -5943,7 +6092,7 @@ pub(super) mod tests {
         }
 
         let started = Instant::now();
-        worker.publish();
+        worker.commit(StagedCommit::default());
         let elapsed = started.elapsed();
 
         let publication = worker.shared.publication.load_full();

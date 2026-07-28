@@ -57,6 +57,26 @@ different part). So the sign is lost further down, in the digit-rendering path, 
 magnitude falls below the format's precision — most likely a rounded-to-zero integer part being
 rendered without consulting the original sign.
 
+## This is NOT the `fix/dollar-negative-zero` case you just reverted
+
+Worth stating explicitly, because they look adjacent and are not the same thing.
+
+`fix/dollar-negative-zero` (reverted on `freecell-fixes` by PR #2, 2026-07) changed the **`DOLLAR`
+worksheet function** in `base/src/functions/text/string_format.rs` so a value whose magnitude
+*rounds to zero* printed `$0.00` instead of `($0.00)`. That is a genuine judgement call about
+Excel's parenthesised-negative convention at the rounds-to-zero boundary, and the revert is a
+defensible position.
+
+This finding is in a **different function** (`base/src/formatter/format.rs::format_number`), on a
+**different surface** (every cell's displayed value, not one worksheet function), and its worst case
+is **not** a rounds-to-zero case at all:
+
+> `#,##0` on the value **−1** displays **`1`**.
+
+−1 does not round to zero at zero decimals. It rounds to −1, and the sign is dropped anyway — right
+through to `−1.49`. No convention explains that; it is simply the wrong number on screen. Please
+don't triage it as a repeat of the DOLLAR decision.
+
 ## Related, same function
 
 `format_number` also rounds **0.5 at zero decimals** to `"1"` while rounding `2.5 → "2"`,

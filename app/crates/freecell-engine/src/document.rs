@@ -2180,10 +2180,14 @@ mod tests {
             ("=QUARTILE.INC({1,2,4,7,8,9,10,12},2)", "7.5"),
             ("=XMATCH(30,{10,20,30,40,50})", "3"),
         ];
-        // The four fork correctness fixes — prove the pin carries each landed branch.
+        // The fork correctness fixes — prove the pin carries each landed branch.
+        //
+        // `fix/dollar-negative-zero` was REVERTED on the fork (PR #2, `8a79a7f`) and its
+        // assertion (`=DOLLAR(-0.001,2)` → `"$0.00"`) removed here when the pin moved onto the
+        // post-revert tip (v05-cleanup-1/A1). The revert is deliberate; this test was simply
+        // missed at the time.
         let fixes = [
             ("=TRIM(\"a    b\")", "a b"),           // fix/trim-internal-runs
-            ("=DOLLAR(-0.001,2)", "$0.00"),         // fix/dollar-negative-zero
             ("=ADDRESS(1,1,1,TRUE,\"\")", "!$A$1"), // fix/address-empty-sheet
             ("=XMATCH(\"ban*\",{\"apple\",\"banana\",\"cherry\"},2)", "2"), // fix/xmatch-array-constant
         ];

@@ -115,7 +115,7 @@ opt-level = 3
 # (merged cells) alongside the `UserModel::set_user_inputs` batched-write API the paste /
 # Replace-All path rides on.
 #
-# WHAT IS ON THE BRANCH: 11 changes at this pin — 6 already merged upstream, 5 fork-only. The
+# WHAT IS ON THE BRANCH: 10 changes at this pin — 6 already merged upstream, 4 fork-only. The
 # per-fix table (with the patch-id method to re-derive it, because a hand-maintained list goes
 # stale) lives in specs/projects/ironcalc-upstreaming/implementation_plan.md §Status table. Don't
 # duplicate it here; this comment has been wrong about the branch's contents before.
@@ -129,14 +129,15 @@ opt-level = 3
 #
 # BUMPING THE FORK is a deliberate one-line edit of both revs below, followed by
 # `cargo update -p ironcalc -p ironcalc_base`. It is a real change to what ships and belongs in
-# its own commit — never a drive-by. Confirm the workspace tests still pass: the fork's branch
-# tip has diverged from this pin before (see specs/projects/v05-cleanup-1/phase_plans/phase_1.md
-# — the tip at the time of pinning reverted `fix/dollar-negative-zero`, which
-# `freecell-engine::document`'s scalar-function tests assert).
+# its own commit — never a drive-by, and never left to a stray `cargo update`. ALWAYS run the
+# workspace tests after: a bump can change engine behaviour the suite asserts. Worked example —
+# this pin's own move onto `ecbf6226` picked up the deliberate revert of
+# `fix/dollar-negative-zero` (fork PR #2), which required deleting a now-stale
+# `=DOLLAR(-0.001,2)` assertion in `freecell-engine::document`.
 # ---------------------------------------------------------------------------------
 [patch.crates-io]
-ironcalc = { git = "https://github.com/scosman/ironcalc", rev = "cee2859dceda65ff64e52192be4ec47a259870e1" }
-ironcalc_base = { git = "https://github.com/scosman/ironcalc", rev = "cee2859dceda65ff64e52192be4ec47a259870e1" }
+ironcalc = { git = "https://github.com/scosman/ironcalc", rev = "ecbf6226ddfbe20bec15f9904647db450efdf2ea" }
+ironcalc_base = { git = "https://github.com/scosman/ironcalc", rev = "ecbf6226ddfbe20bec15f9904647db450efdf2ea" }
 
 # ---------------------------------------------------------------------------------
 # GPL ship blocker (zed#55470). gpui pulls `sum_tree` -> `ztracing` -> `zlog` +

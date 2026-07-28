@@ -55,8 +55,8 @@ FreeCell. This is the standing way of working, not a one-off.
   against. Sync `main` from upstream periodically (rebase `fix/*` + `freecell-fixes`); expect
   incidental drift to reconcile on the FreeCell side — upstream may also *reshape* what it merged
   (it renamed our `set_worksheet_index` to `move_sheet`), so a sync can break a FreeCell call site.
-- **Current state of the delta** (rebuilt 2026-07-28, patch-id verified against upstream):
-  6 of 11 changes are **merged upstream**; 5 are fork-only. Per-fix table + the method to re-derive
+- **Current state of the delta** (rebuilt 2026-07-28 at `ecbf6226`, patch-id verified against
+  upstream): 6 of 10 changes are **merged upstream**; 4 are fork-only. Per-fix table + the method to re-derive
   it: [`specs/projects/ironcalc-upstreaming/implementation_plan.md`](specs/projects/ironcalc-upstreaming/implementation_plan.md)
   §Status table. Don't trust a stale summary — re-run the classification.
 - **One fix = one branch = one focused single-feature upstream PR. Never fold multiple fork fixes

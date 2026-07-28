@@ -12,7 +12,7 @@
 ## Why the fork is permanent
 
 Not every fix we need is one upstream will take, and not every capability we need is a fix at all.
-Of the eleven changes `freecell-fixes` carries, six are merged upstream and five are fork-only —
+Of the ten changes `freecell-fixes` carries, six are merged upstream and four are fork-only —
 including **merged cells** (a whole feature, `base/src/merge_cells.rs`) and
 **`UserModel::set_user_inputs`** (the batched single-undo write the paste / Replace-All path
 depends on). Even if upstream took every one of them tomorrow, the *next* thing FreeCell needs
@@ -48,9 +48,11 @@ Re-syncing is where the cost of the fork actually lands. It is ordinary, not ala
   rather than pinning the fork away from upstream.
 - **The fork's `main` mirror goes stale.** As of 2026-07-28 it is at `cedba4e`, **99 commits
   behind** upstream `main`. A sync is overdue.
-- **`freecell-fixes` can move under you.** Its tip is currently two commits past the pinned SHA and
-  those commits *revert* `fix/dollar-negative-zero`, which `document.rs:2186` asserts. The rev pin
-  means nothing changes until someone chooses to bump — reconciling that is part of the bump.
+- **A revert upstream of us is a normal outcome.** `fix/dollar-negative-zero` was deliberately
+  reverted on `freecell-fixes` (PR #2). FreeCell's pin moved onto the post-revert tip in
+  v05-cleanup-1/A1, which meant deleting the now-stale `=DOLLAR(-0.001,2)` assertion in
+  `freecell-engine::document`. **This is why a bump always runs the workspace tests**: the rev pin
+  guarantees nothing moves until you choose, and the test suite tells you what changed when you do.
 
 ## The optional simplification (not a goal)
 

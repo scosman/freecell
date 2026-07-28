@@ -188,7 +188,7 @@ every fix we carry is released — never a goal that shapes the work
 **Rebuilt 2026-07-28 from the fork's history** (v05-cleanup-1 / unit A4). The previous version of
 this table listed two fixes as "awaiting sign-off" and was three months stale; the review that
 prompted the rebuild went further and claimed *nothing* had been upstreamed, which is **wrong** —
-six of the eleven are merged.
+six of the ten are merged.
 
 Method, so it can be re-run: enumerate the first-parent merges on `freecell-fixes`
 (`git log --first-parent`), take each merge's second parent as the fix branch, and classify with
@@ -196,7 +196,7 @@ Method, so it can be re-run: enumerate the first-parent merges on `freecell-fixe
 upstream even when it landed with a rewritten SHA or a reworded subject. Subject matching alone
 is not reliable and disagreed with patch-id on two rows.
 
-Verified against fork `freecell-fixes` @ `cee2859d` (the SHA `app/Cargo.toml` pins) and upstream
+Verified against fork `freecell-fixes` @ `ecbf6226` (the SHA `app/Cargo.toml` pins) and upstream
 `ironcalc/IronCalc` `main` @ `2e2465c`.
 
 | Fix | Branch / head | Upstream status | Notes |
@@ -209,7 +209,7 @@ Verified against fork `freecell-fixes` @ `cee2859d` (the SHA `app/Cargo.toml` pi
 | ADDRESS `!` prefix for empty sheet | `fix/address-empty-sheet` (`09259476`) | ✅ **merged** — upstream `2b8672a` | |
 | `UserModel::set_user_inputs` (batched single-undo) | `fix/batch-set-inputs` (`a51cf46c`) | **fork-only** | Load-bearing: `document.rs` Replace-All rides it |
 | Merged cells (core/model + bindings + xlsx) | merged-cells (`a9fc9fa0`, 5 commits) | **fork-only** | A whole feature, not a fix — adds `base/src/merge_cells.rs`, absent upstream |
-| DOLLAR: no parens when the value rounds to zero | `fix/dollar-negative-zero` (`aa36a177`) | **fork-only** | ⚠️ **reverted on the fork's own branch tip** (`8a79a7f`), while the pinned SHA still carries it — see below |
+| ~~DOLLAR: no parens when the value rounds to zero~~ | ~~`fix/dollar-negative-zero`~~ (`aa36a177`) | **REVERTED — no longer on the branch** | Deliberately backed out on `freecell-fixes` by PR #2 (`8a79a7f`, merged `ecbf6226`). FreeCell's pin now sits on the post-revert tip and its stale `=DOLLAR(-0.001,2)` assertion has been deleted. Not carried, not upstreamed. |
 | XMATCH array-constant `lookup_array` | `fix/xmatch-array-constant` (`f9d1f9ce`) | **fork-only** | |
 | Frozen pane tracked on insert/delete row/col | `fix/structural-edits-adjust-frozen-pane` (`507fe6c7`) | **fork-only** | The `freecell-fixes` tip commit |
 
@@ -222,12 +222,12 @@ never carried by us.
    `freecell-engine/src/document.rs:1514` still calls `set_worksheet_index`, so the **next re-sync
    of the fork onto upstream `main` will break FreeCell's build at that call site**. It is a
    one-line rename, but it must be expected rather than discovered.
-2. **The fork's branch tip has moved past the pin, and reverts a fix we depend on.**
-   `freecell-fixes` is at `ecbf6226`, two commits past the pinned `cee2859d`, and those commits
-   revert `fix/dollar-negative-zero` — which `freecell-engine/src/document.rs:2186` asserts
-   (`=DOLLAR(-0.001,2)` → `"$0.00"`). Since v05-cleanup-1/A1 the manifest pins a SHA, so nothing
-   moves under us; but the next deliberate bump has to reconcile it — either FreeCell drops that
-   assertion or the revert is reverted on the fork.
+2. **`fix/dollar-negative-zero` was deliberately reverted, and FreeCell's test was stale.**
+   Fork PR #2 (`8a79a7f`) backed the fix out of `freecell-fixes`; FreeCell's pin has moved onto the
+   post-revert tip (`ecbf6226`) and its now-wrong `=DOLLAR(-0.001,2)` → `"$0.00"` assertion in
+   `freecell-engine/src/document.rs` has been removed. Recorded because it is the worked example of
+   why a rev bump always re-runs the workspace tests: the pin guarantees nothing moves until you
+   choose, and the suite tells you what changed when you do.
 
 **Also stale:** the fork's `main` mirror is at `cedba4e`, **99 commits behind** upstream `main`. A
 re-sync is overdue and is the normal maintenance this project's operating model calls for.

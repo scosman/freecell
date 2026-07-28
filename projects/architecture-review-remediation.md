@@ -176,15 +176,16 @@ the post-0.7.1 style-colour API, so if that pin is still there it is inert at be
 misleading at worst.
 
 **Outcome (v05-cleanup-1 P1, 2026-07-28): CONFIRMED — and the hazard was already live.**
-Both patch entries now pin `rev = "cee2859d…"`. When the pin was made, the fork's
-`freecell-fixes` tip had **already moved past the locked commit** and reverted
-`fix/dollar-negative-zero`, which `freecell-engine/src/document.rs:2186` asserts
-(`=DOLLAR(-0.001,2)` → `"$0.00"`) — so a `cargo update` would have silently turned a
-committed test red. Pinned the *locked* SHA, not the tip, so the unit changes how the
-dependency is addressed and not what it resolves to; adopting the fork's revert is now a
-deliberate one-line decision. The `=0.7.1` lines are **not** inert and must not be deleted —
-cargo only applies a `[patch]` whose replacement version satisfies the requirement being
-replaced, so they are the patch's attachment point; the comment now says so.
+Both patch entries now pin `rev = "ecbf6226…"`, the `freecell-fixes` tip. When the pin was made
+the branch had **already moved past the locked commit**, reverting `fix/dollar-negative-zero`
+— which `freecell-engine/src/document.rs` asserted (`=DOLLAR(-0.001,2)` → `"$0.00"`). **Owner
+confirmed the revert is intentional and that assertion was simply never removed**, so it is
+deleted and the pin sits on the tip. A `branch =` pin would have delivered the same divergence
+as a mysteriously-red test at whatever moment someone regenerated the lock; the `rev` pin
+delivered it as a deliberate one-line edit — the point of the unit. `freecell-fixes` therefore
+carries **10** changes, not 11 (6 upstream, 4 fork-only). The `=0.7.1` lines are **not** inert
+and must not be deleted — cargo only applies a `[patch]` whose replacement version satisfies
+the requirement being replaced, so they are the patch's attachment point; the comment says so.
 See `specs/projects/v05-cleanup-1/phase_plans/phase_1.md`.
 
 ### A2. `--locked` on every cargo invocation in CI
@@ -248,8 +249,8 @@ Scope:
 **Outcome (v05-cleanup-1 P3, 2026-07-28): CONFIRMED — docs were stale; the review's
 upstreaming claim is disproved with evidence.** Inventory rebuilt from the fork's history by
 patch-id (`git cherry upstream/main <fix-head> <merge-base>`) — subject matching got two rows
-wrong, content probes got more wrong. **11 changes on `freecell-fixes` @ `cee2859d`: 6 merged
-upstream, 5 fork-only.** Upstream `main`'s *tip commit* is one of ours (TRIM, `2e2465c`).
+wrong, content probes got more wrong. **10 changes on `freecell-fixes` @ `ecbf6226`: 6 merged
+upstream, 4 fork-only.** Upstream `main`'s *tip commit* is one of ours (TRIM, `2e2465c`).
 Rewrote: the upstreaming §Status table (was 2 rows, both "awaiting sign-off", ~3 months stale),
 `projects/ironcalc-upgrade.md` (retitled from "move to a released pin"; the released pin is now
 an explicitly hypothetical simplification, not a goal), `CLAUDE.md` §Engine, and the
@@ -259,7 +260,8 @@ since a duplicated inventory is how that comment went wrong in the first place.
 Two discrepancies surfaced that were not in the brief: **(a)** upstream merged our
 `set_worksheet_index` and then **renamed it to `move_sheet`** (`7ca43c7`), so the next fork
 re-sync breaks `freecell-engine/src/document.rs:1514`; **(b)** the fork's `main` mirror is
-**99 commits behind** upstream — a re-sync is overdue.
+**99 commits behind** upstream — a re-sync is overdue. (A third — the `fix/dollar-negative-zero`
+revert — turned out to be an intentional fork change with a stale FreeCell test, resolved in P1.)
 See `specs/projects/v05-cleanup-1/phase_plans/phase_3.md`.
 
 ---

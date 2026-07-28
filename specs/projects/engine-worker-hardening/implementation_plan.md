@@ -64,9 +64,10 @@ change, so the unification is built on stable ground.
         for the `is_pending` gate to what it actually removes (a queued-but-unprompted window's
         death still stands the quit down — deliberately, since the narrower rule is worse).
 
-- [x] **Phase 3 — extract chart handling out of `run.rs`.** Move ≈1,180 production lines and
-      the chart tests into `worker/charts.rs`. Behaviour-preserving; every existing test passes
-      with its assertions unchanged.
+- [x] **Phase 3 — extract chart handling out of `run.rs`.** Planned as ≈1,180 production lines
+      plus the chart tests into `worker/charts.rs`; **actually moved 1,048** (see the closing
+      note for the prediction-vs-outcome reconciliation). Behaviour-preserving; every existing
+      test passes with its assertions unchanged.
       → `architecture.md §A4`
 
 - [x] **Phase 4 — E1: one commit point.** `StagedCommit` + `Worker::commit`; every shared-surface
@@ -104,9 +105,46 @@ can move.
 
 ## Closing note — `run.rs` against the F2 ceiling
 
-`worker/run.rs` production went 3,984 → **3,148** (the chart extraction removed 1,010; Phase 4's
-commit point added ~100 back plus the new error paths). That is **still over the 2,000-line
-ceiling F2 will enforce**, and the chart extraction was the only move F1 scoped for this file.
+All counts here are **production lines** = lines before the file's first top-level `#[cfg(test)]`.
+That is the method that reproduces the specs' own 3,984 baseline, and every figure below was
+re-measured with it rather than carried forward from an earlier draft.
+
+`worker/run.rs` production, phase by phase:
+
+| Point | Commit | Production | Δ |
+|---|---|---|---|
+| Spec baseline | `b378edd` | 3,984 | — |
+| After Phase 1 (B2) | `b61f052` | 4,036 | +52 |
+| After Phase 2 (B1) | `0f4ddd1` | 4,096 | +60 |
+| After Phase 3 — chart extraction | `bccd033` | **3,048** | **−1,048** |
+| After Phase 4 (E1) | `167d144` | 3,148 | +100 |
+| **As of this commit** (Phase 1/2 CR rounds) | — | **3,192** | +44 |
+
+So `3,984 + 52 + 60 − 1,048 + 100 + 44 = 3,192`. The chart extraction removed **1,048** lines
+(not the ~1,000/1,010 earlier drafts of this note claimed), and `worker/charts.rs` production
+landed at **1,113** at `bccd033`.
+
+**The reported figure is 3,192, measured as of this commit.** It will move again as later work
+lands — Phase 4's CR round in particular — so a future re-measure that differs is an update, not
+a contradiction of this note.
+
+**Prediction vs outcome.** `architecture.md` §A4.4 and `functional_spec.md` §F3 predicted the
+extraction would remove ≈1,180 and land `run.rs` at ≈2,800. It removed **1,048** and landed at
+**3,048** — ~130 fewer lines moved than predicted, and ~250 above the predicted landing point.
+
+The shortfall is **estimate error, not an incomplete extraction**: all 28 items §A4.1 listed (24
+`impl Worker` methods, 4 free functions, `AuthoredEntry`, `ChartUndo`) are gone from `run.rs` and
+present in `charts.rs`, and `charts.rs` production went 39 → 1,113, i.e. **+1,074** against
+`run.rs`'s −1,048 — the moved code did not shrink, the destination is slightly larger for its own
+module doc, imports and `impl` header. F1's ≈1,180 was an explicitly approximate sum of the chart
+items' spans; the real total was ~130 lines smaller. The ≈2,800 landing point additionally
+assumed the 3,984 baseline, but Phases 1–2 had already added 112 lines before the cut, which
+accounts for the rest of the ~250 gap (4,096 − 1,048 = 3,048, vs 3,984 − 1,180 = 2,804).
+
+**F2 next round should size off 3,192 and −1,048, not off 2,800 and −1,180.**
+
+That is **still over the 2,000-line ceiling F2 will enforce**, and the chart extraction was the
+only move F1 scoped for this file.
 
 Three further mechanical extractions get it under, and are recorded in the remediation plan's
 F2 entry rather than attempted here: `worker/clipboard.rs` (~420 lines — `components/clipboard.md`

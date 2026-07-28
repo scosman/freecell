@@ -2655,7 +2655,7 @@ impl Worker {
 
     /// The sheet list as `SheetMeta` (stable id + current name + `has_content`), in workbook
     /// order. `has_content` gates the UI's delete-confirm modal (`functional_spec.md §3.7`).
-    pub(super) fn sheet_metas(&self) -> Vec<SheetMeta> {
+    fn sheet_metas(&self) -> Vec<SheetMeta> {
         self.doc
             .sheet_properties_with_content()
             .into_iter()
@@ -3191,15 +3191,20 @@ fn clamp_span(range: std::ops::Range<u32>, sheet_max: u32, max_len: u32) -> std:
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(super) mod testutil {
+    //! Test helpers shared by this module's tests and those of its siblings under `mod worker`
+    //! (`charts.rs`, `client.rs`) — `architecture.md` §A4.2.
+    //!
+    //! They live in their own `pub(super)` module rather than in `mod tests` so that a sibling
+    //! never has to reach into another module's *test* module to borrow a helper. `mod tests`
+    //! itself stays private; only what is genuinely shared is exposed, and only within
+    //! `mod worker`.
+
     use super::*;
-    use crate::worker::protocol::StylePath;
-    use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
-    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, Rgb};
 
     /// Build a headless worker over a fresh empty workbook plus the event receiver, without a
     /// spawned thread — the deterministic substrate for the coalescing / recovery tests.
-    pub(in crate::worker) fn test_worker() -> (Worker, async_channel::Receiver<WorkerEvent>) {
+    pub fn test_worker() -> (Worker, async_channel::Receiver<WorkerEvent>) {
         let (tx, rx) = async_channel::unbounded();
         let doc = WorkbookDocument::new_empty().unwrap();
         let shared = Arc::new(Shared::new(SheetId(0)));
@@ -3239,13 +3244,11 @@ pub(super) mod tests {
     }
 
     /// The only sheet's stable id (what commands must address).
-    pub(in crate::worker) fn sheet0(worker: &Worker) -> SheetId {
+    pub fn sheet0(worker: &Worker) -> SheetId {
         worker.sheet_metas()[0].id
     }
 
-    pub(in crate::worker) fn drain_events(
-        rx: &async_channel::Receiver<WorkerEvent>,
-    ) -> Vec<WorkerEvent> {
+    pub fn drain_events(rx: &async_channel::Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             out.push(ev);
@@ -3253,7 +3256,7 @@ pub(super) mod tests {
         out
     }
 
-    pub(in crate::worker) fn set_input(sheet: SheetId, row: u32, col: u32, input: &str) -> Command {
+    pub fn set_input(sheet: SheetId, row: u32, col: u32, input: &str) -> Command {
         Command::SetCellInput {
             sheet,
             cell: CellRef::new(row, col),
@@ -3263,13 +3266,22 @@ pub(super) mod tests {
 
     /// Silence the default panic hook while `f` runs, so the injected-panic tests don't spew a
     /// scary (but expected) backtrace into the test log.
-    pub(in crate::worker) fn quiet_panics<R>(f: impl FnOnce() -> R) -> R {
+    pub fn quiet_panics<R>(f: impl FnOnce() -> R) -> R {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let r = f();
         std::panic::set_hook(prev);
         r
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
+    use crate::worker::protocol::StylePath;
+    use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, Rgb};
 
     #[test]
     fn drain_coalesces_burst_into_one_eval() {
@@ -4875,12 +4887,6 @@ pub(super) mod tests {
             }
         )));
     }
-
-    // --- Charts feedback item 4: chart ops on the unified undo timeline ----------------------
-
-    // --- P19: edit panel range/type ---------------------------------------------------------
-
-    // --- P20: chrome editing ----------------------------------------------------------------
 
     #[test]
     fn undo_redo_agreement_walk() {
@@ -6867,9 +6873,7 @@ pub(super) mod tests {
 
     /// A worker over an already-opened document (the merged fixture), with its active-sheet cache
     /// built — mirrors `test_worker` but takes the document.
-    pub(in crate::worker) fn worker_over(
-        doc: WorkbookDocument,
-    ) -> (Worker, async_channel::Receiver<WorkerEvent>) {
+    fn worker_over(doc: WorkbookDocument) -> (Worker, async_channel::Receiver<WorkerEvent>) {
         let (tx, rx) = async_channel::unbounded();
         let shared = Arc::new(Shared::new(SheetId(0)));
         let mut worker = Worker {

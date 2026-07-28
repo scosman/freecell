@@ -366,6 +366,7 @@ impl WorkerEventReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::run::testutil::quiet_panics;
     use freecell_core::{CfPreview, CfRuleView};
 
     fn sample_rule() -> CfRuleView {
@@ -448,7 +449,7 @@ mod tests {
         // The panic hook is process-global, so it is swapped from the PARENT thread with the
         // shared `quiet_panics` helper, around both the spawn and the wait — a hook swapped
         // inside the spawned thread would race every other test's panics.
-        let handle = super::super::run::tests::quiet_panics(|| {
+        let handle = quiet_panics(|| {
             let handle = std::thread::spawn(|| panic!("stand-in for an unguarded worker panic"));
             wait_finished(&handle);
             handle

@@ -344,6 +344,15 @@ ceiling CI will enforce next round. If it is still over — it will be, at ≈2,
 does not silently leave it over: it names what should move next, in the implementation plan's
 closing note, as input to F2 of the remediation plan.
 
+> **Outcome (measured).** The success criterion was met in substance but not in magnitude: the
+> extraction removed **1,048** production lines, not ≈1,180, and every existing test passed
+> unmodified in substance. `run.rs` landed at **3,048**, not ≈2,800, and is **3,192 as of this
+> commit** once Phase 4 and the Phase 1/2 CR rounds are counted — measured as of this commit and
+> expected to move again as later work lands. Still over the ceiling, exactly as this section
+> anticipated, so the closing-note obligation stands and is discharged there.
+> **F2 should be sized off 3,192 / −1,048, not off the ≈2,800 / ≈1,180 predicted here.** See
+> `architecture.md` §A4.4 and the `implementation_plan.md` closing note for the reconciliation.
+
 ---
 
 ## 4. F4 — One commit point for the four shared surfaces (E1)

@@ -9,9 +9,12 @@
 //! [`version`](ChartSnapshot::version) changed, so a scroll-only publish — or an edit that touches
 //! no chart — never re-installs.
 //!
-//! The `impl Worker` block here is the chart machinery **extracted from `run.rs`** (F1): it was
-//! ~1,000 production lines of a 3,984-line file whose subject already had this module. Nothing about
-//! it changed in the move — same commands, same events, same ordering. `run.rs` keeps the loop,
+//! The `impl Worker` block here is the chart machinery **extracted from `run.rs`** (F1), whose
+//! subject already had this module. The extraction took **1,048 production lines** out of
+//! `run.rs` (production 4,096 → 3,048, measured at the extraction commit; both counts drift as
+//! later work lands, so treat them as provenance, not as a current description of either file).
+//! Nothing about it changed in the move — same commands, same events, same ordering. `run.rs`
+//! keeps the loop,
 //! the publication and the save; this file keeps everything chart-shaped, including the pieces
 //! `save_workbook` calls into (`ensure_all_charts_discovered`, `authored_write_list`,
 //! `sheet_name_of`).
@@ -1212,7 +1215,9 @@ mod tests {
     use super::*;
     use crate::chart::binding::ChartBindings;
     use crate::worker::protocol::Command;
-    use crate::worker::run::tests::{drain_events, quiet_panics, set_input, sheet0, test_worker};
+    use crate::worker::run::testutil::{
+        drain_events, quiet_panics, set_input, sheet0, test_worker,
+    };
     use freecell_core::Rgb;
 
     /// A default authored-chart anchor (8 cols × 15 rows from A1), matching the chrome's insert.
@@ -1475,6 +1480,8 @@ mod tests {
         // The authored chart is untouched by the cell undo/redo.
         assert_eq!(worker.authored_charts.len(), 1);
     }
+
+    // --- Charts feedback item 4: chart ops on the unified undo timeline ----------------------
 
     /// Build + install a single **loaded** chart on `sheet` with the given `chart_part`, returning
     /// its assigned [`ChartId`]. Mirrors a discovered file-loaded chart so its delete/anchor undo can
@@ -1836,6 +1843,8 @@ mod tests {
         );
     }
 
+    // --- P19: edit panel range/type ---------------------------------------------------------
+
     /// A small data grid an authored chart can bind to: B1 header, A2:A3 categories, B2:B3 values.
     fn seed_chart_data(worker: &mut Worker, sheet: SheetId) {
         worker.process_batch(vec![
@@ -2101,6 +2110,8 @@ mod tests {
             freecell_chart_model::ChartKind::Line { .. }
         ));
     }
+
+    // --- P20: chrome editing ----------------------------------------------------------------
 
     /// The published authored chart's typed [`Chart`] (for chrome assertions).
     fn authored_chart(worker: &Worker, idx: usize) -> Chart {

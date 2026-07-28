@@ -545,6 +545,18 @@ mechanical, and is called out rather than accommodated.
 above the 2,000-line ceiling F2 will enforce. The implementation plan closes with a named
 proposal for what should move next; it does not attempt it.
 
+> **Outcome (measured, as of the Phase 3 CR commit).** The prediction above was optimistic on
+> both counts. The extraction removed **1,048** production lines, not ≈1,180, and `run.rs`
+> landed at **3,048**, not ≈2,800 — ~250 above the predicted point. Two independent causes,
+> both verified: (a) F1's ≈1,180 was an approximate sum of the chart items' spans and ran ~130
+> lines high — all 28 listed items did move, and `charts.rs` production went 39 → 1,113
+> (**+1,074**), so nothing was left behind; (b) the ≈2,800 assumed the 3,984 baseline, but
+> Phases 1–2 added 112 lines *before* the cut (4,096 − 1,048 = 3,048). With Phase 4 and the
+> Phase 1/2 CR rounds on top, `run.rs` production is **3,192 as of this commit** — it will move
+> again as later work lands, so re-measure rather than treating this figure as fixed. The
+> conclusion the prediction drew is unchanged: still well over the 2,000 ceiling.
+> **F2 should size off 3,192 / −1,048.** Full table: `implementation_plan.md` closing note.
+
 ---
 
 ## A5. Unit 4 — One commit point (E1)

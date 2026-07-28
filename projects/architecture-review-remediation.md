@@ -571,35 +571,67 @@ merge that removes the duplication for good is F3.
 from running them. Build the differential test before deciding how big the fix is — it may
 turn out they agree everywhere that matters, in which case the test is the deliverable.*
 
-**Outcome (v05-cleanup-1 P6, 2026-07-28): mostly DISPROVED as stated — the test is the
-deliverable, and it found a serious IronCalc bug instead.**
+**Outcome (v05-cleanup-1 P6, 2026-07-28; REVISED after code review, same day): PARTLY CONFIRMED.
+The first write-up of this outcome said "every divergence is IronCalc's, not chart-model's" — that
+was WRONG, and it was wrong because the test's carve-outs and corpus were both too loose.**
 
 *numfmt:* `chart-model`'s formatter is a **bounded subset** with a `renders_faithfully` predicate
 that already degrades out-of-subset codes, so the testable invariant is agreement *inside* that
 subset. `tests/numfmt_agreement.rs` (engine crate — preserves the ironcalc-free boundary) sweeps
-every `formatCode` in the repo's fixtures × sign/rounding/magnitude-boundary values. **Every
-divergence found is IronCalc's, not chart-model's.**
+every `formatCode` in the repo's fixtures, plus the everyday codes, × sign / rounding-band /
+magnitude-boundary values.
 
-**⚠ The big one: IronCalc renders negative numbers WITHOUT their minus sign** when
-`|value| < 1.5 × 10^-decimals` — a cell formatted `#,##0` holding **-1 displays "1"**. Reproduced
-end-to-end through the real app (worker + `SetStylePath(NumFmt)` + publication). Filed as
-[`projects/ironcalc-negative-sign-display.md`](ironcalc-negative-sign-display.md); needs a fork fix
-(one `fix/` branch, one upstream PR) and is more severe than the unit that found it. Also found:
-IronCalc rounds `0.5→"1"` but `2.5→"2"`, `1234.5→"1234"` — inconsistent with Excel and itself.
+**Three real `chart-model` defects, all found only after the review tightened the test:**
 
-Changing `chart-model` to round half-away-from-zero was tried and made agreement **strictly
-worse**; reverted, with the reason recorded in the code so it is not retried. `General` diverges by
-design (a tick-label formatter vs Excel's ~9 significant digits) — pinned in shape, filed as a
-data-label gap rather than "fixed" by putting `0.333333333` on an axis.
+1. **Negative zero.** `apply_number_format` decided the sign from `scaled < 0.0` *before* rounding,
+   so any negative that rounds to zero at the format's precision printed `-0`, `-0.00`, `-$0.00`,
+   `-0%`, `-0.00 kg`. Excel and IronCalc both print those unsigned. The original sign carve-out —
+   "chart says `-X`, cell says `X`" — matched all 15 of them alongside the 12 genuine IronCalc
+   cases, so the gate stayed green and the bug was invisible. Fixed: the sign now comes from the
+   rendered magnitude, the carve-out additionally requires a non-zero digit, and `chart-model`
+   gained the small-negative unit tests it had never had.
+2. **`#` treated as a required digit.** `FormatSpec::parse` counted `#` and `0` identically, so
+   `#,##0.0#` on 1.5 rendered `"1.50"` where the cell read `"1.5"` — with the chart classified
+   **Faithful and drawn with no badge**. The whole `#` family (`0.##`, `#,##0.##`, `#,##0.0#`,
+   `0.###`, `#,###`) was missing from the corpus, which is why nothing caught it. Fixed in
+   `chart-model` (optional trailing digits, the retained decimal separator Excel emits for `0.##` on
+   1, and integer suppression for an all-`#` integer run) and the family is now asserted.
+3. **Whitespace padding trimmed.** The applier ran `code.trim()`, silently dropping literal padding
+   the cell renders (`"0 "` on 1 is `1 ` in a cell). Fixed; `"0 "` is in the corpus.
 
-*`rgb_to_hsl`:* **DISPROVED.** The copies are in `freecell-app/src/chart/palette.rs` and
+**IronCalc defects remain real, and both were mischaracterised.** ⚠ **Negative numbers render
+WITHOUT their minus sign** — a cell formatted `#,##0` holding **-1 displays "1"**, reproduced
+end-to-end through the real app (worker + `SetStylePath(NumFmt)` + publication). The threshold is
+**≈`10^-decimals`**, *not* the `1.5 × 10^-decimals` first recorded (which is right only at zero
+decimals; measured 1.5 / 0.105 / 0.01005 / 0.0010005 at 0–3 dp). And IronCalc's **rounding is not a
+rule at all**: it pre-rounds to `precision + integer_digits` significant digits (half-to-even) and
+then rounds again, corrupting a band that includes positives — `0.45`, `0.46`, `0.49` all display as
+`1` under code `0`, and `0.96` displays as `0.0` under `0.0`. The earlier "half-to-even except 0.5"
+story was wrong; a fork fix written against it would not have fixed either case. Filed in
+[`projects/ironcalc-negative-sign-display.md`](ironcalc-negative-sign-display.md) and `GAPS.md`
+E6/E7, both corrected; needs a fork fix (one `fix/` branch, one upstream PR).
+
+Changing `chart-model` to round half-away-from-zero was tried and made agreement with **IronCalc**
+strictly worse — but IronCalc is itself wrong against Excel there, so the half-to-even choice is
+**pinned to a buggy reference**, not correct on its own merits, and must be revisited when the fork
+fix lands. That is now what the code comment says. `General` diverges by design (a tick-label
+formatter vs Excel's ~9 significant digits) — excluded from the gate with the argument written out,
+pinned in shape, and filed as a data-label gap rather than "fixed" by putting `0.333333333` on an
+axis.
+
+*`rgb_to_hsl`:* **DISPROVED.** The copies were in `freecell-app/src/chart/palette.rs` and
 `chart-model/src/theme.rs` (not `core`), and the `%` vs `.rem_euclid` difference is **normalised
-away** — both end with `.rem_euclid(360.0)`. Verified identical over the whole reachable input
-space. Guard test added; deduplication is F3.
+away** — `rgb_to_hsl` ends with `.rem_euclid(360.0)`, so it returns `h ∈ [0, 360)`, `hsl_to_rgb`'s
+`hp = h/60` is never negative, and `%` ≡ `rem_euclid` there for *every* input (not merely for the
+laps a sweep enumerates). Per architecture §6 the app copy is now **deleted** and the helpers are
+imported from `chart-model`; the equivalence test is replaced by one that pins `series_color`'s
+actual output per index — bit-identical to before, so no pixel moves.
 
 *Office palette:* **CONFIRMED** — `core::palette::FILL_PALETTE` and
 `chart_model::ThemePalette::office_default()` really are two definitions of the same ten colours.
-They agree; `tests/office_palette_agreement.rs` now enforces it slot by slot.
+They agree; `tests/office_palette_agreement.rs` now enforces it slot by slot, and the slot-coverage
+test is an exhaustive `match` (the previous `len() == len()` assertion compared two compile-time
+10s and could not fail).
 See `specs/projects/v05-cleanup-1/phase_plans/phase_6.md`.
 
 ### F3. Fold `freecell-chart-model` onto `freecell-core`

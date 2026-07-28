@@ -51,9 +51,10 @@ pub use spec::{
     Anchor, AnchorCell, CfRange, ChartBody, ChartId, ChartSpec, Origin, SourcePart, SourceXml,
 };
 pub use stroke::LineStroke;
-// `rgb_to_hsl` / `hsl_to_rgb` are exported so `freecell-app`'s series-colour cycle, which keeps
-// its own copy of both, can PIN their agreement in a test (unit F3a). Removing the duplicate
-// outright means merging the crates (unit F3).
+// `rgb_to_hsl` / `hsl_to_rgb` are exported because `freecell-app`'s series-colour cycle
+// (`chart/palette.rs`) CALLS them. It used to carry a byte-identical second copy; unit F3a proved
+// the two equivalent and deleted the copy, so this export is the single definition, not a hook for
+// a guard test.
 pub use theme::{hsl_to_rgb, rgb_to_hsl, ChartColor, ThemePalette, ThemeSlot};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
@@ -607,6 +608,11 @@ pub(crate) fn format_number(n: f64) -> String {
     while s.contains('.') && (s.ends_with('0') || s.ends_with('.')) {
         s.pop();
     }
+    // A magnitude that rounds away to zero must not keep its sign: `-0.0001` is `0`, not `-0`.
+    // (Same rule the `numfmt` applier uses — the sign belongs to the *rendered* number.)
+    if !s.chars().any(|c| c.is_ascii_digit() && c != '0') {
+        s = s.trim_start_matches('-').to_string();
+    }
     s
 }
 
@@ -629,6 +635,18 @@ mod tests {
         assert_eq!(Category::Number(2024.0).label(), "2024");
         assert_eq!(Category::Number(3.5).label(), "3.5");
         assert_eq!(Category::Number(3.250).label(), "3.25");
+    }
+
+    /// A magnitude that rounds away to nothing prints unsigned — the General/fall-back path must
+    /// not emit `-0` any more than the `numfmt` applier does.
+    #[test]
+    fn general_formatting_never_emits_negative_zero() {
+        assert_eq!(format_number(-0.0001), "0");
+        assert_eq!(format_number(-1e-9), "0");
+        assert_eq!(format_number(-0.0), "0");
+        // A value that still has a digit at three decimals keeps its sign.
+        assert_eq!(format_number(-0.001), "-0.001");
+        assert_eq!(format_number(-2.5), "-2.5");
     }
 
     #[test]

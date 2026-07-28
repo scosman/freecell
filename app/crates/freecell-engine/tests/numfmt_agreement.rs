@@ -10,7 +10,7 @@
 //! only crate that depends on **both**; putting it in `chart-model` would violate the
 //! ironcalc-free boundary the whole design rests on.
 //!
-//! # The invariant, and why it is scoped
+//! # The invariant, and how it is scoped
 //!
 //! `chart-model`'s formatter is deliberately a *subset*, with a companion predicate
 //! `renders_faithfully(code)`. A chart whose format codes fall **outside** that subset is
@@ -24,6 +24,26 @@
 //! A disagreement inside that set is a real bug: a chart labelled Faithful showing a different
 //! string than the data it plots. A disagreement outside it is already flagged, and closing it
 //! for real is F3 / G3.
+//!
+//! **`General` is the one in-subset code this gate does not assert, and that is a hole, not a
+//! property.** `renders_faithfully("General")` returns `true`, so by the invariant above the
+//! strings should match — and they do not: `chart-model`'s General is a *tick-label* formatter
+//! (three decimals, trimmed), IronCalc's is Excel's (~9 significant digits, scientific outside
+//! `[1e-8, 1e11)`). `functional_spec.md` §F3a offers exactly two remedies for a disagreement
+//! inside the subset — fix `chart-model` to match IronCalc, or (architecture §6 "Fix policy")
+//! make `renders_faithfully` return `false` so the chart degrades honestly. Neither is taken
+//! here, deliberately:
+//!
+//! - Matching IronCalc means axis ticks reading `0.333333333`, which is worse for the user than
+//!   the divergence it removes; and
+//! - returning `false` would badge **every chart with a General axis** — i.e. the default — as
+//!   Degraded, converting a legible rounding difference into a permanent ⚠ on almost every file.
+//!
+//! The honest fix is the third of the spec's three outcomes ("fix what is reachable, file the
+//! rest"): separating tick formatting from data-label formatting, which is chart-project work and
+//! is filed in `GAPS.md`. Until then, `general_differs_from_the_cell_only_by_rounding` below pins
+//! the *shape* of the divergence so it cannot silently widen, and this paragraph is the record
+//! that the exclusion is a known, argued gap rather than an oversight.
 //!
 //! Codes outside the subset are still *exercised* here — printed as an informational table by
 //! [`report_unfaithful_divergence`] — so the size of the disclosed gap is visible rather than
@@ -62,10 +82,22 @@ const FIXTURE_CODES: &[&str] = &[
 
 /// The everyday codes a chart axis or data label carries, beyond what the fixtures happen to
 /// contain — the subset `chart-model` claims to render exactly.
+///
+/// The `#` **optional-digit** family (`0.##`, `#,##0.##`, `#,##0.0#`, `0.###`, `#,###`) is here
+/// because it was missing when the gate was first written, and its absence hid a real
+/// `chart-model` defect: `FormatSpec::parse` counted `#` and `0` identically, so `#,##0.0#` on 1.5
+/// padded to `"1.50"` while the cell read `"1.5"` — with the chart classified Faithful and drawn
+/// with no badge. The whitespace-padded `"0 "` is here for the same reason (the applier used to
+/// `trim()` the code and silently drop the literal padding the cell renders).
+///
+/// `"0.0"` is here because it is the only single-decimal, non-percent code in the corpus, and it is
+/// what makes the value `0.96` reach IronCalc's **lost fractional carry** defect (`"0.0"` on 0.96
+/// displays `0.0`) — without it that half of E7 would be characterised but never exercised.
 const COMMON_CODES: &[&str] = &[
     "",
     "general",
     "0",
+    "0.0",
     "0.00",
     "0.000",
     "#,##0.00",
@@ -73,6 +105,12 @@ const COMMON_CODES: &[&str] = &[
     "$#,##0",
     "$#,##0.00",
     "#,##0.00 \"kg\"",
+    "0.##",
+    "#,##0.##",
+    "#,##0.0#",
+    "0.###",
+    "#,###",
+    "0 ",
 ];
 
 /// Codes deliberately **outside** the bounded subset. Not asserted — they exist so the
@@ -90,6 +128,10 @@ const OUT_OF_SUBSET_CODES: &[&str] = &[
 
 /// Values chosen to hit the places two independent implementations diverge: sign handling, the
 /// rounding half-way boundary, magnitudes that cross grouping and exponent thresholds.
+///
+/// `0.45`, `-0.46` and `0.96` are in the **E7 band** — the values IronCalc's double-rounding
+/// corrupts (see [`is_ironcalc_rounding_defect`]). They are here because the previous corpus
+/// contained nothing in that band except `±0.5`, which made a one-point carve-out look sufficient.
 const VALUES: &[f64] = &[
     0.0,
     1.0,
@@ -104,6 +146,9 @@ const VALUES: &[f64] = &[
     -0.005,
     0.001,  // rounds to zero at 2dp — the negative twin is the DOLLAR-style trap
     -0.001, //
+    0.45,   // E7: displays as "1" under code `0` (pre-rounded to 1 significant digit first)
+    -0.46,  // E7, negative twin
+    0.96,   // E7: displays as "0.0" under code `0.0` (the fractional carry is dropped)
     1_000_000.0,
     -1_000_000.0,
     1e-7,
@@ -111,54 +156,118 @@ const VALUES: &[f64] = &[
     0.3333333333333333,
 ];
 
+/// The format's fractional-digit count and percent scale — the two things IronCalc's rounding path
+/// is parameterised by, and which [`is_ironcalc_rounding_defect`] needs in order to locate the
+/// defective band. Mirrors `chart-model`'s own parse closely enough for the corpus (first section,
+/// placeholders between the first and last `0`/`#`).
+fn code_precision(code: &str) -> (usize, bool) {
+    let section = code.split(';').next().unwrap_or(code);
+    let percent = section.contains('%');
+    let decimals = match (section.find(['0', '#']), section.rfind(['0', '#'])) {
+        (Some(first), Some(last)) => section[first..=last]
+            .split_once('.')
+            .map(|(_, frac)| frac.chars().filter(|c| *c == '0' || *c == '#').count())
+            .unwrap_or(0),
+        _ => 0,
+    };
+    (decimals, percent)
+}
+
 /// The three carve-outs below are the *only* permitted disagreements, and each names a specific,
 /// characterised defect rather than waving the difference away. Everything else must match exactly.
 ///
-/// **1. IronCalc drops the minus sign on small negatives.** `format_number` returns an UNSIGNED
-/// string whenever `|value| < 1.5 × 10^-decimals` — so a cell formatted `#,##0` holding **-1
-/// displays "1"**, and `0.00` holding -0.005 displays "0.01". Verified end-to-end through the real
-/// app (worker + `SetStylePath(NumFmt)` + publication), not just through this helper. `General` is
-/// unaffected (a different code path in IronCalc), and larger magnitudes are fine: -1.5 renders
-/// "-2" and -1234.5 renders "-1,234".
+/// **1. IronCalc drops the minus sign on small negatives** (`GAPS.md` E6). `format_number` computes
+/// `is_negative = value < -(10^-precision)` **after** pre-rounding, so the sign is dropped whenever
+/// `|value| <= 10^-decimals` — a cell formatted `#,##0` holding **-1 displays "1"**, and `0.00`
+/// holding -0.005 displays "0.01". (Not `1.5 × 10^-decimals`, as this comment and `GAPS.md` used to
+/// say: that expression is only right at `decimals = 0`. Measured thresholds: `0` → ~1.05, `0.0` →
+/// ~0.105, `0.00` → ~0.0101, `0.000` → ~0.001.) Verified end-to-end through the real app (worker +
+/// `SetStylePath(NumFmt)` + publication), not just through this helper. `General` is unaffected (a
+/// different code path in IronCalc), and larger magnitudes are fine: -1.5 renders "-2" and -1234.5
+/// renders "-1,234".
 ///
 /// **`chart-model` is CORRECT here and IronCalc is wrong**, so "make them agree" must not be
 /// satisfied by copying the bug into the charts. This is an engine defect and belongs in the fork
 /// per CLAUDE.md §Engine (one `fix/` branch, one upstream PR); tracked in `GAPS.md`. When the fork
 /// carries the fix, delete this carve-out and the gate tightens by itself.
+///
+/// **The predicate is deliberately narrow.** It requires the chart's *unsigned* rendering to carry
+/// a non-zero digit, so it can only fire where a real number lost its sign. Without that clause it
+/// also swallowed 15 pairs where **`chart-model`** was the buggy side — it emitted `-0`, `-0.00`,
+/// `-$0.00`, `-0%`, `-0.00 kg` for negatives that round to zero, which Excel and IronCalc both
+/// print unsigned. That defect is fixed in `chart-model`; this clause makes sure the carve-out
+/// cannot hide its like again.
 fn is_ironcalc_sign_bug(value: f64, chart: &str, cell: &str) -> bool {
-    value < 0.0 && chart.starts_with('-') && !cell.contains('-') && chart[1..] == *cell
+    value < 0.0
+        && chart.starts_with('-')
+        && !cell.contains('-')
+        && chart[1..] == *cell
+        && chart[1..].contains(|c: char| c.is_ascii_digit() && c != '0')
 }
 
-/// **2. IronCalc rounds 0.5-at-zero-decimals inconsistently with itself.** `format_number` gives
-/// `0.5 → "1"` but `2.5 → "2"`, `4.5 → "4"`, `10.5 → "10"`, `1234.5 → "1234"` — half-to-even
-/// everywhere except that one value. `chart-model` uses `{:.n}` (half-to-even throughout) and so
-/// matches IronCalc on **every** other half-way case in the corpus, including `0.125 → "0.12"` and
-/// `2.675 → "2.67"`.
+/// **2. IronCalc's rounding is not a rounding rule** (`GAPS.md` E7). `formatter/format.rs` does not
+/// round once; it rounds in pieces, and the pieces disagree:
 ///
-/// Making `chart-model` round half-away-from-zero to fix `0.5` was tried and made agreement
-/// strictly worse — it broke 1234.5, 0.125 and every other half-way case to fix one. There is no
-/// rounding rule that matches an inconsistent reference, so this single value is carved out and
-/// the inconsistency is recorded as IronCalc's.
+/// 1. it pre-rounds with `to_precision(value, precision + integer_digits)` — round to that many
+///    **significant** digits, via Rust's `{:.*e}`, which is half-to-**even**; then
+/// 2. it renders the integer part with `value_abs.round()` when `precision == 0` (half **away from
+///    zero**) or `value_abs.floor()` plus a separately-rounded fractional string when
+///    `precision > 0`.
 ///
-/// The deviation is at the single value ±0.5 rendered at zero decimals, so the predicate tests
-/// exactly that — including after a percent code's ×100 scaling, which is how `0%` on 0.005
-/// reaches the same point (0.005 × 100 = 0.5 → IronCalc `"1%"`, chart `"0%"`).
-fn is_ironcalc_half_up_outlier(value: f64) -> bool {
-    let is_half = |v: f64| v.abs() == 0.5;
-    is_half(value) || is_half(value * 100.0)
+/// Two distinct corruptions fall out, and **both hit positives** — this is not, as the carve-out
+/// previously claimed, "half-to-even everywhere except the single value ±0.5":
+///
+/// - **Double rounding, `decimals == 0`, `|v| < 1`.** `floor(|v|)` prints as `"0"`, so step 1 keeps
+///   just **one** significant digit: `0.45`, `0.46`, `0.49` all become `0.5`, which step 2 then
+///   rounds away from zero to `"1"`. The correct answer is `"0"`. The band is `|v| ∈ [0.45, 0.5]`,
+///   whose endpoint `0.5` is the single value the old predicate tested — it looked sufficient only
+///   because `VALUES` contained nothing else in the band.
+/// - **Lost fractional carry, `decimals >= 1`, `|v| < 1`.** The integer part is `floor(|v|) = 0`
+///   while `get_fract_part` rounds the fraction separately and slices it as `"0.ddd"[2..]`; when the
+///   fraction rounds up to `1.0` the slice is empty and the carry is simply discarded. So `0.96`
+///   under `0.0` displays **`"0.0"`**, and `-0.96` displays `"-0.0"`.
+///
+/// For `|v| >= 1` step 1 rounds at exactly the rendered precision, so IronCalc lands on half-to-even
+/// — which is why `2.5 → "2"`, `4.5 → "4"`, `1234.5 → "1234"`. Excel is half-away-from-zero
+/// throughout (`2.5 → 3`), so **IronCalc and `chart-model` are both wrong there, in the same
+/// direction**; `chart-model`'s `{:.n}` is pinned to IronCalc's behaviour on purpose so the axis
+/// matches the cell beside it. A fork fix must therefore change more than `0.5`, and when it lands,
+/// half-away-from-zero becomes correct in `chart-model` too (see the comment on
+/// `numfmt::format_magnitude`).
+///
+/// The predicate takes the **code**, not just the value, because the band depends on the format's
+/// decimal count and percent scale — `0%` reaches the `decimals == 0` band at value `0.005`
+/// (0.005 × 100 = 0.5). The old predicate ignored `code` entirely while its doc claimed otherwise.
+fn is_ironcalc_rounding_defect(code: &str, value: f64) -> bool {
+    let (decimals, percent) = code_precision(code);
+    let magnitude = if percent { value * 100.0 } else { value }.abs();
+    if decimals == 0 {
+        // Pre-rounded to one significant digit, then rounded away from zero.
+        return (0.45..=0.5).contains(&magnitude);
+    }
+    // The fraction rounds up to 1.0 and the carry into the (zero) integer part is dropped.
+    magnitude < 1.0
+        && format!("{magnitude:.*}", decimals)
+            .parse::<f64>()
+            .is_ok_and(|rounded| rounded >= 1.0)
 }
 
 /// **3. An empty format code is not a thing a cell can have.** OOXML lets a chart carry
 /// `formatCode=""`, which `chart-model` reasonably treats as General; IronCalc's formatter returns
-/// `#VALUE!` because a *cell* always has a format string. Comparing them here measures an input
-/// the cell path cannot receive.
+/// `#VALUE!` because a *cell* always has a format string. Comparing them here measures an input the
+/// cell path cannot receive.
+///
+/// This is a **pin, not a waiver**: the empty code is fed through the gate (it is not skipped with
+/// `General`) precisely so that `#VALUE!` is asserted rather than assumed. Written the other way —
+/// skipping the empty code alongside General — the predicate fired zero times and the claim that
+/// IronCalc answers `#VALUE!` was documented but untested.
 fn is_empty_code_artifact(code: &str, cell: &str) -> bool {
     code.trim().is_empty() && cell == "#VALUE!"
 }
 
-/// **The gate.** Inside the faithful subset, for every explicit numeric code, the chart label and
-/// the cell must be byte-identical. (`General` has its own test below — it is a deliberate
-/// tick-label formatter, not an exact renderer.)
+/// **The gate.** Inside the faithful subset, for every code but `General`, the chart label and the
+/// cell must be byte-identical. (`General` has its own test below, and the module docs argue why it
+/// is excluded rather than fixed or badged.)
 #[test]
 fn chart_and_cell_agree_on_every_faithfully_rendered_code() {
     let mut disagreements: Vec<String> = Vec::new();
@@ -170,10 +279,12 @@ fn chart_and_cell_agree_on_every_faithfully_rendered_code() {
         for &value in VALUES {
             let chart = apply_number_format(code, value);
             let cell = ironcalc(code, value);
+            // `is_empty_code_artifact` is tested FIRST: an empty code never reaches a numeric
+            // format path at all, so the other two predicates have nothing to say about it.
             if chart == cell
-                || is_ironcalc_sign_bug(value, &chart, &cell)
-                || is_ironcalc_half_up_outlier(value)
                 || is_empty_code_artifact(code, &cell)
+                || is_ironcalc_sign_bug(value, &chart, &cell)
+                || is_ironcalc_rounding_defect(code, value)
             {
                 continue;
             }
@@ -197,9 +308,10 @@ fn chart_and_cell_agree_on_every_faithfully_rendered_code() {
     );
 }
 
+/// `General` only — the empty code is **not** skipped, so that `is_empty_code_artifact` pins
+/// IronCalc's `#VALUE!` instead of documenting it.
 fn is_general(code: &str) -> bool {
-    let c = code.trim();
-    c.is_empty() || c.eq_ignore_ascii_case("General")
+    code.trim().eq_ignore_ascii_case("General")
 }
 
 /// **`General` is deliberately different, and this test pins how.**
@@ -212,33 +324,53 @@ fn is_general(code: &str) -> bool {
 /// That is a real fidelity gap for data labels (tracked in `GAPS.md`), but it is **not** a bug to
 /// close by making axis ticks print `0.333333333` — nobody wants that on an axis. Closing it
 /// properly means separating tick formatting from label formatting, which is chart-project work,
-/// not F3a's. This test therefore asserts the *shape* of the divergence so it cannot silently
-/// widen: General must agree on everything an axis realistically shows, and may differ only by
-/// showing FEWER digits.
+/// not F3a's (the module docs argue the exclusion in full). This test therefore asserts the *shape*
+/// of the divergence so it cannot silently widen: the chart must print **the same number with
+/// fewer digits** — never a different number, never more than three decimals, never a signed zero.
 #[test]
-fn general_differs_from_the_cell_only_by_rounding_to_three_decimals() {
+fn general_differs_from_the_cell_only_by_rounding() {
     for &value in VALUES {
         let chart = apply_number_format("General", value);
         let cell = ironcalc("General", value);
         if chart == cell {
             continue;
         }
-        // Whatever the chart prints must be a correctly-rounded, shorter rendering — never a
-        // different number, and never longer than what the cell shows.
         let reparsed: f64 = chart.parse().unwrap_or_else(|_| {
             panic!("General produced a non-numeric label {chart:?} for {value} (cell: {cell:?})")
         });
-        let tolerance = (value.abs() * 1e-3).max(5e-4);
+
+        // 1. Same number: exactly `value` rounded to three decimals, not merely "close to" it.
+        //    (The old relative tolerance would have accepted 1233.3 for 1234.5, and only two of
+        //    the corpus values ever reached it.)
+        let expected: f64 = format!("{value:.3}").parse().expect("`{:.3}` parses back");
+        assert_eq!(
+            reparsed, expected,
+            "General on the chart rendered {value} as {chart:?} — that is not {value} rounded to \
+             three decimals, it is a different number (cell shows {cell:?})",
+        );
+
+        // 2. Fewer digits, never more: at most three fractional digits, and no trailing zeros.
+        let fractional = chart.split_once('.').map_or("", |(_, frac)| frac);
         assert!(
-            (reparsed - value).abs() <= tolerance || value.abs() >= 1e11,
-            "General on the chart rendered {value} as {chart:?} — that is not the same number \
-             rounded, it is a different one (cell shows {cell:?})",
+            fractional.len() <= 3 && !fractional.ends_with('0'),
+            "General on the chart rendered {value} as {chart:?} — a tick label must be the SHORTER \
+             rendering (<= 3 fractional digits, trimmed), not a longer or padded one (cell shows \
+             {cell:?})",
+        );
+
+        // 3. Never a signed zero: `-0` is not "the same number with fewer digits".
+        assert!(
+            !(chart.starts_with('-') && !chart.contains(|c: char| c.is_ascii_digit() && c != '0')),
+            "General on the chart rendered {value} as {chart:?} — a magnitude that rounds away to \
+             zero must print unsigned (cell shows {cell:?})",
         );
     }
 }
 
 /// Codes *outside* the subset are allowed to disagree (the chart is badged `Degraded`), but the
-/// size of that gap should be visible rather than assumed. This test cannot fail; run it with
+/// size of that gap should be visible rather than assumed. Informational only — the assertion that
+/// `OUT_OF_SUBSET_CODES` really is out of subset lives in
+/// [`the_faithful_subset_is_actually_a_subset`], so this test genuinely cannot fail. Run it with
 /// `--nocapture` to read the table.
 #[test]
 fn report_unfaithful_divergence() {
@@ -246,11 +378,6 @@ fn report_unfaithful_divergence() {
     let mut differing = 0usize;
     println!("codes OUTSIDE the faithful subset (chart shows ⚠, disagreement is disclosed):");
     for code in OUT_OF_SUBSET_CODES {
-        assert!(
-            !renders_faithfully(code),
-            "{code:?} is in the faithful subset — move it to COMMON_CODES so it is ASSERTED, not \
-             merely reported",
-        );
         for &value in VALUES {
             rows += 1;
             let chart = apply_number_format(code, value);
@@ -279,6 +406,51 @@ fn the_faithful_subset_is_actually_a_subset() {
     );
     assert!(
         OUT_OF_SUBSET_CODES.iter().all(|c| !renders_faithfully(c)),
-        "the out-of-subset corpus is not out of subset",
+        "the out-of-subset corpus is not out of subset — move any faithful code to COMMON_CODES so \
+         it is ASSERTED, not merely reported",
+    );
+}
+
+/// Each carve-out must stay a *carve-out*: a named, characterised defect that suppresses a handful
+/// of pairs, not a blanket that quietly swallows new disagreements as the corpus grows. This test
+/// reports the suppression counts and fails if any one of them runs away.
+#[test]
+fn the_carve_outs_suppress_only_a_handful_of_pairs() {
+    let (mut sign, mut rounding, mut empty, mut agree, mut total) = (0, 0, 0, 0, 0);
+    for code in FIXTURE_CODES.iter().chain(COMMON_CODES) {
+        if !renders_faithfully(code) || is_general(code) {
+            continue;
+        }
+        for &value in VALUES {
+            total += 1;
+            let chart = apply_number_format(code, value);
+            let cell = ironcalc(code, value);
+            if chart == cell {
+                agree += 1;
+            } else if is_empty_code_artifact(code, &cell) {
+                empty += 1;
+            } else if is_ironcalc_sign_bug(value, &chart, &cell) {
+                sign += 1;
+            } else if is_ironcalc_rounding_defect(code, value) {
+                rounding += 1;
+            }
+        }
+    }
+    println!(
+        "carve-outs over {total} in-subset pairs: {agree} agree, \
+         {sign} IronCalc sign bug (E6), {rounding} IronCalc rounding defect (E7), \
+         {empty} empty-code `#VALUE!`",
+    );
+    assert!(
+        sign > 0 && rounding > 0 && empty > 0,
+        "a carve-out fired ZERO times (sign {sign}, rounding {rounding}, empty {empty}) — either \
+         the fork landed the fix (delete the carve-out and let the gate tighten) or the corpus no \
+         longer reaches the defect it documents",
+    );
+    assert!(
+        sign + rounding + empty < total / 4,
+        "the carve-outs now suppress {} of {total} in-subset pairs — that is no longer a carve-out \
+         for a characterised defect, it is a hole. Re-derive each predicate before widening it.",
+        sign + rounding + empty,
     );
 }

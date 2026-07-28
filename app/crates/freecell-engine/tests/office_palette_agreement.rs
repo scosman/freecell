@@ -70,9 +70,67 @@ fn the_cell_fill_palette_and_the_chart_theme_palette_are_the_same_colours() {
 
 /// The swatch list is exactly the theme's ten UI-exposed slots — no more, no fewer. `hlink` /
 /// `folHlink` are theme slots with no fill swatch, which is correct (Excel does not offer them in
-/// the fill dropdown) and is asserted here so adding one to `ThemePalette` does not quietly leave
-/// the two lists different lengths.
+/// the fill dropdown), and every *other* slot must appear in `EXPECTED`.
+///
+/// The classification is an **exhaustive `match`** rather than a length comparison on purpose: the
+/// previous version asserted `FILL_PALETTE.len() == EXPECTED.len()`, and both sides are the
+/// compile-time constant 10, so it was a tautology that could never fail. Adding a variant to
+/// `ThemeSlot` now fails to **compile** here until someone decides, explicitly, whether it is a
+/// fill swatch or not.
 #[test]
-fn the_swatch_list_covers_exactly_the_ten_ui_slots() {
-    assert_eq!(FILL_PALETTE.len(), EXPECTED.len());
+fn every_theme_slot_is_either_a_fill_swatch_or_a_declared_non_swatch() {
+    /// Exhaustive over `ThemeSlot` — no wildcard arm, so a new variant is a compile error.
+    fn is_ui_fill_swatch(slot: ThemeSlot) -> bool {
+        match slot {
+            ThemeSlot::Light1
+            | ThemeSlot::Dark1
+            | ThemeSlot::Light2
+            | ThemeSlot::Dark2
+            | ThemeSlot::Accent1
+            | ThemeSlot::Accent2
+            | ThemeSlot::Accent3
+            | ThemeSlot::Accent4
+            | ThemeSlot::Accent5
+            | ThemeSlot::Accent6 => true,
+            // Theme colours with no fill swatch: Excel does not offer them in the fill dropdown.
+            ThemeSlot::Hyperlink | ThemeSlot::FollowedHyperlink => false,
+        }
+    }
+
+    // Every slot the match calls a swatch is mapped by EXPECTED, and vice versa.
+    for (_, slot) in EXPECTED {
+        assert!(
+            is_ui_fill_swatch(slot),
+            "{slot:?} is mapped to a fill swatch by EXPECTED but the exhaustive classification \
+             says it has none",
+        );
+    }
+    let all_slots = [
+        ThemeSlot::Light1,
+        ThemeSlot::Dark1,
+        ThemeSlot::Light2,
+        ThemeSlot::Dark2,
+        ThemeSlot::Accent1,
+        ThemeSlot::Accent2,
+        ThemeSlot::Accent3,
+        ThemeSlot::Accent4,
+        ThemeSlot::Accent5,
+        ThemeSlot::Accent6,
+        ThemeSlot::Hyperlink,
+        ThemeSlot::FollowedHyperlink,
+    ];
+    for slot in all_slots {
+        assert_eq!(
+            is_ui_fill_swatch(slot),
+            EXPECTED.iter().any(|(_, mapped)| *mapped == slot),
+            "{slot:?} is classified as a fill swatch = {} but EXPECTED disagrees — a theme slot \
+             gained or lost its swatch and the two crates' lists are now different lengths",
+            is_ui_fill_swatch(slot),
+        );
+    }
+    assert_eq!(
+        FILL_PALETTE.len(),
+        EXPECTED.len(),
+        "FILL_PALETTE and the slot mapping have different lengths",
+    );
 }

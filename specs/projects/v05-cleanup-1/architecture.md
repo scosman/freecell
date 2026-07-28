@@ -457,6 +457,10 @@ Two separate claims, each with its own experiment:
    and the fix is **deduplication** (export the `chart-model` implementation, delete the app
    copy) so it cannot become live — a strictly-smaller change than the review implied, and
    free of crate-graph impact since `freecell-app` already depends on `freecell-chart-model`.
+   **(Implemented 2026-07-28. Phase 6 first did only the export, leaving more public API *and* the
+   duplicate; flagged in code review and corrected — the app copy is deleted and the helpers are
+   imported. "Export **and** delete" is the whole instruction; doing half of it is worse than
+   doing neither.)**
 2. **Two Office palettes.** Reconnaissance suggests these are not duplicates:
    `chart_model::ThemePalette::office_default()` is the theme **accent-slot** palette, while
    `freecell-core::palette::FILL_PALETTE` is the cell-fill **swatch list** that happens to

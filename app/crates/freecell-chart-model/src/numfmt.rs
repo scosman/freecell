@@ -4,9 +4,10 @@
 //!
 //! A `formatCode` comes from `<c:numFmt formatCode="…">` on an axis or inside a `c:dLbls`;
 //! [`apply_number_format`] turns a numeric tick/value into its label text under that code. The
-//! supported subset is the everyday chart cases — General, percent, thousands grouping, fixed
-//! decimals, and a currency/text affix — and it **falls back to general formatting** for anything
-//! it does not parse (dates, scientific, fractions, section conditionals), so an unknown code
+//! supported subset is the everyday chart cases — General, percent, thousands grouping, required
+//! (`0`) and optional (`#`) decimal placeholders, and a currency/text affix — and it **falls back
+//! to general formatting** for anything it does not parse (dates, scientific, fractions, section
+//! conditionals), so an unknown code
 //! degrades to a readable number rather than misformatting or panicking. [`renders_faithfully`]
 //! reports whether a code is inside that subset — the fidelity accessor uses it so a code we
 //! render exactly is Faithful while one we fall back on still degrades.
@@ -19,8 +20,11 @@ use crate::format_number;
 /// subset). Unsupported constructs (scientific, dates, fractions, section conditionals) fall back
 /// to general formatting.
 pub fn apply_number_format(code: &str, value: f64) -> String {
-    let code = code.trim();
-    if code.is_empty() || code.eq_ignore_ascii_case("General") {
+    // Only the *General* test trims: leading/trailing whitespace elsewhere in a format code is
+    // literal padding that Excel and IronCalc both render (`"0 "` on 1 shows `1 `), so the parsed
+    // section keeps it. Trimming here used to drop that character silently.
+    let trimmed = code.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("General") {
         return format_number(value);
     }
 
@@ -32,21 +36,29 @@ pub fn apply_number_format(code: &str, value: f64) -> String {
     };
 
     let scaled = if spec.percent { value * 100.0 } else { value };
+    let magnitude = format_magnitude(scaled.abs(), &spec);
     let mut out = String::new();
-    if scaled < 0.0 {
+    // The sign is decided from the **rendered magnitude**, not from the raw value: a negative that
+    // rounds to zero at the format's precision must print unsigned, because that is what Excel
+    // shows (`-0.001` under `0.00` is `0.00`, not `-0.00`) and what IronCalc shows. Testing
+    // `scaled < 0.0` *before* rounding is what made this emit `-0`, `-0.00`, `-$0.00`, `-0%` —
+    // a chart-model defect that the differential gate's sign carve-out hid for a while.
+    if scaled < 0.0 && has_significant_digit(&magnitude) {
         out.push('-');
     }
     out.push_str(&spec.prefix);
-    out.push_str(&format_magnitude(
-        scaled.abs(),
-        spec.decimals,
-        spec.grouping,
-    ));
+    out.push_str(&magnitude);
     out.push_str(&spec.suffix);
     if spec.percent {
         out.push('%');
     }
     out
+}
+
+/// Whether a rendered magnitude carries any non-zero digit — i.e. whether it is a number a minus
+/// sign should be attached to. `"0.00"`, `"0"`, `""` and `"."` are all "rendered zero".
+fn has_significant_digit(magnitude: &str) -> bool {
+    magnitude.chars().any(|c| c.is_ascii_digit() && c != '0')
 }
 
 /// Whether [`apply_number_format`] renders `code` **exactly as authored** (rather than
@@ -55,9 +67,10 @@ pub fn apply_number_format(code: &str, value: f64) -> String {
 /// are ones we render is Faithful, while a code we only approximate stays Degraded (⚠ badge).
 ///
 /// `true` for the supported subset: empty / `General`, and a **single**, non-conditional section
-/// the applier parses exactly (percent, thousands **grouping**, fixed decimals, currency/text
-/// affix). `false` for codes outside it — a **multi-section** code (`;`, whose negative/zero/text
-/// sections the applier drops), a **conditional** section (`[<`/`[>`/`[=`, which selects a format
+/// the applier parses exactly (percent, thousands **grouping**, required (`0`) **and optional
+/// (`#`)** digit placeholders, currency/text affix, literal whitespace padding). `false` for codes
+/// outside it — a **multi-section** code (`;`, whose negative/zero/text sections the applier
+/// drops), a **conditional** section (`[<`/`[>`/`[=`, which selects a format
 /// by value), a **scaling comma** (a `,` after the last digit placeholder — Excel's ÷1000-per-comma
 /// "in thousands / millions" scale, which the applier silently ignores, e.g. `#,##0,` → `1,235`
 /// but we'd emit `1,234,567`), an **unhandled control/format char** (`_` column-align, `*`
@@ -66,8 +79,10 @@ pub fn apply_number_format(code: &str, value: f64) -> String {
 /// accepts several of these and renders them wrong — being *called* Faithful is what would hide the
 /// mis-render, so this gate rejects them even though the applier still produces (approximate) output.
 pub fn renders_faithfully(code: &str) -> bool {
-    let code = code.trim();
-    if code.is_empty() || code.eq_ignore_ascii_case("General") {
+    // Only the General test trims — everything below inspects the code the applier actually
+    // parses, whitespace padding included (see [`apply_number_format`]).
+    let trimmed = code.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("General") {
         return true;
     }
     // The applier honors only the positive section, so a multi-section code renders its negative /
@@ -147,8 +162,20 @@ struct FormatSpec {
     prefix: String,
     /// Literal text after the number (excluding a trailing `%`, handled separately).
     suffix: String,
-    /// Digits after the decimal point.
+    /// **Maximum** digits after the decimal point — every `0`/`#` placeholder in the fractional
+    /// run. The value is rounded to this many places.
     decimals: usize,
+    /// **Minimum** digits after the decimal point — the placeholders up to and including the last
+    /// required (`0`) one. Fractional digits beyond this are `#` *optional* digits and are dropped
+    /// when they are trailing zeros, which is what makes `#,##0.0#` print `1.5`, not `1.50`.
+    min_decimals: usize,
+    /// Whether the section has a decimal separator inside its numeric run. Excel (and IronCalc)
+    /// keep the separator even when every fractional digit is suppressed — `0.##` on 1 is `1.`.
+    decimal_point: bool,
+    /// Whether the integer run is made only of optional (`#`) placeholders, in which case an
+    /// integer part that rounds to zero renders as nothing at all (`#,###` on 0 is the empty
+    /// string; `#.##` on 0.5 is `.5`).
+    integer_optional: bool,
     /// Whether to group the integer part in thousands.
     grouping: bool,
     /// Whether the code is a percentage (scales the value by 100 and appends `%`).
@@ -202,10 +229,26 @@ impl FormatSpec {
         let last = cleaned.rfind(|c| placeholders.contains(c))?;
         let numeric = &cleaned[first..=last];
         let grouping = numeric.contains(',');
-        let decimals = numeric
-            .split_once('.')
-            .map(|(_, frac)| frac.chars().filter(|c| placeholders.contains(*c)).count())
-            .unwrap_or(0);
+        let (integer_run, fractional_run) = match numeric.split_once('.') {
+            Some((int_run, frac)) => (int_run, Some(frac)),
+            None => (numeric, None),
+        };
+        // `0` is a REQUIRED digit, `#` an OPTIONAL one (ECMA-376 §18.8.31). Counting them
+        // identically is what made `#,##0.0#` pad 1.5 to "1.50" where Excel and IronCalc show
+        // "1.5". `decimals` is the rounding precision (all placeholders); `min_decimals` stops at
+        // the last required one, and anything past it is trimmed if it is a trailing zero.
+        let decimal_point = fractional_run.is_some();
+        let (decimals, min_decimals) = match fractional_run {
+            Some(frac) => {
+                let digits: Vec<char> =
+                    frac.chars().filter(|c| placeholders.contains(*c)).collect();
+                let required = digits.iter().rposition(|c| *c == '0').map_or(0, |i| i + 1);
+                (digits.len(), required)
+            }
+            None => (0, 0),
+        };
+        // An all-`#` integer run suppresses a zero integer part entirely, the way Excel does.
+        let integer_optional = !integer_run.contains('0');
 
         // Prefix / suffix are the literal text around the numeric run, minus quotes, escapes, and
         // the percent sign (appended separately).
@@ -216,6 +259,9 @@ impl FormatSpec {
             prefix,
             suffix,
             decimals,
+            min_decimals,
+            decimal_point,
+            integer_optional,
             grouping,
             percent,
         })
@@ -250,30 +296,51 @@ fn literal(fragment: &str) -> String {
     out
 }
 
-/// Format a non-negative magnitude with `decimals` fractional digits and optional thousands
-/// grouping of the integer part.
-fn format_magnitude(value: f64, decimals: usize, grouping: bool) -> String {
-    // Rounding is `{:.n}`'s — half to EVEN — and that is deliberate, not an oversight. Unit F3a's
-    // differential test (`freecell-engine/tests/numfmt_agreement.rs`) swept every half-way value in
-    // the corpus against IronCalc, which formats the cells these labels sit beside: the two agree
-    // on 2.5→"2", 4.5→"4", 10.5→"10", 1234.5→"1234", 0.125→"0.12", 2.675→"2.67" — everywhere
-    // except 0.5-at-zero-decimals, where IronCalc alone rounds up (inconsistently with its own
-    // 2.5→"2"). Switching this to half-away-from-zero was tried and made agreement strictly
-    // WORSE, breaking every case in that list to fix one. Leave it.
-    let fixed = format!("{value:.decimals$}");
+/// Format a non-negative magnitude under `spec`: round to `spec.decimals` places, trim optional
+/// (`#`) trailing zeros back to `spec.min_decimals`, group the integer part if asked, and suppress
+/// a zero integer part when the integer run is all-`#`.
+fn format_magnitude(value: f64, spec: &FormatSpec) -> String {
+    // ROUNDING: `{:.n}` is half-to-EVEN, and that is **pinned to IronCalc's current behaviour, not
+    // to correctness**. Excel rounds half AWAY from zero (2.5→3, 1234.5→1235); IronCalc does not
+    // implement a single rule at all — `formatter/format.rs` pre-rounds through
+    // `to_precision(value, precision + integer_digits)`, whose `{:.*e}` is half-to-even, and only
+    // then rounds/floors again, so it lands on half-to-even for |v| ≥ 1 while a separate
+    // double-rounding path corrupts |v| < 1 (`0.45`, `0.46`, `0.49` all display as `1` under code
+    // `0`). Half-to-even here therefore matches the *cells beside the chart* on 2.5→"2",
+    // 1234.5→"1234", 0.125→"0.12" — which is why switching to half-away-from-zero made the
+    // differential gate strictly worse when it was tried.
+    //
+    // It also means both sides are wrong versus Excel on those ties. That is deliberate and
+    // TEMPORARY: the IronCalc rounding defect is `GAPS.md` E7 and is a fork fix. **When the fork
+    // lands it, half-away-from-zero becomes the correct rule here and this line should be revisited
+    // together with the gate's `is_ironcalc_rounding_defect` carve-out** — do not treat the
+    // half-to-even choice as settled on its own merits.
+    let fixed = format!("{value:.*}", spec.decimals);
     let (int_part, frac_part) = match fixed.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (fixed.as_str(), None),
+        Some((i, f)) => (i, f),
+        None => (fixed.as_str(), ""),
     };
-    let int_out = if grouping {
+
+    // `#` placeholders past the last required `0` are optional: drop them when they are zeros.
+    let mut frac = frac_part;
+    while frac.len() > spec.min_decimals && frac.ends_with('0') {
+        frac = &frac[..frac.len() - 1];
+    }
+
+    let mut out = if spec.integer_optional && int_part == "0" {
+        String::new()
+    } else if spec.grouping {
         group_thousands(int_part)
     } else {
         int_part.to_string()
     };
-    match frac_part {
-        Some(f) => format!("{int_out}.{f}"),
-        None => int_out,
+    // The separator is a literal in the format string: Excel and IronCalc both emit it even when
+    // every fractional digit was optional and got trimmed (`0.##` on 1 → `1.`).
+    if spec.decimal_point {
+        out.push('.');
+        out.push_str(frac);
     }
+    out
 }
 
 /// Insert `,` thousands separators into a run of integer digits (ASCII digits only, as produced
@@ -341,6 +408,69 @@ mod tests {
     fn negatives_get_a_leading_sign() {
         assert_eq!(apply_number_format("#,##0", -1500.0), "-1,500");
         assert_eq!(apply_number_format("0.0%", -0.05), "-5.0%");
+        // The sign survives as soon as the rendered magnitude has a digit to carry it.
+        assert_eq!(apply_number_format("0.00", -0.005), "-0.01");
+        assert_eq!(apply_number_format("0.000", -0.001), "-0.001");
+    }
+
+    /// A negative that **rounds to zero at the format's precision** must print unsigned — Excel
+    /// shows `0.00` for -0.001 under `0.00`, never `-0.00`, and so does IronCalc. Deciding the sign
+    /// from the raw value before rounding emitted `-0`, `-0.00`, `-$0.00`, `-0%`, `-0.00 kg`; the
+    /// F3a differential gate's sign carve-out was broad enough to hide all of them, and this crate
+    /// had no small-negative test of its own to catch it.
+    #[test]
+    fn negatives_that_round_to_zero_print_unsigned() {
+        assert_eq!(apply_number_format("0", -0.4), "0");
+        assert_eq!(apply_number_format("#,##0", -0.005), "0");
+        assert_eq!(apply_number_format("0.00", -0.001), "0.00");
+        assert_eq!(apply_number_format("$#,##0.00", -0.001), "$0.00");
+        assert_eq!(apply_number_format("0%", -0.001), "0%");
+        assert_eq!(apply_number_format("0.00\" kg\"", -0.0001), "0.00 kg");
+        assert_eq!(apply_number_format("0.000", -1e-7), "0.000");
+        // Zero itself is unsigned whichever way it arrives.
+        assert_eq!(apply_number_format("0.00", -0.0), "0.00");
+    }
+
+    /// `#` is an **optional** digit: trailing zeros it would fill are suppressed down to the last
+    /// required `0`. Counting `#` and `0` identically padded `1.5` to `"1.50"` under `#,##0.0#`
+    /// while the cell beside it read `1.5`.
+    #[test]
+    fn optional_hash_digits_suppress_trailing_zeros() {
+        assert_eq!(apply_number_format("#,##0.0#", 1.5), "1.5");
+        assert_eq!(apply_number_format("#,##0.0#", 1.25), "1.25");
+        assert_eq!(apply_number_format("#,##0.0#", 1.0), "1.0");
+        assert_eq!(apply_number_format("0.##", 0.5), "0.5");
+        assert_eq!(apply_number_format("0.##", 0.125), "0.12");
+        assert_eq!(apply_number_format("0.###", 0.3333333333333333), "0.333");
+        // Every fractional digit optional and all of them zero: the separator is a literal in the
+        // format string, so Excel and IronCalc still emit it.
+        assert_eq!(apply_number_format("0.##", 1.0), "1.");
+        assert_eq!(apply_number_format("#,##0.##", 1000000.0), "1,000,000.");
+    }
+
+    /// An all-`#` integer run has no required digit, so an integer part that rounds to zero renders
+    /// as nothing at all — `#,###` on 0 is blank in Excel, and `#.##` on 0.5 is `.5`.
+    #[test]
+    fn optional_integer_run_suppresses_a_zero_integer_part() {
+        assert_eq!(apply_number_format("#,###", 0.0), "");
+        assert_eq!(apply_number_format("#,###", 0.4), "");
+        assert_eq!(apply_number_format("#,###", -0.4), "");
+        assert_eq!(apply_number_format("#,###", 1234.0), "1,234");
+        assert_eq!(apply_number_format("#.##", 0.5), ".5");
+        assert_eq!(apply_number_format("#.##", -0.5), "-.5");
+        assert_eq!(apply_number_format("#.##", -0.001), ".");
+        // A required `0` anywhere in the integer run keeps it.
+        assert_eq!(apply_number_format("#,##0", 0.0), "0");
+    }
+
+    /// Whitespace in a format code is literal padding the cell renders, so the applier must not
+    /// trim it away. (Only the `General`/empty test trims.)
+    #[test]
+    fn literal_whitespace_padding_is_kept() {
+        assert_eq!(apply_number_format("0 ", 1.0), "1 ");
+        assert_eq!(apply_number_format("0 ", -1234.5), "-1234 ");
+        assert_eq!(apply_number_format("   ", 42.0), "42");
+        assert_eq!(apply_number_format("  General  ", 42.0), "42");
     }
 
     #[test]
@@ -357,6 +487,9 @@ mod tests {
         // rejected (see the reject test).
         for code in [
             "", "General", "general", "0", "0.00", "#,##0", "#,##0.00", "0%", "0.0%", "$#,##0",
+            // The optional-digit (`#`) family renders exactly too, now that `#` is honored as an
+            // optional placeholder rather than counted as a required one.
+            "0.##", "#,##0.##", "#,##0.0#", "0.###", "#,###", "0 ",
         ] {
             assert!(
                 renders_faithfully(code),

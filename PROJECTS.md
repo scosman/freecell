@@ -73,7 +73,9 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 - **IronCalc drops the minus sign on small negatives** — *v0.5. Filed, unfixed — needs a fork fix.*
   A cell formatted `#,##0` holding **-1 displays "1"**: `format_number` returns an unsigned string
-  whenever `|value| < 1.5 × 10^-decimals`. Silent numeric misinformation on the primary display
+  whenever the pre-rounded magnitude is at or below **`10^-decimals`** (measured thresholds 1.5 at
+  `0`, 0.105 at `0.0`, 0.01005 at `0.00` — *not* `1.5 × 10^-decimals`, which is only right at zero
+  decimals). Silent numeric misinformation on the primary display
   surface, worst on the most common format. Found by unit F3a's chart-vs-cell differential test and
   reproduced end-to-end through the app. `GAPS.md` E6/E7 + the v0.5 release tier.
   → [`projects/ironcalc-negative-sign-display.md`](projects/ironcalc-negative-sign-display.md)

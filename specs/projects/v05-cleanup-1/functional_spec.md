@@ -294,6 +294,14 @@ is a required per-PR check.
      from the fixtures in-tree, the general format, `#,##0.00` and its family,
      percentages, currency, scientific, dates/times, negative-number sections, and text
      sections. Values must include negatives, zero, very large/small magnitudes.
+     > **Annotation (2026-07-28, post-code-review — this section is `status: complete` but this
+     > requirement was too weak.)** "`#,##0.00` and its family" was read as the *required-digit*
+     > family and the **`#` optional-digit** codes (`0.##`, `#,##0.##`, `#,##0.0#`, `0.###`,
+     > `#,###`) were left out, as was any whitespace-padded code. `renders_faithfully` accepts all
+     > of them, so the gate certified them Faithful without ever evaluating them — and that hid a
+     > real `chart-model` defect. The binding rule is: **the corpus must cover every code shape the
+     > faithfulness predicate accepts**, and the value set must contain points the carve-out
+     > predicates do *not* explain. See `phase_plans/phase_6.md`.
 2. **Only then** decide the fix size. Three outcomes, all acceptable:
    - **They agree** on everything reachable → *the test is the deliverable*; record that
      the divergence claim was overstated, and correct the remediation doc.
@@ -319,6 +327,14 @@ ironcalc.
 A differential test exists and passes, any confirmed disagreement in reachable format
 codes is fixed or explicitly filed, and the colour-helper duplication is either proven
 equivalent (with a guard test) or reconciled.
+
+> **Annotation (2026-07-28, post-code-review).** "Exists and passes" is not sufficient on its own:
+> a differential test passes trivially if its carve-outs are broad enough. Phase 6's first pass met
+> this bar with a green gate over a live `chart-model` bug. Read it as: **passes, with every
+> carve-out narrow enough that it cannot also match a defect on our side of the comparison, and
+> with counts reported.** On the colour half, "reconciled" was the outcome architecture §6 actually
+> prescribed (export **and** delete); a guard test over a duplicate that could simply be deleted is
+> the weaker option, not an equal one.
 
 ---
 

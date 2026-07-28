@@ -328,11 +328,24 @@ variance).
 
 ### CI (GitHub Actions, repo root — **Linux runners are the gating target**)
 
-Four workflows. **checks** and **perf-gates** run automatically on the app critical path
-(paths-scoped to `app/**`); **render** — the software-render pixel gate — is **manual
-`workflow_dispatch`** (a deliberate "final check before merge"), because a lavapipe pass is
-slow and occasionally flaky and not worth spending on every push. `checks`, `render`, and
-`perf-gates` are all **required** status checks.
+> **Updated 2026-07-28 (v05-cleanup-1 unit D1).** This section previously described **render**
+> as `workflow_dispatch`-only and listed it among the **required** status checks. Those two
+> were never simultaneously satisfiable — a dispatch-only workflow reports no context on a PR,
+> so requiring it would block every merge rather than gate anything, and in practice it was
+> never wired into branch protection. D1 resolved the contradiction the other way: render gained
+> a **weekly schedule on `main`** and a **`workflow_call`** entry point used by `release.yml`,
+> and is explicitly **off the PR path / not a required check**. The text below describes the
+> post-D1 reality. See `.github/workflows/render.yml`'s header and
+> `specs/projects/v05-cleanup-1/phase_plans/phase_4.md`.
+
+**checks** and **perf-gates** run automatically on the app critical path (paths-scoped to
+`app/**`) and are the **required** status checks. **render** — the software-render pixel gate —
+is **not on the PR path and not required**: a lavapipe pass is slow (many minutes) and most PRs
+cannot move a pixel, so it is not worth spending on every push. Instead it runs **weekly on
+`main`** (a backstop, since a scheduled workflow only ever fires on the default branch), **at
+release** (`release.yml` calls it via `workflow_call` and every packaging job `needs:` it, so
+nothing ships without a green suite), and on **`workflow_dispatch`** against any branch — which
+is how an agent confirms an intentional rendering change before merge.
 
 1. **checks** (`checks.yml`, Linux, **auto** on every push-to-`main` / PR that touches
    `app/**` — paths-scoped, so spec/experiments/docs-only changes skip it; required, fast):
@@ -347,12 +360,15 @@ slow and occasionally flaky and not worth spending on every push. `checks`, `ren
    needed here** — `CARGO_INCREMENTAL=0` + `CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only`
    keep the build+test `target/` peak ~6.3 GB (well under the ~14 GB free on `ubuntu-24.04`),
    and `Swatinem/rust-cache` (`cache-on-failure: true`) makes a warm run ~3 min.
-2. **render** (`render.yml`, **NEW**; Linux software Vulkan, **manual `workflow_dispatch`**,
-   required): the cell-render pixel suite under **Xvfb + Mesa lavapipe** (see "Cell-render
-   snapshot suite" above). **Split out of `checks`** because software rendering is slow and
-   occasionally flaky; it frees runner disk first (it is the disk-hungry job now) and installs
-   the full capture stack. Must be wired into branch protection under the exact context name
-   **`render (Xvfb + lavapipe)`**.
+2. **render** (`render.yml`; Linux software Vulkan; **`schedule` weekly on `main` +
+   `workflow_call` from `release.yml` + `workflow_dispatch`**; **not** a required status check):
+   the cell-render pixel suite under **Xvfb + Mesa lavapipe** (see "Cell-render snapshot suite"
+   above). **Split out of `checks`** because software rendering is slow; it frees runner disk
+   first (it is the disk-hungry job now) and installs the full capture stack. It must **not** be
+   wired into branch protection — with no PR-triggering event its context is never reported, so
+   requiring it would leave every PR waiting forever. The weekly run is a backstop, not a
+   pre-merge gate: dispatching it on the branch is still the author's job for an intentional
+   rendering change.
 3. **perf-gates** (`perf-gates.yml`, Linux buffered, **auto** on every push-to-`main` / PR
    that touches `app/**` — paths-scoped; required): the perf harness with **hard but buffered
    thresholds** (product call): during the perf phase, calibrate on the pinned runner image
@@ -371,11 +387,13 @@ build tolerable across runs. GitHub scopes caches by branch, so the win lands on
 runs green + saves once; feature-branch runs then restore `main`'s cache as fallback.
 
 **`workflow_dispatch` bootstrap caveat (render):** a manual workflow's "Run workflow" button
-only appears once the file exists on the default branch (`main`), so the PR that first
-introduces `render.yml` cannot dispatch that check on *itself* — merge to `main` first (or
-make it non-required temporarily). Dispatch **render** from the Actions tab against the PR's
-branch (or, if a merge queue is later enabled, wire it to a `merge_group` trigger so the queue
-runs it automatically).
+only appears once the file exists on the default branch (`main`), so a PR that *introduces* a
+dispatchable workflow cannot dispatch it on *itself* — merge to `main` first. Dispatch
+**render** from the Actions tab against the PR's branch. A related caveat applies to D1's two
+new triggers: dispatching on a feature branch runs **that branch's** `render.yml`, which
+validates the job's steps and environment, but it exercises neither the `schedule` path (only
+ever fires on the default branch) nor the `workflow_call` path (only exercised by a release), so
+changes to those are verifiable only after merge / at the next tag.
 
 ## 10. Technical risks & mitigations (build-time)
 

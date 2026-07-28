@@ -9,7 +9,7 @@
 # and runs its GPUI-free unit tests, but every pixel case self-skips without FREECELL_RENDER —
 # so the crate stays compiled + covered on every push while no pixel is ever diffed here. The
 # pixel suite is .github/workflows/render.yml: weekly on `main`, blocking at release, and
-# dispatchable on a branch. (An earlier version of this comment implied `checks` covered it.)
+# dispatchable on a branch.
 #
 # The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
 

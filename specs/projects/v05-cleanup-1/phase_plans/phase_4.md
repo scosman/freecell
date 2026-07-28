@@ -61,21 +61,44 @@ produces **no artifacts at all**, rather than artifacts plus a red X somebody is
 It costs the suite's wall-clock at the front of a release. On an infrequent, deliberate operation
 that is the right trade, and it is stated in both headers so it is not a surprise.
 
-### Concurrency — the bug this nearly introduced
+### Concurrency — the bug this nearly introduced, and the one it first introduced
 
 The existing key was `render-${{ github.ref }}` with `cancel-in-progress: true`. Adding a schedule
 would have made a manual dispatch on `main` and the weekly scheduled run **share a group and cancel
-each other** — silently eating the backstop the phase exists to add. The key now includes the
-event:
+each other** — silently eating the backstop the phase exists to add.
+
+The first fix, `render-${{ github.event_name }}-${{ github.ref }}`, was **not sufficient**, and the
+reasoning behind it was wrong. Inside a **reusable** workflow the `github` context is the
+**CALLER's**: on the `workflow_call` path `github.event_name` is whatever triggered `release.yml`
+(`push` for a tag, `workflow_dispatch` for a manual release) — it is *never* the string
+`workflow_call`. So a release dispatched on `main` produced the same group as a direct render
+dispatch on `main`, and with `cancel-in-progress: true` one killed the other — also overriding
+`release.yml`'s deliberate `cancel-in-progress: false`. The key now also carries the caller's
+workflow identity:
 
 ```yaml
-group: render-${{ github.event_name }}-${{ github.ref }}
+group: render-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
 ```
 
-Two dispatches on the same branch still supersede each other, which is what an iterating agent
-wants.
+`github.workflow` is `render` on the direct paths and `release` on the called path, which is what
+actually separates the two. Resulting groups: schedule-on-`main`, dispatch-on-`main`,
+release-by-tag (`refs/tags/vX.Y.Z`), and release-by-dispatch are four distinct groups; two
+dispatches on the same branch still share one and supersede each other, which is what an iterating
+agent wants. The one collision left by construction — two *manual* release dispatches of the same
+ref — is documented in the workflow header and accepted.
+
+### Least privilege
+
+`render.yml` declares `permissions: contents: read` at workflow level. Behaviourally identical to
+the repo default today; the point is that a workflow now embedded in the **release** path states
+its scope explicitly, so a future default change or a broader-permissioned caller can't widen it
+silently.
 
 ## Docs corrected in the same phase
+
+The first pass of this sweep was **not complete** — it corrected the two workflow headers and
+`app/README.md` but missed two documents that still asserted exactly what §D1's "Done when" says
+must be gone from the repo. Both are now fixed:
 
 - **`checks.yml` header** claimed the job covers the render suite. It does not: `cargo test
   --workspace` compiles `render-tests` and runs its GPUI-free unit tests, but every pixel case
@@ -83,7 +106,19 @@ wants.
   suite actually runs. (Its stale "documented GPL ztracing exception" phrase was corrected at the
   same time — the exception is gone, per Phase 2.)
 - **`app/README.md` §CI** listed "the render suite (Xvfb + lavapipe)" under `checks`. Corrected, and
-  `render` now has its own entry describing all three triggers.
+  `render` now has its own entry describing all three triggers. The `roundtrip` workflow, which
+  exists but had never been listed, was added at the same time.
+- **`app/render-tests/README.md`** (missed on the first pass) still called the gate "a required step
+  in `checks.yml`". Corrected to the real mechanism: `checks` compiles the crate and runs its
+  GPUI-free unit tests but diffs no pixels; the gate is `render.yml` under its three triggers.
+- **`specs/projects/mvp/architecture.md` §9** (missed on the first pass) still described render as
+  `workflow_dispatch`-only, listed `checks`/`render`/`perf-gates` as all-required status checks, and
+  instructed that render be wired into branch protection under context `render (Xvfb + lavapipe)`.
+  This mattered more than the others: **both `render.yml` and `checks.yml` cite "architecture.md §9"
+  as their authority**, so the workflows were pointing at a spec that contradicted them. Updated to
+  post-D1 reality with a dated note recording that D1 changed it, and the `workflow_dispatch`
+  bootstrap caveat extended to say a branch dispatch validates steps/env but exercises neither
+  `schedule` nor `workflow_call`. Unrelated parts of that document were left alone.
 - **`render.yml` header** no longer claims to be a required status check, and explains why it is
   off the PR path, with the measured flake data behind the release gate.
 - **`CLAUDE.md` "Render tests"** — the section's *scope* and *cost* guidance was accurate and is the
@@ -91,7 +126,10 @@ wants.
   there is no safety net" became a table of the three triggers plus an explicit statement that
   **the weekly run does not cover you before merge** — it fires after, on someone else's watch. The
   agent's responsibility is unchanged; what changed is that forgetting no longer means *nobody*
-  checked.
+  checked. Two follow-ups: items 1 and 3 still scoped the rule to "grid/cell/sheet or titlebar"
+  while item 2 and the Scope paragraph include **chart-render** — all three now say the same thing;
+  and the "a feature-branch run uses that branch's `render.yml`" bullet gained the caveat that a
+  dispatch validates steps/env only, not the `schedule` or `workflow_call` triggers.
 
 ## Verification
 

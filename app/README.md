@@ -118,6 +118,9 @@ GitHub Actions live at the repo root (`../.github/workflows/`):
   it, so nothing ships without a green suite), and on **manual dispatch** for confirming a
   rendering change on a branch. See `../.github/workflows/render.yml` for why it is off PRs.
 - **perf-gates** (Linux, required): the perf harness with buffered thresholds.
+- **roundtrip** (Linux, auto on `main` / PRs touching `app/**`): the external round-trip gate —
+  a FreeCell-saved chart `.xlsx` must survive being reopened + re-written by a *different* real
+  spreadsheet app (headless LibreOffice). gpui-free, so it needs no X11/Vulkan stack.
 - **macos-verify** (manual/weekly, non-required): build + test + render smoke on macOS.
 - **release** (tag `v*` / manual dispatch): run the render gate, then package the app with
   `cargo-packager` for macOS, Linux, and Windows (all required), uploading installers as run

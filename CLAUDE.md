@@ -173,9 +173,10 @@ cache**. Do **not** intermingle full runs in every coding phase. Instead:
   never background-and-forget it (a detached render job dies at the turn boundary and leaves
   you parked, as happened before).
 
-**1. Run it locally when a change could move *grid/cell/sheet or titlebar* pixels** —
-grid-render code / the `GridView`, fonts, layout, borders, fills, styles, the titlebar row,
-the render harness, or baselines (per the Scope above — not welcome/About/other chrome):
+**1. Run it locally when a change could move *grid/cell/sheet, titlebar or chart-render*
+pixels** — grid-render code / the `GridView`, fonts, layout, borders, fills, styles, the
+titlebar row, the chart widgets (`freecell_app::chart`), the render harness, or baselines
+(per the Scope above — not welcome/About/other chrome):
 - first time: `app/render-tests/scripts/setup_render_env.sh` (installs the capture stack)
 - subset while iterating: `app/render-tests/scripts/render_tests.sh test <prefix>`
 - full suite (only at the late validation phase): `app/render-tests/scripts/render_tests.sh
@@ -196,15 +197,17 @@ merge, on someone else's watch.
 - **Fallback:** if the agent can't dispatch, ask the user to kick off `render` and report
   the result back.
 - A run on a **feature branch** uses that branch's `render.yml`, so a change to the workflow
-  itself is testable before merge.
+  itself is testable before merge — but only its steps/env: a dispatch exercises neither the
+  `schedule` trigger (fires only from the default branch) nor `workflow_call` (only exercised
+  by a release), so changes to those two are verifiable only after merge / at the next tag.
 
 **3. Bake it into plans as its OWN late phase.** When a plan makes **in-scope**
-(grid/cell/sheet or titlebar) rendering changes, put render validation in a **dedicated phase
-AFTER all coding + commits are done** — do **not** intermingle full runs per phase (too slow;
-breaks flow + cache). The earlier coding phases verify with the relevant **subset** only
-(`render_tests.sh test <prefix>`); the final render phase then, once: runs the **full** suite
-(with a ~10-min watchdog), refreshes + **eyeballs** baselines if the change is intentional,
-commits any baseline updates, and **dispatches the CI `render` gate** and confirms it passes.
-Decide this at planning time — don't leave render validation implicit. (Welcome/About/other-
-chrome changes are out of scope for the pixel suite — plan gpui view tests + a smoke launch
-for those instead.)
+(grid/cell/sheet, titlebar or chart-render) rendering changes, put render validation in a
+**dedicated phase AFTER all coding + commits are done** — do **not** intermingle full runs per
+phase (too slow; breaks flow + cache). The earlier coding phases verify with the relevant
+**subset** only (`render_tests.sh test <prefix>`); the final render phase then, once: runs the
+**full** suite (with a ~10-min watchdog), refreshes + **eyeballs** baselines if the change is
+intentional, commits any baseline updates, and **dispatches the CI `render` gate** and confirms
+it passes. Decide this at planning time — don't leave render validation implicit.
+(Welcome/About/other-chrome changes are out of scope for the pixel suite — plan gpui view
+tests + a smoke launch for those instead.)

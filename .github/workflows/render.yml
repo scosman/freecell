@@ -43,6 +43,13 @@
 
 name: render
 
+# Least privilege, stated explicitly now that this workflow is embedded in the RELEASE path via
+# `workflow_call`: it only checks out code and uploads a run artifact, neither of which needs
+# write scope. Behaviourally identical to the repo default today; the point is that a future
+# default change (or a caller with broader permissions) cannot silently widen it.
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   workflow_call:
@@ -51,12 +58,36 @@ on:
     # heavily contended at :00, which delays runs).
     - cron: "17 7 * * 0"
 
-# Keyed by EVENT as well as ref: without the event, a manual dispatch on `main` and the weekly
-# scheduled run share a group and would cancel each other (`cancel-in-progress`), silently
-# eating the backstop. Two dispatches on the same branch still supersede each other, which is
-# what an iterating agent wants.
+# Concurrency key: CALLER WORKFLOW + EVENT + REF.
+#
+# The rule that makes this non-obvious: inside a REUSABLE workflow, the `github` context is the
+# CALLER's, not this file's. So on the `workflow_call` path `github.event_name` is whatever
+# triggered `release.yml` (`push` for a tag, `workflow_dispatch` for a manual release) — never
+# the string "workflow_call" — and `github.workflow` is the caller's workflow name (`release`),
+# while on the direct paths it is this workflow's own name (`render`). Keying on the workflow
+# name is therefore what actually distinguishes "render, called by a release" from "render, run
+# directly"; the event alone does not.
+#
+# What that buys, with `cancel-in-progress: true`:
+#
+#   schedule on `main`      render-render-schedule-refs/heads/main
+#   dispatch on `main`      render-render-workflow_dispatch-refs/heads/main
+#   release by tag          render-release-push-refs/tags/vX.Y.Z
+#   release by dispatch     render-release-workflow_dispatch-<caller ref>
+#
+# — four distinct groups, so none of them can cancel another. In particular the weekly backstop
+# is no longer eaten by someone dispatching on `main`, and a release's render job no longer
+# collides with a direct dispatch on the same ref (which would also have overridden
+# `release.yml`'s deliberate `cancel-in-progress: false`).
+#
+# Two dispatches on the SAME branch still share a group and supersede each other — exactly what
+# an iterating agent wants. The one collision that remains by construction: two *manual* release
+# dispatches on the same ref share a render group, so the newer cancels the older's render job.
+# Releases are infrequent and deliberate, and the caller-level `release-${{ github.ref }}` group
+# is what governs the release itself; a second concurrent release of the same ref is already a
+# mistake, not a workflow we need to keep alive.
 concurrency:
-  group: render-${{ github.event_name }}-${{ github.ref }}
+  group: render-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:

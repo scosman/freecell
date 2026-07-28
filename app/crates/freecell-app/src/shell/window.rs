@@ -25,6 +25,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_chart_model::{ChartColor, ChartId, ChartInsertKind};
+use freecell_core::input_cap::group_thousands;
 use freecell_core::{limits, CellRange, CellRef, Rgb, SelectionModel, SheetId};
 use freecell_engine::{
     Command, DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, PasteError,
@@ -822,7 +823,9 @@ impl WorkbookWindow {
             // The frozen-pane cap (engine-worker-hardening `functional_spec.md F1.2`): an OK-only
             // dialog, nothing changed. The reachable case is Select-All → "Freeze rows", where the
             // header menu derives the count from the whole 1,048,576-row selection — so the copy
-            // echoes the request as well as the cap, or the refusal reads as arbitrary.
+            // echoes the request as well as the cap, or the refusal reads as arbitrary. The
+            // request is grouped (`1,048,576`, per the spec's copy): unseparated it is the one
+            // number in this string a reader has to count digits on.
             EditRejectedReason::FrozenPaneTooLarge {
                 axis,
                 requested,
@@ -830,6 +833,7 @@ impl WorkbookWindow {
             } => {
                 if self.modal.is_none() {
                     let noun = axis.noun();
+                    let requested = group_thousands(*requested as usize);
                     self.modal = Some(ActiveModal::Error {
                         title: format!("Can't freeze that many {noun}").into(),
                         detail: format!(
@@ -1359,6 +1363,17 @@ impl WorkbookWindow {
     pub(crate) fn error_modal_title(&self) -> Option<String> {
         match &self.modal {
             Some(ActiveModal::Error { title, .. }) => Some(title.clone()),
+            _ => None,
+        }
+    }
+
+    /// Test seam: the active error modal's body copy (so a test can assert the exact wording,
+    /// including any number the message quotes back to the user); `None` when no error modal is
+    /// showing.
+    #[cfg(test)]
+    pub(crate) fn error_modal_detail(&self) -> Option<String> {
+        match &self.modal {
+            Some(ActiveModal::Error { detail, .. }) => Some(detail.clone()),
             _ => None,
         }
     }

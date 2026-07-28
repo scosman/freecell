@@ -417,8 +417,18 @@ pub(crate) fn build_sheet_cache(
     // from here, so clamping here bounds the worker thread and the render thread alike. A crafted
     // `<pane ySplit="500000" state="frozen"/>` would otherwise hang both. The model keeps the
     // file's original count (so a save preserves the user's bytes); everything the user sees uses
-    // the clamped one. A `SetFrozen` command can't reach this path over the cap — `pre_validate`
-    // rejects it first — so in practice this only ever clamps a file.
+    // the clamped one.
+    //
+    // TWO paths reach the clamp, and the model/cache divergence it creates is ACCEPTED on both
+    // (`functional_spec.md F1.3`). A `SetFrozen` over the cap can't: `pre_validate` rejects it.
+    // But a STRUCTURAL EDIT can — IronCalc grows/shrinks the frozen boundary inside an
+    // insert/delete's own undo diff, and `InsertRows` is not range-checked against the frozen cap,
+    // so freezing at the cap and then inserting rows above the band leaves the model over it (see
+    // `worker/run.rs::structural_edit_past_the_cap_diverges_model_from_the_clamped_cache`). We do
+    // NOT re-clamp the model afterwards: that would be a second undo diff, breaking both
+    // `SetFrozen`'s and Insert's documented one-undo-step contract, which is the worse trade. So
+    // the model — and a saved file's `<pane>` — can record a count above the cap while every
+    // surface the user touches stays bounded; Unfreeze resolves it.
     builder.set_frozen_rows((ws.frozen_rows.max(0) as u32).min(MAX_FROZEN_ROWS));
     builder.set_frozen_cols((ws.frozen_columns.max(0) as u32).min(MAX_FROZEN_COLS));
 

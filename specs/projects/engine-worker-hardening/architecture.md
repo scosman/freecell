@@ -143,15 +143,24 @@ unenforced one.
 
 | Test | Location | Asserts |
 |---|---|---|
-| `set_frozen_beyond_cap_is_rejected` | `run.rs` unit | ⌘A-scale `SetFrozen { rows: Some(1_048_576) }` → `EditRejected { FrozenPaneTooLarge { .. } }`, `frozen(&worker, sheet) == (0, 0)`, no `Published` |
+| `set_frozen_beyond_the_cap_is_rejected` | `run.rs` unit | ⌘A-scale `SetFrozen { rows: Some(1_048_576) }` → `EditRejected { FrozenPaneTooLarge { .. } }`, `frozen(&worker, sheet) == (0, 0)`, no `Published` |
 | `set_frozen_at_the_cap_is_accepted` | `run.rs` unit | `rows: Some(64)` and `cols: Some(32)` apply; the boundary is inclusive |
-| `set_frozen_cols_beyond_cap_is_rejected` | `run.rs` unit | the column axis reports `FrozenAxis::Columns` and its own cap |
-| `publish_clamps_an_oversized_frozen_band` | `run.rs` unit | seed the cache with `frozen_rows(1_000_000)` directly (bypassing both guards), publish, assert `publication.frozen_rows == 64` and that the publish returns — under a wall-clock bound so a regression fails instead of hanging |
-| `crafted_pane_element_opens_clamped` | `run.rs` unit | extends the existing `<pane>` fixture (`run.rs:7783`) with `ySplit="500000"`; the sheet opens and `frozen(&worker, sheet).0 == 64` |
-| `frozen_pane_too_large_is_rejected` | `worker_seam.rs` | the same rejection over the real spawned-worker seam |
+| `set_frozen_cols_beyond_the_cap_is_rejected` | `run.rs` unit | the column axis reports `FrozenAxis::Columns` and its own cap |
+| `publish_clamps_an_oversized_frozen_band` | `run.rs` unit | seed the cache with a sheet-size band directly (bypassing both guards), publish, assert `publication.frozen_rows == 64` and that the publish returns at all |
+| `crafted_pane_element_opens_clamped` | `run.rs` unit | extends the existing `<pane>` fixture (the `pane_fixture` / `pane_fixture_with` helpers in `run.rs`'s test module) with `ySplit="500000"`; the sheet opens and `frozen(&worker, sheet).0 == 64` |
+| `structural_edit_past_the_cap_diverges_model_from_the_clamped_cache` | `run.rs` unit | freeze at the cap, insert rows above the band: the model's count grows past 64 while the cache, the band and the publication stay at 64 (`functional_spec.md F1.3` path 2); Unfreeze clears both |
+| `oversized_freeze_is_rejected_and_the_worker_keeps_serving` | `worker_seam.rs` | the same rejection over the real spawned-worker seam |
+| `edit_rejected_frozen_pane_too_large_names_the_axis_request_and_cap` (+ `…_uses_the_column_noun`) | `shell/app.rs` gpui test | the dialog itself: exact title, and a detail carrying the cap, the **grouped** request and the axis noun; dismissing does not close the window |
 
-The publish-clamp test is the one that would hang on a regression, so it asserts elapsed time
-against a generous bound (5 s) rather than relying on the harness timeout.
+The publish-clamp test is the one that would **hang** on a full regression, and `cargo test` has
+no per-test timeout — so it runs the publish on a spawned thread and bounds it with
+`recv_timeout` (30 s), which turns a never-returning loop into a test failure. `Timeout` and
+`Disconnected` are handled separately: a timeout is reported as the hang it is, while a
+disconnect joins the thread and re-raises its panic, so a crash inside `commit` is never
+mislabelled as a hang. On a real timeout the wedged thread is left detached; the harness exits
+the process without joining it. A separate, tighter wall-clock assertion (5 s, measured across
+the whole spawn→result round trip) catches a *partial* regression — a clamp that still bounds the
+loop but costs far too much.
 
 ---
 

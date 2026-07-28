@@ -188,3 +188,14 @@ registry: each entry is a short description plus a pointer to a design note unde
   correct; the bug is operator-level, with a broad blast radius across every formula that negates a
   non-number — out of the scalar-functions batch's function-local scope. Workarounds
   `SUMPRODUCT(1*(cond))` and `SUMPRODUCT((A=x)*(B))` both work today. → [`projects/unary-minus-boolean-coercion.md`](projects/unary-minus-boolean-coercion.md)
+
+- **Frozen-pane boundary overflow on structural edits (fork fix)** — *Future (found in
+  `engine-worker-hardening` Phase 1 review, 2026-07-28).* IronCalc grows a sheet's frozen boundary
+  inside an insert's diff (`base/src/actions.rs:1051`, and the column twin at `:725`) with no upper
+  bound, and `insert_rows` only range-checks the **populated** dimension — which empty inserted rows
+  don't grow. So freeze 1 row + three `InsertRows { count: 1_000_000 }` leaves `frozen_rows =
+  3,000,001` on a 1,048,576-row sheet, and it survives save/reopen as an invalid
+  `<pane ySplit="3000001">`. Reachable by gesture, because the insert count comes from the selected
+  header run — the same untrusted-selection pattern that caused B2. Belongs in the fork on its own
+  `fix/<slug>` branch as one upstream PR, **not** as a FreeCell workaround; FreeCell itself stays
+  bounded because the sheet-cache clamp holds. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)

@@ -48,7 +48,8 @@ The cap is enforced at three independent points, because there are three indepen
 |---|---|---|
 | A `SetFrozen` command (the header-menu Freeze item) | **Rejected** in `pre_validate` | An OK-only error dialog. The workbook is unchanged; no undo step is created. |
 | A workbook file whose `<pane>` asks for more | **Clamped** when the sheet cache is built | The sheet opens, showing a band clamped to the cap. The file's own bytes are not modified. |
-| Any residual path into the publish loop | **Clamped** at the loop | None — a backstop that cannot be observed if the two above hold. |
+| A **structural edit** that grows the frozen boundary past the cap (insert rows/columns above the band) | **Clamped** when the sheet cache is rebuilt | The band stops growing at the cap. The model keeps the grown count (§F1.3). |
+| Any residual path into the publish loop | **Clamped** at the loop | None — a backstop that cannot be observed if the three above hold. |
 
 ### F1.2 The rejection
 
@@ -63,18 +64,79 @@ The cap is enforced at three independent points, because there are three indepen
 
 `n = 0` (Unfreeze) is always valid on both axes.
 
-### F1.3 The clamp
+### F1.3 The clamp, and the model/cache divergence it accepts
 
 A cache built from a worksheet whose `frozen_rows`/`frozen_columns` exceed the cap stores the
 capped value. Every consumer — the grid's frozen-band layout and hit-testing, the header menu's
 Freeze/Unfreeze label, and the publication's band — therefore agrees, because they all read the
 same cache.
 
-Consequence, accepted and documented: for such a file the model and the cache disagree. The
-model keeps the file's original count (so a save preserves the user's bytes); the cache, and
-everything the user sees, uses the capped one. Right-clicking the boundary row then offers
-"Unfreeze", which sends `SetFrozen { rows: Some(0) }` and resolves the disagreement in the
-user's favour.
+Consequence, accepted and documented: when the model's count is over the cap, the model and the
+cache disagree. The model keeps its count (so a save preserves it); the cache, and everything
+the user sees, uses the capped one.
+
+**Two paths put the model over the cap, and the second is not exotic:**
+
+1. **A crafted or foreign file.** Its `<pane>` asks for more than the cap; the count enters the
+   model at load and is capped on the way into the cache.
+2. **An ordinary structural edit.** IronCalc adjusts the frozen boundary *inside* an
+   insert/delete's own undo diff (the `fix/structural-edits-adjust-frozen-pane` fork fix, relied
+   on by `structural_edits_track_frozen_boundary_in_one_undo_step`), and `InsertRows` /
+   `InsertColumns` are **not** range-checked against the frozen cap. So freezing at the cap and then
+   inserting rows above the band — two ordinary gestures, no hostile input — leaves the model at,
+   say, 72 while the cache stays at 64.
+
+**Why path 2 is not "fixed" by re-clamping the model.** It could be: after a structural edit,
+issue a `set_frozen_rows(min(count, cap))`. We deliberately do not, because that write is a
+*second* undoable diff. It would break `SetFrozen`'s "one action = one undo step" contract and
+Insert's alike — one Undo would no longer revert one gesture. Trading a documented,
+user-visible undo contract for the tidiness of two numbers agreeing is the worse deal. The
+divergence is the cheaper defect, so it is chosen rather than discovered.
+
+**What the divergence actually costs.** Two things, both real.
+
+*The band stops responding to structural edits until the model comes back under the cap.* Every
+surface stays bounded and safe — the band, the hit-testing, the header-menu label and the
+publication all read the clamped cache, and the publish loop's bound (§F1.4) holds — but "bounded"
+is not "unaffected". Walked from a legal freeze at 64:
+
+| Gesture | Model | Band the user sees |
+|---|---|---|
+| freeze 64 rows | 64 | 64 |
+| insert 8 rows above the band | 72 | 64 — no change |
+| insert 8 more | 80 | 64 — no change |
+| delete 8 rows in the band | 72 | 64 — no change |
+| delete 8 more | 64 | 64 |
+| delete 8 more | 56 | **56** |
+
+So four consecutive band-affecting gestures produce no visible change at all, and the fifth
+moves the band. That is a genuinely confusing few seconds for a user who freezes at exactly the
+cap and then reorganises rows. It is bounded, self-healing (the band tracks normally again the
+moment the model drops under the cap) and never wrong about safety — but it is not invisible,
+and this spec should not have said it was.
+
+*The saved count is unbounded.* IronCalc's boundary adjustment (`base/src/actions.rs:1051`, and
+the column twin at `:725`) has no upper guard, and `insert_rows` range-checks only the
+**populated** dimension — which empty inserted rows do not grow. So the model's count is not
+merely "over the cap": freeze 1 row and insert 1,000,000 rows three times and it is 3,000,001 on
+a 1,048,576-row sheet, and it survives save → reopen. FreeCell writes a `<pane ySplit>` that is
+not a row of the sheet it describes, and another application reading that file gets a
+structurally invalid freeze rather than just a larger one.
+
+That second cost is an **engine** defect, not a FreeCell one, and it is not fixed here: per
+`CLAUDE.md` a fork bug gets its own `fix/<slug>` branch and one focused upstream PR, never a
+compensating workaround in FreeCell and never folded into an unrelated phase. It is captured in
+`PROJECTS.md` → [`projects/frozen-pane-boundary-overflow.md`](../../../projects/frozen-pane-boundary-overflow.md).
+FreeCell stays bounded regardless, because the cache clamp is what every consumer reads. Once
+the fork clamps the boundary to the sheet dimension, this paragraph reduces to
+"bounded-but-over-cap".
+
+Reopening such a file in FreeCell takes path 1 and clamps again. Right-clicking the boundary row
+offers "Unfreeze", which sends `SetFrozen { rows: Some(0) }` and clears both sides.
+
+Pinned by `structural_edit_past_the_cap_diverges_model_from_the_clamped_cache`
+(`worker/run.rs`) — which walks the table above assertion by assertion — so the behaviour cannot
+drift back into being an accident.
 
 ### F1.4 Bound
 
@@ -85,8 +147,21 @@ that claimed the property without enforcing it.
 
 ### F1.5 Out of scope
 
-Persisting a "this file's freeze was clamped" notice to the user. The clamp is silent by
-design — a warning banner for a case only a crafted file reaches is noise.
+Telling the user that a freeze was clamped. The clamp stays silent, but **not** on the grounds
+first written here ("a case only a crafted file reaches") — §F1.3 path 2 shows an ordinary
+insert reaches it too, so that justification is retired. The reason it stays silent is that
+there is nothing actionable to say: the band the user is looking at is the correct, usable one,
+the freeze they asked for was never possible to render, and the escape hatch (Unfreeze) is
+already one right-click away in the same header menu. A banner would report a state the user
+cannot act on differently.
+
+What that *does* buy are the two surprises §F1.3 spells out: gestures that do not move the band
+while the model is over the cap, and a workbook saved with a `<pane>` count FreeCell itself will
+not display (today, an unbounded one). If either bites in practice — a support report of "my
+freeze stopped following my inserts", or "my freeze changed when I opened it in Excel" — the
+answers are respectively a **band-level** hint and a **save-time** notice, not a load-time
+banner, and both belong in `PROJECTS.md` rather than here. The unbounded half of the second is
+already tracked there as an engine fix.
 
 ---
 
@@ -236,6 +311,7 @@ from. The UI does not read it today; the ordering tests do.
 |---|---|---|
 | `SetFrozen` over the cap | Yes — nothing applied | `EditRejected` → OK-only dialog (F1.2) |
 | File `<pane>` over the cap | Yes — clamped silently | none (F1.3) |
+| Structural edit grows the boundary over the cap | Yes — clamped silently; model diverges by design | none (F1.3) |
 | Panic in `from_source` | No, for that window | `LoadFailed` → dialog, window closes on dismiss (F2.1) |
 | Panic in `save_workbook`, model still healthy | Yes | `SaveFailed` → dialog, window continues (F2.2) |
 | Panic in `save_workbook`, model poisoned | No | `SaveFailed` dialog **and** `WorkerDegraded` bar (F2.2) |

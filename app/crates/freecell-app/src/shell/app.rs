@@ -1549,7 +1549,7 @@ mod tests {
     use freecell_core::data_row::FieldMode;
     use freecell_core::input_cap::InputRejection;
     use freecell_core::{CellRange, CellRef, SelectionModel, SheetId};
-    use freecell_engine::{EditRejectedReason, SheetMeta};
+    use freecell_engine::{EditRejectedReason, FrozenAxis, SheetMeta};
 
     fn sheet_meta(id: u32, name: &str, has_content: bool) -> SheetMeta {
         SheetMeta {
@@ -1692,6 +1692,88 @@ mod tests {
             cx.update(|cx| entity.read(cx).error_modal_closes_window_on_dismiss()),
             Some(false),
             "the document is intact — dismissing keeps the window (§6)"
+        );
+    }
+
+    #[gpui::test]
+    fn edit_rejected_frozen_pane_too_large_names_the_axis_request_and_cap(cx: &mut TestAppContext) {
+        // B2's ONLY user-facing surface (`engine-worker-hardening functional_spec.md F1.2`): the
+        // reachable gesture is ⌘A → right-click a row header → "Freeze rows", which asks to pin
+        // the whole 1,048,576-row axis. The refusal has to name all three numbers or it reads as
+        // arbitrary, and the request is grouped because that is the number the user has to
+        // recognise as "the entire sheet".
+        boot(cx);
+        let (handle, entity) = new_injectable_window(cx);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EditRejected {
+                            reason: EditRejectedReason::FrozenPaneTooLarge {
+                                axis: FrozenAxis::Rows,
+                                requested: 1_048_576,
+                                max: 64,
+                            },
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("Can't freeze that many rows".to_string())
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_detail()),
+            Some(
+                "FreeCell can pin at most 64 rows (you asked for 1,048,576). \
+                 Select fewer rows and try again."
+                    .to_string()
+            ),
+            "the detail carries the cap, the GROUPED request and the axis noun"
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_closes_window_on_dismiss()),
+            Some(false),
+            "nothing was applied — dismissing keeps the window"
+        );
+    }
+
+    #[gpui::test]
+    fn edit_rejected_frozen_pane_too_large_uses_the_column_noun(cx: &mut TestAppContext) {
+        // The column axis reports its own noun and its own (smaller) cap.
+        boot(cx);
+        let (handle, entity) = new_injectable_window(cx);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EditRejected {
+                            reason: EditRejectedReason::FrozenPaneTooLarge {
+                                axis: FrozenAxis::Columns,
+                                requested: 16_384,
+                                max: 32,
+                            },
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("Can't freeze that many columns".to_string())
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_detail()),
+            Some(
+                "FreeCell can pin at most 32 columns (you asked for 16,384). \
+                 Select fewer columns and try again."
+                    .to_string()
+            )
         );
     }
 

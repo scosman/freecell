@@ -888,10 +888,22 @@ impl WorkbookDocument {
     }
 
     /// Sets the frozen-rows count `M` — leading rows `0..M` pinned to the top (`freeze-panes`
-    /// `architecture.md §2.2`). One undoable diff (the fork's `set_frozen_rows_count`). Defensive
-    /// clamp: the fork's `Model::set_frozen_rows` **errors** at `count >= LAST_ROW`, i.e. its max
-    /// accepted count is all-but-one track — so a "freeze at the very last track" action degrades
-    /// to the engine max instead of erroring (`functional_spec.md §5.2` tolerates, never blocks).
+    /// `architecture.md §2.2`). One undoable diff (the fork's `set_frozen_rows_count`).
+    ///
+    /// The `MAX_ROWS - 1` clamp is a **dead backstop, kept deliberately**. It exists because the
+    /// fork's `Model::set_frozen_rows_count` *errors* at `count >= LAST_ROW`, and it used to be
+    /// live: `freeze-panes` §5.2 let any count through and degraded an out-of-range one to the
+    /// engine max. That contract is **superseded** by B2
+    /// (`engine-worker-hardening/functional_spec.md F1.2`) — degrading to ~1M frozen rows *was*
+    /// the denial of service. `Worker::pre_validate` now rejects any `SetFrozen` over
+    /// `MAX_FROZEN_ROWS` (64), which sits four orders of magnitude below this clamp, so **no
+    /// command path can reach it**.
+    ///
+    /// No test exercises it any more, and that is accepted: the only way to reach it would be to
+    /// call this wrapper directly, bypassing the command path that is the sole production caller —
+    /// a test that asserts on an unreachable branch pins an implementation detail, not a contract.
+    /// The clamp stays because it is one `min` and it keeps this wrapper total if the cap above it
+    /// is ever raised or moved.
     pub(crate) fn set_frozen_rows(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
         crate::instrument::record_engine_call();
         let clamped = count.min(freecell_core::limits::MAX_ROWS - 1);
@@ -901,6 +913,10 @@ impl WorkbookDocument {
     /// Sets the frozen-columns count `K` — leading columns `0..K` pinned to the left (the column
     /// analog of [`set_frozen_rows`](Self::set_frozen_rows); the fork's
     /// `set_frozen_columns_count`, clamped below its `LAST_COLUMN` guard).
+    ///
+    /// Same status as the row clamp: a dead backstop below `MAX_FROZEN_COLS` (32), unreachable
+    /// from any command path because `pre_validate` rejects first, and untested for the reason
+    /// spelled out on [`set_frozen_rows`](Self::set_frozen_rows).
     pub(crate) fn set_frozen_columns(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
         crate::instrument::record_engine_call();
         let clamped = count.min(freecell_core::limits::MAX_COLS - 1);

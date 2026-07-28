@@ -6070,9 +6070,14 @@ pub(super) mod tests {
     fn publish_clamps_an_oversized_frozen_band() {
         // The publish-site backstop (`functional_spec.md F1.4`). Seed the resident cache with a
         // sheet-size band DIRECTLY, bypassing both the command guard and the cache-build clamp, and
-        // assert the publish still returns promptly with a clamped band. Under the pre-fix code
-        // this loop ran ~1M x 256 `formatted_value` calls and never returned, so the wall-clock
-        // assertion is the real subject of this test — a regression must fail, not hang.
+        // assert the publish still returns with a clamped band. Under the pre-fix code this loop
+        // ran ~1M x 256 `formatted_value` calls and NEVER returned, so "it returns at all" is the
+        // real subject of this test.
+        //
+        // `cargo test` has no per-test timeout, so the publish runs on a spawned thread bounded by
+        // `recv_timeout`: a fully removed clamp trips the timeout and FAILS here instead of parking
+        // the whole run forever. `Timeout` and `Disconnected` are distinguished, so a PANIC inside
+        // `commit` is joined and re-raised rather than misreported as a hang.
         let (mut worker, _rx) = test_worker();
         let sheet = sheet0(&worker);
         worker.process_batch(vec![Command::SetViewport {
@@ -6091,13 +6096,39 @@ pub(super) mod tests {
             worker.shared.caches.write().insert(sheet, hostile);
         }
 
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let started = Instant::now();
-        worker.commit(StagedCommit::default());
-        let elapsed = started.elapsed();
+        let publisher = std::thread::spawn(move || {
+            worker.commit(StagedCommit::default());
+            let publication = worker.shared.publication.load_full();
+            let _ = done_tx.send((publication.frozen_rows, publication.frozen_cols));
+            // Hold the worker alive until the receiver has its answer.
+            drop(worker);
+        });
+        let (frozen_rows, frozen_cols) =
+            match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(band) => {
+                    publisher.join().expect("the publish thread did not panic");
+                    band
+                }
+                // Disconnected = the thread unwound before sending. Join to re-raise its panic, so a
+                // crash in `commit` is reported as a crash rather than as a hang.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match publisher.join() {
+                    Err(payload) => std::panic::resume_unwind(payload),
+                    Ok(()) => panic!("the publish thread finished without sending its band"),
+                },
+                // A real hang: the clamp is gone and the loop is walking the whole sheet. Leave
+                // the thread detached — the harness exits the process without joining it.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the clamped-band publish did not return within 30s")
+                }
+            };
 
-        let publication = worker.shared.publication.load_full();
-        assert_eq!(publication.frozen_rows, MAX_FROZEN_ROWS);
-        assert_eq!(publication.frozen_cols, MAX_FROZEN_COLS);
+        assert_eq!(frozen_rows, MAX_FROZEN_ROWS);
+        assert_eq!(frozen_cols, MAX_FROZEN_COLS);
+        // A *partial* regression (a clamp that still bounds the loop but costs far too much) shows
+        // up here rather than at the timeout above.
+        let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "the clamped band publish must return promptly, took {elapsed:?}"
@@ -6110,7 +6141,9 @@ pub(super) mod tests {
         // where the counts enter the read model, so BOTH the publish loop and the grid's
         // `for r in 0..frozen_rows` band renderer see a bounded band. The sheet opens normally.
         let dir = tempfile::tempdir().unwrap();
-        let path = pane_fixture_with(dir.path(), 500_000, 400_000);
+        // `pane_fixture_with(dir, x_split, y_split)` — the ROW axis is the second argument, so
+        // this is the `ySplit="500000"` the comment above and `architecture.md §A2.5` name.
+        let path = pane_fixture_with(dir.path(), 400_000, 500_000);
         let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
         let (worker, _rx) = worker_over(doc);
         let sheet = sheet0(&worker);
@@ -6280,6 +6313,127 @@ pub(super) mod tests {
             3,
             "a single undo reverts the delete and the boundary together"
         );
+    }
+
+    #[test]
+    fn structural_edit_past_the_cap_diverges_model_from_the_clamped_cache() {
+        // The ACCEPTED divergence (`engine-worker-hardening functional_spec.md F1.3`), pinned so a
+        // future reader does not mistake it for a bug — or "fix" it by re-clamping after the edit.
+        //
+        // A freeze at the cap is legal, and IronCalc grows the frozen boundary INSIDE a structural
+        // edit's own undo diff (see `structural_edits_track_frozen_boundary_in_one_undo_step`).
+        // `InsertRows` is not range-checked against the frozen cap — and must not be: re-clamping
+        // the model afterwards would cost a SECOND undo diff and break both `SetFrozen`'s and
+        // Insert's one-undo-step contract. So two ordinary gestures move the model's count past the
+        // cap while the cache — which is what the publish loop, the grid band and the header menu
+        // all read — stays clamped. That is the deal: the model (and a save) keeps the larger
+        // count; everything the user sees is bounded; Unfreeze resolves it.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            // A viewport, so `build_publication` produces a real (band-carrying) publication.
+            Command::SetViewport {
+                sheet,
+                rows: 0..40,
+                cols: 0..10,
+            },
+            Command::SetFrozen {
+                sheet,
+                rows: Some(MAX_FROZEN_ROWS),
+                cols: None,
+            },
+        ]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            MAX_FROZEN_ROWS,
+            "a freeze exactly at the cap applies"
+        );
+
+        // Insert above the band: IronCalc grows the boundary to 64 + 8 = 72, past the cap.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+
+        let idx = worker.resolve(sheet).expect("sheet is live");
+        assert_eq!(
+            worker.doc.worksheet(idx).unwrap().frozen_rows,
+            MAX_FROZEN_ROWS as i32 + 8,
+            "the model's frozen count grew past the cap — the structural edit is not range-checked"
+        );
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            MAX_FROZEN_ROWS,
+            "the cache — and therefore the band, the menu label and the publication — stays clamped"
+        );
+        let publication = worker.shared.publication.load_full();
+        assert_eq!(
+            publication.frozen_rows, MAX_FROZEN_ROWS,
+            "the published band is bounded even though the model is over the cap"
+        );
+
+        // The cost of the divergence, pinned exactly (`functional_spec.md F1.3`): while the model
+        // is OVER the cap, further band-affecting gestures move the model and leave the visible
+        // boundary standing still. The band starts tracking again only once the model comes back
+        // under. `model_then_cache` walks the sequence a user would actually produce.
+        let model_then_cache = |worker: &Worker| {
+            let idx = worker.resolve(sheet).expect("sheet is live");
+            (
+                worker.doc.worksheet(idx).unwrap().frozen_rows,
+                frozen(worker, sheet).0,
+            )
+        };
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (80, MAX_FROZEN_ROWS),
+            "a second insert moves the model again; the band does not move"
+        );
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (72, MAX_FROZEN_ROWS),
+            "deleting back down is invisible too, while the model is still over the cap"
+        );
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (MAX_FROZEN_ROWS as i32, MAX_FROZEN_ROWS),
+            "at the cap the two agree again"
+        );
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (56, 56),
+            "under the cap the band tracks the model again — the divergence is not sticky"
+        );
+
+        // Unfreeze is the user's way out, and it clears BOTH sides.
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(0),
+            cols: None,
+        }]);
+        let idx = worker.resolve(sheet).expect("sheet is live");
+        assert_eq!(worker.doc.worksheet(idx).unwrap().frozen_rows, 0);
+        assert_eq!(frozen(&worker, sheet).0, 0);
     }
 
     fn auto_grow(sheet: SheetId, heights: Vec<(u32, f32)>) -> Command {

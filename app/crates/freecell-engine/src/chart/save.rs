@@ -22,7 +22,8 @@ use anyhow::{anyhow, Context, Result};
 use roxmltree::{Document, Node};
 
 use freecell_chart_model::{
-    Anchor, AnchorCell, Category, Chart, ChartColor, ChartKind, Color, SeriesData, ThemePalette,
+    Anchor, AnchorCell, Category, Chart, ChartColor, ChartKind, Color, DataLabels, SeriesData,
+    ThemePalette,
 };
 
 use super::load::{self, parse_chart_xml, SheetDrawing};
@@ -1076,6 +1077,42 @@ const SER_SPPR_FOLLOWING: &[&str] = &[
     "shape",
     "extLst",
 ];
+/// The children of `c:dLbls` in `CT_DLbls` schema order, from the first element that may follow a
+/// per-point `c:dLbl` onward. A modelled child's "following" set is the **suffix after its own
+/// name**, so an upsert into an existing `c:dLbls` lands in a schema-valid position — which is what
+/// keeps Excel (a strict reader) opening the result.
+///
+/// `dLbl` (per-point overrides) precedes all of these and is never in a following set: nothing we
+/// insert may land before it. `delete` is likewise excluded — it is the *alternative* to this whole
+/// group, and [`patch_data_labels`] removes it rather than ordering against it.
+const DLBLS_CHILD_ORDER: &[&str] = &[
+    "numFmt",
+    "spPr",
+    "txPr",
+    "dLblPos",
+    "showLegendKey",
+    "showVal",
+    "showCatName",
+    "showSerName",
+    "showPercent",
+    "showBubbleSize",
+    "separator",
+    "showLeaderLines",
+    "leaderLines",
+    "extLst",
+];
+
+/// The elements that may legally follow `local` inside a `c:dLbls` — the suffix of
+/// [`DLBLS_CHILD_ORDER`] after `local` itself. Returns the whole list for a name not in the order
+/// (which cannot happen for a modelled child, and degrades to "insert as early as legal" if it
+/// somehow did).
+fn dlbls_following(local: &str) -> &'static [&'static str] {
+    match DLBLS_CHILD_ORDER.iter().position(|n| *n == local) {
+        Some(i) => &DLBLS_CHILD_ORDER[i + 1..],
+        None => DLBLS_CHILD_ORDER,
+    }
+}
+
 /// After a `c:ser` `c:dLbls`.
 const SER_DLBLS_FOLLOWING: &[&str] = &[
     "trendline",
@@ -1316,17 +1353,11 @@ fn collect_chrome_edits(
             }
             // Data labels → the series' `c:dLbls` (schema-ordered before the data roles).
             if series.data_labels != cached_series.data_labels {
-                let new = series
-                    .data_labels
-                    .as_ref()
-                    .map(|l| chrome::dlbls_element(c, l));
-                upsert_child(
+                patch_data_labels(
                     src,
                     ser,
-                    &["dLbls"],
-                    new,
-                    SER_DLBLS_FOLLOWING,
-                    1, // after a same-anchor new spPr (seq 0)
+                    c,
+                    series.data_labels.as_ref(),
                     &mut replaces,
                     &mut inserts,
                 );
@@ -1346,6 +1377,109 @@ fn collect_chrome_edits(
     }
     edits.extend(replaces);
     edits.extend(merged);
+}
+
+/// Splice a **data-label** change into a series, preserving everything in the file's `c:dLbls` that
+/// the model does not carry.
+///
+/// The previous implementation replaced the whole `c:dLbls` node with a freshly-built one
+/// (`upsert_child(…, &["dLbls"], Some(chrome::dlbls_element(…)), …)`), which destroyed every child
+/// outside the model: per-point `c:dLbl` overrides (a label the user re-typed or re-positioned on
+/// one point), `c:txPr` label typography, `c:spPr` label fill, `c:showLeaderLines`/`c:leaderLines`,
+/// and any `c:extLst`. That was the one hole in an otherwise strict preserve-unknown save path —
+/// a **data-loss** bug, unit G5.
+///
+/// This follows the shape [`patch_series_color`] already established for `c:spPr`: when the parent
+/// element exists and has a content region, patch *inside* it; only build a whole element when
+/// there is nothing to preserve.
+///
+/// | Existing `c:dLbls` | Action |
+/// |---|---|
+/// | absent | insert a whole element (nothing to preserve) |
+/// | self-closing `<c:dLbls/>` | replace it whole — lossless, it held nothing |
+/// | present with content | upsert each modelled child **inside** it; leave every other child alone |
+///
+/// **Clearing labels still removes the whole node.** Keeping an empty `c:dLbls` husk to preserve
+/// unknown children would mean "labels on, with defaults" to Excel — the opposite of what the user
+/// asked for. Per-point overrides of removed labels are moot, so this is the right trade and is not
+/// an oversight.
+fn patch_data_labels(
+    src: &str,
+    ser: &Node,
+    c: &str,
+    new: Option<&DataLabels>,
+    replaces: &mut Vec<(Range<usize>, String)>,
+    inserts: &mut Vec<(usize, usize, String)>,
+) {
+    let existing = child(ser, "dLbls");
+    let Some(labels) = new else {
+        // Clear: drop the whole element (see the doc comment).
+        if let Some(node) = existing {
+            replaces.push((node.range(), String::new()));
+        }
+        return;
+    };
+
+    let Some(dlbls) = existing else {
+        // No `c:dLbls` at all → insert a complete one, schema-ordered within `c:ser`.
+        inserts.push((
+            insertion_offset(src, ser, SER_DLBLS_FOLLOWING),
+            1, // after a same-anchor new spPr (seq 0)
+            chrome::dlbls_element(c, labels),
+        ));
+        return;
+    };
+
+    if is_self_closing(src, &dlbls) {
+        // `<c:dLbls/>` has no content region to splice into (the same trap `patch_series_color`
+        // documents for `<c:spPr/>`: an insert would land OUTSIDE the element, as an invalid direct
+        // child of `c:ser`). It holds nothing, so replacing it whole preserves everything it had.
+        replaces.push((dlbls.range(), chrome::dlbls_element(c, labels)));
+        return;
+    }
+
+    // A `<c:delete val="1"/>` means "no labels on this series". If it survived while we turn a
+    // `show*` flag on, Excel would honor the delete and show nothing — the edit would silently do
+    // nothing. The whole-node replace got this right by accident; an in-place patch has to do it on
+    // purpose. (`val="0"` is the benign explicit-off form and is left alone.)
+    if let Some(del) = child(&dlbls, "delete") {
+        let is_on = matches!(
+            del.attribute("val"),
+            None | Some("1") | Some("true") | Some("on")
+        );
+        if is_on {
+            replaces.push((del.range(), String::new()));
+        }
+    }
+
+    // Upsert each modelled child in place. `seq` follows schema order so several fresh children
+    // inserted at the same anchor (an empty-but-closed `<c:dLbls></c:dLbls>`) come out ordered.
+    let modelled = chrome::dlbls_children(c, labels);
+    let present: Vec<&str> = modelled.iter().map(|(name, _)| *name).collect();
+    for (seq, (name, fragment)) in modelled.iter().enumerate() {
+        upsert_child(
+            src,
+            &dlbls,
+            &[name],
+            Some(fragment.clone()),
+            dlbls_following(name),
+            seq,
+            replaces,
+            inserts,
+        );
+    }
+
+    // An optional child the model no longer carries (a cleared number format, position or
+    // separator) must be REMOVED, not left behind — otherwise clearing a label's number format in
+    // the panel would leave the file's old code in place. The `show*` flags are always present in
+    // `modelled`, so they never take this path.
+    for optional in ["numFmt", "dLblPos", "separator"] {
+        if !present.contains(&optional) {
+            if let Some(node) = child(&dlbls, optional) {
+                replaces.push((node.range(), String::new()));
+            }
+        }
+    }
 }
 
 /// The `(category, value)` axis nodes to patch an axis title into: for scatter the two `c:valAx`
@@ -2368,6 +2502,190 @@ mod tests {
             "an unchanged loaded chart (chrome + values) re-patches byte-for-byte",
         );
         assert!(patched.contains("<c:roundedCorners val=\"1\"/>"));
+    }
+
+    /// A `c:dLbls` carrying everything the model does NOT know about: a per-point `c:dLbl`
+    /// override (a label the user re-typed on one point), label fill (`c:spPr`), label typography
+    /// (`c:txPr`), and leader lines.
+    fn rich_dlbls() -> &'static str {
+        r#"<c:dLbls><c:dLbl><c:idx val="1"/><c:layout/><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>Custom</a:t></a:r></a:p></c:rich></c:tx><c:showVal val="1"/></c:dLbl><c:spPr><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill></c:spPr><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1400" b="1"/></a:pPr><a:endParaRPr lang="en-US"/></a:p></c:txPr><c:numFmt formatCode="0.0%" sourceLinked="0"/><c:showLegendKey val="0"/><c:showVal val="0"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showLeaderLines val="1"/></c:dLbls>"#
+    }
+
+    fn line_fixture_with_rich_dlbls() -> String {
+        let xml = line_fixture_with_unmodeled().replacen(
+            "</c:ser>",
+            &format!("{}</c:ser>", rich_dlbls()),
+            1,
+        );
+        assert!(xml.contains("ABCDEF"), "the rich dLbls was injected");
+        xml
+    }
+
+    /// **G5 gate — the data-loss fix.** Editing one modelled label field used to whole-node-replace
+    /// `c:dLbls`, destroying every child the model does not carry. Now the edit lands and each of
+    /// those children survives byte-for-byte.
+    #[test]
+    fn patch_data_labels_preserves_per_point_overrides_and_typography() {
+        let xml = line_fixture_with_rich_dlbls();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        let mut dl = chart.series[0].data_labels.clone().expect("labels parsed");
+        assert!(!dl.show_value, "the fixture starts with showVal off");
+        dl.show_value = true;
+        chart.series[0].data_labels = Some(dl);
+
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+
+        // The edit landed.
+        let reparsed = parse_chart_xml(&patched).unwrap();
+        assert!(
+            reparsed.series[0].data_labels.as_ref().unwrap().show_value,
+            "the showVal edit must survive the round trip:\n{patched}",
+        );
+
+        // …and every unmodelled child came through.
+        for (what, needle) in [
+            ("the per-point c:dLbl override", "<c:idx val=\"1\"/>"),
+            ("the per-point label text", "Custom"),
+            ("label fill (c:spPr)", "ABCDEF"),
+            ("label typography (c:txPr)", "sz=\"1400\""),
+            ("leader lines", "showLeaderLines"),
+        ] {
+            assert!(
+                patched.contains(needle),
+                "{what} was destroyed by a data-label edit — this is the G5 data loss:\n{patched}",
+            );
+        }
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+        assert!(patched.contains("<c:roundedCorners val=\"1\"/>"));
+    }
+
+    /// The modelled fields are still fully editable in place — a second field changes, and the
+    /// file's own `c:numFmt` is REPLACED rather than duplicated.
+    #[test]
+    fn patch_data_labels_updates_modelled_fields_in_place() {
+        let xml = line_fixture_with_rich_dlbls();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        let mut dl = chart.series[0].data_labels.clone().unwrap();
+        assert_eq!(dl.number_format.as_deref(), Some("0.0%"));
+        dl.show_percent = true;
+        dl.number_format = Some("#,##0.00".into());
+        chart.series[0].data_labels = Some(dl);
+
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        assert_eq!(
+            patched.matches("<c:numFmt").count(),
+            xml.matches("<c:numFmt").count(),
+            "the numFmt was replaced in place, not duplicated:\n{patched}",
+        );
+        assert!(!patched.contains("formatCode=\"0.0%\""), "old code gone");
+        let dl = parse_chart_xml(&patched).unwrap().series[0]
+            .data_labels
+            .clone()
+            .unwrap();
+        assert!(dl.show_percent);
+        assert_eq!(dl.number_format.as_deref(), Some("#,##0.00"));
+        assert!(patched.contains("Custom"), "overrides still preserved");
+    }
+
+    /// Clearing an optional modelled field REMOVES its element rather than leaving the file's old
+    /// value behind — otherwise clearing a label's number format in the panel would be a no-op.
+    #[test]
+    fn patch_data_labels_clears_an_optional_field() {
+        let xml = line_fixture_with_rich_dlbls();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        let mut dl = chart.series[0].data_labels.clone().unwrap();
+        dl.number_format = None;
+        chart.series[0].data_labels = Some(dl);
+
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        assert!(
+            !patched.contains("formatCode=\"0.0%\""),
+            "the cleared number format must be removed:\n{patched}",
+        );
+        assert!(patched.contains("Custom"), "overrides still preserved");
+        assert!(parse_chart_xml(&patched).unwrap().series[0]
+            .data_labels
+            .as_ref()
+            .unwrap()
+            .number_format
+            .is_none());
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+    }
+
+    /// A `<c:delete val="1"/>` means "no labels on this series". Turning a flag on must remove it,
+    /// or Excel honors the delete and the edit silently does nothing. The old whole-node replace
+    /// got this right by accident; an in-place patch has to do it on purpose.
+    #[test]
+    fn patch_data_labels_removes_a_delete_when_turning_labels_on() {
+        let dlbls = r#"<c:dLbls><c:delete val="1"/></c:dLbls>"#;
+        let xml =
+            line_fixture_with_unmodeled().replacen("</c:ser>", &format!("{dlbls}</c:ser>"), 1);
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        let mut dl = chart.series[0].data_labels.clone().unwrap_or_default();
+        dl.show_value = true;
+        chart.series[0].data_labels = Some(dl);
+
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        // Scope the check to the series' own `c:dLbls` — `c:catAx`/`c:valAx` legitimately carry
+        // their own `<c:delete val="0"/>` (axis visibility), which must not be touched.
+        let start = patched.find("<c:dLbls").expect("the dLbls survives");
+        let end = patched[start..].find("</c:dLbls>").expect("closed") + start;
+        let dlbls = &patched[start..end];
+        assert!(
+            !dlbls.contains("<c:delete"),
+            "the label delete must go, else the labels stay hidden:\n{dlbls}",
+        );
+        assert!(
+            patched.matches("<c:delete val=\"0\"/>").count() == 2,
+            "both axes keep their own c:delete:\n{patched}",
+        );
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+        assert!(
+            parse_chart_xml(&patched).unwrap().series[0]
+                .data_labels
+                .as_ref()
+                .unwrap()
+                .show_value
+        );
+    }
+
+    /// A **self-closing** `<c:dLbls/>` has no content region to splice into (the same trap
+    /// `patch_series_color` documents for `<c:spPr/>`: an insert would land outside the element as
+    /// an invalid direct child of `c:ser`). It holds nothing, so it is replaced whole.
+    #[test]
+    fn patch_data_labels_into_a_self_closing_dlbls() {
+        let xml = line_fixture_with_unmodeled().replacen("</c:ser>", "<c:dLbls/></c:ser>", 1);
+        assert!(xml.contains("<c:dLbls/>"));
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        let mut dl = chart.series[0].data_labels.clone().unwrap_or_default();
+        dl.show_value = true;
+        chart.series[0].data_labels = Some(dl);
+
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        assert!(!patched.contains("<c:dLbls/>"), "replaced whole");
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+        assert!(
+            parse_chart_xml(&patched).unwrap().series[0]
+                .data_labels
+                .as_ref()
+                .unwrap()
+                .show_value
+        );
+    }
+
+    /// Clearing labels removes the whole `c:dLbls`, unknown children and all. Deliberate: an empty
+    /// husk reads as "labels on, with defaults" to Excel, which is the opposite of the request.
+    #[test]
+    fn patch_data_labels_clearing_removes_the_element() {
+        let xml = line_fixture_with_rich_dlbls();
+        let mut chart = parse_chart_xml(&xml).unwrap();
+        chart.series[0].data_labels = None;
+        let patched = patch_chart_source(&xml, &chart).unwrap();
+        assert!(!patched.contains("<c:dLbls"), "element removed:\n{patched}");
+        assert!(roxmltree::Document::parse(&patched).is_ok());
+        assert!(parse_chart_xml(&patched).unwrap().series[0]
+            .data_labels
+            .is_none());
     }
 
     #[test]

@@ -733,6 +733,26 @@ v0.5 half is a data-loss fix. Separately, inserting a chart onto a sheet that al
 carries one is a hard `SaveError`, because the byte-preserve and write-from-model paths
 cannot compose on a shared drawing. Same file; naturally done together.
 
+**Outcome (v05-cleanup-1 P8, 2026-07-28): CONFIRMED, both halves. `dLbls` FIXED; insert collision
+filed.**
+
+*`dLbls`:* demonstrated by probe before fixing — editing one modelled field destroyed the per-point
+`c:dLbl` override, `c:txPr` typography, **and** (beyond what the unit named) the label's `c:spPr`
+fill and `c:showLeaderLines`. New `patch_data_labels` follows the shape `patch_series_color`
+already established for `c:spPr` — patch *inside* an existing element, build a whole one only when
+there is nothing to preserve. `chrome::dlbls_element` refactored into `dlbls_children` so the
+whole-element builder and the in-place patcher share one spelling per element. Decided explicitly:
+`CT_DLbls` insertion anchors per child; a truthy `c:delete` is removed when turning labels on
+(the whole-node replace got that right by accident, an in-place patch must do it on purpose); a
+cleared optional field removes its element; clearing labels still removes the whole node.
+
+*Insert collision:* confirmed from `worker/run.rs` (**read only** — the parallel project owns it),
+whose own comment documents it. The review's framing was slightly broad: **two authored charts on
+one sheet compose fine**; it is *loaded + authored on the same sheet* that cannot merge, and it
+**fails loudly** (no silent drop, no double `<drawing>`, original untouched). Filed as `GAPS.md`
+C-G5-1 at v1.0 with root cause and the shape of the fix. `dLbls` shipped alone, as instructed.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_8.md`.
+
 ---
 
 ## H. The generator fix

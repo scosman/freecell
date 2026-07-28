@@ -34,7 +34,7 @@ Details live in [`functional_spec.md`](functional_spec.md) and
 - [x] **Phase 7 — G1: detect multi-group (combo) charts.** Group counting in
       `source_fidelity`, tightened `is_extended_chart`, corrected `GAPS.md` combo row + G1b
       entry. (§7)
-- [ ] **Phase 8 — G5: `dLbls` per-point overrides.** In-place patch of an existing `c:dLbls`
+- [x] **Phase 8 — G5: `dLbls` per-point overrides.** In-place patch of an existing `c:dLbls`
       instead of whole-node replacement; chart-insert collision confirmed and filed, not
       fixed. (§8)
 

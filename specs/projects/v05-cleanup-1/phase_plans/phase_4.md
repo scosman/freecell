@@ -148,3 +148,31 @@ The schedule and release paths cannot be executed from here; they are verifiable
 
 Bump-token, `paths` filter, per-PR gate — all three explicitly rejected by the owner decision the
 unit records.
+
+## Reviewer findings not actioned
+
+Recorded rather than implemented, with reasons.
+
+- **`skip_render` escape hatch on `release.yml`'s dispatch input — rejected.** The suggestion was a
+  `workflow_dispatch` boolean letting an owner package a build without waiting for the pixel suite
+  (e.g. a doc-only re-tag, or a suite outage). D1 exists *precisely* to make the pixel gate
+  unskippable at release; a documented bypass reintroduces exactly the hole the unit closes, and
+  bypasses get used under time pressure, which is when they are least safe. The current failure mode
+  is acceptable: a red or broken suite blocks packaging until a human either fixes it or edits the
+  workflow — a deliberate, reviewable act rather than a checkbox. If the owner ever wants this, it
+  is an owner decision to record in the unit, not an agent's call.
+- **Cron slot inconsistency with `macos-verify.yml` — noted, not changed.** `render.yml` runs
+  `17 7 * * 0` (off the hour, to dodge GitHub's heavily-contended `:00` scheduling queue) while
+  `macos-verify.yml` runs `0 6 * * 1` (on the hour, different day). The reasoning behind the offset
+  applies equally to `macos-verify`, but that file is not in this unit's scope and changing it would
+  be a drive-by edit to another workflow's schedule. Worth folding into a later CI-hygiene pass.
+- **Scheduled-failure notification discoverability — unresolved; a post-merge check for the owner.**
+  A weekly backstop only helps if a red run is *noticed*. GitHub emails failed-scheduled-run
+  notifications to the account associated with the commit that most recently changed the cron — and
+  here that commit is authored `Claude <noreply@anthropic.com>`, which is not a GitHub account, so
+  the notification may go nowhere. This cannot be verified from inside the container (it depends on
+  the owner's GitHub notification settings and on how the commit's author maps to an account). The
+  owner should confirm after merge that a failed weekly `render` run actually reaches a human —
+  e.g. by watching the repo's Actions notifications, or by re-committing the cron line under their
+  own identity. An unnoticed weekly failure makes the backstop exactly as ignorable as the
+  never-run-on-`main` state it replaces.

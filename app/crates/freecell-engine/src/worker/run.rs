@@ -173,23 +173,23 @@ pub(super) enum UndoEntry {
 pub(super) struct Worker {
     pub(super) doc: WorkbookDocument,
     pub(super) shared: Arc<Shared>,
-    pub(super) event_tx: async_channel::Sender<WorkerEvent>,
+    event_tx: async_channel::Sender<WorkerEvent>,
     /// The active sheet (stable id) — the one the published viewport covers.
-    pub(super) active_sheet: SheetId,
+    active_sheet: SheetId,
     /// The stored overscanned viewport (already overscanned UI-side), clamped to sheet bounds.
     /// `None` until the first `SetViewport` (the initial publish is empty).
-    pub(super) viewport: Option<Viewport>,
+    viewport: Option<Viewport>,
     /// Committed undoable ops (dirty tracking; mirrored to `Shared::committed_ops`).
     pub(super) ops_seen: u64,
     /// Number of **worker-initiated** `evaluate()` calls — the test-observable coalescing
     /// metric. This measures worker behavior (one recompute per drained batch), NOT the
     /// engine's internal recompute count; IronCalc's own coalescing was validated in
     /// round-3 A and Phase 12's perf harness catches recompute regressions.
-    pub(super) eval_count: u64,
+    eval_count: u64,
     /// Set after an unrecoverable panic: keep serving reads/save, refuse edits.
     pub(super) degraded: bool,
     /// Count of caught panics (a second one, or an unresponsive probe, degrades the worker).
-    pub(super) panic_count: u32,
+    panic_count: u32,
     /// The **unified undo timeline** ([`UndoEntry`], charts feedback item 4): one ordered stack over
     /// IronCalc-backed cell edits AND worker-side chart ops, so Ctrl+Z pops the single most-recent
     /// action regardless of kind. A new undoable action (edit OR chart op) pushes here + clears
@@ -201,7 +201,7 @@ pub(super) struct Worker {
     pub(super) redo_stack: Vec<UndoEntry>,
     /// The range clipboard slot (`architecture.md §6`): `Some` after a copy/cut, replaced by the
     /// next copy/cut, and cleared after a cut is pasted (single-use).
-    pub(super) clipboard: Option<ClipboardSlot>,
+    clipboard: Option<ClipboardSlot>,
     /// The live-bound charts this workbook owns (P9, charts/architecture §4.1) — the range→chart
     /// index the worker re-resolves on edit. Empty for a new/unopened or chart-less workbook.
     pub(super) charts: ChartBindings,
@@ -254,14 +254,14 @@ pub(super) struct Worker {
     /// `custom_height` row. Wrap-driven auto-grow ([`Command::AutoGrowRowHeights`]) never touches a
     /// manual row (neither grows nor shrinks it) and never adds to this set. **Session-scoped** — not
     /// persisted to xlsx (a reloaded file's non-custom-height rows start auto).
-    pub(super) manual_rows: HashMap<SheetId, HashSet<u32>>,
+    manual_rows: HashMap<SheetId, HashSet<u32>>,
     /// Per-sheet **wrap-driven** row heights (device px) the UI measured on the render thread — the
     /// auto-grow **contribution** kept separate from IronCalc's own row heights (font/newline
     /// auto-fit / user resize). The resident cache's height for such a row is
     /// `max(base_ironcalc, wrap)`; holding the wrap part here lets it **survive a full cache rebuild**
     /// (resize / insert / delete / band edit) — re-projected in [`build_and_store_cache`] — instead of
     /// being wiped back to the IronCalc base. Only ever holds **auto** rows (manual rows are dropped).
-    pub(super) wrap_heights: HashMap<SheetId, BTreeMap<u32, f32>>,
+    wrap_heights: HashMap<SheetId, BTreeMap<u32, f32>>,
 }
 
 /// What one batch has to commit through [`Worker::commit`] (E1, `functional_spec.md F4`). Every

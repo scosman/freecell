@@ -13,7 +13,8 @@
 //!   policy, dirty-op accounting), the publication, and the save.
 //! - [`charts`] — the chart half: the published [`ChartSnapshot`], the authored-chart store, the
 //!   chart undo timeline, and every chart command (F1 — extracted from `run.rs`, which carried
-//!   ~1,000 production lines of chart machinery beside this module's 39).
+//!   1,048 production lines of chart machinery beside this module's 39; see `charts.rs`'s own
+//!   header for the provenance of those figures).
 //!
 //! [`WorkbookDocument`]: crate::WorkbookDocument
 

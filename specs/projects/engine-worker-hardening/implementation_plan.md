@@ -132,8 +132,9 @@ a contradiction of this note.
 extraction would remove ≈1,180 and land `run.rs` at ≈2,800. It removed **1,048** and landed at
 **3,048** — ~130 fewer lines moved than predicted, and ~250 above the predicted landing point.
 
-The shortfall is **estimate error, not an incomplete extraction**: all 28 items §A4.1 listed (24
-`impl Worker` methods, 4 free functions, `AuthoredEntry`, `ChartUndo`) are gone from `run.rs` and
+The shortfall is **estimate error, not an incomplete extraction**: all **30** items §A4.1 lists
+(24 `impl Worker` methods + 4 free functions = 28 functions, plus the 2 types `AuthoredEntry` and
+`ChartUndo`) are gone from `run.rs` and
 present in `charts.rs`, and `charts.rs` production went 39 → 1,113, i.e. **+1,074** against
 `run.rs`'s −1,048 — the moved code did not shrink, the destination is slightly larger for its own
 module doc, imports and `impl` header. F1's ≈1,180 was an explicitly approximate sum of the chart

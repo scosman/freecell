@@ -9,15 +9,14 @@
 //! [`version`](ChartSnapshot::version) changed, so a scroll-only publish — or an edit that touches
 //! no chart — never re-installs.
 //!
-//! The `impl Worker` block here is the chart machinery **extracted from `run.rs`** (F1), whose
-//! subject already had this module. The extraction took **1,048 production lines** out of
-//! `run.rs` (production 4,096 → 3,048, measured at the extraction commit; both counts drift as
-//! later work lands, so treat them as provenance, not as a current description of either file).
-//! Nothing about it changed in the move — same commands, same events, same ordering. `run.rs`
-//! keeps the loop,
-//! the publication and the save; this file keeps everything chart-shaped, including the pieces
-//! `save_workbook` calls into (`ensure_all_charts_discovered`, `authored_write_list`,
-//! `sheet_name_of`).
+//! The `impl Worker` block here is the chart machinery **extracted from `run.rs`** (F1), which
+//! had carried it even though this module already owned the subject. The extraction took
+//! **1,048 production lines** out of `run.rs` (production 4,096 → 3,048, measured at the
+//! extraction commit; both counts drift as later work lands, so treat them as provenance rather
+//! than as a current description of either file). Nothing about it changed in the move — same
+//! commands, same events, same ordering. `run.rs` keeps the loop, the publication and the save;
+//! this file keeps everything chart-shaped, including the pieces `save_workbook` calls into
+//! (`ensure_all_charts_discovered`, `authored_write_list`, `sheet_name_of`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

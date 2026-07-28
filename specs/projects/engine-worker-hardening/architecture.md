@@ -517,10 +517,21 @@ Staying in `run.rs`: `save_workbook` (a save function that happens to call chart
 `charts.rs` can name `super::run::Worker` but cannot reach its private fields. Two mechanical
 adjustments:
 
-1. `Worker`'s fields become `pub(super)` — visible within `mod worker` only, which is where
-   both modules live. This is the smallest possible widening: `Worker` itself stays
+1. **Only the `Worker` fields the chart code actually reads** become `pub(super)` — visible
+   within `mod worker` only, which is where both modules live. `Worker` itself stays
    `pub(super)`, so nothing outside the worker module can see the type at all, let alone its
    fields.
+
+   > **Amended after Phase 3 CR.** This item originally read "`Worker`'s fields become
+   > `pub(super)`" — a blanket, written for convenience at spec time rather than as a considered
+   > decision, and in tension with this section's own "smallest widening that compiles"
+   > principle. The blanket widened all 24 fields; only **16** are reachable from outside
+   > `run.rs`. The other **8** — `event_tx`, `active_sheet`, `viewport`, `eval_count`,
+   > `panic_count`, `clipboard`, `manual_rows`, `wrap_heights` — are private again, verified by
+   > narrowing all 24 and letting `cargo check -p freecell-engine --all-targets` name the ones
+   > the compiler demands back. Unused `pub` never warns, so this could not have self-corrected.
+   > Widen per field, as needed, and re-derive the set the same way if the chart code's reads
+   > change.
 2. `Touch`, `UndoEntry`, `AppliedOp` and the small shared helpers the chart code calls
    (`resolve`, `emit`, and after Phase 4, `commit`) become `pub(super)` for the same reason.
 
@@ -549,7 +560,8 @@ proposal for what should move next; it does not attempt it.
 > both counts. The extraction removed **1,048** production lines, not ≈1,180, and `run.rs`
 > landed at **3,048**, not ≈2,800 — ~250 above the predicted point. Two independent causes,
 > both verified: (a) F1's ≈1,180 was an approximate sum of the chart items' spans and ran ~130
-> lines high — all 28 listed items did move, and `charts.rs` production went 39 → 1,113
+> lines high — all **30** items §A4.1 lists did move (28 functions + 2 types), and `charts.rs`
+> production went 39 → 1,113
 > (**+1,074**), so nothing was left behind; (b) the ≈2,800 assumed the 3,984 baseline, but
 > Phases 1–2 added 112 lines *before* the cut (4,096 − 1,048 = 3,048). With Phase 4 and the
 > Phase 1/2 CR rounds on top, `run.rs` production is **3,192 as of this commit** — it will move

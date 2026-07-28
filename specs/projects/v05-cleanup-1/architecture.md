@@ -606,6 +606,17 @@ Preserving a `c:dLbls` husk to keep unknown children would produce a node that m
 "labels on, with defaults" to Excel. So: clearing still removes the node, and this is stated
 in a comment so it does not read as an oversight.
 
+> **Superseded 2026-07-28 (phase 8 code review, finding 4).** Removing the node is **wrong**:
+> `load` resolves a chart-**group**-level `c:dLbls` as the default for every series without its
+> own, so on a file that has one the series re-inherits that default and the user's "turn these
+> labels off" silently does nothing. The shipped save writes an explicit
+> `<c:dLbls><c:delete val="1"/></c:dLbls>` instead — the OOXML "no labels on this series"
+> construct — inserting one even where the series had no `c:dLbls` of its own. The paragraph's
+> *premise* still holds (a `c:dLbls` **husk** would read as "labels on, with defaults"); a
+> `c:delete` is not a husk. Consequences recorded as `GAPS.md` C-G5-3 and in
+> [`phase_plans/phase_8.md`](phase_plans/phase_8.md) §"Code-review round". Left as written above
+> for the record — this section is `status: complete`.
+
 **Schema order for the inner upserts.** `CT_DLbls` orders its children: the `c:dLbl` group
 first, then either `c:delete` or the settings group (`numFmt`, `spPr`, `txPr`, `dLblPos`,
 `showLegendKey`, `showVal`, `showCatName`, `showSerName`, `showPercent`, `showBubbleSize`,
@@ -627,6 +638,15 @@ concept in effect (labels off), so the patcher removes a truthy `c:delete` when 
 `show*` flag on. This is an edge case the whole-node replace accidentally got right and an
 in-place patch can get wrong — hence an explicit rule and a test.
 
+> **Superseded 2026-07-28 (phase 8 code review, finding 1).** "Removes a **truthy** `c:delete`" is
+> too narrow: the shipped patcher removes **any** `c:delete` whenever it writes group children,
+> whatever its `val`. `CT_DLbls` is `dLbl*, (delete | Group_DLbls), extLst?`, so `delete` and the
+> settings group are **mutually exclusive** — a leftover falsy `<c:delete val="0"/>` beside the
+> `show*` flags is schema-invalid output, which a strict reader rejects. A `val="0"` delete is a
+> no-op by definition, so removing it unconditionally cannot change meaning, and it removes the
+> save path's second spelling of the OOXML-boolean predicate outright. Left as written above for
+> the record — this section is `status: complete`.
+
 ### Tests
 
 In `save.rs`'s test module:
@@ -640,6 +660,22 @@ In `save.rs`'s test module:
 7. `c:delete val="1"` + turning labels on → `c:delete` removed, labels visible on re-parse;
 8. every case: `roxmltree::Document::parse(&patched).is_ok()` and a `parse_chart_xml`
    round-trip of the modelled fields.
+
+> **Superseded 2026-07-28 (phase 8 code review, findings 1–4).** Item **6** reads, as shipped,
+> *"clearing labels writes an explicit `c:delete`, overriding any chart-group-level default"* (see
+> the annotation under "Setting to `None`"), and item **7** covers `val="0"` as well as `val="1"`.
+> Item **8** was **not sufficient**: well-formedness plus an order-agnostic `parse_chart_xml`
+> round-trip cannot see a wrong child order, which was the highest-risk decision here. The shipped
+> suite therefore also asserts, on every case, that each series' `c:dLbls` children agree with
+> `save::DLBLS_CHILD_ORDER`; pins that constant to a hand-written ECMA-376 `CT_DLbls` literal
+> (`dlbls_child_order_matches_ct_dlbls` — without it the order assertions only check the code
+> against itself); asserts the two spellings of the order (`chrome::dlbls_children` build order vs
+> the insert-anchor order) agree; and adds the two **insertion** shapes the original list missed
+> (empty-but-closed `<c:dLbls></c:dLbls>`, and a `c:dLbls` of only unmodelled children), since
+> items 1–7 all exercise *replacement* only. Two further cases guard values the model cannot
+> represent (`dLblPos val="bestFit"`, `numFmt formatCode="General"`, `numFmt@sourceLinked`). Full
+> list in [`phase_plans/phase_8.md`](phase_plans/phase_8.md) §"Code-review round". Left as written
+> above for the record — this section is `status: complete`.
 
 ### Chart-insert collisions — explicitly deferred
 

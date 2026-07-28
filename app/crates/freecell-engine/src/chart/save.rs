@@ -2565,31 +2565,47 @@ mod tests {
         xml
     }
 
-    /// The child local-names, in document order, of the **first series'** own `c:dLbls` in a chart
-    /// part (`None` when that series has none). Scoped to the series so the axes' own `c:delete`
-    /// and any chart-group-level `c:dLbls` can never be mistaken for it.
-    fn series_dlbls_child_names(xml: &str) -> Option<Vec<String>> {
+    /// The child local-names, in document order, of **each series'** own `c:dLbls` in a chart part
+    /// — one entry per `c:ser` of the first chart group, `None` where that series has no `c:dLbls`
+    /// of its own. Scoped to the series so the axes' own `c:delete` and any chart-**group**-level
+    /// `c:dLbls` can never be mistaken for one.
+    fn dlbls_child_names_by_series(xml: &str) -> Vec<Option<Vec<String>>> {
         let doc = roxmltree::Document::parse(xml).expect("well-formed chart XML");
         let root = doc.root_element();
-        let group = child(&root, "chart")
+        let Some(group) = child(&root, "chart")
             .and_then(|ch| child(&ch, "plotArea"))
             .and_then(|plot| {
                 plot.children()
                     .find(|n| n.is_element() && load::is_chart_group(n.tag_name().name()))
-            })?;
-        let ser = group
+            })
+        else {
+            return Vec::new();
+        };
+        group
             .children()
-            .find(|n| n.is_element() && n.tag_name().name() == "ser")?;
-        Some(
-            child(&ser, "dLbls")?
-                .children()
-                .filter(|n| n.is_element())
-                .map(|n| n.tag_name().name().to_string())
-                .collect(),
-        )
+            .filter(|n| n.is_element() && n.tag_name().name() == "ser")
+            .map(|ser| {
+                Some(
+                    child(&ser, "dLbls")?
+                        .children()
+                        .filter(|n| n.is_element())
+                        .map(|n| n.tag_name().name().to_string())
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
-    /// Assert the first series' `c:dLbls` children are in **`CT_DLbls` schema order**:
+    /// The **first series'** own `c:dLbls` child names (`None` when it has none) — for the cases
+    /// that assert on that one series specifically.
+    fn series_dlbls_child_names(xml: &str) -> Option<Vec<String>> {
+        dlbls_child_names_by_series(xml)
+            .into_iter()
+            .next()
+            .flatten()
+    }
+
+    /// Assert **every** series' `c:dLbls` children are in **`CT_DLbls` schema order**:
     /// `dLbl*, (delete | Group_DLbls), extLst?` — leading per-point `c:dLbl`s, then either a lone
     /// `c:delete` or a **subsequence** of [`DLBLS_CHILD_ORDER`].
     ///
@@ -2598,10 +2614,28 @@ mod tests {
     /// `parse_chart_xml` is order-agnostic — so a wrong `DLBLS_CHILD_ORDER` (say `showVal` before
     /// `dLblPos`) would have passed the whole suite while handing Excel, a strict reader, XML it
     /// rejects. The highest-risk decision in the unit was the untested one.
+    ///
+    /// It checks **agreement with [`DLBLS_CHILD_ORDER`]**, not schema conformance in the abstract:
+    /// the constant is what anchors this to ECMA-376, and it is separately pinned to a hand-written
+    /// literal by `dlbls_child_order_matches_ct_dlbls`. Every series is walked (an early version
+    /// looked only at the first, so a case editing a later series went unchecked), and at least one
+    /// of them must carry a `c:dLbls` — otherwise the call is vacuous and says nothing.
     fn assert_dlbls_schema_order(xml: &str) {
-        let Some(names) = series_dlbls_child_names(xml) else {
-            return; // the series has no `c:dLbls` — nothing to order
-        };
+        let by_series = dlbls_child_names_by_series(xml);
+        assert!(
+            by_series.iter().any(Option::is_some),
+            "no series carries a `c:dLbls` — this order assertion would pass vacuously",
+        );
+        for (i, names) in by_series.iter().enumerate() {
+            let Some(names) = names else {
+                continue; // this series has no `c:dLbls` of its own — nothing to order
+            };
+            assert_dlbls_names_ordered(i, names);
+        }
+    }
+
+    /// One series' `c:dLbls` child names, checked against [`DLBLS_CHILD_ORDER`].
+    fn assert_dlbls_names_ordered(series: usize, names: &[String]) {
         let mut rest = names
             .iter()
             .map(String::as_str)
@@ -2612,7 +2646,7 @@ mod tests {
             let tail: Vec<&str> = rest.collect();
             assert!(
                 tail.iter().all(|n| *n == "extLst"),
-                "`c:delete` is the ALTERNATIVE to the whole settings group \
+                "series {series}: `c:delete` is the ALTERNATIVE to the whole settings group \
                  (CT_DLbls = `dLbl*, (delete | Group_DLbls), extLst?`), so nothing but `extLst` \
                  may follow it: {names:?}",
             );
@@ -2625,14 +2659,17 @@ mod tests {
                 .position(|n| *n == name)
                 .unwrap_or_else(|| {
                     panic!(
-                        "`c:{name}` is not a legal c:dLbls child in this position — a `c:dLbl` \
-                         must precede the settings group and a `c:delete` excludes it: {names:?}"
+                        "series {series}: `c:{name}` is not a legal c:dLbls child in this position \
+                         — a `c:dLbl` must precede the settings group and a `c:delete` excludes \
+                         it: {names:?}"
                     )
                 });
             assert!(
                 pos >= min,
-                "c:dLbls children are out of CT_DLbls schema order at `c:{name}` — Excel would \
-                 reject this part: {names:?}",
+                "series {series}: the c:dLbls children disagree with DLBLS_CHILD_ORDER at \
+                 `c:{name}` — the constant (pinned to ECMA-376's CT_DLbls by \
+                 `dlbls_child_order_matches_ct_dlbls`) says this child cannot follow the ones \
+                 before it: {names:?}",
             );
             min = pos + 1;
         }
@@ -2904,6 +2941,46 @@ mod tests {
             .unwrap();
         assert!(reparsed.show_value);
         assert_eq!(reparsed.number_format.as_deref(), Some("#,##0"));
+    }
+
+    /// **The external anchor for [`DLBLS_CHILD_ORDER`].** Every other order assertion in this
+    /// module compares patched output *against that constant*, so a wrong constant is
+    /// self-consistent and invisible: swap the adjacent `separator` / `showLeaderLines` (a
+    /// realistic typo — only the first is modelled) and the whole suite still passes, while an
+    /// upsert into a `c:dLbls` that carries `showLeaderLines` emits
+    /// `… showPercent, showLeaderLines, separator` — exactly the invalid XML the order assertion
+    /// exists to catch. So the constant is pinned here to a literal transcribed from the schema,
+    /// which is the one thing no other test can derive from the code under test.
+    ///
+    /// Source: ECMA-376 Part 1, DrawingML Charts (`dml-chart.xsd`) — `CT_DLbls` is
+    /// `dLbl*, (delete | Group_DLbls), extLst?`, and `Group_DLbls` is
+    /// `numFmt?, spPr?, txPr?, dLblPos?, showLegendKey?, showVal?, showCatName?, showSerName?,
+    /// showPercent?, showBubbleSize?, separator?, showLeaderLines?, leaderLines?`. The constant
+    /// covers `Group_DLbls` plus the trailing `extLst`; `dLbl` and `delete` are excluded by
+    /// design (see its doc comment).
+    #[test]
+    fn dlbls_child_order_matches_ct_dlbls() {
+        const CT_DLBLS_FROM_THE_SCHEMA: &[&str] = &[
+            "numFmt",
+            "spPr",
+            "txPr",
+            "dLblPos",
+            "showLegendKey",
+            "showVal",
+            "showCatName",
+            "showSerName",
+            "showPercent",
+            "showBubbleSize",
+            "separator",
+            "showLeaderLines",
+            "leaderLines",
+            "extLst",
+        ];
+        assert_eq!(
+            DLBLS_CHILD_ORDER, CT_DLBLS_FROM_THE_SCHEMA,
+            "DLBLS_CHILD_ORDER drives every in-place `c:dLbls` insertion anchor; it must be \
+             CT_DLbls' own order or the save writes XML Excel rejects",
+        );
     }
 
     /// The two spellings of `CT_DLbls` order must agree: `chrome::dlbls_children` (the BUILD order

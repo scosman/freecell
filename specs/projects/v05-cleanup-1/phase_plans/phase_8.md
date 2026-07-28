@@ -180,10 +180,11 @@ The doc comment no longer claims the old behaviour "is the right trade and is no
 
 ### Spec sections this contradicts (dated annotation, 2026-07-28)
 
-Two `status: complete` sections describe behaviour the review reversed. They are **not** edited
-silently — and not edited at all in this pass, which was scoped to `chart/save.rs`,
-`chart/chrome.rs`, `GAPS.md` and this file while other agents work the same tree. **Annotate them
-with this note when the spec is next touched:**
+`architecture.md` §8 describes behaviour the review reversed. It is **not** rewritten — the section
+is `status: complete`, so the original text stays and each contradiction carries a dated
+supersession note beside it. **Applied 2026-07-28** (second review round: deferring them to "when
+the spec is next touched" left nothing forcing it, and §8 is this unit's own doc). The three notes
+say:
 
 - **`architecture.md` §8 "G5 — `dLbls` per-point overrides" → "Setting to `None` (clearing
   labels)"** — says *"clearing still removes the node, and this is stated in a comment so it does
@@ -220,6 +221,76 @@ with this note when the spec is next touched:**
 - `cargo clippy -p freecell-engine --all-targets` — clean; `cargo fmt --all --check` — clean
 - Files touched: `chart/save.rs`, `chart/chrome.rs`, `GAPS.md`, this file. No render impact (chart
   **save**, not the chart widgets).
+
+## Second review round — 2026-07-28
+
+The re-review cleared nearly everything and left one finding standing plus a new Moderate.
+
+### 1. `assert_dlbls_schema_order` had no external anchor (the finding that stayed open)
+
+The order assertion added in round 1 validates patched output against **`DLBLS_CHILD_ORDER`
+itself** — the very constant it is supposed to be testing. So a wrong constant is *self-consistent*
+and invisible. The reviewer demonstrated it: swap the adjacent `separator` / `showLeaderLines` (a
+genuinely invalid `CT_DLbls` order, and a realistic typo — only the first of the two is modelled)
+and **all 137 tests pass**, while an upsert into a `c:dLbls` that carries `showLeaderLines` emits
+`… showPercent, showLeaderLines, separator` — exactly the invalid XML the assertion exists to
+catch. Round 1's mutation check (`showVal` before `dLblPos`) only failed because two fixtures
+happen to spell the true order as string literals; it proved less than it looked.
+
+Fixed by pinning the constant to a **hand-written literal transcribed from the schema**, with the
+citation, in `dlbls_child_order_matches_ct_dlbls`. That is the one assertion no other test can
+derive from the code under test.
+
+**Mutation-verified:** swapping `separator`/`showLeaderLines` in `DLBLS_CHILD_ORDER` now fails
+`dlbls_child_order_matches_ct_dlbls` — and, as the reviewer said, *only* that test (137 pass, 1
+fails), which is precisely why the anchor had to exist. Restored, 138 pass. Re-running round 1's
+`showVal`-before-`dLblPos` mutation against the reworked helper fails 13 tests.
+
+Two weaknesses in the same helper, fixed with it:
+
+- it inspected only the **first** series and silently returned when that series had no `c:dLbls`,
+  so a case editing a later series went unchecked. It now walks **every** series
+  (`dlbls_child_names_by_series`) and asserts at least one carries a `c:dLbls`, so a vacuous call
+  fails instead of passing. `series_dlbls_child_names` remains as a thin first-series view for the
+  two cases that assert on that series specifically.
+- under a mutated constant its failure message claimed *"Excel would reject this part"* about
+  output that was correctly ordered — schema authority the assertion does not have. It now says
+  what it checks: **agreement with `DLBLS_CHILD_ORDER`**, naming the test that anchors the
+  constant to ECMA-376.
+
+### 2. `architecture.md` §8 still stated the reversed behaviour (new Moderate)
+
+Round 1 recorded the three contradictions but deferred writing them "when the spec is next
+touched" — which nothing forced, and the scoping reason did not hold (§8 is this unit's own doc,
+and the annotation is a smaller diff than the section that recorded the intent). **Applied**: the
+three dated supersession notes now sit in `architecture.md` §8 beside the text they supersede,
+annotating rather than rewriting.
+
+### 3. `GAPS.md` sharpened (two Mild)
+
+- **C-G5-2** gained the save-side half. The unchanged-child skip introduced in this phase
+  **persists** the `CT_Boolean` misread: before, every modelled child was regenerated on each save,
+  so a `<c:showVal/>` file converged to `val="0"`; now an unrelated toggle leaves it byte-identical
+  and the file keeps showing values in Excel while FreeCell shows them off. A read-only bug became
+  a persisted file/UI divergence — the real argument for fixing `child_bool`.
+- **C-G5-3** understated twice. Its trigger is not only a deliberate turn-off: the worker sends
+  `None` for *any* all-off toggle set and the call is gated only on `series.data_labels !=
+  cached_series.data_labels`, so an **already**-all-off `c:dLbls` carrying a per-point `c:dLbl`,
+  `c:txPr` and `c:extLst` is replaced by a bare `c:delete` on a semantically **no-op** edit. And
+  "styling that no longer renders anything" was wrong — a per-point `c:dLbl` can carry
+  `c:tx`/`c:rich`, i.e. **user-authored label text**, so this can destroy content. The cheap guard
+  the reviewer floated (skip the clear when `cached.is_shown()` is already false) is now recorded
+  **with a decision**: not taken here, because it drops today's normalization of an already-off
+  `c:dLbls` to the canonical `c:delete` (re-premising a committed test) and makes the C-G5-2
+  misread load-bearing on the **save** path. Order: fix `child_bool`, then add the guard.
+
+### Second-round verification (2026-07-28)
+
+- `cargo test -p freecell-engine --lib chart::` — **138 passed** (137 + the new schema anchor)
+- `cargo clippy --locked -p freecell-engine --all-targets -- -D warnings` — clean;
+  `cargo fmt --all --check` — clean
+- Files touched: `chart/save.rs` (tests only — no production behaviour change), `GAPS.md`,
+  `architecture.md`, this file. No render impact.
 
 ## Verification
 

@@ -84,15 +84,27 @@ group: render-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
 actually separates the two. Resulting groups: schedule-on-`main`, dispatch-on-`main`,
 release-by-tag (`refs/tags/vX.Y.Z`), and release-by-dispatch are four distinct groups; two
 dispatches on the same branch still share one and supersede each other, which is what an iterating
-agent wants. The one collision left by construction — two *manual* release dispatches of the same
-ref — is documented in the workflow header and accepted.
+agent wants.
+
+The one combination that shares a group — two *manual* release dispatches of the same ref — was
+first written up as "a collision left by construction, accepted". Review corrected that: it is
+**unreachable**, because `release.yml` sets `concurrency: release-${{ github.ref }}` with
+`cancel-in-progress: false`, and a run entering an occupied group under that setting goes
+**pending** — starting no jobs at all — so the second release's render job never launches and
+there is nothing to cancel. The header now says which mechanism makes it unreachable (and that
+deleting `release.yml`'s group would make it real), which is the useful thing to record.
 
 ### Least privilege
 
-`render.yml` declares `permissions: contents: read` at workflow level. Behaviourally identical to
-the repo default today; the point is that a workflow now embedded in the **release** path states
-its scope explicitly, so a future default change or a broader-permissioned caller can't widen it
-silently.
+`render.yml` declares `permissions: contents: read` at workflow level. This is stated as what the
+**job** needs, not as a claim about the repo-wide default (which a workflow cannot see): if that
+default is read/write, the block genuinely narrows the token — `contents: read`, every other scope
+`none`. Either way no step here needs more (`actions/checkout` needs `contents: read`;
+`Swatinem/rust-cache` and `actions/upload-artifact` use the runtime token, not `GITHUB_TOKEN`).
+The point is that a workflow now embedded in the **release** path states its scope explicitly, so
+a future default change or a broader-permissioned caller can't widen it silently. Valid on the
+`workflow_call` path too: a called workflow may only *downgrade* the caller's token, and
+`release.yml` sets no `permissions:` block.
 
 ## Docs corrected in the same phase
 
@@ -141,6 +153,15 @@ must be gone from the repo. Both are now fixed:
   still parses and runs — the one part of this change that is executable pre-merge. D1 must not be
   the change that silently breaks the manual path.
 
+  **Caveat (review, 2026-07-28): that dispatch is stale evidence for part of the change.** It is
+  run #30 (`30375672745`), head SHA `e20baac` — *before* the concurrency-key and `permissions:`
+  edits. `concurrency.group` and `permissions:` are evaluated at **run start**, not at parse time,
+  so `yaml.safe_load` passing does not cover them; a malformed group expression produces a startup
+  failure only a real dispatch catches. The bullet's literal claim still holds (the `on:` block was
+  not touched after the dispatch), but a fresh dispatch is what actually validates the current
+  file. One is scheduled as part of this project's render-validation phase, which covers both
+  concerns in one run.
+
 The schedule and release paths cannot be executed from here; they are verifiable only once on
 `main` (schedule) and at the next tag (release).
 
@@ -176,3 +197,21 @@ Recorded rather than implemented, with reasons.
   e.g. by watching the repo's Actions notifications, or by re-committing the cron line under their
   own identity. An unnoticed weekly failure makes the backstop exactly as ignorable as the
   never-run-on-`main` state it replaces.
+
+---
+
+## Review remediation (2026-07-28)
+
+A second review round confirmed the concurrency-key fix is genuinely right — it re-derived the
+reusable-workflow rule that the whole `github` context is the *caller's* (so `github.workflow` is
+the discriminator that `github.event_name` provably could not be), walked all six firing
+combinations, and could construct **no** reachable collision the key misses. It also confirmed the
+two stale documents are fixed and that the repo-wide sweep for "render is required" now returns
+only correct historical record. Everything it raised was **Mild** and documentation-precision:
+
+| Finding | Fix |
+|---|---|
+| `render.yml`'s header claimed a remaining collision between two manual release dispatches of the same ref — which is unreachable, and the very next sentence explained why while presenting it as mitigation. | Header and §Concurrency above rewritten to state the mechanism (`release.yml`'s `cancel-in-progress: false` group makes the second run *pend* before any job starts) and to name the condition under which it would become real (deleting that group). |
+| "Behaviourally identical to the repo default today" is unverifiable from a workflow, and probably imprecise — if the default is read/write this block genuinely narrows the token. | Both the workflow comment and §Least privilege now state the claim as *what this job needs*, enumerate why no step needs more, and drop the assertion about the repo default. |
+| The live-dispatch verification is stale evidence: run #30 (`e20baac`) predates the concurrency/`permissions:` edits, and both are evaluated at run start rather than parse time. | Recorded inline in §Verification, with a fresh dispatch folded into this project's render-validation phase. |
+| `specs/projects/mvp/architecture.md` §9 enumerated only four workflows while six exist — inconsistent with the same commit adding the missing `roundtrip` entry to `app/README.md`. | Added `roundtrip` and `release` entries, both checked against the workflow files (triggers, paths filter, `workflow_call` wiring, unsigned-artifact caveat). Noted `macos-verify.yml`'s own "§9 item 3" self-description as harmless pre-existing drift rather than renumbering another workflow's header. |

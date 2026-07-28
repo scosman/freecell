@@ -45,8 +45,12 @@ name: render
 
 # Least privilege, stated explicitly now that this workflow is embedded in the RELEASE path via
 # `workflow_call`: it only checks out code and uploads a run artifact, neither of which needs
-# write scope. Behaviourally identical to the repo default today; the point is that a future
-# default change (or a caller with broader permissions) cannot silently widen it.
+# write scope. This is stated as what the JOB needs, not as a claim about the repo-wide default
+# (which is not visible from the workflow): if that default is read/write, this block genuinely
+# narrows the token — `contents: read`, every other scope `none` — and no step here uses another
+# scope (`actions/checkout` needs `contents: read`; `Swatinem/rust-cache` and
+# `actions/upload-artifact` use the runtime token, not `GITHUB_TOKEN`). The point is that a future
+# default change, or a caller with broader permissions, cannot silently widen it.
 permissions:
   contents: read
 
@@ -81,11 +85,15 @@ on:
 # `release.yml`'s deliberate `cancel-in-progress: false`).
 #
 # Two dispatches on the SAME branch still share a group and supersede each other — exactly what
-# an iterating agent wants. The one collision that remains by construction: two *manual* release
-# dispatches on the same ref share a render group, so the newer cancels the older's render job.
-# Releases are infrequent and deliberate, and the caller-level `release-${{ github.ref }}` group
-# is what governs the release itself; a second concurrent release of the same ref is already a
-# mistake, not a workflow we need to keep alive.
+# an iterating agent wants.
+#
+# One combination shares a group but is UNREACHABLE, and it is worth writing down which mechanism
+# makes it so: two *manual* release dispatches of the same ref would land in the same render group
+# (`render-release-workflow_dispatch-<ref>`). They cannot collide, because `release.yml` sets
+# `concurrency: release-${{ github.ref }}` with `cancel-in-progress: false`, and a run entering an
+# occupied group under that setting goes PENDING — it starts NO jobs, so the second release's
+# render job never launches while the first one's is running and there is nothing to cancel. That
+# guarantee lives entirely in `release.yml`'s group: delete it and this collision becomes real.
 concurrency:
   group: render-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true

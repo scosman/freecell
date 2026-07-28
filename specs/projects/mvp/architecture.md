@@ -380,7 +380,17 @@ is how an agent confirms an intentional rendering change before merge.
    thresholds)`**.
 4. **macos-verify** (`macos-verify.yml`, **manual dispatch / weekly cron, non-required**):
    full build + test + render-harness smoke on `macos-14` — keeps the primary design target
-   honest without putting slow/expensive runners in the merge path.
+   honest without putting slow/expensive runners in the merge path. (Its own header still
+   self-describes as "§9 item 3" — pre-existing drift, harmless.)
+5. **roundtrip** (`roundtrip.yml`, Linux, **auto** on push-to-`main` / PR touching `app/**`;
+   non-required): installs LibreOffice headless and runs the round-trip tests that open a
+   saved workbook in a real consumer, catching OOXML we write that Excel-family readers
+   reject. Slow enough to keep off the required path, cheap enough to run per-PR.
+6. **release** (`release.yml`, `v*` tag push / manual dispatch): builds and packages
+   macOS + Linux (x64 and arm64) + Windows, uploading each as a workflow **artifact** — it
+   does not create a GitHub Release, because the builds are unsigned pending
+   signing/notarization. Every packaging job `needs:` the `render` workflow above via
+   `workflow_call`, so a red pixel diff produces no artifacts at all.
 
 Caching (`Swatinem/rust-cache`, `workspaces: app`, `cache-on-failure: true`) keeps the gpui
 build tolerable across runs. GitHub scopes caches by branch, so the win lands once `main`

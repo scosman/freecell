@@ -428,12 +428,20 @@ stand-down below runs. Two orderings make it necessary:
 **The stand-down is scoped to windows the plan is pending on.** It goes through
 `FreeCellApp::note_quit_prompt_unanswerable(self.key, cx)`, not the unscoped
 `note_prompt_cancelled` the user-driven paths call, because a worker death is not a user gesture:
-it can land in a window the quit never included. Aborting from there would switch the quit off
-underneath whichever window is being prompted — probed: two windows, only window 0 dirty, ⌘Q
-prompts it, then the clean window 1's worker dies and the plan is gone, so answering window 0's
-still-visible prompt closes that window and nothing further happens. The gate is
-`QuitPlan::is_pending`, the same check (for the same reason) `on_window_closed` already applies so
-an unrelated window *closing* mid-quit doesn't disturb the prompt in flight.
+it can land in a window the quit never included — a clean one, or one already resolved — where
+nothing about that window's document is in question and aborting would switch the quit off on
+account of a window it never involved. Probed: two windows, only window 0 dirty, ⌘Q prompts it,
+then the clean window 1's worker dies and the plan is gone, so answering window 0's still-visible
+prompt closes that window and nothing further happens. The gate is `QuitPlan::is_pending`, the same
+check (for the same reason) `on_window_closed` already applies so an unrelated window *closing*
+mid-quit doesn't disturb the prompt in flight.
+
+`is_pending` is true for a window **queued behind** the one being prompted, so a death there does
+still stand the quit down while another window's prompt is on screen — that prompt is left
+standing and answering it drives nothing. That is deliberate, not a residue of the gate: the
+narrower rule (`plan.next() == Prompt(key)`) would let the quit reach the dead window's turn and
+replace its fatal report with an unsaved-changes prompt, which is worse. F2.3 bullet 5 states the
+consequence rather than leaving it implied.
 
 When the plan **is** waiting on the dying window the whole quit stands down, not just that
 window's step — matching `abort_save_with_backup_error` and the `SaveFailed` arm. `advance_quit`

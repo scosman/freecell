@@ -203,3 +203,15 @@ registry: each entry is a short description plus a pointer to a design note unde
   a FreeCell workaround; FreeCell itself stays bounded because the sheet-cache clamp holds. The
   note's measurements are observations at a pinned commit, not an envelope — re-derive before
   relying on them. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)
+
+- **Quit stand-down scope: save-failure paths abort a quit prompting a *different* window** —
+  *Future (found in `engine-worker-hardening` Phase 2 review, 2026-07-28).* `note_prompt_cancelled`
+  aborts the global `QuitPlan` with no reference to the calling window. That is right for a
+  cancelled prompt, but three **save-failure** sites reach it from windows the quit was never
+  waiting on — the `SaveFailed` arm, `abort_save_with_backup_error`, and `prompt_then_save`'s
+  cancelled-panel arm — because `save` has no dirty guard, so a ⌘S (or a late Save-As panel) arms a
+  save on a *clean* window and a clean window is never in the plan. The quit then switches off while
+  another window's prompt is still on screen. `dismiss_modal`'s cancel path is already safe (an
+  `UnsavedChanges` window is dirty, hence in-plan), and B1's worker-death teardown already uses the
+  scoped `note_quit_prompt_unanswerable`. Fix all three together, gated on `QuitPlan::is_pending`,
+  each with its own two-window regression test. → [`projects/quit-stand-down-scope.md`](projects/quit-stand-down-scope.md)

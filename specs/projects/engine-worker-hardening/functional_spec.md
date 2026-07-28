@@ -272,9 +272,9 @@ Save might work. Concretely, in the worker-lost state:
   workbook can't be exported from this window any more…"). Nothing is sent and nothing is armed.
   This is not defensive tidiness: `DocumentClient::send` drops a command when the worker is gone,
   so a save that *looked* accepted would never receive `Saved` or `SaveFailed` — the native panel
-  would pick a file that is never written. The notice does not replace a *terminal* dialog: on a window whose
-  load failed, the close-on-dismiss report stays up (⌘S still routes to Save whatever modal is
-  showing, and swapping that dialog would stop the window closing on dismiss).
+  would pick a file that is never written. The notice does not replace a *terminal* dialog: on a
+  window whose load failed, the close-on-dismiss report stays up (⌘S still routes to Save whatever
+  modal is showing, and swapping that dialog would stop the window closing on dismiss).
 - **Anything already in flight is abandoned, not left waiting.** Refusing new saves is not enough
   — the worker can die *during* one, which is this whole section's premise. So on worker loss the
   window also clears the armed save (`close_after_save`, the pending save request and path, the
@@ -293,17 +293,24 @@ Save might work. Concretely, in the worker-lost state:
   changes can't be saved"). Offering Save would arm a close-after-save that could never fire,
   leaving the window open forever.
 - **Losing the worker of a window the quit is waiting on stands the whole quit down**, rather than
-  skipping that one window. The user asked to quit with that document's changes *handled*, and
-  that is no longer possible, so the honest answer is to stop and let them decide — the same choice
-  a failed save and a failed `.back` backup already make. The document stays **dirty** (losing the
+  skipping that one window. The user asked to quit with that document's changes *handled*, and that
+  is no longer possible, so the honest answer is to stop and let them decide — the same choice a
+  failed save and a failed `.back` backup already make. The document stays **dirty** (losing the
   worker changes no op accounting), so a re-issued ⌘Q prompts that window again, now with the
   Cancel / Close Without Saving form; discarding closes it and the quit runs on. Nothing is wedged
   — the quit just has to be asked for again.
+
+  "Waiting on" includes a window **queued behind** the one being prompted, and the consequence is
+  worth stating: the quit stands down while the prompt already on screen stays up, so answering
+  that prompt no longer drives anything — the question was withdrawn, and re-issuing ⌘Q is what
+  restarts it. The narrower rule (stand down only when the dying window is the one *currently*
+  prompted) is worse: the dead window's fatal report would then be replaced by an unsaved-changes
+  prompt when its turn came.
 - **A death in a window the quit was never waiting on leaves the quit alone.** Unlike a cancelled
   prompt, a worker death is not a user gesture and can land in any window — a clean one, or one
-  whose prompt is already resolved. Standing the quit down from there would switch it off
-  underneath whichever window is currently prompted: the user would answer that prompt, its window
-  would close, and nothing further would happen. So the stand-down is gated on the quit actually
+  whose prompt is already resolved. Standing the quit down from *there* is the case with no
+  redeeming reading at all: nothing about that window's document is in question, so the quit would
+  be switched off on account of a window it never involved. Hence the gate — the quit must be
   pending on the dying window — the same scope rule that already stops an unrelated window
   *closing* mid-quit from disturbing the prompt in flight.
 

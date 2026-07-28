@@ -55,6 +55,14 @@ change, so the unification is built on stable ground.
         Also: a bind-side `#[cfg(test)]` injection now gates "marked after parse **and** bind" (the
         parse-side test alone passed under an ordering that marks between them); §F2.3 quotes the
         export refusal's real wording.
+      - **Code-review follow-ups (B1 round 5):** corrected a false parenthetical claiming the
+        `SaveFailed` / backup-failure sites are "always in-plan" windows — `save` has no dirty
+        guard, so a ⌘S arms a save on a clean window, which is never in the plan. The underlying
+        defect (three save-failure sites aborting a quit that prompts a *different* window) is
+        pre-existing §5.2/§7.3 behaviour, so per `CLAUDE.md` it is **captured, not fixed here**:
+        `PROJECTS.md` → `projects/quit-stand-down-scope.md`. Also scoped §F2.3/§A3.5's motivation
+        for the `is_pending` gate to what it actually removes (a queued-but-unprompted window's
+        death still stands the quit down — deliberately, since the narrower rule is worse).
 
 - [x] **Phase 3 — extract chart handling out of `run.rs`.** Move ≈1,180 production lines and
       the chart tests into `worker/charts.rs`. Behaviour-preserving; every existing test passes

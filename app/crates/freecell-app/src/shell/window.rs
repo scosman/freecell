@@ -1180,9 +1180,18 @@ impl WorkbookWindow {
     /// it can happen in a window the quit never included, and aborting the whole quit from there
     /// would switch it off underneath the window actually being prompted. When the plan *is*
     /// waiting on this window the whole quit does stand down — the user asked to quit with this
-    /// document's changes handled, and that is no longer possible — which is the same call
-    /// [`abort_save_with_backup_error`](Self::abort_save_with_backup_error) and the `SaveFailed`
-    /// arm make for their (always in-plan) windows.
+    /// document's changes handled, and that is no longer possible.
+    ///
+    /// The three save-failure sites that still call the **unscoped**
+    /// [`note_prompt_cancelled`] — [`abort_save_with_backup_error`], the `SaveFailed` arm, and
+    /// `prompt_then_save`'s cancelled-panel arm — are **not** in-plan-only, and this comment used
+    /// to claim they were. `save` has no dirty guard, so a ⌘S (or a Save-As panel that resolves
+    /// after a quit starts) arms a save on a *clean* window, and a clean window is never in the
+    /// plan: a `SaveFailed` folding into it aborts a quit prompting some other window. That is a
+    /// pre-existing §5.2/§7.3 defect, unrelated to anything B1 changed, so it is captured in
+    /// `projects/quit-stand-down-scope.md` to be fixed with its own tests rather than widened into
+    /// this diff. (`dismiss_modal`'s cancel path is genuinely safe: a window showing an
+    /// `UnsavedChanges` modal is dirty, hence in the plan.)
     ///
     /// [`abort_save_with_backup_error`]: Self::abort_save_with_backup_error
     /// [`note_quit_prompt_unanswerable`]: FreeCellApp::note_quit_prompt_unanswerable

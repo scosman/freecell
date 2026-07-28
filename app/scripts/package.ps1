@@ -50,6 +50,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 Write-Host "package.ps1: packaging formats '$formats' -> $outDir"
+# No `--locked` here, deliberately (A2): `cargo packager` is a cargo-packager subcommand that
+# does not accept the flag, and it needs none — it packages the binary the `--locked` build
+# above just produced, in this same script, from the committed lockfile.
 cargo packager --release --packages freecell-app --formats $formats --out-dir $outDir @args
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

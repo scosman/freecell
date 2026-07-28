@@ -49,6 +49,10 @@ harmless manifest edits.
 
 ### Why the scripts take an env var rather than a hard `--locked`
 
+> **Superseded — see §"Review remediation" below.** The `CARGO_LOCKED` opt-in described here
+> shipped in `64310b6` and was replaced during review remediation by an unconditional
+> `--locked` plus an explicit opt-out. The reasoning is kept for the record.
+
 `render.yml` and `perf-gates.yml` do not call cargo directly — they call
 `render_tests.sh` / `perf.sh`, which are also the everyday local iteration tools (CLAUDE.md
 tells agents to run the render subset constantly). The unit's scope is *CI*, so CI sets
@@ -105,3 +109,103 @@ than leaving it.
 
 No `cargo tree -i zlog` guard — the unit explicitly drops it, and `cargo deny --locked check`
 (now with the lock provably current) already fails on a reintroduced GPL crate.
+
+---
+
+## Review remediation (2026-07-28)
+
+A code review of `64310b6` raised two Moderate findings against the `CARGO_LOCKED` indirection
+and four Mild ones. It independently re-enumerated every cargo invocation reachable from CI and
+**confirmed the sweep itself is complete**, and confirmed `cargo deny --locked check` is the
+correct argument order, that the committed lock is current, and that the Part-2 DISPROVED call
+was right. None of that changed. What changed is the *shape* of the two wrapper scripts.
+
+### The two Moderates, and why they are one fix
+
+1. **The value was spliced into argv, so a wrong value failed GREEN.** `CARGO_LOCKED` reads
+   like a boolean but its value became cargo arguments. `CARGO_LOCKED=1` — the obvious guess
+   for a flag-named variable — expands to `cargo test 1 --manifest-path …`, where `1` is a
+   *test-name filter*. libtest exits 0 on a filter matching nothing. That is precisely the
+   "required gate that renders zero pixels" outcome `render_tests.sh`'s `require_tools` block
+   exists to prevent, except silent instead of loud.
+2. **The indirection was fail-OPEN.** For two of the six workflows the `--locked` guarantee
+   depended on a workflow author remembering an `env:` line. A new workflow calling
+   `render_tests.sh`, or an edit dropping the `env:`, would silently revert A2 for that path
+   with no test, lint or assertion to notice — the same class of silent hole A2 exists to
+   close.
+
+**Resolution taken: invert the polarity.** Both scripts now pass `--locked`
+**unconditionally**, with an explicit named opt-out, `FREECELL_CARGO_UNLOCKED=1`, for the one
+legitimate local case (iterating mid-dependency-edit, before the lock is regenerated). This
+closes both findings with one change:
+
+- *Fail-safe instead of fail-open.* Strict is what you get by default, from CI and from a new
+  workflow that has never heard of A2. The two `env:` blocks in `render.yml` / `perf-gates.yml`
+  are no longer load-bearing and were **removed** (replaced by a one-line comment pointing at
+  the scripts, so a reader who expects to find the plumbing there learns where it went).
+- *No value can become a cargo argument.* The env var is **compared, never interpolated**: the
+  scripts branch on it in a `case` and build an argv **array** (`cargo_locked=(--locked)` or
+  `()`), expanded `"${cargo_locked[@]}"`. Unset/empty → strict. Exactly `1` → unlocked, with a
+  warning on stderr. **Anything else → hard exit 2**, rather than guessing.
+- *Consistency.* `package.sh` / `package.ps1` were already unconditional, justified in the
+  original commit by "a release artifact must come from the committed lock however it is
+  built". That reasoning applies just as well to a CI gate, and the inconsistency is now gone.
+- The local-ergonomics rationale from the original commit is legitimate and is preserved
+  intact — it just argues for the opposite *default*. An opt-out costs the one developer who
+  is mid-edit a single env var, once; the opt-in cost every future workflow author a silent
+  regression.
+
+Documented in both script headers (a `# Env:` block in the usage comment plus the rationale at
+the branch).
+
+### Mild fixes
+
+| Finding | Fix |
+|---|---|
+| `app/deny.toml:3` said CI runs `cargo deny check` — stale as of *this phase*, which made it `cargo deny --locked check`. Part 2 disproved the original header claim and then introduced fresh drift in the same header. | One-word fix: header now says `cargo deny --locked check`. |
+| `architecture.md` §2 Tests said "`cargo deny check --locked` succeeds" — invalid CLI (wrong argument order), the reverse of what shipped. | The doc is `status: complete`, so it is **annotated** with a dated correction note rather than silently rewritten. The same note records that §2's env-var design was superseded here. |
+| `cargo packager` in `package.sh` / `package.ps1` was neither swept nor exempted. | No actual hole — it runs immediately after a successful `cargo build --locked` in the same script, and cargo-packager does not accept `--locked` — but functional_spec §A2's edge-case rule asks for an inline "why" comment on anything without the flag. Added to both. |
+| `perf.sh` inlined `${CARGO_LOCKED:-}` with no comment while `render_tests.sh` got a named variable and a rationale. | The two are now **symmetric**: same `case` block, same array, same header `# Env:` note, cross-referencing each other. |
+
+### Enumeration methodology — the category the sweep's *method* missed
+
+The sweep's result was right, but its method has a blind spot worth recording so the next one
+does not re-derive it:
+
+- **Marketplace actions that shell out to cargo.** Six workflows (`checks`, `render`,
+  `perf-gates`, `roundtrip`, `macos-verify`, and `release` three times) use
+  `Swatinem/rust-cache@v2`, which runs cargo **but not from a `run:` line** — so a grep of
+  `run:` blocks misses it entirely. It is **not** a hole: its main step calls
+  `cargo metadata … --no-deps`, which does not rewrite `Cargo.lock` (verified empirically by
+  the reviewer); the full-deps call lives in the **post** step, after the build has already
+  happened. Recorded so the category is not missed again when a new action is added — the
+  enumeration must cover `uses:` as well as `run:`.
+
+### Considered and excluded
+
+- **`app/scripts/linux_render_spike.sh:53`** — `cargo build -p freecell-app --bin freecell`,
+  the one remaining in-repo cargo build against this workspace without `--locked`. It is a
+  manual GPU/lavapipe spike script, **not reachable from any workflow**, so it is outside
+  §A2's CI scope and was deliberately left alone. Named here because a reader currently cannot
+  distinguish "excluded" from "missed".
+
+### Verification of the remediation
+
+- All six workflow files re-parse as YAML.
+- `bash -n` clean on `render_tests.sh`, `perf.sh`, `package.sh`.
+- **Behaviour exercised**, not just read — both scripts run against a stub `cargo` that prints
+  its argv (and stub capture tooling, so `require_tools` passes):
+
+  | Env | Resulting cargo argv | Exit |
+  |---|---|---|
+  | unset | `test --locked --manifest-path … -p render-tests cell_` | 0 |
+  | `""` | `test --locked …` (empty ≡ unset ≡ strict) | 0 |
+  | `1` | `test --manifest-path …` — no `--locked`, warning on stderr | 0 |
+  | `--locked` | *refused*: "must be unset or exactly '1'" | 2 |
+  | `1 --manifest-path /evil` | *refused* — the value never reaches argv | 2 |
+
+  `generate` (both its `build` and `run` calls) and `perf.sh` (`run` and `gate`) behave
+  identically. **No value of the variable can produce a cargo positional argument**, so the
+  `CARGO_LOCKED=1`-becomes-a-test-filter failure mode is structurally impossible.
+- `cargo metadata --locked` from `app/` still exits 0 — the strict default passes against the
+  committed lock.

@@ -212,8 +212,12 @@ DISPROVED.**
 `cargo deny --locked check`), `macos-verify.yml`, `roundtrip.yml`, and — the signed-binary
 path the unit named — `app/scripts/package.{sh,ps1}`, which is what `release.yml` actually
 invokes. `render.yml` / `perf-gates.yml` reach cargo through wrapper scripts, so those scripts
-forward `${CARGO_LOCKED:-}` and the workflows set it; local iteration runs stay unstrict on
-purpose. Precondition checked: the committed lock is current
+pass `--locked` **unconditionally**, with an explicit `FREECELL_CARGO_UNLOCKED=1` opt-out for
+the one legitimate local case (iterating mid-dependency-edit). The scripts initially took a
+`CARGO_LOCKED` env var that the workflows set; review remediation inverted that polarity —
+the opt-in was fail-open (a future workflow forgetting the `env:` line silently lost the
+guarantee) and its value was spliced into argv (`CARGO_LOCKED=1` would have become a libtest
+name filter, i.e. a green zero-case run). Precondition checked: the committed lock is current
 (`cargo metadata --locked` + `cargo deny --locked check` both clean at HEAD).
 
 *`deny.toml` header:* **the claim is wrong.** The header does not reference a surviving GPL

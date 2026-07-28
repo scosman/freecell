@@ -154,6 +154,15 @@ CI-config change; no unit test. Verification: local `cargo build --locked --work
 succeeds; `cargo deny check --locked` succeeds; YAML parses (`python3 -c "import
 yaml,sys;[yaml.safe_load(open(f)) for f in sys.argv[1:]]"` over the workflow files).
 
+> **Correction (2026-07-28, post-Phase-2 review).** `cargo deny check --locked` above is
+> invalid CLI and is **not** what shipped. `--locked` is a cargo-deny *global* option and must
+> precede the subcommand, so the correct (and implemented) invocation is
+> **`cargo deny --locked check`**; with the arguments the other way round clap errors out.
+> Also superseded by implementation: the design's env-var plumbing for `render_tests.sh` /
+> `perf.sh` was replaced during review remediation with an **unconditional `--locked` plus an
+> explicit `FREECELL_CARGO_UNLOCKED=1` opt-out** — the opt-in shape was fail-open and its value
+> was spliced into argv. See `phase_plans/phase_2.md` §"Review remediation".
+
 ---
 
 ## 3. A4 — Fork docs and the real strategy

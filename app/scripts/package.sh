@@ -62,6 +62,9 @@ cargo build --locked --release -p freecell-app --bin freecell
 # --- package ----------------------------------------------------------------------
 mkdir -p "$out_dir"
 echo "package.sh: packaging formats '$formats' -> $out_dir"
+# No `--locked` here, deliberately (A2): `cargo packager` is a cargo-packager subcommand that
+# does not accept the flag, and it needs none — it packages the binary the `--locked` build
+# above just produced, in this same script, from the committed lockfile.
 cargo packager \
     --release \
     --packages freecell-app \

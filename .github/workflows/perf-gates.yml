@@ -36,10 +36,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # A2: CI must prove it built the COMMITTED lockfile (the one cargo-deny audits), so the
-  # wrapper script forwards this to its cargo invocations. Unset locally, where a mid-edit
-  # lock must not fail an iteration run.
-  CARGO_LOCKED: "--locked"
+  # A2 (--locked) needs nothing here: perf.sh passes `--locked` unconditionally, so this
+  # workflow — and any future one that calls it — gets the committed-lockfile guarantee
+  # without an env: line that could be forgotten or dropped. See that script's header.
   # No incremental artifacts in CI (large + useless; rust-cache discards them). The release
   # profile already emits no debug info, so target/ stays small and no debug trim (or disk
   # prune) is needed here — see the DISK note in the header.

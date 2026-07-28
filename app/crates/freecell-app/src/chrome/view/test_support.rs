@@ -309,3 +309,22 @@ pub(super) fn tick(cx: &mut TestAppContext, ms: u64) {
     cx.executor().advance_clock(Duration::from_millis(ms));
     cx.run_until_parked();
 }
+
+/// A ready-made numeric aggregate for the reply-plumbing tests.
+pub(super) fn numeric_stats() -> SelectionStats {
+    SelectionStats {
+        count: 5,
+        numeric_count: 2,
+        sum: 30.0,
+        min: Some(10.0),
+        max: Some(20.0),
+    }
+}
+
+/// A1:A3 (a 3-cell column selection).
+pub(super) fn multi_a1_a3() -> SelectionModel {
+    SelectionModel {
+        anchor: cell(0, 0),
+        active: cell(2, 0),
+    }
+}

@@ -106,8 +106,19 @@ opt-level = 3
 opt-level = 3
 
 # ---------------------------------------------------------------------------------
-# IronCalc upstreaming (specs/projects/ironcalc-upstreaming): build against our fork
-# `scosman/ironcalc`, pinned BY SHA to a commit on its `freecell-fixes` integration branch.
+# IronCalc: build against our fork `scosman/ironcalc`, pinned BY SHA to a commit on its
+# `freecell-fixes` integration branch.
+#
+# THE FORK IS PERMANENT. We keep it, keep upstreaming fixes as clean single-fix PRs, and keep
+# re-syncing from upstream `main` (CLAUDE.md §Engine, projects/ironcalc-upgrade.md). It is not a
+# temporary state with an exit: `freecell-fixes` carries a whole FEATURE upstream does not have
+# (merged cells) alongside the `UserModel::set_user_inputs` batched-write API the paste /
+# Replace-All path rides on.
+#
+# WHAT IS ON THE BRANCH: 11 changes at this pin — 6 already merged upstream, 5 fork-only. The
+# per-fix table (with the patch-id method to re-derive it, because a hand-maintained list goes
+# stale) lives in specs/projects/ironcalc-upstreaming/implementation_plan.md §Status table. Don't
+# duplicate it here; this comment has been wrong about the branch's contents before.
 #
 # WHY A `rev`, NOT A `branch`: `freecell-fixes` is maintained by REBASING onto upstream `main`
 # (CLAUDE.md §Engine), and it is rewritten and reverted in place. A `branch =` pin means the

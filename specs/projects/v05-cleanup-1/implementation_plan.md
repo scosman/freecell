@@ -20,7 +20,7 @@ Details live in [`functional_spec.md`](functional_spec.md) and
 - [x] **Phase 2 — A2: `--locked` across CI + `deny.toml` header.** Sweep workflows *and*
       scripts; verify the committed lock is current first. Runs after Phase 1 so the
       precondition is checked against the post-A1 lock. (§2)
-- [ ] **Phase 3 — A4: fork inventory, doc corrections, permanent-fork strategy.** Docs only;
+- [x] **Phase 3 — A4: fork inventory, doc corrections, permanent-fork strategy.** Docs only;
       edits the manifest comment Phase 1 rewrote. (§3)
 - [ ] **Phase 4 — D1: render gate weekly on `main` + at release.** Triggers, concurrency key,
       plus `render.yml` header, `checks.yml` header, `app/README.md` §CI and `CLAUDE.md`

@@ -40,12 +40,25 @@ IronCalc bug or missing capability, **fix it in the fork and contribute it back 
 (`ironcalc/IronCalc`) as a clean single-fix PR — do **not** add a compensating workaround in
 FreeCell. This is the standing way of working, not a one-off.
 
-- FreeCell's `app/Cargo.toml` pins `ironcalc`/`ironcalc_base` via `[patch.crates-io]` → the fork's
-  **`freecell-fixes`** branch (the sum of our not-yet-upstreamed fixes).
+- **The fork is permanent — there is no exit and we are not working toward one.** We keep it, keep
+  upstreaming fixes as clean single-fix PRs, and keep re-syncing from upstream `main`. It carries
+  more than fixes: merged cells is a whole feature upstream does not have. Upstreaming keeps the
+  carried delta small; it is not an attempt to reach zero. (`projects/ironcalc-upgrade.md`)
+- FreeCell's `app/Cargo.toml` patches `ironcalc`/`ironcalc_base` via `[patch.crates-io]` to a
+  **`rev = "<sha>"` on the fork's `freecell-fixes` branch** — pinned by SHA, never by branch, since
+  `freecell-fixes` is rebased and reverted in place (v05-cleanup-1/A1). **Bumping the fork is a
+  deliberate one-line edit of both revs + `cargo update -p ironcalc -p ironcalc_base`, in its own
+  commit, with the workspace tests run** — never a drive-by, and never left to a stray
+  `cargo update`.
 - Fork branches: `main` = clean mirror of upstream; `fix/<slug>` = one branch per fix (off `main`,
   with upstream-style tests) = one clean PR; `freecell-fixes` = integration branch FreeCell builds
   against. Sync `main` from upstream periodically (rebase `fix/*` + `freecell-fixes`); expect
-  incidental drift to reconcile on the FreeCell side.
+  incidental drift to reconcile on the FreeCell side — upstream may also *reshape* what it merged
+  (it renamed our `set_worksheet_index` to `move_sheet`), so a sync can break a FreeCell call site.
+- **Current state of the delta** (rebuilt 2026-07-28, patch-id verified against upstream):
+  6 of 11 changes are **merged upstream**; 5 are fork-only. Per-fix table + the method to re-derive
+  it: [`specs/projects/ironcalc-upstreaming/implementation_plan.md`](specs/projects/ironcalc-upstreaming/implementation_plan.md)
+  §Status table. Don't trust a stale summary — re-run the classification.
 - **One fix = one branch = one focused single-feature upstream PR. Never fold multiple fork fixes
   into a single `fix/` branch (or a single FreeCell phase).** Upstream wants independent,
   single-feature PRs they can review + merge in isolation; a bundled branch is not acceptable
@@ -59,7 +72,12 @@ FreeCell. This is the standing way of working, not a one-off.
   `add_repo` **upfront while the user is present** — it needs interactive approval and fails
   mid-run once they leave; if it's unavailable, the container's git-proxy already routes
   `scosman/ironcalc`, so clone/push via `http://local_proxy@127.0.0.1:<port>/git/scosman/ironcalc`
-  (port from FreeCell's `git remote -v`). The agent **can't open upstream `ironcalc/IronCalc`
+  (port from FreeCell's `git remote -v`). For **read-only** work (inventorying the fork, comparing
+  against upstream) neither is needed — a plain `git clone --bare --filter=blob:none
+  https://github.com/scosman/ironcalc` works through the outbound proxy, and upstream
+  `ironcalc/IronCalc` can be added as a second remote and fetched the same way (verified in
+  v05-cleanup-1/A4). Prefer that over `add_repo` when you only need to read.
+  The agent **can't open upstream `ironcalc/IronCalc`
   PRs** — it prepares a compare link (`.../compare/main...scosman:ironcalc:fix/<slug>`) + title +
   description for the owner to open. Before branching a `fix/*`, check the capability isn't
   **already in** `freecell-fixes` (`git merge-base --is-ancestor <sha> origin/freecell-fixes`).

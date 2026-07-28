@@ -245,6 +245,23 @@ Scope:
    not a temporary state with an exit. `CLAUDE.md` §Engine and
    [`projects/ironcalc-upgrade.md`](ironcalc-upgrade.md) currently imply the latter.
 
+**Outcome (v05-cleanup-1 P3, 2026-07-28): CONFIRMED — docs were stale; the review's
+upstreaming claim is disproved with evidence.** Inventory rebuilt from the fork's history by
+patch-id (`git cherry upstream/main <fix-head> <merge-base>`) — subject matching got two rows
+wrong, content probes got more wrong. **11 changes on `freecell-fixes` @ `cee2859d`: 6 merged
+upstream, 5 fork-only.** Upstream `main`'s *tip commit* is one of ours (TRIM, `2e2465c`).
+Rewrote: the upstreaming §Status table (was 2 rows, both "awaiting sign-off", ~3 months stale),
+`projects/ironcalc-upgrade.md` (retitled from "move to a released pin"; the released pin is now
+an explicitly hypothetical simplification, not a goal), `CLAUDE.md` §Engine, and the
+`Cargo.toml` comment — which now carries the headline + a pointer rather than an inlined list,
+since a duplicated inventory is how that comment went wrong in the first place.
+
+Two discrepancies surfaced that were not in the brief: **(a)** upstream merged our
+`set_worksheet_index` and then **renamed it to `move_sheet`** (`7ca43c7`), so the next fork
+re-sync breaks `freecell-engine/src/document.rs:1514`; **(b)** the fork's `main` mirror is
+**99 commits behind** upstream — a re-sync is overdue.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_3.md`.
+
 ---
 
 ## B. Crash & hang safety

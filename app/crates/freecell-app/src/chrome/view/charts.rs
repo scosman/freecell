@@ -79,6 +79,27 @@ pub struct ChartPanel {
     pub labels: DataLabelToggles,
 }
 
+impl ChartPanel {
+    /// A panel for `chart` with the chrome fields defaulted — a convenience for tests + the
+    /// near-empty authored insert case (the window fills the chrome from the snapshot).
+    #[cfg(test)]
+    pub fn skeleton(sheet: SheetId, id: ChartId, is_authored: bool, kind: ChartInsertKind) -> Self {
+        Self {
+            sheet,
+            id,
+            is_authored,
+            kind,
+            ranges: None,
+            title: None,
+            legend: None,
+            cat_axis_title: None,
+            val_axis_title: None,
+            series: Vec::new(),
+            labels: DataLabelToggles::default(),
+        }
+    }
+}
+
 impl ChromeView {
     // ---- Action row: insert chart (P17) ---------------------------------------------------
 

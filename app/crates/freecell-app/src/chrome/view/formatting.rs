@@ -648,28 +648,6 @@ impl ChromeView {
         }
     }
 
-    /// Marks the worker degraded/read-only (or clears it) — disables every mutating action-bar
-    /// control (`functional_spec.md §6`). Called by the window on `WorkerDegraded`. Closes any open
-    /// formatting popover so a swatch/entry can't be clicked after the controls lock.
-    pub fn set_degraded(&mut self, degraded: bool, cx: &mut Context<Self>) {
-        if self.degraded != degraded {
-            self.degraded = degraded;
-            if degraded {
-                self.fill_open = false;
-                self.text_color_open = false;
-                self.num_fmt_open = false;
-                self.num_fmt_more_open = false;
-                self.font_family_open = false;
-                self.font_size_open = false;
-                self.borders_open = false;
-                self.chart_menu_open = false;
-                self.chart_panel = None;
-                self.cond_fmt = None;
-            }
-            cx.notify();
-        }
-    }
-
     /// Whether the bold toggle is pressed (active cell is bold).
     pub fn bold_active(&self) -> bool {
         self.active_style.map(|s| s.bold).unwrap_or(false)

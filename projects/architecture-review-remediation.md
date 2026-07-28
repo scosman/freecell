@@ -234,6 +234,15 @@ say so.
 directions — it looks like a threading bug from one side and a persistence bug from the
 other, and is neither.*
 
+> **DONE (v0.5, `engine-worker-hardening` Phase 2).** Re-derived at HEAD before fixing and
+> **confirmed exactly as written**, including the reachable exporter `panic!`
+> (`xlsx/src/export/worksheets.rs:177`, upstream-flagged `// TODO: We should NOT panic
+> here.`). Both calls are guarded into `LoadError::EnginePanic` / `SaveError::EnginePanic`;
+> `handle_caught_panic` split so the save path reuses the poisoning policy without also
+> claiming an edit was rejected; the `JoinHandle` is retained behind
+> `DocumentClient::worker_exit()`; the window reports a stream close it did not request as
+> fatal (log + degraded bar + dialog) and stays open rather than closing.
+
 ### B2. Clamp the frozen-pane band; validate `SetFrozen`
 **task · v0.5 · no dependencies**
 
@@ -244,6 +253,28 @@ computes the count as "last row of the header run you right-clicked", so freezin
 worker never returns — two clicks to a permanent hang, also reachable from a crafted
 `.xlsx` `<pane>` element. Clamp at the publish site *and* range-validate in
 `pre_validate`, closing both the click path and the file path.
+
+> **DONE (v0.5, `engine-worker-hardening` Phase 1) — with one CORRECTION to this entry.**
+>
+> The finding is real and the click path is **worse** than described: the count is
+> `menu.run.1 + 1` off the *selected* header run (`grid/view.rs:4696`), so ⌘A → right-click
+> → "Freeze rows" asks to pin the whole **1,048,576**-row axis, not 500,000.
+>
+> The correction: **the blast radius is not confined to the worker.** The grid renders the
+> band as `for r in 0..frame.frozen_rows` (`grid/view.rs:4529`) off the *same* resident
+> cache, so a crafted `<pane ySplit="500000" state="frozen"/>` hangs the **render thread**
+> too. Clamping "at the publish site" — as this entry proposed — would have left that half
+> live. The clamp therefore lands where **both** consumers read: `cache::build_sheet_cache`,
+> the one place a worksheet's frozen counts enter the read model. Three layers ship:
+> `pre_validate` rejects an over-cap `SetFrozen` (new
+> `EditRejectedReason::FrozenPaneTooLarge`, an OK-only dialog naming axis, request and cap);
+> the cache build clamps the file path for worker and grid alike; and `build_publication`
+> clamps its own inputs so the loop enforces its own precondition rather than inheriting it.
+> `MAX_FROZEN_ROWS = 64` / `MAX_FROZEN_COLS = 32` keep the worst-case publish at a constant
+> 165,888 probes.
+>
+> This supersedes `freeze-panes` `functional_spec.md §5.2` ("an out-of-range count degrades
+> to the engine max"): that degradation *is* the hang.
 
 ### B3. Cache lock hold-time
 **task · v3+ · no dependencies**
@@ -427,6 +458,22 @@ to "what does the UI see at generation N", which is the question you must be abl
 to reason about this seam at all. Unify under one generation counter and one commit point;
 add ordering tests with non-zero-sample assertions.
 
+> **DONE (v0.5, `engine-worker-hardening` Phase 4) — confirmed as written.** Five publishing
+> paths did `publish(); emit(Published);` and only *then* wrote the style cache and the CF
+> map, with a comment calling the ordering deliberate; three more emitted `Published` while
+> `Shared::generation` stood still. `Worker::commit` is now the single commit point: every
+> surface write for generation N happens before one `Release` store of the counter, and
+> every announcing event after it. `ChartSnapshot` gained a `generation` stamp (it is an
+> `ArcSwap`, so a reader has no lock edge to reason from); its `version` keeps its exact
+> meaning as the *change* gate, because making it the generation would re-install every
+> chart on every scroll. Nothing the UI reads changed shape — only when it may read it.
+> The ordering tests carry non-zero-sample assertions and were negative-controlled against
+> the old ordering (326 violations; the chart-op counter frozen).
+>
+> **B3 is not made free by this** (it was worth checking): the long write-lock hold is a
+> property of `refresh_cache_cells`' loop, not of where that loop sits in the commit.
+> Unchanged, still v3+.
+
 ### E2. Single source of truth for UI state
 **project · v1.0 · after F1 (strongly preferred)**
 
@@ -466,6 +513,18 @@ visibility changes** to the 71 private fields, so this is mechanical. Same for m
 *This is the **loudest** problem and one of the **least dangerous**. Do it — it is the top
 velocity and bus-factor problem — but do not let its volume displace B and C.*
 
+> **ENGINE HALF DONE (v0.5, `engine-worker-hardening` Phase 3).** 1,010 production lines —
+> 24 `Worker` methods, 4 free functions, the `AuthoredEntry` store and the `ChartUndo`
+> timeline — moved into `worker/charts.rs` (39 → 1,106 lines), with the chart tests
+> following their subject unedited. Behaviour-preserving; identical test counts before and
+> after. `run.rs` production: 4,069 → **3,148** (Phase 4 added ~100 back).
+>
+> One correction to the "zero visibility changes" claim: that holds for the *directory*
+> shape (`chrome/view/`), but `worker/charts.rs` is a **sibling** of `worker/run.rs`, not a
+> descendant, so `Worker`'s fields and a few shared helpers had to widen to `pub(super)`.
+> Contained to `mod worker`; `Worker` itself stays `pub(super)`, so the type remains
+> invisible outside the module. The `chrome/view/` half is unaffected.
+
 ### F2. Production-line ceiling in CI
 **task · v0.5 · after F1 (required)**
 
@@ -474,6 +533,21 @@ on per-file **production** line count (excluding `#[cfg(test)]` blocks — sever
 40–50% inline tests and that is fine) with a ceiling of **2,000**. Verify after F1 that
 every file actually lands under it; anything that can't be split cleanly gets an explicit,
 listed exemption rather than a raised global ceiling.
+
+> **`worker/run.rs` will NOT be under the ceiling after F1** — it is **3,148** production
+> lines, and the chart extraction was the only move F1 scoped for it. Rather than take an
+> exemption, F2 should be preceded by (or bundled with) three further mechanical extractions,
+> each of which already has a component doc or an obvious seam:
+>
+> | Move | Contents | ≈ lines |
+> |---|---|---|
+> | `worker/clipboard.rs` | `apply_clipboard_op`, `apply_copy`, `apply_paste_internal` / `_values` / `_tsv`, `run_guarded_paste`, `commit_paste`, `ClipboardSlot`, `PasteOutcome` (`components/clipboard.md` is already its doc) | ~420 |
+> | `worker/cache_mirror.rs` | `stage_cache_refresh`, `stage_cf_caches_after_recompute`, `refresh_cache_cells`, `build_and_store_cache`, `project_wrap_heights`, `mark_rows_manual`, `apply_auto_grow`, `ensure_active_cache_built`, `is_band_creating`, `range_area`, `MAX_REFRESH_CELLS`, `AUTO_GROW_EPS_PX` | ~450 |
+> | `worker/apply.rs` | `apply_one` (255 lines by itself), `op_of`, `apply_style`, `any_cell_lacks`, `resolve_idx` — the whole `Command` → engine mapping | ~400 |
+>
+> That leaves `run.rs` at roughly **1,900**: the loop, coalescing, the commit point, the
+> publication, the save, and the panic policy — which is what the file should be. The same
+> `pub(super)` widening Phase 3 established makes each move mechanical.
 
 ### F3a. Make chart-axis number formatting agree with cells
 **task · v0.5 · no dependencies**

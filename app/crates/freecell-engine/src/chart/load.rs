@@ -1149,6 +1149,71 @@ mod tests {
     use crate::chart::authoring;
     use freecell_chart_model::{source_fidelity, Fidelity, SeriesData};
 
+    /// **G1 guard.** [`CHART_GROUP_TAGS`] (the groups we can turn into a `ChartKind`) must stay a
+    /// subset of `chart-model`'s `CHART_GROUP_ELEMENTS` (every group OOXML defines), because that
+    /// wider list is what the combo detector *counts*. If support for a new group landed here
+    /// without being added there, the detector would go blind to combos involving it — and a
+    /// combo it cannot see is a chart drawn with missing series and no badge.
+    #[test]
+    fn every_parsable_chart_group_is_known_to_the_combo_detector() {
+        for tag in CHART_GROUP_TAGS {
+            assert!(
+                freecell_chart_model::CHART_GROUP_ELEMENTS.contains(tag),
+                "{tag} is parsable here but absent from chart-model's CHART_GROUP_ELEMENTS, so \
+                 has_multiple_chart_groups cannot count it",
+            );
+        }
+        for tag in ["bar3DChart", "line3DChart", "pie3DChart", "area3DChart"] {
+            assert!(
+                freecell_chart_model::CHART_GROUP_ELEMENTS.contains(&tag),
+                "3-D group {tag} is normalized here but absent from CHART_GROUP_ELEMENTS",
+            );
+        }
+    }
+
+    /// **G1, the parser half.** A combo plot area parses to the FIRST group only — the second
+    /// group's series is dropped. This test does not endorse that; it locks the documented
+    /// behaviour so it is visible, and pairs with `source_fidelity` now returning `Degraded` so
+    /// the user is told. Actually drawing the second group is unit G1b (v2.0).
+    #[test]
+    fn a_combo_parses_to_the_first_group_only_and_is_flagged() {
+        let xml = COLUMN_CHART.replace(
+            "</c:barChart>",
+            r#"</c:barChart>
+   <c:lineChart><c:grouping val="standard"/>
+     <c:ser><c:idx val="9"/><c:order val="9"/>
+       <c:tx><c:strRef><c:f>Sheet1!$Z$1</c:f><c:strCache><c:ptCount val="1"/>
+         <c:pt idx="0"><c:v>Dropped Line</c:v></c:pt></c:strCache></c:strRef></c:tx>
+       <c:val><c:numRef><c:f>Sheet1!$Z$2:$Z$3</c:f><c:numCache><c:ptCount val="2"/>
+         <c:pt idx="0"><c:v>7</c:v></c:pt><c:pt idx="1"><c:v>8</c:v></c:pt></c:numCache></c:numRef></c:val>
+     </c:ser>
+     <c:axId val="1"/><c:axId val="2"/>
+   </c:lineChart>"#,
+        );
+        assert!(xml.contains("lineChart"), "the combo fixture was built");
+
+        let chart = parse_chart_xml(&xml).expect("a combo still parses");
+        assert!(
+            matches!(chart.kind, ChartKind::Bar { .. }),
+            "the first group wins: {:?}",
+            chart.kind,
+        );
+        assert!(
+            chart
+                .series
+                .iter()
+                .all(|s| s.name.as_deref() != Some("Dropped Line")),
+            "the second group's series is discarded by the parser (G1b would keep it)",
+        );
+
+        // …and that silent loss is now disclosed rather than presented as exact.
+        assert_eq!(
+            source_fidelity(&xml),
+            Fidelity::Degraded,
+            "a combo must be badged Degraded now that a group is being dropped",
+        );
+    }
+
     const COLUMN_CHART: &str = r#"<?xml version="1.0"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"

@@ -176,6 +176,9 @@ pub fn source_fidelity(chart_xml: &str) -> Fidelity {
     if is_unsupported_chart(chart_xml) {
         return Fidelity::Unsupported;
     }
+    if has_multiple_chart_groups(chart_xml) {
+        return Fidelity::Degraded;
+    }
     if has_3d_chart_group(chart_xml) {
         return Fidelity::Degraded;
     }
@@ -183,6 +186,56 @@ pub fn source_fidelity(chart_xml: &str) -> Fidelity {
         return Fidelity::Degraded;
     }
     Fidelity::Faithful
+}
+
+/// Every chart-group element name OOXML defines for a `c:plotArea` — the supported 2-D set, the
+/// 3-D set, and the ones we cannot draw at all. This is the *counting* set for
+/// [`has_multiple_chart_groups`], so it must be the complete list rather than the subset we parse:
+/// a `barChart` + `surfaceChart` combo is still a combo.
+///
+/// `freecell-engine`'s `chart::load::CHART_GROUP_TAGS` is the narrower "groups we can turn into a
+/// `ChartKind`" list; a guard test there asserts it stays a subset of this one, so adding support
+/// for a new group cannot leave this counter blind to it.
+pub const CHART_GROUP_ELEMENTS: &[&str] = &[
+    "areaChart",
+    "area3DChart",
+    "barChart",
+    "bar3DChart",
+    "bubbleChart",
+    "doughnutChart",
+    "lineChart",
+    "line3DChart",
+    "ofPieChart",
+    "pieChart",
+    "pie3DChart",
+    "radarChart",
+    "scatterChart",
+    "stockChart",
+    "surfaceChart",
+    "surface3DChart",
+];
+
+/// A **combo chart**: more than one chart-group element in the plot area (Excel's ordinary
+/// bar+line, or anything with a secondary axis).
+///
+/// The parser (`freecell-engine::chart::load::parse_chart_xml`) keeps only the **first** group and
+/// silently discards the rest, so the line series of a bar+line combo is simply **absent from the
+/// picture**. Before this check, `source_fidelity` never counted groups, so such a chart was
+/// classified `Faithful` and drawn with no badge — a chart missing half its data, presented as
+/// exact. Counting the groups makes the failure **honest**; drawing them properly is unit G1b.
+///
+/// Ordering note: this sits *after* [`is_unsupported_chart`] so a plot area combining an
+/// unsupported group with a supported one stays `Unsupported` (the stronger verdict) rather than
+/// being softened to `Degraded`.
+fn has_multiple_chart_groups(xml: &str) -> bool {
+    let mut seen = 0;
+    for group in CHART_GROUP_ELEMENTS {
+        seen += count_opening_tags(xml, group);
+        if seen > 1 {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_unsupported_chart(xml: &str) -> bool {
@@ -248,8 +301,20 @@ fn unsupported_data_point(xml: &str) -> bool {
 /// funnel, region map): a different schema (`.../2014/chartex`) we don't render. The retained
 /// part declares that namespace, so its URI fragment is a reliable marker.
 fn is_extended_chart(xml: &str) -> bool {
-    xml.contains("chartex")
+    xml.contains(NS_CHARTEX)
 }
+
+/// The extended-chart namespace URI. Matching the **full URI** rather than the bare substring
+/// `"chartex"` is the point: `xml.contains("chartex")` tests a seven-letter string against the
+/// entire part text, including every cached category label, series name and formatted string in
+/// the file. A chart whose data contains the word — a category called `"chartex"`, a series named
+/// after a `chartex` column — was classified `Unsupported` and replaced with the placeholder,
+/// hiding a perfectly renderable chart. Demonstrated in
+/// `a_literal_chartex_string_in_content_is_not_an_extended_chart`.
+///
+/// The URI is long, specific, and appears only in a namespace declaration, so it cannot collide
+/// with content in the same way.
+const NS_CHARTEX: &str = "http://schemas.microsoft.com/office/drawing/2014/chartex";
 
 /// Axis `c:scaling` features the renderer honors only on a **line** chart (P13): explicit
 /// `c:min`/`c:max` bounds and a reversed `c:orientation val="maxMin"`. On a `lineChart` the renderer
@@ -470,6 +535,28 @@ fn contains_element(xml: &str, local_name: &str) -> bool {
 /// end a tag name (whitespace / `>` / `/`), and the text **before** it must open an element
 /// (`<` or `<prefix:`) — which also excludes closing tags (`</…>`) and names embedded in a
 /// longer name or an attribute value.
+/// How many **opening** tags in `xml` have the prefix-agnostic local name `local_name`. Same
+/// boundary rules as [`any_opening_tag`] (which is the early-exit form of this scan) — closing
+/// tags, longer names and attribute-value text do not count.
+fn count_opening_tags(xml: &str, local_name: &str) -> usize {
+    let mut from = 0;
+    let mut n = 0;
+    while let Some(rel) = xml[from..].find(local_name) {
+        let start = from + rel;
+        let end = start + local_name.len();
+        from = end;
+
+        let after_ends_name = matches!(
+            xml[end..].chars().next(),
+            Some(c) if c == '>' || c == '/' || c.is_whitespace()
+        );
+        if after_ends_name && opens_tag_name(&xml[..start]) {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn any_opening_tag<F: Fn(&str) -> bool>(xml: &str, local_name: &str, pred: F) -> bool {
     let mut from = 0;
     while let Some(rel) = xml[from..].find(local_name) {
@@ -754,6 +841,131 @@ mod tests {
             <cx:chart><cx:plotArea><cx:series layoutId="waterfall"/></cx:plotArea></cx:chart>
         </cx:chartSpace>"#;
         assert_eq!(source_fidelity(xml), Fidelity::Unsupported);
+    }
+
+    /// **G1 gate.** An ordinary Excel bar+line combo. Before this unit `source_fidelity` never
+    /// counted groups, so this returned `Faithful` — while the parser keeps only the FIRST group,
+    /// meaning the line series is absent from the drawing. A chart missing half its data,
+    /// presented as exact.
+    #[test]
+    fn a_combo_chart_is_degraded() {
+        let xml = combo_plot_area("barChart", "lineChart");
+        assert_eq!(
+            source_fidelity(&xml),
+            Fidelity::Degraded,
+            "a bar+line combo must be Degraded — only the first group is drawn",
+        );
+    }
+
+    /// Every pairing of supported groups, so the counter is not accidentally specific to bar+line.
+    #[test]
+    fn every_combo_of_supported_groups_is_degraded() {
+        let supported = [
+            "barChart",
+            "lineChart",
+            "areaChart",
+            "pieChart",
+            "doughnutChart",
+            "scatterChart",
+            "bubbleChart",
+        ];
+        for (i, a) in supported.iter().enumerate() {
+            for b in &supported[i..] {
+                let xml = combo_plot_area(a, b);
+                assert_eq!(
+                    source_fidelity(&xml),
+                    Fidelity::Degraded,
+                    "{a} + {b} must be Degraded",
+                );
+            }
+        }
+    }
+
+    /// **The false-positive guard.** A plot area with ONE group plus the ordinary non-group
+    /// siblings (layout, axes, data table, shape properties) must stay Faithful — the counter
+    /// counts chart groups, not children.
+    #[test]
+    fn a_single_group_with_non_group_siblings_stays_faithful() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+            <c:chart><c:plotArea>
+              <c:layout/>
+              <c:barChart><c:barDir val="col"/><c:axId val="1"/><c:axId val="2"/></c:barChart>
+              <c:catAx><c:axId val="1"/><c:crossAx val="2"/></c:catAx>
+              <c:valAx><c:axId val="2"/><c:crossAx val="1"/></c:valAx>
+              <c:dTable/>
+              <c:spPr/>
+            </c:plotArea></c:chart>
+        </c:chartSpace>"#;
+        assert_eq!(source_fidelity(xml), Fidelity::Faithful);
+    }
+
+    /// Precedence: an Unsupported group in a combo keeps the STRONGER verdict. Detecting a combo
+    /// must never soften `Unsupported` to `Degraded` — that would replace an honest placeholder
+    /// with a badged drawing of a chart we cannot render.
+    #[test]
+    fn a_combo_containing_an_unsupported_group_stays_unsupported() {
+        for bad in UNSUPPORTED_CHART_GROUPS {
+            let xml = combo_plot_area(bad, "lineChart");
+            assert_eq!(
+                source_fidelity(&xml),
+                Fidelity::Unsupported,
+                "{bad} + lineChart must stay Unsupported, not soften to Degraded",
+            );
+        }
+    }
+
+    /// A 3-D group in a combo: both signals say Degraded, so the verdict is stable either way.
+    #[test]
+    fn a_three_d_combo_is_degraded() {
+        assert_eq!(
+            source_fidelity(&combo_plot_area("bar3DChart", "lineChart")),
+            Fidelity::Degraded,
+        );
+    }
+
+    /// A `c:barChart` closing tag must not be counted as a second group — the scanner is
+    /// boundary-aware, and a combo detector that counted `</c:barChart>` would flag every single
+    /// -group chart in existence.
+    #[test]
+    fn closing_tags_are_not_counted_as_groups() {
+        let xml = r#"<c:chartSpace><c:chart><c:plotArea>
+            <c:barChart><c:ser><c:idx val="0"/></c:ser></c:barChart>
+        </c:plotArea></c:chart></c:chartSpace>"#;
+        assert_eq!(source_fidelity(xml), Fidelity::Faithful);
+    }
+
+    /// **The `is_extended_chart` defect, demonstrated.** The old implementation was
+    /// `xml.contains("chartex")` — a seven-letter substring tested against the WHOLE part,
+    /// including every cached label. A chart whose category happens to be the word `chartex`
+    /// was hidden behind the "unsupported chart" placeholder.
+    #[test]
+    fn a_literal_chartex_string_in_content_is_not_an_extended_chart() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+            <c:chart><c:plotArea><c:layout/>
+              <c:barChart><c:ser><c:tx><c:strRef><c:f>Sheet1!$A$1</c:f><c:strCache>
+                <c:ptCount val="1"/><c:pt idx="0"><c:v>chartex rollout</c:v></c:pt>
+              </c:strCache></c:strRef></c:tx></c:ser></c:barChart>
+            </c:plotArea></c:chart>
+        </c:chartSpace>"#;
+        assert_eq!(
+            source_fidelity(xml),
+            Fidelity::Faithful,
+            "a series named after `chartex` is an ordinary bar chart, not an extended one",
+        );
+    }
+
+    /// Build a `c:plotArea` holding two chart groups — an Excel combo.
+    fn combo_plot_area(first: &str, second: &str) -> String {
+        format!(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+              <c:chart><c:plotArea><c:layout/>
+                <c:{first}><c:ser><c:idx val="0"/></c:ser><c:axId val="1"/><c:axId val="2"/></c:{first}>
+                <c:{second}><c:ser><c:idx val="1"/></c:ser><c:axId val="1"/><c:axId val="2"/></c:{second}>
+                <c:catAx><c:axId val="1"/><c:crossAx val="2"/></c:catAx>
+                <c:valAx><c:axId val="2"/><c:crossAx val="1"/></c:valAx>
+              </c:plotArea></c:chart>
+            </c:chartSpace>"#
+        )
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub use authoring::ChartInsertKind;
 pub use downsample::{
     cap_markers_for_paint, downsample_for_paint, MAX_PAINT_MARKERS, MAX_PAINT_VERTICES,
 };
-pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
+pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity, CHART_GROUP_ELEMENTS};
 pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};
 // `renders_faithfully` is exported alongside the applier because it is the CONTRACT on it: it

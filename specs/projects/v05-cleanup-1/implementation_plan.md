@@ -31,7 +31,7 @@ Details live in [`functional_spec.md`](functional_spec.md) and
 - [x] **Phase 6 — F3a: chart/cell number-format + colour agreement.** Differential corpus in
       `freecell-engine`; fix or honestly-degrade any disagreement inside the faithful subset;
       resolve the `rgb_to_hsl` and Office-palette duplication claims. (§6)
-- [ ] **Phase 7 — G1: detect multi-group (combo) charts.** Group counting in
+- [x] **Phase 7 — G1: detect multi-group (combo) charts.** Group counting in
       `source_fidelity`, tightened `is_extended_chart`, corrected `GAPS.md` combo row + G1b
       entry. (§7)
 - [ ] **Phase 8 — G5: `dLbls` per-point overrides.** In-place patch of an existing `c:dLbls`

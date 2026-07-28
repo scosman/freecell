@@ -637,6 +637,26 @@ row, which currently claims placeholder behaviour that does not happen.
 
 *This makes the failure honest, not correct. Actual support is G1b.*
 
+**Outcome (v05-cleanup-1 P7, 2026-07-28): CONFIRMED, both halves — each demonstrated by a test
+that FAILS against the old code**, not by reading. A bar+line plot area classified `Faithful`
+while `parse_chart_xml` kept only the first group; and `is_extended_chart`'s bare
+`contains("chartex")` classified a bar chart whose series was named `"chartex rollout"` as
+`Unsupported` — a renderable chart replaced by the placeholder. The old test only ever fed it a
+genuine `cx:` part, so the false positive was invisible.
+
+Fixed: `has_multiple_chart_groups` in `source_fidelity` (after `is_unsupported_chart`, so a combo
+containing an unsupported group keeps the stronger verdict — tested), counting over a new
+`chart-model::CHART_GROUP_ELEMENTS` (all sixteen OOXML group names, not just the ones we parse);
+`is_extended_chart` now matches the full namespace URI. A guard test asserts
+`load::CHART_GROUP_TAGS ⊆ CHART_GROUP_ELEMENTS`, so adding engine support for a new group cannot
+leave the detector blind to combos involving it.
+
+**Reason strings deliberately skipped:** `Fidelity` is a bare enum, and widening it touches every
+call site plus the badge UI — that is G3's rework. G1 stays detection-only, as scoped.
+`GAPS.md`'s combo row is now its own entry stating what actually happens (it previously implied a
+combo got the unsupported-chart placeholder, which it does not).
+See `specs/projects/v05-cleanup-1/phase_plans/phase_7.md`.
+
 ### G1b. Combo / dual-axis chart support
 **project · v2.0 · after G1**
 

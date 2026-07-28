@@ -188,3 +188,14 @@ registry: each entry is a short description plus a pointer to a design note unde
   correct; the bug is operator-level, with a broad blast radius across every formula that negates a
   non-number — out of the scalar-functions batch's function-local scope. Workarounds
   `SUMPRODUCT(1*(cond))` and `SUMPRODUCT((A=x)*(B))` both work today. → [`projects/unary-minus-boolean-coercion.md`](projects/unary-minus-boolean-coercion.md)
+
+- **Split `grid/view.rs` (10,627 lines)** — *Future (filed from `chrome-view-split`,
+  2026-07-28).* The grid view is **6,575 production lines** — 3.3× the 2,000-line ceiling F2 is
+  meant to enforce, and the largest file in the workspace. Not urgent (it costs velocity and bus
+  factor, not users), but it blocks F2 from being a real gate rather than a ceiling with the
+  repo's biggest file exempted. Now cheap to do: `chrome-view-split` proved the method — Rust's
+  module-descendant privacy means the child modules see the parent's private fields with zero
+  visibility changes, and the compiler names every cross-module item that needs `pub(super)`.
+  The note records the reusable procedure, what to re-measure first (does it carry the same
+  agreeing production/test banner sections that made the chrome split mechanical?), and the four
+  other files currently over the ceiling. → [`projects/grid-view-split.md`](projects/grid-view-split.md)

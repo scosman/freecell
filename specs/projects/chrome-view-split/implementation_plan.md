@@ -18,26 +18,26 @@ Details live in `architecture.md` §7 (the source-range → destination mapping)
 
 ## Phases
 
-- [ ] **Phase 1: Directory + test support.** `git mv view.rs view/mod.rs` as its own commit
+- [x] **Phase 1: Directory + test support.** `git mv view.rs view/mod.rs` as its own commit
       (arch §4.1), then extract `test_support.rs` — the `Harness`, the nine build helpers, and
       the 15 `#[cfg(test)]` seams. Proves the `pub(super)` + `use super::*` mechanics (arch
       §3) on a small surface before any production code moves.
-- [ ] **Phase 2: `stats.rs` and `find.rs`.** The two smallest, least-coupled domains (~110 and
+- [x] **Phase 2: `stats.rs` and `find.rs`.** The two smallest, least-coupled domains (~110 and
       ~410 production lines). First phase to move production code *and* its tests together;
       validates the banner-to-banner cut end to end.
-- [ ] **Phase 3: `tabs.rs`.** Sheet tab bar, reorder drag, rename, context menu, delete
+- [x] **Phase 3: `tabs.rs`.** Sheet tab bar, reorder drag, rename, context menu, delete
       confirm, plus `TabDrag`/`TabSpan` and the tab-geometry free functions.
-- [ ] **Phase 4: `charts.rs`.** Insert-chart menu, chart edit panel and its P20 chrome, and the
+- [x] **Phase 4: `charts.rs`.** Insert-chart menu, chart edit panel and its P20 chrome, and the
       `ChartPanel`/`ChartPanelSeries` types — which must stay `pub` and keep re-exporting
       through `chrome/mod.rs` unchanged.
-- [ ] **Phase 5: `cf_sidebar.rs` and `cf_editor.rs`.** The largest domain and the only one that
+- [x] **Phase 5: `cf_sidebar.rs` and `cf_editor.rs`.** The largest domain and the only one that
       splits in two (arch §7.3). Done as one phase because the sidebar/editor seam is only
       verifiable with both sides moved.
-- [ ] **Phase 6: `formatting.rs`.** Style toggles, merge, fill, text colour, number format,
+- [x] **Phase 6: `formatting.rs`.** Style toggles, merge, fill, text colour, number format,
       font, borders, their popovers and free helpers.
-- [ ] **Phase 7: `editing.rs`.** Data row, in-cell editor, quick-edit, autocomplete, signature
+- [x] **Phase 7: `editing.rs`.** Data row, in-cell editor, quick-edit, autocomplete, signature
       hints. Largest test payload (~1,930 lines across eight banner sections).
-- [ ] **Phase 8: `shell.rs` + project close-out.** Move the residue (`Render`/`Focusable`,
+- [x] **Phase 8: `shell.rs` + project close-out.** Move the residue (`Render`/`Focusable`,
       `render_action_row`, overlays, `on_worker_event`, selection plumbing, degrade) out of
       `mod.rs`, leaving it the struct + `new` + shared constants. Then, once: verify every
       file is under the 2,000 production-line ceiling, run `cargo test -p freecell-app` (all

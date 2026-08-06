@@ -209,11 +209,17 @@ an action-bar button.
 
 - **Open:** Cmd/Ctrl+F (a new `OpenFind` action + keybinding) **or** a search-icon button
   in the action bar. Opening focuses the Find field and selects any existing text in it.
+- Cmd/Ctrl+F **only ever opens** — it never dismisses the bar. Pressed while the bar is
+  already open (whatever holds focus — the grid, a cell editor, the bar itself) it keeps
+  the bar open, returns focus to the Find field, and selects its text, so the next
+  keystroke starts a fresh query. "⌘F then type" can therefore never land in a cell. The
+  action-row search button keeps its toggle behavior; the shortcut does not.
 - If a single cell or range is selected when opening, the bar opens with whatever find
   text is already there (no auto-populate from the cell in this batch).
-- **Close:** the X button, or **Escape** while the bar is focused. Closing returns focus
-  to the grid and clears any transient match highlight. The find/replace text is retained
-  for the next open within the session.
+- **Close:** the X button, **Escape** while the bar is focused, or clicking the action-row
+  search button again — the ⌘F shortcut is deliberately *not* one of them. Closing returns
+  focus to the grid and clears any transient match highlight. The find/replace text is
+  retained for the next open within the session.
 
 ### 4.3 Find behavior
 

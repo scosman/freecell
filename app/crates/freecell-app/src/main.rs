@@ -99,6 +99,17 @@ fn main() {
         rx
     };
 
+    // gpui's `QuitMode::Default` (set in `FreeCellApp::init`) keeps a macOS app alive after its
+    // last window closes, so a Dock-icon click on the running app is the way back in — AppKit
+    // delivers it as `applicationShouldHandleReopen:`, surfaced by gpui as
+    // `Application::on_reopen` (a BUILDER method like `on_open_urls` above, so it must be
+    // registered here, before `run` consumes `app`). gpui only invokes it when no window is
+    // visible; `handle_dock_reopen` then reopens welcome (no windows at all) or brings the
+    // existing — minimized — windows forward. Registered unconditionally (rather than
+    // `cfg(target_os = "macos")`) so the wiring is compiled + type-checked by the Linux CI: the
+    // gpui Linux/Windows platforms only *store* this callback, they never fire it.
+    app.on_reopen(FreeCellApp::handle_dock_reopen);
+
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
         register_fonts(cx); // registers the bundled Inter faces + sets Inter as the UI font,

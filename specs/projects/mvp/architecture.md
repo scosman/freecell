@@ -259,7 +259,9 @@ Full design in `components/app_shell.md`:
 
 - `gpui_platform::application().run(...)`; a `FreeCellApp` global holds the window
   registry. Welcome window at launch; opening/creating a document closes it; when the
-  last window closes, the app quits. Quit prompts per dirty window.
+  last window closes, the app quits on Windows/Linux — on macOS it stays resident in
+  the Dock and `Application::on_reopen` (Dock click) activates the existing windows or
+  re-opens Welcome. Quit prompts per dirty window and always terminates.
 - macOS menu bar via GPUI's menu/action API; menu actions dispatch to the focused
   window's entity. Keyboard shortcuts are GPUI key bindings bound to the same actions
   (single source of truth).

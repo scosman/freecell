@@ -145,20 +145,20 @@ critical path.
 | **Render-time fallback to Inter for unavailable *explicit* fonts** | Mild | A cell with an **explicit** non-default font the OS lacks (e.g. `Calibri` off-Windows) is passed straight to GPUI, which substitutes an arbitrary system font instead of our bundled Inter. (The common case — the *workbook default* font — already renders Inter via `GRID_FONT_FAMILY`, so this is only explicit non-default fonts.) | **FreeCell-side, small.** At the grid render site, resolve the family via `text_system().all_font_names()` and fall back to `GRID_FONT_FAMILY` (Inter) when absent; keep the real name in the model for round-trip. |
 | **Opened xlsx (from another app) renders wider columns than the source app** | Mild (cosmetic; values, charts, and layout logic all correct) | A file created in Excel/Numbers with **no explicit `<col width>`** opens in FreeCell using FreeCell's *wider* default column width, so the same sheet — and its cell-anchored charts — read wider than in the originating app (same column *count*, wider columns). Surfaced comparing a real chart workbook's Excel vs FreeCell render during the charts project (P4–P11, 2026-07-10). | **FreeCell-side, deferred (design TBD; NOT a charts-project fix).** For columns lacking an explicit width, adopt a default closer to Excel's (~8.43 char ≈ 64px). Open question the owner flagged: change FreeCell's default width **everywhere**, or apply an Excel-like default only to files we *open* that look Excel-originated (they omit widths). Inverse/pair of the export-direction row above (`persist sheet/workbook defaults`). |
 
-## Engine (fork) — `DOLLAR` parenthesizes a negative that rounds to zero (2026-08-06)
+## Engine (fork) — pasting a copied spill cell clears the destination with no undo (2026-08-06)
 
-Surfaced re-pinning FreeCell onto `freecell-fixes` HEAD for the paste-fill fix
-(`fix/paste-fill-relative-refs`). The pin had been sitting on `cee2859d`, one commit *before*
-the fork reverted `fix/dollar-negative-zero` back out of `freecell-fixes` (`8a79a7f6`, merged as
-scosman/ironcalc#2, 2026-07-28, after the IronCalc team pushed back on the fix upstream). So the
-divergence the `scalar-functions-batch` project had fixed is live again in FreeCell as of that
-re-pin. That project's tracker
-(`specs/projects/scalar-functions-batch/fork-fixes/README.md`) is annotated to match: the fix is
-neither on the integration branch FreeCell builds against nor on a live `fix/` branch any more.
+Found reviewing `fix/paste-fill-relative-refs`; **pre-existing** in IronCalc, not introduced by
+the paste-fill. Repro + fix sketch:
+[`projects/paste-spill-cell-undo-hole.md`](projects/paste-spill-cell-undo-hole.md).
+
+*(Side note, not this gap: the pinned fork's `UserModel` — which `freecell-engine` drives
+directly — **does** evaluate dynamic arrays and spill, so the "Dynamic arrays / spill absent …
+the engine surfaces an error" line above and the v1.0-backlog row below read **stale for the
+current pin**. Left as-is here; re-triaging them is its own task.)*
 
 | Gap | Severity | Current behavior | Root cause / home |
 |-----|----------|------------------|-------------------|
-| **`DOLLAR` wraps a rounds-to-zero negative in parentheses** | Mild (one function, one edge value; no data loss, no import/export effect) | `=DOLLAR(-0.001,2)` → `($0.00)`; Excel returns `$0.00`. Real negatives are unaffected (`=DOLLAR(-1234.567,2)` → `($1,234.57)`, correct). Asserted as-is by `scalar_functions_batch_computes_through_pinned_engine` so it can't drift unnoticed. | **Fork/upstream.** `fn_dollar` (`base/src/functions/text/string_format.rs`) branches on `value < 0.0` before checking whether the rounded magnitude is zero. The one-line guard exists as fork commit `aa36a177` — its `fix/dollar-negative-zero` branch has been **deleted from the remote**, so the commit is reachable only as an ancestor of `freecell-fixes` (through the reverted merge `6163e084`). Re-landing it needs an owner decision (re-push the branch + re-merge into `freecell-fixes` and carry it, or accept the divergence). |
+| **A paste that copies a spill cell destroys the destination's content, with nothing in the undo entry to restore it** | Mild on **frequency** only (spill formulas are rare in real FreeCell sheets today) — but genuinely **reachable**: ⌘C/⌘V over any dynamic-array spill region hits it | A paste clears its whole destination rectangle via `range_clear_contents(target_area)`, but a copied spill cell (`ClipboardCell.is_spill`) records only a `SetCellStyle` diff — undo restores the style, not the cleared content. The new paste-fill repeats this per repetition rather than once. | **Fork/upstream.** `UserModel::paste_from_clipboard` (`base/src/user_model/clipboard.rs`). Needs its own `fix/<slug>` branch + single-fix upstream PR: capture the old value before clearing and record it as a diff, the way `paste_csv_string` already does. |
 
 ## Data safety & robustness
 
@@ -324,13 +324,12 @@ See the [v0.5 tier row](#v05--table-stakes-for-pretty-good-target-90-at-great-ux
 
 ### `mvp-gaps` UI review — accepted limitations (owner-approved 2026-07-06)
 
-Two judgment calls from the post-Phase-8 **UI-review bug-fix round**, reviewed and accepted by
-the owner as-is. Each ships as built; recorded here so neither is later mistaken for a defect.
+One judgment call from the post-Phase-8 **UI-review bug-fix round**, reviewed and accepted by
+the owner as-is. It ships as built; recorded here so it is not later mistaken for a defect.
 
 | # | Limitation | Vs. Excel | Root cause | Current behavior | Follow-up if needed |
 |---|---|---|---|---|---|
 | U1 | **Open dialog shows all files, not filtered to `.xlsx`/`.csv`** (updated 2026-07-16: filter target is now **both** `.xlsx` and `.csv`, since CSV import ships in `gaps_closing_7_15` and the **Open** panel handles a `.csv` pick by importing it as an untitled workbook — there is intentionally no separate "Import CSV…" menu item) | Excel's file picker filters to workbook types | **API gap (save-as-GAP, not building):** the pinned gpui rev's `PathPromptOptions` (`crates/gpui/src/platform.rs`) has **no** extension/content-type field, and neither the macOS impl (`NSOpenPanel`, never calls `setAllowedContentTypes:`) nor the Linux `prompt_for_paths` exposes a filter hook — so pre-filtering is impossible without bumping the pinned gpui dep (a separate, riskier change against a pinned dependency). | **Correct + graceful fallback:** a files-only picker, then routing by the pick: a `.csv` imports as an untitled workbook; anything else runs the `.xlsx` loader, whose **post-selection** magic-byte check rejects a non-workbook → `LoadError::NotXlsx` → the "Couldn't open the workbook" dialog. No crash, no wrong-file load. | Revisit when gpui is bumped to a rev whose path prompt gains a filter field (or via a fork fix to `PathPromptOptions`); then set the allowed set to **`.xlsx` + `.csv`** in `open_panel_options` (`shell/window.rs`). |
-| U2 | ~~**Single-cell paste-fill uses block-uniform formula displacement, not per-cell relative fill**~~ — **RESOLVED 2026-08-06** (fork `fix/paste-fill-relative-refs`) | — (now matches Excel) | The old fill synthesized a target-sized clipboard payload and pasted it in one call, so the whole block took a single uniform `anchor − source` reference shift. The fix taught the engine's `paste_from_clipboard` to repeat the copy across a whole-multiple selection itself, re-anchoring each repetition through `extend_copied_value` — still ONE diff list, so the one-undo-step constraint never had to be relaxed. | Pasting a 1×1 (or exact-divisor block) copy onto a larger selection fills the **whole** target in **one** undo step, with **per-cell** relative-reference adjustment (`=B3+1` copied from B4 over B5:B10 → `=B4+1`, `=B5+1`, … `=B9+1`); `$`-absolute parts stay pinned; values + styles exact. Over-large fills (> 100k cells) are still rejected as Overflow. | Upstream PR for `fix/paste-fill-relative-refs` still to be opened by the owner. |
 
 ---
 

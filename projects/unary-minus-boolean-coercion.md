@@ -47,9 +47,9 @@ exists and why the operator's failure to coerce surfaces here as a `0`.
 ## Why it's deferred (out of the scalar-functions batch's scope)
 
 The scalar-functions batch is **function-local** engine coverage/correctness — new registry entries
-plus small in-function fixes (DOLLAR neg-zero guard, ADDRESS empty-sheet prefix, XMATCH
-array-constant acceptance). This is different in kind: it's an **engine operator** fix with a
-**broad blast radius** — every formula that applies unary `-`/`--` to a non-number runs through the
+plus small in-function fixes (ADDRESS empty-sheet prefix, XMATCH array-constant acceptance). This
+is different in kind: it's an **engine operator** fix with a **broad blast radius** — every
+formula that applies unary `-`/`--` to a non-number runs through the
 changed path, so the risk surface and required regression coverage are much larger than a single
 function. Bundling it into a SUMPRODUCT branch would also violate "one fix = one branch = one clean
 upstream PR" (it isn't a SUMPRODUCT change at all). It gets its own project when prioritized.

@@ -235,12 +235,11 @@ Shared CP1252 mapping for 0x80–0x9F (0xA0–0xFF = Unicode identity; undefined
 - **Format** `v` as currency text via the formatter TEXT/FIXED use **[checkpoint]**, en-US locale,
   format code `"$"#,##0[.0…d…0];("$"#,##0[.0…d…0])` (dp = `max(d,0)`). **No trailing alignment space**
   on positives — verify against §3.7 (drop any `_)` padding or assemble the string directly if the
-  formatter injects it). Negatives → parenthesized, no minus. A rounded-to-zero value → `"$0"`/`"$0.00"`
-  (never `-`/`()`; treat `v == 0.0` as non-negative). Return `String`.
+  formatter injects it). Negatives → parenthesized, no minus; a **negative** that rounds to zero
+  stays parenthesized (`(-0.001,2)`→`($0.00)`, matching Excel). Return `String`.
 - Non-numeric `number` → `#VALUE!`.
 - **Tests** (§3.7): `DOLLAR(1234.567)`→`$1,234.57`; `(1234.567,1)`→`$1,234.6`; `(-1234.567,2)`→
-  `($1,234.57)`; `(99.9,0)`→`$100`; `(12345.67,-2)`→`$12,300`; `(50,-3)`→`$0`; `(0)`→`$0.00`;
-  **add** `(-0.001,2)`→`$0.00` (negative-zero guard).
+  `($1,234.57)`; `(99.9,0)`→`$100`; `(12345.67,-2)`→`$12,300`; `(50,-3)`→`$0`; `(0)`→`$0.00`.
 
 ### 3.8 ADDRESS — `fn_address` (lookup_and_reference.rs)
 
@@ -468,8 +467,8 @@ Owner shepherds the PRs (the human-in-loop step); when one merges upstream it re
   IronCalc's harness (`new_empty_model()` → `model._set("A1","=…")` → `model.evaluate()` →
   `assert_eq!(model._get_text("A1"), …)` **[checkpoint]**), covering **every worked example** in the
   function's §3 subsection **verbatim** (they are the test vectors) + the added edge rows called out
-  above (DOLLAR negative-zero, ADDRESS empty-sheet, XMATCH 2-D/case-insensitive/binary≡linear, CHAR/CODE
-  inverse invariant, TRIM 0x20-only proof). Errors assert as their string form (`"#VALUE!"`, `"#NUM!"`,
+  above (ADDRESS empty-sheet, XMATCH 2-D/case-insensitive/binary≡linear, CHAR/CODE inverse
+  invariant, TRIM 0x20-only proof). Errors assert as their string form (`"#VALUE!"`, `"#NUM!"`,
   `"#N/A"`). Run **crate-scoped**: `cargo test -p ironcalc_base` + `make lint` (fmt + strict clippy) on
   each branch — not the whole fork workspace per iteration.
 - **FreeCell-side smoke (once, after integration).** After `cargo update` re-pins `freecell-fixes`, a

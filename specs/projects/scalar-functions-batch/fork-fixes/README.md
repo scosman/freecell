@@ -27,7 +27,13 @@ is an engine-operator issue **deferred** off the critical path.
 **The batch's real deliverable = 4 fork branches / PRs:**
 
 - **TRIM fix** (`fix/trim-internal-runs`) — the one net-new behavior fix from the original scope.
-- **DOLLAR** (`fix/dollar-negative-zero`) — negative-zero-guard correctness fix.
+- **DOLLAR** (`fix/dollar-negative-zero`) — negative-zero-guard correctness fix. **Reverted out
+  of `freecell-fixes` on 2026-07-28** (`8a79a7f6`, merged as scosman/ironcalc#2) after upstream
+  pushed back on it, and **the branch has since been deleted from `scosman/ironcalc`** — the
+  commit itself survives in `freecell-fixes` history at `aa36a177` (merge `6163e084`, reverted by
+  `8a79a7f6`), so nothing is lost, but the branch must be re-pushed before the compare link below
+  resolves. FreeCell no longer gets the fix — see the status-table row below and the `DOLLAR`
+  entry in root `GAPS.md`.
 - **ADDRESS** (`fix/address-empty-sheet`) — empty-`sheet_text` prefix correctness fix (O-4 edge).
 - **XMATCH** (`fix/xmatch-array-constant`) — accept array constants as `lookup_array`.
 
@@ -50,7 +56,7 @@ Per-phase records: `phase_plans/phase_{1,3,4,5,6,7,8,9,10}.md`. One additional o
 | 4 | ~~`fix/replace`~~ | REPLACE | `fn_replace` `text/string_format.rs:207` | §3.3 — all pass | inherited | n/a | **already present — verified, branch skipped** |
 | 5 | ~~`fix/char-code`~~ | CHAR + CODE | `fn_char`, `fn_code` `text/char_code.rs` | §3.4/§3.5 — all pass; 5 undefined CP1252 slots = owner SKIP | inherited | n/a | **already present (CP1252) — verified, branch skipped** |
 | 6 | ~~`fix/clean`~~ | CLEAN | `fn_clean` `text/char_code.rs:137` | §3.6 — all pass (0–31 only) | inherited | n/a | **already present — verified, branch skipped** |
-| 7 | `fix/dollar-negative-zero` | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — divergence (neg-zero → `($0.00)`) **confirmed + FIXED** | ✅ (merge `6163e084`) | ✅ prep (below) | **landed + pushed** — branch `aa36a177` |
+| 7 | `fix/dollar-negative-zero` | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — divergence (neg-zero → `($0.00)`) **confirmed + FIXED** | ⛔ **merge `6163e084` REVERTED** by `8a79a7f6` (scosman/ironcalc#2, 2026-07-28) | ⛔ blocked — branch deleted | **commit `aa36a177` survives only in `freecell-fixes` history; the branch is GONE from the remote and the fix is NOT in `freecell-fixes`** — upstream pushed back; re-push `aa36a177` as `fix/dollar-negative-zero` to revive the PR. The divergence is live again in FreeCell (root `GAPS.md`) |
 | 8 | ~~`fix/percentile-quartile-inc`~~ | PERCENTILE(.INC) + QUARTILE(.INC) | `fn_percentile_inc` `statistical/percentile.rs:44`, `fn_quartile_inc` `statistical/quartile.rs` | §3.9/§3.10 — all pass; legacy routes to inclusive | inherited | n/a | **already present — verified, branch skipped** |
 | 9 | `fix/address-empty-sheet` | ADDRESS | `fn_address` `lookup_and_reference/address_areas.rs:18` | §3.8 — divergence (empty sheet → `$A$1`) **confirmed + FIXED** | ✅ (merge `582a78b1`) | ✅ prep (below) | **landed + pushed** — branch `09259476` |
 | 10 | `fix/xmatch-array-constant` | XMATCH | `fn_xmatch` `lookup_and_reference/xmatch.rs` | §3.11 — divergence (array-constant → `#VALUE!`) **confirmed + FIXED** | ✅ (merge `9161a463`) | ✅ prep (below) | **landed + pushed** — branch `f9d1f9ce` |
@@ -63,7 +69,7 @@ divergence is deferred as an operator-level follow-on (below).
 
 | Function | §ref | Spec expects | Fork actual (before) | Disposition |
 |---|---|---|---|---|
-| DOLLAR | §3.7 | `DOLLAR(-0.001,2)` → `$0.00` | `($0.00)` | **FIXED** — `fix/dollar-negative-zero` (`aa36a177`). Rounds-to-zero unsigned guard in `fn_dollar`. |
+| DOLLAR | §3.7 | `DOLLAR(-0.001,2)` → `$0.00` | `($0.00)` | **FIXED on the branch, then reverted out of `freecell-fixes` (and the branch deleted)** — `aa36a177` adds the rounds-to-zero unsigned guard in `fn_dollar`, but `8a79a7f6` (scosman/ironcalc#2) reverted its merge after upstream pushback, so the pinned engine still returns `($0.00)`. The commit is reachable only through that reverted merge in `freecell-fixes` history. |
 | ADDRESS | §3.8 (O-4) | `ADDRESS(1,1,1,TRUE,"")` → `!$A$1` | `$A$1` | **FIXED** — `fix/address-empty-sheet` (`09259476`). Present-empty `sheet_text` emits the `!` prefix. |
 | XMATCH | §2.5 | accepts array constants | `#VALUE!` on `{...}` | **FIXED** — `fix/xmatch-array-constant` (`f9d1f9ce`). Materialize `CalcResult::Array` as well as `Range`; function-local. |
 | SUMPRODUCT | §3.1 | `SUMPRODUCT(--(cond))` counts → `2` | `0` | **DEFERRED** — root cause is the unary-minus operator (`=--TRUE`→`TRUE` not `1`), not SUMPRODUCT. Broad blast radius, out of this batch's scope. → `projects/unary-minus-boolean-coercion.md` (PROJECTS.md). Workarounds `1*(cond)` and `(A=x)*(B)` work today. |
@@ -116,7 +122,11 @@ For each branch, once green on `freecell-fixes`:
 ### `fix/dollar-negative-zero` — Fix DOLLAR to not parenthesize a value that rounds to zero
 
 - **Compare link:** https://github.com/ironcalc/IronCalc/compare/main...scosman:ironcalc:fix/dollar-negative-zero
-- **Branch commit:** `aa36a177` (off `main`) · **`freecell-fixes` merge:** `6163e084` · both pushed to `scosman/ironcalc`.
+  — **404s today**: the branch was deleted (see below); re-push it to make the link resolve.
+- **Branch commit:** `aa36a177` (off `main`) · **`freecell-fixes` merge:** `6163e084`, **reverted by
+  `8a79a7f6`** (scosman/ironcalc#2, 2026-07-28, after upstream pushback) · **branch deleted from
+  `scosman/ironcalc`** — `aa36a177` survives only as an ancestor of `freecell-fixes` through that
+  reverted merge, and is **not** carried by `freecell-fixes` itself.
 - **Title:** `Fix DOLLAR to not parenthesize a value that rounds to zero`
 - **Body:**
 

@@ -1749,11 +1749,21 @@ impl WorkbookDocument {
         persist_atomically(temp, path)
     }
 
-    /// Paste a previously-copied engine payload at `anchor` on `dest_idx` (`paste_from_clipboard`,
-    /// `common.rs:1811`): Excel relative-reference adjustment on copy, move semantics + source
-    /// clear on cut, one undoable diff list, then the pasted area is re-selected. `source_idx` /
+    /// Paste a previously-copied engine payload over `selection` on `dest_idx`
+    /// (`paste_from_clipboard`): Excel relative-reference adjustment on copy — including the
+    /// per-cell re-anchoring of a fill into a larger selection — move semantics + source clear on
+    /// cut, one undoable diff list, then the pasted area is re-selected. `source_idx` /
     /// `source_range` are the copy-time sheet index + effective rectangle (the source cleared on
     /// cut). The caller pauses evaluation around this (the batch's single recompute follows).
+    ///
+    /// **`selection` is what decides a fill.** The engine repeats the copy across the *selected*
+    /// area when that area is an exact multiple of (and larger than) the copied rectangle — one
+    /// diff-list, each repetition's relative references re-anchored to its own position, as Excel
+    /// does. So the caller passes the whole paste target only when it wants that fill (i.e. when
+    /// [`fill_target_dims`] sized one and its cell-count cap accepted it) and the anchor cell
+    /// alone otherwise — a single-cell selection can never be read as a fill, whatever the
+    /// engine's own rule is. Deciding it in the one place that also caps it
+    /// ([`apply_paste_internal`](crate::worker::run)) is what keeps the cap authoritative.
     pub(crate) fn paste_clipboard(
         &mut self,
         dest_idx: u32,
@@ -1761,43 +1771,15 @@ impl WorkbookDocument {
         source_range: (i32, i32, i32, i32),
         data_json: &serde_json::Value,
         cut: bool,
-        target: CellRange,
+        selection: CellRange,
     ) -> Result<(), String> {
-        // The paste anchors at the target's top-left (the destination selection's anchor).
-        let anchor = target.start;
-        // A single-cell (or exact-divisor) COPY into a larger selection tiles/fills the source
-        // across the whole `target` as ONE diff-list — the engine only ever pastes the source
-        // rectangle once at the anchor, so we synthesize a target-sized payload here (BUG 4). Values
-        // and styles fill exactly; because the whole synthesized block is pasted in one call it
-        // takes a single uniform `anchor − source` reference shift, so a **formula** is filled with
-        // the top-left cell's shift on every cell, NOT Excel's per-cell relative fill (accepted
-        // limitation U2 in `GAPS.md`; per-cell fill would need N×M pastes = N×M undo entries). A cut
-        // is a move with a single destination, so it never fills.
-        let fill = (!cut)
-            .then(|| fill_target_dims(source_range, target))
-            .flatten();
-        // Set the destination selection to the single anchor cell (the paste anchors from it).
-        self.set_view_selection(dest_idx, CellRange::single(anchor))?;
+        self.set_view_selection(dest_idx, selection)?;
         crate::instrument::record_engine_call();
-        match fill {
-            Some((tw, th)) => {
-                let tiled_json = tile_clipboard_json(data_json, source_range, tw, th)?;
-                let data = ClipboardData::deserialize(&tiled_json)
-                    .map_err(|e| format!("failed to deserialize tiled clipboard data: {e}"))?;
-                let (sr0, sc0, _, _) = source_range;
-                let tiled_range = (sr0, sc0, sr0 + th as i32 - 1, sc0 + tw as i32 - 1);
-                self.model
-                    .paste_from_clipboard(source_idx, tiled_range, &data, cut)
-            }
-            None => {
-                // Deserialize directly from the borrowed `Value` (no clone — `&Value` is a
-                // Deserializer).
-                let data = ClipboardData::deserialize(data_json)
-                    .map_err(|e| format!("failed to deserialize clipboard data: {e}"))?;
-                self.model
-                    .paste_from_clipboard(source_idx, source_range, &data, cut)
-            }
-        }
+        // Deserialize directly from the borrowed `Value` (no clone — `&Value` is a Deserializer).
+        let data = ClipboardData::deserialize(data_json)
+            .map_err(|e| format!("failed to deserialize clipboard data: {e}"))?;
+        self.model
+            .paste_from_clipboard(source_idx, source_range, &data, cut)
     }
 
     /// Paste a tab-delimited TSV at `anchor` on `dest_idx` (`paste_csv_string`, `common.rs:1926`):
@@ -1962,14 +1944,13 @@ fn number_token(n: f64, decimal_sep: char) -> String {
     }
 }
 
-/// The tiled destination dims `(width, height)` in cells when a copied `source_range` fills a
-/// larger `target` selection by whole-multiple replication (single-cell / exact-divisor block
-/// fill): `Some((tw, th))` iff `target` is an exact multiple of the source in BOTH axes AND
-/// strictly larger; else `None` (paste the source once at the anchor). Shared by the worker (fill
-/// cap) and [`WorkbookDocument::paste_clipboard`] (the synthesis) so the two can never disagree.
-/// `source_range` is the engine's (1-based, inclusive) copied rectangle; only its dims are read,
-/// so the coordinate base is immaterial. (The fill copies values + styles exactly but shifts a
-/// formula's refs uniformly, not per-cell — accepted limitation U2 in `GAPS.md`.)
+/// The filled destination dims `(width, height)` in cells when a copied `source_range` repeats to
+/// cover a larger `target` selection (single-cell / exact-divisor block fill): `Some((tw, th))` iff
+/// `target` is an exact multiple of the source in BOTH axes AND strictly larger; else `None` (the
+/// copy pastes once at the anchor). This mirrors the fill rule the engine's `paste_from_clipboard`
+/// applies, so the worker can size-cap a fill (and Paste Values can tile its own literals) before
+/// the write. `source_range` is the engine's (1-based, inclusive) copied rectangle; only its dims
+/// are read, so the coordinate base is immaterial.
 pub(crate) fn fill_target_dims(
     source_range: (i32, i32, i32, i32),
     target: CellRange,
@@ -1984,54 +1965,6 @@ pub(crate) fn fill_target_dims(
     let th = target.height();
     let exact = sw != 0 && sh != 0 && tw.is_multiple_of(sw) && th.is_multiple_of(sh);
     (exact && (tw > sw || th > sh)).then_some((tw, th))
-}
-
-/// Replicates a clipboard payload's cells to fill a `tw`×`th` block by tiling the `source_range`
-/// rectangle across it (BUG 4 fill). `data_json` is the serialized [`ClipboardData`] —
-/// `{ "<row>": { "<col>": { text, style } } }` with engine 1-based integer-as-string keys — and
-/// the result has the same shape, every tile's cells cloned into place, ready to
-/// `ClipboardData::deserialize`. `tw`/`th` are assumed whole multiples of the source dims (the
-/// caller gates on [`fill_target_dims`]). Errors only on a malformed payload (non-object shape /
-/// non-integer keys) — a defensive guard, since the payload always comes from the engine's own
-/// `copy_to_clipboard`.
-fn tile_clipboard_json(
-    data_json: &serde_json::Value,
-    source_range: (i32, i32, i32, i32),
-    tw: u32,
-    th: u32,
-) -> Result<serde_json::Value, String> {
-    let (sr0, sc0, sr1, sc1) = source_range;
-    let sw = sc1 - sc0 + 1;
-    let sh = sr1 - sr0 + 1;
-    let src = data_json
-        .as_object()
-        .ok_or_else(|| "clipboard data is not an object".to_string())?;
-    let reps_r = th as i32 / sh;
-    let reps_c = tw as i32 / sw;
-    let mut out = serde_json::Map::new();
-    for a in 0..reps_r {
-        for b in 0..reps_c {
-            for (row_key, row_val) in src {
-                let src_row: i32 = row_key
-                    .parse()
-                    .map_err(|_| format!("bad clipboard row key: {row_key}"))?;
-                let row_obj = row_val
-                    .as_object()
-                    .ok_or_else(|| "clipboard row is not an object".to_string())?;
-                let out_row = out
-                    .entry((src_row + a * sh).to_string())
-                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-                let out_row_obj = out_row.as_object_mut().expect("just inserted an object");
-                for (col_key, cell_val) in row_obj {
-                    let src_col: i32 = col_key
-                        .parse()
-                        .map_err(|_| format!("bad clipboard col key: {col_key}"))?;
-                    out_row_obj.insert((src_col + b * sw).to_string(), cell_val.clone());
-                }
-            }
-        }
-    }
-    Ok(serde_json::Value::Object(out))
 }
 
 /// Converts a 0-based [`CellRange`] on `sheet_idx` to IronCalc's 1-based inclusive
@@ -2180,10 +2113,17 @@ mod tests {
             ("=QUARTILE.INC({1,2,4,7,8,9,10,12},2)", "7.5"),
             ("=XMATCH(30,{10,20,30,40,50})", "3"),
         ];
-        // The four fork correctness fixes — prove the pin carries each landed branch.
+        // The fork correctness fixes still on `freecell-fixes` — prove the pin carries each branch.
+        // `fix/dollar-negative-zero` is NOT among them: it was reverted out of `freecell-fixes`
+        // (fork `8a79a7f6`, merged as scosman/ironcalc#2) after upstream pushed back on it, so the
+        // pinned engine parenthesizes a negative that rounds to zero (`=DOLLAR(-0.001,2)` →
+        // `($0.00)`, Excel says `$0.00`). Asserted here so the divergence stays watched rather than
+        // silently drifting; logged as a gap in `GAPS.md`.
         let fixes = [
-            ("=TRIM(\"a    b\")", "a b"),           // fix/trim-internal-runs
-            ("=DOLLAR(-0.001,2)", "$0.00"),         // fix/dollar-negative-zero
+            ("=TRIM(\"a    b\")", "a b"), // fix/trim-internal-runs
+            // fix/dollar-negative-zero — reverted out of `freecell-fixes`, so this is the
+            // divergence, not the fix.
+            ("=DOLLAR(-0.001,2)", "($0.00)"),
             ("=ADDRESS(1,1,1,TRUE,\"\")", "!$A$1"), // fix/address-empty-sheet
             ("=XMATCH(\"ban*\",{\"apple\",\"banana\",\"cherry\"},2)", "2"), // fix/xmatch-array-constant
         ];

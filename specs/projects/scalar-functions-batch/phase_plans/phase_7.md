@@ -24,7 +24,7 @@ only the **negative-zero** case diverged. That one case is now fixed.
 | `DOLLAR(12345.67,-2)` | `$12,300` (round left of point) | PASS | PASS |
 | `DOLLAR(50,-3)` | `$0` (rounds to nearest 1000 = 0) | PASS | PASS |
 | `DOLLAR(0)` | `$0.00` | PASS | PASS |
-| `DOLLAR(-0.001,2)` | `$0.00` (negative-zero guard) | **`($0.00)`** | **PASS** |
+| `DOLLAR(-0.001,2)` | `$0.00` (negative-zero guard) | **`($0.00)`** | **PASS** (on the branch; the merge was later reverted — see Fork delivery) |
 | `DOLLAR(-50,-3)` | `$0` (negative rounds to 0 left of point) | (n/a) | PASS |
 
 ## Confirmed divergence (CONFIRM-FIRST repro)
@@ -59,5 +59,7 @@ clean; `cargo clippy -p ironcalc_base --all-targets --all-features` clean under
 
 - Branch `fix/dollar-negative-zero` off `main`, commit **`aa36a177`**
   ("Fix DOLLAR to not parenthesize a value that rounds to zero").
-- Merged into `freecell-fixes` at **`6163e084`** (`--no-ff`, no conflicts).
+- Merged into `freecell-fixes` at **`6163e084`** (`--no-ff`, no conflicts). **Reverted out again on
+  2026-07-28** by `8a79a7f6` (scosman/ironcalc#2) after upstream pushed back on the fix — the branch
+  stands, but FreeCell's pin no longer carries it (root `GAPS.md` logs the live divergence).
 - Both pushed to `scosman/ironcalc`. Upstream-PR prep recorded in `../fork-fixes/README.md`.

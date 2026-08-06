@@ -188,3 +188,11 @@ registry: each entry is a short description plus a pointer to a design note unde
   correct; the bug is operator-level, with a broad blast radius across every formula that negates a
   non-number — out of the scalar-functions batch's function-local scope. Workarounds
   `SUMPRODUCT(1*(cond))` and `SUMPRODUCT((A=x)*(B))` both work today. → [`projects/unary-minus-boolean-coercion.md`](projects/unary-minus-boolean-coercion.md)
+
+- **Paste over a spill cell loses its content on undo (engine `paste_from_clipboard`)** — *Future
+  (spotted reviewing `fix/paste-fill-relative-refs`, 2026-08-06).* A paste clears its whole
+  destination rectangle up front, but a copied **spill cell** (part of a dynamic-array result)
+  writes only a style diff — so the destination's prior content is destroyed with nothing in the
+  undo entry to restore it. Pre-existing; the new paste-fill just repeats it per repetition rather
+  than once. Needs its own fork `fix/` branch + upstream PR (don't fold it into the fill fix).
+  → [`projects/paste-spill-cell-undo-hole.md`](projects/paste-spill-cell-undo-hole.md)

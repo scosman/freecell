@@ -42,9 +42,11 @@ freecell-engine = { path = "crates/freecell-engine" }
 # the perf harness (Phase 12) depend on it to render the real grid over fixtures.
 freecell-app = { path = "crates/freecell-app" }
 
-# Engine (exact pin — the number all experiment results are comparable against)
-ironcalc = "=0.7.1"
-ironcalc_base = "=0.7.1"
+# Engine (exact pin — the number all experiment results are comparable against). The
+# `[patch.crates-io]` below redirects both to our fork's `freecell-fixes`, so this version must
+# track the version the fork declares (upstream bumped 0.7.1 → 0.8.3) or the patch won't apply.
+ironcalc = "=0.8.3"
+ironcalc_base = "=0.8.3"
 
 # GPUI (pinned zed rev). gpui_platform features mirror gpui-component's own workspace
 # (font-kit + the Linux backends x11/wayland + runtime_shaders) so the cross-platform

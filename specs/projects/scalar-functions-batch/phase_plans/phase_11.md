@@ -45,6 +45,11 @@ CLEAN, PERCENTILE.INC, QUARTILE.INC), and the SUMPRODUCT `--` divergence turned 
      `ADDRESS(1,1,1,TRUE,"")`="!$A$1" (`fix/address-empty-sheet`),
      `XMATCH("ban*",{"apple","banana","cherry"},2)`=2 (`fix/xmatch-array-constant`).
 
+   > **Superseded 2026-08-06 (see `fork-fixes/README.md` row #7).** `fix/dollar-negative-zero`
+   > was reverted out of `freecell-fixes` after upstream pushed back, so the live assertion is
+   > `DOLLAR(-0.001,2)`=`"($0.00)"`. The other three landed upstream and now arrive via `main`.
+   > This phase record is left as-written; the test in `document.rs` is the current truth.
+
 3. **Finalize PR preps.** Verified `fork-fixes/README.md` already carries complete,
    self-contained upstream-PR preps (compare link + branch/merge commits + title + body) for
    all 4 fork branches. Nothing missing; no edits needed.

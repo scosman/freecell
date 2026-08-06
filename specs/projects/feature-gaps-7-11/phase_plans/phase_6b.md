@@ -54,6 +54,10 @@ cursor). Tab bar is **not** baselined by the pixel suite → validate with gpui 
    }
    ```
 
+   > **Renamed since (2026-08-06 fork sync).** Upstream took this fix and renamed the engine
+   > method `set_worksheet_index` → `move_sheet`. The shipped wrapper calls `move_sheet`; this
+   > snippet is left as the historical record of what the phase built.
+
 3. **`worker/run.rs`** — three edits:
    - **Classify** (exhaustive routing ~`:426`): add `| Command::MoveSheet { .. }` to the
      `edits.push(edit)` sheet-op group (alongside Add/Rename/Delete). (Required to compile —

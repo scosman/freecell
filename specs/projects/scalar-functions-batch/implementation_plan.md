@@ -104,6 +104,13 @@ QUARTILE.INC) were found **already present upstream + verified in place** (no br
 operator** bug, spun out as a **deferred** off-critical-path follow-on
 (`projects/unary-minus-boolean-coercion.md`), not fixed here.
 
+> **Outcome update (2026-08-06 upstream sync) — see `fork-fixes/README.md` for the current
+> per-branch state.** Three of the four landed upstream (TRIM, ADDRESS, XMATCH) and are now
+> inherited via `main` rather than carried. **DOLLAR was reverted**: upstream pushed back, so
+> `fix/dollar-negative-zero` was backed out of `freecell-fixes` and FreeCell now accepts
+> IronCalc's `($0.00)`. That accepted divergence is tracked in
+> [`projects/dollar-negative-zero-divergence.md`](../../../projects/dollar-negative-zero-divergence.md).
+
 Phase 11 re-pinned FreeCell's lock onto `freecell-fixes` HEAD (`81feec40` → `9161a463`) and
 added a `freecell-engine` smoke test (13 assertions: 9 presence + 4 fixes) proving the batch
 computes end-to-end through the FreeCell engine seam. The per-branch upstreaming state + the

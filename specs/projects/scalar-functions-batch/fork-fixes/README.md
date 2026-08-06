@@ -27,7 +27,8 @@ is an engine-operator issue **deferred** off the critical path.
 **The batch's real deliverable = 4 fork branches / PRs:**
 
 - **TRIM fix** (`fix/trim-internal-runs`) — the one net-new behavior fix from the original scope.
-- **DOLLAR** (`fix/dollar-negative-zero`) — negative-zero-guard correctness fix.
+- **DOLLAR** (`fix/dollar-negative-zero`) — negative-zero-guard correctness fix. **Reverted** (see
+  row #7): upstream pushed back, so it is no longer in `freecell-fixes`.
 - **ADDRESS** (`fix/address-empty-sheet`) — empty-`sheet_text` prefix correctness fix (O-4 edge).
 - **XMATCH** (`fix/xmatch-array-constant`) — accept array constants as `lookup_array`.
 
@@ -40,7 +41,10 @@ operator** bug, not a SUMPRODUCT bug — spun out as a **deferred** off-critical
 Per-phase records: `phase_plans/phase_{1,3,4,5,6,7,8,9,10}.md`. One additional owner-decided
 **SKIP** stands (CHAR/CODE 5 undefined CP1252 slots — acceptable divergence).
 
-## Status table (7 verified-and-skipped · 4 landed = TRIM + DOLLAR + ADDRESS + XMATCH · 1 deferred)
+## Status table (7 skipped · 3 landed = TRIM/ADDRESS/XMATCH · 1 reverted = DOLLAR · 1 deferred)
+
+> **2026-08-06 upstream sync:** TRIM, ADDRESS and XMATCH have all merged upstream, so they now
+> arrive via `main` rather than via a fork branch. DOLLAR was reverted (row #7).
 
 | # | Branch | Function(s) | Impl fn (module) | Verified vs §3 | `freecell-fixes` | Upstream PR | State |
 |---|--------|-------------|----------------------------------|-------|------------------|-------------|-------|
@@ -50,7 +54,7 @@ Per-phase records: `phase_plans/phase_{1,3,4,5,6,7,8,9,10}.md`. One additional o
 | 4 | ~~`fix/replace`~~ | REPLACE | `fn_replace` `text/string_format.rs:207` | §3.3 — all pass | inherited | n/a | **already present — verified, branch skipped** |
 | 5 | ~~`fix/char-code`~~ | CHAR + CODE | `fn_char`, `fn_code` `text/char_code.rs` | §3.4/§3.5 — all pass; 5 undefined CP1252 slots = owner SKIP | inherited | n/a | **already present (CP1252) — verified, branch skipped** |
 | 6 | ~~`fix/clean`~~ | CLEAN | `fn_clean` `text/char_code.rs:137` | §3.6 — all pass (0–31 only) | inherited | n/a | **already present — verified, branch skipped** |
-| 7 | `fix/dollar-negative-zero` | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — divergence (neg-zero → `($0.00)`) **confirmed + FIXED** | ✅ (merge `6163e084`) | ✅ prep (below) | **landed + pushed** — branch `aa36a177` |
+| 7 | `fix/dollar-negative-zero` | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — divergence (neg-zero → `($0.00)`) **confirmed + fixed, then REVERTED** | ❌ reverted out (`8a79a7f6`, fork PR #2) | ❌ withdrawn — upstream pushed back | **reverted** — branch `aa36a177` still on origin, unmerged |
 | 8 | ~~`fix/percentile-quartile-inc`~~ | PERCENTILE(.INC) + QUARTILE(.INC) | `fn_percentile_inc` `statistical/percentile.rs:44`, `fn_quartile_inc` `statistical/quartile.rs` | §3.9/§3.10 — all pass; legacy routes to inclusive | inherited | n/a | **already present — verified, branch skipped** |
 | 9 | `fix/address-empty-sheet` | ADDRESS | `fn_address` `lookup_and_reference/address_areas.rs:18` | §3.8 — divergence (empty sheet → `$A$1`) **confirmed + FIXED** | ✅ (merge `582a78b1`) | ✅ prep (below) | **landed + pushed** — branch `09259476` |
 | 10 | `fix/xmatch-array-constant` | XMATCH | `fn_xmatch` `lookup_and_reference/xmatch.rs` | §3.11 — divergence (array-constant → `#VALUE!`) **confirmed + FIXED** | ✅ (merge `9161a463`) | ✅ prep (below) | **landed + pushed** — branch `f9d1f9ce` |
@@ -63,7 +67,7 @@ divergence is deferred as an operator-level follow-on (below).
 
 | Function | §ref | Spec expects | Fork actual (before) | Disposition |
 |---|---|---|---|---|
-| DOLLAR | §3.7 | `DOLLAR(-0.001,2)` → `$0.00` | `($0.00)` | **FIXED** — `fix/dollar-negative-zero` (`aa36a177`). Rounds-to-zero unsigned guard in `fn_dollar`. |
+| DOLLAR | §3.7 | `DOLLAR(-0.001,2)` → `$0.00` | `($0.00)` | **REVERTED** — the guard landed as `fix/dollar-negative-zero` (`aa36a177`) but the IronCalc team pushed back upstream, so it was backed out of `freecell-fixes` (`8a79a7f6`). FreeCell keeps IronCalc's `($0.00)` — asserted in `scalar_functions_batch_computes_through_pinned_engine`. |
 | ADDRESS | §3.8 (O-4) | `ADDRESS(1,1,1,TRUE,"")` → `!$A$1` | `$A$1` | **FIXED** — `fix/address-empty-sheet` (`09259476`). Present-empty `sheet_text` emits the `!` prefix. |
 | XMATCH | §2.5 | accepts array constants | `#VALUE!` on `{...}` | **FIXED** — `fix/xmatch-array-constant` (`f9d1f9ce`). Materialize `CalcResult::Array` as well as `Range`; function-local. |
 | SUMPRODUCT | §3.1 | `SUMPRODUCT(--(cond))` counts → `2` | `0` | **DEFERRED** — root cause is the unary-minus operator (`=--TRUE`→`TRUE` not `1`), not SUMPRODUCT. Broad blast radius, out of this batch's scope. → `projects/unary-minus-boolean-coercion.md` (PROJECTS.md). Workarounds `1*(cond)` and `(A=x)*(B)` work today. |

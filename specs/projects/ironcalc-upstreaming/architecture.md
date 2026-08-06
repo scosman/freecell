@@ -106,7 +106,8 @@ status: draft
 ## 6. FreeCell upgrade onto the fork
 
 ### 6.1 Wire the dep (`freecell:app/Cargo.toml`)
-Keep `ironcalc = "=0.7.1"` / `ironcalc_base = "=0.7.1"`, add:
+Set the exact requirement to whatever version the **fork** declares — currently
+`ironcalc = "=0.8.3"` / `ironcalc_base = "=0.8.3"` — and add:
 
 ```toml
 [patch.crates-io]
@@ -114,10 +115,14 @@ ironcalc      = { git = "https://github.com/scosman/ironcalc", branch = "freecel
 ironcalc_base = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
 ```
 
-The fork crates are versioned `0.7.1`, so the patch satisfies the `=0.7.1` requirement. For fast
-in-container iteration a `path` patch to `/workspace/ironcalc/{xlsx,base}` is equivalent; the
-committed form uses the git branch (reproducible off-container). The 4.1 build break is expected
-and is the discovery pass for any API drift beyond colors.
+A `[patch.crates-io]` only applies when the patched crate **satisfies** the requirement, so the
+two must move together: the fork was `0.7.1` when this was written and the 2026-08-06 upstream
+sync bumped it to `0.8.3`. Re-check both fork manifests on every sync — `ironcalc_base`'s version
+comes from `base/Cargo.toml` and `ironcalc`'s from `xlsx/Cargo.toml`, and they can drift apart
+(`bindings/wasm` was already at `0.8.4` while both of these sat at `0.8.3`). For fast in-container
+iteration a `path` patch to `/workspace/ironcalc/{xlsx,base}` is equivalent; the committed form
+uses the git branch (reproducible off-container). The 4.1 build break is expected and is the
+discovery pass for any API drift beyond colors.
 
 ### 6.2 The `Color` model (what changed)
 `main`: `Style { fill: Fill { color: Color }, font: Font { color: Color, .. }, border: … }` where

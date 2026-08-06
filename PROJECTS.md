@@ -188,3 +188,23 @@ registry: each entry is a short description plus a pointer to a design note unde
   correct; the bug is operator-level, with a broad blast radius across every formula that negates a
   non-number — out of the scalar-functions batch's function-local scope. Workarounds
   `SUMPRODUCT(1*(cond))` and `SUMPRODUCT((A=x)*(B))` both work today. → [`projects/unary-minus-boolean-coercion.md`](projects/unary-minus-boolean-coercion.md)
+
+- **DOLLAR negative-zero divergence (accepted)** — *Future (accepted from
+  `scalar-functions-batch`, 2026-08-06).* Excel emits `DOLLAR(-0.001,2)` unsigned as `$0.00`
+  because the value is no longer negative once rounded; IronCalc branches on the pre-rounding
+  sign and returns `($0.00)`. We wrote and merged the guard (`fix/dollar-negative-zero`), then
+  **backed it out** after upstream pushed back — so FreeCell now knowingly ships the engine's
+  behaviour rather than a FreeCell-side workaround. Narrow blast radius (one function, one input
+  class); pinned by an explicit assertion so a future change is deliberate. → [`projects/dollar-negative-zero-divergence.md`](projects/dollar-negative-zero-divergence.md)
+
+- **`set_user_inputs` skips the merged-cell edit guard (IronCalc fork)** — *Future (found during
+  the 2026-08-06 fork sync; pre-existing, but **reachable in the shipped UI**).* `set_user_input`
+  refuses a write to a covered (non-anchor) cell of a merged region; the batched `set_user_inputs`
+  validates only coordinates. **Paste Values (⌘⇧V)** batches every cell of the destination
+  rectangle unfiltered, and FreeCell's only merge guard covers fills — so pasting over a merge
+  writes values that are stored, never painted, and saved to xlsx. (Replace All is safe: merging
+  clears covered cells, so they can't match a search.) The two APIs were built on separate fork
+  branches and never met in review. Fix = hoist the guard into a shared helper and run it in the
+  batch's up-front all-or-nothing validation; whichever of the two lands upstream second should
+  carry it. →
+  [`projects/set-user-inputs-merged-cell-guard.md`](projects/set-user-inputs-merged-cell-guard.md)

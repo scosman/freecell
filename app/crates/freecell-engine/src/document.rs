@@ -1507,11 +1507,13 @@ impl WorkbookDocument {
     /// Moves the sheet at `sheet_idx` to `to_index` (`MoveSheet`), shifting the intervening
     /// sheets so the moved sheet lands at exactly `to_index`. Undoable (rides the fork's
     /// history); the new order is preserved on xlsx save; cross-sheet references stay valid
-    /// (sheet order is a vector position, not an identity). Wraps the fork's index-based
-    /// `UserModel::set_worksheet_index` (Phase 6a). A same-index move is a fork-level no-op.
+    /// (sheet order is a vector position, not an identity). Wraps the engine's index-based
+    /// `UserModel::move_sheet` (Phase 6a) — contributed as `fix/sheet-reorder` and since merged
+    /// upstream, so it is inherited rather than carried. A same-index move is an engine-level
+    /// no-op.
     pub(crate) fn move_sheet(&mut self, sheet_idx: u32, to_index: u32) -> Result<(), String> {
         crate::instrument::record_engine_call();
-        self.model.set_worksheet_index(sheet_idx, to_index)
+        self.model.move_sheet(sheet_idx, to_index)
     }
 
     /// Undoes the last committed edit (engine history). Auto-evaluates unless paused.
@@ -2154,9 +2156,9 @@ mod tests {
     /// or `#VALUE!`/`#N/A`), so a literal-value match here is the regression guard that the batch
     /// is present and correct through the real FreeCell engine seam — no FreeCell-side code beyond
     /// the pin bump. Split into "presence" (the 9 functions verified already-present upstream) and
-    /// "fixes" (the 4 fork correctness fixes this batch actually landed:
-    /// `fix/trim-internal-runs`, `fix/dollar-negative-zero`, `fix/address-empty-sheet`,
-    /// `fix/xmatch-array-constant` — see `specs/projects/scalar-functions-batch/fork-fixes/`).
+    /// "fixes" (the correctness fixes this batch landed: `fix/trim-internal-runs`,
+    /// `fix/address-empty-sheet`, `fix/xmatch-array-constant`, plus the reverted
+    /// `fix/dollar-negative-zero` — see `specs/projects/scalar-functions-batch/fork-fixes/`).
     #[test]
     fn scalar_functions_batch_computes_through_pinned_engine() {
         // Set `formula` (a leading-`=` expression) into A1, evaluate, and return its formatted
@@ -2180,10 +2182,15 @@ mod tests {
             ("=QUARTILE.INC({1,2,4,7,8,9,10,12},2)", "7.5"),
             ("=XMATCH(30,{10,20,30,40,50})", "3"),
         ];
-        // The four fork correctness fixes — prove the pin carries each landed branch.
+        // The three correctness fixes this batch landed and that the pin still carries — all
+        // three have since been merged upstream, so they now arrive via `main` rather than via
+        // a fork branch. (`fix/dollar-negative-zero` was the fourth; upstream pushed back on it
+        // and it was reverted out of `freecell-fixes`, so DOLLAR keeps IronCalc's behaviour of
+        // parenthesizing a negative that rounds to zero — asserted below so a future re-land is
+        // a deliberate, visible change.)
         let fixes = [
             ("=TRIM(\"a    b\")", "a b"),           // fix/trim-internal-runs
-            ("=DOLLAR(-0.001,2)", "$0.00"),         // fix/dollar-negative-zero
+            ("=DOLLAR(-0.001,2)", "($0.00)"),       // fix/dollar-negative-zero, reverted
             ("=ADDRESS(1,1,1,TRUE,\"\")", "!$A$1"), // fix/address-empty-sheet
             ("=XMATCH(\"ban*\",{\"apple\",\"banana\",\"cherry\"},2)", "2"), // fix/xmatch-array-constant
         ];

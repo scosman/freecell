@@ -19,6 +19,11 @@ opened); FreeCell re-pinned `48b0b23` → `a49cfd60` and builds clean.
 
 ## The API
 
+> **Renamed upstream to `move_sheet` (2026-08-06 sync).** Upstream took this fix and renamed the
+> `UserModel` method `set_worksheet_index` → `move_sheet`, matching the `Model` method it wraps.
+> Every `set_worksheet_index` below is the historical name this phase built; the current engine
+> symbol — and what `WorkbookDocument::move_sheet` calls — is `UserModel::move_sheet`.
+
 `UserModel::set_worksheet_index(sheet_index: u32, new_index: u32) -> Result<(), String>`
 (the symbol `architecture.md §6.1` names), wrapping a new low-level
 `Model::move_sheet(sheet_index, new_index)`. The worksheet at `sheet_index` is moved so it

@@ -90,7 +90,8 @@ Times in the future (clock skew) clamp to `Just now`. All buckets are pure funct
 
 Redesigned per the mockups (`ui_design.md`), keeping the existing lifecycle
 (`functional_spec` of the MVP): opens at launch, closes when any document window loads,
-closing the last window quits the app, and it can still host the app-level error dialog when
+closing the last window quits the app on Windows/Linux (on macOS the app stays in the Dock and
+a Dock-icon click re-opens it), and it can still host the app-level error dialog when
 no document window exists (the About screen is its own window now — §4).
 
 ### 2.1 Layout (two panes)
@@ -153,7 +154,8 @@ overlay hosted on the welcome/document windows.
   window (macOS custom titlebar / Linux server decorations).
 - **Lifecycle:** it counts as an open window for the "quit when the last window closes" rule
   — the app stays alive while only the About window is open and quits when it, as the last
-  window, closes. It never participates in dirty/quit prompting.
+  window, closes (macOS excepted: the app stays resident in the Dock there). It never
+  participates in dirty/quit prompting.
 
 ### 4.1 Content (per the mockup, directional)
 

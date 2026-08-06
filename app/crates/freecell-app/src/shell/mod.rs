@@ -82,7 +82,8 @@ actions!(
         /// F2`) — the Edit-menu "Merge Cells" item + ⌃⌘M shortcut, routed through the chrome's
         /// `toggle_merge` (same path as the action-row button).
         ToggleMerge,
-        /// Open (or toggle) the find/replace bar over the focused workbook (`functional_spec.md §4`).
+        /// Open the find/replace bar over the focused workbook, selecting any existing query
+        /// (`functional_spec.md §4`). Never closes an already-open bar.
         OpenFind,
         /// Quit the application (prompts each dirty window).
         Quit,

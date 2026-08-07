@@ -18,11 +18,14 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
   table was structurally misaligned (index ≠ id from id ~18), so the fix is a full ECMA-376
   realignment, not a few-cell edit. `base` 2107 + `xlsx` 213 green, fmt + strict clippy clean.
   Merged → `freecell-fixes`. Pushed. (id 47 `mmss.0` = separate formatter gap, documented.)
-- [x] **Phase 2 — E5: `<indexedColors>` override (fork).** `fix/e5-indexed` (`1c2c477`). Parse
+- [x] **Phase 2 — E5: `<indexedColors>` override (fork).** `fix/e5-indexed`. Parse
   `<indexedColors>` in `styles.rs`, thread through the styles-path colour resolution via
   `get_color_indexed` (fills/fonts/borders/dxfs); tab/CF colours keep the default resolver
   (documented follow-up). 4 tests (end-to-end load_styles ±override + guards), fmt + clippy clean.
-  Merged → `freecell-fixes` (`48b0b23`, both fixes; combined suite green). Pushed.
+  Merged → `freecell-fixes` (merge `70f512fb`; combined suite green). Pushed.
+  *(Corrected 2026-08-07: this entry cited `1c2c477` and `48b0b23`, neither of which exists in the
+  fork any more — they were pre-rebase SHAs, and `freecell-fixes` has been rebased since. The live
+  SHAs are branch head `5df8c277` (with `17057b81`) and merge `70f512fb`; see §Status table.)*
 - [x] **Phase 3 — FreeCell upgrade (the migration). DONE.**
   Done: `[patch.crates-io]` → `freecell-fixes`; deleted `open_fixups.rs` + `open_repair.rs` (+ the
   `document.rs::open` call sites), dropped `roxmltree`, moved `zip` to dev-deps; migrated the
@@ -38,9 +41,13 @@ repo on `claude/ironcalc-workarounds-oss-rlt0i1`. See `architecture.md` for per-
   pass: open the mortgage (purple theme), Numbers (indexed palette + `xfId`-less), and a
   currency/accounting file (num-fmt) — confirm correct render + that each opens; open→save→reopen
   one affected file. This gate confirms pulling the hacks is correct.
-- [ ] **Phase 5 — Sign-off gate → upstream PRs.** On owner approval: rebase `fix/*` on fresh
-  `upstream/main`; open one PR per fix (E2, E5) against `ironcalc/IronCalc:main`, PR-first, minimal
-  repro + tests in each body. Record in the status table.
+- [x] **Phase 5 — Sign-off gate → upstream PRs. DONE for this project's two fixes.** E2 and E5 were
+  opened and **merged** upstream as [#1223](https://github.com/ironcalc/IronCalc/pull/1223) and
+  [#1224](https://github.com/ironcalc/IronCalc/pull/1224) (both in upstream's v0.8.0 milestone).
+  *(Checked off 2026-08-07: this box was still unticked and still read "open one PR per fix (E2,
+  E5)" long after both had merged — the §Status table already recorded them as merged.)* The
+  same loop has since carried six more of our changes upstream and has three PRs open; the
+  §Status table is the live record.
 - [x] **Phase 6 — Adopt the fork as FreeCell's permanent engine + establish the ongoing loop.**
   Not a one-shot: this makes "FreeCell rides our fork; fix IronCalc, don't hack FreeCell" the
   standing way of working. See **§Operating model** below for the durable process. Concretely for
@@ -185,52 +192,96 @@ every fix we carry is released — never a goal that shapes the work
 
 ## Status table
 
-**Rebuilt 2026-07-28 from the fork's history** (v05-cleanup-1 / unit A4). The previous version of
-this table listed two fixes as "awaiting sign-off" and was three months stale; the review that
-prompted the rebuild went further and claimed *nothing* had been upstreamed, which is **wrong** —
-six of the ten are merged.
+**Rebuilt 2026-07-28, re-derived and corrected 2026-08-07** (v05-cleanup-1 / units A4 + review
+remediation). The version before the 07-28 rebuild listed two fixes as "awaiting sign-off" and was
+three months stale; the review that prompted the rebuild went further and claimed *nothing* had
+been upstreamed, which is **wrong** — eight of the eleven are merged.
 
-Method, so it can be re-run: enumerate the first-parent merges on `freecell-fixes`
-(`git log --first-parent`), take each merge's second parent as the fix branch, and classify with
-`git cherry upstream/main <branch-head> <merge-base>` — patch-id equivalence, which finds a fix
-upstream even when it landed with a rewritten SHA or a reworded subject. Subject matching alone
-is not reliable and disagreed with patch-id on two rows.
+#### What this table counts
 
-Verified against fork `freecell-fixes` @ `ecbf6226` (the SHA `app/Cargo.toml` pins) and upstream
-`ironcalc/IronCalc` `main` @ `2e2465c`.
+**Every change *we authored* that the pin carries, or that upstream merged and the fork
+re-inherited via its `main` mirror.** That rule has to be stated, because the obvious
+enumeration does not produce it (see the method's step 3 — it provably under-counts).
 
-| Fix | Branch / head | Upstream status | Notes |
-|---|---|---|---|
-| Built-in `numFmtId` table (E2) | `fix/e2-numfmt` (`953af32`) | ✅ **merged** — upstream `5b98252` | Absorbed by a fork rebase, so it no longer appears as a fork-only merge |
-| Negative `indexedColors` guard (E5) | `fix/e5-indexed` (`5df8c277`) | ✅ **merged** — upstream `e481dc6` | |
-| `UserModel::set_worksheet_index` | `fix/sheet-reorder` (`21cde336`) | ✅ **merged** — upstream `2f53937` | ⚠️ **upstream then RENAMED it to `move_sheet` (`7ca43c7`)** — see the drift note below |
-| ECMA-376 `true/false` for `xsd:boolean` | `fix/xlsx-bool-import` (`2cd099e9`) | ✅ **merged** — upstream `13fb8f4b` | |
-| TRIM collapses internal runs | `fix/trim-internal-runs` (`6c894ba2`) | ✅ **merged** — upstream `2e2465c` | |
-| ADDRESS `!` prefix for empty sheet | `fix/address-empty-sheet` (`09259476`) | ✅ **merged** — upstream `2b8672a` | |
-| `UserModel::set_user_inputs` (batched single-undo) | `fix/batch-set-inputs` (`a51cf46c`) | **fork-only** | Load-bearing: `document.rs` Replace-All rides it |
-| Merged cells (core/model + bindings + xlsx) | merged-cells (`a9fc9fa0`, 5 commits) | **fork-only** | A whole feature, not a fix — adds `base/src/merge_cells.rs`, absent upstream |
-| ~~DOLLAR: no parens when the value rounds to zero~~ | ~~`fix/dollar-negative-zero`~~ (`aa36a177`) | **REVERTED — no longer on the branch** | Deliberately backed out on `freecell-fixes` by PR #2 (`8a79a7f`, merged `ecbf6226`). FreeCell's pin now sits on the post-revert tip and its stale `=DOLLAR(-0.001,2)` assertion has been deleted. Not carried, not upstreamed. |
-| XMATCH array-constant `lookup_array` | `fix/xmatch-array-constant` (`f9d1f9ce`) | **fork-only** | |
-| Frozen pane tracked on insert/delete row/col | `fix/structural-edits-adjust-frozen-pane` (`507fe6c7`) | **fork-only** | The `freecell-fixes` tip commit |
+#### Method, so it can be re-run
 
-E1 / E4 / the tint fix are not rows here: they were already on upstream `main` and are inherited,
-never carried by us.
+1. **Enumerate the branch's own merges.** `git log --first-parent --merges main..freecell-fixes`;
+   each merge's second parent is a `fix/*` branch head.
+2. **Classify each by patch-id.** `git cherry upstream/main <head> <merge-base>` — `-` means
+   upstream has an equivalent patch, `+` means it does not. Patch-id finds a fix upstream even
+   when it landed with a rewritten SHA or a reworded subject; **subject matching alone is not
+   reliable and disagreed with patch-id on two rows.**
+3. **CROSS-CHECK for what step 1 cannot see — this step is mandatory.** Once upstream merges a
+   change and the fork rebases `main` onto it, the change stops appearing as a first-parent merge
+   on `freecell-fixes`, so **step 1 structurally under-counts our merged work.** Two rows are
+   invisible to it (E2 and the font-`<name>` fix), and the font fix was *missed entirely* in the
+   07-28 rebuild for exactly this reason. Recover them with an authorship sweep over upstream:
 
-### Two live discrepancies this rebuild surfaced
+   ```
+   git log --author=scosman refs/remotes/upstream/main
+   ```
 
-1. **`set_worksheet_index` → `move_sheet`.** Upstream merged our API and then renamed it.
+   and reconcile against the upstream PR list (`author:scosman` in `ironcalc/IronCalc`). Any hit
+   not already a row is a missing row; confirm with `git merge-base --is-ancestor <sha> main`
+   (on the fork's mirror ⇒ inherited-after-merge).
+4. **Re-check "fork-only" rows against open PRs.** Fork-only is a *current* state, not a verdict —
+   three of these rows have live upstream PRs and one moved from fork-only to merged between
+   2026-07-28 and 2026-08-07. Query, don't assume; the GitHub MCP `search_pull_requests` tool
+   reaches `ironcalc/IronCalc` even though the repo is not in the session's scope.
+
+Verified against fork `freecell-fixes` @ `ecbf6226` (the SHA `app/Cargo.toml` pins), fork `main` @
+`cedba4ea`, and upstream `ironcalc/IronCalc` `main` @ `91d343c3` (2026-08-07).
+
+| Fix | Branch / carried head | Upstream status | Upstream PR | Notes |
+|---|---|---|---|---|
+| Built-in `numFmtId` table (E2) | `fix/e2-numfmt` (`953af32a`) | ✅ **merged** — upstream `5b982529` | [#1223](https://github.com/ironcalc/IronCalc/pull/1223) merged | **Inherited after merge** — on the fork's `main`, so invisible to first-parent enumeration (method step 3) |
+| xlsx: preserve font `<name>` on import | `14790bdd` (no live `fix/*` branch) | ✅ **merged** — upstream `14790bdd` | [#1236](https://github.com/ironcalc/IronCalc/pull/1236) merged | **Inherited after merge**, same as E2. **Missing from the 07-28 rebuild** — the row step 3 exists to catch |
+| `<indexedColors>` override + negative guard (E5) | `fix/e5-indexed` (`5df8c277`, with `17057b81`) | ✅ **merged** — upstream `ef336e06` + `e481dc65` | [#1224](https://github.com/ironcalc/IronCalc/pull/1224) merged | Still carried on the branch too (fork `main` predates the merge) |
+| `UserModel::set_worksheet_index` | `fix/sheet-reorder` (`21cde336`) | ✅ **merged** — upstream `2f539370` | [#1257](https://github.com/ironcalc/IronCalc/pull/1257) merged | ⚠️ **upstream then RENAMED it to `move_sheet` (`7ca43c7`)** — see the drift note below |
+| ECMA-376 `true/false` for `xsd:boolean` | `fix/xlsx-bool-import` (`2cd099e9`) | ✅ **merged** — upstream `13fb8f4b` | [#1259](https://github.com/ironcalc/IronCalc/pull/1259) merged | Patch-id found this; the subject was reworded upstream |
+| TRIM collapses internal runs | `fix/trim-internal-runs` (`6c894ba2`) | ✅ **merged** — upstream `2e2465c0` | [#1292](https://github.com/ironcalc/IronCalc/pull/1292) merged | |
+| ADDRESS `!` prefix for empty sheet | `fix/address-empty-sheet` (`09259476`) | ✅ **merged** — upstream `2b8672ae` | [#1294](https://github.com/ironcalc/IronCalc/pull/1294) merged | |
+| XMATCH array-constant `lookup_array` | `fix/xmatch-array-constant` (`f9d1f9ce`) | ✅ **merged** — upstream `54e301b3` | [#1295](https://github.com/ironcalc/IronCalc/pull/1295) merged 2026-07-29 | **Was fork-only on 2026-07-28** — merged since. Patch-id identical (`643cb6a8…`) |
+| `UserModel::set_user_inputs` (batched single-undo) | `fix/batch-set-inputs` (carried `a51cf46c`; branch head `30472b84`) | **fork-only** | [#1258](https://github.com/ironcalc/IronCalc/pull/1258) **OPEN** | Load-bearing: `document.rs` Replace-All rides it. ⚠️ **The branch is ahead of the pin** — `6f086bb9` ("make `set_user_inputs` atomic on mid-batch write failure", PR-feedback) is on `fix/batch-set-inputs` but **not** on `freecell-fixes`, so this pin does not carry it |
+| Merged cells (core/model + bindings + xlsx) | `claude/merged-cells-implementation-yv1pr7` (`a9fc9fa0`, 5 commits) | **fork-only** | none | A whole feature, not a fix — adds `base/src/merge_cells.rs`, absent upstream. This row alone makes the fork permanent |
+| Frozen pane tracked on insert/delete row/col | `fix/structural-edits-adjust-frozen-pane` (`507fe6c7`) | **fork-only** | [#1290](https://github.com/ironcalc/IronCalc/pull/1290) **OPEN** | |
+| ~~DOLLAR: no parens when the value rounds to zero~~ | ~~`fix/dollar-negative-zero`~~ (`aa36a177`) | **REVERTED — not carried, not upstreamed** | [#1293](https://github.com/ironcalc/IronCalc/pull/1293) **CLOSED unmerged** | **Not counted** (neither carried nor merged). The "fix" was wrong: Excel returns `($0.00)` — see the note below |
+
+**Totals: 11 changes — 8 merged upstream, 3 fork-only** (the struck DOLLAR row is excluded from
+both counts). E1 / E4 / the tint fix are not rows either: they were already on upstream `main`
+before we started and are inherited, never authored by us.
+
+One further change of ours is **outside** this table because it is neither carried at this pin nor
+merged: [#1333](https://github.com/ironcalc/IronCalc/pull/1333) (`fix(clipboard): fill a
+whole-multiple selection on paste, per-cell references`), **OPEN**, no corresponding branch in
+`scosman/ironcalc` today.
+
+### Drift and discrepancies
+
+1. **`set_worksheet_index` → `move_sheet` (live).** Upstream merged our API and then renamed it.
    `freecell-engine/src/document.rs:1514` still calls `set_worksheet_index`, so the **next re-sync
    of the fork onto upstream `main` will break FreeCell's build at that call site**. It is a
    one-line rename, but it must be expected rather than discovered.
-2. **`fix/dollar-negative-zero` was deliberately reverted, and FreeCell's test was stale.**
-   Fork PR #2 (`8a79a7f`) backed the fix out of `freecell-fixes`; FreeCell's pin has moved onto the
-   post-revert tip (`ecbf6226`) and its now-wrong `=DOLLAR(-0.001,2)` → `"$0.00"` assertion in
-   `freecell-engine/src/document.rs` has been removed. Recorded because it is the worked example of
-   why a rev bump always re-runs the workspace tests: the pin guarantees nothing moves until you
-   choose, and the suite tells you what changed when you do.
+2. **`fix/dollar-negative-zero` was reverted because it was WRONG (resolved).** Fork PR #2
+   (`8a79a7f`) backed it out of `freecell-fixes`, and upstream closed [#1293] without merging:
+   the maintainer tested Excel directly and a second reviewer reproduced. **Excel returns
+   `($0.00)`** for `=DOLLAR(-0.001,2)` — it selects DOLLAR's parenthesized form from the *sign of
+   the input, before rounding*, so a negative that rounds to zero still parenthesizes. (The
+   pinned engine's `fn_dollar` shows the mechanism plainly: the branch is `if value < 0.0`,
+   evaluated on the raw input, while rounding happens inside `format_abs(value.abs(), …)`.)
+   `$0.00` is *Google Sheets'* answer, and IronCalc targets Excel. So IronCalc was right all
+   along, the revert is correct and complete, and there is no outstanding gap. FreeCell's
+   `document.rs` asserts `("=DOLLAR(-0.001,2)", "($0.00)")` to keep this from being re-litigated
+   in either direction.
+3. **`fix/batch-set-inputs` has advanced past the pin (live).** See the table row: the atomicity
+   hardening in `6f086bb9` is on the branch and in the open PR, but not on `freecell-fixes`. Fold
+   it in at the next fork bump.
 
-**Also stale:** the fork's `main` mirror is at `cedba4e`, **99 commits behind** upstream `main`. A
-re-sync is overdue and is the normal maintenance this project's operating model calls for.
+**Also stale:** the fork's `main` mirror is at `cedba4ea` (2026-07-10), **188 commits behind**
+upstream `main` as of 2026-08-07 (it was 99 behind on 07-28 — the gap is widening). Upstream has
+since released **0.8.x** while the fork's crates still declare `0.7.1`, so that re-sync will also
+move the version `app/Cargo.toml`'s `[workspace.dependencies]` requirement must match. A re-sync
+is overdue and is the normal maintenance this project's operating model calls for.
 
 > **Push access resolved (2026-07-07):** owner granted write to `scosman/ironcalc`; commits are
 > authored `Steve Cosman <848343+scosman@users.noreply.github.com>` (noreply, to satisfy email

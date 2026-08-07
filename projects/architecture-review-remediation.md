@@ -178,15 +178,18 @@ misleading at worst.
 **Outcome (v05-cleanup-1 P1, 2026-07-28): CONFIRMED — and the hazard was already live.**
 Both patch entries now pin `rev = "ecbf6226…"`, the `freecell-fixes` tip. When the pin was made
 the branch had **already moved past the locked commit**, reverting `fix/dollar-negative-zero`
-— which `freecell-engine/src/document.rs` asserted (`=DOLLAR(-0.001,2)` → `"$0.00"`). **Owner
-confirmed the revert is intentional and that assertion was simply never removed**, so it is
-deleted and the pin sits on the tip. A `branch =` pin would have delivered the same divergence
-as a mysteriously-red test at whatever moment someone regenerated the lock; the `rev` pin
-delivered it as a deliberate one-line edit — the point of the unit. `freecell-fixes` therefore
-carries **10** changes, not 11 (6 upstream, 4 fork-only). The `=0.7.1` lines are **not** inert
-and must not be deleted — cargo only applies a `[patch]` whose replacement version satisfies
-the requirement being replaced, so they are the patch's attachment point; the comment says so.
-See `specs/projects/v05-cleanup-1/phase_plans/phase_1.md`.
+— which `freecell-engine/src/document.rs` asserted (`=DOLLAR(-0.001,2)` → `"$0.00"`). The revert
+is intentional **and the reverted "fix" was itself wrong**: Excel returns `($0.00)` (upstream
+[#1293](https://github.com/ironcalc/IronCalc/pull/1293), closed unmerged), so the assertion was
+**corrected to `($0.00)`**, not deleted, and the pin sits on the tip. A `branch =` pin would have
+delivered the same divergence as a mysteriously-red test at whatever moment someone regenerated
+the lock; the `rev` pin delivered it as a deliberate one-line edit — the point of the unit. The
+`=0.7.1` lines are **not** inert and must not be deleted — cargo only applies a `[patch]` whose
+replacement version satisfies the requirement being replaced, so they are the patch's attachment
+point; the comment says so. See `specs/projects/v05-cleanup-1/phase_plans/phase_1.md`.
+*(Count corrected 2026-08-07: this paragraph said the branch carries 10 changes, 6 upstream / 4
+fork-only. The real figure is **11 changes we authored — 8 merged upstream, 3 fork-only**; see
+the A4 note below and the §Status table.)*
 
 ### A2. `--locked` on every cargo invocation in CI
 **task · v0.5 · no dependencies**
@@ -253,8 +256,10 @@ Scope:
 **Outcome (v05-cleanup-1 P3, 2026-07-28): CONFIRMED — docs were stale; the review's
 upstreaming claim is disproved with evidence.** Inventory rebuilt from the fork's history by
 patch-id (`git cherry upstream/main <fix-head> <merge-base>`) — subject matching got two rows
-wrong, content probes got more wrong. **10 changes on `freecell-fixes` @ `ecbf6226`: 6 merged
-upstream, 4 fork-only.** Upstream `main`'s *tip commit* is one of ours (TRIM, `2e2465c`).
+wrong, content probes got more wrong. **11 changes we authored, at `ecbf6226`: 8 merged upstream,
+3 fork-only** (re-derived 2026-08-07; the 07-28 pass reported 6/4 — it missed the font-`<name>`
+fix, which enumerating the branch's merges structurally cannot see, and XMATCH has merged
+upstream since). Of the 3 remaining, 2 have open upstream PRs and only **merged cells** has none.
 Rewrote: the upstreaming §Status table (was 2 rows, both "awaiting sign-off", ~3 months stale),
 `projects/ironcalc-upgrade.md` (retitled from "move to a released pin"; the released pin is now
 an explicitly hypothetical simplification, not a goal), `CLAUDE.md` §Engine, and the
@@ -263,10 +268,16 @@ since a duplicated inventory is how that comment went wrong in the first place.
 
 Two discrepancies surfaced that were not in the brief: **(a)** upstream merged our
 `set_worksheet_index` and then **renamed it to `move_sheet`** (`7ca43c7`), so the next fork
-re-sync breaks `freecell-engine/src/document.rs:1514`; **(b)** the fork's `main` mirror is
-**99 commits behind** upstream — a re-sync is overdue. (A third — the `fix/dollar-negative-zero`
-revert — turned out to be an intentional fork change with a stale FreeCell test, resolved in P1.)
-See `specs/projects/v05-cleanup-1/phase_plans/phase_3.md`.
+re-sync breaks `freecell-engine/src/document.rs:1514`; **(b)** the fork's `main` mirror is far
+behind upstream — **188 commits** as of 2026-08-07, up from 99 ten days earlier — so a re-sync is
+overdue, and it will also bump the fork off `0.7.1` (upstream has released 0.8.x), which the
+`[patch]` attachment in `app/Cargo.toml` must track in the same commit. (A third — the
+`fix/dollar-negative-zero` revert — turned out to be an intentional fork change *and* a wrong
+"fix": Excel returns `($0.00)`, so FreeCell's assertion was corrected rather than dropped.
+Resolved in P1.) A fourth, found in the 2026-08-07 review remediation: `fix/batch-set-inputs` has
+advanced past the pin (`6f086bb9`, atomicity on mid-batch failure, is on the branch and in open PR
+#1258 but not on `freecell-fixes`). See
+`specs/projects/v05-cleanup-1/phase_plans/phase_3.md` §Review remediation.
 
 ---
 

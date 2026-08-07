@@ -78,6 +78,15 @@ ironcalc_base = { git = "https://github.com/scosman/ironcalc", rev = "<40-hex>" 
 byte-identical to what HEAD already builds. This is the load-bearing constraint of the unit:
 A1 changes *how* the dependency is addressed, never *what* it resolves to.
 
+> **Deviation, deliberate — recorded 2026-08-07.** This assumed the branch tip and the locked
+> SHA were the same commit. They were not: the tip was two commits ahead and **reverted**
+> `fix/dollar-negative-zero`. "The SHA `freecell-fixes` currently points at" and "byte-identical
+> resolution" were therefore not simultaneously satisfiable. On owner instruction the phase
+> chose the **tip**, so the resolved engine did change (`=DOLLAR(-0.001,2)`: `$0.00` →
+> `($0.00)`, which is Excel-correct). The `Cargo.lock` check below still ran and still passed
+> in its meaningful form: only the two `ironcalc*` lines moved, no third-party dependency
+> drifted. See `phase_plans/phase_1.md`.
+
 **Verifying no drift.** `Cargo.lock` records git sources as
 `git+<url>?branch=freecell-fixes#<sha>` today and will become `git+<url>?rev=<sha>#<sha>`.
 The **fragment SHA must be unchanged** across the edit. That is the check: diff `Cargo.lock`
@@ -184,6 +193,17 @@ The fork is a separate repo. Two evidence sources, in preference order:
    `git merge-base --is-ancestor <fix-sha> upstream/main` per fix. Where it is not, the
    status table records the fix with status **`unknown (not verifiable from this container)`**
    rather than a guess.
+
+   > **Corrected in practice — recorded 2026-08-07.** Two things were better than planned here.
+   > (a) `--is-ancestor` on the *fork's* SHA is the wrong test: upstream rewrites SHAs on merge,
+   > so it produces false negatives. **`git cherry upstream/main <head> <merge-base>` (patch-id)
+   > is the method that works**, and it must be paired with an authorship cross-check
+   > (`git log --author=scosman upstream/main`), because enumerating the branch's merges
+   > structurally cannot see a fix that upstream merged and the fork re-inherited. (b) The
+   > **open-PR** state that the `merged / open PR / fork-only` trichotomy needs *is* reachable:
+   > the GitHub MCP `search_pull_requests` tool queries `ironcalc/IronCalc` even though the repo
+   > is outside the session's scope. `phase_3.md` wrongly recorded it as unobtainable. Both are
+   > now written into the §Status table's Method.
 
 The overview states as fact that fixes *have* been merged upstream. The inventory must
 therefore not reproduce the review's "nothing upstreamed" claim; where per-fix status cannot

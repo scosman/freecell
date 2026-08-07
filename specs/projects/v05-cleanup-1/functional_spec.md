@@ -77,6 +77,15 @@ A **Disproved** verdict is a successful phase. It is not a reason to invent adja
 2. `Cargo.lock` is regenerated so the locked source URL carries that rev, and the build
    resolves to the *same* code as before the change (no dependency drift is permitted as
    a side effect of this unit).
+
+   > **Deviation, deliberate — recorded 2026-08-07.** Items 1 and 2 turned out to be in
+   > conflict: `freecell-fixes`' tip had already moved two commits past the locked SHA, so
+   > pinning "the current tip" (item 1) necessarily changed what the build resolves to
+   > (item 2). On owner instruction the phase pinned the **tip** (`ecbf6226`) and accepted
+   > the engine change — a deliberate revert of `fix/dollar-negative-zero`, which moved
+   > `=DOLLAR(-0.001,2)` from `$0.00` to `($0.00)`. Nothing else in `Cargo.lock` moved
+   > (the diff is 4 lines). Item 2's real intent — *no **incidental** drift* — holds.
+   > Full reasoning: `phase_plans/phase_1.md`.
 3. A comment states the maintenance procedure: bumping the pin is a one-line edit; the
    SHA must be re-pinned whenever the fork moves.
 4. The `ironcalc = "=0.7.1"` / `ironcalc_base = "=0.7.1"` workspace lines are

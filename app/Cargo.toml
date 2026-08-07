@@ -44,10 +44,20 @@ freecell-app = { path = "crates/freecell-app" }
 
 # Engine. These are NOT the version that ships: `[patch.crates-io]` at the bottom of this file
 # redirects both crates to our fork, so nothing is ever resolved from crates.io under this
-# requirement. The `=0.7.1` requirement is what the patch ATTACHES to — cargo only applies a
-# `[patch]` entry whose replacement version satisfies the requirement it replaces, so the pin has
-# to stay and has to keep matching the fork's declared version. Read it as "the fork's base
-# version", not as "we ship IronCalc 0.7.1"; the code that actually builds is the `rev` below.
+# requirement. What must exist is SOME requirement the patch can satisfy — cargo only applies a
+# `[patch]` entry whose replacement version satisfies the requirement it replaces. The `=` is not
+# the load-bearing part (a plain `0.7` would work just as well); what is load-bearing is that the
+# requirement keeps matching the version the fork's own manifest declares. Read it as "the fork's
+# base version", not as "we ship IronCalc 0.7.1"; the code that builds is the `rev` below.
+#
+# THE FAILURE MODE IS A WARNING, NOT AN ERROR — which is why this is worth spelling out. If the
+# fork's declared version ever stops satisfying this requirement, cargo does not fail: it prints
+# `patch for 'ironcalc' ... was not used in the crate graph`, silently resolves the REAL crates.io
+# `ironcalc` instead, and the build only dies much later at compile time on a missing fork API
+# (e.g. merged cells). This is live, not hypothetical: the fork's crates declare `0.7.1` at the
+# pinned rev, while upstream `ironcalc/IronCalc` has already released `0.8.x`. The next re-sync of
+# the fork's `main` onto upstream will bump its declared version — expect to move these two lines
+# in the same commit as that re-sync, and treat a "patch was not used" warning as a hard error.
 ironcalc = "=0.7.1"
 ironcalc_base = "=0.7.1"
 
@@ -115,25 +125,34 @@ opt-level = 3
 # (merged cells) alongside the `UserModel::set_user_inputs` batched-write API the paste /
 # Replace-All path rides on.
 #
-# WHAT IS ON THE BRANCH: 10 changes at this pin — 6 already merged upstream, 4 fork-only. The
-# per-fix table (with the patch-id method to re-derive it, because a hand-maintained list goes
-# stale) lives in specs/projects/ironcalc-upstreaming/implementation_plan.md §Status table. Don't
-# duplicate it here; this comment has been wrong about the branch's contents before.
+# WHAT WE HAVE AUTHORED: 11 changes as of 2026-08-07 — 8 already merged upstream, 3 fork-only.
+# The counted set is "every change WE authored that this pin carries, or that upstream merged and
+# the fork re-inherited via its `main` mirror" — not "the merges visible on the branch", which
+# under-counts (a merged fix stops being a fork-only merge once `main` is re-synced). The per-fix
+# table (with the method to re-derive it, because a hand-maintained list goes stale) lives in
+# specs/projects/ironcalc-upstreaming/implementation_plan.md §Status table. Don't duplicate it
+# here; this comment has been wrong about the branch's contents before.
 #
 # WHY A `rev`, NOT A `branch`: `freecell-fixes` is maintained by REBASING onto upstream `main`
-# (CLAUDE.md §Engine), and it is rewritten and reverted in place. A `branch =` pin means the
-# commit a given FreeCell revision builds against is decided by whatever the branch points at
-# when the lock is next regenerated — so an old FreeCell commit is not reproducible, and one
-# force-push + GC makes it unbuildable. Every other git dependency here (the four zed/
-# gpui-component pins) is `rev`-pinned; this is now consistent with them.
+# (CLAUDE.md §Engine), and it is rewritten and reverted in place. Under `branch =` the lock does
+# record an exact commit — but ANY regeneration of the lock silently moves the build to whatever
+# the branch points at then, with NOTHING in the manifest recording that the engine changed. That
+# is not theoretical: it is exactly how this pin's own move onto `ecbf6226` (below) would have
+# arrived — as a mysteriously-red DOLLAR assertion after a stray `cargo update`, instead of as a
+# deliberate one-line edit. Every other git dependency here (the four zed/gpui-component pins) is
+# `rev`-pinned; this is now consistent with them.
 #
 # BUMPING THE FORK is a deliberate one-line edit of both revs below, followed by
 # `cargo update -p ironcalc -p ironcalc_base`. It is a real change to what ships and belongs in
 # its own commit — never a drive-by, and never left to a stray `cargo update`. ALWAYS run the
 # workspace tests after: a bump can change engine behaviour the suite asserts. Worked example —
 # this pin's own move onto `ecbf6226` picked up the deliberate revert of
-# `fix/dollar-negative-zero` (fork PR #2), which required deleting a now-stale
-# `=DOLLAR(-0.001,2)` assertion in `freecell-engine::document`.
+# `fix/dollar-negative-zero` (fork PR #2), turning `=DOLLAR(-0.001,2)` in
+# `freecell-engine::document` red. The right resolution was to CORRECT the expectation to
+# `($0.00)`, not to drop it: Excel picks DOLLAR's parenthesized form from the sign of the input
+# BEFORE rounding, so a negative that rounds to zero still parenthesizes (upstream
+# ironcalc/IronCalc#1293, closed unmerged — Google Sheets is what returns `$0.00`). A bump that
+# reddens a test is telling you what changed; answer it, don't silence it.
 # ---------------------------------------------------------------------------------
 [patch.crates-io]
 ironcalc = { git = "https://github.com/scosman/ironcalc", rev = "ecbf6226ddfbe20bec15f9904647db450efdf2ea" }

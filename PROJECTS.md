@@ -66,9 +66,10 @@ registry: each entry is a short description plus a pointer to a design note unde
 
 - **IronCalc — keeping the fork current** — *Ongoing (standing maintenance).*
   The fork is **permanent**: we keep it, keep upstreaming fixes as clean single-fix PRs, and keep
-  re-syncing from upstream `main`. 6 of the 10 changes on `freecell-fixes` are already merged
-  upstream; 4 are fork-only, including merged cells (a whole feature upstream lacks). Moving to a
-  released crates.io pin is a hypothetical simplification, not a goal.
+  re-syncing from upstream `main`. Of the 11 changes we have authored, **8 are already merged
+  upstream** (2026-08-07); 3 are fork-only, including merged cells (a whole feature upstream
+  lacks) — and 2 of those 3 have open upstream PRs. Moving to a released crates.io pin is a
+  hypothetical simplification, not a goal.
   → [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md)
 
 - **IronCalc drops the minus sign on small negatives** — *v0.5. Filed, unfixed — needs a fork fix.*

@@ -2148,15 +2148,15 @@ mod tests {
     use tempfile::tempdir;
 
     /// End-to-end proof that FreeCell's IronCalc pin (`app/Cargo.toml`'s `[patch.crates-io]` →
-    /// the fork's `freecell-fixes` branch) actually carries the scalar-functions batch: each
-    /// function is set as a formula in A1 and its **computed, formatted** value is asserted. A
+    /// a `rev` on the fork's `freecell-fixes` branch) actually carries the scalar-functions batch:
+    /// each function is set as a formula in A1 and its **computed, formatted** value is asserted. A
     /// name the pinned engine doesn't know would return `#NAME?` (and a broken impl a wrong value
     /// or `#VALUE!`/`#N/A`), so a literal-value match here is the regression guard that the batch
     /// is present and correct through the real FreeCell engine seam — no FreeCell-side code beyond
     /// the pin bump. Split into "presence" (the 9 functions verified already-present upstream) and
-    /// "fixes" (the 4 fork correctness fixes this batch actually landed:
-    /// `fix/trim-internal-runs`, `fix/dollar-negative-zero`, `fix/address-empty-sheet`,
-    /// `fix/xmatch-array-constant` — see `specs/projects/scalar-functions-batch/fork-fixes/`).
+    /// "fixes" (the 3 fork correctness fixes this batch actually landed:
+    /// `fix/trim-internal-runs`, `fix/address-empty-sheet`, `fix/xmatch-array-constant` — see
+    /// `specs/projects/scalar-functions-batch/fork-fixes/`).
     #[test]
     fn scalar_functions_batch_computes_through_pinned_engine() {
         // Set `formula` (a leading-`=` expression) into A1, evaluate, and return its formatted
@@ -2180,14 +2180,14 @@ mod tests {
             ("=QUARTILE.INC({1,2,4,7,8,9,10,12},2)", "7.5"),
             ("=XMATCH(30,{10,20,30,40,50})", "3"),
         ];
-        // The fork correctness fixes — prove the pin carries each landed branch.
-        //
-        // `fix/dollar-negative-zero` was REVERTED on the fork (PR #2, `8a79a7f`) and its
-        // assertion (`=DOLLAR(-0.001,2)` → `"$0.00"`) removed here when the pin moved onto the
-        // post-revert tip (v05-cleanup-1/A1). The revert is deliberate; this test was simply
-        // missed at the time.
+        // The fork correctness fixes on `freecell-fixes` — prove the pin carries each branch.
+        // The DOLLAR row is not one of them: `($0.00)` is Excel's answer, so the
+        // `fix/dollar-negative-zero` attempt was wrong and was reverted out of `freecell-fixes`
+        // (ironcalc/IronCalc#1293, closed; Google Sheets is what returns `$0.00`).
         let fixes = [
-            ("=TRIM(\"a    b\")", "a b"),           // fix/trim-internal-runs
+            ("=TRIM(\"a    b\")", "a b"), // fix/trim-internal-runs
+            // Excel-correct as-is — see the note above; not a fix branch.
+            ("=DOLLAR(-0.001,2)", "($0.00)"),
             ("=ADDRESS(1,1,1,TRUE,\"\")", "!$A$1"), // fix/address-empty-sheet
             ("=XMATCH(\"ban*\",{\"apple\",\"banana\",\"cherry\"},2)", "2"), // fix/xmatch-array-constant
         ];

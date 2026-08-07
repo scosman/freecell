@@ -74,12 +74,24 @@ hardware smoke (item **M-15** in `specs/projects/mvp/smoke_checklist.md`) is non
   **cut (2026-07-13)** — the backup covers the risk; full pass-through **preservation**
   stays v1.0 ([`projects/xlsx-preservation.md`](projects/xlsx-preservation.md)).
 
-  > **The strip is now MEASURED, not estimated (2026-07-28, unit C1).**
+  > **The strip is now MEASURED at the package level, not estimated (2026-07-28, unit C1;
+  > scope-corrected 2026-08-07).**
   > `app/crates/freecell-engine/tests/part_inventory.rs` opens each real third-party fixture,
   > saves it through the **real app save path** (worker + `Command::Save`), and diffs the OPC
-  > part inventory of the two zips. Before this, `tests/roundtrip.rs` only round-tripped
-  > workbooks FreeCell itself authored — a closed loop over IronCalc's own serializer, which is
-  > why the size of this loss had never been visible.
+  > part inventory *and the `[Content_Types].xml` declarations* of the two zips. Before this,
+  > `tests/roundtrip.rs` only round-tripped workbooks FreeCell itself authored — a closed loop
+  > over IronCalc's own serializer, which is why the size of this loss had never been visible.
+  >
+  > **What "measured" does and does not cover.** The detector is **package-level only**: it
+  > compares which *parts* and which *content-type declarations* survive. Content dropped
+  > **inside** a surviving part is NOT measured, and it is substantial — every fixture that has
+  > one loses `pageSetup` + `pageMargins` (usually also `headerFooter`, `printOptions`,
+  > `sheetPr`, `sheetFormatPr`) out of every `xl/worksheets/sheetN.xml`; `xl/workbook.xml` loses
+  > its `extLst` and most of its bytes on three fixtures; `xl/styles.xml` loses `indexedColors`
+  > / `tableStyles` / `protection`; and `xl/theme/theme1.xml` is replaced wholesale with
+  > IronCalc's default theme. **So every number below is a floor on the real loss, and "no parts
+  > dropped" never means "preserved".** Measuring in-part loss needs a semantic per-part-type
+  > XML diff and belongs with C3.
   >
   > On `personal_monthly_budget.xlsx` (a real Excel template) **27 parts are dropped**:
   > - **all 12 `xl/tables/tableN.xml` — every table (ListObject) definition.** Banded
@@ -91,18 +103,29 @@ hardware smoke (item **M-15** in `specs/projects/mvp/smoke_checklist.md`) is non
   > - the sheet `_rels` binding those parts, and `xl/calcChain.xml` (benign — a cache Excel
   >   rebuilds).
   >
-  > `docProps/custom.xml` (user-defined document properties) is dropped on **every** fixture
-  > measured. Three smaller fixtures (`dates`, `numbers_table`, `FONTS`) lose **nothing**.
+  > …plus, inside the parts that *do* survive, all twelve `<tablePart>` references out of
+  > `sheet2.xml` and four-fifths of `xl/workbook.xml` (2227 → 448 bytes).
+  >
+  > `docProps/custom.xml` (user-defined document properties) is dropped on every fixture **that
+  > has one** — 3 of the 6 measured (`personal_monthly_budget`, `libreoffice_custom_height_wrap`,
+  > `charts/excel_line_chart_workbook`); the other three never had one. Three smaller fixtures
+  > (`dates`, `numbers_table`, `FONTS`) lose **no whole parts** — which is *not* the same as
+  > losing nothing: `numbers_table` and `FONTS` still lose their page setup and their theme
+  > (21716 → 8716 bytes), per the scope note above.
   >
   > **Charts are the counter-example, and the template for the fix.** Through the bare
-  > serializer the chart workbook loses all four chart parts, its drawing and their
-  > relationships; through the app path it loses none of them. The existing "IronCalc writer +
-  > targeted re-injection" machinery already solves this class — C3 generalises it from charts
-  > to tables and the rest.
+  > serializer the chart workbook loses all four chart parts, its drawing, their relationships
+  > **and their `[Content_Types].xml` overrides**; through the app path it loses none of them.
+  > The existing "IronCalc writer + targeted re-injection" machinery already solves this class —
+  > C3 generalises it from charts to tables and the rest.
   >
   > The measured drop sets are committed as baselines in that test, so the loss is now
-  > **non-regressing**: dropping a new part fails the build. The fix is C3 (v1.0); the warning
-  > dialog is C2.
+  > **non-regressing**: dropping a new part, or a new content-type override, fails the build. The
+  > fix is C3 (v1.0); the warning dialog is C2.
+  >
+  > **This box is honour-system-coupled to the test.** Nothing mechanically ties these numbers to
+  > `part_inventory.rs`'s baselines; the non-regression property is enforced by CI, the
+  > *currency of this prose* is not. Re-derive before relying on it.
 - **Dynamic arrays / spill absent** (§8) — accepted absent for v1; the engine surfaces
   an error. Out of MVP scope by product call.
 

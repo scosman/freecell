@@ -279,6 +279,33 @@ Workflow YAML cannot be executed here. Verification:
 
 ## 5. C1 — Part-inventory round-trip test (keystone)
 
+> **Correction (2026-08-07, post-Phase-5 review).** Two things in this section were superseded
+> by the implementation; both are improvements, and neither was silently taken — the reasoning
+> is in `phase_plans/phase_5.md`.
+>
+> 1. **Save path.** This section says "the test drives `save_with_charts` for chart-bearing
+>    fixtures and `WorkbookDocument::open` + `save` for the rest", on the grounds that
+>    `worker/run.rs` belongs to the parallel engine-worker-hardening project. That reasoning
+>    does not hold: the test needs only the **public** `DocumentClient` / `Command` /
+>    `WorkerEvent` seam (the same one `tests/worker_seam.rs` already uses) and edits nothing
+>    under `worker/*`. **What shipped drives the real ⌘S path — worker + `Command::Save` — as
+>    primary**, and keeps `WorkbookDocument::save` + `chart::save_with_charts` as contrast on the
+>    chart fixture. See `phase_plans/phase_5.md` §"Which save path".
+> 2. **The inventory is two sets, not one.** Part names alone are blind to
+>    `[Content_Types].xml`: a part can survive while its `<Override PartName=…>` does not, and
+>    Excel then offers to "repair" the file. Since `chart::save_with_charts` splices exactly
+>    those overrides back (§5 above says so), the design as written would have left
+>    `chart_workbook_part_inventory_preserved` **green** on a regression that carried every chart
+>    part across without its typing — verified by mutation, 2026-08-07. **What shipped diffs the
+>    `<Default>` / `<Override>` declaration set alongside the part names**, with its own
+>    committed baseline per fixture, asserted in both directions like the part baselines.
+>
+> Also worth stating plainly, because this section's framing invites the opposite reading: the
+> detector is **package-level only**. "No parts dropped" does **not** mean "preserved" — content
+> lost *inside* surviving parts (page setup, `workbook.xml`'s `extLst`, the theme) is not
+> measured here and is substantial. See the SCOPE note at the top of `part_inventory.rs` and the
+> C1 box in `GAPS.md`.
+
 ### The production save paths — which one the test must drive
 
 This is the central design question of the unit, and getting it wrong makes the test measure

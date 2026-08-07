@@ -175,6 +175,22 @@ Also check the `ironcalc = "=0.7.1"` version line while in the file: FreeCell mi
 the post-0.7.1 style-colour API, so if that pin is still there it is inert at best and
 misleading at worst.
 
+**Outcome (v05-cleanup-1 P1, 2026-07-28): CONFIRMED — and the hazard was already live.**
+Both patch entries now pin `rev = "ecbf6226…"`, the `freecell-fixes` tip. When the pin was made
+the branch had **already moved past the locked commit**, reverting `fix/dollar-negative-zero`
+— which `freecell-engine/src/document.rs` asserted (`=DOLLAR(-0.001,2)` → `"$0.00"`). The revert
+is intentional **and the reverted "fix" was itself wrong**: Excel returns `($0.00)` (upstream
+[#1293](https://github.com/ironcalc/IronCalc/pull/1293), closed unmerged), so the assertion was
+**corrected to `($0.00)`**, not deleted, and the pin sits on the tip. A `branch =` pin would have
+delivered the same divergence as a mysteriously-red test at whatever moment someone regenerated
+the lock; the `rev` pin delivered it as a deliberate one-line edit — the point of the unit. The
+`=0.7.1` lines are **not** inert and must not be deleted — cargo only applies a `[patch]` whose
+replacement version satisfies the requirement being replaced, so they are the patch's attachment
+point; the comment says so. See `specs/projects/v05-cleanup-1/phase_plans/phase_1.md`.
+*(Count corrected 2026-08-07: this paragraph said the branch carries 10 changes, 6 upstream / 4
+fork-only. The real figure is **11 changes we authored — 8 merged upstream, 3 fork-only**; see
+the A4 note below and the §Status table.)*
+
 ### A2. `--locked` on every cargo invocation in CI
 **task · v0.5 · no dependencies**
 
@@ -189,6 +205,29 @@ replaced with `exceptions = []`. Fix the comment.
 *Note: the GPL reintroduction case is already covered — `cargo deny` runs on every push
 and PR under an `app/**` paths filter, with GPL absent from `allow` and `exceptions = []`,
 so a reappearing GPL crate fails the license gate. No extra guard needed.*
+
+**Outcome (v05-cleanup-1 P2, 2026-07-28): `--locked` CONFIRMED · `deny.toml` header
+DISPROVED.**
+
+*`--locked`:* confirmed and demonstrated — pinning `anyhow` off the locked version made
+`cargo metadata --locked` exit 101 while the bare command **silently rewrote** the lock
+(1.0.103 → 1.0.99). `--locked` added to `checks.yml` (clippy/build/test, and
+`cargo deny --locked check`), `macos-verify.yml`, `roundtrip.yml`, and — the signed-binary
+path the unit named — `app/scripts/package.{sh,ps1}`, which is what `release.yml` actually
+invokes. `render.yml` / `perf-gates.yml` reach cargo through wrapper scripts, so those scripts
+pass `--locked` **unconditionally**, with an explicit `FREECELL_CARGO_UNLOCKED=1` opt-out for
+the one legitimate local case (iterating mid-dependency-edit). The scripts initially took a
+`CARGO_LOCKED` env var that the workflows set; review remediation inverted that polarity —
+the opt-in was fail-open (a future workflow forgetting the `env:` line silently lost the
+guarantee) and its value was spliced into argv (`CARGO_LOCKED=1` would have become a libtest
+name filter, i.e. a green zero-case run). Precondition checked: the committed lock is current
+(`cargo metadata --locked` + `cargo deny --locked check` both clean at HEAD).
+
+*`deny.toml` header:* **the claim is wrong.** The header does not reference a surviving GPL
+exception — it says *"There is therefore NO license exception here"*, and the block above
+`exceptions = []` says *"No per-crate license exceptions."* Both were updated together in
+`19195b2` when the vendored no-op stubs landed. No change made.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_2.md`.
 
 ### A4. Correct the fork docs; state the real fork strategy
 **task · v0.5 · no dependencies**
@@ -213,6 +252,32 @@ Scope:
    re-syncing the fork from upstream `main`.** The fork is a normal operating position,
    not a temporary state with an exit. `CLAUDE.md` §Engine and
    [`projects/ironcalc-upgrade.md`](ironcalc-upgrade.md) currently imply the latter.
+
+**Outcome (v05-cleanup-1 P3, 2026-07-28): CONFIRMED — docs were stale; the review's
+upstreaming claim is disproved with evidence.** Inventory rebuilt from the fork's history by
+patch-id (`git cherry upstream/main <fix-head> <merge-base>`) — subject matching got two rows
+wrong, content probes got more wrong. **11 changes we authored, at `ecbf6226`: 8 merged upstream,
+3 fork-only** (re-derived 2026-08-07; the 07-28 pass reported 6/4 — it missed the font-`<name>`
+fix, which enumerating the branch's merges structurally cannot see, and XMATCH has merged
+upstream since). Of the 3 remaining, 2 have open upstream PRs and only **merged cells** has none.
+Rewrote: the upstreaming §Status table (was 2 rows, both "awaiting sign-off", ~3 months stale),
+`projects/ironcalc-upgrade.md` (retitled from "move to a released pin"; the released pin is now
+an explicitly hypothetical simplification, not a goal), `CLAUDE.md` §Engine, and the
+`Cargo.toml` comment — which now carries the headline + a pointer rather than an inlined list,
+since a duplicated inventory is how that comment went wrong in the first place.
+
+Two discrepancies surfaced that were not in the brief: **(a)** upstream merged our
+`set_worksheet_index` and then **renamed it to `move_sheet`** (`7ca43c7`), so the next fork
+re-sync breaks `freecell-engine/src/document.rs:1514`; **(b)** the fork's `main` mirror is far
+behind upstream — **188 commits** as of 2026-08-07, up from 99 ten days earlier — so a re-sync is
+overdue, and it will also bump the fork off `0.7.1` (upstream has released 0.8.x), which the
+`[patch]` attachment in `app/Cargo.toml` must track in the same commit. (A third — the
+`fix/dollar-negative-zero` revert — turned out to be an intentional fork change *and* a wrong
+"fix": Excel returns `($0.00)`, so FreeCell's assertion was corrected rather than dropped.
+Resolved in P1.) A fourth, found in the 2026-08-07 review remediation: `fix/batch-set-inputs` has
+advanced past the pin (`6f086bb9`, atomicity on mid-batch failure, is on the branch and in open PR
+#1258 but not on `freecell-fixes`). See
+`specs/projects/v05-cleanup-1/phase_plans/phase_3.md` §Review remediation.
 
 ---
 
@@ -283,6 +348,28 @@ siblings, asserting a **part-level inventory** of both zips. Build the detector 
 fix so the fix is measurable and non-regressing.
 
 *C2, C3, C4 and D5 all sit behind this. If only one unit starts, start here.*
+
+**Outcome (v05-cleanup-1 P5, 2026-07-28): CONFIRMED — and the loss is bigger than the unit
+implied.** `app/crates/freecell-engine/tests/part_inventory.rs` opens each real fixture, saves
+through the **real app path** (worker + `Command::Save` — only the public `DocumentClient`
+surface, so `worker/*` is untouched), and diffs the OPC part inventories.
+
+`personal_monthly_budget.xlsx` **loses 27 parts**, headlined by **all twelve
+`xl/tables/tableN.xml` — every table (ListObject) definition**: banded formatting, header/total
+rows, filter buttons, structured references. Also all `customXml/*`, printer settings, and the
+sheet `_rels`. `docProps/custom.xml` is lost on *every* fixture; three smaller fixtures lose
+nothing.
+
+**The chart workbook is the counter-example and the template for C3:** through the bare
+serializer it loses all four chart parts + the drawing; through the app path it loses none.
+"IronCalc's writer + targeted re-injection" is already shipped and working — C3 is generalising
+it from charts to tables, not inventing a mechanism.
+
+Landed **green** rather than red: each fixture carries a committed, annotated drop-set baseline
+asserted in **both** directions, so a new drop fails the build and a fix cannot land without
+updating the record. A permanently-red required check gets disabled, and then the loss is
+invisible again for a different reason. `GAPS.md` updated with the measurements.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_5.md`.
 
 ### C2. Save-fidelity warning dialog
 **task · v0.5 · after C1 (required)**
@@ -499,6 +586,69 @@ merge that removes the duplication for good is F3.
 from running them. Build the differential test before deciding how big the fix is — it may
 turn out they agree everywhere that matters, in which case the test is the deliverable.*
 
+**Outcome (v05-cleanup-1 P6, 2026-07-28; REVISED after code review, same day): PARTLY CONFIRMED.
+The first write-up of this outcome said "every divergence is IronCalc's, not chart-model's" — that
+was WRONG, and it was wrong because the test's carve-outs and corpus were both too loose.**
+
+*numfmt:* `chart-model`'s formatter is a **bounded subset** with a `renders_faithfully` predicate
+that already degrades out-of-subset codes, so the testable invariant is agreement *inside* that
+subset. `tests/numfmt_agreement.rs` (engine crate — preserves the ironcalc-free boundary) sweeps
+every `formatCode` in the repo's fixtures, plus the everyday codes, × sign / rounding-band /
+magnitude-boundary values.
+
+**Three real `chart-model` defects, all found only after the review tightened the test:**
+
+1. **Negative zero.** `apply_number_format` decided the sign from `scaled < 0.0` *before* rounding,
+   so any negative that rounds to zero at the format's precision printed `-0`, `-0.00`, `-$0.00`,
+   `-0%`, `-0.00 kg`. Excel and IronCalc both print those unsigned. The original sign carve-out —
+   "chart says `-X`, cell says `X`" — matched all 15 of them alongside the 12 genuine IronCalc
+   cases, so the gate stayed green and the bug was invisible. Fixed: the sign now comes from the
+   rendered magnitude, the carve-out additionally requires a non-zero digit, and `chart-model`
+   gained the small-negative unit tests it had never had.
+2. **`#` treated as a required digit.** `FormatSpec::parse` counted `#` and `0` identically, so
+   `#,##0.0#` on 1.5 rendered `"1.50"` where the cell read `"1.5"` — with the chart classified
+   **Faithful and drawn with no badge**. The whole `#` family (`0.##`, `#,##0.##`, `#,##0.0#`,
+   `0.###`, `#,###`) was missing from the corpus, which is why nothing caught it. Fixed in
+   `chart-model` (optional trailing digits, the retained decimal separator Excel emits for `0.##` on
+   1, and integer suppression for an all-`#` integer run) and the family is now asserted.
+3. **Whitespace padding trimmed.** The applier ran `code.trim()`, silently dropping literal padding
+   the cell renders (`"0 "` on 1 is `1 ` in a cell). Fixed; `"0 "` is in the corpus.
+
+**IronCalc defects remain real, and both were mischaracterised.** ⚠ **Negative numbers render
+WITHOUT their minus sign** — a cell formatted `#,##0` holding **-1 displays "1"**, reproduced
+end-to-end through the real app (worker + `SetStylePath(NumFmt)` + publication). The threshold is
+**≈`10^-decimals`**, *not* the `1.5 × 10^-decimals` first recorded (which is right only at zero
+decimals; measured 1.5 / 0.105 / 0.01005 / 0.0010005 at 0–3 dp). And IronCalc's **rounding is not a
+rule at all**: it pre-rounds to `precision + integer_digits` significant digits (half-to-even) and
+then rounds again, corrupting a band that includes positives — `0.45`, `0.46`, `0.49` all display as
+`1` under code `0`, and `0.96` displays as `0.0` under `0.0`. The earlier "half-to-even except 0.5"
+story was wrong; a fork fix written against it would not have fixed either case. Filed in
+[`projects/ironcalc-negative-sign-display.md`](ironcalc-negative-sign-display.md) and `GAPS.md`
+E6/E7, both corrected; needs a fork fix (one `fix/` branch, one upstream PR).
+
+Changing `chart-model` to round half-away-from-zero was tried and made agreement with **IronCalc**
+strictly worse — but IronCalc is itself wrong against Excel there, so the half-to-even choice is
+**pinned to a buggy reference**, not correct on its own merits, and must be revisited when the fork
+fix lands. That is now what the code comment says. `General` diverges by design (a tick-label
+formatter vs Excel's ~9 significant digits) — excluded from the gate with the argument written out,
+pinned in shape, and filed as a data-label gap rather than "fixed" by putting `0.333333333` on an
+axis.
+
+*`rgb_to_hsl`:* **DISPROVED.** The copies were in `freecell-app/src/chart/palette.rs` and
+`chart-model/src/theme.rs` (not `core`), and the `%` vs `.rem_euclid` difference is **normalised
+away** — `rgb_to_hsl` ends with `.rem_euclid(360.0)`, so it returns `h ∈ [0, 360)`, `hsl_to_rgb`'s
+`hp = h/60` is never negative, and `%` ≡ `rem_euclid` there for *every* input (not merely for the
+laps a sweep enumerates). Per architecture §6 the app copy is now **deleted** and the helpers are
+imported from `chart-model`; the equivalence test is replaced by one that pins `series_color`'s
+actual output per index — bit-identical to before, so no pixel moves.
+
+*Office palette:* **CONFIRMED** — `core::palette::FILL_PALETTE` and
+`chart_model::ThemePalette::office_default()` really are two definitions of the same ten colours.
+They agree; `tests/office_palette_agreement.rs` now enforces it slot by slot, and the slot-coverage
+test is an exhaustive `match` (the previous `len() == len()` assertion compared two compile-time
+10s and could not fail).
+See `specs/projects/v05-cleanup-1/phase_plans/phase_6.md`.
+
 ### F3. Fold `freecell-chart-model` onto `freecell-core`
 **project · v1.0 · after F3a · coordinate with G3**
 
@@ -535,6 +685,26 @@ Also fix `is_extended_chart`'s bare `contains("chartex")`, and correct the `GAPS
 row, which currently claims placeholder behaviour that does not happen.
 
 *This makes the failure honest, not correct. Actual support is G1b.*
+
+**Outcome (v05-cleanup-1 P7, 2026-07-28): CONFIRMED, both halves — each demonstrated by a test
+that FAILS against the old code**, not by reading. A bar+line plot area classified `Faithful`
+while `parse_chart_xml` kept only the first group; and `is_extended_chart`'s bare
+`contains("chartex")` classified a bar chart whose series was named `"chartex rollout"` as
+`Unsupported` — a renderable chart replaced by the placeholder. The old test only ever fed it a
+genuine `cx:` part, so the false positive was invisible.
+
+Fixed: `has_multiple_chart_groups` in `source_fidelity` (after `is_unsupported_chart`, so a combo
+containing an unsupported group keeps the stronger verdict — tested), counting over a new
+`chart-model::CHART_GROUP_ELEMENTS` (all sixteen OOXML group names, not just the ones we parse);
+`is_extended_chart` now matches the full namespace URI. A guard test asserts
+`load::CHART_GROUP_TAGS ⊆ CHART_GROUP_ELEMENTS`, so adding engine support for a new group cannot
+leave the detector blind to combos involving it.
+
+**Reason strings deliberately skipped:** `Fidelity` is a bare enum, and widening it touches every
+call site plus the badge UI — that is G3's rework. G1 stays detection-only, as scoped.
+`GAPS.md`'s combo row is now its own entry stating what actually happens (it previously implied a
+combo got the unsupported-chart placeholder, which it does not).
+See `specs/projects/v05-cleanup-1/phase_plans/phase_7.md`.
 
 ### G1b. Combo / dual-axis chart support
 **project · v2.0 · after G1**
@@ -611,6 +781,26 @@ typography — the one real hole in an otherwise excellent preserve-unknown save
 v0.5 half is a data-loss fix. Separately, inserting a chart onto a sheet that already
 carries one is a hard `SaveError`, because the byte-preserve and write-from-model paths
 cannot compose on a shared drawing. Same file; naturally done together.
+
+**Outcome (v05-cleanup-1 P8, 2026-07-28): CONFIRMED, both halves. `dLbls` FIXED; insert collision
+filed.**
+
+*`dLbls`:* demonstrated by probe before fixing — editing one modelled field destroyed the per-point
+`c:dLbl` override, `c:txPr` typography, **and** (beyond what the unit named) the label's `c:spPr`
+fill and `c:showLeaderLines`. New `patch_data_labels` follows the shape `patch_series_color`
+already established for `c:spPr` — patch *inside* an existing element, build a whole one only when
+there is nothing to preserve. `chrome::dlbls_element` refactored into `dlbls_children` so the
+whole-element builder and the in-place patcher share one spelling per element. Decided explicitly:
+`CT_DLbls` insertion anchors per child; a truthy `c:delete` is removed when turning labels on
+(the whole-node replace got that right by accident, an in-place patch must do it on purpose); a
+cleared optional field removes its element; clearing labels still removes the whole node.
+
+*Insert collision:* confirmed from `worker/run.rs` (**read only** — the parallel project owns it),
+whose own comment documents it. The review's framing was slightly broad: **two authored charts on
+one sheet compose fine**; it is *loaded + authored on the same sheet* that cannot merge, and it
+**fails loudly** (no silent drop, no double `<drawing>`, original untouched). Filed as `GAPS.md`
+C-G5-1 at v1.0 with root cause and the shape of the fix. `dLbls` shipped alone, as instructed.
+See `specs/projects/v05-cleanup-1/phase_plans/phase_8.md`.
 
 ---
 

@@ -165,5 +165,11 @@ today.
 
 ## 7. Follow-up (slim)
 
-Move FreeCell from the git-`main` patch to a **released** IronCalc pin once the fixes ship →
-`freecell:projects/ironcalc-upgrade.md`.
+~~Move FreeCell from the git-`main` patch to a **released** IronCalc pin once the fixes ship →
+`freecell:projects/ironcalc-upgrade.md`.~~
+
+**SUPERSEDED (2026-08-07, v05-cleanup-1/A4 review remediation)** — see functional_spec §2 **D7**.
+The fork is permanent and the `[patch.crates-io]` `rev` pin is the normal dependency, not a
+waiting room. `projects/ironcalc-upgrade.md` was retitled to *"keeping the fork current"*: the
+standing follow-up is **re-syncing the fork from upstream `main` and bumping the rev**, not
+getting off it.

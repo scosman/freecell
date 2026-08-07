@@ -88,8 +88,11 @@ Color`, `BorderItem.color: Color`, where `Color = Rgb(String) | Theme(i32,f64) |
 ## 5. Out of scope
 - **Already fixed upstream, now simply consumed:** E4 `xfId`, E1 theme, E1′ tint (no work beyond
   deleting the hacks that compensated for them).
-- **Move to a released IronCalc pin** once the fixes ship in a version → slim follow-up
-  `projects/ironcalc-upgrade.md` (this project deliberately pins git-`main` for validation).
+- ~~**Move to a released IronCalc pin** once the fixes ship in a version → slim follow-up
+  `projects/ironcalc-upgrade.md` (this project deliberately pins git-`main` for validation).~~
+  **SUPERSEDED (2026-08-07)** — see D7. `projects/ironcalc-upgrade.md` is no longer a plan to move
+  to a released pin; it was retitled to *"keeping the fork current"* and the released pin is now
+  an explicitly hypothetical simplification, not a follow-up we are working toward.
 - **API-visibility cluster** (Clipboard/BorderArea/Function/default-font) and **parser depth-cap**
   — deferred fast-follows.
 - **Kept FreeCell-side / large features** — unchanged from the inventory.
@@ -113,4 +116,8 @@ Color`, `BorderItem.color: Color`, where `Color = Rgb(String) | Theme(i32,f64) |
   proof the removal is correct.
 - Fork fixes pass `cargo test` + `make lint`; synthetic fixtures only; no model identifier in fork
   commits/PRs.
-- The git-`main` pin is temporary and clearly marked; the fork carries the minimum diff.
+- ~~The git-`main` pin is temporary and clearly marked; the fork carries the minimum diff.~~
+  **SUPERSEDED (2026-08-07, v05-cleanup-1/A4 review remediation).** The pin is **not** temporary —
+  see **D7** at the top of this file and `projects/ironcalc-upgrade.md`. The fork is permanent;
+  the pin is a `rev` on `freecell-fixes` (v05-cleanup-1/A1). "The fork carries the minimum diff"
+  survives and is still the goal — that is what upstreaming is for.

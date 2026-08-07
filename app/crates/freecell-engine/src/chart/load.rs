@@ -15,7 +15,7 @@ use freecell_chart_model::{
     normalize_3d_chart_group, Anchor, AnchorCell, Axis, BarDir, BarLayout, Category, CfRange,
     Chart, ChartColor, ChartKind, ChartSpec, Color, DataLabelPosition, DataLabels, DataPoint,
     Grouping, Legend, LegendPosition, LineStroke, ScatterStyle, Series, SeriesShape,
-    SizeRepresentation, SourcePart, SourceXml, ThemeSlot,
+    SizeRepresentation, SourcePart, SourceXml, ThemeSlot, CHART_GROUP_ELEMENTS,
 };
 
 use super::xlsx::{self, attr};
@@ -589,6 +589,23 @@ pub(super) fn is_chart_group(local_name: &str) -> bool {
     CHART_GROUP_TAGS.contains(&local_name) || normalize_3d_chart_group(local_name).is_some()
 }
 
+/// The chart-group elements in `plot_area` that [`parse_chart_xml`] **drops** — every group child
+/// other than the `retained` one, in document order, by element local name (duplicates kept: two
+/// dropped `lineChart`s are two losses).
+///
+/// Counted over `chart-model`'s complete `CHART_GROUP_ELEMENTS` rather than the narrower
+/// [`CHART_GROUP_TAGS`], so a dropped group we cannot even parse (a `surfaceChart` sitting beside
+/// a `barChart`) is still named. Empty for the overwhelmingly common single-group plot area.
+fn dropped_chart_groups(plot_area: &Node, retained: &Node) -> Vec<String> {
+    plot_area
+        .children()
+        .filter(|n| {
+            n.is_element() && n != retained && CHART_GROUP_ELEMENTS.contains(&n.tag_name().name())
+        })
+        .map(|n| n.tag_name().name().to_string())
+        .collect()
+}
+
 /// Parses a single `xl/charts/chartN.xml` document (`c:chartSpace`) into a [`Chart`], reading
 /// cached values only. Returns an error if no recognized chart-group element is present.
 ///
@@ -606,6 +623,20 @@ pub fn parse_chart_xml(xml: &str) -> Result<Chart> {
         .children()
         .find(|n| n.is_element() && is_chart_group(n.tag_name().name()))
         .ok_or_else(|| anyhow!("no recognized chart-group element in <c:plotArea>"))?;
+
+    // A combo plot area loses every group after the first (unit G1b would draw them). The model
+    // can't say so — `Fidelity` is a bare enum with no reason field, and widening it belongs to G3
+    // (charts/architecture §7) — so name the loss here, where the file's other per-chart
+    // diagnostics already go. `source_fidelity` gives the user the badge; this gives whoever reads
+    // the log the *reason* the functional spec asks for (§G1(2)).
+    let dropped = dropped_chart_groups(&plot_area, &group);
+    if !dropped.is_empty() {
+        tracing::warn!(
+            retained = group.tag_name().name(),
+            dropped = %dropped.join(", "),
+            "combo chart: only the first chart group is drawn; the other groups' series are dropped",
+        );
+    }
 
     // Normalize a 3-D group to its 2-D equivalent name before reading its kind.
     let group_name = group.tag_name().name();
@@ -1148,6 +1179,143 @@ mod tests {
     use super::*;
     use crate::chart::authoring;
     use freecell_chart_model::{source_fidelity, Fidelity, SeriesData};
+
+    /// **G1 tripwire.** [`CHART_GROUP_TAGS`] (the groups we can turn into a `ChartKind`) must stay
+    /// a subset of `chart-model`'s `CHART_GROUP_ELEMENTS` (every group OOXML defines), because that
+    /// wider list is what the combo detector *counts*.
+    ///
+    /// **What it really catches:** a typo or a misspelled name added here. It is close to vacuous
+    /// against the failure it guards, because `CHART_GROUP_ELEMENTS` is already the **complete**
+    /// `CT_PlotArea` group set — any group the engine could learn to parse is in it by
+    /// construction. It is kept because it is one line and a misspelling here is otherwise silent.
+    /// The agreements with real teeth live in `chart-model` beside the lists they constrain
+    /// (`classifier_group_lists_are_subsets_of_the_counting_set`,
+    /// `no_group_normalizes_to_2d_without_being_listed_as_3d`) — including the 3-D names, which is
+    /// why this test no longer restates them from a hardcoded copy that a fifth 3-D mapping would
+    /// slip straight past.
+    #[test]
+    fn every_parsable_chart_group_is_known_to_the_combo_detector() {
+        for tag in CHART_GROUP_TAGS {
+            assert!(
+                CHART_GROUP_ELEMENTS.contains(tag),
+                "{tag} is parsable here but absent from chart-model's CHART_GROUP_ELEMENTS, so \
+                 has_multiple_chart_groups cannot count it",
+            );
+        }
+        // The 3-D half of `is_chart_group` is the normalizer's domain, so derive it rather than
+        // restating it: every countable name the normalizer maps must be one we accept as a group.
+        let three_d: Vec<&&str> = CHART_GROUP_ELEMENTS
+            .iter()
+            .filter(|tag| normalize_3d_chart_group(tag).is_some())
+            .collect();
+        assert!(!three_d.is_empty(), "the 3-D set cannot be empty");
+        for tag in three_d {
+            assert!(
+                is_chart_group(tag),
+                "{tag} normalizes to a 2-D group but is_chart_group rejects it",
+            );
+        }
+    }
+
+    /// **G1, the parser half.** A combo plot area parses to the FIRST group only — the second
+    /// group's series is dropped. This test does not endorse that; it locks the documented
+    /// behaviour so it is visible, and pairs with `source_fidelity` now returning `Degraded` so
+    /// the user is told. Actually drawing the second group is unit G1b (v2.0).
+    #[test]
+    fn a_combo_parses_to_the_first_group_only_and_is_flagged() {
+        let xml = COLUMN_CHART.replace(
+            "</c:barChart>",
+            r#"</c:barChart>
+   <c:lineChart><c:grouping val="standard"/>
+     <c:ser><c:idx val="9"/><c:order val="9"/>
+       <c:tx><c:strRef><c:f>Sheet1!$Z$1</c:f><c:strCache><c:ptCount val="1"/>
+         <c:pt idx="0"><c:v>Dropped Line</c:v></c:pt></c:strCache></c:strRef></c:tx>
+       <c:val><c:numRef><c:f>Sheet1!$Z$2:$Z$3</c:f><c:numCache><c:ptCount val="2"/>
+         <c:pt idx="0"><c:v>7</c:v></c:pt><c:pt idx="1"><c:v>8</c:v></c:pt></c:numCache></c:numRef></c:val>
+     </c:ser>
+     <c:axId val="1"/><c:axId val="2"/>
+   </c:lineChart>"#,
+        );
+        assert!(xml.contains("lineChart"), "the combo fixture was built");
+
+        let chart = parse_chart_xml(&xml).expect("a combo still parses");
+        assert!(
+            matches!(chart.kind, ChartKind::Bar { .. }),
+            "the first group wins: {:?}",
+            chart.kind,
+        );
+        // Pinned by COUNT as well as by name: an `all(…)` over the series alone would also pass if
+        // the parser returned nothing at all, which is a different (worse) bug wearing the same
+        // green tick.
+        assert_eq!(
+            chart.series.len(),
+            1,
+            "the bar group's one series is kept: {:?}",
+            chart.series.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        );
+        assert_eq!(chart.series[0].name.as_deref(), Some("Widgets"));
+        assert!(
+            chart
+                .series
+                .iter()
+                .all(|s| s.name.as_deref() != Some("Dropped Line")),
+            "the second group's series is discarded by the parser (G1b would keep it)",
+        );
+
+        // …and the parser names the loss in the log (charts/architecture §7 — the reason the
+        // functional spec asks for, on the channel this file already uses for per-chart
+        // diagnostics). `dropped_chart_groups` is what the `tracing::warn!` interpolates.
+        let doc = Document::parse(&xml).unwrap();
+        let plot_area = child(&child(&doc.root_element(), "chart").unwrap(), "plotArea").unwrap();
+        let retained = plot_area
+            .children()
+            .find(|n| n.is_element() && is_chart_group(n.tag_name().name()))
+            .unwrap();
+        assert_eq!(
+            dropped_chart_groups(&plot_area, &retained),
+            vec!["lineChart".to_string()],
+            "the warn must name the dropped group",
+        );
+
+        // …and that silent loss is now disclosed rather than presented as exact.
+        assert_eq!(
+            source_fidelity(&xml),
+            Fidelity::Degraded,
+            "a combo must be badged Degraded now that a group is being dropped",
+        );
+    }
+
+    /// `dropped_chart_groups` names every group the parser discards — including one it could not
+    /// have parsed anyway (a `surfaceChart` beside the bar) — and is **empty** for an ordinary
+    /// single-group plot area, so the combo warn cannot fire once per chart load on normal files.
+    #[test]
+    fn dropped_chart_groups_names_the_losses_and_is_empty_otherwise() {
+        fn dropped_of(xml: &str) -> Vec<String> {
+            let doc = Document::parse(xml).unwrap();
+            let plot_area =
+                child(&child(&doc.root_element(), "chart").unwrap(), "plotArea").unwrap();
+            let retained = plot_area
+                .children()
+                .find(|n| n.is_element() && is_chart_group(n.tag_name().name()))
+                .unwrap();
+            dropped_chart_groups(&plot_area, &retained)
+        }
+
+        assert!(
+            dropped_of(COLUMN_CHART).is_empty(),
+            "a single-group chart drops nothing, so no warn fires",
+        );
+
+        let combo = COLUMN_CHART.replace(
+            "</c:barChart>",
+            "</c:barChart>\n   <c:lineChart><c:ser/></c:lineChart>\n   <c:surfaceChart><c:ser/></c:surfaceChart>",
+        );
+        assert_eq!(
+            dropped_of(&combo),
+            vec!["lineChart".to_string(), "surfaceChart".to_string()],
+            "both dropped groups are named, in document order — including the unparsable one",
+        );
+    }
 
     const COLUMN_CHART: &str = r#"<?xml version="1.0"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"

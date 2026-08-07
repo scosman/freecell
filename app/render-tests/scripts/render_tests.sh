@@ -22,12 +22,37 @@
 #                                   #   `test cell_` or `test border_`). The full suite is slow;
 #                                   #   see CLAUDE.md "Render tests" for when to run which.
 #   render_tests.sh generate [--only <prefix>]   # (re)write baselines/, print a summary
+#
+# Env:
+#   FREECELL_CARGO_UNLOCKED=1   # opt OUT of `--locked` (see below). Only for a local run
+#                               #   taken mid-dependency-edit, before Cargo.lock is updated.
 # ---------------------------------------------------------------------------------
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # app/
 mode="${1:-test}"
 export FREECELL_RENDER=1
+
+# `--locked` is UNCONDITIONAL (A2 — projects/architecture-review-remediation.md): every cargo
+# invocation that resolves this workspace must prove it built the COMMITTED lockfile — the one
+# cargo-deny audited. Strict is the default so CI cannot lose the guarantee by forgetting an
+# `env:` line, and so a new workflow calling this script inherits it (the earlier
+# CARGO_LOCKED-opt-IN shape was fail-open; see phase_plans/phase_2.md).
+#
+# The single legitimate local exception — iterating mid-dependency-edit, before Cargo.lock is
+# regenerated — opts out explicitly with FREECELL_CARGO_UNLOCKED=1. Note this is a *flag*, not
+# a place to put cargo arguments: the value is compared, never spliced into argv, so a wrong
+# value can never become a cargo positional (e.g. a stray test-name filter that would make the
+# pixel gate pass green having run zero cases).
+case "${FREECELL_CARGO_UNLOCKED:-}" in
+    "")  cargo_locked=(--locked) ;;
+    1)   cargo_locked=()
+         echo "render_tests.sh: FREECELL_CARGO_UNLOCKED=1 — running WITHOUT --locked;" \
+              "cargo may rewrite Cargo.lock. Never set this in CI." >&2 ;;
+    *)   echo "render_tests.sh: FREECELL_CARGO_UNLOCKED must be unset or exactly '1'" \
+              "(got '${FREECELL_CARGO_UNLOCKED}'); refusing to guess." >&2
+         exit 2 ;;
+esac
 
 # Assert the capture stack is present BEFORE invoking cargo. Setting FREECELL_RENDER=1 means the
 # operator wants the real pixel gate; if the tooling is missing we must fail loudly rather than let
@@ -58,16 +83,16 @@ case "$mode" in
     test)
         require_tools
         shift || true   # drop the "test" arg; forward any remaining as a cargo test name filter
-        exec cargo test --manifest-path "$here/Cargo.toml" -p render-tests "$@"
+        exec cargo test "${cargo_locked[@]}" --manifest-path "$here/Cargo.toml" -p render-tests "$@"
         ;;
     generate)
         require_tools
         shift || true
         # `cargo run --bin generate_baselines` does not build its sibling render_scene,
         # which it shells out to — build both bins first.
-        cargo build --manifest-path "$here/Cargo.toml" -p render-tests \
+        cargo build "${cargo_locked[@]}" --manifest-path "$here/Cargo.toml" -p render-tests \
             --bin render_scene --bin generate_baselines
-        exec cargo run --manifest-path "$here/Cargo.toml" -p render-tests \
+        exec cargo run "${cargo_locked[@]}" --manifest-path "$here/Cargo.toml" -p render-tests \
             --bin generate_baselines -- "$@"
         ;;
     *)

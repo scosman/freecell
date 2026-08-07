@@ -85,26 +85,78 @@ pub(super) fn series_sppr_element(c: &str, a: &str, color: Color) -> String {
 /// (`c:` prefix) and the loaded chrome patch (the file's prefix).
 pub(super) fn dlbls_element(c: &str, labels: &DataLabels) -> String {
     let mut s = format!("<{c}dLbls>");
-    if let Some(code) = &labels.number_format {
-        s.push_str(&format!(
-            "<{c}numFmt formatCode=\"{}\" sourceLinked=\"0\"/>",
-            attr_escape(code),
-        ));
-    }
-    if let Some(pos) = labels.position {
-        s.push_str(&format!("<{c}dLblPos val=\"{}\"/>", dlbl_pos_val(pos)));
-    }
-    let flag = |name: &str, on: bool| format!("<{c}{name} val=\"{}\"/>", if on { 1 } else { 0 });
-    s.push_str(&flag("showLegendKey", labels.show_legend_key));
-    s.push_str(&flag("showVal", labels.show_value));
-    s.push_str(&flag("showCatName", labels.show_category_name));
-    s.push_str(&flag("showSerName", labels.show_series_name));
-    s.push_str(&flag("showPercent", labels.show_percent));
-    if let Some(sep) = &labels.separator {
-        s.push_str(&format!("<{c}separator>{}</{c}separator>", escape_xml(sep)));
+    for (_, fragment) in dlbls_children(c, labels) {
+        s.push_str(&fragment);
     }
     s.push_str(&format!("</{c}dLbls>"));
     s
+}
+
+/// The **five toggle** children of `c:dLbls`, in `CT_DLbls` order. Always built (a `show*` flag
+/// is meaningful in both states, so a fresh element spells all five out). Private: only
+/// [`dlbls_children`] uses it — the patcher orders against `DLBLS_CHILD_ORDER` in
+/// [`super::save`], and a test there asserts the two spellings agree.
+const DLBLS_FLAGS: [&str; 5] = [
+    "showLegendKey",
+    "showVal",
+    "showCatName",
+    "showSerName",
+    "showPercent",
+];
+
+/// Every child of `c:dLbls` this crate models, as `(local name, serialized element)` pairs in
+/// `CT_DLbls` schema order — `numFmt`, `dLblPos`, the five `show*` flags, `separator`.
+///
+/// Shared by the two write modes so there is exactly ONE spelling of each element:
+/// - [`dlbls_element`] concatenates them into a whole `c:dLbls` (a series that had none);
+/// - [`patch_data_labels`](super::save) upserts them **individually inside an existing**
+///   `c:dLbls`, so the file's per-point `c:dLbl` overrides, `c:spPr`/`c:txPr` typography and
+///   `c:showLeaderLines`/`c:leaderLines` survive an edit instead of being replaced wholesale.
+///
+/// An entry is absent when the model carries no value for it (`numFmt` / `dLblPos` / `separator`
+/// are `Option`s). The patcher does **not** read a bare absence as "remove this child": it diffs
+/// this list for the *file's* labels against this list for the *new* labels, so a child is removed
+/// only when the model actually **dropped** a value it used to carry. That distinction matters
+/// because the model cannot represent every legal value — `c:dLblPos val="bestFit"` (what Excel
+/// writes for pie labels) and `c:numFmt formatCode="General"` both parse to `None` — and those must
+/// survive an unrelated edit rather than be mistaken for a user's clear.
+pub(super) fn dlbls_children(c: &str, labels: &DataLabels) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    if let Some(code) = &labels.number_format {
+        out.push((
+            "numFmt",
+            format!(
+                "<{c}numFmt formatCode=\"{}\" sourceLinked=\"0\"/>",
+                attr_escape(code),
+            ),
+        ));
+    }
+    if let Some(pos) = labels.position {
+        out.push((
+            "dLblPos",
+            format!("<{c}dLblPos val=\"{}\"/>", dlbl_pos_val(pos)),
+        ));
+    }
+    let on = [
+        labels.show_legend_key,
+        labels.show_value,
+        labels.show_category_name,
+        labels.show_series_name,
+        labels.show_percent,
+    ];
+    for (name, on) in DLBLS_FLAGS.into_iter().zip(on) {
+        out.push((
+            name,
+            format!("<{c}{name} val=\"{}\"/>", if on { 1 } else { 0 }),
+        ));
+    }
+    if let Some(sep) = &labels.separator {
+        out.push((
+            "separator",
+            format!("<{c}separator>{}</{c}separator>", escape_xml(sep)),
+        ));
+    }
+    out
 }
 
 /// The `c:dLblPos@val` token for a [`DataLabelPosition`](freecell_chart_model::DataLabelPosition).

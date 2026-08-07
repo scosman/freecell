@@ -1,36 +1,108 @@
-# Linux `render` — the MANUAL, required-before-merge pixel gate (architecture.md §9).
+# Linux `render` — the pixel gate (architecture.md §9).
 #
 # Renders the real grid over engine-produced scenes under Xvfb + Mesa lavapipe (software
-# Vulkan) and perceptual-diffs each case against a committed baseline. This was SPLIT OUT
-# of the fast `checks` job because software rendering is slow and occasionally flaky, and we
-# don't want it on the every-push critical path. Instead it is a deliberate "final check
-# before merge": trigger it by hand (Actions tab -> "render" -> Run workflow) on the PR's
-# branch once you're ready to merge.
+# Vulkan) and perceptual-diffs each case against a committed baseline. It is SPLIT OUT of the
+# fast `checks` job because software rendering is slow (many minutes), and it is deliberately
+# NOT on the PR path: most PRs cannot move a pixel, and the suite cannot earn its cost on them.
 #
-# BRANCH PROTECTION: because this is the pixel gate, it MUST be a required status check.
-# Add it to branch protection under the EXACT context name `render (Xvfb + lavapipe)` (the
-# job `name:` below). Keep that name stable — renaming it silently drops the requirement.
-# It is `workflow_dispatch`-only, so GitHub will not auto-run it; the merge is gated on a
-# green *manual* run of the current head commit.
+# THREE TRIGGERS, and why (D1 — projects/architecture-review-remediation.md):
 #
-# BOOTSTRAP NOTE: a `workflow_dispatch` workflow's "Run workflow" button (and the trigger
-# itself) only appear once this file exists on the DEFAULT branch (`main`). So the very PR
-# that introduces render.yml cannot dispatch this check on itself — merge it to `main` first
-# (or mark the check non-required temporarily), then it is dispatchable on later PRs.
+#   schedule  — WEEKLY ON `main`. This is the backstop. Before D1 this workflow was
+#               `workflow_dispatch`-only, and in its whole life it ran 29 times across 13
+#               feature branches and ZERO times on `main`, against 44 merged PRs — so `main`
+#               had never been render-verified. A weekly run catches whatever slipped through
+#               merges, at a cadence where a regression is still cheap to bisect. (A scheduled
+#               workflow only ever runs on the default branch, which is exactly what we want.)
+#
+#   workflow_call — invoked by `release.yml`, which makes its packaging jobs `needs:` this.
+#               Nothing ships without a green pixel suite. This is a BLOCKING gate: it adds
+#               the suite's wall-clock to the front of a release, which is an accepted cost on
+#               an infrequent, deliberate operation. See the flake note below for why blocking
+#               is defensible.
+#
+#   workflow_dispatch — unchanged, for the agent-driven case: an agent making a rendering
+#               change runs the relevant subset locally and dispatches the full suite on its
+#               branch when it wants confirmation. What D1 changed is that FORGETTING to do so
+#               no longer means nobody checked.
+#
+# NOT A REQUIRED PER-PR STATUS CHECK. The previous header claimed it "MUST be a required
+# status check" while the trigger made that impossible to satisfy — a dispatch-only workflow
+# reports no context on a PR, so a required check would simply block every merge. Owner
+# decision (2026-07-28): keep it off the PR path entirely. Bump-token, `paths` filter and a
+# per-PR gate were all considered and rejected as ceremony over a weekly backstop.
+#
+# FLAKE, measured rather than assumed: of the 29 dispatched runs, 26 succeeded, 1 was
+# cancelled, and 2 failed — both on the SAME branch on the SAME day, mid-development on a
+# chart-rendering change, i.e. the gate doing its job on genuinely-moved pixels. There is no
+# evidence of lavapipe infrastructure flake in 29 runs, which is what makes blocking a release
+# on it reasonable. If that changes, back the release gate off before weakening the schedule.
+#
+# NOTE: GitHub disables scheduled workflows in a repository with no activity for 60 days.
 #
 # The workspace lives in `app/`; the pinned toolchain comes from `app/rust-toolchain.toml`.
 
 name: render
 
+# Least privilege, stated explicitly now that this workflow is embedded in the RELEASE path via
+# `workflow_call`: it only checks out code and uploads a run artifact, neither of which needs
+# write scope. This is stated as what the JOB needs, not as a claim about the repo-wide default
+# (which is not visible from the workflow): if that default is read/write, this block genuinely
+# narrows the token — `contents: read`, every other scope `none` — and no step here uses another
+# scope (`actions/checkout` needs `contents: read`; `Swatinem/rust-cache` and
+# `actions/upload-artifact` use the runtime token, not `GITHUB_TOKEN`). The point is that a future
+# default change, or a caller with broader permissions, cannot silently widen it.
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
+  workflow_call:
+  schedule:
+    # Weekly on `main`, Sunday 07:17 UTC — off-peak, and off the hour (GitHub's scheduler is
+    # heavily contended at :00, which delays runs).
+    - cron: "17 7 * * 0"
 
+# Concurrency key: CALLER WORKFLOW + EVENT + REF.
+#
+# The rule that makes this non-obvious: inside a REUSABLE workflow, the `github` context is the
+# CALLER's, not this file's. So on the `workflow_call` path `github.event_name` is whatever
+# triggered `release.yml` (`push` for a tag, `workflow_dispatch` for a manual release) — never
+# the string "workflow_call" — and `github.workflow` is the caller's workflow name (`release`),
+# while on the direct paths it is this workflow's own name (`render`). Keying on the workflow
+# name is therefore what actually distinguishes "render, called by a release" from "render, run
+# directly"; the event alone does not.
+#
+# What that buys, with `cancel-in-progress: true`:
+#
+#   schedule on `main`      render-render-schedule-refs/heads/main
+#   dispatch on `main`      render-render-workflow_dispatch-refs/heads/main
+#   release by tag          render-release-push-refs/tags/vX.Y.Z
+#   release by dispatch     render-release-workflow_dispatch-<caller ref>
+#
+# — four distinct groups, so none of them can cancel another. In particular the weekly backstop
+# is no longer eaten by someone dispatching on `main`, and a release's render job no longer
+# collides with a direct dispatch on the same ref (which would also have overridden
+# `release.yml`'s deliberate `cancel-in-progress: false`).
+#
+# Two dispatches on the SAME branch still share a group and supersede each other — exactly what
+# an iterating agent wants.
+#
+# One combination shares a group but is UNREACHABLE, and it is worth writing down which mechanism
+# makes it so: two *manual* release dispatches of the same ref would land in the same render group
+# (`render-release-workflow_dispatch-<ref>`). They cannot collide, because `release.yml` sets
+# `concurrency: release-${{ github.ref }}` with `cancel-in-progress: false`, and a run entering an
+# occupied group under that setting goes PENDING — it starts NO jobs, so the second release's
+# render job never launches while the first one's is running and there is nothing to cancel. That
+# guarantee lives entirely in `release.yml`'s group: delete it and this collision becomes real.
 concurrency:
-  group: render-${{ github.ref }}
+  group: render-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # A2 (--locked) needs nothing here: render_tests.sh passes `--locked` unconditionally, so
+  # this workflow — and any future one that calls it — gets the committed-lockfile guarantee
+  # without an env: line that could be forgotten or dropped. See that script's header.
   # Same CI-only build trims as checks.yml so render's own build stays disk-lean:
   # no incremental artifacts, and line-tables-only debug info (keeps file:line in
   # backtraces but drops the heavy DWARF that dominated target/ + the link step).

@@ -36,11 +36,11 @@ jobs:
 
       - name: Build workspace
         working-directory: app
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       - name: Test workspace
         working-directory: app
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       # The Linux Xvfb+lavapipe capture is the PRIMARY, proven pixel gate (Phase-1 spike
       # PASSED; the full render pixel suite runs in the required `render` workflow —

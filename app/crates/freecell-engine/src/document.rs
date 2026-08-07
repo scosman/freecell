@@ -2081,8 +2081,8 @@ mod tests {
     use tempfile::tempdir;
 
     /// End-to-end proof that FreeCell's IronCalc pin (`app/Cargo.toml`'s `[patch.crates-io]` →
-    /// the fork's `freecell-fixes` branch) actually carries the scalar-functions batch: each
-    /// function is set as a formula in A1 and its **computed, formatted** value is asserted. A
+    /// a `rev` on the fork's `freecell-fixes` branch) actually carries the scalar-functions batch:
+    /// each function is set as a formula in A1 and its **computed, formatted** value is asserted. A
     /// name the pinned engine doesn't know would return `#NAME?` (and a broken impl a wrong value
     /// or `#VALUE!`/`#N/A`), so a literal-value match here is the regression guard that the batch
     /// is present and correct through the real FreeCell engine seam — no FreeCell-side code beyond

@@ -25,10 +25,11 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 
 use freecell_chart_model::{ChartColor, ChartId, ChartInsertKind};
+use freecell_core::input_cap::group_thousands;
 use freecell_core::{limits, CellRange, CellRef, Rgb, SelectionModel, SheetId};
 use freecell_engine::{
     Command, DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, PasteError,
-    SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
+    SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver, WorkerExit,
 };
 
 use crate::chrome::{ChartPanel, ChartPanelSeries, ChromeGridRequest, ChromeGridSink, ChromeView};
@@ -139,8 +140,16 @@ pub struct WorkbookWindow {
     /// §5.1`); `None` once the document has loaded.
     loading: Option<String>,
     /// A degraded-worker reason (`functional_spec.md §6`): the window keeps serving the last
-    /// good state + Save As but refuses edits.
+    /// good state + Save As but refuses edits. The worker is still **alive** — it answered the
+    /// probe — so Save As really can write the file.
     degraded: Option<String>,
+    /// The worker thread is **gone** (B1, `engine-worker-hardening functional_spec.md F2.3`) —
+    /// strictly worse than [`degraded`](Self::degraded) and deliberately a separate flag, because
+    /// the two states differ in exactly the thing the degraded bar offers: with no worker there is
+    /// nothing left that can write a file, so this window must not present a Save (its command
+    /// would be dropped by `DocumentClient::send` and no `Saved`/`SaveFailed` would ever come
+    /// back). Set once, when the event stream closes without a requested shutdown.
+    worker_lost: bool,
 
     /// The op index the file on disk currently reflects; the dirty flag is
     /// `committed_ops > last_saved_ops` (`architecture.md §2`).
@@ -215,6 +224,23 @@ impl WorkbookWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let (client, receiver) = DocumentClient::detached();
+        Self::build(key, Rc::new(client), receiver, None, path, window, cx)
+    }
+
+    /// Test-only constructor over a worker-less client whose event stream stays **open**, handing
+    /// the test the sender that feeds it. Dropping that sender closes the stream with no requested
+    /// shutdown — exactly what a dead worker looks like from the window's side — so this is how the
+    /// worker-lost path is exercised (B1, `functional_spec.md F2.3`).
+    #[cfg(test)]
+    pub(crate) fn new_detached_live_for_test(
+        key: WindowKey,
+        path: Option<PathBuf>,
+        sender_slot: &mut Option<async_channel::Sender<WorkerEvent>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (client, receiver, sender) = DocumentClient::detached_live();
+        *sender_slot = Some(sender);
         Self::build(key, Rc::new(client), receiver, None, path, window, cx)
     }
 
@@ -326,6 +352,7 @@ impl WorkbookWindow {
             path,
             loading,
             degraded: None,
+            worker_lost: false,
             last_saved_ops: 0,
             dirty: false,
             modal: None,
@@ -355,10 +382,106 @@ impl WorkbookWindow {
                     })
                     .is_ok();
                 if !alive {
-                    break; // the window is gone
+                    return; // the window is gone — nothing to report to
                 }
             }
+            // The stream ended rather than the window going away: the worker thread is gone
+            // (B1, `functional_spec.md F2.3`). `update_in` is a no-op if the window has since
+            // closed, so this only ever reports to a live window.
+            let _ = this.update_in(cx, |this, window, cx| this.on_worker_lost(window, cx));
         })
+    }
+
+    /// The worker→UI event stream closed. Unless this window asked for it, the worker thread is
+    /// gone and this document can no longer be edited or saved — say so
+    /// (B1, `functional_spec.md F2.3`).
+    ///
+    /// This is the fix for the **silent zombie**: with the `JoinHandle` discarded at spawn and
+    /// `DocumentClient::send` swallowing `SendError` by design, a dead worker used to leave the
+    /// window rendering its last publication forever — edits vanished, Save did nothing, and there
+    /// was no dialog, no degraded bar and no log line anywhere.
+    ///
+    /// The window deliberately stays **open**: closing it would take the last readable copy of the
+    /// user's data off the screen. It does not pretend a Save might work either — [`worker_lost`]
+    /// takes every save path out of service and replaces the degraded bar's `Save As…` button with
+    /// a bar that says the work cannot be saved from this window.
+    ///
+    /// [`worker_lost`]: Self::worker_lost
+    fn on_worker_lost(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.client.has_worker() || self.client.shutdown_requested() {
+            return; // no worker to lose, or an orderly stop we asked for
+        }
+        self.report_worker_exit(cx);
+
+        self.worker_lost = true;
+        self.degraded = Some("the calculation engine stopped".to_string());
+        self.chrome.update(cx, |c, cx| c.set_degraded(true, cx));
+        // Everything that was waiting on a worker reply is abandoned HERE, unconditionally. The
+        // refusals on `save` / `send_save` / `export_csv` only guard the *entry* to a new request;
+        // they cannot help a request that was already in flight when the worker died — which is the
+        // premise of B1, since the unguarded panic that kills the worker can happen mid-save.
+        self.abandon_work_waiting_on_the_worker(cx);
+        // A worker that dies before `Loaded` leaves the "Opening X…" overlay up — everything after
+        // the guarded `from_source` (`sheet_metas`, the cache build, the CF publish) runs on
+        // freshly parsed input and is still unguarded. Clear it as the `Loaded` and `LoadFailed`
+        // arms do, or it spins forever behind this dialog.
+        self.loading = None;
+        self.grid.update(cx, |g, cx| g.set_loading(None, cx));
+        // Only a modal that is ITSELF a terminal report is left alone: a failed load emits
+        // `LoadFailed` and *then* returns, closing the stream — its accurate "Couldn't open the
+        // workbook" dialog must survive this generic one, and it already tells the user the window
+        // is finished. Anything else (an unsaved-changes prompt, a merge confirm) is replaced: it
+        // is offering choices that can no longer be carried out, and this notice fires exactly once
+        // with no re-arm, so a suppressed report would never be shown at all.
+        let keep_terminal_report = matches!(
+            self.modal,
+            Some(ActiveModal::Error {
+                close_window_on_dismiss: true,
+                ..
+            })
+        );
+        if !keep_terminal_report {
+            self.modal = Some(ActiveModal::Error {
+                title: "The calculation engine stopped".into(),
+                detail: "This window can't be edited or saved any more. Its unsaved changes are \
+                         lost. Open the file again to keep working."
+                    .into(),
+                close_window_on_dismiss: false,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Logs **how** the worker ended. The UI thread never joins: the event stream closes when the
+    /// worker's frame drops its event sender, which happens well before the thread has finished
+    /// unwinding the rest of the `Worker` (the `UserModel`, the caches, the chart bindings) and
+    /// marks itself finished — so the probe here usually answers `Running`, which on its own says
+    /// nothing about how the worker died. That is not a dead end: the thread is by construction on
+    /// its way out, so the handle is taken and joined on the **background** executor, and the real
+    /// outcome is logged when it lands.
+    fn report_worker_exit(&self, cx: &mut Context<Self>) {
+        match self.client.worker_exit() {
+            WorkerExit::Running => match self.client.take_worker_handle() {
+                Some(handle) => {
+                    tracing::error!(
+                        "worker thread ended without a requested shutdown; still unwinding, \
+                         joining off the UI thread"
+                    );
+                    cx.background_executor()
+                        .spawn(async move {
+                            let exit = freecell_engine::join_worker(handle);
+                            tracing::error!(?exit, "lost worker thread joined");
+                        })
+                        .detach();
+                }
+                // Already taken (only reachable if something joined it first) — nothing left to
+                // join, so nothing more to say than that it ended.
+                None => tracing::error!(
+                    "worker thread ended without a requested shutdown; handle already taken"
+                ),
+            },
+            exit => tracing::error!(?exit, "worker thread ended without a requested shutdown"),
+        }
     }
 
     /// Installs the worker's live-bound charts into the grid's **ChartLayer** from the publication
@@ -761,6 +884,31 @@ impl WorkbookWindow {
                     cx.notify();
                 }
             }
+            // The frozen-pane cap (engine-worker-hardening `functional_spec.md F1.2`): an OK-only
+            // dialog, nothing changed. The reachable case is Select-All → "Freeze rows", where the
+            // header menu derives the count from the whole 1,048,576-row selection — so the copy
+            // echoes the request as well as the cap, or the refusal reads as arbitrary. The
+            // request is grouped (`1,048,576`, per the spec's copy): unseparated it is the one
+            // number in this string a reader has to count digits on.
+            EditRejectedReason::FrozenPaneTooLarge {
+                axis,
+                requested,
+                max,
+            } => {
+                if self.modal.is_none() {
+                    let noun = axis.noun();
+                    let requested = group_thousands(*requested as usize);
+                    self.modal = Some(ActiveModal::Error {
+                        title: format!("Can't freeze that many {noun}"),
+                        detail: format!(
+                            "FreeCell can pin at most {max} {noun} (you asked for {requested}). \
+                             Select fewer {noun} and try again."
+                        ),
+                        close_window_on_dismiss: false,
+                    });
+                    cx.notify();
+                }
+            }
             EditRejectedReason::InvalidSheetName(_) | EditRejectedReason::Degraded => {}
         }
     }
@@ -935,6 +1083,10 @@ impl WorkbookWindow {
     /// to its path. There is **no fidelity warning** — a successful write silently drops
     /// anything IronCalc can't model (`functional_spec.md §5.2`).
     pub fn save(&mut self, save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.worker_lost {
+            self.refuse_save_worker_lost(cx);
+            return;
+        }
         match lifecycle::resolve_save_target(self.path.as_deref(), save_as) {
             SaveTarget::Path(path) => self.send_save(path, cx),
             SaveTarget::Prompt { suggested_name } => {
@@ -978,6 +1130,15 @@ impl WorkbookWindow {
     /// a one-time `.back` backup of its original bytes (`§7.3`); a backup failure aborts the
     /// save with a dialog — data safety wins over convenience.
     fn send_save(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // With the worker gone this send goes nowhere — `DocumentClient::send` drops the command,
+        // so no `Saved` and no `SaveFailed` would ever come back and the arming below would leave a
+        // save pending forever (and, on the close path, a window that never closes). Refuse instead
+        // (B1, `functional_spec.md F2.3`). Checked here as well as in `save` because the save panel
+        // is async: the worker can die while it is open.
+        if self.worker_lost {
+            self.refuse_save_worker_lost(cx);
+            return;
+        }
         if let Some(backup) = lifecycle::backup_target(self.opened_from.as_deref(), &path) {
             if let Err(err) = std::fs::copy(&path, &backup) {
                 self.abort_save_with_backup_error(err, cx);
@@ -989,6 +1150,82 @@ impl WorkbookWindow {
         self.pending_save_req = Some(req_id);
         self.pending_save_path = Some(path.clone());
         self.client.send(Command::Save { path, req_id });
+        cx.notify();
+    }
+
+    /// Refuses a save because the worker is gone (B1, `functional_spec.md F2.3`). Nothing is
+    /// written and nothing is armed: any close/quit follow-up is cancelled (exactly as a
+    /// `SaveFailed` does — otherwise an in-progress Quit would park its plan on a window whose
+    /// save can never resolve), and the same notice the worker-lost report shows explains why.
+    fn refuse_save_worker_lost(&mut self, cx: &mut Context<Self>) {
+        self.abandon_work_waiting_on_the_worker(cx);
+        self.show_worker_lost_notice(
+            "This workbook can't be saved from this window any more. Open the file again to keep \
+             working.",
+            cx,
+        );
+    }
+
+    /// Drops every piece of window state that is waiting for a reply the worker can no longer
+    /// send, and — if a quit is waiting on *this* window — stands that quit down
+    /// (`functional_spec.md F2.3`).
+    ///
+    /// The close/quit follow-up is the load-bearing part. `close_after_save` fires only from the
+    /// `Saved` arm and `pending_save_req` is only ever cleared by `Saved`/`SaveFailed`, so with the
+    /// worker gone both would stay armed forever: the window would never close and `advance_quit`
+    /// would sit on a prompt that can never resolve.
+    ///
+    /// The stand-down goes through [`note_quit_prompt_unanswerable`], **not** the unscoped
+    /// [`note_prompt_cancelled`] the user-driven paths use. A worker death is not a user gesture:
+    /// it can happen in a window the quit never included, and aborting the whole quit from there
+    /// would switch it off underneath the window actually being prompted. When the plan *is*
+    /// waiting on this window the whole quit does stand down — the user asked to quit with this
+    /// document's changes handled, and that is no longer possible.
+    ///
+    /// The three save-failure sites that still call the **unscoped**
+    /// [`note_prompt_cancelled`] — [`abort_save_with_backup_error`], the `SaveFailed` arm, and
+    /// `prompt_then_save`'s cancelled-panel arm — are **not** in-plan-only, and this comment used
+    /// to claim they were. `save` has no dirty guard, so a ⌘S (or a Save-As panel that resolves
+    /// after a quit starts) arms a save on a *clean* window, and a clean window is never in the
+    /// plan: a `SaveFailed` folding into it aborts a quit prompting some other window. That is a
+    /// pre-existing §5.2/§7.3 defect, unrelated to anything B1 changed, so it is captured in
+    /// `projects/quit-stand-down-scope.md` to be fixed with its own tests rather than widened into
+    /// this diff. (`dismiss_modal`'s cancel path is genuinely safe: a window showing an
+    /// `UnsavedChanges` modal is dirty, hence in the plan.)
+    ///
+    /// [`abort_save_with_backup_error`]: Self::abort_save_with_backup_error
+    /// [`note_quit_prompt_unanswerable`]: FreeCellApp::note_quit_prompt_unanswerable
+    /// [`note_prompt_cancelled`]: FreeCellApp::note_prompt_cancelled
+    fn abandon_work_waiting_on_the_worker(&mut self, cx: &mut Context<Self>) {
+        self.close_after_save = false;
+        self.pending_save_req = None;
+        self.pending_save_path = None;
+        // Not load-bearing (an export gates nothing), but no reply is coming for it either.
+        self.pending_export_req = None;
+        FreeCellApp::note_quit_prompt_unanswerable(self.key, cx);
+    }
+
+    /// The OK-only notice explaining that an action was refused because the worker is gone. A
+    /// **terminal** report already showing (the load failure, which closes the window on dismiss)
+    /// is not replaced — same rule as `on_worker_lost`, and reachable the same way: a window whose
+    /// load failed is showing that dialog and is also worker-lost, so a ⌘S (which routes to `save`
+    /// whatever modal is up) would otherwise swap it for a non-terminal notice and the window would
+    /// stop closing on dismiss.
+    fn show_worker_lost_notice(&mut self, detail: &str, cx: &mut Context<Self>) {
+        if matches!(
+            self.modal,
+            Some(ActiveModal::Error {
+                close_window_on_dismiss: true,
+                ..
+            })
+        ) {
+            return;
+        }
+        self.modal = Some(ActiveModal::Error {
+            title: "The calculation engine stopped".into(),
+            detail: detail.into(),
+            close_window_on_dismiss: false,
+        });
         cx.notify();
     }
 
@@ -1012,6 +1249,17 @@ impl WorkbookWindow {
     /// side output — it does **not** change the document's dirty flag, path, or title. A cancelled
     /// panel is a no-op (no close/quit follow-up rides an export).
     fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Same reason as the save paths (B1, `functional_spec.md F2.3`): with the worker gone the
+        // `ExportCsv` command is dropped and no `CsvExported`/`CsvExportFailed` ever comes back, so
+        // the panel would be a lie. Say so instead of opening it.
+        if self.worker_lost {
+            self.show_worker_lost_notice(
+                "This workbook can't be exported from this window any more. Open the file again \
+                 to keep working.",
+                cx,
+            );
+            return;
+        }
         let sheet = self.sink_shared.active_sheet.get();
         let suggested = self.export_csv_suggested_name(sheet);
         let directory = self
@@ -1117,6 +1365,12 @@ impl WorkbookWindow {
     #[cfg(test)]
     pub(crate) fn dismiss_modal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_modal(window, cx);
+    }
+
+    /// Test seam: the unsaved-changes prompt's **Don't Save** / **Close Without Saving** button.
+    #[cfg(test)]
+    pub(crate) fn modal_dont_save_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal_dont_save(window, cx);
     }
 
     /// Test seam: fold a synthesized [`WorkerEvent`] directly, with no live-worker
@@ -1283,6 +1537,44 @@ impl WorkbookWindow {
         }
     }
 
+    /// Test seam: the active error modal's body copy (so a test can assert the exact wording,
+    /// including any number the message quotes back to the user); `None` when no error modal is
+    /// showing.
+    #[cfg(test)]
+    pub(crate) fn error_modal_detail(&self) -> Option<String> {
+        match &self.modal {
+            Some(ActiveModal::Error { detail, .. }) => Some(detail.clone()),
+            _ => None,
+        }
+    }
+
+    /// Test seam: give the window a document path (as a load / Save-As adoption would), so a
+    /// `save(false, ..)` resolves straight to a path instead of opening the native panel.
+    #[cfg(test)]
+    pub(crate) fn set_path_for_test(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
+    /// Test seam: whether the window lost its worker (B1, `functional_spec.md F2.3`) — the state
+    /// in which every save path refuses and the bar carries no `Save As…`.
+    #[cfg(test)]
+    pub(crate) fn is_worker_lost_for_test(&self) -> bool {
+        self.worker_lost
+    }
+
+    /// Test seam: whether a save is armed and waiting for a `Saved`/`SaveFailed` reply.
+    #[cfg(test)]
+    pub(crate) fn has_pending_save_for_test(&self) -> bool {
+        self.pending_save_req.is_some()
+    }
+
+    /// Test seam: whether the window is in the degraded state (the degraded bar + disabled
+    /// mutating controls).
+    #[cfg(test)]
+    pub(crate) fn is_degraded_for_test(&self) -> bool {
+        self.degraded.is_some()
+    }
+
     /// Test seam: the `(sheet, area)` the merge confirm modal carries — the exact merge that its
     /// **Merge** button re-sends with `confirmed: true`; `None` when no confirm modal is showing.
     #[cfg(test)]
@@ -1365,11 +1657,15 @@ impl Render for WorkbookWindow {
             .children(
                 titlebar::MACOS_TITLEBAR.then(|| titlebar::titlebar_row(self.titlebar_title())),
             )
-            .children(
-                self.degraded
-                    .clone()
-                    .map(|reason| self.render_degraded_bar(&reason, cx)),
-            )
+            .children(self.degraded.clone().map(|reason| {
+                // A lost worker gets its own bar: same look, no `Save As…` (B1,
+                // `functional_spec.md F2.3` — there is nothing left that could write the file).
+                if self.worker_lost {
+                    self.render_worker_lost_bar()
+                } else {
+                    self.render_degraded_bar(&reason, cx)
+                }
+            }))
             .child(self.render_body(cx))
             .children(self.render_modal(cx))
     }
@@ -1403,6 +1699,29 @@ impl WorkbookWindow {
     fn render_modal(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let modal = self.modal.as_ref()?;
         let card = match modal {
+            // With the worker gone there is no Save to offer (B1, `functional_spec.md F2.3`): the
+            // command would be dropped and the window would sit here forever waiting for a `Saved`
+            // that cannot arrive — which, on the quit path, parks the whole `QuitPlan`. The prompt
+            // states that and offers the two choices that still resolve.
+            ActiveModal::UnsavedChanges if self.worker_lost => dialog_card(
+                "Unsaved changes can't be saved",
+                "The calculation engine stopped, so this workbook can no longer be saved from \
+                 this window. Closing it discards the unsaved changes.",
+                vec![
+                    Button::new("cancel")
+                        .label("Cancel")
+                        .ghost()
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.dismiss_modal(window, cx)
+                        })),
+                    Button::new("dont-save")
+                        .label("Close Without Saving")
+                        .primary()
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.modal_dont_save(window, cx)
+                        })),
+                ],
+            ),
             ActiveModal::UnsavedChanges => dialog_card(
                 "Unsaved changes",
                 "Do you want to save the changes to this workbook?",
@@ -1521,8 +1840,41 @@ fn dialog_card(title: &str, body: &str, buttons: Vec<Button>) -> gpui::AnyElemen
 }
 
 impl WorkbookWindow {
+    /// The **worker-lost** bar (B1, `engine-worker-hardening functional_spec.md F2.3`): the
+    /// degraded bar's look with **no Save As button**, because with the worker gone no save can be
+    /// performed from this window. The wording matches the dialog rather than contradicting it —
+    /// the degraded bar's "Save As to keep your work" would be an offer this state cannot honour.
+    fn render_worker_lost_bar(&self) -> gpui::AnyElement {
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .bg(rgb(DEGRADED_BG))
+            .border_b_1()
+            .border_color(rgb(DANGER))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.0))
+                    .text_color(rgb(DANGER))
+                    .child(
+                        "The calculation engine stopped. This window is read-only and its \
+                         unsaved changes can't be saved — open the file again to keep working."
+                            .to_string(),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The non-dismissable degraded-worker bar (`functional_spec.md §6`): an explanatory line
-    /// plus a real **Save As** button that writes the last good state (edits are refused).
+    /// plus a real **Save As** button that writes the last good state (edits are refused). Only
+    /// shown while the worker is still **alive** — see [`render_worker_lost_bar`] for the state
+    /// where it is not, in which that button could do nothing.
+    ///
+    /// [`render_worker_lost_bar`]: Self::render_worker_lost_bar
     fn render_degraded_bar(&self, reason: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
             .w_full()
@@ -2155,6 +2507,403 @@ pub(super) fn open_panel_options() -> PathPromptOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+
+    /// Boots gpui-component + the app global in a fresh test app, with recents isolated from the
+    /// real per-user data dir (mirrors `app.rs`'s own `boot`, which is private to its test module).
+    fn boot(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            FreeCellApp::init(cx);
+            FreeCellApp::reset_recents_for_test(None, cx);
+        });
+    }
+
+    /// B1 (`functional_spec.md F2.3`): the worker→UI event stream closing without a shutdown this
+    /// window requested means the worker thread is gone. It used to `break` silently — the window
+    /// kept rendering its last publication forever while edits vanished and Save did nothing.
+    #[gpui::test]
+    fn worker_death_degrades_the_window_and_says_so(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let window = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        assert!(
+            !cx.update(|cx| window.read(cx).is_degraded_for_test()),
+            "a live worker is not degraded"
+        );
+
+        // The worker thread dying = its sender dropped, closing the event stream.
+        drop(sender);
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|cx| window.read(cx).is_degraded_for_test()),
+            "a lost worker degrades the window (bar up, mutating controls off)"
+        );
+        assert_eq!(
+            cx.update(|cx| window.read(cx).error_modal_title()),
+            Some("The calculation engine stopped".to_string()),
+            "and it says so, rather than rendering a stale document forever"
+        );
+        assert_eq!(
+            cx.update(|cx| window.read(cx).error_modal_closes_window_on_dismiss()),
+            Some(false),
+            "the window stays open — closing it would take the last readable copy off the screen"
+        );
+    }
+
+    /// B1 (`functional_spec.md F2.3`): a lost worker must not be offered a Save. `save` refuses
+    /// (nothing armed, nothing sent, no close/quit follow-up left standing) and says why — before
+    /// this, `send_save` armed `pending_save_req` and dropped the command into a channel with no
+    /// reader, so no `Saved`/`SaveFailed` could ever arrive.
+    #[gpui::test]
+    fn a_lost_worker_refuses_to_save(cx: &mut TestAppContext) {
+        boot(cx);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Budget.xlsx");
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        let handle = cx
+            .update(|cx| FreeCellApp::nth_window_handle(cx, 0))
+            .unwrap();
+
+        drop(sender);
+        cx.run_until_parked();
+        assert!(cx.update(|cx| entity.read(cx).is_worker_lost_for_test()));
+
+        // Arm the close-after-save follow-up the unsaved-changes **Save** button sets (and give the
+        // window a path, so `save` resolves straight to `send_save` with no native panel), then run
+        // the save flow.
+        cx.update(|cx| {
+            entity.update(cx, |w, _| {
+                w.set_path_for_test(target.clone());
+                w.arm_pending_save_for_test(target.clone(), 7, true);
+            })
+        });
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.save(false, window, ctx));
+            })
+            .unwrap();
+
+        assert!(
+            !cx.update(|cx| entity.read(cx).will_close_after_save()),
+            "a refused save must not leave the window waiting to close — that is how a dirty \
+             window whose worker died used to park an in-progress Quit forever"
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).has_pending_save_for_test()),
+            "and it must not arm a save that can never be answered"
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("The calculation engine stopped".to_string()),
+            "the refusal is explained rather than silent"
+        );
+        assert!(!target.exists(), "nothing was written");
+    }
+
+    /// A failed load emits `LoadFailed` and *then* returns, closing the stream — so the worker-lost
+    /// path fires right behind it. The accurate open-failure dialog must survive.
+    #[gpui::test]
+    fn worker_death_after_a_load_failure_keeps_the_load_dialog(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let window = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+
+        sender
+            .send_blocking(WorkerEvent::LoadFailed {
+                error: freecell_engine::LoadError::EnginePanic,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        drop(sender);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| window.read(cx).error_modal_title()),
+            Some("Couldn't open the workbook".to_string()),
+            "the specific load-failure dialog is not stomped by the generic crash one"
+        );
+        assert!(
+            cx.update(|cx| window.read(cx).is_degraded_for_test()),
+            "the window is still degraded — the worker really is gone"
+        );
+    }
+
+    /// The stand-down is scoped to windows the quit is actually waiting on. Losing a worker in a
+    /// window the plan never included — a clean window, or one already resolved — must not silently
+    /// switch the quit off underneath the window being prompted: the user would answer that prompt,
+    /// its window would close, and nothing further would happen. Same rule (and the same
+    /// `QuitPlan::is_pending` check) `on_window_closed` already applies so an unrelated window
+    /// closing mid-quit doesn't disturb the prompt in flight.
+    #[gpui::test]
+    fn a_clean_windows_worker_death_leaves_someone_elses_quit_alone(cx: &mut TestAppContext) {
+        boot(cx);
+        let _dirty_sender = cx.update(FreeCellApp::open_detached_live_document);
+        let clean_sender = cx.update(FreeCellApp::open_detached_live_document);
+        let dirty = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        let dirty_handle = cx
+            .update(|cx| FreeCellApp::nth_window_handle(cx, 0))
+            .unwrap();
+        let clean = cx.update(|cx| FreeCellApp::nth_window(cx, 1)).unwrap();
+
+        cx.update(|cx| dirty.update(cx, |w, cx| w.set_dirty_for_test(true, cx)));
+        cx.update(FreeCellApp::request_quit);
+        assert!(
+            cx.update(|cx| dirty.read(cx).has_unsaved_modal()),
+            "the quit prompts the one dirty window"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            Some((1, false))
+        );
+
+        // The OTHER window — clean, never prompted, not in the plan — loses its worker.
+        drop(clean_sender);
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|cx| clean.read(cx).is_worker_lost_for_test()),
+            "precondition: the clean window really did lose its worker"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            Some((1, false)),
+            "a death in a window the quit was never waiting on leaves the quit running"
+        );
+
+        // And the prompt still drives it: discarding closes the prompted window and the quit
+        // proceeds (no window left dirty → it quits rather than sitting on a dead plan).
+        dirty_handle
+            .update(cx, |_root, window, appcx| {
+                dirty.update(appcx, |w, ctx| w.modal_dont_save_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "answering the prompt resolves the plan, rather than answering into a quit that was \
+             switched off behind the user's back"
+        );
+    }
+
+    /// Ordering (a): the worker dies while the **quit prompt** is up. Replacing the prompt with the
+    /// fatal report is not enough on its own — dismissing that report runs `dismiss_modal`, whose
+    /// quit-abort branch only fires for an `UnsavedChanges` modal, so the `QuitPlan` was left
+    /// pending on a window that will never resolve. ⌘Q then looked like it did nothing, and worse:
+    /// closing some *other* dirty window later re-prompted this one out of nowhere.
+    #[gpui::test]
+    fn worker_death_during_a_quit_prompt_stands_the_quit_down(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        let handle = cx
+            .update(|cx| FreeCellApp::nth_window_handle(cx, 0))
+            .unwrap();
+
+        cx.update(|cx| entity.update(cx, |w, cx| w.set_dirty_for_test(true, cx)));
+        cx.update(FreeCellApp::request_quit);
+        assert!(
+            cx.update(|cx| entity.read(cx).has_unsaved_modal()),
+            "the quit prompts the dirty window"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            Some((1, false))
+        );
+
+        drop(sender);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "losing the worker under a quit prompt stands the quit down — the window can no \
+             longer answer it, so the plan is abandoned rather than left pending"
+        );
+
+        // Dismissing the fatal report leaves nothing armed, and the quit stays stood down.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.dismiss_modal_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "and dismissing it does not revive the quit"
+        );
+
+        // The window is *still dirty* (losing the worker doesn't change the op accounting), so a
+        // fresh ⌘Q prompts it again — with the worker-lost variant, whose Cancel / Close Without
+        // Saving both resolve. Nothing is wedged; the quit simply has to be re-issued.
+        cx.update(FreeCellApp::request_quit);
+        assert!(
+            cx.update(|cx| entity.read(cx).is_dirty()),
+            "the document is still dirty after the loss"
+        );
+        assert!(
+            cx.update(|cx| entity.read(cx).has_unsaved_modal()),
+            "a re-issued quit still prompts this window"
+        );
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.modal_dont_save_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::window_count(cx)),
+            0,
+            "Close Without Saving closes it, which is how the re-issued quit resolves"
+        );
+    }
+
+    /// Ordering (b): a save was **already in flight** when the worker died — the unsaved-changes
+    /// Save armed `close_after_save` + `pending_save_req` and sent, and *then* an unguarded panic
+    /// took the worker down, which is the premise of B1. No `Saved`/`SaveFailed` can arrive, so
+    /// both flags stayed armed forever: the window never closed and the quit never resolved. The
+    /// entry guards on `save`/`send_save` cannot cover this; the teardown in `on_worker_lost` does.
+    #[gpui::test]
+    fn worker_death_disarms_a_save_that_was_already_in_flight(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+
+        cx.update(|cx| entity.update(cx, |w, cx| w.set_dirty_for_test(true, cx)));
+        cx.update(FreeCellApp::request_quit);
+        // What the prompt's **Save** button does: arm the close-after-save follow-up and send.
+        cx.update(|cx| {
+            entity.update(cx, |w, _| {
+                w.arm_pending_save_for_test(PathBuf::from("/never/written.xlsx"), 7, true)
+            })
+        });
+        assert!(cx.update(|cx| entity.read(cx).will_close_after_save()));
+
+        drop(sender);
+        cx.run_until_parked();
+
+        assert!(
+            !cx.update(|cx| entity.read(cx).has_pending_save_for_test()),
+            "a save that can never be answered must not stay armed"
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).will_close_after_save()),
+            "and it must not leave the window waiting to close on that answer"
+        );
+        assert_eq!(
+            cx.update(|cx| FreeCellApp::quit_plan_for_test(cx)),
+            None,
+            "the quit that was waiting on that save is stood down rather than parked"
+        );
+    }
+
+    /// A refused save must not stomp a **terminal** report either. Reachable: the load fails (its
+    /// dialog closes the window on dismiss) and the thread then exits, so the window is also
+    /// worker-lost; ⌘S routes to `save` whatever modal is up, and the refusal notice would replace
+    /// the terminal dialog with a non-terminal one — after which dismissing no longer closes the
+    /// window. Same rule as `on_worker_lost`, applied at the other end.
+    #[gpui::test]
+    fn a_refused_save_keeps_a_terminal_load_dialog(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+        let handle = cx
+            .update(|cx| FreeCellApp::nth_window_handle(cx, 0))
+            .unwrap();
+
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::LoadFailed {
+                            error: freecell_engine::LoadError::EnginePanic,
+                        },
+                        window,
+                        ctx,
+                    )
+                });
+            })
+            .unwrap();
+        drop(sender);
+        cx.run_until_parked();
+        assert!(cx.update(|cx| entity.read(cx).is_worker_lost_for_test()));
+
+        // ⌘S on the failed window.
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.save(false, window, ctx));
+            })
+            .unwrap();
+
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("Couldn't open the workbook".to_string()),
+            "the terminal load-failure dialog survives a refused save"
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_closes_window_on_dismiss()),
+            Some(true),
+            "and it still closes the window on dismiss"
+        );
+    }
+
+    /// The fatal report fires **once**, with no re-arm, so a modal that is not itself a terminal
+    /// report must not swallow it: an unsaved-changes prompt showing when the worker dies is
+    /// offering a Save that can no longer happen, and dismissing it would otherwise leave the user
+    /// with only the bar and no notice at all.
+    #[gpui::test]
+    fn worker_death_replaces_a_non_terminal_modal(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+
+        cx.update(|cx| entity.update(cx, |w, cx| w.show_unsaved_modal(cx)));
+        assert!(cx.update(|cx| entity.read(cx).has_unsaved_modal()));
+
+        drop(sender);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("The calculation engine stopped".to_string()),
+            "the prompt that can no longer be honoured is replaced by the fatal report"
+        );
+    }
+
+    /// A worker that dies **before** `Loaded` (everything after the guarded `from_source` still
+    /// runs unguarded on freshly parsed input) used to leave the "Opening X…" overlay spinning
+    /// behind the fatal dialog: `on_worker_lost` never cleared it the way `Loaded`/`LoadFailed` do.
+    #[gpui::test]
+    fn worker_death_clears_the_loading_overlay(cx: &mut TestAppContext) {
+        boot(cx);
+        let sender = cx.update(FreeCellApp::open_detached_live_document);
+        let entity = cx.update(|cx| FreeCellApp::nth_window(cx, 0)).unwrap();
+
+        // The state an `OpenFile` window sits in until the worker's first `Loaded`: window flag +
+        // the grid's overlay, exactly as `WorkbookWindow::new` sets them.
+        cx.update(|cx| {
+            entity.update(cx, |w, cx| {
+                w.set_loading_for_test(Some("Budget.xlsx".to_string()));
+                w.grid
+                    .update(cx, |g, cx| g.set_loading(Some("Budget.xlsx".into()), cx));
+            })
+        });
+        assert!(cx.update(|cx| entity.read(cx).is_loading()));
+        assert!(cx.update(|cx| entity.read(cx).grid.read(cx).is_loading_for_test()));
+
+        drop(sender);
+        cx.run_until_parked();
+
+        assert!(
+            !cx.update(|cx| entity.read(cx).is_loading()),
+            "a lost worker is never going to finish opening the file"
+        );
+        assert!(
+            !cx.update(|cx| entity.read(cx).grid.read(cx).is_loading_for_test()),
+            "including the overlay the user actually sees spinning"
+        );
+    }
 
     /// The macOS custom titlebar (§7.1 / `ui_design.md §1`) shows the edited state **textually**
     /// and **always** — its distinguishing contract vs the native window title, which drops the

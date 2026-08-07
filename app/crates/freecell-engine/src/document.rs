@@ -78,6 +78,22 @@ pub enum DocumentSource {
     OpenDemo(PathBuf),
 }
 
+/// The file name that makes [`WorkbookDocument::from_source`] and
+/// [`crate::worker`]'s save path panic on purpose, so the `catch_unwind` guards around them can be
+/// exercised at their real call sites (B1, `functional_spec.md F2`). `#[cfg(test)]` — it cannot
+/// reach a release build, and no real file is ever read or written under this name.
+#[cfg(test)]
+pub(crate) const PANIC_SENTINEL: &str = "FREECELL_TEST_PANIC.xlsx";
+
+/// The chart-source file name that makes the worker's chart **bind** step
+/// ([`Worker::bind_discovered`](crate::worker::charts)) panic on purpose. Separate from
+/// [`PANIC_SENTINEL`] because the save-time sweep has two panic-prone steps per sheet — the parse
+/// and the bind — and its "mark the sheet only after BOTH returned" ordering needs a test for each
+/// (a parse-side injection alone passes under an ordering that marks between them). `#[cfg(test)]`;
+/// no real file is ever read or written under this name.
+#[cfg(test)]
+pub(crate) const CHART_BIND_PANIC_SENTINEL: &str = "FREECELL_TEST_BIND_PANIC.xlsx";
+
 /// A typed open failure. Each variant maps to a human-readable dialog sentence; the
 /// underlying engine/OS message is preserved for the details line (`architecture.md §5`,
 /// `functional_spec.md §5.1`). `Clone` so it can ride the worker's `WorkerEvent::LoadFailed`.
@@ -106,6 +122,14 @@ pub enum LoadError {
     /// malformed record (`functional_spec.md §2`, D2.5). The message is the dialog detail.
     #[error("This CSV can't be imported: {0}")]
     BadCsv(String),
+    /// The calculation engine **panicked** while opening the file, and the worker caught it
+    /// (`engine-worker-hardening functional_spec.md F2.1`). Distinct from [`Corrupt`](Self::Corrupt):
+    /// the importer didn't return an error, it unwound.
+    #[error(
+        "The calculation engine crashed while opening this file. The file may use a feature \
+         FreeCell can't read yet."
+    )]
+    EnginePanic,
 }
 
 /// A typed save failure. Because saves are atomic (temp file + rename), any failure leaves
@@ -119,6 +143,16 @@ pub enum SaveError {
     /// IronCalc's xlsx writer failed to serialize the model.
     #[error("The workbook couldn't be written: {0}")]
     Serialize(String),
+    /// The calculation engine **panicked** while writing the file, and the worker caught it
+    /// (`engine-worker-hardening functional_spec.md F2.2`). This is not hypothetical: the pinned
+    /// exporter still carries `panic!("Model needs to be evaluated before saving!")` on an
+    /// unevaluated formula cell (`xlsx/src/export/worksheets.rs`, upstream-flagged `// TODO: We
+    /// should NOT panic here.`). The save is atomic, so the destination file is untouched.
+    #[error(
+        "The calculation engine crashed while writing the file. Your work is still open and \
+         unchanged — try Save As to a new file."
+    )]
+    EnginePanic,
 }
 
 /// A cell read (formatted value / raw content / style) hit an invalid sheet or coordinate.
@@ -258,6 +292,17 @@ impl WorkbookDocument {
 
     /// Builds a document from a [`DocumentSource`] (Phase-4 `spawn` entry point).
     pub fn from_source(source: &DocumentSource) -> Result<Self, LoadError> {
+        // Panic injection for the load guard's test (B1, `functional_spec.md F2.1`), keyed off a
+        // sentinel file name rather than a new `DocumentSource` variant so no test-only shape
+        // reaches the public source enum. `#[cfg(test)]`, mirroring `Command::TestPanic`.
+        #[cfg(test)]
+        if matches!(
+            source,
+            DocumentSource::OpenFile(p) | DocumentSource::ImportCsv(p) | DocumentSource::OpenDemo(p)
+                if p.file_name().is_some_and(|n| n == PANIC_SENTINEL)
+        ) {
+            panic!("injected test panic (load catch_unwind recovery)");
+        }
         match source {
             DocumentSource::NewWorkbook => Self::new_empty(),
             DocumentSource::OpenFile(path) => Self::open(path),
@@ -852,10 +897,22 @@ impl WorkbookDocument {
     }
 
     /// Sets the frozen-rows count `M` — leading rows `0..M` pinned to the top (`freeze-panes`
-    /// `architecture.md §2.2`). One undoable diff (the fork's `set_frozen_rows_count`). Defensive
-    /// clamp: the fork's `Model::set_frozen_rows` **errors** at `count >= LAST_ROW`, i.e. its max
-    /// accepted count is all-but-one track — so a "freeze at the very last track" action degrades
-    /// to the engine max instead of erroring (`functional_spec.md §5.2` tolerates, never blocks).
+    /// `architecture.md §2.2`). One undoable diff (the fork's `set_frozen_rows_count`).
+    ///
+    /// The `MAX_ROWS - 1` clamp is a **dead backstop, kept deliberately**. It exists because the
+    /// fork's `Model::set_frozen_rows_count` *errors* at `count >= LAST_ROW`, and it used to be
+    /// live: `freeze-panes` §5.2 let any count through and degraded an out-of-range one to the
+    /// engine max. That contract is **superseded** by B2
+    /// (`engine-worker-hardening/functional_spec.md F1.2`) — degrading to ~1M frozen rows *was*
+    /// the denial of service. `Worker::pre_validate` now rejects any `SetFrozen` over
+    /// `MAX_FROZEN_ROWS` (64), which sits four orders of magnitude below this clamp, so **no
+    /// command path can reach it**.
+    ///
+    /// No test exercises it any more, and that is accepted: the only way to reach it would be to
+    /// call this wrapper directly, bypassing the command path that is the sole production caller —
+    /// a test that asserts on an unreachable branch pins an implementation detail, not a contract.
+    /// The clamp stays because it is one `min` and it keeps this wrapper total if the cap above it
+    /// is ever raised or moved.
     pub(crate) fn set_frozen_rows(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
         crate::instrument::record_engine_call();
         let clamped = count.min(freecell_core::limits::MAX_ROWS - 1);
@@ -865,6 +922,10 @@ impl WorkbookDocument {
     /// Sets the frozen-columns count `K` — leading columns `0..K` pinned to the left (the column
     /// analog of [`set_frozen_rows`](Self::set_frozen_rows); the fork's
     /// `set_frozen_columns_count`, clamped below its `LAST_COLUMN` guard).
+    ///
+    /// Same status as the row clamp: a dead backstop below `MAX_FROZEN_COLS` (32), unreachable
+    /// from any command path because `pre_validate` rejects first, and untested for the reason
+    /// spelled out on [`set_frozen_rows`](Self::set_frozen_rows).
     pub(crate) fn set_frozen_columns(&mut self, sheet_idx: u32, count: u32) -> Result<(), String> {
         crate::instrument::record_engine_call();
         let clamped = count.min(freecell_core::limits::MAX_COLS - 1);

@@ -170,6 +170,38 @@ impl FreeCellApp {
         });
     }
 
+    /// Test-only: opens a worker-less document window whose event stream stays **open**, and
+    /// returns the sender feeding it. Dropping the sender simulates the worker thread dying without
+    /// a requested shutdown (B1, `functional_spec.md F2.3`).
+    #[cfg(test)]
+    pub(crate) fn open_detached_live_document(
+        cx: &mut App,
+    ) -> async_channel::Sender<freecell_engine::WorkerEvent> {
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let filled = std::rc::Rc::clone(&slot);
+        cx.update_global::<FreeCellApp, _>(move |app, cx| {
+            let key = app.registry.register(None);
+            app.install_document_window(
+                key,
+                move |window, cx| {
+                    let mut sender = None;
+                    let w = WorkbookWindow::new_detached_live_for_test(
+                        key,
+                        None,
+                        &mut sender,
+                        window,
+                        cx,
+                    );
+                    *filled.borrow_mut() = sender;
+                    w
+                },
+                cx,
+            );
+        });
+        let sender = slot.borrow_mut().take();
+        sender.expect("the detached-live window handed back its event sender")
+    }
+
     /// Test-only mirror of [`open_path`](Self::open_path): same canonicalize + dedupe, but the
     /// opened window is worker-less (so the required suite stays deterministic).
     #[cfg(test)]
@@ -268,6 +300,32 @@ impl FreeCellApp {
     /// A close/quit prompt (or its save panel) was cancelled → abort an in-progress quit.
     pub fn note_prompt_cancelled(cx: &mut App) {
         cx.update_global::<FreeCellApp, _>(|app, cx| {
+            if let Some(plan) = app.quit_plan.as_mut() {
+                plan.cancel();
+                app.advance_quit(cx);
+            }
+        });
+    }
+
+    /// `key`'s window can no longer answer a quit prompt (its worker died — B1,
+    /// `engine-worker-hardening functional_spec.md F2.3`) → stand the quit down, but **only if the
+    /// plan is actually waiting on that window**.
+    ///
+    /// The scope check is the point. A worker death is not a user gesture, so unlike
+    /// [`note_prompt_cancelled`](Self::note_prompt_cancelled) it can fire in a window that has
+    /// nothing to do with the quit — a clean window, or one already resolved. Aborting on that
+    /// would switch the quit off underneath whichever window is being prompted: the user answers
+    /// that prompt, its window closes, and nothing further happens. Same guard, for the same
+    /// reason, as [`on_window_closed`](Self::on_window_closed)'s `is_pending` check.
+    pub fn note_quit_prompt_unanswerable(key: WindowKey, cx: &mut App) {
+        cx.update_global::<FreeCellApp, _>(|app, cx| {
+            let waiting_on_this_window = app
+                .quit_plan
+                .as_ref()
+                .is_some_and(|plan| plan.is_pending(key));
+            if !waiting_on_this_window {
+                return;
+            }
             if let Some(plan) = app.quit_plan.as_mut() {
                 plan.cancel();
                 app.advance_quit(cx);
@@ -741,6 +799,17 @@ impl FreeCellApp {
             .windows
             .get(index)
             .map(|w| w.handle)
+    }
+
+    /// The in-progress quit plan, as `(pending prompt count, aborted)` — `None` when no quit is
+    /// running (tests). A plan that is neither gone nor aborted is a quit still waiting on a
+    /// window's prompt, which is exactly the state a lost worker must not be able to leave behind.
+    #[cfg(test)]
+    pub(crate) fn quit_plan_for_test(cx: &App) -> Option<(usize, bool)> {
+        cx.global::<FreeCellApp>()
+            .quit_plan
+            .as_ref()
+            .map(|plan| (plan.pending_count(), plan.aborted()))
     }
 
     /// The stored recent-files paths, most-recent-first (tests).
@@ -1627,14 +1696,25 @@ mod tests {
         // window constructs with loading = None, which would make it vacuous).
         handle
             .update(cx, |_root, _window, appcx| {
-                entity.update(appcx, |w, _ctx| {
+                entity.update(appcx, |w, ctx| {
                     w.set_loading_for_test(Some("Budget.xlsx".into()));
+                    // The overlay half too — that is what actually paints the spinner.
+                    w.grid_for_test()
+                        .update(ctx, |g, ctx| g.set_loading(Some("Budget.xlsx".into()), ctx));
                 });
             })
             .unwrap();
         assert!(
             cx.update(|cx| entity.read(cx).is_loading()),
             "precondition: the window is loading before the failure"
+        );
+        assert!(
+            cx.update(|cx| entity
+                .read(cx)
+                .grid_for_test()
+                .read(cx)
+                .is_loading_for_test()),
+            "precondition: the grid overlay is up before the failure"
         );
 
         handle
@@ -1664,6 +1744,14 @@ mod tests {
             !cx.update(|cx| entity.read(cx).is_loading()),
             "the loading state is cleared on load failure"
         );
+        assert!(
+            !cx.update(|cx| entity
+                .read(cx)
+                .grid_for_test()
+                .read(cx)
+                .is_loading_for_test()),
+            "including the grid overlay, which would otherwise spin behind the dialog"
+        );
     }
 
     // ---- Phase 11: composed grid + chrome + worker-event routing ---------------------------
@@ -1678,7 +1766,7 @@ mod tests {
     use freecell_core::data_row::FieldMode;
     use freecell_core::input_cap::InputRejection;
     use freecell_core::{CellRange, CellRef, SelectionModel, SheetId};
-    use freecell_engine::{EditRejectedReason, SheetMeta};
+    use freecell_engine::{EditRejectedReason, FrozenAxis, SheetMeta};
 
     fn sheet_meta(id: u32, name: &str, has_content: bool) -> SheetMeta {
         SheetMeta {
@@ -1821,6 +1909,88 @@ mod tests {
             cx.update(|cx| entity.read(cx).error_modal_closes_window_on_dismiss()),
             Some(false),
             "the document is intact — dismissing keeps the window (§6)"
+        );
+    }
+
+    #[gpui::test]
+    fn edit_rejected_frozen_pane_too_large_names_the_axis_request_and_cap(cx: &mut TestAppContext) {
+        // B2's ONLY user-facing surface (`engine-worker-hardening functional_spec.md F1.2`): the
+        // reachable gesture is ⌘A → right-click a row header → "Freeze rows", which asks to pin
+        // the whole 1,048,576-row axis. The refusal has to name all three numbers or it reads as
+        // arbitrary, and the request is grouped because that is the number the user has to
+        // recognise as "the entire sheet".
+        boot(cx);
+        let (handle, entity) = new_injectable_window(cx);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EditRejected {
+                            reason: EditRejectedReason::FrozenPaneTooLarge {
+                                axis: FrozenAxis::Rows,
+                                requested: 1_048_576,
+                                max: 64,
+                            },
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("Can't freeze that many rows".to_string())
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_detail()),
+            Some(
+                "FreeCell can pin at most 64 rows (you asked for 1,048,576). \
+                 Select fewer rows and try again."
+                    .to_string()
+            ),
+            "the detail carries the cap, the GROUPED request and the axis noun"
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_closes_window_on_dismiss()),
+            Some(false),
+            "nothing was applied — dismissing keeps the window"
+        );
+    }
+
+    #[gpui::test]
+    fn edit_rejected_frozen_pane_too_large_uses_the_column_noun(cx: &mut TestAppContext) {
+        // The column axis reports its own noun and its own (smaller) cap.
+        boot(cx);
+        let (handle, entity) = new_injectable_window(cx);
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| {
+                    w.inject_worker_event_for_test(
+                        WorkerEvent::EditRejected {
+                            reason: EditRejectedReason::FrozenPaneTooLarge {
+                                axis: FrozenAxis::Columns,
+                                requested: 16_384,
+                                max: 32,
+                            },
+                        },
+                        window,
+                        ctx,
+                    );
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_title()),
+            Some("Can't freeze that many columns".to_string())
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).error_modal_detail()),
+            Some(
+                "FreeCell can pin at most 32 columns (you asked for 16,384). \
+                 Select fewer columns and try again."
+                    .to_string()
+            )
         );
     }
 
@@ -2237,6 +2407,7 @@ mod tests {
         // 1) A v1 snapshot with one chart installs on the next Published.
         client.set_chart_snapshot(ChartSnapshot {
             version: 1,
+            generation: 1,
             sheets: vec![(sheet, std::sync::Arc::from(vec![chart_spec_for_test()]))],
         });
         inject_published(cx);
@@ -2250,6 +2421,7 @@ mod tests {
         // re-install would have cleared the sheet.
         client.set_chart_snapshot(ChartSnapshot {
             version: 1,
+            generation: 1,
             sheets: Vec::new(),
         });
         inject_published(cx);
@@ -2262,6 +2434,7 @@ mod tests {
         // 3) A higher version that drops the sheet clears its charts (the dropped-sheet branch).
         client.set_chart_snapshot(ChartSnapshot {
             version: 2,
+            generation: 2,
             sheets: Vec::new(),
         });
         inject_published(cx);

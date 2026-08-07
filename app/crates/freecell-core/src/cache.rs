@@ -670,12 +670,21 @@ impl SheetCacheBuilder {
 
     /// Sets the frozen-rows count `M` (`freeze-panes`). The engine's build loop copies the
     /// worksheet's `frozen_rows` here; no geometry effect (see [`SheetCache::frozen_rows`]).
+    ///
+    /// **This setter does not enforce the frozen-pane cap** — it takes any `u32`. The cap
+    /// (`MAX_FROZEN_ROWS` / `MAX_FROZEN_COLS`, `engine-worker-hardening/architecture.md §A2.1`)
+    /// lives in `freecell-engine`, which is where the counts come from, and is applied at the two
+    /// points that matter: `freecell_engine::cache::build_sheet_cache` (the only production caller
+    /// of this setter, and what bounds both the publish loop and the grid's band renderer) and
+    /// `Worker::build_publication`. A hand-built fixture may therefore carry an oversized band on
+    /// purpose — `publish_clamps_an_oversized_frozen_band` does exactly that to test the backstop.
     pub fn set_frozen_rows(&mut self, count: u32) {
         self.frozen_rows = count;
     }
 
     /// Sets the frozen-columns count `K` (`freeze-panes`). See
-    /// [`SheetCacheBuilder::set_frozen_rows`].
+    /// [`SheetCacheBuilder::set_frozen_rows`] — including its note on where the frozen-pane cap
+    /// is enforced (not here).
     pub fn set_frozen_cols(&mut self, count: u32) {
         self.frozen_cols = count;
     }

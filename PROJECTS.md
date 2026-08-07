@@ -189,6 +189,32 @@ registry: each entry is a short description plus a pointer to a design note unde
   non-number — out of the scalar-functions batch's function-local scope. Workarounds
   `SUMPRODUCT(1*(cond))` and `SUMPRODUCT((A=x)*(B))` both work today. → [`projects/unary-minus-boolean-coercion.md`](projects/unary-minus-boolean-coercion.md)
 
+- **Frozen-pane boundary overflow on structural edits (fork fix)** — *Future (found in
+  `engine-worker-hardening` Phase 1 review, 2026-07-28).* IronCalc grows a sheet's frozen boundary
+  inside an insert's diff (`base/src/actions.rs:1051`, and the column twin at `:725`) with no upper
+  bound. `insert_rows`' range check doesn't help: it bounds the **insert** against the *populated*
+  dimension, not the resulting boundary, so the frozen count can end up past the last row of the
+  sheet — and it round-trips, because the writer emits `ySplit` verbatim and the reader takes it
+  back unchecked. Reaching it needs a **near-empty sheet** (with FreeCell's 64-row cap, nothing at
+  row 64 or deeper); on such a sheet it takes one Insert of a near-Select-All header run, or
+  repetition of ordinary ones to push the count arbitrarily high. Any data at row 64 or deeper
+  closes both. The count comes from the selected header run — the same untrusted-selection pattern
+  that caused B2. Belongs in the fork on its own `fix/<slug>` branch as one upstream PR, **not** as
+  a FreeCell workaround; FreeCell itself stays bounded because the sheet-cache clamp holds. The
+  note's measurements are observations at a pinned commit, not an envelope — re-derive before
+  relying on them. → [`projects/frozen-pane-boundary-overflow.md`](projects/frozen-pane-boundary-overflow.md)
+
+- **Quit stand-down scope: save-failure paths abort a quit prompting a *different* window** —
+  *Future (found in `engine-worker-hardening` Phase 2 review, 2026-07-28).* `note_prompt_cancelled`
+  aborts the global `QuitPlan` with no reference to the calling window. That is right for a
+  cancelled prompt, but three **save-failure** sites reach it from windows the quit was never
+  waiting on — the `SaveFailed` arm, `abort_save_with_backup_error`, and `prompt_then_save`'s
+  cancelled-panel arm — because `save` has no dirty guard, so a ⌘S (or a late Save-As panel) arms a
+  save on a *clean* window and a clean window is never in the plan. The quit then switches off while
+  another window's prompt is still on screen. `dismiss_modal`'s cancel path is already safe (an
+  `UnsavedChanges` window is dirty, hence in-plan), and B1's worker-death teardown already uses the
+  scoped `note_quit_prompt_unanswerable`. Fix all three together, gated on `QuitPlan::is_pending`,
+  each with its own two-window regression test. → [`projects/quit-stand-down-scope.md`](projects/quit-stand-down-scope.md)
 - **Split `grid/view.rs` (10,627 lines)** — *Future (filed from `chrome-view-split`,
   2026-07-28).* The grid view is **6,575 production lines** — 3.3× the 2,000-line ceiling F2 is
   meant to enforce, and the largest file in the workspace. Not urgent (it costs velocity and bus

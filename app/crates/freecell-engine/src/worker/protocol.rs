@@ -638,6 +638,32 @@ pub enum EditRejectedReason {
     /// The worker is degraded (a prior unrecoverable panic) and is refusing edits; the UI
     /// offers Save As + reopen.
     Degraded,
+    /// A [`Command::SetFrozen`] asked to pin more leading tracks than FreeCell supports
+    /// (B2, `functional_spec.md F1.2`). Carries the axis, the requested count and the cap so the
+    /// dialog can name all three — the reachable case is Select-All → Freeze, which asks for the
+    /// whole 1,048,576-row axis, and a message that doesn't echo the request looks arbitrary there.
+    FrozenPaneTooLarge {
+        axis: FrozenAxis,
+        requested: u32,
+        max: u32,
+    },
+}
+
+/// Which axis an [`EditRejectedReason::FrozenPaneTooLarge`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrozenAxis {
+    Rows,
+    Columns,
+}
+
+impl FrozenAxis {
+    /// The lowercase plural noun for dialog copy — `"rows"` / `"columns"`.
+    pub fn noun(self) -> &'static str {
+        match self {
+            FrozenAxis::Rows => "rows",
+            FrozenAxis::Columns => "columns",
+        }
+    }
 }
 
 /// Why a paste was refused (carried by [`WorkerEvent::PasteRejected`]). `Overflow` is

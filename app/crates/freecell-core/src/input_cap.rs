@@ -54,9 +54,13 @@ impl InputRejection {
     }
 }
 
-/// Formats `n` with `,` thousands separators (`8192` → `"8,192"`). Used only for the small
-/// cap values in [`InputRejection::message`].
-fn group_thousands(n: usize) -> String {
+/// Formats `n` with `,` thousands separators (`8192` → `"8,192"`, `1048576` → `"1,048,576"`).
+///
+/// Shared by the cap-rejection messages that have to quote a number back to the user:
+/// [`InputRejection::message`] here, and the app's frozen-pane rejection dialog
+/// (`engine-worker-hardening/functional_spec.md F1.2`, which quotes the *requested* count —
+/// the one case where the number is large enough that unseparated digits have to be counted).
+pub fn group_thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     // The first group has `len % 3` digits (or 3 when the length is a multiple of 3); a
@@ -264,5 +268,9 @@ mod tests {
         assert_eq!(group_thousands(8192), "8,192");
         assert_eq!(group_thousands(1_000), "1,000");
         assert_eq!(group_thousands(1_000_000), "1,000,000");
+        // The frozen-pane dialog's headline case — `engine-worker-hardening
+        // functional_spec.md F1.2` pins the copy "you asked for 1,048,576".
+        assert_eq!(group_thousands(16_384), "16,384");
+        assert_eq!(group_thousands(1_048_576), "1,048,576");
     }
 }

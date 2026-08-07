@@ -253,6 +253,12 @@ impl QuitPlan {
     pub fn aborted(&self) -> bool {
         self.aborted
     }
+
+    /// How many windows are still waiting to be prompted (tests).
+    #[cfg(test)]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 #[cfg(test)]

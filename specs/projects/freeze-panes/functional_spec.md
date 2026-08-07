@@ -289,11 +289,24 @@ blocked**:
 
 ### 5.2 Freezing at/near the last row or column ("freeze everything")
 
+> **SUPERSEDED** by `engine-worker-hardening` (`specs/projects/engine-worker-hardening/`,
+> §F1) — B2. What follows is the original contract; the paragraph after it is what is true now.
+
 Freezing is permitted at any track, including the last row/column. Freezing at or near the
 end simply produces a very large band and a tiny (possibly empty) scrolling region — the §
 5.1 tolerance applies. There is no "freeze would leave nothing visible" block (that guard
 exists for Hide, where it hides data; freeze hides nothing — every cell is still on screen,
 just pinned).
+
+**What is true now.** "Freeze everything" is not a tolerable degenerate display state, it is a
+denial of service. The frozen band is republished on **every** publish as `(0..M) × (0..K)`, and
+the grid renders it as `for r in 0..M`, so a whole-axis freeze wedges the worker thread *and* the
+render thread permanently — there is no window to enlarge and no way back to the header menu. So
+FreeCell now **caps** the band at **64 rows / 32 columns**: a `SetFrozen` over the cap is rejected
+with an OK-only dialog (`engine-worker-hardening functional_spec.md F1.2`), and a count arriving
+from a file or from a structural edit is clamped where the sheet cache is built (§F1.3). §5.1's
+tolerance is unchanged and still applies **within** the cap — a 64-row band in a short window
+still just clips.
 
 ### 5.3 Freeze/unfreeze while scrolled
 

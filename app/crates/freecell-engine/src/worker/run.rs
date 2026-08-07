@@ -7,7 +7,8 @@
 //! ```text
 //! recv() (park when idle) → [first] + try_iter()   // DRAIN = coalescing
 //!   → apply the coalesced edit batch under one paused/evaluate() recompute
-//!   → publish the viewport snapshot, THEN bump the generation (publish-then-bump)
+//!   → stage EVERY shared surface (publication, style cache, chart snapshot, CF map),
+//!     THEN bump the generation, THEN emit the events — the one `commit` point (E1)
 //!   → handle reads / saves / shutdown
 //! ```
 //!
@@ -34,30 +35,22 @@ use freecell_core::{
     SheetId,
 };
 
-use freecell_chart_model::{
-    Anchor, CfRange, Chart, ChartColor, ChartId, ChartInsertKind, ChartKind, ChartSpec, Color,
-    Legend,
-};
+use freecell_chart_model::Anchor;
 
 use crate::cache;
-use crate::chart::binding::{
-    binding_from_refs, binding_is_dirty, build_series_shells, resolve_chart, CellData,
-    ChartBindings, RemovedChart, SheetResolver,
-};
-use crate::chart::write::{AuthoredChart, SeriesRefs};
-use crate::document::{DocumentSource, FontFlag, SaveError, WorkbookDocument};
+use crate::chart::binding::ChartBindings;
+use crate::document::{DocumentSource, FontFlag, LoadError, SaveError, WorkbookDocument};
 use std::path::Path;
 
-use super::charts::ChartSnapshot;
+use super::charts::{AuthoredEntry, ChartUndo};
 use super::client::Shared;
 use super::protocol::{
-    ChartAxisKind, ChartChromeEdit, Command, EditRejectedReason, PasteError, SheetMeta, StyleAttr,
-    WorkerEvent,
+    Command, EditRejectedReason, FrozenAxis, PasteError, SheetMeta, StyleAttr, WorkerEvent,
 };
 
 /// Whether the loop should keep running after a batch.
 #[derive(Debug, PartialEq, Eq)]
-enum Flow {
+pub(super) enum Flow {
     Continue,
     Shutdown,
 }
@@ -102,7 +95,7 @@ enum AppliedKind {
 /// affected cells (`components/style_cache.md §Lifecycle`: undo/redo re-reads the recorded
 /// touch-set). Kept in a parallel worker-side history aligned 1:1 with IronCalc's undo stack.
 #[derive(Debug, Clone)]
-enum Touch {
+pub(super) enum Touch {
     /// A cell/style/clear edit touched `range` on `sheet`; re-read those cells to mirror it.
     Cells { sheet: SheetId, range: CellRange },
     /// A paste touched one or more `(sheet, range)`s in a **single** undo entry (the pasted
@@ -124,7 +117,7 @@ enum Touch {
 /// `ClipboardData`. `sheet` is the **stable** source [`SheetId`] (resolved to an index at paste
 /// time, so a copy survives a sheet add/reorder); `range` is the engine's effective 1-based
 /// source rectangle; `cut` drives move-vs-copy semantics + single-use clearing.
-struct ClipboardSlot {
+pub(super) struct ClipboardSlot {
     sheet: SheetId,
     range: (i32, i32, i32, i32),
     data: serde_json::Value,
@@ -133,31 +126,6 @@ struct ClipboardSlot {
     /// Paste Values (⌘⇧V) source. Captured at copy time alongside `data`; see
     /// [`WorkbookDocument::copied_value_tokens`](crate::document::WorkbookDocument).
     values: Vec<Vec<String>>,
-}
-
-/// One **authored** chart the worker holds (P17, charts/write-path §1 mode 3). Distinct from the
-/// loaded [`ChartBindings`]: an authored chart is **snapshot-but-not-live** — it rides the published
-/// [`ChartSnapshot`] so the grid renders it, but it carries no `c:f` binding yet (ranges arrive in
-/// P19), so it is **never** touched by the dirty-set re-resolve and is saved by the
-/// **write-from-model** path ([`write::write_authored_charts`](crate::chart::write::write_authored_charts)),
-/// never the loaded re-inject. `spec.origin` is always [`Authored`](freecell_chart_model::Origin::Authored).
-#[derive(Clone)]
-struct AuthoredEntry {
-    /// The worksheet the chart is anchored on (keys the published snapshot; resolved to the current
-    /// worksheet name at save time, so an in-session rename follows and a deleted host drops it).
-    anchor_sheet: SheetId,
-    /// The stable manipulation handle (P18) the worker stamps onto the published spec, so the app
-    /// can name this authored chart back for move/resize/delete.
-    id: ChartId,
-    /// The authored render envelope (a `ChartSpec::authored`, no retained source).
-    spec: ChartSpec,
-    /// The per-series `c:f` references once a **data range** is set (P19) — **empty** for a still
-    /// near-empty placeholder. This is the source of truth for a bound authored chart: its live
-    /// re-resolve derives a `ChartBinding` from it ([`binding_from_refs`]), and the write path
-    /// consumes it directly so the saved chart carries `c:f` + caches (not literals). Setting a range
-    /// (or switching type on a bound chart) rebuilds these; the chart becomes LIVE the moment it is
-    /// non-empty.
-    refs: Vec<SeriesRefs>,
 }
 
 /// The outcome of a guarded paste (`run_guarded_paste`): applied (with the pasted 0-based
@@ -197,67 +165,15 @@ enum AppliedOp {
 /// This **reverses** the earlier P18 decision (chart ops off the Ctrl+Z stack): a half-integration
 /// would desync ordering on an interleave (cellEdit → insertChart → deleteChart, then Undo×2 must
 /// restore-then-remove the chart, not restore-then-undo-the-cell), so all four chart ops ride here.
-enum UndoEntry {
+pub(super) enum UndoEntry {
     Cell(Touch),
     Chart(ChartUndo),
 }
 
-/// The stashed inverse (and redo) of one chart op — enough whole worker state to both revert it and
-/// re-apply it. Deliberately snapshot-based (clone the affected entry) rather than delta-based:
-/// simple + obviously correct over lean. The heavy snapshots ([`AuthoredEntry`] / [`RemovedChart`])
-/// are boxed so the enum stays small (an undo stack is cold, so the indirection is free).
-enum ChartUndo {
-    /// Insert of an **authored** chart at list `index` (the born-live `entry` stashed whole, so a
-    /// redo re-inserts it with its Batch-3 range binding intact — no re-derivation). Undo removes
-    /// index; redo re-inserts `entry` at index.
-    InsertAuthored {
-        index: usize,
-        entry: Box<AuthoredEntry>,
-    },
-    /// Delete of an **authored** chart. Undo re-inserts `entry` at `index`; redo removes index.
-    DeleteAuthored {
-        index: usize,
-        entry: Box<AuthoredEntry>,
-    },
-    /// Delete of a **loaded** chart. `removed` is the whole binding (so undo re-binds it exactly);
-    /// `chart_part` is the save-drop key the delete added to `loaded_deletes`; `prior_anchor_edit`
-    /// is the `loaded_anchor_edits` value the delete evicted (restored on undo). Undo re-binds +
-    /// clears the save-set bookkeeping; redo re-runs the delete effects.
-    DeleteLoaded {
-        removed: Box<RemovedChart>,
-        chart_part: String,
-        prior_anchor_edit: Option<Anchor>,
-    },
-    /// Anchor move/resize of an **authored** chart: swap `prior` and `applied` on the chart's model
-    /// anchor.
-    SetAnchorAuthored {
-        id: ChartId,
-        prior: Anchor,
-        applied: Anchor,
-    },
-    /// Anchor move/resize of a **loaded** chart: swap the render anchor AND the `loaded_anchor_edits`
-    /// entry. `prior_render` is the render anchor before the move; `prior_edit` is the
-    /// `loaded_anchor_edits` value the move replaced (restored on undo).
-    SetAnchorLoaded {
-        id: ChartId,
-        chart_part: String,
-        prior_render: Anchor,
-        prior_edit: Option<Anchor>,
-        applied: Anchor,
-    },
-    /// Range bind of an **authored** chart (P19): the whole pre-bind `prior` entry and post-bind
-    /// `applied` entry are stashed, so undo/redo just restore the clone (no re-derivation).
-    SetRangeAuthored {
-        index: usize,
-        prior: Box<AuthoredEntry>,
-        applied: Box<AuthoredEntry>,
-    },
-}
-
 /// The per-window worker: owns the document + the shared read-surfaces and drives the loop.
 pub(super) struct Worker {
-    doc: WorkbookDocument,
-    shared: Arc<Shared>,
+    pub(super) doc: WorkbookDocument,
+    pub(super) shared: Arc<Shared>,
     event_tx: async_channel::Sender<WorkerEvent>,
     /// The active sheet (stable id) — the one the published viewport covers.
     active_sheet: SheetId,
@@ -265,14 +181,14 @@ pub(super) struct Worker {
     /// `None` until the first `SetViewport` (the initial publish is empty).
     viewport: Option<Viewport>,
     /// Committed undoable ops (dirty tracking; mirrored to `Shared::committed_ops`).
-    ops_seen: u64,
+    pub(super) ops_seen: u64,
     /// Number of **worker-initiated** `evaluate()` calls — the test-observable coalescing
     /// metric. This measures worker behavior (one recompute per drained batch), NOT the
     /// engine's internal recompute count; IronCalc's own coalescing was validated in
     /// round-3 A and Phase 12's perf harness catches recompute regressions.
     eval_count: u64,
     /// Set after an unrecoverable panic: keep serving reads/save, refuse edits.
-    degraded: bool,
+    pub(super) degraded: bool,
     /// Count of caught panics (a second one, or an unresponsive probe, degrades the worker).
     panic_count: u32,
     /// The **unified undo timeline** ([`UndoEntry`], charts feedback item 4): one ordered stack over
@@ -281,51 +197,57 @@ pub(super) struct Worker {
     /// `redo_stack`; `Undo` pops here → `redo_stack`; `Redo` the reverse. The `Cell(Touch)` entries
     /// stay 1:1 with IronCalc's undo stack (a `Chart` entry never touches it) and re-read the popped
     /// touch-set to keep the caches in agreement; `Chart` entries invert from their stashed snapshot.
-    undo_stack: Vec<UndoEntry>,
+    pub(super) undo_stack: Vec<UndoEntry>,
     /// The redo side of the unified timeline (mirrors IronCalc's redo stack for its `Cell` entries).
-    redo_stack: Vec<UndoEntry>,
+    pub(super) redo_stack: Vec<UndoEntry>,
     /// The range clipboard slot (`architecture.md §6`): `Some` after a copy/cut, replaced by the
     /// next copy/cut, and cleared after a cut is pasted (single-use).
     clipboard: Option<ClipboardSlot>,
     /// The live-bound charts this workbook owns (P9, charts/architecture §4.1) — the range→chart
     /// index the worker re-resolves on edit. Empty for a new/unopened or chart-less workbook.
-    charts: ChartBindings,
+    pub(super) charts: ChartBindings,
     /// The **authored** (in-app inserted) charts this workbook owns (P17), held separately from the
     /// loaded [`charts`](Self::charts): they ride the published snapshot but are never re-resolved
     /// (no binding yet) and are saved via the write-from-model path, not the loaded re-inject.
-    authored_charts: Vec<AuthoredEntry>,
+    pub(super) authored_charts: Vec<AuthoredEntry>,
     /// Monotonic source of stable [`ChartId`]s (P18), shared across loaded + authored charts so a
     /// manipulation id names exactly one chart. Starts at 1 ([`ChartId::NONE`] = 0 is unassigned).
-    next_chart_id: u64,
+    pub(super) next_chart_id: u64,
     /// Loaded charts moved/resized in-session (P18): `chart_part → new twoCellAnchor`, accumulated
     /// **relative to the current [`chart_source_path`](Self::chart_source_path)**. The save patches
     /// each into the retained drawing part; a save that advances the source (bakes them in) clears
     /// this. An authored-charts-present save keeps the source (and this map) put.
-    loaded_anchor_edits: HashMap<String, Anchor>,
+    pub(super) loaded_anchor_edits: HashMap<String, Anchor>,
     /// Loaded charts deleted in-session (P18): the `chart_part`s the save must drop from the
     /// package (their `twoCellAnchor` + part chain), also relative to `chart_source_path`. Deleted
     /// parts are additionally skipped by the save-time discovery sweep so they can't be re-bound.
-    loaded_deletes: HashSet<String>,
+    pub(super) loaded_deletes: HashSet<String>,
     /// The published [`ChartSnapshot`] version — bumped on load (when charts exist) and on each
     /// dirty re-resolve, so the UI installs charts only when they actually change.
-    chart_version: u64,
+    pub(super) chart_version: u64,
+    /// Set by [`mark_charts_changed`](Self::mark_charts_changed) when the bound chart set moved, and
+    /// consumed by the next [`commit`](Self::commit) — which is the only writer of the shared
+    /// `ChartSnapshot`. The chart paths used to `store` the snapshot themselves and have `commit`
+    /// immediately re-store a structurally identical value one generation later: two `ArcSwap`
+    /// stores per chart op, the first of them stamped with a generation it did not belong to.
+    pub(super) chart_snapshot_dirty: bool,
     /// The file whose chart machinery (drawings, chart parts, content-type overrides) a
     /// chart-preserving save re-injects into the model body (P10, charts/architecture §4.1/§5):
     /// the opened path on load, then the last path successfully saved (a chart-preserving save
     /// writes a self-contained superset, so the just-saved file is a valid source for the next
     /// save — surviving a Save-As away from a since-deleted original). `None` for a workbook never
     /// opened from a file; then save falls through to the plain (chart-less) writer.
-    chart_source_path: Option<PathBuf>,
+    pub(super) chart_source_path: Option<PathBuf>,
     /// The sheets whose chart drawings have already been **walked** (P11 lazy discovery,
     /// charts/architecture §5 challenge 5). A sheet is inserted the first time it is painted so its
     /// zip is walked **at most once** — even if it carries no charts (so we don't re-parse on every
     /// scroll). Correctness (never double-binding a chart) is `ChartBindings::add_missing`'s job;
     /// this set is purely the "walk each sheet once" guard.
-    discovered_chart_sheets: HashSet<SheetId>,
+    pub(super) discovered_chart_sheets: HashSet<SheetId>,
     /// Set once every sheet's charts have been discovered — after the save-time full sweep
     /// (`ensure_all_charts_discovered`), or for a workbook that was never opened from a file. Short-
     /// circuits all further lazy per-sheet walks.
-    charts_fully_discovered: bool,
+    pub(super) charts_fully_discovered: bool,
     /// The **stable** `SheetId → file worksheet part` map (e.g. `xl/worksheets/sheet2.xml`),
     /// captured **once at open** by joining the model's at-open sheet names with the file's
     /// `workbook.xml.rels` name→part map (P11 CR fix). Keying lazy discovery + the save sweep on
@@ -333,7 +255,7 @@ pub(super) struct Worker {
     /// renamed in-session keeps its `SheetId`, so its charts still resolve to their file part, and
     /// the chart follows the rename on save (`live_sheet_targets` resolves `SheetId → current
     /// name`). Empty for a workbook never opened from a file, or if the map couldn't be read.
-    chart_sheet_parts: HashMap<SheetId, String>,
+    pub(super) chart_sheet_parts: HashMap<SheetId, String>,
     /// Per-sheet **manually-resized** 0-based rows (`functional_spec.md §3.3`). A row enters when a
     /// **user** [`Command::SetRowHeights`] commits, or is seeded at first cache build from a loaded
     /// `custom_height` row. Wrap-driven auto-grow ([`Command::AutoGrowRowHeights`]) never touches a
@@ -349,9 +271,109 @@ pub(super) struct Worker {
     wrap_heights: HashMap<SheetId, BTreeMap<u32, f32>>,
 }
 
+/// What one batch has to commit through [`Worker::commit`] (E1, `functional_spec.md F4`). Every
+/// field is cheap to leave empty — a pure-scroll republish stages nothing but the publication —
+/// so the eight publishing paths all read the same way regardless of how much they touch.
+#[derive(Default)]
+pub(super) struct StagedCommit {
+    /// Cells whose style-cache entries must be re-read.
+    refresh: Vec<(SheetId, CellRange)>,
+    /// Sheets whose style caches must be rebuilt wholesale.
+    rebuild: Vec<SheetId>,
+    /// Sheets whose published CF rule list must be reconciled. Also the "already rebuilt this
+    /// batch" set for the post-recompute CF refresh.
+    cf_sheets: Vec<SheetId>,
+    /// The sheet list as it was before the batch; drives the caches/CF-map reconcile and the
+    /// `SheetsChanged` event. `None` when the batch cannot change the sheet set.
+    sheets_before: Option<Vec<SheetMeta>>,
+    /// Re-run the value-dependent CF cache refresh (a recompute happened).
+    cf_after_recompute: bool,
+    /// Build the active sheet's cache if it isn't resident yet (a sheet activation).
+    ensure_active_cache: bool,
+    /// The batch changed **no** published value, format or viewport — set only by the chart-op
+    /// commits, whose whole mutation lives in the chart snapshot. `Worker::stage_publication` then
+    /// re-stamps the resident [`Publication`] with the new generation instead of rebuilding it, so
+    /// the generation stays honest without a viewport rebuild the batch cannot have invalidated.
+    ///
+    /// Defaults to `false` (rebuild), so a new call site is safe by construction: the only cost of
+    /// getting it wrong that way round is the rebuild the code did anyway.
+    values_unchanged: bool,
+}
+
+impl StagedCommit {
+    /// A commit whose entire mutation is the chart snapshot: no cell value, format, geometry, sheet
+    /// or CF rule moved, so the publication is re-stamped rather than rebuilt
+    /// (see [`values_unchanged`](StagedCommit::values_unchanged)). The constructor exists so the
+    /// chart module can express this without the fields leaving `mod run`.
+    pub(super) fn chart_only() -> Self {
+        Self {
+            values_unchanged: true,
+            ..Self::default()
+        }
+    }
+}
+
+// Test-only observation point, fired by `Worker::commit` at the exact instant of its `Release`
+// store — every shared surface for the new generation written, nothing about it announced yet
+// (`architecture.md §A5.5`).
+//
+// It exists because the contract is a statement about that *instant*, and no after-the-fact drain
+// can see it. Draining once the batch has returned shows the same event order under the pre-Phase-4
+// shape (store + `Published` first, style cache and CF map written only afterwards) as under this
+// one, so a test built on the drained order alone cannot fail when the ordering is reverted — which
+// is exactly what the first version of `commit_emits_nothing_before_the_bump` did. A probe fired
+// *at* the store can check the surfaces.
+//
+// `#[cfg(test)]`, the same house style as `Command::TestPanic` / `document::PANIC_SENTINEL`: it does
+// not exist in a release build. Thread-local because the headless test worker runs on the test's own
+// thread, so no field has to be threaded through `Worker`'s construction sites (nor made `Send` for
+// the real spawned worker).
+#[cfg(test)]
+thread_local! {
+    static COMMIT_STORE_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a `COMMIT_STORE_PROBE` for the guard's lifetime.
+#[cfg(test)]
+pub(super) struct CommitStoreProbe;
+
+#[cfg(test)]
+impl CommitStoreProbe {
+    pub(super) fn install(probe: impl Fn() + 'static) -> Self {
+        COMMIT_STORE_PROBE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(
+                slot.is_none(),
+                "a commit-store probe is already installed on this thread"
+            );
+            *slot = Some(Box::new(probe));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CommitStoreProbe {
+    fn drop(&mut self) {
+        COMMIT_STORE_PROBE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Fire the installed probe, if any. The slot stays borrowed for the call, so a probe must not
+/// install or remove one (nor drive a `commit` of its own).
+#[cfg(test)]
+fn fire_commit_store_probe() {
+    COMMIT_STORE_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow().as_ref() {
+            probe();
+        }
+    });
+}
+
 /// A clamped, half-open viewport window on the active sheet.
 #[derive(Debug, Clone)]
-struct Viewport {
+pub(super) struct Viewport {
     rows: std::ops::Range<u32>,
     cols: std::ops::Range<u32>,
 }
@@ -366,10 +388,24 @@ impl Worker {
         event_tx: async_channel::Sender<WorkerEvent>,
         cmd_rx: Receiver<Command>,
     ) {
-        let doc = match WorkbookDocument::from_source(&source) {
-            Ok(doc) => doc,
-            Err(error) => {
+        // GUARDED (B1, `functional_spec.md F2.1`). The file path was the one mutation-adjacent
+        // region outside `catch_unwind`, and IronCalc's importer is as panic-prone as its
+        // evaluator. An unguarded panic here unwinds out of the thread entry point, which drops
+        // `event_tx` — so the window sees the event stream close with no event explaining it, i.e.
+        // a silent zombie. `AssertUnwindSafe` is sound for the same reason as the six existing
+        // guards: the closure touches only the immutable `source` and the not-yet-built document,
+        // which is dropped on unwind.
+        let doc = match catch_unwind(AssertUnwindSafe(|| WorkbookDocument::from_source(&source))) {
+            Ok(Ok(doc)) => doc,
+            Ok(Err(error)) => {
                 let _ = event_tx.try_send(WorkerEvent::LoadFailed { error });
+                return;
+            }
+            Err(_) => {
+                tracing::error!("worker: caught panic in from_source; reporting LoadFailed");
+                let _ = event_tx.try_send(WorkerEvent::LoadFailed {
+                    error: LoadError::EnginePanic,
+                });
                 return;
             }
         };
@@ -393,6 +429,7 @@ impl Worker {
             loaded_anchor_edits: HashMap::new(),
             loaded_deletes: HashSet::new(),
             chart_version: 0,
+            chart_snapshot_dirty: false,
             chart_source_path: match &source {
                 // An open and the demo both carry a real `.xlsx` whose charts we render + preserve
                 // — their source file is re-read lazily (on paint) and on save (chart re-inject).
@@ -468,7 +505,7 @@ impl Worker {
 
     /// Split a drained batch into edits / viewport / reads / saves / shutdown, then apply the
     /// edits under a single coalesced eval + publish, then service the control commands.
-    fn process_batch(&mut self, batch: Vec<Command>) -> Flow {
+    pub(super) fn process_batch(&mut self, batch: Vec<Command>) -> Flow {
         let mut edits: Vec<Command> = Vec::new();
         let mut reads: Vec<(SheetId, CellRef, u64)> = Vec::new();
         // Selection-stats queries (`Command::SelectionStats`) are pure reads (no eval/publish),
@@ -615,24 +652,29 @@ impl Worker {
         }
 
         // Edits first (they carry the coalesced eval + a fresh publish). The publish uses the
-        // viewport already updated above, so a batch of {scroll, edit} publishes once.
+        // viewport already updated above, so a batch of {scroll, edit} publishes once — and the
+        // activation's cache build is staged INTO that one commit (`viewport_changed` is threaded
+        // in), not bolted on after it.
         let published = if edits.is_empty() {
             false
         } else {
-            self.apply_edit_batch(edits)
+            self.apply_edit_batch(edits, viewport_changed)
         };
 
-        // A pure viewport change (no edit) still republishes current values (no eval).
-        if !published && viewport_changed {
-            self.publish();
-            self.emit(WorkerEvent::Published);
-        }
-
-        // Activating a sheet (a viewport switch to it) builds its style/geometry cache on first
-        // visit, then stays resident (`components/style_cache.md §Lifecycle`).
-        if viewport_changed && self.ensure_active_cache_built() {
-            self.emit(WorkerEvent::StyleCacheUpdated {
-                sheet: self.active_sheet,
+        // A pure viewport change (no edit) still republishes current values (no eval), and a
+        // viewport switch to a new sheet builds that sheet's style/geometry cache on first visit
+        // (`components/style_cache.md §Lifecycle`). Both are staged through the one commit point, so
+        // the cache the scroll's `Published` refers to is already in place when it fires (E1).
+        //
+        // Skipped when the edit batch already committed: it carried this batch's activation itself.
+        // The mixed {activate, edit} batch used to take a second path that built the cache AFTER the
+        // `Release` store — which left the publication's frozen band read off a cache that did not
+        // exist yet (regression test:
+        // `a_batched_sheet_switch_and_edit_commit_the_new_sheets_cache_together`).
+        if viewport_changed && !published {
+            self.commit(StagedCommit {
+                ensure_active_cache: true,
+                ..StagedCommit::default()
             });
         }
 
@@ -755,27 +797,103 @@ impl Worker {
         }
 
         for (path, req_id) in saves {
-            match self.save_workbook(&path) {
-                Ok(()) => self.emit(WorkerEvent::Saved {
+            // GUARDED (B1, `functional_spec.md F2.2`). The pinned exporter panics outright on an
+            // unevaluated formula cell, and an unguarded panic here kills the worker thread with no
+            // event to explain it: the window keeps rendering the last publication while edits
+            // vanish and Save silently does nothing.
+            //
+            // What `AssertUnwindSafe` over `&mut self` costs here, stated accurately rather than
+            // waved through: `save_workbook` DOES mutate `self` before it can panic — its first
+            // statement is `ensure_all_charts_discovered`, which binds charts, bumps
+            // `chart_version` and commits. So a caught panic can leave the worker with *some* of
+            // this save's chart discovery applied. That state is deliberately made re-entrant
+            // rather than assumed away: the sweep walks sheets in `SheetId` order and marks each
+            // discovered only after BOTH its parse and its bind have returned (see `charts.rs`),
+            // so what survives a panic is a deterministic prefix of fully bound sheets plus
+            // `charts_fully_discovered == false` — a partially-swept worker, which the next save
+            // (or a lazy per-sheet discovery) completes. The late mutations (`chart_source_path`,
+            // `loaded_anchor_edits`, `loaded_deletes`) are the last statements before `Ok`, after
+            // every fallible step, so those cannot be half-applied.
+            //
+            // What E1 put under this guard, stated at its real size: that sweep now `commit`s (it
+            // used to just emit `Published`), so the commit runs inside this `catch_unwind`. In
+            // practice that adds nothing — it is a `chart_only()` commit, so no refresh, no
+            // rebuild, `sheets_before: None` (not even a `sheet_metas()` call), and
+            // `stage_publication` takes the restamp branch, which it always does here:
+            // `publication.sheet == active_sheet` is an invariant (`active_sheet` is assigned only
+            // in `load_and_run` and the `SetViewport` routing arm, and every `SetViewport` commits).
+            // So no engine call reaches this guard on this path. Only the *fallback*
+            // `build_publication` would, and it is unreachable given that invariant — but it is
+            // real code, so: if it ever ran, an IronCalc panic in `formatted_value` would report as
+            // a `SaveError::EnginePanic` and count toward degrading the worker, rather than as a
+            // publish-path panic. Named so the misattribution wouldn't be a surprise.
+            let outcome = catch_unwind(AssertUnwindSafe(|| self.save_workbook(&path)));
+            match outcome {
+                Ok(Ok(())) => self.emit(WorkerEvent::Saved {
                     req_id,
                     ops_seen: self.ops_seen,
                 }),
-                Err(error) => self.emit(WorkerEvent::SaveFailed { req_id, error }),
+                Ok(Err(error)) => self.emit(WorkerEvent::SaveFailed { req_id, error }),
+                Err(_) => {
+                    tracing::error!("worker: caught panic in save_workbook; reporting SaveFailed");
+                    self.emit(WorkerEvent::SaveFailed {
+                        req_id,
+                        error: SaveError::EnginePanic,
+                    });
+                    // The poisoning policy WITHOUT the edit path's `EditRejected` — `SaveFailed`
+                    // has already told the user, and one failed save is not by itself a reason to
+                    // condemn a model that still answers.
+                    self.note_caught_panic();
+                }
             }
         }
 
         // CSV exports (pure reads — no dirty change). An unresolvable sheet (deleted mid-flight)
         // fails cleanly rather than writing a wrong sheet.
+        //
+        // GUARDED (B1, `functional_spec.md F2.2`) on the same grounds as the save two statements
+        // up: this walks the engine over every cell of a sheet, so it is the same engine on the
+        // same kind of user data, and an unguarded panic here kills the worker thread with no event
+        // to explain it. `AssertUnwindSafe` is unconditionally sound for this closure — it takes
+        // only shared borrows (`resolve`, `doc.export_csv`) and mutates no worker state at all, so
+        // there is nothing a panic could tear.
         for (sheet, path, req_id) in exports {
-            let result = match self.resolve(sheet) {
-                Some(idx) => self.doc.export_csv(idx, &path),
-                None => Err(crate::document::SaveError::Io(
-                    "the sheet no longer exists".to_string(),
-                )),
-            };
-            match result {
-                Ok(()) => self.emit(WorkerEvent::CsvExported { req_id }),
-                Err(error) => self.emit(WorkerEvent::CsvExportFailed { req_id, error }),
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // Panic injection for this guard's test — see `document::PANIC_SENTINEL`.
+                #[cfg(test)]
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == crate::document::PANIC_SENTINEL)
+                {
+                    panic!("injected test panic (export catch_unwind recovery)");
+                }
+                match self.resolve(sheet) {
+                    Some(idx) => self.doc.export_csv(idx, &path),
+                    None => Err(crate::document::SaveError::Io(
+                        "the sheet no longer exists".to_string(),
+                    )),
+                }
+            }));
+            match outcome {
+                Ok(Ok(())) => self.emit(WorkerEvent::CsvExported { req_id }),
+                Ok(Err(error)) => self.emit(WorkerEvent::CsvExportFailed { req_id, error }),
+                Err(_) => {
+                    tracing::error!(
+                        "worker: caught panic in export_csv; reporting CsvExportFailed"
+                    );
+                    // The same typed error the save path reports (`SaveError::EnginePanic`) — the
+                    // export dialog names the CSV, and the shared sentence "the calculation engine
+                    // crashed while writing the file" is exactly what happened. Any partially
+                    // written file is a temp that never got renamed (`export_csv` is atomic).
+                    self.emit(WorkerEvent::CsvExportFailed {
+                        req_id,
+                        error: SaveError::EnginePanic,
+                    });
+                    // The poisoning policy WITHOUT the edit path's `EditRejected`, as for a save:
+                    // `CsvExportFailed` has already told the user, and a model that still answers
+                    // is not condemned by one failed export.
+                    self.note_caught_panic();
+                }
             }
         }
 
@@ -787,10 +905,18 @@ impl Worker {
     }
 
     /// Apply a coalesced edit batch: pre-validate (cap / name) outside the panic guard, then
-    /// apply the survivors under one `catch_unwind`-guarded paused recompute, then
-    /// publish-then-bump. Returns whether it published. Emits the SP1 observable timings
-    /// (apply / eval / publish) at `debug` — Phase 12's perf harness reads these.
-    fn apply_edit_batch(&mut self, edits: Vec<Command>) -> bool {
+    /// apply the survivors under one `catch_unwind`-guarded paused recompute, then stage everything
+    /// through the one [`commit`](Self::commit). Returns whether it committed. Emits the SP1
+    /// observable timings (apply / eval / publish) at `debug` — Phase 12's perf harness reads these.
+    ///
+    /// `viewport_changed` says the same drained batch also activated a sheet, so this batch's commit
+    /// owns the activation's cache build too (E1). [`active_sheet`](Self::active_sheet) is already
+    /// the new sheet — `process_batch`'s routing loop sets it before any edit runs — and
+    /// `commit` runs `ensure_active_cache_built` *after* the edits have applied, so the build sees
+    /// post-edit state, exactly as the pure-viewport batch's commit does. When this returns `false`
+    /// (nothing valid, degraded, a no-op batch, or a caught panic) nothing was committed and
+    /// `process_batch` still commits the activation on its own.
+    fn apply_edit_batch(&mut self, edits: Vec<Command>, viewport_changed: bool) -> bool {
         // Clean rejects (no panic risk): input cap + sheet-name re-check + fill merge-guard.
         let mut valid: Vec<Command> = Vec::new();
         for edit in edits {
@@ -957,59 +1083,26 @@ impl Worker {
                 // The rebuilt-sheet set is the CF-relevant one: a CF mutation, a structural CF-range
                 // shift, and the undo/redo of either land here (all map to `AppliedOp::Rebuild` /
                 // `Touch::Rebuild`). Captured before `rebuild` is consumed by `apply_cache_refresh`.
-                let mut cf_sheets = rebuild.clone();
-                // Re-resolve any charts whose source ranges the edit touched, BEFORE publishing, so
+                let cf_sheets = rebuild.clone();
+                // Re-resolve any charts whose source ranges the edit touched, BEFORE the commit, so
                 // the edit's single `Published` carries fresh cells AND fresh charts (P9,
                 // charts/architecture §4.1). Only intersecting charts recompute.
                 self.reresolve_charts(&refresh, &rebuild);
 
-                self.publish();
-                self.emit(WorkerEvent::Published);
-
-                // Mirror the applied ops into the style/geometry cache (re-read touched cells) and
-                // ship `StyleCacheUpdated` deltas. Ordered after `Published` (unchanged event order).
-                self.apply_cache_refresh(refresh, rebuild, &sheets_before);
-
-                // Value-dependent conditional formatting: a recompute can change cell values, which
-                // flips CF results (a threshold crosses, a Top-N/average cell enters or leaves the
-                // set, a color scale re-interpolates) with NO CF command. Rebuild the affected CF
-                // sheets' style caches via the extended path — only on a recompute, and short-circuited
-                // for a non-CF workbook by the empty-map gate inside. `cf_sheets` (this batch's full
-                // rebuilds) is passed so a CF/structural op already rebuilt above isn't rebuilt twice.
-                if needs_eval {
-                    self.refresh_cf_caches_after_recompute(&cf_sheets);
-                }
-
-                // Republish the CF rule list for any rebuilt sheet whose rules actually changed, and
-                // notify the window (`components/engine_cf.md §5`). Gated inside so a non-CF sheet is
-                // free; deduped so a coalesced multi-CF batch reconciles each sheet once.
-                cf_sheets.sort_unstable();
-                cf_sheets.dedup();
-                self.reconcile_published_cond_fmt(&cf_sheets);
-
-                // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the
-                // tab bar. Compared by value so undo/redo of a sheet op is caught too.
-                let sheets_after = self.sheet_metas();
-                if sheets_after != sheets_before {
-                    // Reconcile the CF map with the changed sheet SET. Removed sheets (delete /
-                    // undo-of-add) are dropped so the map never outlives its sheet. Sheets that
-                    // REAPPEARED (undo-of-delete restores the worksheet + its CF rules) are
-                    // reconciled so a returning CF sheet republishes its rules + emits
-                    // `CondFmtUpdated` — that undo pushes `Touch::Sheets`, not `Touch::Rebuild`, so
-                    // the returning sheet never entered `cf_sheets` above.
-                    let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
-                    let ids_after: HashSet<SheetId> = sheets_after.iter().map(|m| m.id).collect();
-                    self.shared
-                        .cond_fmt
-                        .write()
-                        .retain(|id, _| ids_after.contains(id));
-                    let appeared: Vec<SheetId> =
-                        ids_after.difference(&ids_before).copied().collect();
-                    self.reconcile_published_cond_fmt(&appeared);
-                    self.emit(WorkerEvent::SheetsChanged {
-                        sheets: sheets_after,
-                    });
-                }
+                // One commit point (E1): every surface — publication, style cache, chart snapshot,
+                // CF map — is written before the generation bump, and every event after it. That
+                // includes a sheet activation coalesced into this same batch (`viewport_changed`):
+                // its cache build has to be staged here, because `build_publication` reads the
+                // published sheet's frozen-band counts off exactly that cache.
+                self.commit(StagedCommit {
+                    refresh,
+                    rebuild,
+                    cf_sheets,
+                    sheets_before: Some(sheets_before),
+                    cf_after_recompute: needs_eval,
+                    ensure_active_cache: viewport_changed,
+                    ..StagedCommit::default()
+                });
                 true
             }
             Err(_) => {
@@ -1191,17 +1284,17 @@ impl Worker {
                         .committed_ops
                         .store(self.ops_seen, Ordering::Release);
                     self.reresolve_charts(&touched, &[]);
-                    self.publish();
-                    self.emit(WorkerEvent::Published);
                     self.undo_stack
                         .push(UndoEntry::Cell(Touch::Ranges(touched.clone())));
                     self.redo_stack.clear();
-                    for s in self.refresh_cache_cells(&touched) {
-                        self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
-                    }
-                    // A replace recomputes values → re-evaluate CF on the resident CF sheets
-                    // (empty-map gated, so a non-CF workbook is unaffected).
-                    self.refresh_cf_caches_after_recompute(&[]);
+                    // One commit (E1): the touched cells' styles and the value-dependent CF refresh
+                    // (a replace recomputes values; empty-map gated, so a non-CF workbook is
+                    // unaffected) both land before the generation bump this `Published` announces.
+                    self.commit(StagedCommit {
+                        refresh: touched,
+                        cf_after_recompute: true,
+                        ..StagedCommit::default()
+                    });
                 }
                 self.emit(WorkerEvent::ReplacedCount { n });
             }
@@ -1224,8 +1317,10 @@ impl Worker {
     }
 
     /// Shared post-replace bookkeeping for a single-cell replace (`ReplaceOne`): count the op,
-    /// re-resolve any charts the change touched, publish, push one undo touch entry, and refresh the
-    /// touched cache cell. (`ReplaceAll` inlines the single-entry, multi-range variant.)
+    /// re-resolve any charts the change touched, push one undo touch entry, then stage the touched
+    /// cache cell + the CF refresh and commit them with the publication in one bump (E1 — the
+    /// refresh used to run *after* the publish and its `Published`). (`ReplaceAll` inlines the
+    /// single-entry, multi-range variant.)
     fn commit_replacements(&mut self, touched: &[(SheetId, CellRange)]) {
         self.eval_count += 1;
         self.ops_seen += 1;
@@ -1233,8 +1328,6 @@ impl Worker {
             .committed_ops
             .store(self.ops_seen, Ordering::Release);
         self.reresolve_charts(touched, &[]);
-        self.publish();
-        self.emit(WorkerEvent::Published);
         for (sheet, range) in touched {
             self.undo_stack.push(UndoEntry::Cell(Touch::Cells {
                 sheet: *sheet,
@@ -1242,11 +1335,13 @@ impl Worker {
             }));
         }
         self.redo_stack.clear();
-        for sheet in self.refresh_cache_cells(touched) {
-            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
-        }
-        // A replace recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
-        self.refresh_cf_caches_after_recompute(&[]);
+        // One commit (E1). A replace recomputes values → the CF caches refresh here too, before the
+        // bump rather than after the `Published` that used to precede them.
+        self.commit(StagedCommit {
+            refresh: touched.to_vec(),
+            cf_after_recompute: true,
+            ..StagedCommit::default()
+        });
     }
 
     /// Copy (or cut) `range` to the engine clipboard slot and reply with the system-clipboard
@@ -1573,19 +1668,18 @@ impl Worker {
         // Re-resolve any charts the pasted values touched, before the publish (P9) — a paste into a
         // source range re-renders the chart on the same `Published`.
         self.reresolve_charts(&touched, &[]);
-        self.publish();
-        self.emit(WorkerEvent::Published);
 
         // One paste = one engine undo entry → one touch-entry (possibly multi-range), and a
         // fresh edit invalidates the redo stack.
         self.undo_stack
             .push(UndoEntry::Cell(Touch::Ranges(touched.clone())));
         self.redo_stack.clear();
-        for sheet in self.refresh_cache_cells(&touched) {
-            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
-        }
-        // A paste recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
-        self.refresh_cf_caches_after_recompute(&[]);
+        // One commit (E1); a paste recomputes values, so the CF caches refresh with it.
+        self.commit(StagedCommit {
+            refresh: touched,
+            cf_after_recompute: true,
+            ..StagedCommit::default()
+        });
 
         self.emit(WorkerEvent::Pasted {
             sheet: dest,
@@ -1718,8 +1812,6 @@ impl Worker {
                 self.shared
                     .committed_ops
                     .store(self.ops_seen, Ordering::Release);
-                self.publish();
-                self.emit(WorkerEvent::Published);
                 // One touch per committed diff-list (all covering the clamped range — re-reading it
                 // syncs both the styles and the row heights), and a fresh edit clears the redo side.
                 for _ in 0..diff_lists {
@@ -1729,9 +1821,12 @@ impl Worker {
                     }));
                 }
                 self.redo_stack.clear();
-                for s in self.refresh_cache_cells(&[(sheet, clamped)]) {
-                    self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
-                }
+                // One commit (E1): a font change IS a style change, so the cache mirror landing
+                // after `Published` was the split-brain in its purest form.
+                self.commit(StagedCommit {
+                    refresh: vec![(sheet, clamped)],
+                    ..StagedCommit::default()
+                });
             }
             // A clean engine error (near-unreachable for valid input): nothing committed → no touch.
             Ok((Err(msg), _)) => self.emit(WorkerEvent::EditRejected {
@@ -1816,29 +1911,33 @@ impl Worker {
 
     /// Mirror a batch's edited cells into the resident cache (`components/style_cache.md
     /// §Lifecycle`): reconcile the caches map when the sheet set changed, re-read the touched cells,
-    /// and emit `StyleCacheUpdated` per changed sheet. Consumes the `(refresh, rebuild)` from
-    /// [`collect_edited_ranges`](Self::collect_edited_ranges). Runs after the eval + publish (styles
-    /// don't depend on the recompute).
-    fn apply_cache_refresh(
+    /// rebuild what a per-cell mirror can't express, and **return** the sheets whose cache changed.
+    /// Consumes the `(refresh, rebuild)` from
+    /// [`collect_edited_ranges`](Self::collect_edited_ranges).
+    ///
+    /// Returns rather than emits (E1): the `StyleCacheUpdated` announcements belong after
+    /// [`commit`](Self::commit)'s generation bump, and this write must happen before it. Previously
+    /// this ran *after* `Published` had already told the UI to repaint.
+    fn stage_cache_refresh(
         &mut self,
         refresh: Vec<(SheetId, CellRange)>,
         mut rebuild: Vec<SheetId>,
-        sheets_before: &[SheetMeta],
-    ) {
+        sheets_before: Option<&[SheetMeta]>,
+    ) -> Vec<SheetId> {
         // When the sheet-id SET changed (delete, or undo-of-add), drop caches for absent sheets.
         // A returning sheet (undo-of-delete) rebuilds lazily on its next activation.
-        let ids_before: HashSet<SheetId> = sheets_before.iter().map(|m| m.id).collect();
-        let ids_after: HashSet<SheetId> = self.sheet_metas().iter().map(|m| m.id).collect();
-        if ids_before != ids_after {
-            self.shared
-                .caches
-                .write()
-                .retain(|id| ids_after.contains(&id));
+        if let Some(before) = sheets_before {
+            let ids_before: HashSet<SheetId> = before.iter().map(|m| m.id).collect();
+            let ids_after: HashSet<SheetId> = self.sheet_metas().iter().map(|m| m.id).collect();
+            if ids_before != ids_after {
+                self.shared
+                    .caches
+                    .write()
+                    .retain(|id| ids_after.contains(&id));
+            }
         }
 
-        for sheet in self.refresh_cache_cells(&refresh) {
-            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
-        }
+        let mut changed = self.refresh_cache_cells(&refresh);
 
         // Full rebuilds for resize / insert / delete (and their undo/redo). Only resident sheets
         // rebuild — an absent sheet rebuilds lazily on its next activation. Deduped so a batch that
@@ -1847,9 +1946,10 @@ impl Worker {
         rebuild.dedup();
         for sheet in rebuild {
             if self.shared.caches.read().contains(sheet) && self.build_and_store_cache(sheet) {
-                self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+                changed.push(sheet);
             }
         }
+        changed
     }
 
     /// Re-evaluate conditional formatting for the resident CF sheets after a recompute may have
@@ -1859,16 +1959,17 @@ impl Worker {
     /// (its result at one cell depends on the whole range), the touched-cell mirror is insufficient,
     /// so each affected CF sheet's whole style cache is rebuilt via the extended path
     /// ([`build_and_store_cache`](Self::build_and_store_cache) → `build_sheet_cache(cf = true)`) and a
-    /// `StyleCacheUpdated` emitted. This is the one new coupling in FreeCell: value publish → style
-    /// refresh.
+    /// the changed sheets **returned** (E1: the announcement belongs after `commit`'s bump). This is
+    /// the one new coupling in FreeCell: value publish → style refresh.
     ///
     /// **Fast gate (the perf invariant):** the published CF map is empty ⟺ no sheet carries a rule
     /// (P2 maintains it), so a non-CF workbook returns here immediately — no resident scan, no
     /// `has_cond_fmt` reads, no rebuilds. `already_rebuilt` names sheets the caller has just fully
     /// rebuilt this batch (a CF-rule mutation or a structural op), so they are not rebuilt twice.
-    fn refresh_cf_caches_after_recompute(&mut self, already_rebuilt: &[SheetId]) {
+    fn stage_cf_caches_after_recompute(&mut self, already_rebuilt: &[SheetId]) -> Vec<SheetId> {
+        let mut changed = Vec::new();
         if self.shared.cond_fmt.read().is_empty() {
-            return; // no CF anywhere → nothing value-dependent to refresh (non-CF fast path)
+            return changed; // no CF anywhere → nothing value-dependent to refresh (non-CF fast path)
         }
         // Snapshot the resident ids (bounded by the few activated sheets) so the read lock is
         // released before the per-sheet `&mut` rebuild below.
@@ -1884,9 +1985,10 @@ impl Worker {
                 continue; // a non-CF sheet's cache is value-independent → leave it untouched
             }
             if self.build_and_store_cache(sheet) {
-                self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+                changed.push(sheet);
             }
         }
+        changed
     }
 
     /// Re-read every cell in `refresh` and update its cache entry (the mirror primitive), for the
@@ -2157,6 +2259,21 @@ impl Worker {
     /// probe the model; if it still responds and this is the first panic, reject the edit and
     /// keep serving; on a second panic or an unresponsive probe, degrade and stop taking edits.
     fn handle_caught_panic(&mut self) {
+        if !self.note_caught_panic() {
+            self.emit(WorkerEvent::EditRejected {
+                reason: EditRejectedReason::EnginePanic,
+            });
+        }
+    }
+
+    /// The poisoning policy *without* the edit path's `EditRejected` announcement: count the panic,
+    /// probe the model, and degrade (emitting `WorkerDegraded`) on a second panic or an
+    /// unresponsive probe. Returns whether the worker is now degraded.
+    ///
+    /// Split out of [`handle_caught_panic`](Self::handle_caught_panic) so the **save** path can
+    /// share the identical count/probe/threshold without also claiming an edit was rejected — a
+    /// caught save panic reports itself through `SaveFailed` (B1, `functional_spec.md F2.2`).
+    fn note_caught_panic(&mut self) -> bool {
         self.panic_count += 1;
         let responsive = self.probe_model();
         if self.panic_count >= 2 || !responsive {
@@ -2164,10 +2281,9 @@ impl Worker {
             self.emit(WorkerEvent::WorkerDegraded {
                 reason: "the calculation engine hit an unrecoverable error".to_string(),
             });
+            true
         } else {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::EnginePanic,
-            });
+            false
         }
     }
 
@@ -2212,6 +2328,28 @@ impl Worker {
             Command::FillDrag { sheet, target, .. } => {
                 self.fill_merge_guard(*sheet, |merges| blocks_fill(merges, *target))
             }
+            // Frozen-pane range check (B2, `functional_spec.md F1.2`). The header menu derives the
+            // count from the SELECTED header run, so Select-All → Freeze asks to pin the whole
+            // 1,048,576-row axis — two clicks to a publish loop that never returns. Rejected here,
+            // outside the panic guard, before it can reach the model. Both axes are checked (the UI
+            // sends one, the command permits both); `0` (Unfreeze) is always valid.
+            Command::SetFrozen { rows, cols, .. } => {
+                if let Some(n) = rows.filter(|n| *n > MAX_FROZEN_ROWS) {
+                    return Err(EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Rows,
+                        requested: n,
+                        max: MAX_FROZEN_ROWS,
+                    });
+                }
+                if let Some(n) = cols.filter(|n| *n > MAX_FROZEN_COLS) {
+                    return Err(EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Columns,
+                        requested: n,
+                        max: MAX_FROZEN_COLS,
+                    });
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -2246,198 +2384,6 @@ impl Worker {
         self.doc.merge_would_lose_data(idx, area).unwrap_or(true)
     }
 
-    /// Re-resolve the charts whose source ranges the edit touched, and store a fresh
-    /// [`ChartSnapshot`] iff any changed (P9, charts/architecture §4.1, §5 challenge 2). The dirty
-    /// set is the range→chart index intersected with the edit's `refresh` cells (+ any structurally
-    /// `rebuilt` data sheet); only those charts read live values. Runs **before** the `Published`
-    /// bump so the fresh charts ride the same event that repaints the cells. Cheap when nothing
-    /// intersects — a disjoint edit does no reads and leaves the snapshot untouched.
-    fn reresolve_charts(&mut self, refresh: &[(SheetId, CellRange)], rebuilt: &[SheetId]) {
-        // A bound authored chart (P19) rides the SAME dirty-set/re-resolve path as a loaded one, so
-        // an edit re-renders it too — even in a workbook that has *only* authored charts (no loaded
-        // set). Bail only when there is nothing bound to re-resolve.
-        let any_authored_bound = self.authored_charts.iter().any(|e| !e.refs.is_empty());
-        if self.charts.is_empty() && !any_authored_bound {
-            return;
-        }
-        // A `c:f` sheet name → stable id against the current model. Owned (`move`), so it never
-        // borrows `self` while the chart sets are mutated below.
-        let props = self.doc.sheet_properties();
-        let resolve_sheet = move |name: &str| -> Option<SheetId> {
-            props
-                .iter()
-                .find(|(_, n)| n == name)
-                .map(|(id, _)| SheetId(*id))
-        };
-        let mut changed = false;
-
-        // Loaded charts (P9): intersect the range→chart index, re-resolve only the dirty ones.
-        if !self.charts.is_empty() {
-            let indices = self.charts.dirty_indices(refresh, rebuilt, &resolve_sheet);
-            if !indices.is_empty() {
-                // Live cell reader over the doc — a disjoint field borrow from `self.charts` below.
-                let doc = &self.doc;
-                let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
-                    match resolve_idx(doc, sheet) {
-                        Ok(idx) => doc.cell_value(idx, cell),
-                        Err(_) => CellData::Empty,
-                    }
-                };
-                if self.charts.reresolve(&indices, &resolve_sheet, &read_cell) {
-                    changed = true;
-                }
-            }
-        }
-
-        // Authored charts (P19): re-resolve any bound authored chart the edit touched, so a range set
-        // in the panel behaves exactly like a loaded chart's live binding.
-        if any_authored_bound {
-            changed |= self.reresolve_authored(refresh, rebuilt, &resolve_sheet);
-        }
-
-        if changed {
-            self.chart_version += 1;
-            self.store_chart_snapshot();
-        }
-    }
-
-    /// Capture the **stable** `SheetId → file worksheet part` map at open (P11 CR fix): the file's
-    /// `workbook.xml.rels` name→part map joined with the model's **at-open** sheet names (which still
-    /// match the file). No chart XML is parsed — this is the tiny, eager half of "lazy parse off the
-    /// critical path"; the heavy chart XML still defers to first paint. A read failure yields an
-    /// empty map (the workbook opens chart-less rather than failing) and is logged.
-    ///
-    /// **Join assumption:** the map is built by **exact name-equality** between the file's
-    /// `workbook.xml` `<sheet name>` and the model's at-open `sheet_properties()` name — i.e. it
-    /// assumes IronCalc loads sheet names byte-identical to the file's `<sheets>` (true at open;
-    /// both derive from the same `workbook.xml`). A sheet whose name fails to join is filter-mapped
-    /// out, so its charts degrade to **chart-less** (never discovered/saved) rather than
-    /// mis-anchored — matching the "workbook open never breaks on charts" invariant.
-    fn build_chart_sheet_part_map(&self, path: &Path) -> HashMap<SheetId, String> {
-        let file_parts = match crate::chart::workbook_sheet_parts(path) {
-            Ok(parts) => parts,
-            Err(err) => {
-                tracing::warn!("chart sheet-part map unreadable; opening chart-less: {err:#}");
-                return HashMap::new();
-            }
-        };
-        let props = self.doc.sheet_properties();
-        file_parts
-            .into_iter()
-            .filter_map(|(name, part)| {
-                props
-                    .iter()
-                    .find(|(_, n)| *n == name)
-                    .map(|(id, _)| (SheetId(*id), part))
-            })
-            .collect()
-    }
-
-    /// Walk + bind `sheet`'s charts the first time it is painted (P11 lazy discovery,
-    /// charts/architecture §5 challenge 5). Runs after the viewport publish, so the parse is off the
-    /// first-paint critical path — the cells are already on screen; the charts ride the **next**
-    /// `Published`, exactly as a live re-resolve does (P9). Keyed on the sheet's **stable file part**
-    /// (via [`chart_sheet_parts`](Self::chart_sheet_parts)), NOT its live name, so a sheet renamed
-    /// before it is painted still resolves to its charts (P11 CR fix). A no-op once the sheet has been
-    /// walked, once every sheet has been discovered, or for a non-file / in-session-added sheet.
-    fn ensure_sheet_charts_discovered(&mut self, sheet: SheetId) {
-        if self.charts_fully_discovered {
-            return;
-        }
-        let Some(path) = self.chart_source_path.clone() else {
-            return; // never opened from a file → nothing to discover
-        };
-        if !self.discovered_chart_sheets.insert(sheet) {
-            return; // already walked this sheet (walk each at most once)
-        }
-        let Some(part) = self.chart_sheet_parts.get(&sheet).cloned() else {
-            return; // not a file worksheet (added in-session) → no file charts
-        };
-        match crate::chart::discover_and_parse_for_part(&path, &part) {
-            Ok(specs) => {
-                if self.bind_discovered(sheet, specs) {
-                    self.chart_version += 1;
-                    self.store_chart_snapshot();
-                    self.emit(WorkerEvent::Published);
-                }
-            }
-            Err(err) => tracing::warn!(%part, "lazy chart discovery failed: {err:#}"),
-        }
-    }
-
-    /// Bind the charts `specs` discovered on `sheet`, skipping any deleted in-session (P18 — so a
-    /// save-time full sweep can't resurrect a deleted loaded chart), and — when new charts were
-    /// bound — stamp their stable [`ChartId`]s. Returns whether anything was added.
-    fn bind_discovered(&mut self, sheet: SheetId, specs: crate::chart::load::SheetCharts) -> bool {
-        let specs: crate::chart::load::SheetCharts = specs
-            .into_iter()
-            .filter(|(part, _)| !self.loaded_deletes.contains(part))
-            .collect();
-        if self.charts.add_missing(vec![(sheet, specs)]) {
-            self.charts.assign_missing_ids(&mut self.next_chart_id);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Discover + bind **every** file worksheet's charts (P11), so a chart-preserving save never
-    /// drops a chart whose sheet the user never painted. Runs once at the top of
-    /// [`save_workbook`](Self::save_workbook); a no-op after the first full sweep. Iterates the
-    /// **stable** `SheetId → file part` map, so each chart binds to its real `SheetId` regardless of
-    /// any in-session rename — a renamed host's chart follows the rename, a deleted host's `SheetId`
-    /// no longer resolves so `live_sheet_targets` drops it (the P10 delete outcome), and the
-    /// active-sheet-fallback mis-anchoring bug is impossible. Merges through
-    /// [`add_missing`](ChartBindings::add_missing), so charts already bound lazily (and their
-    /// live-resolved values) are kept untouched. A discovery failure is logged (the save then
-    /// proceeds with whatever was already bound, rather than aborting the user's save).
-    fn ensure_all_charts_discovered(&mut self) {
-        if self.charts_fully_discovered {
-            return;
-        }
-        if self.chart_source_path.is_none() {
-            self.charts_fully_discovered = true;
-            return; // never opened from a file → nothing to discover
-        }
-        let path = self.chart_source_path.clone().expect("checked Some above");
-        // Snapshot the stable map so we don't borrow `self` while binding into `self.charts`.
-        let sheet_parts: Vec<(SheetId, String)> = self
-            .chart_sheet_parts
-            .iter()
-            .map(|(id, part)| (*id, part.clone()))
-            .collect();
-        let mut added = false;
-        for (sheet, part) in sheet_parts {
-            self.discovered_chart_sheets.insert(sheet);
-            match crate::chart::discover_and_parse_for_part(&path, &part) {
-                Ok(specs) if !specs.is_empty() => {
-                    if self.bind_discovered(sheet, specs) {
-                        added = true;
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => tracing::warn!(%part, "chart discovery for save failed: {err:#}"),
-            }
-        }
-        self.charts_fully_discovered = true;
-        if added {
-            self.chart_version += 1;
-            self.store_chart_snapshot();
-            self.emit(WorkerEvent::Published);
-        }
-    }
-
-    /// The current name of the worksheet with stable id `sheet` (against the live model), or `None`
-    /// if that sheet no longer exists (deleted in-session). The rename-safe key the chart-preserving
-    /// save resolves each chart's host worksheet through.
-    fn sheet_name_of(&self, sheet: SheetId) -> Option<String> {
-        self.doc
-            .sheet_properties()
-            .into_iter()
-            .find(|(id, _)| SheetId(*id) == sheet)
-            .map(|(_, name)| name)
-    }
-
     /// Save the workbook to `path` (`Command::Save` / Save-As), **preserving embedded charts**
     /// (P10, charts/architecture §4.1/§5). When the workbook was opened from a file *and* carries
     /// live charts, it re-injects that file's chart machinery into the current model body and
@@ -2451,6 +2397,19 @@ impl Worker {
         // — otherwise a chart on a sheet the user never scrolled to would be silently dropped by the
         // chart-less writer.
         self.ensure_all_charts_discovered();
+
+        // Panic injection for the save guard's test (B1, `functional_spec.md F2.2`) — see
+        // `document::PANIC_SENTINEL`. Placed **after** the chart sweep so it sits where the pinned
+        // exporter's `panic!("Model needs to be evaluated before saving!")` really is: downstream
+        // of the sweep, with whatever that sweep mutated already applied. Exercises the guard at
+        // its real call site inside `process_batch`.
+        #[cfg(test)]
+        if path
+            .file_name()
+            .is_some_and(|n| n == crate::document::PANIC_SENTINEL)
+        {
+            panic!("injected test panic (save catch_unwind recovery)");
+        }
 
         // Mode 1/2 (loaded re-inject) applies only to a workbook opened from a file that still
         // carries loaded charts; mode 3 (authored write-from-model) applies to any inserted chart.
@@ -2523,437 +2482,6 @@ impl Worker {
         Ok(())
     }
 
-    /// The authored charts as [`AuthoredChart`]s for the write-from-model save, resolving each one's
-    /// host worksheet name (dropping a chart whose host sheet was deleted in-session, like a loaded
-    /// chart) and assigning it a **free** `xl/charts/chartN.xml` part — one that collides with
-    /// neither an existing part in `package_bytes` (loaded charts already re-injected) nor another
-    /// authored chart. A **ranged** chart (P19) carries its per-series `c:f`
-    /// [`refs`](AuthoredEntry::refs), so the serializer emits `numRef`/`strRef` + caches (fully
-    /// cell-bound, live-binds like a loaded chart on reopen); a still near-empty placeholder carries
-    /// empty `refs`, so the serializer emits schema-valid literals.
-    fn authored_write_list(&self, package_bytes: &[u8]) -> Vec<AuthoredChart> {
-        let mut used = existing_chart_parts(package_bytes);
-        let mut out = Vec::new();
-        for entry in &self.authored_charts {
-            let Some(sheet_name) = self.sheet_name_of(entry.anchor_sheet) else {
-                tracing::warn!("dropping an authored chart whose host worksheet was deleted");
-                continue;
-            };
-            let Some(chart) = entry.spec.chart().cloned() else {
-                continue; // an authored chart always has a typed Chart; defensive
-            };
-            out.push(AuthoredChart {
-                sheet_name,
-                chart_part: next_chart_part(&mut used),
-                chart,
-                anchor: entry.spec.anchor,
-                refs: entry.refs.clone(),
-            });
-        }
-        out
-    }
-
-    /// Insert an **authored** chart of `kind` onto `sheet` at `anchor` (P17, charts/ui_design §3.1).
-    /// A degraded worker rejects it (like every mutating op). Otherwise it builds the template chart
-    /// and holds it as an Authored [`ChartSpec`], marks the document dirty, and republishes the chart
-    /// snapshot so the window's `sync_charts` installs it into the grid. When `data` is `Some` (the
-    /// action bar captured a real selection — Batch 3 item 8) the chart is **bound at creation** via
-    /// [`bind_authored_range_at`](Self::bind_authored_range_at), so it is born LIVE; when `None` it
-    /// stays snapshot-but-not-live (no `c:f` binding, so it never enters the dirty-set re-resolve
-    /// until a range is set in P19).
-    fn insert_authored_chart(
-        &mut self,
-        sheet: SheetId,
-        kind: ChartInsertKind,
-        anchor: Anchor,
-        data: Option<CellRange>,
-    ) {
-        // A degraded worker refuses edits (consistent with the edit batch / paste / SetFont).
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        // The host sheet must exist (the UI only ever sends the active sheet; this is a backstop).
-        if self.resolve(sheet).is_none() {
-            tracing::warn!(sheet = sheet.0, "InsertChart onto a missing sheet ignored");
-            return;
-        }
-        let id = ChartId(self.next_chart_id);
-        self.next_chart_id += 1;
-        self.authored_charts.push(AuthoredEntry {
-            anchor_sheet: sheet,
-            id,
-            spec: ChartSpec::authored(kind.near_empty_chart(), anchor),
-            // A freshly inserted chart carries placeholder literals — no `c:f` binding until a range
-            // is set (P19). Empty `refs` keeps it snapshot-but-not-live, saved as literals.
-            refs: Vec::new(),
-        });
-        // Post-v1 Batch 3, item 8: if the action bar captured a real selection at insert time, bind
-        // it right now so the chart is born LIVE (real `c:f` refs + resolved values) — same block→
-        // series binding as `SetChartRange`, on the id we just assigned. The data lives on the insert
-        // `sheet` (the selection's own — anchor — sheet). A `None` selection stays near-empty.
-        let pos = self.authored_charts.len() - 1;
-        if let Some(data) = data {
-            if let Some(data_sheet_name) = self.sheet_name_of(sheet) {
-                self.bind_authored_range_at(pos, sheet, &data_sheet_name, data);
-            }
-        }
-        // **Undo timeline (charts feedback item 4, reversing the earlier P18 "charts off Ctrl+Z"
-        // decision):** an insert now pushes onto the unified undo stack. We stash the FINAL entry
-        // (after any born-live range bind above) so a redo re-inserts it whole — refs/series intact,
-        // no re-derivation. A chart entry never touches IronCalc's own undo stack, so the `Cell`
-        // entries stay 1:1 with it (no desync). `ops_seen` still counts the op for the dirty flag.
-        let entry = Box::new(self.authored_charts[pos].clone());
-        self.push_chart_undo(ChartUndo::InsertAuthored { index: pos, entry });
-        // Publish the new chart on the same seam the loaded charts ride, so the window installs it.
-        self.commit_chart_op();
-    }
-
-    /// Move/resize a chart (P18, `Command::SetChartAnchor`): set the chart named by `id` to `anchor`.
-    /// Degraded-guarded like every mutating op. An **authored** chart's model anchor is rewritten
-    /// (the write-from-model save re-synthesizes its drawing there); a **loaded** chart's render
-    /// anchor is updated AND recorded in `loaded_anchor_edits` so the source-first save patches its
-    /// retained `twoCellAnchor`. Republishes the chart snapshot so the grid repaints at the new rect.
-    fn set_chart_anchor(&mut self, _sheet: SheetId, id: ChartId, anchor: Anchor) {
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        // Authored first (its ids never collide with loaded ones — one shared counter). Each branch
-        // stashes the prior placement onto the undo timeline (charts feedback item 4) before the move.
-        if let Some(entry) = self.authored_charts.iter_mut().find(|e| e.id == id) {
-            let prior = entry.spec.anchor;
-            entry.spec.anchor = anchor;
-            self.push_chart_undo(ChartUndo::SetAnchorAuthored {
-                id,
-                prior,
-                applied: anchor,
-            });
-        } else if let Some(prior_render) = self.charts.anchor_by_id(id) {
-            let chart_part = self
-                .charts
-                .set_anchor_by_id(id, anchor)
-                .expect("id resolved by anchor_by_id");
-            // `insert` returns the value it replaced — the prior `loaded_anchor_edits` state to
-            // restore on undo (a chart moved twice in-session has a prior edit; a first move has None).
-            let prior_edit = self.loaded_anchor_edits.insert(chart_part.clone(), anchor);
-            self.push_chart_undo(ChartUndo::SetAnchorLoaded {
-                id,
-                chart_part,
-                prior_render,
-                prior_edit,
-                applied: anchor,
-            });
-        } else {
-            tracing::warn!(id = id.0, "SetChartAnchor for an unknown chart id ignored");
-            return;
-        }
-        self.commit_chart_op();
-    }
-
-    /// Delete a chart (P18, `Command::DeleteChart`): drop the chart named by `id`. Degraded-guarded.
-    /// An **authored** chart is removed from the authored set; a **loaded** chart is unbound and its
-    /// `chart_part` recorded in `loaded_deletes` so the source-first save drops it from the package
-    /// (its `twoCellAnchor` + part chain) — and the save-time discovery sweep skips it so it can't be
-    /// re-bound. Republishes so the grid drops it. Both provenances stash enough state to **undo** the
-    /// delete (charts feedback item 4): the removed authored entry, or the whole removed loaded
-    /// binding + the save-set bookkeeping it changed.
-    fn delete_chart(&mut self, _sheet: SheetId, id: ChartId) {
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        if let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) {
-            let entry = Box::new(self.authored_charts.remove(pos));
-            self.push_chart_undo(ChartUndo::DeleteAuthored { index: pos, entry });
-        } else if let Some(removed) = self.charts.take_by_id(id) {
-            let chart_part = removed.chart_part().to_string();
-            // `remove` returns the anchor-edit the delete evicts — restored on undo.
-            let prior_anchor_edit = self.loaded_anchor_edits.remove(&chart_part);
-            self.loaded_deletes.insert(chart_part.clone());
-            self.push_chart_undo(ChartUndo::DeleteLoaded {
-                removed: Box::new(removed),
-                chart_part,
-                prior_anchor_edit,
-            });
-        } else {
-            tracing::warn!(id = id.0, "DeleteChart for an unknown chart id ignored");
-            return;
-        }
-        self.commit_chart_op();
-    }
-
-    /// Set an **authored** chart's data range (P19, `Command::SetChartRange`): give the chart named by
-    /// `id` real `c:f` refs derived from the `data` block on `sheet` (the sheet the data lives on —
-    /// not necessarily the chart's host sheet; the chart is found by `id`), rebuild its series in the
-    /// kind's data shape, and re-resolve their values from the current cells — so it transitions from
-    /// P17's snapshot-but-not-live placeholder to a **LIVE** chart (re-renders on edit,
-    /// `reresolve_authored`; saves with `c:f` + caches, `authored_write_list`). Degraded-guarded; a
-    /// loaded/unknown id is ignored (loaded re-range is P20's source-patch territory).
-    fn set_chart_range(&mut self, sheet: SheetId, id: ChartId, data: CellRange) {
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        let Some(data_sheet_name) = self.sheet_name_of(sheet) else {
-            tracing::warn!(
-                sheet = sheet.0,
-                "SetChartRange onto a missing sheet ignored"
-            );
-            return;
-        };
-        let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) else {
-            tracing::warn!(
-                id = id.0,
-                "SetChartRange for a non-authored/unknown chart ignored (loaded re-range is P20)"
-            );
-            return;
-        };
-        // Stash the whole pre-bind entry (refs/series/source_ranges) and the post-bind entry, so the
-        // undo timeline can restore either clone without re-deriving (charts feedback item 4).
-        let prior = Box::new(self.authored_charts[pos].clone());
-        self.bind_authored_range_at(pos, sheet, &data_sheet_name, data);
-        let applied = Box::new(self.authored_charts[pos].clone());
-        self.push_chart_undo(ChartUndo::SetRangeAuthored {
-            index: pos,
-            prior,
-            applied,
-        });
-        self.commit_chart_op();
-    }
-
-    /// Bind the authored chart at index `pos` to the `data` block on `data_sheet` (named
-    /// `data_sheet_name`): derive its `c:f` refs, rebuild its series shells in the current kind's data
-    /// shape, and re-resolve their values from the current cells — turning a near-empty placeholder
-    /// into a **LIVE** chart. The shared body of `SetChartRange` (P19) and the range-at-insert path
-    /// (Batch 3 item 8). Does **not** publish — the caller commits/publishes once.
-    fn bind_authored_range_at(
-        &mut self,
-        pos: usize,
-        data_sheet: SheetId,
-        data_sheet_name: &str,
-        data: CellRange,
-    ) {
-        let Some(mut template) = self.authored_charts[pos].spec.chart().cloned() else {
-            return; // an authored chart always has a typed Chart; defensive
-        };
-        let refs = crate::chart::series_refs_from_block(data_sheet_name, data);
-        let binding = binding_from_refs(&refs);
-        // The range keeps the current type, so the series data shape is unchanged — derive the shape
-        // from the current kind (xy for scatter, xy+size for bubble, else category/value) the same
-        // way `set_chart_type` does (`ChartInsertKind::series_shape`), not with an ad-hoc `matches!`.
-        let shape = ChartInsertKind::from_chart_kind(&template.kind)
-            .map(|k| k.series_shape())
-            .unwrap_or(freecell_chart_model::SeriesShape::CategoryValue);
-        template.series = build_series_shells(refs.len(), shape);
-        let resolved = self.resolve_authored_chart(data_sheet, &template, &binding);
-        let source_ranges = source_ranges_from_refs(&refs);
-
-        let entry = &mut self.authored_charts[pos];
-        if let Some(slot) = entry.spec.chart_mut() {
-            *slot = resolved;
-        }
-        entry.spec.source_ranges = source_ranges;
-        entry.refs = refs;
-    }
-
-    /// Switch an **authored** chart's type (P19, `Command::SetChartType`): rebuild the chart named by
-    /// `id` to `kind`, preserving its title and — if it is already **bound** to a data range — its
-    /// `c:f` refs (rebuilding the series in the new kind's data shape and re-resolving live). An
-    /// unbound (still near-empty) chart is swapped to that kind's placeholder template, keeping the
-    /// title. Degraded-guarded; a loaded/unknown id is ignored.
-    fn set_chart_type(&mut self, sheet: SheetId, id: ChartId, kind: ChartInsertKind) {
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) else {
-            tracing::warn!(
-                id = id.0,
-                "SetChartType for a non-authored/unknown chart ignored"
-            );
-            return;
-        };
-        let title = self.authored_charts[pos]
-            .spec
-            .chart()
-            .and_then(|c| c.title.clone());
-        let refs = self.authored_charts[pos].refs.clone();
-
-        if refs.is_empty() {
-            // Unbound placeholder: swap to the new kind's near-empty template, keeping the title so a
-            // pre-range retype doesn't reset the (only) field the user has set.
-            let mut chart = kind.near_empty_chart();
-            chart.title = title;
-            if let Some(slot) = self.authored_charts[pos].spec.chart_mut() {
-                *slot = chart;
-            }
-        } else {
-            // Bound: keep the range refs + title/axes/legend, rebuild the series in the new kind's
-            // data shape, and re-resolve their values from the current cells.
-            let mut template = self.authored_charts[pos]
-                .spec
-                .chart()
-                .cloned()
-                .expect("authored chart has a typed Chart");
-            template.kind = kind.chart_kind();
-            template.series = build_series_shells(refs.len(), kind.series_shape());
-            let binding = binding_from_refs(&refs);
-            let resolved = self.resolve_authored_chart(sheet, &template, &binding);
-            if let Some(slot) = self.authored_charts[pos].spec.chart_mut() {
-                *slot = resolved;
-            }
-        }
-        // Type change stays IMMEDIATE (not itself undoable — charts feedback item 4 covers only
-        // insert/delete/anchor/range), but it is a new forward action, so it invalidates the redo
-        // stack (a pending redo must not resurrect pre-retype state).
-        self.redo_stack.clear();
-        self.commit_chart_op();
-    }
-
-    /// Edit a chart's **chrome** (P20, `Command::SetChartChrome`): apply one chrome attribute change
-    /// — title / legend / axis title / series color / data-label toggles — to the chart named by `id`,
-    /// on **either** provenance. An **authored** chart's model is mutated (re-serialized on save); a
-    /// **loaded** chart's retained render model is mutated (so it re-renders live) and its retained
-    /// `chartN.xml` is source-patched on save (only the changed sub-element, preserving unmodeled
-    /// styling — the edit contract). Degraded-guarded; an unknown/Unsupported id is ignored.
-    fn set_chart_chrome(&mut self, _sheet: SheetId, id: ChartId, edit: ChartChromeEdit) {
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        // Authored first (its ids never collide with loaded ones — one shared counter). Chrome edits
-        // stay IMMEDIATE (not themselves undoable — charts feedback item 4 covers only insert/delete/
-        // anchor/range), but each is a new forward action, so it invalidates the redo stack.
-        if let Some(pos) = self.authored_charts.iter().position(|e| e.id == id) {
-            if let Some(chart) = self.authored_charts[pos].spec.chart_mut() {
-                apply_chrome_edit(chart, &edit);
-                self.redo_stack.clear();
-                self.commit_chart_op();
-            }
-            return;
-        }
-        // Loaded: mutate the bound chart's render model in place (its binding is untouched, so it
-        // still live-re-resolves; the save patches its retained source).
-        if self
-            .charts
-            .edit_chart_by_id(id, |chart| apply_chrome_edit(chart, &edit))
-        {
-            self.redo_stack.clear();
-            self.commit_chart_op();
-            return;
-        }
-        tracing::warn!(
-            id = id.0,
-            "SetChartChrome for an unknown/unsupported chart id ignored"
-        );
-    }
-
-    /// Resolve an authored chart's series values from the **current** cells, given a `template` whose
-    /// series shells are already in the right data shape and its `binding` (P19). A `&self` mirror of
-    /// the [`reresolve_charts`](Self::reresolve_charts) closure setup, used by the range/type handlers
-    /// to fill a freshly-rebuilt chart before it is published.
-    fn resolve_authored_chart(
-        &self,
-        anchor_sheet: SheetId,
-        template: &Chart,
-        binding: &crate::chart::ChartBinding,
-    ) -> Chart {
-        let props = self.doc.sheet_properties();
-        let resolve_sheet = move |name: &str| -> Option<SheetId> {
-            props
-                .iter()
-                .find(|(_, n)| n == name)
-                .map(|(id, _)| SheetId(*id))
-        };
-        let doc = &self.doc;
-        let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
-            match resolve_idx(doc, sheet) {
-                Ok(idx) => doc.cell_value(idx, cell),
-                Err(_) => CellData::Empty,
-            }
-        };
-        resolve_chart(template, binding, anchor_sheet, &resolve_sheet, &read_cell)
-    }
-
-    /// Re-resolve every **bound** authored chart the edit touched (P19), in place — returns whether
-    /// any authored chart's picture changed. Mirrors [`ChartBindings::reresolve`] for the authored
-    /// set: an authored chart's `ChartBinding` is derived from its `refs` on demand (their single
-    /// source of truth), so a dirty chart refreshes from the current cells through the shared
-    /// [`resolve_chart`].
-    fn reresolve_authored(
-        &mut self,
-        refresh: &[(SheetId, CellRange)],
-        rebuilt: &[SheetId],
-        resolve_sheet: &SheetResolver<'_>,
-    ) -> bool {
-        let doc = &self.doc;
-        let read_cell = |sheet: SheetId, cell: CellRef| -> CellData {
-            match resolve_idx(doc, sheet) {
-                Ok(idx) => doc.cell_value(idx, cell),
-                Err(_) => CellData::Empty,
-            }
-        };
-        let mut changed = false;
-        for entry in &mut self.authored_charts {
-            if entry.refs.is_empty() {
-                continue; // a still near-empty placeholder has no binding to re-resolve
-            }
-            let binding = binding_from_refs(&entry.refs);
-            let anchor_sheet = entry.anchor_sheet;
-            if !binding_is_dirty(&binding, anchor_sheet, refresh, rebuilt, resolve_sheet) {
-                continue;
-            }
-            let Some(template) = entry.spec.chart() else {
-                continue;
-            };
-            let resolved =
-                resolve_chart(template, &binding, anchor_sheet, resolve_sheet, &read_cell);
-            if entry.spec.chart() != Some(&resolved) {
-                if let Some(slot) = entry.spec.chart_mut() {
-                    *slot = resolved;
-                }
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Shared post-mutation bookkeeping for a chart op: count the committed op (dirty + savable),
-    /// bump the chart version, re-store the snapshot, and publish. Deliberately does **not** touch
-    /// the undo/redo stacks — the caller (a forward op via [`push_chart_undo`](Self::push_chart_undo),
-    /// or an undo/redo via [`undo_chart_op`](Self::undo_chart_op)) owns the timeline — so it is reused
-    /// verbatim by both the forward chart ops and the chart undo/redo republish.
-    fn commit_chart_op(&mut self) {
-        self.ops_seen += 1;
-        self.shared
-            .committed_ops
-            .store(self.ops_seen, Ordering::Release);
-        self.chart_version += 1;
-        self.store_chart_snapshot();
-        self.emit(WorkerEvent::Published);
-    }
-
-    /// Push a chart op onto the unified undo timeline (charts feedback item 4) and clear the redo
-    /// stack — a new forward action always invalidates redo. Called by the four undoable chart ops
-    /// (insert / delete / anchor / range) just before [`commit_chart_op`](Self::commit_chart_op).
-    fn push_chart_undo(&mut self, cu: ChartUndo) {
-        self.undo_stack.push(UndoEntry::Chart(cu));
-        self.redo_stack.clear();
-    }
-
     /// Undo the single most-recent action (`Command::Undo`). Dispatches on the unified timeline's top
     /// entry: a `Cell` top drives IronCalc's own undo through the single-command edit path (which
     /// re-reads the popped touch-set); a `Chart` top is inverted worker-side without touching
@@ -2963,8 +2491,10 @@ impl Worker {
             self.undo_chart_op();
         } else {
             // `Cell` top or empty → the IronCalc undo path (degraded-guarded inside; the empty case
-            // is a no-op, identical to before charts joined the timeline).
-            self.apply_edit_batch(vec![Command::Undo]);
+            // is a no-op, identical to before charts joined the timeline). `viewport_changed: false`
+            // — undo/redo run one-by-one AFTER `process_batch`'s viewport handling, so any sheet the
+            // batch activated has already been committed with its cache.
+            self.apply_edit_batch(vec![Command::Undo], false);
         }
     }
 
@@ -2974,262 +2504,177 @@ impl Worker {
         if matches!(self.redo_stack.last(), Some(UndoEntry::Chart(_))) {
             self.redo_chart_op();
         } else {
-            self.apply_edit_batch(vec![Command::Redo]);
+            self.apply_edit_batch(vec![Command::Redo], false);
         }
     }
 
-    /// Undo a chart op: pop the `Chart` entry (the caller guaranteed one is on top), apply its
-    /// inverse worker-side, push the counterpart onto the redo stack, and republish. Degraded-guarded
-    /// like every mutating op — a degraded worker refuses (leaving the stacks untouched). Does NOT
-    /// call IronCalc's `undo()`, so the `Cell` entries stay 1:1 with IronCalc's stack.
-    fn undo_chart_op(&mut self) {
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        let Some(UndoEntry::Chart(cu)) = self.undo_stack.pop() else {
-            return; // caller guarantees a Chart entry is on top
-        };
-        let counterpart = self.undo_chart_entry(cu);
-        self.redo_stack.push(UndoEntry::Chart(counterpart));
-        self.commit_chart_op();
-    }
-
-    /// Redo a chart op: the mirror of [`undo_chart_op`](Self::undo_chart_op) over the redo stack.
-    fn redo_chart_op(&mut self) {
-        if self.degraded {
-            self.emit(WorkerEvent::EditRejected {
-                reason: EditRejectedReason::Degraded,
-            });
-            return;
-        }
-        let Some(UndoEntry::Chart(cu)) = self.redo_stack.pop() else {
-            return;
-        };
-        let counterpart = self.redo_chart_entry(cu);
-        self.undo_stack.push(UndoEntry::Chart(counterpart));
-        self.commit_chart_op();
-    }
-
-    /// Apply the **inverse** of one chart op (revert it), and return the [`ChartUndo`] to push onto
-    /// the redo stack (the same variant — [`redo_chart_entry`](Self::redo_chart_entry) re-applies it
-    /// forward). Snapshot-based, so each arm just restores or removes stashed whole state.
-    fn undo_chart_entry(&mut self, cu: ChartUndo) -> ChartUndo {
-        match cu {
-            // Undo an insert → remove it (redo re-inserts `entry`).
-            ChartUndo::InsertAuthored { index, entry } => {
-                if index < self.authored_charts.len() {
-                    self.authored_charts.remove(index);
-                }
-                ChartUndo::InsertAuthored { index, entry }
-            }
-            // Undo a delete → re-insert `entry` at its old slot (redo removes it again).
-            ChartUndo::DeleteAuthored { index, entry } => {
-                let at = index.min(self.authored_charts.len());
-                self.authored_charts.insert(at, (*entry).clone());
-                ChartUndo::DeleteAuthored { index, entry }
-            }
-            // Undo a loaded delete → re-bind the chart, clear the save-set bookkeeping the delete
-            // added, and restore the anchor-edit it evicted.
-            ChartUndo::DeleteLoaded {
-                removed,
-                chart_part,
-                prior_anchor_edit,
-            } => {
-                self.charts.reinsert_removed((*removed).clone());
-                self.loaded_deletes.remove(&chart_part);
-                match prior_anchor_edit {
-                    Some(a) => {
-                        self.loaded_anchor_edits.insert(chart_part.clone(), a);
-                    }
-                    None => {
-                        self.loaded_anchor_edits.remove(&chart_part);
-                    }
-                }
-                ChartUndo::DeleteLoaded {
-                    removed,
-                    chart_part,
-                    prior_anchor_edit,
-                }
-            }
-            ChartUndo::SetAnchorAuthored { id, prior, applied } => {
-                if let Some(e) = self.authored_charts.iter_mut().find(|e| e.id == id) {
-                    e.spec.anchor = prior;
-                }
-                ChartUndo::SetAnchorAuthored { id, prior, applied }
-            }
-            ChartUndo::SetAnchorLoaded {
-                id,
-                chart_part,
-                prior_render,
-                prior_edit,
-                applied,
-            } => {
-                self.charts.set_anchor_by_id(id, prior_render);
-                match prior_edit {
-                    Some(a) => {
-                        self.loaded_anchor_edits.insert(chart_part.clone(), a);
-                    }
-                    None => {
-                        self.loaded_anchor_edits.remove(&chart_part);
-                    }
-                }
-                ChartUndo::SetAnchorLoaded {
-                    id,
-                    chart_part,
-                    prior_render,
-                    prior_edit,
-                    applied,
-                }
-            }
-            ChartUndo::SetRangeAuthored {
-                index,
-                prior,
-                applied,
-            } => {
-                if index < self.authored_charts.len() {
-                    self.authored_charts[index] = (*prior).clone();
-                }
-                ChartUndo::SetRangeAuthored {
-                    index,
-                    prior,
-                    applied,
-                }
-            }
-        }
-    }
-
-    /// Apply the **forward** of one chart op (re-apply it), and return the [`ChartUndo`] to push onto
-    /// the undo stack — the mirror of [`undo_chart_entry`](Self::undo_chart_entry).
-    fn redo_chart_entry(&mut self, cu: ChartUndo) -> ChartUndo {
-        match cu {
-            // Redo an insert → re-insert `entry` at its slot.
-            ChartUndo::InsertAuthored { index, entry } => {
-                let at = index.min(self.authored_charts.len());
-                self.authored_charts.insert(at, (*entry).clone());
-                ChartUndo::InsertAuthored { index, entry }
-            }
-            // Redo a delete → remove it again.
-            ChartUndo::DeleteAuthored { index, entry } => {
-                if index < self.authored_charts.len() {
-                    self.authored_charts.remove(index);
-                }
-                ChartUndo::DeleteAuthored { index, entry }
-            }
-            // Redo a loaded delete → re-run the delete effects: take the chart out again (a fresh
-            // whole binding for a later undo), re-add its part to `loaded_deletes`, drop the
-            // anchor-edit the undo restored.
-            ChartUndo::DeleteLoaded {
-                removed,
-                chart_part,
-                prior_anchor_edit,
-            } => {
-                let fresh = self.charts.take_by_id(removed.id());
-                self.loaded_anchor_edits.remove(&chart_part);
-                self.loaded_deletes.insert(chart_part.clone());
-                // A fresh whole binding for a later undo (identical to `removed`; the chart wasn't
-                // touched while re-bound), falling back to the stash if the take somehow missed.
-                let removed = fresh.map(Box::new).unwrap_or(removed);
-                ChartUndo::DeleteLoaded {
-                    removed,
-                    chart_part,
-                    prior_anchor_edit,
-                }
-            }
-            ChartUndo::SetAnchorAuthored { id, prior, applied } => {
-                if let Some(e) = self.authored_charts.iter_mut().find(|e| e.id == id) {
-                    e.spec.anchor = applied;
-                }
-                ChartUndo::SetAnchorAuthored { id, prior, applied }
-            }
-            ChartUndo::SetAnchorLoaded {
-                id,
-                chart_part,
-                prior_render,
-                prior_edit,
-                applied,
-            } => {
-                self.charts.set_anchor_by_id(id, applied);
-                self.loaded_anchor_edits.insert(chart_part.clone(), applied);
-                ChartUndo::SetAnchorLoaded {
-                    id,
-                    chart_part,
-                    prior_render,
-                    prior_edit,
-                    applied,
-                }
-            }
-            ChartUndo::SetRangeAuthored {
-                index,
-                prior,
-                applied,
-            } => {
-                if index < self.authored_charts.len() {
-                    self.authored_charts[index] = (*applied).clone();
-                }
-                ChartUndo::SetRangeAuthored {
-                    index,
-                    prior,
-                    applied,
-                }
-            }
-        }
-    }
-
-    /// Store the current bound charts as the published [`ChartSnapshot`] (charts/architecture §4.1),
-    /// riding the same wait-free `arc_swap` container as the cell publication. Merges the loaded
-    /// (live-bound) charts with the **authored** ones (P17) into per-sheet groups.
-    fn store_chart_snapshot(&self) {
-        let sheets = if self.authored_charts.is_empty() {
-            // Fast path (no authored charts): share the worker's `Arc<[ChartSpec]>` allocations
-            // directly (P11 "off-screen free" — no per-publish deep copy of the loaded specs).
-            self.charts.specs_by_sheet()
-        } else {
-            self.charts_by_sheet_with_authored()
-        };
-        self.shared.chart_snapshot.store(Arc::new(ChartSnapshot {
-            version: self.chart_version,
-            sheets,
-        }));
-    }
-
-    /// The loaded specs (grouped by sheet) with each authored chart appended to its anchor sheet's
-    /// group — the snapshot payload when the workbook carries authored charts. Loaded charts keep
-    /// their discovery order; authored charts follow in insert order.
-    fn charts_by_sheet_with_authored(&self) -> Vec<(SheetId, Arc<[ChartSpec]>)> {
-        let mut groups: Vec<(SheetId, Vec<ChartSpec>)> = self
-            .charts
-            .specs_by_sheet()
-            .into_iter()
-            .map(|(sheet, specs)| (sheet, specs.to_vec()))
-            .collect();
-        for entry in &self.authored_charts {
-            // Stamp the authored chart's stable id (P18) so the app can manipulate it.
-            let spec = entry.spec.clone().with_id(entry.id);
-            match groups.iter_mut().find(|(s, _)| *s == entry.anchor_sheet) {
-                Some((_, specs)) => specs.push(spec),
-                None => groups.push((entry.anchor_sheet, vec![spec])),
-            }
-        }
-        groups
-            .into_iter()
-            .map(|(sheet, specs)| (sheet, Arc::from(specs)))
-            .collect()
-    }
-
-    /// Publish the active sheet's viewport snapshot, THEN bump the generation — a bump always
-    /// has fresh data behind it (SP1's publish-then-bump; the render loop reads generation
-    /// then the publication, safe either order). Logs the publish timing at `debug` (an SP1
-    /// observable; both the edit and the pure-scroll republish paths route through here).
-    fn publish(&self) {
-        let started = Instant::now();
+    /// The **one commit point** for the four worker→UI shared surfaces (E1,
+    /// `functional_spec.md F4`).
+    ///
+    /// Ordering contract — the reason this is a single function rather than eight open-coded
+    /// sequences:
+    ///
+    /// 1. every shared-surface write for generation `N` happens **here**, before the bump;
+    /// 2. `Shared::generation` is stored (`Release`) exactly once, and *that store is the commit*;
+    /// 3. every event announcing `N` is emitted **after** the store.
+    ///
+    /// So a UI reader that observes `generation == N` sees all four surfaces at `N` or later, and
+    /// "what does the UI see at generation N" finally has an answer. It did not before: the value
+    /// commit bumped and emitted `Published`, and only *then* did the style cache and CF map get
+    /// written — a real window in which the grid painted generation-N values against
+    /// generation-(N−1) styles. Chart-only ops were worse still: they emitted `Published` without
+    /// publishing anything, so the counter did not move at all.
+    ///
+    /// **The invariant, stated in the direction F4.1 actually needs: no surface may ever be *behind*
+    /// the committed generation. A surface running *ahead* of it is legal.** That is what a reader
+    /// checks and what the ordering tests assert; "nothing writes a shared surface outside this
+    /// function" would be a stronger claim, and it is **not** true. Two sanctioned writers sit
+    /// outside, both forward-only:
+    ///
+    /// - [`load_and_run`](Self::load_and_run) seeds the publication, the active sheet's cache and
+    ///   the CF map before the loop starts, and announces them with `Loaded` + `StyleCacheUpdated`
+    ///   while `generation` never leaves 0. It is not routed through `commit` because a `commit`
+    ///   there would emit `Published` *ahead of* `Loaded`, and F4.2 fixes the event set: no event
+    ///   added, none removed, none reordered relative to `Loaded`. It is sound on a different
+    ///   argument from the one above — the `Loaded` **channel send** is the happens-before edge, so
+    ///   a UI that has seen `Loaded` has seen those writes. Every surface is at generation 0, the
+    ///   committed generation, so nothing is behind.
+    /// - [`apply_auto_grow`](Self::apply_auto_grow) writes row heights into the resident cache and
+    ///   emits a bare `StyleCacheUpdated` with no commit and no bump. It is a cache-only geometry
+    ///   update that rides no undo/touch stack (§3.4), applying a fresh UI measurement **on top of**
+    ///   the committed cache; it never rewinds the cache to a pre-commit state. So the cache runs at
+    ///   or ahead of the generation — legal — and never behind it.
+    ///
+    /// That enumeration is of **this crate**. Two writers of the same surfaces live outside it —
+    /// `DocumentClient::set_chart_snapshot` (`#[cfg(feature = "test-support")]`, worker-less view
+    /// tests) and `freecell_app::grid::GridView::autogrow_measure_now` (an ungated `pub fn` driven
+    /// only by the pixel render harness, over a shut-down worker, writing forward-only row
+    /// geometry). Both leave the invariant standing; `functional_spec.md` F4.1 lists all four in
+    /// one place.
+    ///
+    /// `commit_emits_nothing_before_the_bump` asserts step 3 at the store itself, via the
+    /// `#[cfg(test)]` `COMMIT_STORE_PROBE` hook — and asserts step 1 there too, which is the half
+    /// that a drained event order cannot see.
+    pub(super) fn commit(&mut self, staged: StagedCommit) {
+        // ---- stage: every shared-surface write for this generation ------------------------------
         let generation = self.shared.generation.load(Ordering::Acquire) + 1;
-        let publication = self.build_publication(generation);
+
+        let mut style_sheets: Vec<SheetId> = Vec::new();
+        // Activating a sheet builds its style/geometry cache on first visit, then it stays resident
+        // (`components/style_cache.md §Lifecycle`).
+        if staged.ensure_active_cache && self.ensure_active_cache_built() {
+            style_sheets.push(self.active_sheet);
+        }
+        // Mirror the batch's edited cells into the resident cache (re-read touched cells, rebuild
+        // whole sheets where a per-cell mirror can't express the change).
+        style_sheets.extend(self.stage_cache_refresh(
+            staged.refresh,
+            staged.rebuild,
+            staged.sheets_before.as_deref(),
+        ));
+        // Value-dependent conditional formatting: a recompute can change cell values, which flips CF
+        // results (a threshold crosses, a Top-N/average cell enters or leaves the set, a color scale
+        // re-interpolates) with NO CF command. Only on a recompute, and short-circuited for a
+        // non-CF workbook by the empty-map gate inside. `cf_sheets` (this batch's full rebuilds) is
+        // passed so a sheet already rebuilt above isn't rebuilt twice.
+        if staged.cf_after_recompute {
+            style_sheets.extend(self.stage_cf_caches_after_recompute(&staged.cf_sheets));
+        }
+        // Republish the CF rule list for any rebuilt sheet whose rules actually changed
+        // (`components/engine_cf.md §5`). Gated inside so a non-CF sheet is free; deduped so a
+        // coalesced multi-CF batch reconciles each sheet once.
+        let mut cf_sheets = staged.cf_sheets;
+        cf_sheets.sort_unstable();
+        cf_sheets.dedup();
+        let mut cf_updated = self.stage_cond_fmt(&cf_sheets);
+
+        // A changed sheet list (add/rename/delete, or an undo/redo of one) re-syncs the tab bar.
+        // Compared by value so undo/redo of a sheet op is caught too.
+        let sheets_changed = match &staged.sheets_before {
+            Some(before) => {
+                let after = self.sheet_metas();
+                if after == *before {
+                    None
+                } else {
+                    // Reconcile the CF map with the changed sheet SET. Removed sheets (delete /
+                    // undo-of-add) are dropped so the map never outlives its sheet. Sheets that
+                    // REAPPEARED (undo-of-delete restores the worksheet + its CF rules) are
+                    // reconciled so a returning CF sheet republishes its rules + emits
+                    // `CondFmtUpdated` — that undo pushes `Touch::Sheets`, not `Touch::Rebuild`, so
+                    // the returning sheet never entered `cf_sheets` above.
+                    let ids_before: HashSet<SheetId> = before.iter().map(|m| m.id).collect();
+                    let ids_after: HashSet<SheetId> = after.iter().map(|m| m.id).collect();
+                    self.shared
+                        .cond_fmt
+                        .write()
+                        .retain(|id, _| ids_after.contains(id));
+                    let appeared: Vec<SheetId> =
+                        ids_after.difference(&ids_before).copied().collect();
+                    cf_updated.extend(self.stage_cond_fmt(&appeared));
+                    Some(after)
+                }
+            }
+            None => None,
+        };
+
+        self.stage_publication(generation, staged.values_unchanged);
+        self.stamp_chart_snapshot(generation);
+
+        // ---- commit: one Release store, and it is the whole ordering guarantee ------------------
+        // Test-only observation point (§A5.5): fires with every surface for `generation` written and
+        // nothing about it announced — the instant the contract is a statement about.
+        #[cfg(test)]
+        fire_commit_store_probe();
+        self.shared.generation.store(generation, Ordering::Release);
+
+        // ---- announce: nothing above this line may move below it, and vice versa ----------------
+        self.emit(WorkerEvent::Published);
+        for sheet in style_sheets {
+            self.emit(WorkerEvent::StyleCacheUpdated { sheet });
+        }
+        for sheet in cf_updated {
+            self.emit(WorkerEvent::CondFmtUpdated { sheet });
+        }
+        if let Some(sheets) = sheets_changed {
+            self.emit(WorkerEvent::SheetsChanged { sheets });
+        }
+    }
+
+    /// Store the active sheet's viewport snapshot for `generation` — **without** bumping the
+    /// counter. The bump is [`commit`](Self::commit)'s job and its alone (E1): it is the single
+    /// release edge that makes this publication, the style cache, the chart snapshot and the CF map
+    /// visible together. Logs the publish timing at `debug` (an SP1 observable; every publishing
+    /// path routes through here).
+    ///
+    /// `values_unchanged` (a chart-op commit, `StagedCommit::values_unchanged`) takes the **restamp**
+    /// path: the resident publication is re-stored under the new generation instead of rebuilt. The
+    /// generation still moves — that is the whole point of routing chart ops through `commit` — but
+    /// a commit that provably changed no cell doesn't pay a viewport rebuild for it. That matters
+    /// because a chart op is **not** always a discrete gesture: `SetChartChrome` is sent live per
+    /// keystroke while a chart/axis title is typed (`chrome/view/charts.rs::on_chart_title_event`),
+    /// and chart ops commit one-by-one, so five characters would otherwise be five full-viewport
+    /// rebuilds (≈20k engine probes each, 165,888 worst case). The restamp is a `Vec` clone of cells
+    /// already built — no engine call at all.
+    ///
+    /// The restamp is skipped (and a full build taken) if the resident publication is for another
+    /// sheet. That is belt-and-braces, not a live branch: `publication.sheet == active_sheet` is an
+    /// invariant — `active_sheet` is assigned only in `load_and_run` (which seeds the publication
+    /// immediately after) and in `process_batch`'s `SetViewport` arm (which always commits, before
+    /// any chart op in the same batch runs), so the resident publication always describes the active
+    /// sheet and its current window.
+    fn stage_publication(&self, generation: u64, values_unchanged: bool) {
+        let started = Instant::now();
+        let current = self.shared.publication.load();
+        let publication = if values_unchanged && current.sheet == self.active_sheet {
+            Publication {
+                generation,
+                ..(**current).clone()
+            }
+        } else {
+            self.build_publication(generation)
+        };
         let cells = publication.cells.len();
         self.shared.publication.store(Arc::new(publication));
-        self.shared.generation.store(generation, Ordering::Release);
         tracing::debug!(
             generation,
             cells,
@@ -3252,15 +2697,28 @@ impl Worker {
                 // counts off the resident cache (0 when unfrozen, or not yet built on the very first
                 // publish — harmless, the band is inside the body window at scroll 0). The published
                 // set is the union of the ≤4 quadrant rectangles `(0..M ∪ body_rows) × (0..K ∪
-                // body_cols)`; O(visible) — the bands are a few leading tracks, never a sheet-size
-                // loop. Flooring the body ranges past the bands makes the chained iteration visit
-                // each cell exactly once.
+                // body_cols)`. Flooring the body ranges past the bands makes the chained iteration
+                // visit each cell exactly once.
+                //
+                // The band counts are CLAMPED here (B2, `functional_spec.md F1`). This loop's bound
+                // used to be asserted in prose — "the bands are a few leading tracks, never a
+                // sheet-size loop" — and that assertion was false: `M` comes from a header
+                // SELECTION, so Select-All → Freeze made it 1,048,576 and this loop never returned.
+                // The cache build clamps the same way, so this is a backstop rather than the only
+                // guard; it is written here anyway because this is the loop that depends on it, and
+                // an invariant with a mechanism is the only kind that holds. Worst case is now the
+                // constant `(64 + 512) × (32 + 256)` = 165,888 probes.
                 let (m, k) = self
                     .shared
                     .caches
                     .read()
                     .get(sheet)
-                    .map(|c| (c.frozen_rows(), c.frozen_cols()))
+                    .map(|c| {
+                        (
+                            c.frozen_rows().min(MAX_FROZEN_ROWS),
+                            c.frozen_cols().min(MAX_FROZEN_COLS),
+                        )
+                    })
                     .unwrap_or((0, 0));
                 let body_rows = vp.rows.start.max(m)..vp.rows.end.max(m);
                 let body_cols = vp.cols.start.max(k)..vp.cols.end.max(k);
@@ -3304,14 +2762,16 @@ impl Worker {
     }
 
     /// Reconcile the published CF rule map for each of `sheets` against the document's current
-    /// rules, emitting [`WorkerEvent::CondFmtUpdated`] only when a sheet's published list actually
-    /// changed (`architecture.md §4.5`, `components/engine_cf.md §5`).
+    /// rules, **returning** the sheets whose published list actually changed
+    /// (`architecture.md §4.5`, `components/engine_cf.md §5`). The caller announces them with
+    /// [`WorkerEvent::CondFmtUpdated`] after [`commit`](Self::commit)'s bump (E1).
     ///
     /// Gated so a non-CF workbook pays nothing: a sheet with no CF rule **and** no published entry is
     /// skipped before any list read. A rule change (add / update / delete / reorder, or a structural
     /// range shift) or the undo/redo of one flips `has_cond_fmt` / the list contents, so it is
     /// reconciled. The map holds no entry for a sheet with zero rules (so the client reads empty).
-    fn reconcile_published_cond_fmt(&self, sheets: &[SheetId]) {
+    fn stage_cond_fmt(&self, sheets: &[SheetId]) -> Vec<SheetId> {
+        let mut updated = Vec::new();
         for &sheet in sheets {
             let Some(idx) = self.resolve(sheet) else {
                 continue; // sheet deleted out from under the touch-set — pruned by the caller
@@ -3352,8 +2812,9 @@ impl Worker {
                     map.insert(sheet, rules);
                 }
             }
-            self.emit(WorkerEvent::CondFmtUpdated { sheet });
+            updated.push(sheet);
         }
+        updated
     }
 
     /// Populate the published CF map once on open for every sheet that carries rules
@@ -3391,69 +2852,14 @@ impl Worker {
     }
 
     /// Resolve a stable [`SheetId`] to its current worksheet index (`None` if it was deleted).
-    fn resolve(&self, sheet: SheetId) -> Option<u32> {
+    pub(super) fn resolve(&self, sheet: SheetId) -> Option<u32> {
         resolve_idx(&self.doc, sheet).ok()
     }
 
     /// Send an event; drops silently if the UI has released the receiver (worker outlives it
     /// only at teardown).
-    fn emit(&self, event: WorkerEvent) {
+    pub(super) fn emit(&self, event: WorkerEvent) {
         let _ = self.event_tx.try_send(event);
-    }
-}
-
-/// Apply one chrome edit to a render [`Chart`] (P20) — the pure mutation shared by the authored and
-/// loaded chrome-edit paths (`set_chart_chrome`). A [`DataLabels`](ChartChromeEdit::DataLabels) edit
-/// applies the show toggles across **every** series, preserving each series' existing label
-/// number-format / separator / position (and any legend-key / series-name already shown), and clears
-/// a series' labels to `None` only when nothing at all would show.
-fn apply_chrome_edit(chart: &mut Chart, edit: &ChartChromeEdit) {
-    match edit {
-        ChartChromeEdit::Title(title) => chart.title = title.clone(),
-        ChartChromeEdit::Legend(position) => {
-            chart.legend = position.map(|position| Legend { position })
-        }
-        ChartChromeEdit::AxisTitle { axis, title } => {
-            let ax = match axis {
-                ChartAxisKind::Category => &mut chart.cat_axis,
-                ChartAxisKind::Value => &mut chart.val_axis,
-            };
-            ax.title = title.clone();
-        }
-        ChartChromeEdit::SeriesColor { series, color } => {
-            // A "series color" edit recolors the WHOLE series. Only a LINE or SCATTER series carries
-            // its visible color on the `a:ln` stroke, which the renderer prefers over `color`
-            // (line.rs / scatter.rs: `stroke.color.or(color)`). Leaving the stroke on its original
-            // color is exactly why a loaded LINE chart kept its old color on screen and through save
-            // while an authored one (no stroke) honored the edit — charts feedback item 9. FILLED
-            // kinds (bar/column/area/pie/bubble) render from the fill (`color`) and treat `a:ln` as
-            // a decorative border, so recoloring their stroke would over-reach — mutating a border
-            // the user never touched (charts feedback Batch 5). Gate the stroke recolor accordingly.
-            let recolor_stroke = matches!(
-                chart.kind,
-                ChartKind::Line { .. } | ChartKind::Scatter { .. }
-            );
-            if let Some(s) = chart.series.get_mut(*series) {
-                let new = color.map(|rgb| ChartColor::Rgb(Color::from_hex(rgb.to_hex())));
-                s.color = new;
-                // Override only the stroke's COLOR (keep its width/alpha); clearing the series color
-                // (`None`) reverts the stroke to the palette too.
-                if recolor_stroke {
-                    if let Some(stroke) = &mut s.stroke {
-                        stroke.color = new;
-                    }
-                }
-            }
-        }
-        ChartChromeEdit::DataLabels(toggles) => {
-            for s in &mut chart.series {
-                let mut labels = s.data_labels.clone().unwrap_or_default();
-                labels.show_value = toggles.show_value;
-                labels.show_category_name = toggles.show_category_name;
-                labels.show_percent = toggles.show_percent;
-                s.data_labels = labels.is_shown().then_some(labels);
-            }
-        }
     }
 }
 
@@ -3761,52 +3167,8 @@ fn any_cell_lacks(
     Ok(false)
 }
 
-/// The `xl/charts/chartN.xml` part names already present in a serialized package (loaded charts
-/// re-injected by mode 1/2) — the used set the authored-chart part assignment avoids colliding with.
-/// A package that can't be read as a zip yields an empty set (the write path then validates any real
-/// collision and fails loudly).
-fn existing_chart_parts(package_bytes: &[u8]) -> HashSet<String> {
-    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(package_bytes)) else {
-        return HashSet::new();
-    };
-    (0..zip.len())
-        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
-        .filter(|n| n.starts_with("xl/charts/") && n.ends_with(".xml") && !n.contains("/_rels/"))
-        .collect()
-}
-
-/// The distinct `c:f` formulas of a ranged authored chart's [`SeriesRefs`] as [`CfRange`]s, in
-/// first-seen order (name / categories / values across the series), for the published spec's
-/// `source_ranges` (P19). Deduped so a shared category column isn't listed once per series — the
-/// value the edit panel reads back to show the chart's current data range.
-fn source_ranges_from_refs(refs: &[SeriesRefs]) -> Vec<CfRange> {
-    let mut out: Vec<CfRange> = Vec::new();
-    for formula in refs
-        .iter()
-        .flat_map(|r| [&r.name, &r.categories, &r.values, &r.sizes])
-        .flatten()
-    {
-        if !out.iter().any(|r| r.as_str() == formula) {
-            out.push(CfRange::new(formula.clone()));
-        }
-    }
-    out
-}
-
-/// The next free `xl/charts/chartN.xml` part, marking it used (mirrors `write::next_drawing_part`).
-fn next_chart_part(used: &mut HashSet<String>) -> String {
-    let mut n = 1;
-    loop {
-        let candidate = format!("xl/charts/chart{n}.xml");
-        if used.insert(candidate.clone()) {
-            return candidate;
-        }
-        n += 1;
-    }
-}
-
 /// Resolve a stable [`SheetId`] to a worksheet index, or an engine-style error message.
-fn resolve_idx(doc: &WorkbookDocument, sheet: SheetId) -> Result<u32, String> {
+pub(super) fn resolve_idx(doc: &WorkbookDocument, sheet: SheetId) -> Result<u32, String> {
     doc.sheet_properties()
         .iter()
         .position(|(id, _)| *id == sheet.0)
@@ -3976,6 +3338,23 @@ const AUTO_GROW_EPS_PX: f32 = 0.5;
 const MAX_PUBLISH_ROWS: u32 = 512;
 const MAX_PUBLISH_COLS: u32 = 256;
 
+/// The most leading rows / columns FreeCell will pin as a frozen pane (`functional_spec.md F1`).
+///
+/// The frozen band is published on EVERY publish, on top of the body window, so an unbounded band
+/// is an unbounded publish — `(0..M) × (0..K)` from a count the UI derives from a header
+/// **selection**, which Select-All makes `1_048_576`. It is also rendered by the grid as
+/// `for r in 0..frozen_rows`, so an unbounded band wedges the render thread too. Both consumers
+/// read the count off the resident cache, so the cache build clamps it there
+/// ([`crate::cache::build_sheet_cache`]) and [`Worker::build_publication`] clamps it again at the
+/// loop that depends on it.
+///
+/// Sized past any usable freeze — a band taller than the window makes the sheet unusable, and a 4K
+/// display shows on the order of 100 rows — while keeping the worst-case publish at
+/// `(MAX_FROZEN_ROWS + MAX_PUBLISH_ROWS) × (MAX_FROZEN_COLS + MAX_PUBLISH_COLS)` = 165,888 probe
+/// cells: a constant, which is the property the band loop's doc comment used to merely assert.
+pub(crate) const MAX_FROZEN_ROWS: u32 = 64;
+pub(crate) const MAX_FROZEN_COLS: u32 = 32;
+
 /// Clamp a requested viewport to the sheet bounds **and** a bounded overscan window. The
 /// viewport arrives pre-overscanned UI-side; the worker keeps the top-left anchor and truncates
 /// the span so the published window can never exceed `MAX_PUBLISH_ROWS × MAX_PUBLISH_COLS`.
@@ -3996,15 +3375,20 @@ fn clamp_span(range: std::ops::Range<u32>, sheet_max: u32, max_len: u32) -> std:
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod testutil {
+    //! Test helpers shared by this module's tests and those of its siblings under `mod worker`
+    //! (`charts.rs`, `client.rs`) — `architecture.md` §A4.2.
+    //!
+    //! They live in their own `pub(super)` module rather than in `mod tests` so that a sibling
+    //! never has to reach into another module's *test* module to borrow a helper. `mod tests`
+    //! itself stays private; only what is genuinely shared is exposed, and only within
+    //! `mod worker`.
+
     use super::*;
-    use crate::worker::protocol::StylePath;
-    use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
-    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, Rgb};
 
     /// Build a headless worker over a fresh empty workbook plus the event receiver, without a
     /// spawned thread — the deterministic substrate for the coalescing / recovery tests.
-    fn test_worker() -> (Worker, async_channel::Receiver<WorkerEvent>) {
+    pub fn test_worker() -> (Worker, async_channel::Receiver<WorkerEvent>) {
         let (tx, rx) = async_channel::unbounded();
         let doc = WorkbookDocument::new_empty().unwrap();
         let shared = Arc::new(Shared::new(SheetId(0)));
@@ -4027,6 +3411,7 @@ mod tests {
             loaded_anchor_edits: HashMap::new(),
             loaded_deletes: HashSet::new(),
             chart_version: 0,
+            chart_snapshot_dirty: false,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),
             charts_fully_discovered: true,
@@ -4044,11 +3429,11 @@ mod tests {
     }
 
     /// The only sheet's stable id (what commands must address).
-    fn sheet0(worker: &Worker) -> SheetId {
+    pub fn sheet0(worker: &Worker) -> SheetId {
         worker.sheet_metas()[0].id
     }
 
-    fn drain_events(rx: &async_channel::Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
+    pub fn drain_events(rx: &async_channel::Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             out.push(ev);
@@ -4056,7 +3441,7 @@ mod tests {
         out
     }
 
-    fn set_input(sheet: SheetId, row: u32, col: u32, input: &str) -> Command {
+    pub fn set_input(sheet: SheetId, row: u32, col: u32, input: &str) -> Command {
         Command::SetCellInput {
             sheet,
             cell: CellRef::new(row, col),
@@ -4066,13 +3451,22 @@ mod tests {
 
     /// Silence the default panic hook while `f` runs, so the injected-panic tests don't spew a
     /// scary (but expected) backtrace into the test log.
-    fn quiet_panics<R>(f: impl FnOnce() -> R) -> R {
+    pub fn quiet_panics<R>(f: impl FnOnce() -> R) -> R {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let r = f();
         std::panic::set_hook(prev);
         r
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
+    use crate::worker::protocol::StylePath;
+    use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
+    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, Rgb};
 
     #[test]
     fn drain_coalesces_burst_into_one_eval() {
@@ -4351,6 +3745,249 @@ mod tests {
         );
     }
 
+    /// E1 (`functional_spec.md F4.1`), stated directly at the instant it is about: when `commit`
+    /// performs its `Release` store, every shared surface for the new generation is already written
+    /// and nothing announcing that generation has been emitted.
+    ///
+    /// **Why it needs the `COMMIT_STORE_PROBE` hook rather than a drained event order.** The first
+    /// version of this test only compared positions in the drained event vector, and that is
+    /// *vacuous*: hoist `stage_publication` + the store + `emit(Published)` back to the top of
+    /// `commit` — the pre-Phase-4 shape, where the style cache and CF map were written after the
+    /// bump — and the drained order is unchanged (`Published` still precedes `StyleCacheUpdated`),
+    /// so the test stayed green against the very regression it names. The half that discriminates is
+    /// step 1 of the contract, and it is only observable *at* the store: hence the probe. Reverting
+    /// the ordering fails this test on the number-format assertion below.
+    #[test]
+    fn commit_emits_nothing_before_the_bump() {
+        use std::sync::Mutex;
+
+        /// What the probe saw at the `Release` store.
+        #[derive(Debug)]
+        struct AtStore {
+            /// The counter itself — still the *previous* generation; the store is what moves it.
+            generation: u64,
+            /// The events sitting in the queue at that instant (drained, so the post-commit drain
+            /// below sees only what the announce phase adds). `EvalStarted` / `EvalFinished` are
+            /// expected here — they are replies to the command, not commit announcements.
+            queued: Vec<WorkerEvent>,
+            publication_generation: u64,
+            published_text: Option<String>,
+            chart_generation: u64,
+            /// The resident style cache's number-format code for A1 — the style surface's
+            /// generation-comparable value (the same device the seam test uses).
+            num_fmt: Option<String>,
+        }
+
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        drain_events(&rx);
+        let before = worker.shared.generation.load(Ordering::Acquire);
+
+        let seen: Arc<Mutex<Vec<AtStore>>> = Arc::new(Mutex::new(Vec::new()));
+        let guard = {
+            let seen = Arc::clone(&seen);
+            let shared = Arc::clone(&worker.shared);
+            let rx = rx.clone();
+            CommitStoreProbe::install(move || {
+                let publication = shared.publication.load_full();
+                seen.lock().unwrap().push(AtStore {
+                    generation: shared.generation.load(Ordering::Acquire),
+                    queued: drain_events(&rx),
+                    publication_generation: publication.generation,
+                    published_text: publication
+                        .cells
+                        .iter()
+                        .find(|c| c.row == 0 && c.col == 0)
+                        .map(|c| c.display_text.clone()),
+                    chart_generation: shared.chart_snapshot.load().generation,
+                    num_fmt: shared.caches.read().get(sheet).and_then(|c| {
+                        c.render_style(0, 0)
+                            .map(|rs| c.num_fmt_code(rs.num_fmt).to_string())
+                    }),
+                });
+            })
+        };
+
+        // One batch that moves the VALUE and the STYLE of the same cell, so both surfaces carry a
+        // value that says which generation they are at ("1.000" / "0.000" only exist after it).
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "1"),
+            Command::SetStylePath {
+                sheet,
+                range: CellRange::single(CellRef::new(0, 0)),
+                path: StylePath::NumFmt,
+                value: "0.000".to_string(),
+            },
+        ]);
+        drop(guard);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the batch is exactly one commit; got {seen:?}"
+        );
+        let at = &seen[0];
+        let after = worker.shared.generation.load(Ordering::Acquire);
+        assert!(after > before, "the edit committed a new generation");
+        assert_eq!(
+            at.generation, before,
+            "the probe fires at the store, so the counter has not moved yet"
+        );
+
+        // STEP 3 — nothing announcing this generation had been emitted at the store. (`EvalStarted`
+        // / `EvalFinished` are replies to the command and keep their positions, §A5.4.)
+        assert!(
+            !at.queued.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Published
+                    | WorkerEvent::StyleCacheUpdated { .. }
+                    | WorkerEvent::CondFmtUpdated { .. }
+                    | WorkerEvent::SheetsChanged { .. }
+            )),
+            "no commit announcement may be queued before the bump; got {:?}",
+            at.queued
+        );
+
+        // STEP 1 — every surface was already written for the generation about to be stored. This is
+        // the half the drained order cannot see, and the half a revert breaks.
+        assert_eq!(
+            at.publication_generation,
+            before + 1,
+            "the publication is staged before the store"
+        );
+        assert_eq!(
+            at.published_text.as_deref(),
+            Some("1.000"),
+            "and it carries this batch's value under this batch's number format"
+        );
+        assert_eq!(
+            at.num_fmt.as_deref(),
+            Some("0.000"),
+            "the STYLE cache is written before the store too — reverting the ordering (store + \
+             Published hoisted above the cache write) leaves 'general' here"
+        );
+        assert_eq!(
+            at.chart_generation,
+            before + 1,
+            "and so is the chart snapshot's stamp"
+        );
+
+        // The announce phase, after the store: `Published` first, the style delta after it.
+        let events = drain_events(&rx);
+        let published_at = events
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::Published))
+            .expect("the edit published");
+        let style_at = events
+            .iter()
+            .position(|e| matches!(e, WorkerEvent::StyleCacheUpdated { .. }));
+        assert!(
+            style_at.is_none_or(|i| i > published_at),
+            "StyleCacheUpdated announces a cache already written at the committed generation; got {events:?}"
+        );
+        assert_eq!(
+            worker.shared.publication.load().generation,
+            after,
+            "the publication behind the bump is the one this generation names"
+        );
+        assert_eq!(
+            worker.shared.chart_snapshot.load().generation,
+            after,
+            "and so is the chart snapshot — every surface answers 'what does the UI see at N'"
+        );
+    }
+
+    /// E1 regression (`functional_spec.md F4.1`): a drained batch holding **both** a `SetViewport`
+    /// that activates a not-yet-resident sheet **and** an edit must stage the activation's cache
+    /// build inside the batch's ONE commit — exactly as the pure-viewport batch does.
+    ///
+    /// It used to not: `apply_edit_batch` committed with `ensure_active_cache: false`, and
+    /// `process_batch` then built the cache *after* the `Release` store and emitted a
+    /// `StyleCacheUpdated` for a generation already announced. Two things broke, and the second is
+    /// user-visible: at generation N the published sheet's style cache was absent, and
+    /// [`build_publication`](Worker::build_publication) reads the frozen counts off that very cache
+    /// — so the committed publication claimed `frozen_rows = 0` and omitted the band's values while
+    /// the cache (built a moment later) said 2. The grid renders the band off the cache, so the user
+    /// got a two-row frozen band of EMPTY cells until something else republished.
+    #[test]
+    fn a_batched_sheet_switch_and_edit_commit_the_new_sheets_cache_together() {
+        // A two-sheet file whose SECOND sheet carries a 2-row frozen band with a value in it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two-sheets.xlsx");
+        {
+            let (mut worker, _rx) = test_worker();
+            worker.process_batch(vec![Command::AddSheet]);
+            let s2 = worker.sheet_metas()[1].id;
+            worker.process_batch(vec![
+                Command::SetFrozen {
+                    sheet: s2,
+                    rows: Some(2),
+                    cols: None,
+                },
+                set_input(s2, 0, 0, "HDR"),
+            ]);
+            worker.process_batch(vec![Command::Save {
+                path: path.clone(),
+                req_id: 1,
+            }]);
+        }
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (mut worker, _rx) = worker_over(doc);
+        let s1 = worker.sheet_metas()[0].id;
+        let s2 = worker.sheet_metas()[1].id;
+        // Sheet 1 is active and painted; sheet 2 has never been painted, so its cache is absent —
+        // the state a real open leaves behind (build-on-activation).
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: s1,
+            rows: 0..8,
+            cols: 0..8,
+        }]);
+        assert!(
+            !worker.shared.caches.read().contains(s2),
+            "sheet 2 must start non-resident for this to test anything"
+        );
+
+        // ONE drained batch: activate sheet 2 (scrolled deep past its band) AND edit sheet 1.
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet: s2,
+                rows: 490..520,
+                cols: 0..8,
+            },
+            set_input(s1, 5, 5, "x"),
+        ]);
+
+        let published = worker.shared.publication.load_full();
+        assert_eq!(
+            published.sheet, s2,
+            "the batch published the activated sheet"
+        );
+        assert_eq!(
+            published.frozen_rows, 2,
+            "the activation's cache build is staged BEFORE the publication is built, so the \
+             committed publication carries the band count the cache holds"
+        );
+        assert!(
+            published
+                .cells
+                .iter()
+                .any(|c| c.row == 0 && c.col == 0 && c.display_text == "HDR"),
+            "and therefore the band's VALUES ride the same commit; got {:?}",
+            published.cells
+        );
+        assert_eq!(
+            frozen(&worker, s2).0,
+            2,
+            "the cache and the publication agree at the committed generation"
+        );
+    }
+
     #[test]
     fn catch_unwind_recovery_keeps_worker_alive() {
         let (mut worker, rx) = test_worker();
@@ -4378,6 +4015,175 @@ mod tests {
         assert_eq!(
             worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
             "7"
+        );
+    }
+
+    /// B1 (`functional_spec.md F2.1`): `from_source` was the one document-building call outside
+    /// every `catch_unwind`. An unguarded panic there unwound out of the thread entry point and
+    /// dropped `event_tx`, so the window saw the stream close with **no event** explaining it — a
+    /// silent zombie. It now reports a typed `LoadFailed`, like any other load failure.
+    #[test]
+    fn load_panic_is_caught_and_reported_as_load_failed() {
+        let (tx, rx) = async_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared::new(SheetId(0)));
+        let source = DocumentSource::OpenFile(
+            std::path::PathBuf::from("/nonexistent").join(crate::document::PANIC_SENTINEL),
+        );
+
+        quiet_panics(|| Worker::load_and_run(source, shared, tx, cmd_rx));
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::LoadFailed {
+                    error: LoadError::EnginePanic
+                }
+            )),
+            "a caught load panic reports LoadFailed{{EnginePanic}}; got {events:?}"
+        );
+    }
+
+    /// B1 (`functional_spec.md F2.2`): the pinned exporter still panics outright on an unevaluated
+    /// formula cell, and `save_workbook` ran outside every guard. The panic is now caught and
+    /// reported as `SaveFailed`, the worker keeps serving, and — unlike the edit path — no
+    /// `EditRejected` rides along, because `SaveFailed` has already told the user.
+    #[test]
+    fn save_panic_is_caught_and_reported_as_save_failed() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let dir = tempfile::tempdir().unwrap();
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::Save {
+                path: dir.path().join(crate::document::PANIC_SENTINEL),
+                req_id: 1,
+            }])
+        });
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::SaveFailed {
+                    req_id: 1,
+                    error: SaveError::EnginePanic
+                }
+            )),
+            "a caught save panic reports SaveFailed{{EnginePanic}}; got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::EditRejected { .. })),
+            "a save failure must not also claim an edit was rejected; got {events:?}"
+        );
+        assert!(
+            !worker.degraded,
+            "one caught save panic over a healthy model must not degrade the worker"
+        );
+
+        // The worker is still live: a following edit applies and a real save succeeds.
+        worker.process_batch(vec![set_input(sheet, 0, 0, "7")]);
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "7"
+        );
+        worker.process_batch(vec![Command::Save {
+            path: dir.path().join("real.xlsx"),
+            req_id: 2,
+        }]);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::Saved { req_id: 2, .. })),
+            "a real save after a caught save panic still succeeds"
+        );
+    }
+
+    /// B1 (`functional_spec.md F2.2`): the CSV export walks the same engine over every cell of a
+    /// sheet, two statements below the guarded save, and was left unguarded. A panic there is now
+    /// caught and reported as a typed `CsvExportFailed`, the worker keeps serving, and — like the
+    /// save — no `EditRejected` rides along.
+    #[test]
+    fn export_panic_is_caught_and_reported_as_export_failed() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let dir = tempfile::tempdir().unwrap();
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::ExportCsv {
+                sheet,
+                path: dir.path().join(crate::document::PANIC_SENTINEL),
+                req_id: 1,
+            }])
+        });
+
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::CsvExportFailed {
+                    req_id: 1,
+                    error: SaveError::EnginePanic
+                }
+            )),
+            "a caught export panic reports CsvExportFailed{{EnginePanic}}; got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::EditRejected { .. })),
+            "an export failure must not also claim an edit was rejected; got {events:?}"
+        );
+        assert!(
+            !worker.degraded,
+            "one caught export panic over a healthy model must not degrade the worker"
+        );
+
+        // The worker is still live: a following edit applies and a real export succeeds.
+        worker.process_batch(vec![set_input(sheet, 0, 0, "7")]);
+        let out = dir.path().join("real.csv");
+        worker.process_batch(vec![Command::ExportCsv {
+            sheet,
+            path: out.clone(),
+            req_id: 2,
+        }]);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::CsvExported { req_id: 2 })),
+            "a real export after a caught export panic still succeeds"
+        );
+        assert!(out.exists(), "and it wrote the file");
+    }
+
+    /// The `handle_caught_panic` split must not move the poisoning threshold: a save panic counts
+    /// toward the same budget, so a save panic followed by an edit panic degrades exactly as two
+    /// edit panics would.
+    #[test]
+    fn a_save_panic_counts_toward_the_degrade_threshold() {
+        let (mut worker, rx) = test_worker();
+        let dir = tempfile::tempdir().unwrap();
+
+        quiet_panics(|| {
+            worker.process_batch(vec![Command::Save {
+                path: dir.path().join(crate::document::PANIC_SENTINEL),
+                req_id: 1,
+            }]);
+            assert!(!worker.degraded, "the first panic does not degrade");
+            worker.process_batch(vec![Command::TestPanic]);
+        });
+        assert!(
+            worker.degraded,
+            "a save panic then an edit panic degrades, same as two edit panics"
+        );
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::WorkerDegraded { .. })),
+            "the degrade is announced"
         );
     }
 
@@ -5461,1120 +5267,6 @@ mod tests {
         )));
     }
 
-    /// A default authored-chart anchor (8 cols × 15 rows from A1), matching the chrome's insert.
-    fn test_anchor() -> Anchor {
-        Anchor::new(
-            freecell_chart_model::AnchorCell::new(0, 0),
-            freecell_chart_model::AnchorCell::new(8, 15),
-        )
-    }
-
-    #[test]
-    fn insert_chart_publishes_authored_snapshot() {
-        let (mut worker, rx) = test_worker();
-        let sheet = sheet0(&worker);
-        let before = worker.chart_version;
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-
-        // The insert holds one authored chart, bumps the version, and publishes.
-        assert_eq!(worker.authored_charts.len(), 1);
-        assert!(
-            worker.chart_version > before,
-            "the insert bumps the chart version"
-        );
-        assert!(drain_events(&rx)
-            .iter()
-            .any(|e| matches!(e, WorkerEvent::Published)));
-
-        // The published snapshot carries the authored (snapshot-but-not-live) line chart.
-        let snap = worker.shared.chart_snapshot.load_full();
-        let (snap_sheet, specs) = &snap.sheets[0];
-        assert_eq!(*snap_sheet, sheet);
-        assert_eq!(specs.len(), 1);
-        assert!(
-            specs[0].is_authored(),
-            "the inserted chart is Authored (no retained source, no live binding)"
-        );
-        assert!(matches!(
-            specs[0].chart().unwrap().kind,
-            freecell_chart_model::ChartKind::Line { .. }
-        ));
-        // Dirty tracking: one committed op is recorded so the chart can be saved.
-        assert_eq!(worker.shared.committed_ops.load(Ordering::Acquire), 1);
-    }
-
-    /// Batch 3 item 8: inserting a chart with a `data` range binds it **at creation** — the published
-    /// chart is born LIVE (real `c:f` refs + values resolved from the current cells), exactly as if a
-    /// `SetChartRange` had followed the insert, but in one op. A `data: None` insert (asserted by
-    /// `insert_chart_publishes_authored_snapshot`) stays the near-empty placeholder.
-    #[test]
-    fn insert_chart_with_data_binds_range_at_creation() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        seed_chart_data(&mut worker, sheet); // A1:B3 = Widgets / Q1,Q2 / 10,20
-        let before = worker.chart_version;
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: Some(CellRange::from_a1("A1:B3").unwrap()),
-        }]);
-
-        // Exactly one authored chart, bound at creation (non-empty refs) — no follow-up SetChartRange.
-        assert_eq!(worker.authored_charts.len(), 1);
-        let entry = &worker.authored_charts[0];
-        assert!(
-            !entry.refs.is_empty(),
-            "inserting with a data range binds `c:f` refs at creation"
-        );
-        assert!(
-            entry
-                .spec
-                .source_ranges
-                .iter()
-                .any(|r| r.as_str().contains("$B$2:$B$3")),
-            "the value range is published on the spec (the chart is LIVE, not near-empty)"
-        );
-        // The series resolved LIVE from B2:B3 (10, 20), not the placeholder literals.
-        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
-        assert_eq!(
-            entry.spec.chart().unwrap().series[0].name.as_deref(),
-            Some("Widgets"),
-            "the series name resolved from B1 at creation"
-        );
-        assert!(
-            worker.chart_version > before,
-            "the create-and-bind publishes once"
-        );
-    }
-
-    /// Criterion #3: a degraded worker MUST reject `InsertChart` (consistent with the edit batch /
-    /// paste / SetFont), pushing no authored chart and bumping no version.
-    #[test]
-    fn insert_chart_rejected_when_degraded() {
-        let (mut worker, rx) = test_worker();
-        let sheet = sheet0(&worker);
-        quiet_panics(|| {
-            worker.process_batch(vec![Command::TestPanic]);
-            worker.process_batch(vec![Command::TestPanic]);
-        });
-        assert!(worker.degraded);
-        drain_events(&rx);
-        let version_before = worker.chart_version;
-
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-
-        assert!(
-            drain_events(&rx).iter().any(|e| matches!(
-                e,
-                WorkerEvent::EditRejected {
-                    reason: EditRejectedReason::Degraded
-                }
-            )),
-            "a degraded worker rejects InsertChart"
-        );
-        assert!(
-            worker.authored_charts.is_empty(),
-            "no authored chart is held when degraded"
-        );
-        assert_eq!(
-            worker.chart_version, version_before,
-            "no publish / version bump when degraded"
-        );
-    }
-
-    /// P18: `SetChartAnchor` moves/resizes an authored chart's model anchor + bumps the version.
-    #[test]
-    fn set_chart_anchor_updates_authored_chart() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        let version_before = worker.chart_version;
-        let moved = Anchor::new(
-            freecell_chart_model::AnchorCell::new(3, 3),
-            freecell_chart_model::AnchorCell::new(11, 18),
-        );
-        worker.process_batch(vec![Command::SetChartAnchor {
-            sheet,
-            id,
-            anchor: moved,
-        }]);
-        assert_eq!(worker.authored_charts[0].spec.anchor, moved);
-        assert!(worker.chart_version > version_before, "a move republishes");
-    }
-
-    /// P18: `DeleteChart` removes the named authored chart (leaving the rest).
-    #[test]
-    fn delete_chart_removes_authored_chart() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![
-            Command::InsertChart {
-                sheet,
-                kind: ChartInsertKind::Line,
-                anchor: test_anchor(),
-                data: None,
-            },
-            Command::InsertChart {
-                sheet,
-                kind: ChartInsertKind::Bar,
-                anchor: test_anchor(),
-                data: None,
-            },
-        ]);
-        assert_eq!(worker.authored_charts.len(), 2);
-        let first = worker.authored_charts[0].id;
-        worker.process_batch(vec![Command::DeleteChart { sheet, id: first }]);
-        assert_eq!(worker.authored_charts.len(), 1);
-        assert_ne!(
-            worker.authored_charts[0].id, first,
-            "the other chart survives"
-        );
-    }
-
-    /// P18 degraded guard: a degraded worker rejects `SetChartAnchor` + `DeleteChart` (like insert).
-    #[test]
-    fn set_anchor_and_delete_rejected_when_degraded() {
-        let (mut worker, rx) = test_worker();
-        let sheet = sheet0(&worker);
-        // Insert a chart BEFORE degrading (so there's an id), then degrade.
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        quiet_panics(|| {
-            worker.process_batch(vec![Command::TestPanic]);
-            worker.process_batch(vec![Command::TestPanic]);
-        });
-        assert!(worker.degraded);
-        drain_events(&rx);
-
-        worker.process_batch(vec![
-            Command::SetChartAnchor {
-                sheet,
-                id,
-                anchor: test_anchor(),
-            },
-            Command::DeleteChart { sheet, id },
-        ]);
-        let rejects = drain_events(&rx)
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    WorkerEvent::EditRejected {
-                        reason: EditRejectedReason::Degraded
-                    }
-                )
-            })
-            .count();
-        assert_eq!(rejects, 2, "both chart ops are rejected when degraded");
-        // The chart is untouched (still present).
-        assert_eq!(worker.authored_charts.len(), 1);
-    }
-
-    /// Unified undo timeline (charts feedback item 4): with a chart present but the **cell edit** the
-    /// most-recent action, Ctrl+Z targets the cell (not the chart), and the chart is left untouched.
-    /// The `Cell` entries stay 1:1 with IronCalc's stack even with a `Chart` entry beneath them, so a
-    /// chart's presence never breaks cell undo/redo.
-    #[test]
-    fn cell_undo_redo_correct_with_authored_chart_present() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::SetViewport {
-            sheet,
-            rows: 0..8,
-            cols: 0..8,
-        }]);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let cell00 = |w: &Worker| w.doc.formatted_value(0, CellRef::new(0, 0)).unwrap();
-        worker.process_batch(vec![set_input(sheet, 0, 0, "hello")]);
-        assert_eq!(cell00(&worker), "hello");
-        worker.process_batch(vec![Command::Undo]);
-        assert_eq!(cell00(&worker), "", "cell undo works with a chart present");
-        worker.process_batch(vec![Command::Redo]);
-        assert_eq!(cell00(&worker), "hello", "cell redo works too");
-        // The authored chart is untouched by the cell undo/redo.
-        assert_eq!(worker.authored_charts.len(), 1);
-    }
-
-    // --- Charts feedback item 4: chart ops on the unified undo timeline ----------------------
-
-    /// Build + install a single **loaded** chart on `sheet` with the given `chart_part`, returning
-    /// its assigned [`ChartId`]. Mirrors a discovered file-loaded chart so its delete/anchor undo can
-    /// be exercised at the worker level (no real xlsx needed).
-    fn install_loaded_chart(worker: &mut Worker, sheet: SheetId, chart_part: &str) -> ChartId {
-        use freecell_chart_model::{
-            Axis, Category, Chart, ChartKind, Grouping, Legend, Series, SourceXml,
-        };
-        let chart = Chart {
-            title: None,
-            kind: ChartKind::Line {
-                grouping: Grouping::Standard,
-                smooth: false,
-            },
-            series: vec![Series::category_value(
-                Some("Loaded"),
-                vec![Category::Text("Q1".into())],
-                vec![1.0],
-            )],
-            cat_axis: Axis::untitled(),
-            val_axis: Axis::untitled(),
-            legend: Some(Legend::default()),
-        };
-        let spec = ChartSpec::loaded(
-            chart,
-            SourceXml::new("<c:chartSpace/>"),
-            Vec::new(),
-            test_anchor(),
-        );
-        worker.charts =
-            ChartBindings::from_specs_by_sheet(vec![(sheet, vec![(chart_part.to_string(), spec)])]);
-        let id = ChartId(worker.next_chart_id);
-        worker.charts.assign_missing_ids(&mut worker.next_chart_id);
-        id
-    }
-
-    /// Delete an authored chart → Undo restores it (same id/kind/anchor) → Redo removes it again.
-    #[test]
-    fn delete_authored_chart_undo_redo() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        let anchor = worker.authored_charts[0].spec.anchor;
-        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
-        assert!(
-            worker.authored_charts.is_empty(),
-            "delete removes the chart"
-        );
-
-        worker.process_batch(vec![Command::Undo]);
-        assert_eq!(worker.authored_charts.len(), 1, "undo brings it back");
-        assert_eq!(worker.authored_charts[0].id, id, "same id restored");
-        assert_eq!(worker.authored_charts[0].spec.anchor, anchor, "same anchor");
-        assert!(matches!(
-            worker.authored_charts[0].spec.chart().unwrap().kind,
-            freecell_chart_model::ChartKind::Line { .. }
-        ));
-
-        worker.process_batch(vec![Command::Redo]);
-        assert!(worker.authored_charts.is_empty(), "redo re-deletes it");
-    }
-
-    /// Delete a **loaded** chart → Undo re-binds it AND drops its part from `loaded_deletes` → Redo
-    /// re-deletes it AND restores the part to `loaded_deletes` (so a later save writes the right set).
-    #[test]
-    fn delete_loaded_chart_undo_redo() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        let part = "xl/charts/chart1.xml";
-        let id = install_loaded_chart(&mut worker, sheet, part);
-        assert!(!worker.charts.is_empty());
-
-        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
-        assert!(worker.charts.is_empty(), "delete unbinds the loaded chart");
-        assert!(
-            worker.loaded_deletes.contains(part),
-            "delete records the part in loaded_deletes"
-        );
-
-        worker.process_batch(vec![Command::Undo]);
-        assert!(!worker.charts.is_empty(), "undo re-binds the loaded chart");
-        assert_eq!(
-            worker.charts.anchor_by_id(id),
-            Some(test_anchor()),
-            "the re-bound chart keeps its id + anchor"
-        );
-        assert!(
-            !worker.loaded_deletes.contains(part),
-            "undo clears the loaded-delete record"
-        );
-
-        worker.process_batch(vec![Command::Redo]);
-        assert!(worker.charts.is_empty(), "redo re-deletes it");
-        assert!(
-            worker.loaded_deletes.contains(part),
-            "redo restores the loaded-delete record"
-        );
-    }
-
-    /// Insert a chart → Undo removes it → Redo re-inserts it.
-    #[test]
-    fn insert_chart_undo_redo() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Bar,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        assert_eq!(worker.authored_charts.len(), 1);
-
-        worker.process_batch(vec![Command::Undo]);
-        assert!(worker.authored_charts.is_empty(), "undo removes the insert");
-
-        worker.process_batch(vec![Command::Redo]);
-        assert_eq!(worker.authored_charts.len(), 1, "redo re-inserts it");
-        assert!(matches!(
-            worker.authored_charts[0].spec.chart().unwrap().kind,
-            freecell_chart_model::ChartKind::Bar { .. }
-        ));
-    }
-
-    /// SetAnchor (authored) → Undo restores the prior anchor → Redo re-applies the new one.
-    #[test]
-    fn set_anchor_authored_undo_redo() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        let prior = worker.authored_charts[0].spec.anchor;
-        let moved = Anchor::new(
-            freecell_chart_model::AnchorCell::new(3, 3),
-            freecell_chart_model::AnchorCell::new(11, 18),
-        );
-        worker.process_batch(vec![Command::SetChartAnchor {
-            sheet,
-            id,
-            anchor: moved,
-        }]);
-        assert_eq!(worker.authored_charts[0].spec.anchor, moved);
-
-        worker.process_batch(vec![Command::Undo]);
-        assert_eq!(
-            worker.authored_charts[0].spec.anchor, prior,
-            "undo restores"
-        );
-
-        worker.process_batch(vec![Command::Redo]);
-        assert_eq!(
-            worker.authored_charts[0].spec.anchor, moved,
-            "redo re-applies"
-        );
-    }
-
-    /// SetAnchor (loaded) → Undo restores the prior render anchor AND clears the `loaded_anchor_edits`
-    /// entry the move added → Redo re-applies both.
-    #[test]
-    fn set_anchor_loaded_undo_redo() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        let part = "xl/charts/chart1.xml";
-        let id = install_loaded_chart(&mut worker, sheet, part);
-        let moved = Anchor::new(
-            freecell_chart_model::AnchorCell::new(3, 3),
-            freecell_chart_model::AnchorCell::new(11, 18),
-        );
-        worker.process_batch(vec![Command::SetChartAnchor {
-            sheet,
-            id,
-            anchor: moved,
-        }]);
-        assert_eq!(worker.charts.anchor_by_id(id), Some(moved));
-        assert_eq!(worker.loaded_anchor_edits.get(part), Some(&moved));
-
-        worker.process_batch(vec![Command::Undo]);
-        assert_eq!(
-            worker.charts.anchor_by_id(id),
-            Some(test_anchor()),
-            "undo restores the render anchor"
-        );
-        assert!(
-            !worker.loaded_anchor_edits.contains_key(part),
-            "undo clears the anchor-edit the move added"
-        );
-
-        worker.process_batch(vec![Command::Redo]);
-        assert_eq!(worker.charts.anchor_by_id(id), Some(moved));
-        assert_eq!(worker.loaded_anchor_edits.get(part), Some(&moved));
-    }
-
-    /// SetRange (authored, born-live) → Undo restores the pre-bind (near-empty) state → Redo re-binds.
-    #[test]
-    fn set_range_authored_undo_redo() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        seed_chart_data(&mut worker, sheet); // A1:B3 = Widgets / Q1,Q2 / 10,20
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        assert!(
-            worker.authored_charts[0].refs.is_empty(),
-            "inserted near-empty (no range yet)"
-        );
-        let id = worker.authored_charts[0].id;
-        worker.process_batch(vec![Command::SetChartRange {
-            sheet,
-            id,
-            data: CellRange::from_a1("A1:B3").unwrap(),
-        }]);
-        assert!(
-            !worker.authored_charts[0].refs.is_empty(),
-            "range bound it live"
-        );
-        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
-
-        worker.process_batch(vec![Command::Undo]);
-        assert!(
-            worker.authored_charts[0].refs.is_empty(),
-            "undo restores the pre-bind (unbound) state"
-        );
-
-        worker.process_batch(vec![Command::Redo]);
-        assert!(
-            !worker.authored_charts[0].refs.is_empty(),
-            "redo re-binds the range"
-        );
-        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
-    }
-
-    /// The key correctness test: an INTERLEAVE of cell edit + chart ops undoes/redoes in exact
-    /// most-recent-first order across both op families (cellEdit → InsertChart → DeleteChart, then
-    /// Undo×3 restores-then-removes-the-chart-then-undoes-the-cell, and Redo×3 replays forward).
-    #[test]
-    fn interleaved_cell_and_chart_undo_redo_ordering() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        let cell00 = |w: &Worker| w.doc.formatted_value(0, CellRef::new(0, 0)).unwrap();
-
-        worker.process_batch(vec![set_input(sheet, 0, 0, "hello")]);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
-        assert!(worker.authored_charts.is_empty());
-        assert_eq!(cell00(&worker), "hello");
-
-        // Undo #1 → most recent = DeleteChart → the chart comes back.
-        worker.process_batch(vec![Command::Undo]);
-        assert_eq!(worker.authored_charts.len(), 1, "undo1 restores the chart");
-        assert_eq!(cell00(&worker), "hello", "the cell edit is untouched");
-        // Undo #2 → InsertChart → the chart goes away (NOT the cell edit).
-        worker.process_batch(vec![Command::Undo]);
-        assert!(worker.authored_charts.is_empty(), "undo2 removes the chart");
-        assert_eq!(cell00(&worker), "hello", "the cell edit is still untouched");
-        // Undo #3 → the cell edit.
-        worker.process_batch(vec![Command::Undo]);
-        assert_eq!(cell00(&worker), "", "undo3 undoes the cell edit");
-
-        // Redo replays forward: cell → insert → delete.
-        worker.process_batch(vec![Command::Redo]);
-        assert_eq!(cell00(&worker), "hello", "redo1 re-applies the cell edit");
-        assert!(
-            worker.authored_charts.is_empty(),
-            "chart still gone after redo1"
-        );
-        worker.process_batch(vec![Command::Redo]);
-        assert_eq!(
-            worker.authored_charts.len(),
-            1,
-            "redo2 re-inserts the chart"
-        );
-        worker.process_batch(vec![Command::Redo]);
-        assert!(
-            worker.authored_charts.is_empty(),
-            "redo3 re-deletes the chart"
-        );
-    }
-
-    /// A new action after an undo clears the redo stack: chart op → Undo → cell edit → the pending
-    /// chart redo is discarded, so Redo is a no-op (the chart is not resurrected).
-    #[test]
-    fn new_action_after_undo_clears_chart_redo() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        worker.process_batch(vec![Command::Undo]);
-        assert!(worker.authored_charts.is_empty());
-        assert_eq!(worker.redo_stack.len(), 1, "the insert is redoable");
-
-        // A new (cell) action must invalidate the pending chart redo.
-        worker.process_batch(vec![set_input(sheet, 0, 0, "x")]);
-        assert!(worker.redo_stack.is_empty(), "a new action clears redo");
-
-        worker.process_batch(vec![Command::Redo]);
-        assert!(
-            worker.authored_charts.is_empty(),
-            "redo is a no-op — the chart is not resurrected"
-        );
-    }
-
-    /// A degraded worker refuses a chart Undo/Redo (like every mutating op), leaving the timeline +
-    /// chart state untouched.
-    #[test]
-    fn chart_undo_rejected_when_degraded() {
-        let (mut worker, rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        worker.process_batch(vec![Command::DeleteChart { sheet, id }]);
-        quiet_panics(|| {
-            worker.process_batch(vec![Command::TestPanic]);
-            worker.process_batch(vec![Command::TestPanic]);
-        });
-        assert!(worker.degraded);
-        drain_events(&rx);
-
-        worker.process_batch(vec![Command::Undo]);
-        assert!(
-            drain_events(&rx).iter().any(|e| matches!(
-                e,
-                WorkerEvent::EditRejected {
-                    reason: EditRejectedReason::Degraded
-                }
-            )),
-            "a degraded worker rejects a chart undo"
-        );
-        assert!(
-            worker.authored_charts.is_empty(),
-            "the delete is not undone while degraded"
-        );
-    }
-
-    // --- P19: edit panel range/type ---------------------------------------------------------
-
-    /// A small data grid an authored chart can bind to: B1 header, A2:A3 categories, B2:B3 values.
-    fn seed_chart_data(worker: &mut Worker, sheet: SheetId) {
-        worker.process_batch(vec![
-            set_input(sheet, 0, 1, "Widgets"), // B1 (series name)
-            set_input(sheet, 1, 0, "Q1"),      // A2 (category)
-            set_input(sheet, 2, 0, "Q2"),      // A3
-            set_input(sheet, 1, 1, "10"),      // B2 (value)
-            set_input(sheet, 2, 1, "20"),      // B3
-        ]);
-    }
-
-    fn first_series_values(worker: &Worker, chart_idx: usize) -> Vec<f64> {
-        match &worker.authored_charts[chart_idx]
-            .spec
-            .chart()
-            .unwrap()
-            .series[0]
-            .data
-        {
-            freecell_chart_model::SeriesData::CategoryValue { values, .. } => values.clone(),
-            freecell_chart_model::SeriesData::Xy { y, .. } => y.clone(),
-        }
-    }
-
-    /// P19: setting a data range binds an authored chart to real cells — its published spec gains
-    /// `source_ranges` (`c:f`) AND its values re-resolve LIVE from the current cells (not the
-    /// placeholder literals).
-    #[test]
-    fn set_chart_range_binds_authored_chart() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        seed_chart_data(&mut worker, sheet);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        let version_before = worker.chart_version;
-        worker.process_batch(vec![Command::SetChartRange {
-            sheet,
-            id,
-            data: CellRange::from_a1("A1:B3").unwrap(),
-        }]);
-
-        let entry = &worker.authored_charts[0];
-        assert!(!entry.refs.is_empty(), "the range binds `c:f` refs");
-        assert!(
-            entry
-                .spec
-                .source_ranges
-                .iter()
-                .any(|r| r.as_str().contains("$B$2:$B$3")),
-            "the value range is published on the spec"
-        );
-        // The first series re-resolved from B2:B3 (10, 20), replacing the (4,6,5,8) placeholder.
-        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
-        // And its category + name came from the cells.
-        match &entry.spec.chart().unwrap().series[0].data {
-            freecell_chart_model::SeriesData::CategoryValue { categories, .. } => {
-                assert_eq!(
-                    categories[0],
-                    freecell_chart_model::Category::Text("Q1".into())
-                );
-            }
-            other => panic!("expected CategoryValue, got {other:?}"),
-        }
-        assert_eq!(
-            worker.authored_charts[0].spec.chart().unwrap().series[0]
-                .name
-                .as_deref(),
-            Some("Widgets"),
-        );
-        assert!(
-            worker.chart_version > version_before,
-            "the range republishes"
-        );
-    }
-
-    /// P19: once ranged, an authored chart re-resolves on a source-cell edit — it rides the SAME
-    /// dirty-set/publish path as a loaded chart, even though the workbook has no loaded charts.
-    #[test]
-    fn edit_reresolves_ranged_authored_chart() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        seed_chart_data(&mut worker, sheet);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        worker.process_batch(vec![Command::SetChartRange {
-            sheet,
-            id,
-            data: CellRange::from_a1("A1:B3").unwrap(),
-        }]);
-        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
-
-        let version_before = worker.chart_version;
-        worker.process_batch(vec![set_input(sheet, 1, 1, "999")]); // edit B2
-        assert_eq!(
-            first_series_values(&worker, 0),
-            vec![999.0, 20.0],
-            "editing a bound cell re-resolves the authored chart"
-        );
-        assert!(
-            worker.chart_version > version_before,
-            "the live re-resolve bumped the chart version"
-        );
-    }
-
-    /// A disjoint edit (outside every bound authored range) does NOT re-resolve the chart — the
-    /// authored dirty-set intersection is honored just like the loaded one.
-    #[test]
-    fn disjoint_edit_leaves_ranged_authored_chart_untouched() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        seed_chart_data(&mut worker, sheet);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        worker.process_batch(vec![Command::SetChartRange {
-            sheet,
-            id,
-            data: CellRange::from_a1("A1:B3").unwrap(),
-        }]);
-        let version_before = worker.chart_version;
-        worker.process_batch(vec![set_input(sheet, 20, 20, "42")]); // far outside A1:B3
-        assert_eq!(
-            worker.chart_version, version_before,
-            "a disjoint edit re-resolves nothing"
-        );
-    }
-
-    /// P19: switching an authored chart's type rebuilds it to the new kind, preserving the title.
-    #[test]
-    fn set_chart_type_switches_kind_and_preserves_title() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        let version_before = worker.chart_version;
-        worker.process_batch(vec![Command::SetChartType {
-            sheet,
-            id,
-            kind: ChartInsertKind::Column,
-        }]);
-        let chart = worker.authored_charts[0].spec.chart().unwrap();
-        assert!(
-            matches!(
-                chart.kind,
-                freecell_chart_model::ChartKind::Bar {
-                    dir: freecell_chart_model::BarDir::Col,
-                    ..
-                }
-            ),
-            "the chart is now a column chart"
-        );
-        assert_eq!(
-            chart.title.as_deref(),
-            Some("Chart"),
-            "the title is preserved across a retype"
-        );
-        assert!(
-            worker.chart_version > version_before,
-            "a retype republishes"
-        );
-    }
-
-    /// P19: retyping a chart that already has a data range keeps the range binding (its `c:f` refs +
-    /// live values) — only the kind changes.
-    #[test]
-    fn set_chart_type_preserves_the_range_binding() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        seed_chart_data(&mut worker, sheet);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        worker.process_batch(vec![Command::SetChartRange {
-            sheet,
-            id,
-            data: CellRange::from_a1("A1:B3").unwrap(),
-        }]);
-        worker.process_batch(vec![Command::SetChartType {
-            sheet,
-            id,
-            kind: ChartInsertKind::Column,
-        }]);
-        // Still bound to the same cells → still the live values, now on a column chart.
-        assert!(!worker.authored_charts[0].refs.is_empty(), "refs preserved");
-        assert_eq!(first_series_values(&worker, 0), vec![10.0, 20.0]);
-        assert!(matches!(
-            worker.authored_charts[0].spec.chart().unwrap().kind,
-            freecell_chart_model::ChartKind::Bar { .. }
-        ));
-    }
-
-    /// P19 degraded guard: a degraded worker rejects `SetChartRange` + `SetChartType` (like every
-    /// mutating op), leaving the chart untouched.
-    #[test]
-    fn set_chart_range_and_type_rejected_when_degraded() {
-        let (mut worker, rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        quiet_panics(|| {
-            worker.process_batch(vec![Command::TestPanic]);
-            worker.process_batch(vec![Command::TestPanic]);
-        });
-        assert!(worker.degraded);
-        drain_events(&rx);
-
-        worker.process_batch(vec![
-            Command::SetChartRange {
-                sheet,
-                id,
-                data: CellRange::from_a1("A1:B3").unwrap(),
-            },
-            Command::SetChartType {
-                sheet,
-                id,
-                kind: ChartInsertKind::Bar,
-            },
-        ]);
-        let rejects = drain_events(&rx)
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    WorkerEvent::EditRejected {
-                        reason: EditRejectedReason::Degraded
-                    }
-                )
-            })
-            .count();
-        assert_eq!(rejects, 2, "both chart edits are rejected when degraded");
-        // Untouched: still an unbound line chart.
-        assert!(worker.authored_charts[0].refs.is_empty());
-        assert!(matches!(
-            worker.authored_charts[0].spec.chart().unwrap().kind,
-            freecell_chart_model::ChartKind::Line { .. }
-        ));
-    }
-
-    // --- P20: chrome editing ----------------------------------------------------------------
-
-    /// The published authored chart's typed [`Chart`] (for chrome assertions).
-    fn authored_chart(worker: &Worker, idx: usize) -> Chart {
-        worker.authored_charts[idx].spec.chart().unwrap().clone()
-    }
-
-    fn chrome(sheet: SheetId, id: ChartId, edit: ChartChromeEdit) -> Command {
-        Command::SetChartChrome { sheet, id, edit }
-    }
-
-    /// P20: each chrome edit mutates an **authored** chart's model + republishes.
-    #[test]
-    fn set_chart_chrome_edits_an_authored_chart() {
-        let (mut worker, _rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-
-        // Title.
-        let v0 = worker.chart_version;
-        worker.process_batch(vec![chrome(
-            sheet,
-            id,
-            ChartChromeEdit::Title(Some("Sales".into())),
-        )]);
-        assert_eq!(authored_chart(&worker, 0).title.as_deref(), Some("Sales"));
-        assert!(worker.chart_version > v0, "a chrome edit republishes");
-
-        // Legend off, then on-at-bottom.
-        worker.process_batch(vec![chrome(sheet, id, ChartChromeEdit::Legend(None))]);
-        assert_eq!(authored_chart(&worker, 0).legend, None);
-        worker.process_batch(vec![chrome(
-            sheet,
-            id,
-            ChartChromeEdit::Legend(Some(freecell_chart_model::LegendPosition::Bottom)),
-        )]);
-        assert_eq!(
-            authored_chart(&worker, 0).legend.map(|l| l.position),
-            Some(freecell_chart_model::LegendPosition::Bottom)
-        );
-
-        // Axis titles.
-        worker.process_batch(vec![chrome(
-            sheet,
-            id,
-            ChartChromeEdit::AxisTitle {
-                axis: ChartAxisKind::Category,
-                title: Some("Quarter".into()),
-            },
-        )]);
-        assert_eq!(
-            authored_chart(&worker, 0).cat_axis.title.as_deref(),
-            Some("Quarter")
-        );
-
-        // Series color.
-        worker.process_batch(vec![chrome(
-            sheet,
-            id,
-            ChartChromeEdit::SeriesColor {
-                series: 0,
-                color: Some(Rgb::from_hex(0x70AD47)),
-            },
-        )]);
-        assert_eq!(
-            authored_chart(&worker, 0).series[0].color,
-            Some(freecell_chart_model::ChartColor::Rgb(
-                freecell_chart_model::Color::from_hex(0x70AD47)
-            )),
-        );
-
-        // Data-label toggles apply to every series; clearing all turns labels off.
-        worker.process_batch(vec![chrome(
-            sheet,
-            id,
-            ChartChromeEdit::DataLabels(crate::worker::protocol::DataLabelToggles {
-                show_value: true,
-                show_category_name: false,
-                show_percent: true,
-            }),
-        )]);
-        let dl = authored_chart(&worker, 0).series[0]
-            .data_labels
-            .clone()
-            .expect("labels set");
-        assert!(dl.show_value && dl.show_percent && !dl.show_category_name);
-        worker.process_batch(vec![chrome(
-            sheet,
-            id,
-            ChartChromeEdit::DataLabels(crate::worker::protocol::DataLabelToggles::default()),
-        )]);
-        assert!(
-            authored_chart(&worker, 0).series[0].data_labels.is_none(),
-            "clearing every toggle removes the labels"
-        );
-    }
-
-    /// **Batch 5 gate — a `SeriesColor` edit recolors the `a:ln` STROKE only for LINE / SCATTER.**
-    /// Those two kinds paint their visible color on the stroke (renderer prefers `stroke.color` over
-    /// `color`), so the edit must override it. FILLED kinds (bar/column/area/pie/bubble) render from
-    /// the fill and treat `a:ln` as a decorative border, so recoloring their imported stroke would
-    /// over-reach — mutating a border the user never touched. Pins the live-side gate.
-    #[test]
-    fn series_color_recolors_stroke_only_for_line_and_scatter() {
-        use freecell_chart_model::{
-            Axis, BarDir, BarLayout, Category, Chart, ChartColor, ChartKind, Color, Grouping,
-            LineStroke, ScatterStyle, Series,
-        };
-
-        // A series carrying BOTH a fill color (4472C4) and an imported `a:ln` stroke on a DISTINCT
-        // color (203040) — the shape that distinguishes a fill recolor from a stroke recolor.
-        let stroked = || {
-            let mut s =
-                Series::category_value(Some("S"), vec![Category::Text("Q1".into())], vec![1.0])
-                    .with_color(Color::from_hex(0x4472C4));
-            s.stroke = Some(
-                LineStroke::new()
-                    .with_width_pt(1.0)
-                    .with_color(Color::from_hex(0x203040)),
-            );
-            s
-        };
-        let chart_of = |kind: ChartKind| Chart {
-            title: None,
-            kind,
-            series: vec![stroked()],
-            cat_axis: Axis::untitled(),
-            val_axis: Axis::untitled(),
-            legend: None,
-        };
-        let edit = ChartChromeEdit::SeriesColor {
-            series: 0,
-            color: Some(Rgb::from_hex(0x70AD47)),
-        };
-        let new_cc = Some(ChartColor::Rgb(Color::from_hex(0x70AD47)));
-        let orig_stroke = Some(ChartColor::Rgb(Color::from_hex(0x203040)));
-
-        // FILLED (column): the fill recolors, the imported border stroke is LEFT on its color.
-        let mut bar = chart_of(ChartKind::Bar {
-            dir: BarDir::Col,
-            grouping: Grouping::Clustered,
-            layout: BarLayout::default(),
-        });
-        apply_chrome_edit(&mut bar, &edit);
-        assert_eq!(bar.series[0].color, new_cc, "the filled fill recolors");
-        assert_eq!(
-            bar.series[0].stroke.and_then(|s| s.color),
-            orig_stroke,
-            "a filled series' imported border stroke is left untouched (Batch 5 gate)",
-        );
-
-        // LINE: both fill and stroke recolor (the stroke is the visible line — feedback item 9).
-        let mut line = chart_of(ChartKind::Line {
-            grouping: Grouping::Standard,
-            smooth: false,
-        });
-        apply_chrome_edit(&mut line, &edit);
-        assert_eq!(line.series[0].color, new_cc, "the line fill recolors");
-        assert_eq!(
-            line.series[0].stroke.and_then(|s| s.color),
-            new_cc,
-            "a line's visible stroke recolors to the new color",
-        );
-
-        // SCATTER: same as line — its color also lives on the stroke.
-        let mut scatter = chart_of(ChartKind::Scatter {
-            style: ScatterStyle::LineMarker,
-        });
-        apply_chrome_edit(&mut scatter, &edit);
-        assert_eq!(
-            scatter.series[0].stroke.and_then(|s| s.color),
-            new_cc,
-            "a scatter's visible stroke recolors to the new color",
-        );
-    }
-
-    /// P20 degraded guard: a degraded worker rejects `SetChartChrome`, leaving the chart untouched.
-    #[test]
-    fn set_chart_chrome_rejected_when_degraded() {
-        let (mut worker, rx) = test_worker();
-        let sheet = sheet0(&worker);
-        worker.process_batch(vec![Command::InsertChart {
-            sheet,
-            kind: ChartInsertKind::Line,
-            anchor: test_anchor(),
-            data: None,
-        }]);
-        let id = worker.authored_charts[0].id;
-        let title_before = authored_chart(&worker, 0).title;
-        quiet_panics(|| {
-            worker.process_batch(vec![Command::TestPanic]);
-            worker.process_batch(vec![Command::TestPanic]);
-        });
-        assert!(worker.degraded);
-        drain_events(&rx);
-
-        worker.process_batch(vec![chrome(
-            sheet,
-            id,
-            ChartChromeEdit::Title(Some("nope".into())),
-        )]);
-        assert!(
-            drain_events(&rx).iter().any(|e| matches!(
-                e,
-                WorkerEvent::EditRejected {
-                    reason: EditRejectedReason::Degraded
-                }
-            )),
-            "a degraded worker rejects SetChartChrome"
-        );
-        assert_eq!(
-            authored_chart(&worker, 0).title,
-            title_before,
-            "the chart is untouched when degraded"
-        );
-    }
-
     #[test]
     fn undo_redo_agreement_walk() {
         // A scripted edit/undo/redo walk: the cache must agree with the engine after EVERY step.
@@ -7410,6 +6102,74 @@ mod tests {
     }
 
     #[test]
+    fn paste_fill_commits_the_whole_fill_as_one_generation() {
+        // The seam half of the fill tests above. Every other paste-fill assertion reads
+        // `worker.doc` — the document — so the fill path would pass them all even if it published
+        // nothing, bumped no generation and announced nothing, leaving the grid painting stale
+        // cells. This asserts the fill through `Shared` instead: one fill = exactly one generation
+        // (E1, `functional_spec.md F4` / `architecture.md §A5` — `commit` is the single commit
+        // point), the publication carries that generation, every filled cell is in it at its own
+        // re-anchored value, and a `Published` announced it.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..16,
+                cols: 0..8,
+            },
+            set_input(sheet, 2, 1, "1"),     // B3
+            set_input(sheet, 3, 1, "=B3+1"), // B4 = 2
+        ]);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(3, 1)),
+            false,
+        );
+        // Drain after the copy so the events below belong to the paste alone, and read the
+        // counter at the same instant so the delta is the fill's and nothing else's.
+        drain_events(&rx);
+        let before = worker.shared.generation.load(Ordering::Acquire);
+
+        // Fill-paste B4 over B5:B10 — each row chains off the one above it: 3, 4, 5, 6, 7, 8.
+        let target = CellRange::new(CellRef::new(4, 1), CellRef::new(9, 1));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        let after = worker.shared.generation.load(Ordering::Acquire);
+        assert_eq!(
+            after,
+            before + 1,
+            "the whole fill is ONE commit — not zero (nothing published) and not one per cell"
+        );
+        let publication = worker.shared.publication.load_full();
+        assert_eq!(
+            publication.generation, after,
+            "the publication behind the bump is the one this generation names"
+        );
+        for row in 4..=9 {
+            let cell = publication
+                .cells
+                .iter()
+                .find(|c| c.row == row && c.col == 1)
+                .unwrap_or_else(|| {
+                    panic!("row {row} of the fill is missing from the publication: {publication:?}")
+                });
+            assert_eq!(
+                cell.display_text,
+                (row - 1).to_string(),
+                "row {row} is published at its own re-anchored value"
+            );
+        }
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(e, WorkerEvent::Published)),
+            "the fill announces its commit, so the grid repaints; got {events:?}"
+        );
+    }
+
+    #[test]
     fn paste_fill_repeats_a_block_source_with_per_repetition_refs() {
         // A 2-row block copy filling a 4-row selection repeats twice, each repetition re-anchored:
         // the formula in the second repetition points at that repetition's own value cell.
@@ -7979,28 +6739,181 @@ mod tests {
     }
 
     #[test]
-    fn set_frozen_clamps_to_engine_max() {
-        // The fork's `Model::set_frozen_*` errors at count >= LAST_ROW/LAST_COLUMN, so the
-        // document wrapper clamps to all-but-one track — a "freeze at the very last track"
-        // action degrades to the engine max instead of erroring (`functional_spec.md §5.2`).
+    fn set_frozen_beyond_the_cap_is_rejected() {
+        // B2 (`engine-worker-hardening functional_spec.md F1.2`), SUPERSEDING the `freeze-panes`
+        // §5.2 behaviour this test used to assert (an out-of-range count silently degraded to the
+        // engine max). It can't: the published frozen band is iterated on EVERY publish, so a
+        // ⌘A → right-click → "Freeze rows" — which asks for the whole 1,048,576-row axis, because
+        // the menu derives the count from the selected header run — wedged the worker permanently.
+        // It is now rejected before it reaches the model, with the axis, request and cap named.
         let (mut worker, rx) = test_worker();
         let sheet = sheet0(&worker);
         worker.process_batch(vec![Command::SetFrozen {
             sheet,
-            rows: Some(u32::MAX),
-            cols: Some(limits::MAX_COLS),
+            rows: Some(limits::MAX_ROWS),
+            cols: None,
         }]);
         assert_eq!(
             frozen(&worker, sheet),
-            (limits::MAX_ROWS - 1, limits::MAX_COLS - 1),
-            "out-of-range counts clamp to the engine max, never error"
+            (0, 0),
+            "the rejected freeze left the sheet unfrozen"
         );
         let events = drain_events(&rx);
         assert!(
-            !events
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Rows,
+                        requested,
+                        max,
+                    }
+                } if *requested == limits::MAX_ROWS && *max == MAX_FROZEN_ROWS
+            )),
+            "the row axis reports its own cap + the request; got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, WorkerEvent::Published)),
+            "a rejected freeze publishes nothing"
+        );
+    }
+
+    #[test]
+    fn set_frozen_cols_beyond_the_cap_is_rejected() {
+        // The column axis has its own (smaller) cap and reports it independently.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: None,
+            cols: Some(MAX_FROZEN_COLS + 1),
+        }]);
+        assert_eq!(frozen(&worker, sheet), (0, 0));
+        assert!(
+            drain_events(&rx).iter().any(|e| matches!(
+                e,
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::FrozenPaneTooLarge {
+                        axis: FrozenAxis::Columns,
+                        max,
+                        ..
+                    }
+                } if *max == MAX_FROZEN_COLS
+            )),
+            "the column axis reports FrozenAxis::Columns and MAX_FROZEN_COLS"
+        );
+    }
+
+    #[test]
+    fn set_frozen_at_the_cap_is_accepted() {
+        // The bound is INCLUSIVE — the cap itself is a legal freeze on both axes, so the
+        // rejection can't be off by one in the direction that breaks a legitimate freeze.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetFrozen {
+                sheet,
+                rows: Some(MAX_FROZEN_ROWS),
+                cols: None,
+            },
+            Command::SetFrozen {
+                sheet,
+                rows: None,
+                cols: Some(MAX_FROZEN_COLS),
+            },
+        ]);
+        assert_eq!(frozen(&worker, sheet), (MAX_FROZEN_ROWS, MAX_FROZEN_COLS));
+        assert!(
+            !drain_events(&rx)
                 .iter()
                 .any(|e| matches!(e, WorkerEvent::EditRejected { .. })),
-            "the clamp keeps the edit applied; got {events:?}"
+            "a freeze exactly at the cap is not rejected"
+        );
+    }
+
+    #[test]
+    fn publish_clamps_an_oversized_frozen_band() {
+        // The publish-site backstop (`functional_spec.md F1.4`). Seed the resident cache with a
+        // sheet-size band DIRECTLY, bypassing both the command guard and the cache-build clamp, and
+        // assert the publish still returns with a clamped band. Under the pre-fix code this loop
+        // ran ~1M x 256 `formatted_value` calls and NEVER returned, so "it returns at all" is the
+        // real subject of this test.
+        //
+        // `cargo test` has no per-test timeout, so the publish runs on a spawned thread bounded by
+        // `recv_timeout`: a fully removed clamp trips the timeout and FAILS here instead of parking
+        // the whole run forever. `Timeout` and `Disconnected` are distinguished, so a PANIC inside
+        // `commit` is joined and re-raised rather than misreported as a hang.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet,
+            rows: 0..40,
+            cols: 0..10,
+        }]);
+        {
+            // `SheetCache` exposes the counts read-only, so install a hand-built cache carrying a
+            // sheet-size band. The publish loop reads nothing else off the cache.
+            let hostile =
+                freecell_core::cache::SheetCacheBuilder::new(limits::MAX_ROWS, limits::MAX_COLS)
+                    .frozen_rows(limits::MAX_ROWS - 1)
+                    .frozen_cols(limits::MAX_COLS - 1)
+                    .build();
+            worker.shared.caches.write().insert(sheet, hostile);
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let publisher = std::thread::spawn(move || {
+            worker.commit(StagedCommit::default());
+            let publication = worker.shared.publication.load_full();
+            let _ = done_tx.send((publication.frozen_rows, publication.frozen_cols));
+        });
+        let (frozen_rows, frozen_cols) =
+            match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(band) => {
+                    publisher.join().expect("the publish thread did not panic");
+                    band
+                }
+                // Disconnected = the thread unwound before sending. Join to re-raise its panic, so a
+                // crash in `commit` is reported as a crash rather than as a hang.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match publisher.join() {
+                    Err(payload) => std::panic::resume_unwind(payload),
+                    Ok(()) => panic!("the publish thread finished without sending its band"),
+                },
+                // A real hang: the clamp is gone and the loop is walking the whole sheet. Leave
+                // the thread detached — the harness exits the process without joining it.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the clamped-band publish did not return within 30s")
+                }
+            };
+
+        assert_eq!(frozen_rows, MAX_FROZEN_ROWS);
+        assert_eq!(frozen_cols, MAX_FROZEN_COLS);
+        // A *partial* regression (a clamp that still bounds the loop but costs far too much) shows
+        // up here rather than at the timeout above.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the clamped band publish must return promptly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn crafted_pane_element_opens_clamped() {
+        // The file path (`functional_spec.md F1.3`): a crafted `<pane ySplit="500000">` is clamped
+        // where the counts enter the read model, so BOTH the publish loop and the grid's
+        // `for r in 0..frozen_rows` band renderer see a bounded band. The sheet opens normally.
+        let dir = tempfile::tempdir().unwrap();
+        // `pane_fixture_with(dir, x_split, y_split)` — the ROW axis is the second argument, so
+        // this is the `ySplit="500000"` the comment above and `architecture.md §A2.5` name.
+        let path = pane_fixture_with(dir.path(), 400_000, 500_000);
+        let doc = WorkbookDocument::from_source(&DocumentSource::OpenFile(path)).unwrap();
+        let (worker, _rx) = worker_over(doc);
+        let sheet = sheet0(&worker);
+        assert_eq!(
+            frozen(&worker, sheet),
+            (MAX_FROZEN_ROWS, MAX_FROZEN_COLS),
+            "an oversized file pane clamps at cache build"
         );
     }
 
@@ -8008,6 +6921,12 @@ mod tests {
     /// saving a fresh workbook and injecting the pane element into its sheetView XML (the same
     /// zip-rewrite pattern as `merged_fixture`).
     fn pane_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        pane_fixture_with(dir, 1, 2)
+    }
+
+    /// [`pane_fixture`] with caller-chosen `xSplit`/`ySplit`, so the clamp test can craft a
+    /// sheet-size band the way a hostile file would.
+    fn pane_fixture_with(dir: &std::path::Path, x_split: u32, y_split: u32) -> std::path::PathBuf {
         use std::io::{Read, Write};
         let base = dir.join("base.xlsx");
         WorkbookDocument::new_empty().unwrap().save(&base).unwrap();
@@ -8025,11 +6944,13 @@ mod tests {
             if name.contains("worksheets/sheet1.xml") {
                 // The empty sheet's single <sheetView> carries one <selection …/>; put the pane
                 // element before it (the importer reads any state="frozen" <pane> in sheetView).
-                let s = String::from_utf8(content).unwrap().replace(
-                    "<selection ",
-                    "<pane xSplit=\"1\" ySplit=\"2\" topLeftCell=\"B3\" \
-                     activePane=\"bottomRight\" state=\"frozen\"/><selection ",
+                let pane = format!(
+                    "<pane xSplit=\"{x_split}\" ySplit=\"{y_split}\" topLeftCell=\"B3\" \
+                     activePane=\"bottomRight\" state=\"frozen\"/><selection "
                 );
+                let s = String::from_utf8(content)
+                    .unwrap()
+                    .replace("<selection ", &pane);
                 content = s.into_bytes();
             }
             writer.start_file(name, opts).unwrap();
@@ -8155,6 +7076,134 @@ mod tests {
             3,
             "a single undo reverts the delete and the boundary together"
         );
+    }
+
+    #[test]
+    fn structural_edit_past_the_cap_diverges_model_from_the_clamped_cache() {
+        // The ACCEPTED divergence (`engine-worker-hardening functional_spec.md F1.3`), pinned so a
+        // future reader does not mistake it for a bug — or "fix" it by re-clamping after the edit.
+        //
+        // A freeze at the cap is legal, and IronCalc grows the frozen boundary INSIDE a structural
+        // edit's own undo diff (see `structural_edits_track_frozen_boundary_in_one_undo_step`).
+        // `InsertRows` is not range-checked against the frozen cap — and must not be: re-clamping
+        // the model afterwards would cost a SECOND undo diff and break both `SetFrozen`'s and
+        // Insert's one-undo-step contract. So two ordinary gestures move the model's count past the
+        // cap while the cache — which is what the publish loop, the grid band and the header menu
+        // all read — stays clamped. That is the deal: the model (and a save) keeps the larger
+        // count, while every loop over the band stays bounded by the cap. Note what that does NOT
+        // buy — the band's CONTENTS still shift, so rows drop out of the pinned region instead of
+        // the boundary growing to keep them (F1.3, "content silently falls out"). This test pins
+        // the boundary half; the content half is a rendering consequence, documented not asserted.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            // A viewport, so `build_publication` produces a real (band-carrying) publication.
+            Command::SetViewport {
+                sheet,
+                rows: 0..40,
+                cols: 0..10,
+            },
+            Command::SetFrozen {
+                sheet,
+                rows: Some(MAX_FROZEN_ROWS),
+                cols: None,
+            },
+        ]);
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            MAX_FROZEN_ROWS,
+            "a freeze exactly at the cap applies"
+        );
+
+        // Insert above the band: IronCalc grows the boundary to 64 + 8 = 72, past the cap.
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+
+        let idx = worker.resolve(sheet).expect("sheet is live");
+        assert_eq!(
+            worker.doc.worksheet(idx).unwrap().frozen_rows,
+            MAX_FROZEN_ROWS as i32 + 8,
+            "the model's frozen count grew past the cap — the structural edit is not range-checked"
+        );
+        assert_eq!(
+            frozen(&worker, sheet).0,
+            MAX_FROZEN_ROWS,
+            "the cache — and therefore the band, the menu label and the publication — stays clamped"
+        );
+        let publication = worker.shared.publication.load_full();
+        assert_eq!(
+            publication.frozen_rows, MAX_FROZEN_ROWS,
+            "the published band is bounded even though the model is over the cap"
+        );
+
+        // The boundary half of the cost (`functional_spec.md F1.3`): while the model is OVER the
+        // cap, further band-affecting gestures move the model and leave the visible BOUNDARY
+        // standing still — the number, not the view; the rows inside the band shift as usual. The
+        // boundary tracks again as soon as the model drops back under the cap (last step below).
+        // `model_then_cache` walks the sequence a user would actually produce.
+        let model_then_cache = |worker: &Worker| {
+            let idx = worker.resolve(sheet).expect("sheet is live");
+            (
+                worker.doc.worksheet(idx).unwrap().frozen_rows,
+                frozen(worker, sheet).0,
+            )
+        };
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (80, MAX_FROZEN_ROWS),
+            "a second insert moves the model again; the boundary does not move"
+        );
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (72, MAX_FROZEN_ROWS),
+            "deleting back down leaves the boundary put too, while the model is over the cap"
+        );
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (MAX_FROZEN_ROWS as i32, MAX_FROZEN_ROWS),
+            "at the cap the two agree again"
+        );
+        worker.process_batch(vec![Command::DeleteRows {
+            sheet,
+            row: 0,
+            count: 8,
+        }]);
+        assert_eq!(
+            model_then_cache(&worker),
+            (56, 56),
+            "under the cap the boundary tracks the model again — the divergence is not sticky"
+        );
+
+        // Unfreeze clears BOTH sides in one step, from any count. That matters because a delete
+        // only reduces the count by the rows it removes, so an OVERFLOWED count (see
+        // `projects/frozen-pane-boundary-overflow.md`) needs several whole-axis deletes to walk
+        // down — reachable, but not a recovery path anyone would take.
+        worker.process_batch(vec![Command::SetFrozen {
+            sheet,
+            rows: Some(0),
+            cols: None,
+        }]);
+        let idx = worker.resolve(sheet).expect("sheet is live");
+        assert_eq!(worker.doc.worksheet(idx).unwrap().frozen_rows, 0);
+        assert_eq!(frozen(&worker, sheet).0, 0);
     }
 
     fn auto_grow(sheet: SheetId, heights: Vec<(u32, f32)>) -> Command {
@@ -8504,6 +7553,7 @@ mod tests {
             loaded_anchor_edits: HashMap::new(),
             loaded_deletes: HashSet::new(),
             chart_version: 0,
+            chart_snapshot_dirty: false,
             chart_source_path: None,
             discovered_chart_sheets: HashSet::new(),
             charts_fully_discovered: true,

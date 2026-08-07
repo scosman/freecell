@@ -248,9 +248,24 @@ tracks the data purely through the existing rebuild-re-read path.
   free — it is just another mutation tuple.)
 - **Degenerate band ≥ viewport / freeze-everything** (`functional_spec.md §5.1/§5.2`): no error,
   no block — handled entirely by the render-side clip + shrink-to-zero body in
-  `components/viewport_split.md §Degenerate cases`.
-- **Bad counts:** `SetFrozen` counts are UI-derived from real track runs (`0..=count`), so they
-  are always in range; a defensive clamp to `[0, axis.count()]` sits in the document wrapper.
+  `components/viewport_split.md §Degenerate cases`. **Superseded for "freeze-everything"** by
+  `engine-worker-hardening` §F1: the band is capped at 64 rows / 32 columns and an over-cap
+  `SetFrozen` *is* blocked. The clip/shrink tolerance still governs everything within the cap.
+- ~~**Bad counts:** `SetFrozen` counts are UI-derived from real track runs (`0..=count`), so they
+  are always in range; a defensive clamp to `[0, axis.count()]` sits in the document wrapper.~~
+  **WRONG, and this is the assumption that caused B2** (`engine-worker-hardening
+  functional_spec.md §0`, `§F1`). A count derived from a real track run is in range *for the
+  axis* and says nothing about being a *usable* freeze: the header menu derives it from the
+  **selected** header run (`grid/view.rs`, `run.1 + 1`), so Select-All → right-click → "Freeze
+  rows" is a perfectly well-formed `SetFrozen { rows: Some(1_048_576) }`. It reached the model,
+  the cache and then the publish loop's `(0..M) × (0..K)` iteration, which never returned. The
+  "defensive clamp in the document wrapper" was no defence either — clamping to `MAX_ROWS - 1` is
+  the hang, one row shorter. `SetFrozen` counts are **untrusted input** and are now range-checked
+  in `Worker::pre_validate` against `MAX_FROZEN_ROWS` / `MAX_FROZEN_COLS`. Two other paths move
+  the count without a `SetFrozen` at all: a file's `<pane>` at load, and a structural edit — which
+  *does* arrive as a command (`Command::InsertRows` / `InsertColumns`), but carries a row range,
+  not a frozen count, so there is nothing there for `pre_validate` to range-check. Both are
+  covered instead by the clamp in the sheet-cache build, which is what every consumer reads.
 
 ---
 

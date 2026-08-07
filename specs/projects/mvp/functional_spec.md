@@ -25,7 +25,7 @@ there: CLEAR TO BUILD. This spec builds exactly what those syntheses adopted.
 | Structure | Multiple sheets: add / rename / delete / switch | Insert/delete rows & cols UI, row/col resize (P2), hide, freeze, zoom, sort/filter |
 | Selection | Single cell + rectangular range; keyboard + mouse | Row/col-header select-all, multi-range (Cmd+click), named ranges |
 | Grid scale | Full Excel max: 1,048,576 rows × 16,384 cols, 120 fps scroll budget | — |
-| Windows | Welcome window at launch + one window per workbook, standard macOS menus; app quits when last window closes | Tabs-in-window, session restore |
+| Windows | Welcome window at launch + one window per workbook, standard macOS menus; app quits when last window closes (macOS stays in the Dock) | Tabs-in-window, session restore |
 | Formulas | Full IronCalc formula support: entry, recalc, cross-sheet refs, error values | Dynamic arrays/spill (accepted absent for v1), autocomplete |
 
 "Near parity with the big-name spreadsheets" is the **product trajectory**, not the MVP
@@ -64,9 +64,13 @@ Small, fixed-size, non-resizable window, centered:
   document-edited indicator (dot in close button) reflects the dirty flag; if GPUI
   doesn't expose it at our pinned rev, suffix the title with `— Edited` instead.
 - Closing a window with unsaved changes prompts: **Save / Don't Save / Cancel**.
-- When the last window closes (spreadsheet or Welcome), **the app quits** (product
-  call, planning Round 1). Quit via menu/Cmd+Q behaves the same: prompts per-window
-  for unsaved changes, any Cancel aborts the quit.
+- When the last window closes (spreadsheet or Welcome), **the app quits on Windows and
+  Linux** (product call, planning Round 1). **macOS is the exception** (platform
+  convention): the app stays running in the Dock with zero windows — clicking its Dock
+  icon brings the existing windows forward, or re-opens the Welcome window when none
+  remain. Only **Quit** terminates it there.
+- Quit via menu/Cmd+Q behaves the same on every platform: prompts per-window for unsaved
+  changes, any Cancel aborts the quit, and it always terminates the app.
 
 ### 2.4 Menus (macOS menu bar)
 

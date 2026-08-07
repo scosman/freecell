@@ -42,7 +42,8 @@ comment on `shell/window.rs`, not a real test — the compiled count is 92.)
 | §2.3 Window title = file name / `Untitled` | Auto | `shell/lifecycle.rs::document_name_untitled_and_named` |
 | §2.3 macOS edited dot / `— Edited` suffix | Auto+Manual | `shell/lifecycle.rs::window_title_suffix_only_when_no_dot`, `dirty_by_op_accounting`; **M-13** (macOS dot) |
 | §2.3 Close with unsaved → Save / Don't Save / Cancel | Auto | `shell/app.rs::close_dirty_prompts_and_cancel_keeps_window`, `clean_close_does_not_prompt` |
-| §2.3 Last window closes → app quits | Auto | `shell/registry.rs::empty_only_when_no_windows_and_no_welcome`, `welcome_counts_toward_open_count`; `shell/app.rs` `on_window_closed` |
+| §2.3 Last window closes → app quits (Windows/Linux) | Auto+Manual | Policy is gpui's `QuitMode::Default`, set in `shell/app.rs::init`; registry accounting `shell/registry.rs::empty_only_when_no_windows_and_no_welcome`, `welcome_counts_toward_open_count`, `shell/app.rs::closing_the_last_about_window_clears_its_accounting`; **M-17** (macOS: app stays in the Dock) |
+| §2.3 macOS: last window closes → app stays in the Dock; Dock click re-opens Welcome / activates existing windows | Auto+Manual | `shell/lifecycle.rs::dock_reopen_shows_welcome_only_with_no_windows`, `shell/app.rs::dock_reopen_with_no_windows_opens_welcome`, `dock_reopen_activates_the_existing_workbook_window`, `dock_reopen_activates_the_open_welcome_without_duplicating_it`, `dock_reopen_activates_the_about_window_when_it_is_all_that_is_open`, `dock_reopen_before_the_app_global_exists_is_a_no_op`; **M-17** (real Dock, minimized-window restore, zero-window Finder open — `TestPlatform` can't cover them) |
 | §2.3 Quit (Cmd/Ctrl+Q): per-window prompts, any Cancel aborts | Auto | `shell/lifecycle.rs::quitplan_prompts_in_order_then_quits`, `quitplan_cancel_aborts`, `quitplan_empty_quits_now` |
 | §2.4 macOS menu bar: FreeCell / File / Edit menus | Auto | `shell/menus.rs::menu_bar_has_the_three_specced_menus` |
 | §2.4 Menu items enable/disable by context | Auto+Manual | Window-scoped actions registered on `WorkbookWindow` root (absent on Welcome); structure test above; **M-14** enable/disable visual |
@@ -224,7 +225,7 @@ worker-seam tests (`worker_seam.rs`, `worker/run.rs`); Linux CI as the gating ta
 ## Uncovered? — final answer
 
 **No spec behavior is silently uncovered.** Every §2–§9 behavior is either automated,
-a recorded manual-smoke item (`smoke_checklist.md` M-1…M-16), or a **known-limitation with a
+a recorded manual-smoke item (`smoke_checklist.md` M-1…M-17), or a **known-limitation with a
 home**. The known-limitations (not silent):
 
 1. **Type-based default cell alignment** (§3.6) — grid defaults left; numbers/dates should

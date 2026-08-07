@@ -79,7 +79,7 @@ Per-phase records: `phase_plans/phase_{1,3,4,5,6,7,8,9,10}.md`. One additional o
 | 4 | ~~`fix/replace`~~ | REPLACE | `fn_replace` `text/string_format.rs:207` | §3.3 — all pass | inherited | n/a | **already present — verified, branch skipped** |
 | 5 | ~~`fix/char-code`~~ | CHAR + CODE | `fn_char`, `fn_code` `text/char_code.rs` | §3.4/§3.5 — all pass; 5 undefined CP1252 slots = owner SKIP | inherited | n/a | **already present (CP1252) — verified, branch skipped** |
 | 6 | ~~`fix/clean`~~ | CLEAN | `fn_clean` `text/char_code.rs:137` | §3.6 — all pass (0–31 only) | inherited | n/a | **already present — verified, branch skipped** |
-| 7 | ~~`fix/dollar-negative-zero`~~ | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — the "divergence" was **our error**: `($0.00)` is Excel's answer | ❌ **reverted** (fork PR #2, `8a79a7f`) | [#1293](https://github.com/ironcalc/IronCalc/pull/1293) **CLOSED unmerged** | **WITHDRAWN — the fix was wrong** (see the DOLLAR section above); branch `aa36a177` not carried |
+| 7 | ~~`fix/dollar-negative-zero`~~ | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — the "divergence" was **our error**: `($0.00)` is Excel's answer | ❌ **reverted** (fork PR #2, `8a79a7f`) | [#1293](https://github.com/ironcalc/IronCalc/pull/1293) **CLOSED unmerged** | **WITHDRAWN — the fix was wrong** (see the DOLLAR section above); branch `aa36a177` not carried, and `fix/dollar-negative-zero` was deleted from the fork deliberately — nothing to re-land. |
 | 8 | ~~`fix/percentile-quartile-inc`~~ | PERCENTILE(.INC) + QUARTILE(.INC) | `fn_percentile_inc` `statistical/percentile.rs:44`, `fn_quartile_inc` `statistical/quartile.rs` | §3.9/§3.10 — all pass; legacy routes to inclusive | inherited | n/a | **already present — verified, branch skipped** |
 | 9 | `fix/address-empty-sheet` | ADDRESS | `fn_address` `lookup_and_reference/address_areas.rs:18` | §3.8 — divergence (empty sheet → `$A$1`) **confirmed + FIXED** | ✅ (merge `582a78b1`) | ✅ prep (below) | **landed + pushed** — branch `09259476` |
 | 10 | `fix/xmatch-array-constant` | XMATCH | `fn_xmatch` `lookup_and_reference/xmatch.rs` | §3.11 — divergence (array-constant → `#VALUE!`) **confirmed + FIXED** | ✅ (merge `9161a463`) | ✅ prep (below) | **landed + pushed** — branch `f9d1f9ce` |
@@ -108,7 +108,7 @@ an upstream landing — hide/unhide was already upstream in `gaps_closing_7_15`)
 - `git merge-base --is-ancestor <upstream-sha> origin/freecell-fixes` when a specific commit is suspected.
 - **CHAR/CODE, PERCENTILE/QUARTILE, and TRIM especially** may already exist (common functions; TRIM
   already exists — this is a body fix). If a name already computes correctly → **skip / record "already
-  present"**. If it exists but is wrong (a missing DOLLAR neg-zero guard, an ADDRESS empty-sheet prefix,
+  present"**. If it exists but is wrong (an ADDRESS empty-sheet prefix,
   XMATCH not accepting array constants) → the branch is a **correctness fix** to the existing impl.
 
 ## Upstream PR prep (agent preps; owner opens)

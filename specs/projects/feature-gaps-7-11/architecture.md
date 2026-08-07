@@ -265,12 +265,15 @@ The scan must own the model (huge-sheet-safe, off the render publication). Add c
 - Add `OpenFind` to `actions!` (`shell/mod.rs:46`); bind `primary()+f` in
   `menus::bind_keys` (`shell/menus.rs:29`); optionally add to the Edit menu (`menus.rs:76`).
 - Handler on `WorkbookWindow::render` (`shell/window.rs:1018-1040`, alongside `toggle_style`):
-  call a new `ChromeView` method to toggle/focus the bar. Escape-to-close is handled on the
-  bar's key handling (mirror the data row's Escape at `chrome/view.rs:2775`).
+  call a new `ChromeView` method that **opens** + focuses the bar (`ChromeView::show_find`) —
+  ⌘F never dismisses; only the X, Escape, and the action-row button do (`functional_spec.md
+  §4.2`). Escape-to-close is handled on the bar's key handling (mirror the data row's Escape at
+  `chrome/view.rs:2775`).
 
 ### 4.5 Tests
 
-gpui view tests: bar opens/focuses on ⌘F + button; toggles; counter; next/prev wrap;
+gpui view tests: bar opens/focuses on ⌘F + button; the button toggles while ⌘F only ever opens
+(re-pressing ⌘F refocuses the find field and selects the query); counter; next/prev wrap;
 Escape/X close. Worker unit tests: `Find` predicate (case, whole-cell, substring, formula-text
 match), used-range scoping, `ReplaceAll` count + single-undo (`undo` restores all). No pixel
 impact (chrome not baselined) — smoke launch to confirm layout.

@@ -58,7 +58,8 @@ Add a **search** trigger to the action row (`render_action_row`), at the **trail
 just before the spacer/spinner (grouped after the insert-chart control, behind a
 `action_divider()`): a small ghost icon button using a bundled `search.svg` (magnifier).
 Tooltip "Find & Replace (⌘F)". `selected` (accent tint) while the find bar is open, so it
-reads as a toggle. Clicking it toggles the bar open/closed (same as ⌘F / Esc).
+reads as a toggle. Clicking it toggles the bar open/closed. (⌘F is *not* a toggle — it only
+ever opens; see `functional_spec.md §4.2`.)
 
 `search.svg` is a new vendored Lucide stroke icon (`stroke="currentColor"`, tintable) added
 to `assets/icons/` + `FREECELL_ICONS` per the existing icon convention.

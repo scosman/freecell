@@ -48,13 +48,18 @@ struct WorkbookWindow {                  // root Entity per document window
 ### Lifecycle rules (functional_spec §2)
 
 - Welcome shows at launch only. Any workbook window opening closes it. When the last
-  window closes (workbook post-prompt, or Welcome itself), **the app quits** — the
-  registry quits the app when its window count reaches zero.
+  window closes (workbook post-prompt, or Welcome itself), **the app quits on
+  Windows/Linux** and **stays resident in the Dock on macOS**. That split is gpui's
+  own `QuitMode::Default` policy — FreeCell sets it explicitly in `FreeCellApp::init`
+  and does **not** re-implement it in `on_window_closed`. On macOS a Dock-icon click
+  (`Application::on_reopen` → `FreeCellApp::handle_dock_reopen`) then activates the
+  existing windows or, with none open, re-opens Welcome. Cmd+Q still quits fully on
+  every platform.
 - **Open**: dedupe by canonical path — if already open, activate that window.
   Otherwise create the window immediately in loading state and `DocumentClient::spawn
   (OpenFile)`; `Loaded` → populate tabs + grid; `LoadFailed` → error dialog, then
-  close the window (if it was the last window this quits the app, unless the open
-  came from Welcome — then Welcome simply stays).
+  close the window (if it was the last window this quits the app on Windows/Linux,
+  unless the open came from Welcome — then Welcome simply stays).
 - **Close (Cmd+W / traffic light)**: if dirty → modal Save / Don't Save / Cancel;
   Save routes through the save flow and closes on `Saved`. GPUI window-close
   interception at the pinned rev: use the `on_should_close`-style hook if present;

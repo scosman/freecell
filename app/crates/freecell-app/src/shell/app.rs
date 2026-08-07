@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     point, px, size, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Entity,
-    Global, Pixels, Size, TitlebarOptions, WindowBounds, WindowHandle, WindowId, WindowOptions,
+    Global, Pixels, QuitMode, Size, TitlebarOptions, WindowBounds, WindowHandle, WindowId,
+    WindowOptions,
 };
 use gpui_component::Root;
 
@@ -20,7 +21,7 @@ use freecell_core::recent::{RecentList, WELCOME_LIMIT};
 use freecell_engine::DocumentSource;
 
 use super::about::AboutView;
-use super::lifecycle::{QuitPlan, QuitStep};
+use super::lifecycle::{reopen_action, QuitPlan, QuitStep, ReopenAction};
 use super::registry::{OpenOutcome, WindowKey, WindowRegistry};
 use super::welcome::WelcomeView;
 use super::window::{open_panel_options, WorkbookWindow};
@@ -47,8 +48,6 @@ pub struct FreeCellApp {
     windows: Vec<AppWindow>,
     /// An in-progress app quit (front-to-back dirty-window prompting).
     quit_plan: Option<QuitPlan>,
-    /// Set once the app has decided to quit, so a cascade of window closes doesn't re-quit.
-    quitting: bool,
     /// The live most-recent-first recent-files list, loaded in [`init`](Self::init) and updated
     /// at every record site (`record_recent`) + `clear_recents`. All the list logic is the pure
     /// [`RecentList`] (`freecell_core::recent`); this owns the app's working copy.
@@ -78,7 +77,6 @@ impl FreeCellApp {
             about_id: None,
             windows: Vec::new(),
             quit_plan: None,
-            quitting: false,
             recents: RecentList::default(),
             recents_store: recents::recents_store_path(),
         });
@@ -92,6 +90,15 @@ impl FreeCellApp {
         // dialog if it moved (`architecture.md §3.2, §5`).
         cx.on_action(|a: &OpenRecent, cx| FreeCellApp::open_path(&a.path, cx));
         cx.on_action(|_: &ClearRecent, cx| FreeCellApp::clear_recents(cx));
+
+        // The last-window-close policy is **gpui's**, not ours: with `QuitMode::Default` gpui
+        // quits the app itself the moment its window list empties on Windows/Linux, and
+        // deliberately does not on macOS (`gpui::app`, `QuitMode`) — which is exactly the
+        // behavior FreeCell wants (`functional_spec.md §2.3`: macOS stays resident in the Dock,
+        // where `handle_dock_reopen` brings it back). Set explicitly (it is also the gpui
+        // default) so there is one greppable, authoritative home for the rule and no
+        // hand-rolled duplicate in `on_window_closed`.
+        cx.set_quit_mode(QuitMode::Default);
 
         cx.on_window_closed(|cx, window_id| {
             // Deferred so the handler never runs nested inside another `update_global` lease
@@ -196,6 +203,27 @@ impl FreeCellApp {
     /// Requests an application quit (`functional_spec.md §2.3`, `Cmd/Ctrl+Q`).
     pub fn request_quit(cx: &mut App) {
         cx.update_global::<FreeCellApp, _>(|app, cx| app.do_request_quit(cx));
+    }
+
+    /// Handles a macOS Dock-icon click on the already-running app (`Application::on_reopen`,
+    /// registered in `main.rs`): with windows open — the reopen fires when none of them are
+    /// *visible*, i.e. they are all minimized/hidden — bring the app and its frontmost window
+    /// forward; with no windows at all, open the welcome window, exactly as at a fileless cold
+    /// launch. This is how a macOS app that outlived its last window (gpui's `QuitMode`, see
+    /// [`init`](Self::init)) becomes visible again.
+    ///
+    /// Only ever *delivered* on macOS, but deliberately cfg-free (as is its registration in
+    /// `main.rs`) so the Linux CI compiles the wiring and our `#[gpui::test]` suite covers both
+    /// branches.
+    ///
+    /// Unlike the other entry points this one is called by the **platform**, and it is registered
+    /// on the `Application` builder — before [`init`](Self::init) installs the global — so it
+    /// tolerates a not-yet-installed global instead of panicking in `update_global`.
+    pub fn handle_dock_reopen(cx: &mut App) {
+        if !cx.has_global::<FreeCellApp>() {
+            return;
+        }
+        cx.update_global::<FreeCellApp, _>(|app, cx| app.do_handle_dock_reopen(cx));
     }
 
     /// Opens the standalone About window, or activates it if it is already open (single-instance,
@@ -426,7 +454,7 @@ impl FreeCellApp {
         let order = self.front_to_back_keys(cx);
         let dirty = self.registry.dirty_among(&order);
         if dirty.is_empty() {
-            self.do_quit(cx);
+            cx.quit();
         } else {
             self.quit_plan = Some(QuitPlan::new(dirty));
             self.advance_quit(cx);
@@ -435,6 +463,13 @@ impl FreeCellApp {
 
     /// Drives the quit flow one step: prompt the next dirty window, or quit, or (on cancel)
     /// stand down.
+    ///
+    /// Off macOS the terminal [`QuitStep::QuitNow`] is not necessarily what *ends* the session:
+    /// if the last prompted window was also the last window, gpui's `QuitMode` already quit
+    /// synchronously as it closed, and this arm's `cx.quit()` lands second. Both platform
+    /// implementations are idempotent (`signal.stop()` / `PostQuitMessage(0)`), and the arm is
+    /// still required for the cases gpui does not cover — a quit with windows remaining, and
+    /// macOS, where nothing quits implicitly.
     fn advance_quit(&mut self, cx: &mut App) {
         let step = match self.quit_plan.as_ref() {
             Some(plan) => plan.next(),
@@ -459,7 +494,7 @@ impl FreeCellApp {
             },
             QuitStep::QuitNow => {
                 self.quit_plan = None;
-                self.do_quit(cx);
+                cx.quit();
             }
             QuitStep::Aborted => {
                 self.quit_plan = None;
@@ -467,11 +502,11 @@ impl FreeCellApp {
         }
     }
 
-    fn do_quit(&mut self, cx: &mut App) {
-        self.quitting = true;
-        cx.quit();
-    }
-
+    /// Cleans up after a closed window and advances an in-flight quit plan.
+    ///
+    /// It deliberately does **not** decide whether the app should now terminate: gpui owns that
+    /// (`QuitMode`, set in [`init`](Self::init)) and applies it right after these observers run —
+    /// quitting when the window list empties off macOS, staying resident in the Dock on macOS.
     fn on_window_closed(&mut self, window_id: WindowId, cx: &mut App) {
         if self.welcome_id == Some(window_id) {
             self.welcome = None;
@@ -499,14 +534,45 @@ impl FreeCellApp {
                     plan.resolved(key);
                 }
                 self.advance_quit(cx);
-                return;
             }
         }
+    }
 
-        // Last window closed (workbook or welcome) → the app quits (`functional_spec.md §2`).
-        if !self.quitting && self.registry.is_empty() {
-            self.do_quit(cx);
+    fn do_handle_dock_reopen(&mut self, cx: &mut App) {
+        // Either arm brings the app forward; AppKit does this itself on a Dock click, but being
+        // explicit keeps the two arms symmetric (and is a no-op off macOS).
+        cx.activate(true);
+        match reopen_action(self.registry.is_empty()) {
+            ReopenAction::ShowWelcome => self.do_show_welcome(cx),
+            ReopenAction::ActivateExisting => {
+                if let Some(handle) = self.frontmost_handle(cx) {
+                    handle
+                        .update(cx, |_, window, _| window.activate_window())
+                        .ok();
+                }
+            }
         }
+    }
+
+    /// The window a Dock reopen brings forward: the frontmost document window, else the welcome
+    /// or About window when one of those is all that is open.
+    ///
+    /// It deliberately resolves this from the windows *we* track rather than from the platform
+    /// stack: that stack is macOS's `orderedWindows`, which drops miniaturized and hidden windows
+    /// — and a reopen only arrives when no window is visible, so it is empty in exactly this
+    /// case. `front_to_back_keys` still consults it for *ordering*, degrading to registration
+    /// order when it reports nothing.
+    ///
+    /// The welcome/About arm is reachable only for a **hidden** app (⌘H): both windows are opened
+    /// `is_minimizable: false`, so neither can be miniaturized.
+    fn frontmost_handle(&self, cx: &App) -> Option<AnyWindowHandle> {
+        self.front_to_back_keys(cx)
+            .into_iter()
+            .find_map(|key| self.windows.iter().find(|w| w.key == key).map(|w| w.handle))
+            .or_else(|| {
+                let id = self.welcome_id.or(self.about_id)?;
+                cx.windows().into_iter().find(|w| w.window_id() == id)
+            })
     }
 
     /// Opens or activates the standalone About window (`architecture.md §9.2`). Mirrors
@@ -1207,14 +1273,15 @@ mod tests {
     }
 
     #[gpui::test]
-    fn closing_the_last_about_window_quits(cx: &mut TestAppContext) {
+    fn closing_the_last_about_window_clears_its_accounting(cx: &mut TestAppContext) {
         boot(cx);
         cx.update(FreeCellApp::show_about);
         assert!(cx.update(|cx| FreeCellApp::about_open(cx)));
 
-        // Closing the About window when it is the only window clears its accounting and empties the
-        // registry → the app quits (`functional_spec.md §4`; the `about_id` branch of
-        // `on_window_closed` falls through to the quit-when-empty check).
+        // Closing the About window when it is the only window clears its accounting and empties
+        // the registry (`functional_spec.md §4`; the `about_id` branch of `on_window_closed`).
+        // Whether the app then terminates is gpui's `QuitMode` decision, not FreeCell's — off
+        // macOS it quits, on macOS it stays resident in the Dock.
         let handle = cx.update(|cx| cx.windows().into_iter().next().expect("about window open"));
         handle
             .update(cx, |_root, window, _appcx| window.remove_window())
@@ -1228,6 +1295,100 @@ mod tests {
             cx.update(|cx| cx.windows().len()),
             0,
             "no windows remain after the last (About) window closes"
+        );
+    }
+
+    // ---- macOS Dock reopen (`Application::on_reopen`) --------------------------------------
+
+    #[gpui::test]
+    fn dock_reopen_with_no_windows_opens_welcome(cx: &mut TestAppContext) {
+        boot(cx);
+        // The macOS shape: the app is resident in the Dock with zero windows and the user clicks
+        // its icon → the welcome window comes back, as at a fileless cold launch.
+        cx.update(FreeCellApp::handle_dock_reopen);
+        assert!(
+            cx.update(|cx| FreeCellApp::welcome_open(cx)),
+            "a Dock reopen with no windows opens welcome"
+        );
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    }
+
+    #[gpui::test]
+    fn dock_reopen_activates_the_existing_workbook_window(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::new_workbook_detached);
+        let handle = cx.update(|cx| FreeCellApp::nth_window_handle(cx, 0).unwrap());
+        // Opening a window does not activate it under the test platform, so the activation below
+        // is genuinely attributable to the reopen.
+        assert_eq!(cx.update(|cx| cx.active_window()), None);
+
+        cx.update(FreeCellApp::handle_dock_reopen);
+        assert_eq!(
+            cx.update(|cx| cx.active_window()),
+            Some(handle),
+            "a Dock reopen brings the existing window forward"
+        );
+        assert!(
+            !cx.update(|cx| FreeCellApp::welcome_open(cx)),
+            "it never re-opens welcome while a window is open"
+        );
+        assert_eq!(window_count(cx), 1);
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    }
+
+    #[gpui::test]
+    fn dock_reopen_activates_the_open_welcome_without_duplicating_it(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_welcome);
+        let handle = cx.update(|cx| cx.windows().into_iter().next().expect("welcome open"));
+        // The welcome window is `is_minimizable: false`, so on macOS this arm is the hidden-app
+        // (⌘H) case rather than a minimized one.
+        cx.update(FreeCellApp::handle_dock_reopen);
+        assert!(cx.update(|cx| FreeCellApp::welcome_open(cx)));
+        assert_eq!(
+            cx.update(|cx| cx.active_window()),
+            Some(handle),
+            "the already-open welcome window is activated…"
+        );
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "…not duplicated by a second welcome window"
+        );
+    }
+
+    #[gpui::test]
+    fn dock_reopen_activates_the_about_window_when_it_is_all_that_is_open(cx: &mut TestAppContext) {
+        boot(cx);
+        cx.update(FreeCellApp::show_about);
+        let handle = cx.update(|cx| cx.windows().into_iter().next().expect("about open"));
+        assert_eq!(cx.update(|cx| cx.active_window()), None);
+
+        // The About window counts toward the registry, so the reopen activates it through
+        // `frontmost_handle`'s welcome/About fallback instead of opening welcome over it.
+        cx.update(FreeCellApp::handle_dock_reopen);
+        assert_eq!(
+            cx.update(|cx| cx.active_window()),
+            Some(handle),
+            "the About window is brought forward"
+        );
+        assert!(
+            !cx.update(|cx| FreeCellApp::welcome_open(cx)),
+            "an open About window suppresses the welcome-on-reopen branch"
+        );
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    }
+
+    #[gpui::test]
+    fn dock_reopen_before_the_app_global_exists_is_a_no_op(cx: &mut TestAppContext) {
+        // Deliberately no `boot()`: `on_reopen` is registered on the `Application` builder before
+        // `FreeCellApp::init` installs the global, so a reopen delivered in that window must
+        // return quietly rather than panic in `update_global`.
+        cx.update(FreeCellApp::handle_dock_reopen);
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            0,
+            "no window is opened without an app global"
         );
     }
 

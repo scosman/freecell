@@ -7,9 +7,12 @@
 //! [`WorkbookWindow`] (worker-event routing, grid/chrome coupling, selection/viewport wiring),
 //! replacing the Phase-10 placeholder body.
 //!
-//! **Pure vs GPUI.** The lifecycle *decisions* — window dedupe, quit-when-empty, dirty
-//! accounting, save targeting, quit-prompt ordering — live in the gpui-free [`registry`] and
-//! [`lifecycle`] modules and are unit-tested headlessly. This module's GPUI submodules
+//! **Pure vs GPUI.** The lifecycle *decisions* — window dedupe, open accounting, dirty
+//! accounting, save targeting, quit-prompt ordering, the macOS Dock-reopen action — live in
+//! the gpui-free [`registry`] and [`lifecycle`] modules and are unit-tested headlessly.
+//! (Whether the app terminates once its last window closes is **not** one of them: that is
+//! gpui's `QuitMode`, set in `FreeCellApp::init` — it ends the session off macOS and stays
+//! resident in the Dock on macOS.) This module's GPUI submodules
 //! ([`app`], `welcome`, `window`, [`menus`]) are the thin plumbing that performs those
 //! decisions against real windows, menus, panels, and dialogs.
 
@@ -82,7 +85,8 @@ actions!(
         /// F2`) — the Edit-menu "Merge Cells" item + ⌃⌘M shortcut, routed through the chrome's
         /// `toggle_merge` (same path as the action-row button).
         ToggleMerge,
-        /// Open (or toggle) the find/replace bar over the focused workbook (`functional_spec.md §4`).
+        /// Open the find/replace bar over the focused workbook, selecting any existing query
+        /// (`functional_spec.md §4`). Never closes an already-open bar.
         OpenFind,
         /// Quit the application (prompts each dirty window).
         Quit,

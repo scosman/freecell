@@ -6102,6 +6102,74 @@ mod tests {
     }
 
     #[test]
+    fn paste_fill_commits_the_whole_fill_as_one_generation() {
+        // The seam half of the fill tests above. Every other paste-fill assertion reads
+        // `worker.doc` — the document — so the fill path would pass them all even if it published
+        // nothing, bumped no generation and announced nothing, leaving the grid painting stale
+        // cells. This asserts the fill through `Shared` instead: one fill = exactly one generation
+        // (E1, `functional_spec.md F4` / `architecture.md §A5` — `commit` is the single commit
+        // point), the publication carries that generation, every filled cell is in it at its own
+        // re-anchored value, and a `Published` announced it.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..16,
+                cols: 0..8,
+            },
+            set_input(sheet, 2, 1, "1"),     // B3
+            set_input(sheet, 3, 1, "=B3+1"), // B4 = 2
+        ]);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(3, 1)),
+            false,
+        );
+        // Drain after the copy so the events below belong to the paste alone, and read the
+        // counter at the same instant so the delta is the fill's and nothing else's.
+        drain_events(&rx);
+        let before = worker.shared.generation.load(Ordering::Acquire);
+
+        // Fill-paste B4 over B5:B10 — each row chains off the one above it: 3, 4, 5, 6, 7, 8.
+        let target = CellRange::new(CellRef::new(4, 1), CellRef::new(9, 1));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        let after = worker.shared.generation.load(Ordering::Acquire);
+        assert_eq!(
+            after,
+            before + 1,
+            "the whole fill is ONE commit — not zero (nothing published) and not one per cell"
+        );
+        let publication = worker.shared.publication.load_full();
+        assert_eq!(
+            publication.generation, after,
+            "the publication behind the bump is the one this generation names"
+        );
+        for row in 4..=9 {
+            let cell = publication
+                .cells
+                .iter()
+                .find(|c| c.row == row && c.col == 1)
+                .unwrap_or_else(|| {
+                    panic!("row {row} of the fill is missing from the publication: {publication:?}")
+                });
+            assert_eq!(
+                cell.display_text,
+                (row - 1).to_string(),
+                "row {row} is published at its own re-anchored value"
+            );
+        }
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(e, WorkerEvent::Published)),
+            "the fill announces its commit, so the grid repaints; got {events:?}"
+        );
+    }
+
+    #[test]
     fn paste_fill_repeats_a_block_source_with_per_repetition_refs() {
         // A 2-row block copy filling a 4-row selection repeats twice, each repetition re-anchored:
         // the formula in the second repetition points at that repetition's own value cell.

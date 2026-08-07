@@ -50,8 +50,12 @@ These are the claims this note is willing to stand behind:
 ## Observations
 
 All measured through FreeCell's worker command path against fork commit
-`cee2859dceda65ff64e52192be4ec47a259870e1` (the `freecell-fixes` pin in `Cargo.lock`), rows axis,
-`LAST_ROW` = 1,048,576, FreeCell's `MAX_FROZEN_ROWS` = 64. `max_row` is `dimension().max_row`,
+`cee2859dceda65ff64e52192be4ec47a259870e1`, which was the `freecell-fixes` pin in `Cargo.lock` at
+the time. The pin has since moved to `c1acacbda22e98450ab36139e686ecc29ff19305`; the numbers below
+were **not** re-run there, they were re-verified to still apply: every file this note cites
+(`base/src/actions.rs`, `base/src/model.rs`, `xlsx/src/import/worksheets.rs`) is **byte-identical**
+between the two checkouts, so both the defect and the cited line numbers carry over unchanged. Rows
+axis, `LAST_ROW` = 1,048,576, FreeCell's `MAX_FROZEN_ROWS` = 64. `max_row` is `dimension().max_row`,
 which is 1 on a sheet with no cells. Each row is one observation with its own conditions; nothing
 here should be read as holding outside them.
 

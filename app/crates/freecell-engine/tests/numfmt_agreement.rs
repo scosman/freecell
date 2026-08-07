@@ -28,17 +28,29 @@
 //! # The corpus is GENERATED from the predicate, not remembered
 //!
 //! The invariant above quantifies over *every* code the predicate accepts, so a hand-written corpus
-//! can only ever sample it. Three consecutive reviews each found another accepted shape that
+//! can only ever sample it. Four consecutive reviews each found another accepted shape that
 //! `chart-model` rendered wrong with no badge — the `#` optional-digit family, then a quoted or
-//! `\`-escaped `%` (a 100× error), then required leading zeros — and each time the fix was to add
-//! the missing codes to a list. The list is not the specification; the predicate is.
+//! `\`-escaped `%` (a 100× error), then required leading zeros, then a placeholder character
+//! *inside* a literal (`\#0`, `"Item #"0`) — and each time the fix was to add the missing codes to
+//! a list. The list is not the specification; the predicate is.
 //!
-//! [`generated_shape_space_agrees_with_the_cell`] therefore enumerates the shape space
-//! ([`INTEGER_RUNS`] × [`FRACTIONAL_RUNS`] × [`PERCENT_FORMS`] × [`AFFIX_FORMS`] × [`PADS`] —
-//! 9 360 codes), keeps the ones `renders_faithfully` accepts, and asserts agreement across
-//! [`VALUES`] — roughly 300 000 (code, value) pairs. The hand-written [`FIXTURE_CODES`] /
-//! [`COMMON_CODES`] corpus is kept as the *grounded* half (codes from real files in-tree, and the
-//! everyday codes), but it is no longer the boundary of what is checked.
+//! [`generated_shape_space_agrees_with_the_cell`] therefore enumerates the shape space directly,
+//! keeps the ones `renders_faithfully` accepts, and asserts agreement across [`VALUES`] — about
+//! 266 000 (code, value) pairs. The hand-written [`FIXTURE_CODES`] / [`COMMON_CODES`] corpus is kept
+//! as the *grounded* half (codes from real files in-tree, and the everyday codes), but it is no
+//! longer the boundary of what is checked.
+//!
+//! **Round 4: the generated space is not the same thing as the accepted space, and the axes are
+//! what closes the gap.** The round-3 generator swept
+//! [`INTEGER_RUNS`] × [`FRACTIONAL_RUNS`] × [`PERCENT_FORMS`] × [`AFFIX_FORMS`] × [`PADS`], whose
+//! affix axis was `{"", "$", "\$", "\" kg\"", "[$€-407]", "\"USD \""}` — not a placeholder
+//! character, not a non-`$` bracket token, not a bare literal, not a doubled separator among them.
+//! So a whole class of accepted-and-divergent codes was unreachable *by construction*, and the
+//! round's headline ("zero unexplained disagreements across the whole generated space") was true of
+//! the generated space while being false of the space the invariant actually ranges over. Three new
+//! axes were added rather than the specific codes: [`LITERAL_AFFIXES`], [`BRACKET_TOKENS`] and
+//! [`BARE_LITERALS`], plus the non-grouping comma shapes folded into [`INTEGER_RUNS`]. The residual
+//! is still real and is stated in `phase_6.md`: axes are a sampling strategy, not a proof.
 //!
 //! **`General` is the one in-subset code this gate does not assert, and that is a hole, not a
 //! property.** `renders_faithfully("General")` returns `true`, so by the invariant above the
@@ -143,10 +155,13 @@ const COMMON_CODES: &[&str] = &[
 /// Codes deliberately **outside** the bounded subset. Not asserted — they exist so the
 /// informational report shows how wide the disclosed (badged) gap actually is.
 ///
-/// The last four are the round-3 additions: shapes `chart-model` renders the way *Excel* does and
-/// IronCalc does not, so agreeing with the cell would mean copying an engine defect into the charts
-/// (`GAPS.md` E8/E9). They are badged instead. `the_faithful_subset_is_actually_a_subset` asserts
-/// they really are rejected, so this list cannot rot into a set of silently-faithful codes.
+/// The round-3 additions (`##,##0` … `[$USD-409]#,##0`) are shapes `chart-model` renders the way
+/// *Excel* does and IronCalc does not, so agreeing with the cell would mean copying an engine defect
+/// into the charts (`GAPS.md` E8/E9). They are badged instead. The round-4 additions are the three
+/// shapes the widened axes turned up where the **cell shows `#VALUE!`** (a lexer error) or scales
+/// the value: again chart-model is the correct side, so again the resolution is a badge.
+/// `the_faithful_subset_is_actually_a_subset` asserts they really are rejected, so this list cannot
+/// rot into a set of silently-faithful codes.
 const OUT_OF_SUBSET_CODES: &[&str] = &[
     "0.00E+00",
     "yyyy-mm-dd",
@@ -160,6 +175,10 @@ const OUT_OF_SUBSET_CODES: &[&str] = &[
     "0,000",           // E8: the cell never groups the zeros it padded in
     "0\"a\"\"b\"",     // E9: the two lexers read a doubled quote differently
     "[$USD-409]#,##0", // a multi-character currency symbol the cell's lexer rejects outright
+    "[h]0",            // round 4: elapsed time — the cell shows `#VALUE!`
+    "[DBNum1]#,##0",   // round 4: not a token the cell's lexer knows — `#VALUE!`
+    "0°",              // round 4: a bare literal outside `Token::Literal`'s list — `#VALUE!`
+    "#,,##0",          // round 4: a comma that is not between digits is a ÷1000 scale, not grouping
 ];
 
 /// Values chosen to hit the places two independent implementations diverge: sign handling, the
@@ -286,12 +305,58 @@ fn code_precision(code: &str) -> (usize, i32) {
 /// `-$0.00`, `-0%`, `-0.00 kg` for negatives that round to zero, which Excel and IronCalc both
 /// print unsigned. That defect is fixed in `chart-model`; this clause makes sure the carve-out
 /// cannot hide its like again.
-fn is_ironcalc_sign_bug(value: f64, chart: &str, cell: &str) -> bool {
+///
+/// **Round 4: anchored to the sign POSITION, and to IronCalc's own sign test.** The clause was
+/// `!cell.contains('-')`, which is not a statement about the sign at all — it also excluded every
+/// pair whose *format code* carries a literal `-` (`-0`, `0-`, `$-0` on -1: cell `-1` / `1-` /
+/// `$-1`, chart `--1` / `-1-` / `-$-1`). Those are genuine E6 pairs — IronCalc dropped the sign and
+/// what remains is the code's own literal — and the gate would have reported them as hard failures
+/// once the corpus reached a `-`-bearing code. The sign's position is already pinned by
+/// `chart[1..] == *cell` (the cell is the chart minus exactly the leading character), so the
+/// `contains` test was doing nothing else.
+///
+/// In its place the predicate now **reconstructs IronCalc's own decision**
+/// ([`ironcalc_keeps_the_sign`]) and fires only when that decision was "drop it". That turns a
+/// shape match into a named-defect match: a pair where IronCalc kept the sign and the strings still
+/// differ by a leading `-` is not this defect, and is not suppressed.
+fn is_ironcalc_sign_bug(code: &str, value: f64, chart: &str, cell: &str) -> bool {
     value < 0.0
         && chart.starts_with('-')
-        && !cell.contains('-')
         && chart[1..] == *cell
         && chart[1..].contains(|c: char| c.is_ascii_digit() && c != '0')
+        && !ironcalc_keeps_the_sign(code, value)
+}
+
+/// Whether **`chart-model`** attached a minus sign to this rendering.
+///
+/// Measured by rendering the same magnitude and comparing, **not** by looking for a leading `-`:
+/// a format code may carry a literal `-` of its own, so a leading dash is not evidence of a sign
+/// decision. `#-` on **+0.5** renders `-` (the integer part is suppressed and the dash is the
+/// code's), and a `starts_with('-')` gate read that as "the chart signed a positive number".
+fn chart_is_signed(code: &str, value: f64) -> bool {
+    value < 0.0 && apply_number_format(code, value) != apply_number_format(code, -value)
+}
+
+/// Whether **IronCalc** attached a minus sign, measured the same way. `format.rs` emits the sign as
+/// `text = format!("-{text}")` at integer digit index 0 and takes every digit from `value_abs`, so
+/// the signed rendering is exactly `-` prepended to the unsigned one — which is what makes this
+/// comparison exact rather than approximate.
+fn cell_is_signed(code: &str, value: f64) -> bool {
+    value < 0.0 && ironcalc(code, value) != ironcalc(code, -value)
+}
+
+/// IronCalc's own `is_negative`, reconstructed from `format.rs`: scale by the percent factor,
+/// pre-round with `to_precision(value, precision + integer_digits)` (`:438`), then test
+/// `value < -(10^-precision)` (`:481`). `true` means the cell is expected to carry a minus sign.
+///
+/// The scaling-comma factor (`/1000^comma`) is omitted deliberately: `renders_faithfully` rejects
+/// every code that has one, so no pair reaching this gate can have `comma > 0`.
+fn ironcalc_keeps_the_sign(code: &str, value: f64) -> bool {
+    let (decimals, percent_scale) = code_precision(code);
+    let scaled = value * 100f64.powi(percent_scale);
+    let integer_digits = format!("{}", scaled.abs().floor()).len();
+    let pre_rounded = to_precision(scaled, decimals + integer_digits);
+    pre_rounded < -(10f64.powf(-(decimals as f64)))
 }
 
 /// **2. IronCalc's rounding is not a rounding rule** (`GAPS.md` E7). `formatter/format.rs` does not
@@ -323,11 +388,21 @@ fn is_ironcalc_sign_bug(value: f64, chart: &str, cell: &str) -> bool {
 ///
 /// That confirmation is what keeps it a carve-out rather than a hole. The reconstruction renders
 /// its predicted magnitude through `chart-model` itself, so it can only match the cell when
-/// `chart-model`'s *presentation* (padding, grouping, affixes, percent placement, sign suppression)
-/// is already identical to IronCalc's and the sub-unit **rounding** is the sole difference. A
-/// presentation bug in `chart-model` makes the reconstruction miss the cell, the carve-out stops
-/// firing, and the gate fails — which is exactly what a carve-out that "hid a defect for a while"
-/// must not be able to do again.
+/// `chart-model`'s *presentation* (padding, grouping, affixes, percent placement) is already
+/// identical to IronCalc's and the sub-unit **rounding** is the sole difference.
+///
+/// **That argument had one hole, and round 4 found it: sign suppression.** The reconstruction feeds
+/// the *positive* predicted magnitude to `apply_number_format`, and the negative fallback feeds
+/// `-predicted` — which for the whole lost-carry class is `-0.0`, and `-0.0 < 0.0` is `false`. So
+/// re-introducing round 2's exact chart-side defect (deciding the sign from `scaled < 0.0` before
+/// rounding, i.e. dropping `has_significant_digit`) left every reconstruction untouched: all six
+/// tests still passed, and the census simply moved 6 424 pairs from "agree" into "E7". A carve-out
+/// written specifically so it could not hide a sign bug was hiding a sign bug.
+///
+/// The fix is not prose but a **gate**: the chart and the cell must have made the *same* sign
+/// decision before this predicate may fire at all. Under the re-introduced defect the chart prints
+/// `-0` where the cell prints `0`, the gate blocks the carve-out, and the pair becomes a hard
+/// failure — verified by running exactly that mutation (round-4 remediation, `phase_6.md`).
 ///
 /// For `|v| >= 1` the predicate cannot fire at all, so any disagreement there is a hard failure.
 /// Excel is half-away-from-zero throughout (`2.5 → 3`) while IronCalc lands on half-to-even there
@@ -340,6 +415,12 @@ fn is_ironcalc_sign_bug(value: f64, chart: &str, cell: &str) -> bool {
 /// the format's decimal count and percent scale — `0%` reaches the sub-unit regime at value 0.005
 /// (0.005 × 100 = 0.5).
 fn is_ironcalc_rounding_defect(code: &str, value: f64, cell: &str) -> bool {
+    // **The sign gate.** A rounding carve-out may only explain a pair on which both sides already
+    // agree about the sign; a difference in the *sign* decision is E6's business or a chart bug, and
+    // either way must not be absorbed here. See the doc comment above for the mutation this closes.
+    if chart_is_signed(code, value) != cell_is_signed(code, value) {
+        return false;
+    }
     let (decimals, percent_scale) = code_precision(code);
     let scale = 100f64.powi(percent_scale);
     let magnitude = (value * scale).abs();
@@ -393,7 +474,7 @@ fn carve_out(code: &str, value: f64, chart: &str, cell: &str) -> Option<&'static
     // at all, so the other two predicates have nothing to say about it.
     if is_empty_code_artifact(code, cell) {
         Some("empty-code `#VALUE!`")
-    } else if is_ironcalc_sign_bug(value, chart, cell) {
+    } else if is_ironcalc_sign_bug(code, value, chart, cell) {
         Some("IronCalc sign bug (E6)")
     } else if is_ironcalc_rounding_defect(code, value, cell) {
         Some("IronCalc rounding defect (E7)")
@@ -412,7 +493,11 @@ fn chart_and_cell_agree_on_every_faithfully_rendered_code() {
         .chain(COMMON_CODES)
         .map(|c| c.to_string())
         .collect();
-    assert_agreement(&corpus, "the grounded corpus (fixtures + everyday codes)");
+    let pairs = assert_agreement(&corpus, "the grounded corpus (fixtures + everyday codes)");
+    assert!(
+        pairs > 500,
+        "the grounded corpus contributed only {pairs} asserted pairs",
+    );
 }
 
 /// **The same gate, over the shape space the predicate accepts rather than the codes we remembered.**
@@ -424,20 +509,47 @@ fn chart_and_cell_agree_on_every_faithfully_rendered_code() {
 #[test]
 fn generated_shape_space_agrees_with_the_cell() {
     let corpus = generated_corpus();
+    let pairs = assert_agreement(&corpus, "the generated shape space");
+    // **The degeneracy guard measures what is ASSERTED, not what is generated.** It used to check
+    // `corpus.len() > 5_000` — the *unfiltered* generator output, a number no change to
+    // `renders_faithfully` can move. Narrowing the predicate to accept nothing at all would have
+    // left it green while the gate asserted zero pairs. The count below is the number of
+    // (accepted code, value) pairs actually compared against IronCalc, which is the quantity the
+    // invariant ranges over.
     assert!(
-        corpus.len() > 5_000,
-        "the generator produced only {} codes — it has degenerated and is no longer sweeping the \
-         shape space",
-        corpus.len(),
+        pairs > 100_000,
+        "the generated shape space contributed only {pairs} ASSERTED (code, value) pairs — either \
+         the generator stopped sweeping the shape space or `renders_faithfully` was narrowed to \
+         near-nothing, and this gate is no longer checking the invariant it claims to",
     );
-    assert_agreement(&corpus, "the generated shape space");
 }
 
-/// Integer runs: optional-only, required-only, mixed, and every grouping shape — including the two
-/// (`##,##0`, `0,000`) that `renders_faithfully` must *reject* because IronCalc groups them wrong.
+/// Integer runs: optional-only, required-only, mixed, every grouping shape — including the two
+/// (`##,##0`, `0,000`) that `renders_faithfully` must *reject* because IronCalc groups them wrong —
+/// and (round 4) the **separator axis**: comma placements that are not grouping at all. IronCalc
+/// counts a comma as a thousands separator only when it sits *between two digit tokens*
+/// (`parser.rs`: `use_thousands = last_token_is_digit && next_token_is_digit`) and as a ÷1000 scale
+/// otherwise, so `#,,##0` on 1 shows `0` in the cell where the applier shows `1`.
 const INTEGER_RUNS: &[&str] = &[
-    "#", "0", "##", "00", "000", "0000", "###", "#,##0", "#,###", "##,##0", "#,#00", "#,000",
+    "#",
+    "0",
+    "##",
+    "00",
+    "000",
+    "0000",
+    "###",
+    "#,##0",
+    "#,###",
+    "##,##0",
+    "#,#00",
+    "#,000",
     "0,000",
+    "#,,##0",
+    "#,,#0",
+    "0,,0",
+    "#,#,#0",
+    "#,##,##0",
+    "##,###,##0",
 ];
 /// Fractional runs: absent, optional-only, required-only, and every interleaving that a single
 /// "minimum decimals" count got wrong (`.#0`, `.0#0`).
@@ -453,7 +565,87 @@ const AFFIX_FORMS: &[&str] = &["", "$", "\\$", "suffix", "[$€-407]", "prefix"]
 /// Trailing literal whitespace — the padding the applier used to `trim()` away.
 const PADS: &[&str] = &["", " "];
 
+/// A small set of everyday numeric shapes, used as the carrier for the three round-4 axes below.
+/// Crossing those axes against the *full* `INTEGER_RUNS × FRACTIONAL_RUNS × …` space would multiply
+/// the corpus by 60× for no extra discrimination — the axes are independent of the digit shape.
+const CORE_NUMERIC: &[&str] = &[
+    "0", "0.0", "0.00", "#,##0", "#,##0.00", "#", "#.##", "000", "0%",
+];
+
+/// **The literal-affix axis** (round 4). A literal that *contains* a placeholder character is the
+/// case the predicate and the applier disagreed about for three rounds: `renders_faithfully` looked
+/// for the numeric run on the stripped control body while `FormatSpec::parse` looked for it on a
+/// string that still contained quotes and `\`-escapes, so a `0`/`#`/`,`/`.` inside a literal was
+/// invisible to one and a digit placeholder to the other. `\#0` and `"Item #"0` are standard Excel
+/// idioms; both rendered wrong, unbadged, and neither was reachable from the round-3 axes (whose
+/// affix forms were `{"", "$", "\$", "\" kg\"", "[$€-407]", "\"USD \""}` — not a placeholder
+/// character among them).
+const LITERAL_AFFIXES: &[&str] = &[
+    "\"0\"",
+    "\"#\"",
+    "\",\"",
+    "\".\"",
+    "\" of 100\"",
+    "\"Item #\"",
+    "\" #\"",
+    "\" (0)\"",
+    "\"0.0\"",
+    "\\0",
+    "\\#",
+    "\\,",
+    "\\.",
+    "\" kg\"",
+];
+
+/// **The bracket-token axis** (round 4). Only `[$…]` was swept before. IronCalc's lexer accepts a
+/// currency token, a condition, elapsed time, and exactly seven lower-cased colour names; every
+/// other bracket token is a hard lexer **error** and the cell shows `#VALUE!` while the applier
+/// renders a number. `[Color 5]` is spelled both ways on purpose — the lexer's arm is
+/// case-sensitive (`chars.starts_with("Color")`), so the two spellings are not interchangeable.
+const BRACKET_TOKENS: &[&str] = &[
+    "[Red]",
+    "[red]",
+    "[Blue]",
+    "[Black]",
+    "[Green]",
+    "[Magenta]",
+    "[Yellow]",
+    "[White]",
+    "[Color 5]",
+    "[color 5]",
+    "[Color 99]",
+    "[$€-407]",
+    "[$$-409]",
+    "[$USD-409]",
+    "[h]",
+    "[mm]",
+    "[DBNum1]",
+    "[>=100]",
+    "[<0]",
+    "[t]",
+];
+
+/// **The bare-literal axis** (round 4). An unquoted, unescaped literal character is a
+/// `Token::Literal` only if it is in IronCalc's explicit list (`formatter/lexer.rs`: `$ € ( ) / :
+/// + - ^ ' { } < = ! ~ >` and space); a date letter starts a date token, and anything else is a
+/// lexer error. So `0°` / `0£` / `0¥` / `0µ` / `0×` / `0¤` / `0\t` show `#VALUE!` in the cell while
+/// the applier renders `7°`, `7£`, … Here **chart-model is the correct side**, so the resolution is
+/// a predicate narrowing, not a chart change. `-` and `+` are in the list for a second reason: a
+/// **sign-bearing literal** interacts with IronCalc's sign handling (`-0` on -1 → cell `-1`, chart
+/// `--1`), which is the E6 defect and was not reachable while `is_ironcalc_sign_bug` required
+/// `!cell.contains('-')`.
+const BARE_LITERALS: &[&str] = &[
+    "$", "€", "(", ")", "/", ":", "+", "-", "^", "'", "{", "}", "<", "=", "!", "~", ">", " ", "°",
+    "£", "¥", "µ", "×", "¤", "\t", "k", "z", "E", "m", "y", "AM/PM",
+];
+
 /// Every code in the shape space, faithful or not. Filtering is the caller's job.
+///
+/// Four families, not one cross product: the digit-shape space, then one family per round-4 axis
+/// carried on [`CORE_NUMERIC`]. Each family places its axis value in **both** positions (before and
+/// after the digits), because position is exactly what several of the divergences turned on — a
+/// `[$…]` currency is hoisted to the head of the string, and a literal ahead of the run lands in the
+/// prefix rather than the suffix.
 fn generated_corpus() -> Vec<String> {
     let mut codes = Vec::new();
     for integer_run in INTEGER_RUNS {
@@ -475,11 +667,24 @@ fn generated_corpus() -> Vec<String> {
             }
         }
     }
+    for numeric in CORE_NUMERIC {
+        for axis in LITERAL_AFFIXES
+            .iter()
+            .chain(BRACKET_TOKENS)
+            .chain(BARE_LITERALS)
+        {
+            codes.push(format!("{axis}{numeric}"));
+            codes.push(format!("{numeric}{axis}"));
+        }
+    }
     codes
 }
 
 /// Assert the invariant over a corpus, reporting every disagreement at once rather than the first.
-fn assert_agreement(corpus: &[String], what: &str) {
+/// Returns the number of in-subset (code, value) pairs actually asserted, so a caller can guard
+/// against the corpus or the predicate degenerating.
+#[must_use]
+fn assert_agreement(corpus: &[String], what: &str) -> usize {
     let mut disagreements: Vec<String> = Vec::new();
     let mut pairs = 0usize;
     for code in corpus {
@@ -516,6 +721,7 @@ fn assert_agreement(corpus: &[String], what: &str) {
          than copying it into the charts.",
         disagreements.join("\n"),
     );
+    pairs
 }
 
 /// `General` only — the empty code is **not** skipped, so that `is_empty_code_artifact` pins
@@ -681,6 +887,21 @@ fn the_carve_outs_suppress_only_a_handful_of_pairs() {
                 total += 1;
                 let chart = apply_number_format(code, value);
                 let cell = ironcalc(code, value);
+                // `is_ironcalc_sign_bug` fires on IronCalc's *reconstructed* `is_negative`
+                // (`ironcalc_keeps_the_sign`) rather than on the shape of the two strings. That
+                // reconstruction is only worth anything if it is right, so pin it against the
+                // measured answer on every pair the gate sees. A fork fix that moves the E6 band
+                // fails here first, with a pointer to the line that has to change.
+                // (An empty code never reaches the numeric path — `#VALUE!` carries no sign — so it
+                // is excluded here and pinned by `is_empty_code_artifact` instead.)
+                assert!(
+                    code.trim().is_empty()
+                        || ironcalc_keeps_the_sign(code, value) == cell_is_signed(code, value),
+                    "the reconstruction of IronCalc's `is_negative` (format.rs:438 + :481) \
+                     disagrees with what IronCalc actually did for code {code:?} value {value} \
+                     (cell {cell:?}) — `is_ironcalc_sign_bug` is no longer anchored to the defect \
+                     it names",
+                );
                 if chart == cell {
                     agree += 1;
                     continue;

@@ -77,26 +77,40 @@ fn has_significant_digit(magnitude: &str) -> bool {
 /// `true` for the supported subset: empty / `General`, and a **single**, non-conditional section
 /// the applier parses exactly (percent, thousands **grouping**, required (`0`) **and optional
 /// (`#`)** digit placeholders, currency/text affix, literal whitespace padding). `false` for codes
-/// outside it — a **multi-section** code (`;`, whose negative/zero/text sections the applier
-/// drops), a **conditional** section (`[<`/`[>`/`[=`, which selects a format
-/// by value), a **scaling comma** (a `,` after the last digit placeholder — Excel's ÷1000-per-comma
-/// "in thousands / millions" scale, which the applier silently ignores, e.g. `#,##0,` → `1,235`
-/// but we'd emit `1,234,567`), an **unhandled control/format char** (`_` column-align, `*`
-/// fill-repeat, `?` digit-align, `@` raw-text — none rendered), a **numeric run** carrying anything
-/// but `0`/`#`/`,`/`.`, an integer run that is not `#`…`0`…
-/// ([`integer_run_shape_is_hash_then_zero`]), a grouping shape IronCalc groups differently, a
-/// doubled quote, or a construct the parser rejects (dates, scientific, fractions). The check is
-/// deliberately stricter than
-/// [`FormatSpec::parse`], which accepts several of these and renders them wrong — being *called*
-/// Faithful is what would hide the mis-render, so this gate rejects them even though the applier
-/// still produces (approximate) output.
+/// outside it:
+///
+/// - a **multi-section** code (`;`, whose negative/zero/text sections the applier drops);
+/// - a **bracket token** IronCalc's lexer reads differently or rejects — a conditional section
+///   (`[<`/`[>`/`[=`, which selects a format by value), elapsed time (`[h]`), a non-head or
+///   multi-character `[$…]` currency, or an outright lexer error (`[DBNum1]`, `[Color 5]`), for
+///   which the *cell* shows `#VALUE!`;
+/// - a **scaling comma** (a `,` after the last digit placeholder — Excel's ÷1000-per-comma
+///   "in thousands / millions" scale, which the applier silently ignores, e.g. `#,##0,` → `1,235`
+///   but we'd emit `1,234,567`) or any other comma that is not **between two digit placeholders**
+///   (`#,,##0`, which IronCalc scales rather than groups);
+/// - an **unhandled control/format char** (`_` column-align, `*` fill-repeat, `?` digit-align, `@`
+///   raw-text — none rendered), or a **bare literal** character outside IronCalc's `Token::Literal`
+///   list (`0°`, `0£`, `0\t` → `#VALUE!` in the cell — see [`is_renderable_literal`]);
+/// - a **numeric run** carrying anything but *control* `0`/`#`/`,`/`.` — including a literal
+///   character from a quoted string or a `\`-escape, which IronCalc renders in place among the
+///   digits;
+/// - an integer run that is not `#`…`0`… ([`integer_run_shape_is_hash_then_zero`]), a grouping
+///   shape IronCalc groups differently, a doubled quote, an unterminated `[`/`"`, or a construct
+///   the parser rejects (dates, scientific, fractions).
+///
+/// The check is deliberately stricter than [`FormatSpec::parse`], which accepts several of these
+/// and renders them wrong — being *called* Faithful is what would hide the mis-render, so this gate
+/// rejects them even though the applier still produces (approximate) output.
 ///
 /// **This predicate is the corpus's specification, not a list of remembered cases.**
 /// `numfmt_agreement.rs::generated_shape_space_agrees_with_the_cell` enumerates the shape space it
 /// accepts and asserts agreement with IronCalc across it, so a shape accepted here that we render
-/// differently from the cell fails the build. Three rounds of review each found another such shape
-/// (`#` optional digits → a quoted/escaped `%` → required leading zeros) because the corpus was
-/// hand-written; it is generated now.
+/// differently from the cell fails the build. Four rounds of review each found another such shape
+/// (`#` optional digits → a quoted/escaped `%` → required leading zeros → a placeholder character
+/// inside a literal) because the corpus was hand-written, then generated over axes that did not
+/// reach the accepted space. It is generated over the axes the predicate itself reasons about now —
+/// but note that "the generated space" is still not the same thing as "the accepted space", and the
+/// residual is stated in `phase_6.md` rather than claimed away.
 pub fn renders_faithfully(code: &str) -> bool {
     // Only the General test trims — everything below inspects the code the applier actually
     // parses, whitespace padding included (see [`apply_number_format`]).
@@ -109,23 +123,17 @@ pub fn renders_faithfully(code: &str) -> bool {
     if code.contains(';') {
         return false;
     }
-    // A conditional section ([>=100], [<0], …) changes which format applies by value; the applier
-    // strips the bracket and ignores the condition, so it is not an exact render.
-    if code.contains("[>") || code.contains("[<") || code.contains("[=") {
+    let lexed = lex(code);
+    // An unterminated `[` or `"` errors in IronCalc's lexer (`#VALUE!` in the cell).
+    if lexed.malformed {
         return false;
     }
-    // A bracketed currency token is hoisted to the FRONT of the string by IronCalc's formatter
-    // (`Formatted::text` starts as the currency char), and its lexer reads exactly one symbol
-    // character. So `[$€-407]#,##0` agrees, but a multi-character symbol or a token that is not at
-    // the head of the code does not.
-    if let Some((head, rest)) = code.split_once("[$") {
-        let Some((token, tail)) = rest.split_once(']') else {
-            return false;
-        };
-        let symbol = token.split('-').next().unwrap_or("");
-        if !head.is_empty() || symbol.chars().count() != 1 || tail.contains("[$") {
-            return false;
-        }
+    // Bracket tokens: only a head-position single-symbol `[$…]` currency and the plain colour names
+    // IronCalc's lexer accepts. A conditional section ([>=100], [<0], …) changes which format
+    // applies by value; elapsed time ([h]) is a duration format; `[DBNum1]` / `[Color 5]` are
+    // outright lexer errors. The applier strips all of them and renders a plain number.
+    if !lexed.brackets_are_renderable() {
+        return false;
     }
     // A doubled quote is where the two lexers genuinely disagree about the grammar: IronCalc's
     // `consume_string` reads `""` as an ESCAPED quote inside one literal (`"%"" kg"` → `%" kg`),
@@ -137,33 +145,53 @@ pub fn renders_faithfully(code: &str) -> bool {
     }
     // A scaling comma or an unhandled control char (`_`/`*`/`?`/`@`) parses but mis-renders —
     // reject it here so it is not called Faithful.
-    let body = control_body(code);
+    let body = lexed.control_body();
     if control_body_is_unrenderable(&body) {
+        return false;
+    }
+    // Every control character must be one both formatters render the same way: the five this module
+    // models, or a bare literal IronCalc's lexer accepts (see [`is_renderable_literal`] — anything
+    // else makes the *cell* show `#VALUE!`).
+    if !body.chars().all(is_renderable_control) {
         return false;
     }
     let Some(spec) = FormatSpec::parse(code) else {
         return false;
     };
-    // The numeric run must be *only* placeholders, grouping commas and one decimal separator.
-    // Anything else in it (a space, a `%`, a stray letter) is a literal IronCalc renders **in
-    // place**, inside the digits, which the applier cannot do — it only carries a prefix and a
-    // suffix. `%0` was the case that mattered: a leading percent sign.
-    let (Some(first), Some(last)) = (body.find(['0', '#']), body.rfind(['0', '#'])) else {
+    // The numeric run must be *only* control placeholders, grouping commas and one decimal
+    // separator. Anything else in it — a space, a `%`, a stray letter, or a **literal** character
+    // from a quoted string or a `\`-escape — is text IronCalc renders **in place**, inside the
+    // digits, which the applier cannot do: it only carries a prefix and a suffix. `%0` was the case
+    // that mattered first (a leading percent sign); `0"0"` and `0" (0)"` are the round-4 ones, where
+    // the applier consumed a *literal* `0` as the run's last placeholder and rendered `01` / `07)`
+    // beside cells reading `10` / `7 (0)`.
+    let (Some(first), Some(last)) = (lexed.first_placeholder(), lexed.last_placeholder()) else {
         return false;
     };
-    let run = &body[first..=last];
-    if run.chars().any(|c| !matches!(c, '0' | '#' | ',' | '.')) {
+    let run = &lexed.toks[first..=last];
+    if run
+        .iter()
+        .any(|t| !t.control || !matches!(t.ch, '0' | '#' | ',' | '.'))
+    {
         return false;
     }
+    let run: String = run.iter().map(|t| t.ch).collect();
     if run.matches('.').count() > 1 {
         return false;
     }
     let (integer_run, fractional_run) = match run.split_once('.') {
         Some((int_run, frac)) => (int_run, frac),
-        None => (run, ""),
+        None => (run.as_str(), ""),
     };
     // A comma inside the fractional run is not grouping and not a scale; nothing renders it.
     if fractional_run.contains(',') {
+        return false;
+    }
+    // Grouping is what a comma does only **between two digit placeholders** — that is IronCalc's
+    // own rule (`use_thousands = last_token_is_digit && next_token_is_digit`, `parser.rs`) and
+    // Excel's. Anywhere else inside the run it is another ÷1000 scaling comma the applier ignores:
+    // `#,,##0` on 1 shows `0` in the cell (scaled twice) and `1` on the axis.
+    if !comma_positions_are_grouping(integer_run) {
         return false;
     }
     // Without an integer placeholder IronCalc never emits the minus sign at all (it hangs the sign
@@ -200,6 +228,18 @@ pub fn renders_faithfully(code: &str) -> bool {
 /// placeholders followed by zero or more required `0` placeholders — the shape whose required
 /// digits are expressible as a **minimum integer width**. `#,##0`, `#,#00`, `000` and `###` all
 /// qualify; `0#0` and `00#` do not (their required digits are positional).
+/// Whether every comma in an integer digit run sits **between two digit placeholders** — the only
+/// position in which a comma is a thousands separator rather than a ÷1000 scale.
+fn comma_positions_are_grouping(integer_run: &str) -> bool {
+    let chars: Vec<char> = integer_run.chars().collect();
+    chars.iter().enumerate().all(|(i, c)| {
+        *c != ','
+            || (i > 0
+                && matches!(chars[i - 1], '0' | '#')
+                && matches!(chars.get(i + 1), Some('0' | '#')))
+    })
+}
+
 fn integer_run_shape_is_hash_then_zero(integer_run: &str) -> bool {
     let mut seen_required = false;
     for c in integer_run.chars() {
@@ -212,44 +252,228 @@ fn integer_run_shape_is_hash_then_zero(integer_run: &str) -> bool {
     true
 }
 
-/// The format's "control body" — the code with bracket tokens (`[…]`), quoted literals (`"…"`) and
-/// `\`-escapes removed, leaving only the characters that act as *format controls*.
+/// One character of a format code, tagged with whether it acts as a **format control** (a digit
+/// placeholder, a separator, the percent sign, a bare literal character) or as **literal text** (a
+/// character that came out of a `"…"` string, a `\`-escape, or the symbol of a `[$…]` currency
+/// token).
+#[derive(Clone, Copy, PartialEq)]
+struct Tok {
+    ch: char,
+    control: bool,
+}
+
+/// A `[…]` token's inner text, plus whether any *text-producing* content preceded it (a colour
+/// token emits nothing, so `[Red][$€-407]0` still has the currency at the head of the string).
+struct BracketToken {
+    body: String,
+    preceded_by_text: bool,
+}
+
+/// A format code split into control characters, literal characters and bracket tokens — the
+/// **single** reading of the code that every check and the applier share.
 ///
-/// Every check that asks "does this code contain the control character X?" must run on this string,
-/// never on the raw code: `0" %"` and `0\%` carry a **literal** percent sign (an
-/// already-in-percent-units number, a standard Excel idiom), and treating it as the percent control
-/// scaled the value by 100 with no badge. That bug existed because `control_body_is_unrenderable`
-/// stripped literals and `FormatSpec::parse`'s `contains('%')` did not — two functions disagreeing
-/// about the same character. There is one stripper now, and both callers use it.
-fn control_body(code: &str) -> String {
-    let mut body = String::new();
+/// [`renders_faithfully`] and [`FormatSpec::parse`] used to locate the numeric run independently,
+/// on two *different* strings: the predicate on the control body (quotes, brackets and `\`-escapes
+/// stripped) and the parser on a string that still contained them. So a `0`/`#`/`,`/`.` inside a
+/// quoted literal or behind a `\` was invisible to the predicate and consumed as a digit
+/// placeholder by the applier — `\#0` on 7 rendered `7` beside a cell reading `#7`, `"Item #"0`
+/// rendered `Item 7` beside `Item #7`, `0" of 100"` rendered `007` beside `7 of 100`, and every one
+/// of them was classified Faithful and drawn without a badge. The round-3 fix had made the two
+/// functions agree about `%` only; they agree about **every character** now, because there is one
+/// reading and both take their positions from it.
+struct Lexed {
+    toks: Vec<Tok>,
+    brackets: Vec<BracketToken>,
+    /// An unterminated `[` or `"`. IronCalc's lexer errors on it (`#VALUE!` in the cell), so a code
+    /// carrying one is never faithful.
+    malformed: bool,
+}
+
+/// Split `code` into [`Tok`]s: bracket tokens are consumed (a `[$sym-locale]` contributing its
+/// symbol as literal text, anything else contributing nothing), `"…"` contents and `\`-escaped
+/// characters become literal text, and every remaining character is a control.
+fn lex(code: &str) -> Lexed {
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut brackets = Vec::new();
+    let mut malformed = false;
     let mut chars = code.chars();
     while let Some(c) = chars.next() {
         match c {
-            // Skip a bracket token ([Red], [$-409], …) — brackets don't nest in a number format.
+            // A bracket token ([Red], [>=100], [$-409], …) — brackets don't nest in a number format.
             '[' => {
+                let preceded_by_text = !toks.is_empty();
+                let mut body = String::new();
+                let mut closed = false;
                 for bracket_char in chars.by_ref() {
                     if bracket_char == ']' {
+                        closed = true;
                         break;
                     }
+                    body.push(bracket_char);
                 }
+                malformed |= !closed;
+                // `[$€-407]` keeps its symbol (the text before the locale separator) as literal
+                // text; every other bracket token (colour, condition, elapsed time) emits nothing.
+                if let Some(sym) = body.strip_prefix('$') {
+                    for sym_char in sym.split('-').next().unwrap_or("").chars() {
+                        toks.push(Tok {
+                            ch: sym_char,
+                            control: false,
+                        });
+                    }
+                }
+                brackets.push(BracketToken {
+                    body,
+                    preceded_by_text,
+                });
             }
-            // Skip a quoted literal — its characters are literal text, not format controls.
+            // A quoted literal — its characters are literal text, not format controls.
             '"' => {
+                let mut closed = false;
                 for quote_char in chars.by_ref() {
                     if quote_char == '"' {
+                        closed = true;
                         break;
+                    }
+                    toks.push(Tok {
+                        ch: quote_char,
+                        control: false,
+                    });
+                }
+                malformed |= !closed;
+            }
+            // The escaped character is a literal.
+            '\\' => match chars.next() {
+                Some(escaped) => toks.push(Tok {
+                    ch: escaped,
+                    control: false,
+                }),
+                None => malformed = true,
+            },
+            _ => toks.push(Tok {
+                ch: c,
+                control: true,
+            }),
+        }
+    }
+    Lexed {
+        toks,
+        brackets,
+        malformed,
+    }
+}
+
+impl Lexed {
+    /// The format's "control body" — only the characters that act as *format controls*.
+    ///
+    /// Every check that asks "does this code contain the control character X?" runs on this string,
+    /// never on the raw code: `0" %"` and `0\%` carry a **literal** percent sign (an
+    /// already-in-percent-units number, a standard Excel idiom), and treating it as the percent
+    /// control scaled the value by 100 with no badge.
+    fn control_body(&self) -> String {
+        self.toks
+            .iter()
+            .filter(|t| t.control)
+            .map(|t| t.ch)
+            .collect()
+    }
+
+    /// Index into [`Self::toks`] of the first / last **control** digit placeholder — the ends of
+    /// the numeric run. A `0`/`#` that is literal text is not a placeholder.
+    fn first_placeholder(&self) -> Option<usize> {
+        self.toks.iter().position(Tok::is_placeholder)
+    }
+
+    fn last_placeholder(&self) -> Option<usize> {
+        self.toks.iter().rposition(Tok::is_placeholder)
+    }
+
+    /// Whether every `[…]` token is one both formatters render identically: a **head-position**,
+    /// single-symbol `[$…]` currency (IronCalc hoists the symbol to the front of the string, and
+    /// its lexer reads exactly one symbol character), or one of the seven plain colour names its
+    /// lexer accepts — which emit no text at all, so both sides render the same number.
+    ///
+    /// Everything else is rejected: a condition (`[>=100]`) selects a format by value; elapsed time
+    /// (`[h]`, `[mm]`) is a duration format; and `[DBNum1]`, `[Color 5]`, `[t]` … are outright lexer
+    /// **errors** — the cell shows `#VALUE!` while the applier happily renders a number. All three
+    /// were accepted before, unbadged.
+    fn brackets_are_renderable(&self) -> bool {
+        /// The colour names `formatter::lexer::consume_color` accepts, case-insensitively. The
+        /// `[Color N]` spelling is deliberately **not** accepted: its lexer arm is case-sensitive
+        /// (`chars.starts_with("Color")`) so `[color 5]` is a hard error, and the distinction is
+        /// not one this crate should be reproducing.
+        const COLOR_NAMES: &[&str] = &[
+            "black", "white", "red", "green", "blue", "yellow", "magenta",
+        ];
+        let mut currency_seen = false;
+        for bracket in &self.brackets {
+            match bracket.body.strip_prefix('$') {
+                Some(sym) => {
+                    let symbol = sym.split('-').next().unwrap_or("");
+                    if bracket.preceded_by_text
+                        || currency_seen
+                        || symbol.chars().count() != 1
+                        || !is_renderable_literal(symbol.chars().next().unwrap_or('\0'))
+                    {
+                        return false;
+                    }
+                    currency_seen = true;
+                }
+                None => {
+                    let lowered = bracket.body.to_ascii_lowercase();
+                    if !COLOR_NAMES.contains(&lowered.as_str()) {
+                        return false;
                     }
                 }
             }
-            // Skip the escaped character (a literal).
-            '\\' => {
-                chars.next();
-            }
-            _ => body.push(c),
         }
+        true
     }
-    body
+}
+
+impl Tok {
+    fn is_placeholder(&self) -> bool {
+        self.control && matches!(self.ch, '0' | '#')
+    }
+}
+
+/// Whether a **control** character is one the applier and IronCalc render identically.
+///
+/// `0`/`#`/`,`/`.`/`%` are the controls this module models. Everything else in a format code that
+/// is not quoted, escaped or bracketed has to be a character IronCalc's lexer accepts as
+/// `Token::Literal` — its arm is an explicit list (`formatter/lexer.rs`), and a character outside
+/// it is a lexer **error**: `0°`, `0£`, `0¥`, `0µ`, `0×`, `0¤`, `0\t` all make the cell show
+/// `#VALUE!` while the applier renders `7°`, `7£`, … Here **chart-model is the correct side** — a
+/// currency suffix is a perfectly ordinary format — so this is a *narrowing* (the chart is badged),
+/// not a change to what the applier prints.
+///
+/// `/` and `:` are held out of the list even though the lexer calls them literals: `/` is the
+/// fraction separator the parser rejects outright, and `:` flips IronCalc's section to a **time**
+/// format.
+fn is_renderable_literal(c: char) -> bool {
+    matches!(
+        c,
+        '$' | '€'
+            | '('
+            | ')'
+            | '+'
+            | '-'
+            | '^'
+            | '\''
+            | '{'
+            | '}'
+            | '<'
+            | '='
+            | '!'
+            | '~'
+            | '>'
+            | ' '
+    )
+}
+
+/// Whether a control character is either a modelled control or a renderable bare literal.
+fn is_renderable_control(c: char) -> bool {
+    matches!(c, '0' | '#' | ',' | '.' | '%') || is_renderable_literal(c)
 }
 
 /// Whether a [`control_body`] carries a construct [`apply_number_format`] does **not** render
@@ -319,38 +543,17 @@ impl FormatSpec {
     /// Parse one format section into a [`FormatSpec`], or `None` if it contains a construct outside
     /// the supported subset (scientific / date / fraction), signalling the caller to fall back.
     fn parse(section: &str) -> Option<Self> {
-        // Strip bracket tokens ([Red], [>=100], [$-409], …): color/condition/locale hints we don't
-        // apply. A `[$sym-locale]` currency token keeps its symbol (the text before the `-`).
-        let mut cleaned = String::new();
-        let mut chars = section.chars().peekable();
-        while let Some(&c) = chars.peek() {
-            if c == '[' {
-                let mut token = String::new();
-                chars.next();
-                for tc in chars.by_ref() {
-                    if tc == ']' {
-                        break;
-                    }
-                    token.push(tc);
-                }
-                if let Some(sym) = token.strip_prefix('$') {
-                    // [$€-407] → keep "€" (currency symbol up to the locale separator).
-                    cleaned.push_str(sym.split('-').next().unwrap_or(""));
-                }
-            } else {
-                cleaned.push(c);
-                chars.next();
-            }
-        }
+        // ONE reading of the code, shared with `renders_faithfully` (see [`Lexed`]). Every position
+        // below is an index into `lexed.toks`, so a `0`/`#`/`,`/`.` that came out of a quoted
+        // string, a `\`-escape or a `[$…]` currency token is literal TEXT here exactly as it is
+        // there — it can no longer be silently consumed as a digit placeholder.
+        let lexed = lex(section);
+        let control = lexed.control_body();
 
-        // Scientific / fraction are out of the P6 subset → fall back to general.
-        let lower = cleaned.to_ascii_lowercase();
-        if lower.contains("e+") || lower.contains("e-") || cleaned.contains('/') {
-            return None;
-        }
-        // A date/time code has no digit placeholder to drive; general handles it more sensibly.
-        let has_placeholder = cleaned.contains('0') || cleaned.contains('#');
-        if !has_placeholder {
+        // Scientific / fraction are out of the P6 subset → fall back to general. Read off the
+        // CONTROL body: `0" E+"` and `0\/` carry literal text, not an exponent or a fraction bar.
+        let lower = control.to_ascii_lowercase();
+        if lower.contains("e+") || lower.contains("e-") || control.contains('/') {
             return None;
         }
 
@@ -358,16 +561,17 @@ impl FormatSpec {
         // literal text, not the percent control. Counting it on the raw section is what made
         // `0" %"` (12.5 → `1250 %`) and `0\%` (1 → `100%`) scale by 100 against cells reading
         // `12 %` and `1%`.
-        let percent_scale = control_body(section).matches('%').count() as i32;
-        let placeholders = "0#";
+        let percent_scale = control.matches('%').count() as i32;
 
-        // The numeric run spans the first to the last digit placeholder.
-        let first = cleaned.find(|c| placeholders.contains(c))?;
-        let last = cleaned.rfind(|c| placeholders.contains(c))?;
-        let numeric = &cleaned[first..=last];
-        let grouping = numeric.contains(',');
-        let (integer_run, fractional_run) = match numeric.split_once('.') {
-            Some((int_run, frac)) => (int_run, Some(frac)),
+        // The numeric run spans the first to the last **control** digit placeholder. A code with
+        // none of those (a date/time code) has no digits to drive; general handles it more sensibly.
+        let first = lexed.first_placeholder()?;
+        let last = lexed.last_placeholder()?;
+        let numeric = &lexed.toks[first..=last];
+        let grouping = numeric.iter().any(|t| t.control && t.ch == ',');
+        let dot = numeric.iter().position(|t| t.control && t.ch == '.');
+        let (integer_run, fractional_run) = match dot {
+            Some(i) => (&numeric[..i], Some(&numeric[i + 1..])),
             None => (numeric, None),
         };
         // `0` is a REQUIRED digit, `#` an OPTIONAL one (ECMA-376 §18.8.31). Counting them
@@ -376,20 +580,25 @@ impl FormatSpec {
         // KINDS drive which of the rounded fraction's trailing zeros survive.
         let decimal_point = fractional_run.is_some();
         let fraction_kinds: Vec<char> = fractional_run
-            .unwrap_or("")
-            .chars()
-            .filter(|c| placeholders.contains(*c))
+            .unwrap_or(&[])
+            .iter()
+            .filter(|t| t.is_placeholder())
+            .map(|t| t.ch)
             .collect();
         let decimals = fraction_kinds.len();
         // Each required `0` in the integer run is a digit that must be printed even when the value
         // has none there, so the integer part is left-padded to that width (`000` on 7 → `007`).
         // Zero of them (an all-`#` run) suppresses a zero integer part entirely, the way Excel does.
-        let min_integer_digits = integer_run.chars().filter(|c| *c == '0').count();
+        let min_integer_digits = integer_run
+            .iter()
+            .filter(|t| t.control && t.ch == '0')
+            .count();
 
-        // Prefix / suffix are the literal text around the numeric run, minus quotes and escapes.
-        // A `%` SURVIVES: it is rendered where it stands (see `percent_scale`).
-        let prefix = literal(&cleaned[..first]);
-        let suffix = literal(&cleaned[last + 1..]);
+        // Prefix / suffix are the literal text around the numeric run: literal characters verbatim,
+        // control characters minus the placeholder punctuation (`0 # , . ?`). A `%` SURVIVES: it is
+        // rendered where it stands (see `percent_scale`).
+        let prefix = literal(&lexed.toks[..first]);
+        let suffix = literal(&lexed.toks[last + 1..]);
 
         Some(Self {
             prefix,
@@ -404,33 +613,19 @@ impl FormatSpec {
     }
 }
 
-/// Extract the literal text from a format fragment: unwrap `"…"` quotes, honor `\x` escapes, and
-/// drop the format placeholder punctuation (`0 # , .`) so only genuine literal characters (a
-/// currency symbol, a unit, a percent sign) survive. `%` is **kept** — it is a literal that also
-/// scales the value, and it renders in the position it was written (`%0` → `%100`).
-fn literal(fragment: &str) -> String {
-    let mut out = String::new();
-    let mut chars = fragment.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                for qc in chars.by_ref() {
-                    if qc == '"' {
-                        break;
-                    }
-                    out.push(qc);
-                }
-            }
-            '\\' => {
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            }
-            '0' | '#' | ',' | '.' | '?' => {}
-            _ => out.push(c),
-        }
-    }
-    out
+/// The literal text a run of [`Tok`]s renders: literal characters verbatim (they came from a `"…"`
+/// string, a `\`-escape or a `[$…]` currency symbol), control characters minus the placeholder
+/// punctuation (`0 # , . ?`), which renders nothing outside the numeric run.
+///
+/// `%` is **kept** — it is a literal that also scales the value, and it renders in the position it
+/// was written (`%0` → `%100`). A literal `#` or `0` is kept too, which is the round-4 fix: `\#0`
+/// on 7 must render `#7`, not `7`.
+fn literal(fragment: &[Tok]) -> String {
+    fragment
+        .iter()
+        .filter(|t| !t.control || !matches!(t.ch, '0' | '#' | ',' | '.' | '?'))
+        .map(|t| t.ch)
+        .collect()
 }
 
 /// Format a non-negative magnitude under `spec`: round to `spec.decimals` places, drop the
@@ -554,6 +749,99 @@ mod tests {
         // …and the real percent control still scales when it is not quoted.
         assert_eq!(apply_number_format("0\\%", 1.0), "1%");
         assert_eq!(apply_number_format("0%", 1.0), "100%");
+    }
+
+    /// A `0`/`#`/`,`/`.` inside a **quoted literal** or behind a `\` is literal TEXT, not a digit
+    /// placeholder. The predicate located the numeric run on the stripped control body while the
+    /// parser located it on a string that still carried quotes and escapes, so the applier consumed
+    /// these as placeholders and rendered `007` / `7` / `Item 7` / `01` where the cells read
+    /// `7 of 100` / `#7` / `Item #7` / `10` — every one of them classified Faithful, unbadged.
+    /// `\#0` and `"Item #"0` are standard Excel idioms.
+    #[test]
+    fn a_placeholder_inside_a_literal_is_text_not_a_placeholder() {
+        assert_eq!(apply_number_format("0\" of 100\"", 7.0), "7 of 100");
+        assert_eq!(apply_number_format("0\\#", 7.0), "7#");
+        assert_eq!(apply_number_format("\\#0", 7.0), "#7");
+        assert_eq!(apply_number_format("\"Item #\"0", 7.0), "Item #7");
+        assert_eq!(apply_number_format("#,##0\" #\"", 1234.5), "1,234 #");
+        assert_eq!(apply_number_format("0\" (0)\"", 7.0), "7 (0)");
+        assert_eq!(apply_number_format("0\"0\"", 1.0), "10");
+        assert_eq!(apply_number_format("0.0%\" #\"", 0.0), "0.0% #");
+        assert_eq!(apply_number_format("\"0\"0", 1.0), "01");
+        assert_eq!(apply_number_format("0\",\"", 1.0), "1,");
+        // …and all of them are still inside the faithful subset, because they now agree.
+        for code in [
+            "0\" of 100\"",
+            "\\#0",
+            "\"Item #\"0",
+            "#,##0\" #\"",
+            "0\"0\"",
+            "0.0%\" #\"",
+        ] {
+            assert!(
+                renders_faithfully(code),
+                "{code:?} should render faithfully"
+            );
+        }
+    }
+
+    /// A **bracket token** is only faithful when IronCalc's lexer reads it the same way: a
+    /// head-position single-symbol `[$…]` currency, or one of the seven plain colour names. Elapsed
+    /// time (`[h]`), `[DBNum1]` and `[color 5]` are lexer **errors** — the cell shows `#VALUE!`
+    /// while the applier rendered a plain number, unbadged.
+    #[test]
+    fn renders_faithfully_rejects_bracket_tokens_the_cell_rejects() {
+        for code in ["[Red]0", "[red]0", "[Blue]0", "[Black]0", "[$€-407]#,##0"] {
+            assert!(
+                renders_faithfully(code),
+                "{code:?} should render faithfully"
+            );
+        }
+        for code in [
+            "[h]0",
+            "[mm]0",
+            "[DBNum1]#,##0",
+            "[color 5]0.00",
+            "[Color 5]0.00",
+            "[t]0",
+            "[>=100]0",
+            "[$0",
+            "0\"unterminated",
+        ] {
+            assert!(!renders_faithfully(code), "{code:?} should NOT be faithful");
+        }
+    }
+
+    /// A **bare literal character** is only faithful when IronCalc's lexer accepts it as
+    /// `Token::Literal` — its arm is an explicit list. `0°`, `0£`, `0¥`, `0µ`, `0×`, `0¤` and a bare
+    /// tab all make the *cell* show `#VALUE!` while the applier renders `7°`, `7£`, … Here
+    /// chart-model is the correct side, so these are badged, not "fixed".
+    #[test]
+    fn renders_faithfully_rejects_bare_literals_the_cell_lexer_rejects() {
+        for code in ["0$", "$0", "0€", "0(", "0)", "0+", "0-", "-0", "0 ", "0>"] {
+            assert!(
+                renders_faithfully(code),
+                "{code:?} should render faithfully"
+            );
+        }
+        for code in [
+            "0°", "0£", "0¥", "0µ", "0×", "0¤", "0\t", "0k", "0z", "0m", "0/", "0:",
+        ] {
+            assert!(!renders_faithfully(code), "{code:?} should NOT be faithful");
+        }
+    }
+
+    /// A comma is a thousands separator **only between two digit placeholders** — IronCalc's own
+    /// rule (`use_thousands = last_token_is_digit && next_token_is_digit`) and Excel's. Anywhere
+    /// else inside the run it is another ÷1000 scale the applier ignores: `#,,##0` on 1 shows `0` in
+    /// the cell and `1` on the axis.
+    #[test]
+    fn renders_faithfully_rejects_a_comma_that_is_not_grouping() {
+        assert!(renders_faithfully("#,##0"));
+        assert!(renders_faithfully("#,#,#0"));
+        for code in ["#,,##0", "#,,#0", "0,,0", "#,.0"] {
+            assert!(!renders_faithfully(code), "{code:?} should NOT be faithful");
+        }
     }
 
     /// Required (`0`) integer placeholders are a **minimum width**: `000` zero-pads to three digits

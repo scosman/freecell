@@ -110,15 +110,51 @@ fn every_theme_slot_is_either_a_fill_swatch_or_a_declared_non_swatch() {
              says it has none",
         );
     }
-    // `ThemeSlot::ALL` must itself be complete for this sweep to mean anything: no repeats, and one
-    // entry per slot the classification knows about.
+    // `ThemeSlot::ALL` must itself be complete for this sweep to mean anything. A duplicate check
+    // alone does not get there: `ALL` is a fixed-size array literal, so a 13th variant compiles
+    // beside it and is silently never swept. The check is a **density** one against
+    // `ThemeSlot::index` — a wildcard-free `match` owned by `chart-model`, which a new variant
+    // cannot compile past without being given an index:
+    //
+    //   * every slot in `ALL` sits at its own index (injective, and in index order), and
+    //   * `ALL` is exactly as long as the largest index it holds, so there is no gap and no tail
+    //     the array stops short of.
+    //
+    // Verified by adding a 13th variant locally: `chart-model` stops compiling at
+    // `ThemeSlot::index`, and this file stops compiling at `is_ui_fill_swatch` above.
+    // **What it still does not prove** is exhaustiveness — an author who gives the new variant an
+    // index and forgets `ALL` gets a green build. Rust cannot enumerate a foreign enum without
+    // `variant_count` (unstable) or a macro that defines the enum, and moving `ThemeSlot`'s
+    // definition behind a macro is outside this unit's scope. The compile break is the trip-wire;
+    // this is the consistency check behind it. Recorded rather than papered over
+    // (`phase_6.md` Round 4).
     for (i, slot) in ThemeSlot::ALL.iter().enumerate() {
-        assert!(
-            !ThemeSlot::ALL[..i].contains(slot),
-            "{slot:?} appears twice in ThemeSlot::ALL — the sweep below would then skip whichever \
-             slot was displaced",
+        assert_eq!(
+            slot.index(),
+            i,
+            "ThemeSlot::ALL[{i}] is {slot:?}, whose index() is {} — ALL must be dense and in index \
+             order, or the sweep below skips whichever slot was displaced",
+            slot.index(),
+        );
+        assert_eq!(
+            ThemeSlot::ALL[slot.index()],
+            *slot,
+            "ThemeSlot::ALL[{}] does not round-trip to {slot:?}",
+            slot.index(),
         );
     }
+    let max_index = ThemeSlot::ALL
+        .iter()
+        .map(|slot| slot.index())
+        .max()
+        .expect("ThemeSlot::ALL is non-empty");
+    assert_eq!(
+        ThemeSlot::ALL.len(),
+        max_index + 1,
+        "ThemeSlot::ALL holds {} slots but its largest index is {max_index} — a slot was given an \
+         index the array is not long enough to hold, or the array carries a gap",
+        ThemeSlot::ALL.len(),
+    );
     for slot in ThemeSlot::ALL {
         assert_eq!(
             is_ui_fill_swatch(slot),

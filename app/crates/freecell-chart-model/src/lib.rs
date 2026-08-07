@@ -82,7 +82,48 @@ impl ThemeSlot {
         ThemeSlot::Hyperlink,
         ThemeSlot::FollowedHyperlink,
     ];
+
+    /// This slot's position in [`Self::ALL`].
+    ///
+    /// The `match` is **wildcard-free**, so a new variant does not compile until it is given an
+    /// index here — and the const block below then requires `ALL` to actually *hold* it at that
+    /// index. `ALL` on its own is a fixed-size array literal: a 13th variant compiles fine beside
+    /// it and is silently never swept, which is what this pairing is for.
+    ///
+    /// **What it proves, and what it does not.** It proves `ALL` is duplicate-free, dense and in
+    /// index order, and that no variant can be added without an author editing this file. It does
+    /// **not** prove `ALL` is exhaustive: an author who adds an arm here and does not extend `ALL`
+    /// still gets a green build. Rust cannot enumerate a foreign enum without `variant_count`
+    /// (unstable) or a macro that defines the enum itself, so exhaustiveness rests on the compile
+    /// break plus this note, not on a proof (`phase_6.md` Round 4).
+    pub const fn index(self) -> usize {
+        match self {
+            ThemeSlot::Dark1 => 0,
+            ThemeSlot::Light1 => 1,
+            ThemeSlot::Dark2 => 2,
+            ThemeSlot::Light2 => 3,
+            ThemeSlot::Accent1 => 4,
+            ThemeSlot::Accent2 => 5,
+            ThemeSlot::Accent3 => 6,
+            ThemeSlot::Accent4 => 7,
+            ThemeSlot::Accent5 => 8,
+            ThemeSlot::Accent6 => 9,
+            ThemeSlot::Hyperlink => 10,
+            ThemeSlot::FollowedHyperlink => 11,
+        }
+    }
 }
+
+/// [`ThemeSlot::ALL`] is dense and ordered with respect to [`ThemeSlot::index`] — checked at
+/// **compile time**, so a reordering, a duplicate or a gap is a build failure rather than a test
+/// failure someone has to remember to run. (Verified by swapping two entries: `error[E0080]`.)
+const _: () = {
+    let mut i = 0;
+    while i < ThemeSlot::ALL.len() {
+        assert!(ThemeSlot::ALL[i].index() == i);
+        i += 1;
+    }
+};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
 ///

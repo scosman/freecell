@@ -1,8 +1,11 @@
 # Phase 6 — F3a: chart-axis / cell number-format and colour agreement
 
-> **This record was rewritten on 2026-07-28 after code review, and again after a second and a third
-> review round.** Round 3's findings are in the **Round 3** section at the end; where they
-> contradict the text above, the later section wins and says so.
+> **This record was rewritten on 2026-07-28 after code review, and again after a second, third and
+> fourth review round.** Each round's findings are in its own section at the end; where a later
+> section contradicts the text above, the later section wins and says so. Round 4 retracts a claim
+> made in Round 3 (that the E7 carve-out could not hide a chart-side presentation bug) and corrects
+> Round 3's headline (which was true of the *generated* space, not of the predicate's *accepted*
+> space) — both inline, at the sentences concerned.
 > The first version's headline was
 > *"mostly DISPROVED as stated — every divergence is IronCalc's, not chart-model's."* **That
 > conclusion was false.** It was produced by a test whose carve-outs were too broad and whose corpus
@@ -304,6 +307,18 @@ asked for and did not have.
 After the fixes and the narrowings: **0 unexplained disagreements** over the whole generated space
 (and 0 over the grounded corpus), with only the E6 and E7 carve-outs firing.
 
+> **Round-4 correction to the sentence above.** "The whole generated space" is **not** "the
+> predicate's accepted space", and the invariant quantifies over the second. The round-3 generator's
+> affix axis was `{"", "$", "\$", "\" kg\"", "[$€-407]", "\"USD \""}` — no placeholder character, no
+> non-`$` bracket token, no bare literal, no doubled separator — so an entire class of
+> accepted-and-divergent codes was unreachable *by construction*, and round 4 found seven divergent
+> shapes inside it (607 of 767 sampled codes disagreed). This is round 2's "corpus with a hole in it"
+> one level up: the hole moved from the list of codes to the list of axes. **Residual scope, stated
+> rather than totalled:** the corpus is now a sample over more axes, and a sample over axes is a
+> sampling strategy, not a proof. What can be said is that every disagreement reachable from
+> *these* axes is resolved; what cannot be said is that no accepted code disagrees. Three rounds of
+> confident totals were retracted; this one is not offered.
+
 ### The `#` claim, corrected
 
 Round 2 called the `#` remedy "provably right rather than corpus-fitted". Probing 28 `#`-family codes
@@ -329,6 +344,17 @@ only when the reconstruction reproduces the cell **byte for byte**. Because the 
 rendered through `chart-model` itself, it can only match when `chart-model`'s presentation is already
 identical to IronCalc's and the rounding is the sole difference — so a chart-side presentation bug
 makes the carve-out *stop* firing and the gate fail. It cannot fire at all for `|v| >= 1`.
+
+> **RETRACTED in round 4.** The clause "a chart-side presentation bug makes the carve-out stop firing
+> and the gate fail" was asserted here, in `numfmt_agreement.rs` twice and in `GAPS.md` E7, and it is
+> **false for sign suppression** — the one presentation bug the carve-out was written not to hide.
+> Measured, not argued: re-introducing round 2's exact defect (`if scaled < 0.0` without
+> `has_significant_digit`) on the round-3 tree left **all six tests green** and moved the census
+> `211156 agree / 8008 E7` → `204732 / 14432`, i.e. 6 424 pairs absorbed, comfortably under the
+> `total/4` runaway guard. Mechanism: the reconstruction renders the *positive* predicted magnitude
+> and the negative fallback renders `-predicted`, which for the whole lost-carry class is `-0.0` —
+> and `-0.0 < 0.0` is `false`, so the defective branch is never reached. The claim is now **enforced
+> instead of asserted**; see Round 4 below.
 Representative values (`0.855`, `0.0495`, `-0.8745`, `-0.98765`) are in `VALUES` so the predicate is
 forced to stay honest, alongside the E6 thresholds (`1.5`, `0.105`, `0.01005`, `-0.0101`).
 
@@ -375,3 +401,202 @@ beyond the single trailing `0`, four integer digit tokens (so the E8 narrowing d
 no literal `%`; `"0%"` has a single trailing percent control, which renders in the same position
 before and after the change. Neither reaches any changed behaviour, so no baseline can move and the
 pixel subset was not run.
+
+## Round 4 — the two functions now read the code the same way, and the carve-out is enforced
+
+A fourth review found three Criticals, three Moderates and a Mild. **Every one of them reproduced
+exactly as reported** — nothing in this round is a disproof, which is itself worth recording after
+three rounds in which a confident claim was retracted each time. What changed structurally is that
+two of the findings were *about the previous round's fixes* rather than about new format families:
+the round-3 corpus could not reach the space it claimed to cover, and the round-3 carve-out's safety
+argument was false.
+
+### Critical 1 — a placeholder inside a literal (`\#0`, `"Item #"0`) — **CONFIRMED, fixed**
+
+`renders_faithfully` located the numeric run on `control_body(code)` (quotes, brackets and
+`\`-escapes **stripped**) while `FormatSpec::parse` located it on `cleaned`, which **retained** them.
+So a `0`/`#`/`,`/`.` inside a quoted literal or behind a `\` was invisible to the predicate and
+consumed as a digit placeholder by the applier. Round 3 had made the two agree about `%` only.
+
+Reproduced verbatim, all with `renders_faithfully == true` and therefore no ⚠ badge:
+
+| code | value | chart (before) | cell |
+|---|---|---|---|
+| `0" of 100"` | 7 | `007` | `7 of 100` |
+| `\#0` | 7 | `7` | `#7` |
+| `"Item #"0` | 7 | `Item 7` | `Item #7` |
+| `#,##0" #"` | 1234.5 | `1,234` | `1,234 #` |
+| `0" (0)"` | 7 | `07)` | `7 (0)` |
+| `0"0"` | 1 | `01` | `10` |
+| `0.0%" #"` | 0 | `0.0` | `0.0% #` |
+
+**Fix: one reading of the code, shared.** `numfmt.rs` gained `lex()` → `Lexed`, which splits a format
+code into `Tok { ch, control }` — control characters, literal characters (from `"…"`, `\x`, and a
+`[$…]` symbol) and the bracket tokens. `control_body`, the placeholder positions, the numeric run,
+the percent scale, the prefix and the suffix all now come from that one structure, so the predicate
+and the applier agree about **every** character rather than about `%`. Literal text is emitted as
+literal text: `\#0` on 7 is `#7`, `0"0"` on 1 is `10`.
+
+The general shape of the bug is worth more than the fix: **two functions deriving the same positions
+from two different strings**. That is the third time this module has produced a defect of exactly
+that form (`%` in a literal was the second). There is one stripper and one position source now.
+
+### Critical 2 — the corpus did not cover the predicate's accepted space — **CONFIRMED, widened**
+
+`AFFIX_FORMS` was `{"", "$", "\$", "\" kg\"", "[$€-407]", "\"USD \""}` — no `0`/`#`/`,`/`.`, no
+non-`$` bracket token, no bare literal, no doubled separator — so Critical 1's whole class was
+unreachable *by construction*. The round-3 headline was true of the generated space and false of the
+accepted space. The Round-3 section above now carries that correction inline.
+
+**Widened by axis, not by code.** Three new axes plus one extension:
+
+| Axis | What it sweeps | What it caught |
+|---|---|---|
+| `LITERAL_AFFIXES` (14) | quoted / escaped literals containing `0`, `#`, `,`, `.` — `"Item #"`, `" of 100"`, `\#`, `"0"` … | Critical 1's whole class |
+| `BRACKET_TOKENS` (20) | colours in both cases, `[Color N]` in both spellings, currency, elapsed time, `[DBNum1]`, conditions, `[t]` | `[h]0`, `[DBNum1]#,##0`, `[color 5]0.00` → cell `#VALUE!`, chart a number |
+| `BARE_LITERALS` (31) | every character in IronCalc's `Token::Literal` list, plus ones outside it (`°£¥µ×¤`, tab, letters) | `0°`, `0£`, `0¥`, `0µ`, `0×`, `0¤`, `0\t` → cell `#VALUE!`; and `-0` / `0-` / `$-0`, the sign-bearing literals |
+| `INTEGER_RUNS` (+6) | non-grouping comma placements — `#,,##0`, `0,,0`, `#,##,##0` | `#,,##0` on 1 → chart `1`, cell `0` (IronCalc scales by 1000 per non-grouping comma) |
+
+Each family placed in **both** positions (before and after the digits), because position is what
+several of the divergences turn on. Corpus: 9 360 → **14 850** codes, **224 400 → 265 860** asserted
+pairs.
+
+Resolutions, one per family — and note that on **every** round-4 family chart-model is the correct
+side, so all four are predicate narrowings (badges), not chart changes:
+
+- **Bracket tokens.** `renders_faithfully` now accepts only a *head-position*, single-symbol `[$…]`
+  currency or one of the seven plain colour names `formatter/lexer.rs::consume_color` accepts.
+  Conditions, elapsed time, `[DBNum1]`, `[Color N]` (whose lexer arm is case-sensitive, so
+  `[color 5]` is a hard error) are all rejected.
+- **Bare literals.** A *control* character must now be one of `0 # , . %` or a character in
+  IronCalc's explicit `Token::Literal` list. `/` and `:` are held out of that list deliberately —
+  `/` is the fraction separator the parser already rejects, `:` flips IronCalc's section to a time
+  format.
+- **Repeated separators.** A comma is grouping only **between two digit placeholders**, which is
+  IronCalc's own rule (`use_thousands = last_token_is_digit && next_token_is_digit`) and Excel's;
+  anywhere else it is another ÷1000 scale the applier ignores.
+- **Sign-bearing literals.** Not a narrowing — these are genuine E6 pairs, and the Mild finding below
+  is what let the carve-out see them.
+
+One more shape fell out of the widened corpus that the reviewer had not listed: **`#-` on +0.5**,
+where the chart renders `-` (all-`#` integer run suppressed, plus the code's own literal dash) and
+the cell renders `1-`. It is E7 (half-to-even vs `.round()` at `|v| < 1`), and it is the reason the
+sign gate below is *measured* rather than sniffed from a leading `-`.
+
+### Critical 3 — "a presentation bug makes the carve-out stop firing" was FALSE — **CONFIRMED, enforced**
+
+Verified on the pristine round-3 tree (`git stash` of all round-4 work), re-introducing the round-2
+defect verbatim — `if scaled < 0.0` with `has_significant_digit` removed:
+
+```
+all 6 tests PASSED
+grounded  corpus: 774 agree, 48 E6, 108 E7, 30 empty   (was 821 / 48 / 61 / 30)
+generated space:  204732 agree, 5236 E6, 14432 E7      (was 211156 / 5236 / 8008)
+```
+
+Byte-identical to the reviewer's numbers: 6 424 pairs of a re-introduced chart-model bug silently
+absorbed, well under the `total/4` runaway guard. Mechanism as reported — the reconstruction renders
+`apply_number_format(code, predicted)` with the *positive* magnitude and its negative fallback
+renders `-predicted`, which for the entire lost-carry class is `-0.0`; `-0.0 < 0.0` is `false`, so
+the defective branch is never exercised.
+
+**Fix: a gate, not prose.** `is_ironcalc_rounding_defect` may not fire unless the chart and the cell
+made the **same sign decision**. Both are *measured* by re-rendering the same magnitude
+(`chart_is_signed` / `cell_is_signed`) rather than by testing `starts_with('-')` — the `#-` case
+above is exactly why: a leading dash can be the code's own literal, and a `starts_with` gate read it
+as a sign decision on a positive number and turned a legitimate E7 pair into a hard failure.
+
+**Proof, run both ways:**
+
+| tree | mutation | result |
+|---|---|---|
+| round-3 (pristine `a1f8577`) | round-2 sign defect | **all 6 green** — the hole, confirmed |
+| round-4 (this work) | round-2 sign defect | **RED** — `chart_and_cell_agree_on_every_faithfully_rendered_code` *and* `generated_shape_space_agrees_with_the_cell` both fail, on `#,##0` −0.5 → chart `-0` / cell `1`, `"$"#,##0.00` −0.001 → chart `-$0.00` / cell `$0.00`, … |
+| round-4 | none | all 6 green |
+
+The four places asserting the false claim (`numfmt_agreement.rs` ×2, `phase_6.md` Round 3,
+`GAPS.md` E7) are corrected in place, each saying what was measured rather than just dropping the
+sentence.
+
+### Moderate — the degeneracy guard measured the wrong quantity — **CONFIRMED, fixed**
+
+`assert!(corpus.len() > 5_000)` counted the *unfiltered* generator output (a constant 9 360), which
+no change to `renders_faithfully` can move: narrowing the predicate to accept nothing would have left
+it green while the gate asserted zero pairs. `assert_agreement` is now `#[must_use]` and returns the
+**asserted-pair** count; the generated gate requires `> 100_000` (265 860 today) and the grounded one
+`> 500` (960). The failure message names the quantity it actually checks.
+
+### Moderate — `ThemeSlot::ALL` exhaustiveness — **CONFIRMED, strengthened; residual stated**
+
+`ThemeSlot::index` is a new wildcard-free `const fn` on the type in `chart-model`, and a
+`const _: () = { … }` block asserts at **compile time** that `ALL` is dense and in index order.
+`office_palette_agreement.rs` adds the runtime round-trip (`ALL[s.index()] == s`, `s.index() == i`)
+and pins `ALL.len() == max_index + 1`.
+
+Verified by probe, both directions:
+
+- adding a 13th variant (`ThemeSlot::ProbeThirteenth`): `error[E0004]: non-exhaustive patterns` —
+  `chart-model` itself stops compiling (two sites), and so does the test's `is_ui_fill_swatch`;
+- swapping `ALL[0]` and `ALL[1]`: `error[E0080]: evaluation panicked: assertion failed:
+  ThemeSlot::ALL[i].index() == i` — the const block, at compile time.
+
+**Residual, stated rather than claimed away.** This proves `ALL` is duplicate-free, dense and
+ordered, and that no variant can be added without an author editing `lib.rs`. It does **not** prove
+`ALL` is exhaustive: an author who adds an `index` arm and forgets `ALL` still gets a green build,
+because `ALL.len() == 1 + max index over ALL` is satisfied by the shortened array. Rust cannot
+enumerate a foreign enum without `variant_count` (unstable) or a macro that defines the enum itself,
+and `ThemeSlot`'s definition lives in `theme.rs`, outside this unit's file scope. The compile break
+is the trip-wire; the density check is the consistency behind it; the gap is documented at both the
+`index` definition and the test.
+
+### Moderate — record what E8 does not confirm — **CONFIRMED, recorded**
+
+`GAPS.md` E8 now separates the two halves. The *token-index* half is independently verified
+(`###,##0` on 12345 → cell `1,2345` vs chart `12,345`; `00,000` on 1234 → cell `0,1234` vs chart
+`01,234`; every accepted grouping code agrees at every corpus value; every mis-grouping code is
+rejected). The *padded-zeros* half — `0,000` on 5 → Excel `0,005` — rests on a reading of ECMA-376
+§18.8.31 and **has not been checked against a real Excel**: IronCalc's `0005` is measured, Excel's
+`0,005` is inferred. Nothing depends on resolving it (the shape is rejected either way), but it must
+not be cited as measured.
+
+### Mild — `is_ironcalc_sign_bug`'s `!cell.contains('-')` — **CONFIRMED, anchored**
+
+The clause was not a statement about the sign: it excluded every genuine E6 pair whose *format code*
+carries a literal `-` (`-0`, `0-`, `$-0` on −1 → cell `-1` / `1-` / `$-1`, chart `--1` / `-1-` /
+`-$-1`), which the widened `BARE_LITERALS` axis now reaches. The sign's position was already pinned
+by `chart[1..] == *cell`, so the `contains` test was doing nothing else. It is gone, and in its place
+the predicate **reconstructs IronCalc's own `is_negative`** (`format.rs:438` pre-round, then `:481`)
+and fires only when that reconstruction says the sign was dropped — a named-defect match rather than
+a shape match. The reconstruction is itself asserted against IronCalc's *measured* behaviour on every
+pair the gate sees (266 820 assertions), so a fork fix that moves the E6 band fails there first, with
+a pointer to the line that has to change.
+
+### Carve-out counts after round 4
+
+| Carve-out | Grounded corpus (960 pairs) | Generated space (265 860 pairs) |
+|---|---|---|
+| `is_ironcalc_sign_bug` (E6) | **48** | **6 960** |
+| `is_ironcalc_rounding_defect` (E7) | **61** | **10 686** |
+| `is_empty_code_artifact` | **30** | 0 (the generator emits no empty code) |
+| agreeing | 821 | 248 214 |
+
+5 988 of the 14 850 generated codes are rejected by the predicate (badged) — the mix
+`the_faithful_subset_is_actually_a_subset` requires.
+
+### Verification (round 4)
+
+- `cargo test -p freecell-engine --test numfmt_agreement --test office_palette_agreement` — 6 + 2 passed
+- `cargo test -p freecell-chart-model --lib` — 113 passed (4 new tests: the literal-placeholder fix,
+  the bracket-token narrowing, the bare-literal narrowing, the non-grouping comma)
+- `cargo clippy -p freecell-chart-model -p freecell-engine --all-targets -- -D warnings` — clean
+- `cargo fmt --all --check` — clean
+- **Mutation testing**, the round's central check — see the Critical 3 table: the round-2 sign defect
+  passes on the round-3 tree and fails on this one.
+
+**Render impact: none, and this time the reasoning is about the narrowings.** `apply_number_format`
+changed again, so `render-tests/src/chart_scene.rs`'s codes were re-checked: it uses only `"$#,##0"`
+and `"0%"`, on positive values. Neither carries a quoted literal, a `\`-escape, a bracket token, a
+bare literal outside `$`, or any comma but the single grouping one — so neither reaches the new
+lexer path in a way that can change its output, and both remain inside the (narrowed) faithful
+subset. The `chart_*` baselines cannot move; the pixel subset was not run, per the round's working
+agreement.

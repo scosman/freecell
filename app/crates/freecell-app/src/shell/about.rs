@@ -108,8 +108,9 @@ impl Render for AboutView {
             .flex()
             .flex_col()
             .bg(rgb(CHROME_BG))
-            // Cmd/Ctrl+W closes the About window; closing the last window quits the app via the
-            // registry (`app.rs on_window_closed`).
+            // Cmd/Ctrl+W closes the About window. If it was the last window, gpui ends the
+            // session off macOS (its `QuitMode`, set in `FreeCellApp::init`); on macOS the app
+            // stays resident in the Dock.
             .on_action(cx.listener(|_this, _: &CloseWindow, window, _cx| window.remove_window()))
             // macOS custom titlebar (§7.1); omitted on Linux (server decorations). The About
             // window uses the BLANK row — no centered title, no bottom hairline — so the top bar

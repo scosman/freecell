@@ -1,10 +1,11 @@
 //! Pure lifecycle helpers — window titles, the dirty computation, save-target resolution,
-//! and the quit-flow queue (`components/app_shell.md`, `functional_spec.md §2, §5.2`).
+//! the quit-flow queue, and the macOS Dock-reopen decision (`components/app_shell.md`,
+//! `functional_spec.md §2, §5.2`).
 //!
 //! All gpui-free and table-tested, so the load-bearing rules (Untitled titling, the
 //! op-accounting dirty flag, Save-vs-Save-As targeting, `.xlsx` enforcement, the
-//! front-to-back quit-prompt order + cancel-aborts semantics) run in `cargo test
-//! --workspace` with no display.
+//! front-to-back quit-prompt order + cancel-aborts semantics, welcome-vs-activate on a Dock
+//! reopen) run in `cargo test --workspace` with no display.
 
 use std::path::{Path, PathBuf};
 
@@ -156,6 +157,33 @@ pub fn overscan_range(range: std::ops::Range<u32>, max: u32) -> std::ops::Range<
     let start = range.start.saturating_sub(len);
     let end = range.end.saturating_add(len).min(max);
     start..end
+}
+
+/// What a macOS Dock-icon click on the already-running app should do
+/// (`applicationShouldHandleReopen:`, surfaced by gpui as `Application::on_reopen`).
+///
+/// This is the *other half* of the macOS lifecycle rule whose first half belongs to gpui: with
+/// `QuitMode::Default` gpui quits the app when its last window closes on Windows/Linux but
+/// **not** on macOS (`gpui::app`), so a macOS FreeCell outlives its last window and needs a way
+/// back on screen (`functional_spec.md §2.3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenAction {
+    /// Windows still exist (the reopen arrived because they are all minimized/hidden) — bring
+    /// the app and its frontmost window forward rather than opening anything new.
+    ActivateExisting,
+    /// No windows at all — open the welcome window, exactly as at a fileless cold launch.
+    ShowWelcome,
+}
+
+/// The [`ReopenAction`] for a Dock reopen. `no_windows_open` is the registry's
+/// [`is_empty`](super::registry::WindowRegistry::is_empty) — zero workbook windows, no welcome,
+/// no About.
+pub fn reopen_action(no_windows_open: bool) -> ReopenAction {
+    if no_windows_open {
+        ReopenAction::ShowWelcome
+    } else {
+        ReopenAction::ActivateExisting
+    }
 }
 
 /// The next step the quit flow should take (`functional_spec.md §2.3`: "prompts per-window
@@ -403,6 +431,13 @@ mod tests {
             path("/a/book.csv"),
             "wrong extension → replace"
         );
+    }
+
+    #[test]
+    fn dock_reopen_shows_welcome_only_with_no_windows() {
+        assert_eq!(reopen_action(true), ReopenAction::ShowWelcome);
+        // Any window still open (hidden or minimized, which is why the reopen fired) → activate.
+        assert_eq!(reopen_action(false), ReopenAction::ActivateExisting);
     }
 
     #[test]

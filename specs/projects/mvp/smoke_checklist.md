@@ -57,6 +57,7 @@ Each has clear repro steps; run on the target platform.
 | M-14 | Menu enable/disable by context (`§2.4`) | On macOS, with Welcome frontmost, Save/Undo/Redo/Close are disabled; with a document frontmost they enable and Undo/Redo track history availability. |
 | M-15 | macOS Finder open-file (`§2.1`) | **Wired (`specs/projects/xlsx-file-association`, Phases 1–2 — `84785fa` + `f2e72cc`); pending non-blocking macOS hardware smoke.** OS `.xlsx`/`.csv` file associations (cargo-packager declaration) + a macOS Apple-Event bridge (`shell/open_files.rs::install_finder_open`) route Finder opens through `open_path`. Smoke on real macOS: double-click / Open-With / drag-to-Dock / `open -a`, cold + warm start, for `.xlsx` and `.csv`. |
 | M-16 | macOS traffic-light close prompt (`§2.3`) | On macOS, closing a dirty window via the red traffic light vetoes the OS close and shows the Save / Don't Save / Cancel modal (`on_window_should_close` is present at the pinned rev). |
+| M-17 | macOS stay-in-Dock + Dock reopen (`§2.3`) | On macOS: **(a)** close the last window → the app keeps running (Dock icon stays lit, menu bar present), no exit. **(b)** Click the Dock icon with **zero** windows → the Welcome window opens (recents populated). **(c) The at-risk step** — minimize every **workbook** window (Welcome/About are `is_minimizable: false`, so only workbook windows reach this state), click the Dock icon → a window is restored and focused. gpui's `activate()` is `makeKeyAndOrderFront:` and it exposes no deminiaturize; worse, its `applicationShouldHandleReopen:hasVisibleWindows:` is registered as a **void**-returning fn where AppKit expects `BOOL` (`gpui_macos/src/platform.rs`), so AppKit's own default "deminiaturize the first miniaturized window" fallback is undefined. If the window does not come back, the fix belongs in gpui/zed, **not** a FreeCell workaround. **(c′)** ⌘H-hide the app with only Welcome (or only About) open, then click the Dock icon → that window is brought forward, not duplicated (this is the only way to reach `frontmost_handle`'s welcome/About arm). **(d)** Cmd-Q with 0 windows, 1 clean window, and N windows incl. dirty ones → terminates in every case, prompting per dirty window with Cancel aborting. **(e)** With the app resident and **zero** windows, Finder double-click / drag-a-file-onto-the-Dock-icon → the document window opens with **no Welcome flash** (a state that did not exist before this change: `install_finder_open`'s warm-start loop now runs against an empty window set, and if AppKit delivers a reopen alongside the open event, `handle_dock_reopen` would open Welcome first and `note_window_loaded` would close it again — visibly). Linux `TestPlatform` cannot cover any of this (no Dock, no miniaturization/hiding, `quit()` is a no-op). |
 
 ## mvp-gaps successors (Phases 1–8) — new smoke items
 
@@ -86,8 +87,9 @@ even on Linux — noted per item.
 - **Driven here (PASS, no panics):** launch, CLI-argv open of a real `.xlsx`, and the full
   composed-window render (grid values + styles + selection, action-row bold state, formula
   bar content, fill color, sheet tab bar). Screenshot-verified.
-- **Documented-manual (M-3…M-16):** native file panels, macOS menu bar / edited-dot /
-  traffic-light / Finder-open, scrollbar fade animation, 100 MB open timing, degraded bar,
+- **Documented-manual (M-3…M-17):** native file panels, macOS menu bar / edited-dot /
+  traffic-light / Finder-open / Dock reopen, scrollbar fade animation, 100 MB open timing,
+  degraded bar,
   real read-only-perms failure, and real-hardware frame budget — each with repro steps and,
   where possible, an automated proxy (engine round-trips, injection tests, buffered CI perf
   gates).

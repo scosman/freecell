@@ -55,7 +55,8 @@ Section refs are to `architecture.md` / `functional_spec.md` §3.
       Tests = §3.6 (incl. 127-kept, NBSP-kept).
 - [x] **Phase 7 — DOLLAR (§3.7). `fix/dollar`.** `fn_dollar`; explicit ROUND (half-away), reuse the
       TEXT/FIXED formatter (en-US, no trailing space), negative→parens, negative-decimals rounding,
-      $0 guard. Tests = §3.7 + `(-0.001,2)`→`$0.00`.
+      $0 guard. Tests = §3.7. (The extra `(-0.001,2)`→`$0.00` vector was wrong — see the
+      correction under Status — and the fix built on it was withdrawn.)
 - [x] **Phase 8 — PERCENTILE.INC + QUARTILE.INC (§3.9/§3.10). `fix/percentile-quartile-inc` (paired,
       arch §4).** Shared `collect_numbers` + `percentile_inc_core`; register `.INC` **and** legacy
       `PERCENTILE`/`QUARTILE` onto the two impl fns; QUARTILE maps quart→k over the core. k/quart range →
@@ -102,10 +103,12 @@ pushed. The other **7 functions** (PROPER, REPLACE, CHAR, CODE, CLEAN, PERCENTIL
 QUARTILE.INC) were found **already present upstream + verified in place** (no branch, no PR).
 **SUMPRODUCT** is present + verified; its `--`-idiom divergence is an **engine unary-minus
 operator** bug, spun out as a **deferred** off-critical-path follow-on
-(`projects/unary-minus-boolean-coercion.md`), not fixed here.
+(`projects/unary-minus-boolean-coercion.md`), not fixed here. **Correction (2026-08-06):** the
+DOLLAR fix was wrong — Excel returns `($0.00)` (upstream ironcalc/IronCalc#1293, closed) — so it
+was reverted out of `freecell-fixes` and its branch deleted; 3 live PRs, not 4.
 
 Phase 11 re-pinned FreeCell's lock onto `freecell-fixes` HEAD (`81feec40` → `9161a463`) and
 added a `freecell-engine` smoke test (13 assertions: 9 presence + 4 fixes) proving the batch
 computes end-to-end through the FreeCell engine seam. The per-branch upstreaming state + the
-4 finalized upstream-PR preps (for the owner to open) live in `fork-fixes/README.md` (the
+3 finalized upstream-PR preps (for the owner to open) live in `fork-fixes/README.md` (the
 tracker).

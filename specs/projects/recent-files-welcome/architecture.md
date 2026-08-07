@@ -329,13 +329,14 @@ Mirror the welcome fields/flow:
   the old `do_show_about` modal routing (active-window lookup + `ww.show_about` /
   `welcome.show_about`).
 - `on_window_closed` clears `about`/`about_id` when the About window closes (like the welcome
-  branch) and falls through to the quit-when-empty check.
+  branch); the app-terminates-when-empty decision that follows is gpui's (`QuitMode`).
 
 ### 9.3 Registry accounting (`registry.rs`)
 
 Add an `about_open: bool` parallel to `welcome_open`: `set_about_open`, `about_open`, and
 include it in `open_count` (`windows.len() + welcome + about`). This keeps "app quits when the
-last window closes" correct when only the About window remains. Add a unit test mirroring
+last window closes" (Windows/Linux; on macOS the app stays resident in the Dock instead)
+correct when only the About window remains. Add a unit test mirroring
 `welcome_counts_toward_open_count`.
 
 ### 9.4 Remove the old About modal

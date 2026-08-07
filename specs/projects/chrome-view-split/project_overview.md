@@ -74,6 +74,14 @@ over the line, and do not contort the structure to hit the number.
 
 ## Working agreement
 
+- **Process — follow the `/spec` loop exactly as defined. Do not improvise a faster one.**
+  `/spec implement` puts you in a **manager** role: per phase you spawn a coding sub-agent,
+  validate its attestation, spawn a *fresh* CR sub-agent, route feedback back and re-review
+  until clean, resume the coding agent to commit, then verify with `git status`. Every code
+  change — CR fixes included — needs a clean CR before commit. Do not write the code or run
+  the review inline yourself, and do not skip the CR loop because a change looks small — a
+  mechanical move is exactly the case where an unreviewed "obvious" edit slips through.
+  "Autonomous" below means **no human sign-off**; it does not mean a shortened process.
 - **Autonomy:** run the full spec + implement flow in one pass. Do not stop for sign-off
   between spec phases. Ask only if a real unknown surfaces — for this project, the plausible
   one is a domain that genuinely cannot be separated without a state change. If you hit that,

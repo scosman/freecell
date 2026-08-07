@@ -1411,12 +1411,18 @@ impl Worker {
             });
             return;
         }
-        // A single-cell / exact-divisor COPY into a larger selection fills the whole target (BUG 4);
-        // values + styles fill exactly, formula refs get one uniform (not per-cell) shift (accepted
-        // limitation U2 in `GAPS.md`). Cap the fill at the same size guard font edits use so a 1-cell
-        // paste into a full-column selection can't materialise a million cells — reject it as
-        // Overflow (nothing pasted). The fill target is itself a valid on-sheet selection, so no
-        // sheet-edge overflow is possible.
+        // A single-cell / exact-divisor COPY into a larger selection fills the whole target (BUG 4)
+        // — values + styles exactly, formula refs re-anchored per filled cell (the engine's own fill,
+        // one undo step). Cap the fill at the same size guard font edits use so a 1-cell paste into a
+        // full-column selection can't materialise a million cells — reject it as Overflow (nothing
+        // pasted). The fill target is itself a valid on-sheet selection, so no sheet-edge overflow is
+        // possible.
+        //
+        // This ONE `fill_target_dims` call decides both halves, so they cannot disagree: it sizes the
+        // cap here, and it picks the selection handed to the engine below — the whole target only for
+        // a capped fill, the anchor cell alone otherwise, and a single-cell selection can never be
+        // read as a fill however the engine's own rule evolves. So the cap stays authoritative even
+        // though the fill itself is the engine's.
         let fill = if slot.cut {
             None
         } else {
@@ -1454,12 +1460,19 @@ impl Worker {
 
         let source_range = slot.range;
         let cut = slot.cut;
+        // The selection the engine pastes over — see the `fill` comment above and
+        // `WorkbookDocument::paste_clipboard`.
+        let selection = if fill.is_some() {
+            target
+        } else {
+            CellRange::single(anchor)
+        };
         // Borrow the slot's JSON into the guarded paste (no clone). The closure's borrow ends when
         // `run_guarded_paste` returns, freeing `slot` for the restore/drop decision below.
         let outcome = {
             let data = &slot.data;
             self.run_guarded_paste(move |doc| {
-                doc.paste_clipboard(dest_idx, source_idx, source_range, data, cut, target)
+                doc.paste_clipboard(dest_idx, source_idx, source_range, data, cut, selection)
             })
         };
         match outcome {
@@ -6019,6 +6032,217 @@ mod tests {
             }
         }
         assert_eq!(value_at(&worker, 0, 0), "7", "the copy source is untouched");
+    }
+
+    #[test]
+    fn paste_fill_re_anchors_relative_refs_per_target_cell() {
+        // The reported bug: B4 holds `=B3+1`; copying it onto B5:B10 must give every filled cell
+        // its own relative reference (`=B4+1`, `=B5+1`, … `=B9+1`), not B5's shift everywhere.
+        // `$`-absolute parts stay pinned, and the whole fill is one undo step.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..16,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "100"), // A1, the absolute anchor
+            set_input(sheet, 2, 1, "1"),   // B3
+            set_input(sheet, 3, 1, "=B3+$A$1"), // B4
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(3, 1)),
+            false,
+        );
+        // Paste onto B5:B10 (rows 4..=9, col 1).
+        let target = CellRange::new(CellRef::new(4, 1), CellRef::new(9, 1));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        for row in 4..=9 {
+            assert_eq!(
+                worker
+                    .doc
+                    .cell_content(0, CellRef::new(row, 1))
+                    .unwrap_or_default(),
+                format!("=B{}+$A$1", row),
+                "row {row} must reference the cell above it, with $A$1 pinned"
+            );
+            assert_eq!(
+                value_at(&worker, row, 1),
+                (100 * (row as i32 - 2) + 1).to_string(),
+                "row {row} evaluates its own chained formula"
+            );
+        }
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == target
+            )),
+            "the fill reply carries the whole filled rectangle; got {events:?}"
+        );
+        worker.process_batch(vec![Command::Undo]);
+        for row in 4..=9 {
+            assert_eq!(
+                value_at(&worker, row, 1),
+                "",
+                "one undo must clear the whole fill (row {row})"
+            );
+        }
+        assert_eq!(
+            value_at(&worker, 3, 1),
+            "101",
+            "the copy source is untouched"
+        );
+    }
+
+    #[test]
+    fn paste_fill_repeats_a_block_source_with_per_repetition_refs() {
+        // A 2-row block copy filling a 4-row selection repeats twice, each repetition re-anchored:
+        // the formula in the second repetition points at that repetition's own value cell.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..16,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "5"),   // A1
+            set_input(sheet, 1, 0, "=A1"), // A2
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            false,
+        );
+        // Paste onto C1:C4 — two repetitions of the 2×1 source.
+        let target = CellRange::new(CellRef::new(0, 2), CellRef::new(3, 2));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        let content = |row: u32| {
+            worker
+                .doc
+                .cell_content(0, CellRef::new(row, 2))
+                .unwrap_or_default()
+        };
+        assert_eq!(content(0), "5");
+        assert_eq!(content(1), "=C1");
+        assert_eq!(content(2), "5");
+        assert_eq!(
+            content(3),
+            "=C3",
+            "the second repetition points at its own C3"
+        );
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == target
+            )),
+            "the fill reply carries the whole filled rectangle; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn larger_but_not_whole_multiple_target_pastes_once() {
+        // The fill rule's fall-through — the guard side of the 100k cap depends on it: a target
+        // that is larger than the copy but NOT a whole multiple of it pastes the copy ONCE at the
+        // anchor and leaves the rest of the selection alone (no fill).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..16,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "1"),
+            set_input(sheet, 1, 0, "2"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::new(CellRef::new(0, 0), CellRef::new(1, 0)),
+            false,
+        );
+        // A 2-row copy onto a 3-row selection (C1:C3) — 3 is not a multiple of 2.
+        let target = CellRange::new(CellRef::new(0, 2), CellRef::new(2, 2));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        assert_eq!(value_at(&worker, 0, 2), "1");
+        assert_eq!(value_at(&worker, 1, 2), "2");
+        assert_eq!(
+            value_at(&worker, 2, 2),
+            "",
+            "the third selected cell is not part of the paste"
+        );
+        let pasted = CellRange::new(CellRef::new(0, 2), CellRef::new(1, 2));
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == pasted
+            )),
+            "the reply carries the copy-sized rectangle, not the selection; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn cut_into_a_larger_whole_multiple_target_moves_once() {
+        // A cut is a move: even a selection that WOULD be a fill for a copy (3× the cut rectangle)
+        // moves the cells exactly once, to the anchor. The cap relies on this — a cut is never
+        // sized against the selection.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            Command::SetViewport {
+                sheet,
+                rows: 0..16,
+                cols: 0..8,
+            },
+            set_input(sheet, 0, 0, "7"),
+        ]);
+        drain_events(&rx);
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            true,
+        );
+        // C1:C3 is 3× the 1×1 cut rectangle — a copy would fill it.
+        let target = CellRange::new(CellRef::new(0, 2), CellRef::new(2, 2));
+        worker.process_batch(vec![Command::PasteInternal { sheet, target }]);
+
+        assert_eq!(value_at(&worker, 0, 0), "", "the cut source is cleared");
+        assert_eq!(value_at(&worker, 0, 2), "7");
+        for row in 1..=2 {
+            assert_eq!(
+                value_at(&worker, row, 2),
+                "",
+                "a cut must not fill the rest of the selection (row {row})"
+            );
+        }
+        let pasted = CellRange::single(CellRef::new(0, 2));
+        let events = drain_events(&rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WorkerEvent::Pasted { sheet: s, range } if *s == sheet && *range == pasted
+            )),
+            "the reply carries the single moved cell; got {events:?}"
+        );
     }
 
     #[test]

@@ -1645,10 +1645,11 @@ impl Render for WorkbookWindow {
             .on_action(cx.listener(|this, _: &ToggleMerge, window, cx| {
                 this.chrome.update(cx, |c, cx| c.toggle_merge(window, cx));
             }))
-            // ⌘F / Ctrl-F opens (toggles) the find/replace bar over the grid (`functional_spec.md
-            // §4.2`) — the same path as the action-row search button.
+            // ⌘F / Ctrl-F always *opens* the find/replace bar over the grid and selects any existing
+            // query (`functional_spec.md §4.2`); it never dismisses the bar, so "⌘F then type" can't
+            // land in a cell. Closing stays on Esc / the bar's close button.
             .on_action(cx.listener(|this, _: &OpenFind, window, cx| {
-                this.chrome.update(cx, |c, cx| c.toggle_find(window, cx));
+                this.chrome.update(cx, |c, cx| c.show_find(window, cx));
             }))
             // macOS custom titlebar (§7.1): the very top row, drawn only when the master switch
             // is on (Linux omits it → server decorations, unaffected). Its native integration is

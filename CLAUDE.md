@@ -33,6 +33,34 @@ it:
 This keeps good ideas tracked without dragging them onto the critical path. It is
 distinct from `specs/projects/`, which holds *active* spec-driven build planning.
 
+## Specs are point-in-time — `specs/`
+
+A spec under `specs/projects/` is a **planning artifact of one project, frozen when that
+project ended** — not a description of how the code behaves today. An old spec may simply be
+wrong now; **don't treat it as truth.** Verify against the code (or `GAPS.md`) before acting
+on what it claims.
+
+- **Don't go update finished projects' specs** to match new reality while doing unrelated
+  work. They're the historical record, not documentation to maintain.
+- **Exception:** the spec of the project you are *actively building* is live and **does** get
+  maintained as the plan evolves — that's what the `spec` skill does.
+
+## Known gaps — `GAPS.md`
+
+`GAPS.md` is the **live register of currently-known holes**, each tagged with a target release
+(**v0.5 / v1.0 / v2.0**) — a gap is the observed *hole*, where the `projects/*.md` note it
+often links to is that hole's *work plan*. Everything in it is something we intend to close;
+the only question is *when*.
+
+- **A fixed gap is DELETED** — remove the row. Don't strike it through, don't leave it marked
+  "✅ RESOLVED" in place. (Older entries still carry in-place resolved markers; that shape is
+  obsolete.)
+- **Add a gap when you find one.** Any behavior that diverges from the popular spreadsheet
+  apps (Excel, Sheets, Numbers) earns an entry: what's missing, current behavior, root cause,
+  target release.
+- **Frame it "not yet — targeted at `<release>`", never "accepted limitation."** Out of scope
+  for now = a gap aimed at a later release. `GAPS.md` is not where scope decisions get logged.
+
 ## Engine: we ride our IronCalc fork (fix upstream, don't hack FreeCell)
 
 FreeCell depends on **our fork** `scosman/ironcalc`, not crates.io directly. When you hit an

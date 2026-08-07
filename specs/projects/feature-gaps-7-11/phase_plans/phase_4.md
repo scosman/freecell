@@ -4,6 +4,11 @@ status: complete
 
 # Phase 4: Find / replace
 
+> **Partly superseded (⌘F is no longer a toggle).** This plan wires `OpenFind → toggle_find`
+> (items 8 + 11), which made ⌘F dismiss an open bar. That was later changed: the shortcut now
+> always opens and re-selects the query via `ChromeView::show_find`, and only the X, Escape, and
+> the action-row button dismiss. See `functional_spec.md §4.2` for the current contract.
+
 ## Overview
 
 A dismissible find/replace bar scoped to the current sheet (`functional_spec.md §4`,

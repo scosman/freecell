@@ -342,7 +342,8 @@ the currency symbol, a comma thousands-separator, `decimals` fractional digits (
   - `= 0` → integer dollars, no decimal point.
   - `< 0` → round to the **left** of the decimal point, i.e. to the nearest `10^|decimals|`
     (`decimals = -2` rounds to the nearest 100). If rounding zeroes out the whole magnitude the
-    result is `"$0"`.
+    result is `"$0"` — but a **negative** `number` still takes the parenthesized form
+    (`DOLLAR(-0.001,2)` → `($0.00)`, as Excel does).
 
 **Rounding.** Round **half away from zero** (Excel ROUND), then format.
 

@@ -153,10 +153,28 @@ opt-level = 3
 # BEFORE rounding, so a negative that rounds to zero still parenthesizes (upstream
 # ironcalc/IronCalc#1293, closed unmerged — Google Sheets is what returns `$0.00`). A bump that
 # reddens a test is telling you what changed; answer it, don't silence it.
+#
+# CURRENT PIN `c1acacb` (bumped 2026-08-07, from `ecbf6226`). It is a strict DESCENDANT of the
+# previous pin — exactly four commits, nothing reverted: an XMATCH array-constant xlsx test and
+# its merge, plus `fix/paste-fill-relative-refs` (Excel-style paste fill with per-cell relative
+# references) and its merge. The paste-fill fix is why the pin had to move at all: `main` had
+# already absorbed it, so staying on `ecbf6226` would have reverted it on this branch.
+#
+# DO NOT MOVE THIS PIN TO THE BRANCH TIP without treating it as its own project. Past `c1acacb`
+# the fork merged upstream `main` and `9bed9ec` bumped its declared version to 0.8.3, which does
+# NOT satisfy the `ironcalc = "=0.7.1"` requirement above. Cargo does not error on that: it
+# silently declines to apply a `[patch]` whose replacement version fails the requirement, emits
+# only a "patch ... was not used in the crate graph" warning, resolves the REAL crates.io
+# `ironcalc 0.7.1`, and then fails at compile on the missing merged-cells API with a message that
+# points nowhere near the cause. Moving to the tip therefore means a coordinated `=0.8.3`
+# requirement bump plus an engine minor upgrade carrying an upstream merge — see
+# projects/ironcalc-upgrade.md. After ANY bump, confirm the patch actually applied rather than
+# assuming it: `cargo metadata --locked` must show both crates resolving to the fork `rev`, and
+# the build must emit no "patch ... was not used" warning.
 # ---------------------------------------------------------------------------------
 [patch.crates-io]
-ironcalc = { git = "https://github.com/scosman/ironcalc", rev = "ecbf6226ddfbe20bec15f9904647db450efdf2ea" }
-ironcalc_base = { git = "https://github.com/scosman/ironcalc", rev = "ecbf6226ddfbe20bec15f9904647db450efdf2ea" }
+ironcalc = { git = "https://github.com/scosman/ironcalc", rev = "c1acacbda22e98450ab36139e686ecc29ff19305" }
+ironcalc_base = { git = "https://github.com/scosman/ironcalc", rev = "c1acacbda22e98450ab36139e686ecc29ff19305" }
 
 # ---------------------------------------------------------------------------------
 # GPL ship blocker (zed#55470). gpui pulls `sum_tree` -> `ztracing` -> `zlog` +

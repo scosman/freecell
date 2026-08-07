@@ -221,3 +221,41 @@ the second run. See the corrected §Verification table above: **398** at the A1 
 tests to `freecell-engine` after A1. Reconciled by `#[test]` count (399 → 407 in
 `freecell-engine/src`, one `#[ignore]`d in both). Both figures are now recorded separately rather
 than conflated.
+
+### 2026-08-07 — pin bumped `ecbf6226` → `c1acacb` (merging `origin/main`)
+
+Merging `origin/main` into this branch forced the question the A1 `rev` pin exists to make
+explicit. `main` pins by `branch = "freecell-fixes"` and its lock resolves `c1acacb`, which
+carries `fix/paste-fill-relative-refs`; staying on `ecbf6226` would have quietly reverted that
+fix on this branch. So the pin moved — in its own commit, with the workspace suite run, per
+`CLAUDE.md` §Engine.
+
+`c1acacb` is a **strict descendant** of `ecbf6226`: exactly four commits, nothing reverted (an
+XMATCH array-constant xlsx test and its merge; the paste-fill fix and its merge). It still
+declares `version = "0.7.1"` in both `base/Cargo.toml` and `xlsx/Cargo.toml`, so it satisfies the
+existing `ironcalc = "=0.7.1"` requirement with **no version-requirement change** — the bump is
+one line in each of two `[patch.crates-io]` entries plus `cargo update -p ironcalc -p
+ironcalc_base`, and the lock diff is exactly the two `source =` lines.
+
+**The branch tip `23443cd` was deliberately NOT chosen.** Past `c1acacb` the fork merged upstream
+`main` and `9bed9ec` bumped its declared version to **0.8.3**, which does not satisfy `=0.7.1`.
+Cargo does not error on that — it declines to apply the `[patch]`, warns "patch … was not used in
+the crate graph", resolves the real crates.io `ironcalc 0.7.1`, and fails much later at compile on
+the missing merged-cells API. Adopting the tip is a coordinated `=0.8.3` bump plus an engine minor
+upgrade carrying an upstream merge: its own project (`projects/ironcalc-upgrade.md`), not a
+merge-conflict resolution.
+
+That the patch **applied** was verified rather than assumed: `cargo metadata --locked` shows both
+crates resolving to `git+https://github.com/scosman/ironcalc?rev=c1acacb…`, and neither the build
+nor clippy emitted a "patch … was not used" warning.
+
+**Now live on `main`, and logged in `GAPS.md`:** `main` is still branch-pinned while the branch
+tip declares 0.8.3, so the next lock regeneration there will silently detach the patch and fail
+the build on the missing merged-cells API. `main` builds today only because its committed lock
+happens to hold `c1acacb`. Not fixable from this branch.
+
+**Verification at the new pin** (workspace, `--locked`): `cargo build` clean; `cargo test
+--no-fail-fast` **1685 passed, 2 failed, 4 ignored** — the two failures are
+`charts_roundtrip_libreoffice`, environmental and pre-existing (headless `soffice` in this
+container cannot load *any* file, confirmed by failing to convert a two-line CSV); `cargo clippy
+--all-targets -- -D warnings` clean; `cargo fmt --all --check` clean.

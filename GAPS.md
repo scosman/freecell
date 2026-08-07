@@ -242,6 +242,16 @@ current pin**. Left as-is here; re-triaging them is its own task.)*
 |-----|----------|------------------|-------------------|
 | **A paste that copies a spill cell destroys the destination's content, with nothing in the undo entry to restore it** | Mild on **frequency** only (spill formulas are rare in real FreeCell sheets today) — but genuinely **reachable**: ⌘C/⌘V over any dynamic-array spill region hits it | A paste clears its whole destination rectangle via `range_clear_contents(target_area)`, but a copied spill cell (`ClipboardCell.is_spill`) records only a `SetCellStyle` diff — undo restores the style, not the cleared content. The new paste-fill repeats this per repetition rather than once. | **Fork/upstream.** `UserModel::paste_from_clipboard` (`base/src/user_model/clipboard.rs`). Needs its own `fix/<slug>` branch + single-fix upstream PR: capture the old value before clearing and record it as a diff, the way `paste_csv_string` already does. |
 
+## Engine (fork) — `main`'s branch pin is one `cargo update` away from a silent detach (2026-08-07)
+
+**v0.5. Live, not hypothetical** — found bumping this branch's pin to `c1acacb`
+(v05-cleanup-1 / A1). It is the exact hazard A1's `rev` pin exists to close, now armed on
+`main`. **Do not try to fix it from a feature branch**; it needs its own commit on `main`.
+
+| Gap | Severity | Current behavior | Root cause / home |
+|-----|----------|------------------|-------------------|
+| **A routine lock regeneration on `main` will silently drop the fork and fail the build with a message that points nowhere near the cause** | High **once triggered** — and the trigger is an ordinary `cargo update`, not an exotic one | `main` pins `ironcalc`/`ironcalc_base` by `branch = "freecell-fixes"`. It builds today only because its committed lock happens to hold `c1acacb`. The branch tip has since moved: `9bed9ec` bumped the fork's declared version to **0.8.3**, which does **not** satisfy `main`'s `ironcalc = "=0.7.1"` requirement. Cargo does not error on an unsatisfiable `[patch]` — it emits only `patch for 'ironcalc' ... was not used in the crate graph`, resolves the **real crates.io `ironcalc 0.7.1`**, and dies much later at compile time on the missing merged-cells API. | **FreeCell-side, `main`.** Move `main` to the same `rev` pin this branch uses (`app/Cargo.toml` `[patch.crates-io]`), which makes any engine move a deliberate manifest edit instead of a side effect of lock regeneration. Genuinely adopting the 0.8.3 tip is a *different* job — a coordinated `=0.8.3` requirement bump plus an engine minor upgrade carrying an upstream-`main` merge, tracked as [`projects/ironcalc-upgrade.md`](projects/ironcalc-upgrade.md). |
+
 ## Data safety & robustness
 
 | Gap | Severity | Why it matters | Sketch |

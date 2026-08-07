@@ -1,5 +1,5 @@
 <div align="center">
-<img width="263" height="71" alt="freecell logo mark" src="https://github.com/user-attachments/assets/7ac2febf-9839-4e4f-ace9-561edc909959" />
+<img width="263" height="71" alt="freecell logo mark" src="https://github.com/user-attachments/assets/5019afe8-5318-4cb4-95c1-7c63031ecfa7" />
 
 ### The open spreadsheet app
 </div>

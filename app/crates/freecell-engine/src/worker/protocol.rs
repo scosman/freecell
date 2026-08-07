@@ -400,10 +400,10 @@ pub enum Command {
     /// Paste the engine clipboard slot into `target` — the destination selection (full-fidelity:
     /// values + adjusted formulas + styles). The paste anchors at `target.start`; when the copied
     /// source is a single cell (or an exact divisor of the target) and `target` is larger, the
-    /// source is **tiled/filled** across the whole selection as one undo step (BUG 4). Values and
-    /// styles fill exactly; a **formula** gets the top-left cell's `anchor − source` reference shift
-    /// applied uniformly to every filled cell — NOT Excel's per-cell relative fill (accepted
-    /// limitation U2 in `GAPS.md`, to keep the fill one undo step). Replies with
+    /// source is **repeated/filled** across the whole selection as one undo step (BUG 4). Values
+    /// and styles fill exactly, and every repetition re-anchors its relative formula references to
+    /// its own position (Excel's per-cell fill: `=B3+1` copied from B4 over B5:B10 gives `=B4+1`,
+    /// `=B5+1`, … `=B9+1`); `$`-absolute parts stay pinned. Replies with
     /// [`WorkerEvent::Pasted`] (the pasted range) or [`WorkerEvent::PasteRejected`].
     PasteInternal { sheet: SheetId, target: CellRange },
     /// Paste the internal clipboard slot's **computed values** into `target` — the values-only

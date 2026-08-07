@@ -4,6 +4,13 @@ status: complete
 
 # Phase 11: Integration + FreeCell pickup + PR prep
 
+> **Correction (2026-08-06):** one of the four fixes below, DOLLAR
+> (`fix/dollar-negative-zero`), was **wrong** — Excel returns `($0.00)` for
+> `DOLLAR(-0.001,2)` (upstream ironcalc/IronCalc#1293, closed; Google Sheets is what returns
+> `$0.00`). It was reverted out of `freecell-fixes` and its branch deleted deliberately, so the
+> real deliverable is **3** branches / PRs (TRIM + ADDRESS + XMATCH) and the smoke test asserts
+> `($0.00)`. The record below stands as history.
+
 ## Overview
 
 The final phase. All fork work landed in earlier phases on the fork's `freecell-fixes`
@@ -41,13 +48,15 @@ CLEAN, PERCENTILE.INC, QUARTILE.INC), and the SUMPRODUCT `--` divergence turned 
      `PERCENTILE.INC({1,2,3,4},0.5)`=2.5, `QUARTILE.INC({1,2,4,7,8,9,10,12},2)`=7.5,
      `XMATCH(30,{10,20,30,40,50})`=3.
    - **4 fixes** (prove the pin carries each landed branch): `TRIM("a    b")`="a b"
-     (`fix/trim-internal-runs`), `DOLLAR(-0.001,2)`="$0.00" (`fix/dollar-negative-zero`),
+     (`fix/trim-internal-runs`), `DOLLAR(-0.001,2)`="$0.00" (`fix/dollar-negative-zero`)
+     (now `($0.00)` — see the correction),
      `ADDRESS(1,1,1,TRUE,"")`="!$A$1" (`fix/address-empty-sheet`),
      `XMATCH("ban*",{"apple","banana","cherry"},2)`=2 (`fix/xmatch-array-constant`).
 
 3. **Finalize PR preps.** Verified `fork-fixes/README.md` already carries complete,
    self-contained upstream-PR preps (compare link + branch/merge commits + title + body) for
-   all 4 fork branches. Nothing missing; no edits needed.
+   the fork branches. Nothing missing; no edits needed. (The DOLLAR prep has since been
+   removed — see the correction at the top; 3 preps remain.)
 
 ## Tests
 
@@ -66,8 +75,9 @@ CLEAN, PERCENTILE.INC, QUARTILE.INC), and the SUMPRODUCT `--` divergence turned 
 ## Outcome
 
 - **Pin bump:** `81feec40` → `9161a463` (`freecell-fixes` HEAD).
-- **Real fork deliverable:** 4 branches / PRs — TRIM + DOLLAR + ADDRESS + XMATCH; preps
-  finalized in `fork-fixes/README.md` for the owner to open (human-in-loop).
+- **Real fork deliverable:** 3 branches / PRs — TRIM + ADDRESS + XMATCH (a 4th, DOLLAR, was
+  withdrawn — see the correction at the top); preps finalized in `fork-fixes/README.md` for the
+  owner to open (human-in-loop).
 - **7 functions already present + verified** upstream, no branch/PR.
 - **SUMPRODUCT `--` / unary-minus deferred** off critical path
   (`projects/unary-minus-boolean-coercion.md`).

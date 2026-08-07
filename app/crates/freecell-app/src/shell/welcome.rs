@@ -176,8 +176,9 @@ impl Render for WelcomeView {
             .flex()
             .flex_col()
             .bg(rgb(CHROME_BG))
-            // Cmd/Ctrl+W closes the welcome window (matches the platform convention). Closing
-            // the last window quits the app via the registry (`app.rs on_window_closed`).
+            // Cmd/Ctrl+W closes the welcome window (matches the platform convention). If it was
+            // the last window, gpui ends the session off macOS (its `QuitMode`, set in
+            // `FreeCellApp::init`); on macOS the app stays resident in the Dock.
             .on_action(cx.listener(|_this, _: &CloseWindow, window, _cx| window.remove_window()))
             // macOS custom titlebar (§7.1): "FreeCell", drawn only when the master switch is on.
             // On Linux it is omitted and the two panes below fill the window.

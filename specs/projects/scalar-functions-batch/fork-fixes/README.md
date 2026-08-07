@@ -24,10 +24,13 @@ That surfaced **four narrow divergences**. After a CONFIRM-FIRST re-check with c
 **three were confirmed real and function-local** and each was fixed on its own branch; the fourth
 is an engine-operator issue **deferred** off the critical path.
 
-**The batch's real deliverable = 4 fork branches / PRs:**
+**The batch's real deliverable = 3 fork branches / PRs (a 4th, DOLLAR, was withdrawn — below):**
 
 - **TRIM fix** (`fix/trim-internal-runs`) — the one net-new behavior fix from the original scope.
-- **DOLLAR** (`fix/dollar-negative-zero`) — negative-zero-guard correctness fix.
+- **DOLLAR** (`fix/dollar-negative-zero`) — **WITHDRAWN: the fix was wrong.** Excel returns
+  `($0.00)` for `DOLLAR(-0.001,2)`, so IronCalc was already correct (upstream
+  ironcalc/IronCalc#1293, closed — Google Sheets is what returns `$0.00`). Reverted out of
+  `freecell-fixes` (`8a79a7f6`) and the branch deleted deliberately; nothing to re-land.
 - **ADDRESS** (`fix/address-empty-sheet`) — empty-`sheet_text` prefix correctness fix (O-4 edge).
 - **XMATCH** (`fix/xmatch-array-constant`) — accept array constants as `lookup_array`.
 
@@ -40,7 +43,7 @@ operator** bug, not a SUMPRODUCT bug — spun out as a **deferred** off-critical
 Per-phase records: `phase_plans/phase_{1,3,4,5,6,7,8,9,10}.md`. One additional owner-decided
 **SKIP** stands (CHAR/CODE 5 undefined CP1252 slots — acceptable divergence).
 
-## Status table (7 verified-and-skipped · 4 landed = TRIM + DOLLAR + ADDRESS + XMATCH · 1 deferred)
+## Status table (7 verified-and-skipped · 3 landed = TRIM + ADDRESS + XMATCH · 1 withdrawn = DOLLAR · 1 deferred)
 
 | # | Branch | Function(s) | Impl fn (module) | Verified vs §3 | `freecell-fixes` | Upstream PR | State |
 |---|--------|-------------|----------------------------------|-------|------------------|-------------|-------|
@@ -50,20 +53,20 @@ Per-phase records: `phase_plans/phase_{1,3,4,5,6,7,8,9,10}.md`. One additional o
 | 4 | ~~`fix/replace`~~ | REPLACE | `fn_replace` `text/string_format.rs:207` | §3.3 — all pass | inherited | n/a | **already present — verified, branch skipped** |
 | 5 | ~~`fix/char-code`~~ | CHAR + CODE | `fn_char`, `fn_code` `text/char_code.rs` | §3.4/§3.5 — all pass; 5 undefined CP1252 slots = owner SKIP | inherited | n/a | **already present (CP1252) — verified, branch skipped** |
 | 6 | ~~`fix/clean`~~ | CLEAN | `fn_clean` `text/char_code.rs:137` | §3.6 — all pass (0–31 only) | inherited | n/a | **already present — verified, branch skipped** |
-| 7 | `fix/dollar-negative-zero` | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — divergence (neg-zero → `($0.00)`) **confirmed + FIXED** | ✅ (merge `6163e084`) | ✅ prep (below) | **landed + pushed** — branch `aa36a177` |
+| 7 | ~~`fix/dollar-negative-zero`~~ | DOLLAR | `fn_dollar` `text/string_format.rs:60` | §3.7 — the expectation was wrong: Excel returns `($0.00)` | ⛔ reverted (`8a79a7f6`) | ⛔ withdrawn — ironcalc/IronCalc#1293 closed | **WITHDRAWN — the fix was incorrect**, so IronCalc's `($0.00)` stands (Google Sheets is what returns `$0.00`). Revert complete, branch deleted deliberately; nothing to re-land. |
 | 8 | ~~`fix/percentile-quartile-inc`~~ | PERCENTILE(.INC) + QUARTILE(.INC) | `fn_percentile_inc` `statistical/percentile.rs:44`, `fn_quartile_inc` `statistical/quartile.rs` | §3.9/§3.10 — all pass; legacy routes to inclusive | inherited | n/a | **already present — verified, branch skipped** |
 | 9 | `fix/address-empty-sheet` | ADDRESS | `fn_address` `lookup_and_reference/address_areas.rs:18` | §3.8 — divergence (empty sheet → `$A$1`) **confirmed + FIXED** | ✅ (merge `582a78b1`) | ✅ prep (below) | **landed + pushed** — branch `09259476` |
 | 10 | `fix/xmatch-array-constant` | XMATCH | `fn_xmatch` `lookup_and_reference/xmatch.rs` | §3.11 — divergence (array-constant → `#VALUE!`) **confirmed + FIXED** | ✅ (merge `9161a463`) | ✅ prep (below) | **landed + pushed** — branch `f9d1f9ce` |
 
-Rows #2, #7, #9, #10 are real branches/PRs. Rows #3–6, #8 are inherited from upstream `main` and
-verified in place — no `fix/*` branch, no upstream PR. Row #1 (SUMPRODUCT) is verified in place; its
-divergence is deferred as an operator-level follow-on (below).
+Rows #2, #9, #10 are real branches/PRs; row #7 was withdrawn. Rows #3–6, #8 are inherited from
+upstream `main` and verified in place — no `fix/*` branch, no upstream PR. Row #1 (SUMPRODUCT) is
+verified in place; its divergence is deferred as an operator-level follow-on (below).
 
 ## Divergences found during verification
 
 | Function | §ref | Spec expects | Fork actual (before) | Disposition |
 |---|---|---|---|---|
-| DOLLAR | §3.7 | `DOLLAR(-0.001,2)` → `$0.00` | `($0.00)` | **FIXED** — `fix/dollar-negative-zero` (`aa36a177`). Rounds-to-zero unsigned guard in `fn_dollar`. |
+| DOLLAR | §3.7 | ~~`DOLLAR(-0.001,2)` → `$0.00`~~ | `($0.00)` | **NOT a divergence — the spec expectation was wrong.** Excel returns `($0.00)` (ironcalc/IronCalc#1293, closed); Google Sheets is what returns `$0.00`. The fix was reverted out of `freecell-fixes` and its branch deleted. |
 | ADDRESS | §3.8 (O-4) | `ADDRESS(1,1,1,TRUE,"")` → `!$A$1` | `$A$1` | **FIXED** — `fix/address-empty-sheet` (`09259476`). Present-empty `sheet_text` emits the `!` prefix. |
 | XMATCH | §2.5 | accepts array constants | `#VALUE!` on `{...}` | **FIXED** — `fix/xmatch-array-constant` (`f9d1f9ce`). Materialize `CalcResult::Array` as well as `Range`; function-local. |
 | SUMPRODUCT | §3.1 | `SUMPRODUCT(--(cond))` counts → `2` | `0` | **DEFERRED** — root cause is the unary-minus operator (`=--TRUE`→`TRUE` not `1`), not SUMPRODUCT. Broad blast radius, out of this batch's scope. → `projects/unary-minus-boolean-coercion.md` (PROJECTS.md). Workarounds `1*(cond)` and `(A=x)*(B)` work today. |
@@ -78,7 +81,7 @@ an upstream landing — hide/unhide was already upstream in `gaps_closing_7_15`)
 - `git merge-base --is-ancestor <upstream-sha> origin/freecell-fixes` when a specific commit is suspected.
 - **CHAR/CODE, PERCENTILE/QUARTILE, and TRIM especially** may already exist (common functions; TRIM
   already exists — this is a body fix). If a name already computes correctly → **skip / record "already
-  present"**. If it exists but is wrong (a missing DOLLAR neg-zero guard, an ADDRESS empty-sheet prefix,
+  present"**. If it exists but is wrong (an ADDRESS empty-sheet prefix,
   XMATCH not accepting array constants) → the branch is a **correctness fix** to the existing impl.
 
 ## Upstream PR prep (agent preps; owner opens)
@@ -110,29 +113,6 @@ For each branch, once green on `freecell-fixes`:
   >
   > Minimal repro: `TRIM("a    b")` → `"a b"` (previously `"a    b"`). The `0x20`-only scope is proven by
   > `TRIM("a"&CHAR(9)&CHAR(9)&"b")` keeping its tabs and `TRIM(CHAR(160)&"x"&CHAR(160))` keeping its NBSPs.
-  >
-  > tests included: `base/src/test/text_functions/mod.rs`
-
-### `fix/dollar-negative-zero` — Fix DOLLAR to not parenthesize a value that rounds to zero
-
-- **Compare link:** https://github.com/ironcalc/IronCalc/compare/main...scosman:ironcalc:fix/dollar-negative-zero
-- **Branch commit:** `aa36a177` (off `main`) · **`freecell-fixes` merge:** `6163e084` · both pushed to `scosman/ironcalc`.
-- **Title:** `Fix DOLLAR to not parenthesize a value that rounds to zero`
-- **Body:**
-
-  > DOLLAR formats a number as currency text and wraps **negatives** in parentheses (no minus sign):
-  > `DOLLAR(-1234.567, 2)` → `($1,234.57)`. But a negative `number` whose magnitude **rounds to zero**
-  > must render as the unsigned `$0.00`, not `($0.00)` — Excel reserves the parenthesized form for values
-  > that are still non-zero after rounding. The fork applied the parenthesized-negative format whenever
-  > `value < 0.0`, before checking whether the rounded magnitude was zero, so `DOLLAR(-0.001, 2)` returned
-  > `($0.00)`.
-  >
-  > The fix, localized to `fn_dollar` (`base/src/functions/text/string_format.rs`), detects the
-  > rounds-to-zero case from the already-formatted magnitude (only `0`, `,`, `.` remain) and emits the
-  > non-negative form for it. A value still non-zero after rounding stays parenthesized.
-  >
-  > Minimal repro: `DOLLAR(-0.001, 2)` → `$0.00` (previously `($0.00)`); `DOLLAR(-50, -3)` → `$0`. Real
-  > negatives unchanged: `DOLLAR(-1234.567, 2)` → `($1,234.57)`.
   >
   > tests included: `base/src/test/text_functions/mod.rs`
 
@@ -190,9 +170,9 @@ For each branch, once green on `freecell-fixes`:
    `freecell-fixes` and push (`git am < NNNN-<slug>.patch`), then re-pin FreeCell
    (`cd app && cargo update -p ironcalc_base -p ironcalc`). (All 4 branches pushed cleanly this
    round — no patches needed.)
-2. Open the **4** upstream PRs from the compare links above (`fix/trim-internal-runs`,
-   `fix/dollar-negative-zero`, `fix/address-empty-sheet`, `fix/xmatch-array-constant`), on sign-off.
-   (Rows #3–6, #8 need no PR — already upstream, verified in place.)
+2. Open the **3** upstream PRs from the compare links above (`fix/trim-internal-runs`,
+   `fix/address-empty-sheet`, `fix/xmatch-array-constant`), on sign-off. (Rows #3–6, #8 need no
+   PR — already upstream, verified in place. Row #7, DOLLAR, is withdrawn — see above.)
 3. As each merges upstream, it returns via the next `main` sync — then drop the local `fix/*`
    branch and its `freecell-fixes` merge.
 4. **Deferred — SUMPRODUCT `--` / unary-minus** (`projects/unary-minus-boolean-coercion.md`): an

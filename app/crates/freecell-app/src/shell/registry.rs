@@ -5,9 +5,12 @@
 //! welcome window is up, and answers the three lifecycle questions the GPUI layer asks:
 //!
 //! 1. **Open dedupe** — is a file already open (`resolve_open`)? (`functional_spec.md §5.1`).
-//! 2. **Quit-when-empty** — did the last window just close (`is_empty`)? The welcome window
-//!    counts toward the open count, so closing it with no workbook windows also quits
-//!    (`functional_spec.md §2`).
+//! 2. **Is anything still open?** — `is_empty`, which the welcome and About windows count
+//!    toward (`functional_spec.md §2`). It answers *"are we down to zero windows"*, **not**
+//!    *"should the process exit"* — terminating on that condition is gpui's `QuitMode` policy
+//!    (quit off macOS, stay resident in the Dock on macOS, see `FreeCellApp::init`). Its caller
+//!    is the macOS Dock reopen, which asks it welcome-vs-activate
+//!    ([`reopen_action`](super::lifecycle::reopen_action)).
 //! 3. **Quit prompt order** — which open windows are dirty, front-to-back (`dirty_among`)?
 //!
 //! Windows are identified by an opaque [`WindowKey`] the registry assigns; the GPUI layer
@@ -125,10 +128,13 @@ impl WindowRegistry {
             .unwrap_or(OpenOutcome::OpenNew)
     }
 
-    /// Marks the welcome window as open/closed. It counts toward [`open_count`] so that
-    /// closing it with no workbook windows quits the app (`functional_spec.md §2`).
+    /// Marks the welcome window as open/closed. It counts toward [`open_count`] so that closing
+    /// it with no workbook windows leaves the app with nothing open — ending the session on
+    /// Windows/Linux, and on macOS leaving it resident in the Dock (`functional_spec.md §2`; see
+    /// [`is_empty`] for who acts on that).
     ///
     /// [`open_count`]: Self::open_count
+    /// [`is_empty`]: Self::is_empty
     pub fn set_welcome_open(&mut self, open: bool) {
         self.welcome_open = open;
     }
@@ -139,10 +145,12 @@ impl WindowRegistry {
     }
 
     /// Marks the standalone About window as open/closed. Like the welcome window it counts toward
-    /// [`open_count`] so that closing it as the last window quits the app (`functional_spec.md
-    /// §4`).
+    /// [`open_count`], so closing it as the last window ends the session on Windows/Linux and
+    /// leaves the app resident in the Dock on macOS (`functional_spec.md §4`; see [`is_empty`]
+    /// for who acts on that).
     ///
     /// [`open_count`]: Self::open_count
+    /// [`is_empty`]: Self::is_empty
     pub fn set_about_open(&mut self, open: bool) {
         self.about_open = open;
     }
@@ -158,14 +166,17 @@ impl WindowRegistry {
     }
 
     /// The total open-window count = workbook windows + the welcome window (if up) + the About
-    /// window (if up). The app quits when this reaches zero.
+    /// window (if up). Reaching zero ends the session off macOS — see [`is_empty`](Self::is_empty)
+    /// for who acts on that and what macOS does instead.
     pub fn open_count(&self) -> usize {
         self.windows.len() + usize::from(self.welcome_open) + usize::from(self.about_open)
     }
 
-    /// Whether no windows remain open at all — the app should quit
-    /// (`components/app_shell.md`: "the registry quits the app when its window count reaches
-    /// zero").
+    /// Whether no windows remain open at all (`functional_spec.md §2.3`). gpui terminates the app
+    /// on that condition off macOS (its `QuitMode`, set in `FreeCellApp::init` — the registry is
+    /// not consulted); on macOS the app stays resident in the Dock, and this emptiness is what
+    /// decides welcome-vs-activate when the Dock icon is clicked
+    /// ([`reopen_action`](super::lifecycle::reopen_action)).
     pub fn is_empty(&self) -> bool {
         self.open_count() == 0
     }
@@ -270,7 +281,7 @@ mod tests {
         reg.set_welcome_open(false); // welcome closes when the workbook opens
         assert!(!reg.is_empty());
         reg.remove(w);
-        assert!(reg.is_empty(), "last window closing → app quits");
+        assert!(reg.is_empty(), "last window closing empties the registry");
     }
 
     #[test]

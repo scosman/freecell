@@ -624,6 +624,11 @@ impl ChromeView {
             // Find & Replace trigger (`ui_design.md §2`): toggles the find bar; `selected` (accent)
             // while it is open, so it reads as a toggle. `icons/search.svg` resolves from the
             // gpui-component bundle (the magnifier the bundle already ships + tints).
+            //
+            // The tooltip advertises ⌘F even though the shortcut only ever *opens* while the button
+            // toggles (`functional_spec.md §4.2`). That is deliberate and matches how menus/tooltips
+            // conventionally surface an accelerator: it exists to make the shortcut discoverable for
+            // the action the user came here for (find), not to promise the two are interchangeable.
             .child(
                 // Find is a *read* — it stays available in degraded/read-only mode (only the bar's
                 // Replace / Replace All are gated on `degraded`).

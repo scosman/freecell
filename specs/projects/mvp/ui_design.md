@@ -209,8 +209,9 @@ dialogs are an acceptable fallback — native preferred.
 ## 5. Navigation model
 
 - **Welcome → documents**: Welcome opens at launch only; any document window opening
-  closes it. Closing the last window (Welcome or document) quits the app. No other
-  global navigation.
+  closes it. Closing the last window (Welcome or document) quits the app on
+  Windows/Linux; on macOS the app stays in the Dock and a Dock-icon click re-opens
+  Welcome. No other global navigation.
 - **Within a document**: single screen; sheet tabs are the only intra-document
   navigation. No panels, sidebars, or settings surfaces in MVP.
 - **Focus model**: exactly one of {grid, data-row field, tab-rename field} holds

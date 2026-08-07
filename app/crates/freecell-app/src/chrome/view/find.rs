@@ -178,7 +178,9 @@ impl ChromeView {
 
     // ---- Find / replace behavior (`functional_spec.md §4`) --------------------------------
 
-    /// Toggle the find bar open/closed (⌘F, Esc, or the action-row search button).
+    /// Toggle the find bar open/closed (the action-row search button, which renders as a toggle).
+    /// The ⌘F shortcut deliberately does **not** go through here — see [`show_find`](Self::show_find)
+    /// and `functional_spec.md §4.2`.
     pub fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find_open {
             self.close_find(window, cx);
@@ -187,25 +189,61 @@ impl ChromeView {
         }
     }
 
+    /// The find shortcut (⌘F / Ctrl-F, Edit ▸ Find…): **always** shows the find bar and never
+    /// dismisses it (`functional_spec.md §4.2`). Pressing it again while the bar is open keeps it
+    /// open, pulls focus back to the find field (it may have drifted to the grid), and selects the
+    /// existing query so the next keystroke replaces it — the standard browser/editor behavior.
+    /// Dismissing stays on Esc / the bar's close button.
+    pub fn show_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_open {
+            self.open_find(window, cx);
+            return;
+        }
+        // Already open: re-focus + re-select only. Deliberately no `recompute_matches` — the match
+        // set is already live, and re-running it would yank the grid selection to the first match
+        // under the user. The Replace All notice is cleared like every other find entry point, so
+        // the counter goes back to the live "n of m" for the query about to be retyped.
+        self.replaced_notice = None;
+        let field = self.focus_find_field(window, cx);
+        if !self.find_query(cx).is_empty() {
+            // The bar is already painted, so its field is in the rendered dispatch tree and a
+            // `defer` (end of this update, once entity leases release) suffices — a full frame
+            // sooner than `on_next_frame`. That head start matters here: ⌘F on an open bar is
+            // immediately followed by typing, and a keystroke that beat the selection would append
+            // to the old query instead of replacing it.
+            window.defer(cx, Self::select_find_query(field));
+        }
+        cx.notify();
+    }
+
     /// Open the bar and focus the find field, retaining any prior find/replace text
     /// (`functional_spec.md §4.2`). A recompute picks up retained text so the counter is live on open.
-    /// Existing find text is **selected** on open (`§4.2`) by dispatching gpui-component's `SelectAll`
-    /// to the field's focus handle **after the next paint** (`on_next_frame`) — the field must be in
-    /// the rendered dispatch tree for the action to reach it (a `defer` runs before the repaint, so it
-    /// would fizzle on a freshly-opened bar).
     pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_open = true;
         self.replaced_notice = None;
-        self.find_input
-            .update(cx, |input, cx| input.focus(window, cx));
+        let field = self.focus_find_field(window, cx);
         if !self.find_query(cx).is_empty() {
-            let handle = self.find_input.read(cx).focus_handle(cx);
-            window.on_next_frame(move |window, cx| {
-                handle.dispatch_action(&gpui_component::input::SelectAll, window, cx);
-            });
+            // The bar is opening *this* update, so its field is not in the rendered dispatch tree
+            // yet and the dispatch must wait for the paint — a `defer` runs before the repaint and
+            // would fizzle.
+            window.on_next_frame(Self::select_find_query(field));
         }
         self.recompute_matches(cx);
         cx.notify();
+    }
+
+    /// Focus the find field, handing back its focus handle for [`Self::select_find_query`].
+    fn focus_find_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> FocusHandle {
+        self.find_input
+            .update(cx, |input, cx| input.focus(window, cx));
+        self.find_input.read(cx).focus_handle(cx)
+    }
+
+    /// Selects the whole find query so the next keystroke replaces it (`functional_spec.md §4.2`).
+    /// Returned as a callback rather than run inline because `SelectAll` travels the **rendered**
+    /// frame's dispatch tree — the caller schedules it for whenever `field` is painted.
+    fn select_find_query(field: FocusHandle) -> impl FnOnce(&mut Window, &mut App) {
+        move |window, cx| field.dispatch_action(&gpui_component::input::SelectAll, window, cx)
     }
 
     /// Close the bar, clear the transient match state, and return focus to the grid; the
@@ -445,9 +483,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cmd_f_opens_focuses_and_closes_find(cx: &mut TestAppContext) {
+    fn find_button_opens_focuses_and_closes_find(cx: &mut TestAppContext) {
         let h = one_sheet(cx);
-        // ⌘F path → toggle_find opens the bar.
+        // Action-row search button → toggle_find opens the bar.
         upd(&h, cx, |c, window, cx| c.toggle_find(window, cx));
         assert!(upd(&h, cx, |c, _w, _cx| c.find_is_open()));
         // Type retained across close/reopen (`functional_spec.md §4.2`).
@@ -782,5 +820,115 @@ mod tests {
             ),
             "re-scopes Find to the new sheet, got {cmds:?}"
         );
+    }
+
+    /// ⌘F is an *open*, never a toggle: pressing it again while the bar is open must leave it open
+    /// (the reported bug — "⌘F, type" silently dismissed the bar and typed into a cell), must not
+    /// hand focus back to the grid or re-run the search, and — like every other find entry point —
+    /// must drop a stale "Replaced N" notice so the counter returns to the live "n of m".
+    #[gpui::test]
+    fn cmd_f_never_closes_open_find(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        upd(&h, cx, |c, window, cx| {
+            c.show_find(window, cx);
+            c.test_find_type("hello", window, cx);
+            c.on_worker_event(WorkerEvent::ReplacedCount { n: 5 }, window, cx);
+        });
+        h.grid_requests.borrow_mut().clear();
+        h.client.take_commands();
+
+        upd(&h, cx, |c, window, cx| c.show_find(window, cx));
+
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.find_is_open()),
+            "⌘F on an open find bar keeps it open"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, cx| c.find_field_text(cx)),
+            "hello",
+            "the existing query survives"
+        );
+        assert!(
+            !h.grid_requests
+                .borrow()
+                .iter()
+                .any(|r| matches!(r, ChromeGridRequest::FocusGrid)),
+            "focus must stay in the find bar, not return to the grid"
+        );
+        assert!(
+            find_cmds(&h.client).is_empty(),
+            "re-showing must not re-run the search (it would yank the grid selection)"
+        );
+        assert_eq!(
+            upd(&h, cx, |c, _w, _cx| c.replaced_notice),
+            None,
+            "the stale Replace All notice is cleared"
+        );
+    }
+
+    /// Drives the real "bar already open, ⌘F pressed again" flow with actual paints, so `show_find`'s
+    /// deferred `SelectAll` genuinely lands: seeds `query`, paints, optionally moves focus off the bar
+    /// (modelling the grid holding it), then fires ⌘F. Returns the find field's resulting selection
+    /// range plus whether the field ended up focused.
+    fn cmd_f_on_open_bar(
+        h: &Harness,
+        cx: &mut TestAppContext,
+        query: &str,
+        focus_grid_first: bool,
+    ) -> (std::ops::Range<usize>, bool) {
+        upd(h, cx, |c, window, cx| {
+            c.show_find(window, cx);
+            c.test_find_type(query, window, cx); // caret ends collapsed at the end
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(h.window.into(), cx);
+        vcx.run_until_parked(); // paint the open bar so its field is in the dispatch tree
+        let focused = h
+            .window
+            .update(&mut vcx, |_root, window, cx| {
+                h.chrome.update(cx, |c, cx| {
+                    if focus_grid_first {
+                        let grid_focus = cx.focus_handle();
+                        window.focus(&grid_focus, cx);
+                    }
+                    c.show_find(window, cx);
+                    c.find_input.read(cx).focus_handle(cx).is_focused(window)
+                })
+            })
+            .unwrap();
+        vcx.run_until_parked(); // the deferred SelectAll lands here
+        let range = h
+            .window
+            .update(&mut vcx, |_root, _window, cx| {
+                h.chrome.read(cx).find_selection(cx)
+            })
+            .unwrap();
+        (range, focused)
+    }
+
+    /// The exact reported workflow: the bar is open but focus has drifted to the grid, the user hits
+    /// ⌘F and types. The bar must stay open, focus must come back to the find field, and the whole
+    /// existing query must be selected so the keystrokes start a new search instead of a cell edit.
+    #[gpui::test]
+    fn cmd_f_from_grid_refocuses_and_selects_query(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        let (range, focused) = cmd_f_on_open_bar(&h, cx, "hello", true);
+        assert!(
+            upd(&h, cx, |c, _w, _cx| c.find_is_open()),
+            "⌘F must not dismiss the bar"
+        );
+        assert!(
+            focused,
+            "⌘F must return keyboard focus to the find field so the next keystroke searches"
+        );
+        assert_eq!(range, 0..5, "the whole existing query is selected");
+    }
+
+    /// The same re-selection when focus never left the find field (⌘F pressed twice in a row).
+    #[gpui::test]
+    fn cmd_f_reselects_query_when_field_already_focused(cx: &mut TestAppContext) {
+        let h = one_sheet(cx);
+        let (range, focused) = cmd_f_on_open_bar(&h, cx, "foo", false);
+        assert!(focused, "the find field keeps focus");
+        assert_eq!(range, 0..3, "the whole existing query is re-selected");
     }
 }

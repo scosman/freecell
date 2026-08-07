@@ -139,6 +139,47 @@ const UNSUPPORTED_CHART_GROUPS: &[&str] = &[
 /// scaling, so they are line-scoped in [`unsupported_axis_scaling`].
 const RENDER_AFFECTING_PRESENCE_MARKERS: &[&str] = &["gradFill", "pattFill"];
 
+/// Every chart-group element name OOXML defines for a `c:plotArea` (the complete `CT_PlotArea`
+/// group set) — the supported 2-D set, the 3-D set, and the ones we cannot draw at all. This is
+/// the *counting* set for [`has_multiple_chart_groups`], so it must be the complete list rather
+/// than the subset we parse: a `barChart` + `surfaceChart` combo is still a combo.
+///
+/// [`UNSUPPORTED_CHART_GROUPS`] and [`CHART_GROUPS_3D`] are subsets of this list (asserted by
+/// `list_subsets_are_countable`): a name in either that is missing here would be classified but
+/// never *counted*, blinding the combo detector to combos involving it.
+///
+/// `freecell-engine`'s `chart::load::CHART_GROUP_TAGS` is the narrower "groups we can turn into a
+/// `ChartKind`" list; a guard test there asserts it stays a subset of this one, so adding support
+/// for a new group cannot leave this counter blind to it.
+pub const CHART_GROUP_ELEMENTS: &[&str] = &[
+    "areaChart",
+    "area3DChart",
+    "barChart",
+    "bar3DChart",
+    "bubbleChart",
+    "doughnutChart",
+    "lineChart",
+    "line3DChart",
+    "ofPieChart",
+    "pieChart",
+    "pie3DChart",
+    "radarChart",
+    "scatterChart",
+    "stockChart",
+    "surfaceChart",
+    "surface3DChart",
+];
+
+/// The extended-chart namespace URI, as declared on a `cx:chartSpace` root (see
+/// [`is_extended_chart`]). Matching the **declaration** rather than the bare substring
+/// `"chartex"` is the point: `xml.contains("chartex")` tests a seven-letter string against the
+/// entire part text, including every cached category label, series name and formatted string in
+/// the file. A chart whose data contains the word — a category called `"chartex"`, a series named
+/// after a `chartex` column — was classified `Unsupported` and replaced with the placeholder,
+/// hiding a perfectly renderable chart. Demonstrated in
+/// `a_literal_chartex_string_in_content_is_not_an_extended_chart`.
+const NS_CHARTEX: &str = "http://schemas.microsoft.com/office/drawing/2014/chartex";
+
 /// Map a **3-D** chart-group element local-name to its **2-D** equivalent element local-name
 /// (charts/functional_spec §5): `bar3DChart→barChart`, `line3DChart→lineChart`,
 /// `pie3DChart→pieChart`, `area3DChart→areaChart`. Returns `None` for anything else.
@@ -188,41 +229,29 @@ pub fn source_fidelity(chart_xml: &str) -> Fidelity {
     Fidelity::Faithful
 }
 
-/// Every chart-group element name OOXML defines for a `c:plotArea` — the supported 2-D set, the
-/// 3-D set, and the ones we cannot draw at all. This is the *counting* set for
-/// [`has_multiple_chart_groups`], so it must be the complete list rather than the subset we parse:
-/// a `barChart` + `surfaceChart` combo is still a combo.
-///
-/// `freecell-engine`'s `chart::load::CHART_GROUP_TAGS` is the narrower "groups we can turn into a
-/// `ChartKind`" list; a guard test there asserts it stays a subset of this one, so adding support
-/// for a new group cannot leave this counter blind to it.
-pub const CHART_GROUP_ELEMENTS: &[&str] = &[
-    "areaChart",
-    "area3DChart",
-    "barChart",
-    "bar3DChart",
-    "bubbleChart",
-    "doughnutChart",
-    "lineChart",
-    "line3DChart",
-    "ofPieChart",
-    "pieChart",
-    "pie3DChart",
-    "radarChart",
-    "scatterChart",
-    "stockChart",
-    "surfaceChart",
-    "surface3DChart",
-];
-
-/// A **combo chart**: more than one chart-group element in the plot area (Excel's ordinary
+/// A **combo chart**: more than one chart-group element **anywhere in the part** (Excel's ordinary
 /// bar+line, or anything with a secondary axis).
 ///
-/// The parser (`freecell-engine::chart::load::parse_chart_xml`) keeps only the **first** group and
-/// silently discards the rest, so the line series of a bar+line combo is simply **absent from the
-/// picture**. Before this check, `source_fidelity` never counted groups, so such a chart was
-/// classified `Faithful` and drawn with no badge — a chart missing half its data, presented as
-/// exact. Counting the groups makes the failure **honest**; drawing them properly is unit G1b.
+/// The parser (`freecell-engine::chart::load::parse_chart_xml`) keeps only the first group it
+/// *recognizes* and silently discards the rest, so the line series of a bar+line combo is simply
+/// **absent from the picture**. Before this check, `source_fidelity` never counted groups, so such
+/// a chart was classified `Faithful` and drawn with no badge — a chart missing half its data,
+/// presented as exact. Counting the groups makes the failure **honest**; drawing them properly is
+/// unit G1b.
+///
+/// **Scope of the scan.** It counts over the whole part, not a `c:plotArea` span: the flat
+/// scanner has no element nesting, and a chart-group element is only *legal* inside `c:plotArea`
+/// anyway, so bounding the span would buy nothing against well-formed input while making the
+/// detector fail closed on fragments that carry a group without the surrounding `c:plotArea`
+/// (every group-level unit test here, and any patched-source fragment). A group name in a tail
+/// outside `c:plotArea` therefore counts — see the blind-spot list on [`opening_tags`] for the
+/// (all malformed-or-exotic) shapes that can produce one.
+///
+/// **Known over-count.** An *empty* chart-group element (a second group carrying no `c:ser`)
+/// counts as a group and yields `Degraded` although nothing is actually dropped. Excel does not
+/// write one, and distinguishing it needs the group's children — i.e. nesting, which is exactly
+/// what this classifier deliberately does not do (see the module docs). A too-honest badge on a
+/// degenerate part is the right side to err on; G1b's real multi-group parse removes the question.
 ///
 /// Ordering note: this sits *after* [`is_unsupported_chart`] so a plot area combining an
 /// unsupported group with a supported one stays `Unsupported` (the stronger verdict) rather than
@@ -298,23 +327,69 @@ fn unsupported_data_point(xml: &str) -> bool {
 }
 
 /// The `cx:` extended-chart family (sunburst, treemap, waterfall, histogram, box-&-whisker,
-/// funnel, region map): a different schema (`.../2014/chartex`) we don't render. The retained
-/// part declares that namespace, so its URI fragment is a reliable marker.
+/// funnel, region map): a different schema (`.../2014/chartex`) we don't render.
+///
+/// Tests the **root element**, not the part text (architecture §7): the part is extended iff its
+/// root is a `chartSpace` whose own namespace prefix is **declared** as [`NS_CHARTEX`]. Both
+/// halves are load-bearing, and each rules out a false positive that hid a renderable chart behind
+/// the placeholder:
+/// - *free text* — the URI appearing as a cached string value (`<c:v>http://…/chartex</c:v>`) or
+///   any other content is not a declaration and does not match
+///   (`the_chartex_uri_as_cached_content_is_not_an_extended_chart`);
+/// - *a mere declaration* — a classic `<c:chartSpace … xmlns:cx="…/chartex">` that declares the
+///   namespace without its root living in it is an ordinary `c:` chart
+///   (`a_classic_chart_that_merely_declares_the_cx_namespace_is_not_extended`). Excel writes such
+///   declarations on the root of ordinary parts, so matching a declaration alone would badge real
+///   files.
+///
+/// A genuine extended part's root is always `cx:chartSpace` in the 2014 namespace, whatever its
+/// prefix spelling; the later variant namespaces (`cx1`…`cx8`, `…/2015/9/8/chartex` and friends)
+/// only ever appear as *extra* declarations beside it, so resolving the **root's own** prefix is
+/// both necessary and sufficient (`a_cx_part_declaring_variant_namespaces_is_still_extended`).
+/// Belt and braces: an unparseable `cx:` part becomes `ChartBody::Unsupported` in
+/// `freecell-engine::chart::load::parse_discovered_chart` regardless of this predicate.
 fn is_extended_chart(xml: &str) -> bool {
-    xml.contains(NS_CHARTEX)
+    let Some((qname, attrs)) = root_element(xml) else {
+        return false;
+    };
+    let (prefix, local_name) = match qname.split_once(':') {
+        Some((prefix, local_name)) => (Some(prefix), local_name),
+        None => (None, qname),
+    };
+    if local_name != "chartSpace" {
+        return false;
+    }
+    let declared = match prefix {
+        Some(prefix) => attr_value(attrs, &format!("xmlns:{prefix}")),
+        None => attr_value(attrs, "xmlns"),
+    };
+    declared == Some(NS_CHARTEX)
 }
 
-/// The extended-chart namespace URI. Matching the **full URI** rather than the bare substring
-/// `"chartex"` is the point: `xml.contains("chartex")` tests a seven-letter string against the
-/// entire part text, including every cached category label, series name and formatted string in
-/// the file. A chart whose data contains the word — a category called `"chartex"`, a series named
-/// after a `chartex` column — was classified `Unsupported` and replaced with the placeholder,
-/// hiding a perfectly renderable chart. Demonstrated in
-/// `a_literal_chartex_string_in_content_is_not_an_extended_chart`.
-///
-/// The URI is long, specific, and appears only in a namespace declaration, so it cannot collide
-/// with content in the same way.
-const NS_CHARTEX: &str = "http://schemas.microsoft.com/office/drawing/2014/chartex";
+/// The document's **root element**, as `(qualified name, attribute text)` — e.g.
+/// `("cx:chartSpace", " xmlns:cx=\"…\"")`. Skips the XML declaration, comments, and a doctype
+/// (each of which may itself contain a `<`), so the first thing returned is a real start tag.
+/// Returns `None` for text with no element at all.
+fn root_element(xml: &str) -> Option<(&str, &str)> {
+    let mut from = 0;
+    loop {
+        let start = from + xml[from..].find('<')?;
+        let rest = &xml[start + 1..];
+        if let Some(comment) = rest.strip_prefix("!--") {
+            // Skip the whole comment: its body may contain `<` and even a full element.
+            from = start + 4 + comment.find("-->").map_or(comment.len(), |end| end + 3);
+        } else if rest.starts_with('?') || rest.starts_with('!') || rest.starts_with('/') {
+            // XML/processing declaration, doctype, or a stray closing tag — skip past its `>`.
+            from = start + 1 + tag_close_offset(rest);
+        } else {
+            let name_len = rest
+                .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            let (qname, tail) = rest.split_at(name_len);
+            return Some((qname, &tail[..tag_close_offset(tail)]));
+        }
+    }
+}
 
 /// Axis `c:scaling` features the renderer honors only on a **line** chart (P13): explicit
 /// `c:min`/`c:max` bounds and a reversed `c:orientation val="maxMin"`. On a `lineChart` the renderer
@@ -527,57 +602,58 @@ fn contains_element(xml: &str, local_name: &str) -> bool {
     any_opening_tag(xml, local_name, |_| true)
 }
 
-/// Core scanner: for every **opening** tag in `xml` whose prefix-agnostic local name is
-/// `local_name`, call `pred` with that tag's attribute text (everything between the local name
-/// and the tag-closing `>` / `/>`); return true on the first `pred` that returns true.
+/// **The** core scan: every **opening** tag in `xml` whose prefix-agnostic local name is
+/// `local_name`, yielded as that tag's attribute text (everything between the local name and the
+/// tag-closing `>` / `/>`). [`any_opening_tag`] is `.any(pred)` over it and [`count_opening_tags`]
+/// is `.count()`, so the boundary rules below exist **once** and cannot drift between the two.
 ///
 /// Tag-boundary-aware so short/benign names don't false-match: the char **after** the name must
 /// end a tag name (whitespace / `>` / `/`), and the text **before** it must open an element
 /// (`<` or `<prefix:`) — which also excludes closing tags (`</…>`) and names embedded in a
 /// longer name or an attribute value.
-/// How many **opening** tags in `xml` have the prefix-agnostic local name `local_name`. Same
-/// boundary rules as [`any_opening_tag`] (which is the early-exit form of this scan) — closing
-/// tags, longer names and attribute-value text do not count.
-fn count_opening_tags(xml: &str, local_name: &str) -> usize {
+///
+/// **Blind spots** — this is a flat scan, not a parse, so it sees start tags wherever they look
+/// like start tags. A name inside an XML **comment** (`<!-- <c:lineChart/> -->`), inside a
+/// **CDATA** section, or in the *unused* half of an `mc:AlternateContent` Choice/Fallback pair is
+/// counted like any other, which can over-count groups (a spurious `Degraded`). All three are
+/// absent from parts Excel writes, and over-badging is the safe direction. What the scan is *not*
+/// fooled by is the realistic vector: a chart-group name inside **content** — a cached series name
+/// like `&lt;c:lineChart&gt;` — because XML forbids a raw `<` in character data and in attribute
+/// values, so escaped text can never present as a tag. That is what makes a flat scan safe here.
+fn opening_tags<'a>(xml: &'a str, local_name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
     let mut from = 0;
-    let mut n = 0;
-    while let Some(rel) = xml[from..].find(local_name) {
-        let start = from + rel;
-        let end = start + local_name.len();
-        from = end;
+    std::iter::from_fn(move || {
+        while let Some(rel) = xml[from..].find(local_name) {
+            let start = from + rel;
+            let end = start + local_name.len();
+            from = end;
 
-        let after_ends_name = matches!(
-            xml[end..].chars().next(),
-            Some(c) if c == '>' || c == '/' || c.is_whitespace()
-        );
-        if after_ends_name && opens_tag_name(&xml[..start]) {
-            n += 1;
+            let after_ends_name = matches!(
+                xml[end..].chars().next(),
+                Some(c) if c == '>' || c == '/' || c.is_whitespace()
+            );
+            if !after_ends_name || !opens_tag_name(&xml[..start]) {
+                continue;
+            }
+
+            let attrs_end = end + tag_close_offset(&xml[end..]);
+            return Some(&xml[end..attrs_end]);
         }
-    }
-    n
+        None
+    })
 }
 
+/// How many **opening** tags in `xml` have the prefix-agnostic local name `local_name` — the
+/// counting form of [`opening_tags`] (same boundary rules and blind spots).
+fn count_opening_tags(xml: &str, local_name: &str) -> usize {
+    opening_tags(xml, local_name).count()
+}
+
+/// Whether any **opening** tag in `xml` with the prefix-agnostic local name `local_name` has
+/// attribute text satisfying `pred` — the short-circuiting form of [`opening_tags`] (same boundary
+/// rules and blind spots).
 fn any_opening_tag<F: Fn(&str) -> bool>(xml: &str, local_name: &str, pred: F) -> bool {
-    let mut from = 0;
-    while let Some(rel) = xml[from..].find(local_name) {
-        let start = from + rel;
-        let end = start + local_name.len();
-        from = end;
-
-        let after_ends_name = matches!(
-            xml[end..].chars().next(),
-            Some(c) if c == '>' || c == '/' || c.is_whitespace()
-        );
-        if !after_ends_name || !opens_tag_name(&xml[..start]) {
-            continue;
-        }
-
-        let attrs_end = end + tag_close_offset(&xml[end..]);
-        if pred(&xml[end..attrs_end]) {
-            return true;
-        }
-    }
-    false
+    opening_tags(xml, local_name).any(pred)
 }
 
 /// Byte offset of the `>` that closes the current opening tag, **quote-aware**: a `>` inside a
@@ -914,13 +990,61 @@ mod tests {
         }
     }
 
-    /// A 3-D group in a combo: both signals say Degraded, so the verdict is stable either way.
+    /// A 3-D group in a combo: **both** signals fire, so the verdict is stable either way. Asserted
+    /// on the two detectors directly, not just on the verdict — `source_fidelity` alone would still
+    /// say `Degraded` with the combo counter deleted (`has_3d_chart_group` covers for it), which
+    /// would make this inert as a regression guard.
     #[test]
-    fn a_three_d_combo_is_degraded() {
-        assert_eq!(
-            source_fidelity(&combo_plot_area("bar3DChart", "lineChart")),
-            Fidelity::Degraded,
+    fn a_three_d_combo_trips_both_detectors_and_is_degraded() {
+        let xml = combo_plot_area("bar3DChart", "lineChart");
+        assert!(
+            has_multiple_chart_groups(&xml),
+            "the combo counter must see bar3DChart + lineChart as two groups",
         );
+        assert!(
+            has_3d_chart_group(&xml),
+            "…and the 3-D detector must fire too"
+        );
+        assert_eq!(source_fidelity(&xml), Fidelity::Degraded);
+    }
+
+    /// The two classifying sub-lists must be **countable**: a name in either that is missing from
+    /// [`CHART_GROUP_ELEMENTS`] would be classified but never counted, blinding the combo detector
+    /// to combos involving it. One `assert!` in place of a comment (the same "two lists, nothing
+    /// enforcing agreement" shape this unit exists to remove).
+    #[test]
+    fn classifier_group_lists_are_subsets_of_the_counting_set() {
+        for group in UNSUPPORTED_CHART_GROUPS {
+            assert!(
+                CHART_GROUP_ELEMENTS.contains(group),
+                "{group} is classified Unsupported but is absent from CHART_GROUP_ELEMENTS, so \
+                 has_multiple_chart_groups cannot count it",
+            );
+        }
+        for group in CHART_GROUPS_3D {
+            assert!(
+                CHART_GROUP_ELEMENTS.contains(group),
+                "{group} is classified 3-D but is absent from CHART_GROUP_ELEMENTS, so \
+                 has_multiple_chart_groups cannot count it",
+            );
+        }
+    }
+
+    /// The 3-D **normalizer** and [`CHART_GROUPS_3D`] must agree in both directions. The forward
+    /// direction is `chart_groups_3d_const_matches_normalizer`; this is the reverse — a fifth 3-D
+    /// mapping added to `normalize_3d_chart_group` without being added to the const (which
+    /// `freecell-engine`'s `is_chart_group` would then parse while the detectors stayed blind to
+    /// it). `CHART_GROUP_ELEMENTS` is the complete `CT_PlotArea` set, so any real chart group is in
+    /// it — that makes it a sound universe to quantify over.
+    #[test]
+    fn no_group_normalizes_to_2d_without_being_listed_as_3d() {
+        for group in CHART_GROUP_ELEMENTS {
+            assert_eq!(
+                normalize_3d_chart_group(group).is_some(),
+                CHART_GROUPS_3D.contains(group),
+                "{group}: the normalizer and CHART_GROUPS_3D disagree about whether it is 3-D",
+            );
+        }
     }
 
     /// A `c:barChart` closing tag must not be counted as a second group — the scanner is
@@ -952,6 +1076,86 @@ mod tests {
             Fidelity::Faithful,
             "a series named after `chartex` is an ordinary bar chart, not an extended one",
         );
+    }
+
+    /// **False positive 1 for a `contains`-shaped predicate.** A perfectly ordinary `c:` chart may
+    /// *declare* the chartex namespace on its root without using it (Excel writes such spare
+    /// declarations, and `mc:Ignorable` lists them). Matching the declaration — or the URI as free
+    /// text — would replace a renderable bar chart with the "unsupported chart" placeholder.
+    #[test]
+    fn a_classic_chart_that_merely_declares_the_cx_namespace_is_not_extended() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+                      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                      xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                      xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"
+                      mc:Ignorable="cx">
+          <c:chart><c:plotArea><c:layout/>
+            <c:barChart><c:ser><c:idx val="0"/></c:ser></c:barChart>
+          </c:plotArea></c:chart>
+        </c:chartSpace>"#;
+        assert!(
+            !is_extended_chart(xml),
+            "a c:chartSpace root is a classic chart however many namespaces it declares",
+        );
+        assert_eq!(source_fidelity(xml), Fidelity::Faithful);
+    }
+
+    /// **False positive 2.** The full URI as a *cached string value* — a chart of URLs, or a
+    /// category literally naming the schema. Content is not a declaration.
+    #[test]
+    fn the_chartex_uri_as_cached_content_is_not_an_extended_chart() {
+        let xml = format!(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+              <c:chart><c:plotArea><c:layout/>
+                <c:barChart><c:ser><c:cat><c:strRef><c:strCache>
+                  <c:ptCount val="1"/><c:pt idx="0"><c:v>{NS_CHARTEX}</c:v></c:pt>
+                </c:strCache></c:strRef></c:cat></c:ser></c:barChart>
+              </c:plotArea></c:chart>
+            </c:chartSpace>"#
+        );
+        assert!(!is_extended_chart(&xml));
+        assert_eq!(source_fidelity(&xml), Fidelity::Faithful);
+    }
+
+    /// The variant-namespace assumption, made explicit: a real extended part declares the later
+    /// `cx1`…`cx8` schemas **beside** the 2014 one, and its root still lives in the 2014 namespace.
+    /// Resolving the root's own prefix must therefore still say Unsupported — and must not be
+    /// confused by `xmlns:cx1` sitting next to `xmlns:cx` (whole-attribute-name matching).
+    #[test]
+    fn a_cx_part_declaring_variant_namespaces_is_still_extended() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <cx:chartSpace xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex"
+                       xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"
+                       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <cx:chartData><cx:data id="0"/></cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="waterfall"/>
+          </cx:plotAreaRegion></cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        assert!(is_extended_chart(xml));
+        assert_eq!(source_fidelity(xml), Fidelity::Unsupported);
+    }
+
+    /// `root_element` must step over the XML declaration, comments (whose body may itself contain a
+    /// full element) and a doctype to reach the real root.
+    #[test]
+    fn root_element_skips_prologue_noise() {
+        assert_eq!(
+            root_element("<c:chartSpace xmlns:c=\"x\"><c:chart/></c:chartSpace>"),
+            Some(("c:chartSpace", " xmlns:c=\"x\""))
+        );
+        assert_eq!(
+            root_element(
+                "<?xml version=\"1.0\"?>\n<!-- <cx:chartSpace xmlns:cx=\"chartex\"/> -->\n<c:chartSpace/>"
+            ),
+            Some(("c:chartSpace", "/"))
+        );
+        assert_eq!(root_element("no elements here"), None);
+        // A commented-out cx root does not make a classic chart extended.
+        assert!(!is_extended_chart(&format!(
+            "<!-- <cx:chartSpace xmlns:cx=\"{NS_CHARTEX}\"/> --><c:chartSpace xmlns:c=\"y\"/>"
+        )));
     }
 
     /// Build a `c:plotArea` holding two chart groups — an Excel combo.

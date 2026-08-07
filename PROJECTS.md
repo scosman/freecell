@@ -215,6 +215,17 @@ registry: each entry is a short description plus a pointer to a design note unde
   `UnsavedChanges` window is dirty, hence in-plan), and B1's worker-death teardown already uses the
   scoped `note_quit_prompt_unanswerable`. Fix all three together, gated on `QuitPlan::is_pending`,
   each with its own two-window regression test. → [`projects/quit-stand-down-scope.md`](projects/quit-stand-down-scope.md)
+- **Split `grid/view.rs` (10,627 lines)** — *Future (filed from `chrome-view-split`,
+  2026-07-28).* The grid view is **6,575 production lines** — 3.3× the 2,000-line ceiling F2 is
+  meant to enforce, and the largest file in the workspace. Not urgent (it costs velocity and bus
+  factor, not users), but it blocks F2 from being a real gate rather than a ceiling with the
+  repo's biggest file exempted. Now cheap to do: `chrome-view-split` proved the method — Rust's
+  module-descendant privacy means the child modules see the parent's private fields with zero
+  visibility changes, and the compiler names every cross-module item that needs `pub(super)`.
+  The note records the reusable procedure, what to re-measure first (does it carry the same
+  agreeing production/test banner sections that made the chrome split mechanical?), and the four
+  other files currently over the ceiling. → [`projects/grid-view-split.md`](projects/grid-view-split.md)
+
 - **Paste over a spill cell loses its content on undo (engine `paste_from_clipboard`)** — *Future
   (spotted reviewing `fix/paste-fill-relative-refs`, 2026-08-06).* A paste clears its whole
   destination rectangle up front, but a copied **spill cell** (part of a dynamic-array result)

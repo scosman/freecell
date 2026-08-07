@@ -2651,8 +2651,8 @@ impl Worker {
     /// generation still moves — that is the whole point of routing chart ops through `commit` — but
     /// a commit that provably changed no cell doesn't pay a viewport rebuild for it. That matters
     /// because a chart op is **not** always a discrete gesture: `SetChartChrome` is sent live per
-    /// keystroke while a chart/axis title is typed (`chrome/view.rs::on_chart_title_event`), and
-    /// chart ops commit one-by-one, so five characters would otherwise be five full-viewport
+    /// keystroke while a chart/axis title is typed (`chrome/view/charts.rs::on_chart_title_event`),
+    /// and chart ops commit one-by-one, so five characters would otherwise be five full-viewport
     /// rebuilds (≈20k engine probes each, 165,888 worst case). The restamp is a `Vec` clone of cells
     /// already built — no engine call at all.
     ///

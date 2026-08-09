@@ -208,6 +208,13 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 # `file-associations` block stays present + well-formed (xlsx-file-association project). `toml` is
 # already resolved at 0.8.23 in the lockfile (transitive), so pinning it adds no new crate.
 toml = "0.8"
+# The brand-asset guard (`shell::assets` tests) decodes the wordmark PNG to assert it stays cropped
+# to its ink — the invariant `WORDMARK_ASPECT` and the identity blocks' height-based sizing rest on
+# (a transparent margin would render the mark smaller than its box, and off-centre when the margin
+# is asymmetric, as the delivered export's was). `image` is already resolved at 0.25.10 in the
+# lockfile via gpui — the same decoder `gpui::img` rasterizes this PNG with — so pinning it adds no
+# new crate; `png`-only keeps the test build from pulling the other format decoders.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [lints]
 workspace = true

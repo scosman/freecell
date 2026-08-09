@@ -5,8 +5,9 @@
 //! `Render` + `Focusable` entity like [`WelcomeView`](super::WelcomeView) but **stateless** — pure
 //! static content: the app icon stacked above the FreeCell wordmark, the "The open spreadsheet"
 //! tagline, the build version (`env!("CARGO_PKG_VERSION")`), a hairline, then two label→value link
-//! rows (Homepage / Built with). The icon + wordmark are painted from vendored brand SVGs
-//! (`super::assets`), not font-rendered. Links open in the user's default browser via gpui's
+//! rows (Homepage / Built with). The icon + wordmark are painted from vendored brand art
+//! (`super::assets` — an SVG icon, a PNG wordmark), not font-rendered. Links open in the user's
+//! default browser via gpui's
 //! [`App::open_url`], with a pointer cursor (no hover underline). It registers **no document
 //! actions**, so Save / Undo / etc. are disabled while it is frontmost; the app
 //! opens/activates/tracks/closes it (`super::app`).
@@ -37,7 +38,12 @@ const ICON_SIZE: f32 = 48.0;
 
 /// The rendered height of the wordmark logotype (`img`); its width derives from
 /// [`WORDMARK_ASPECT`]. Matched to the welcome window's wordmark for one consistent brand mark.
-const WORDMARK_H: f32 = 24.0;
+///
+/// This is the height of the *visible* logotype, because the art is cropped to its ink
+/// ([`WORDMARK_ASSET`]). The previous SVG's box carried ~12% vertical padding, so its nominal 24
+/// drew a 21.1 px mark; 21 here keeps the rendered logotype the size it has always been rather
+/// than growing it by a re-crop's worth.
+const WORDMARK_H: f32 = 21.0;
 
 /// The homepage repository — opened in the browser; shown as [`HOMEPAGE_LABEL`].
 const HOMEPAGE_URL: &str = "https://github.com/scosman/freecell";
@@ -151,8 +157,8 @@ fn render_body() -> impl IntoElement {
                         .debug_selector(|| "about-icon".to_string()),
                 )
                 .child(
-                    // The FreeCell wordmark logotype, painted from the vendored brand SVG
-                    // (`brand/freecell-wordmark.svg`) — the same mark the welcome window shows,
+                    // The FreeCell wordmark logotype, painted from the vendored brand art
+                    // (`brand/freecell-wordmark.png`) — the same mark the welcome window shows,
                     // replacing the old font-rendered "FreeCell". Sized by height; the width
                     // derives from the art's aspect ratio so it never distorts.
                     img(WORDMARK_ASSET)

@@ -34,7 +34,12 @@ const LEFT_PANE_WIDTH: f32 = 264.0;
 
 /// The rendered height of the wordmark logotype (`img`); its width derives from
 /// [`WORDMARK_ASPECT`]. Matched to the About window's wordmark for one consistent brand mark.
-const WORDMARK_H: f32 = 28.0;
+///
+/// This is the height of the *visible* logotype, because the art is cropped to its ink
+/// (`assets::WORDMARK_ASSET`). The previous SVG's box carried ~12% vertical padding, so its nominal
+/// 28 drew a 24.7 px mark; 24.5 here keeps the rendered logotype the size it has always been rather
+/// than growing it by a re-crop's worth.
+const WORDMARK_H: f32 = 24.5;
 
 /// A dialog the welcome window can host when there's no document window to own it. Only the
 /// app-level error dialog remains — the About screen is a standalone window now (`shell::about`).
@@ -216,8 +221,8 @@ impl WelcomeView {
                     .flex_col()
                     .gap(px(4.0))
                     .child(
-                        // The FreeCell wordmark logotype, painted from the vendored brand SVG
-                        // (`brand/freecell-wordmark.svg`) — the same mark the About window shows,
+                        // The FreeCell wordmark logotype, painted from the vendored brand art
+                        // (`brand/freecell-wordmark.png`) — the same mark the About window shows,
                         // replacing the old font-rendered "FreeCell". Sized by height; the width
                         // derives from the art's aspect ratio so it never distorts. Wrapped in a
                         // div carrying the `debug_selector` the render/view test looks up.

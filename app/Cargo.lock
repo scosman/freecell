@@ -2053,6 +2053,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "image",
  "parking_lot",
  "tempfile",
  "toml 0.8.23",

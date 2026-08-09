@@ -18,11 +18,15 @@
 //! gpui-component's `Icon` component via `Icon::empty().path("icons/<name>.svg")`.
 //!
 //! Beyond the tintable icons, [`AppAssets`] also serves FreeCell's **full-color brand art**
-//! (`assets/brand/*.svg` — the wordmark logotype + the app icon) under the disjoint `brand/`
-//! prefix. Unlike the icons these are **not** `currentColor` masks: they carry their own fills and
-//! are painted with `gpui::img(...)` (which rasterizes the SVG at its authored colors), so the
-//! welcome / About identity blocks render the real logo instead of a font approximation. They are
-//! deliberately kept out of [`FREECELL_ICONS`] (whose tintability the icon test enforces).
+//! (`assets/brand/` — the wordmark logotype + the app icon) under the disjoint `brand/` prefix.
+//! Unlike the icons these are **not** `currentColor` masks: they carry their own colors and are
+//! painted with `gpui::img(...)` at those authored colors, so the welcome / About identity blocks
+//! render the real logo instead of a font approximation. They are deliberately kept out of
+//! [`FREECELL_ICONS`] (whose tintability the icon test enforces).
+//!
+//! The brand art is **mixed-format**: the app icon is an SVG, while the wordmark is a **PNG**
+//! (the logotype is delivered as raster art). `gpui::img` handles both, so the format is an
+//! asset-level detail — but it does change how each one's intrinsic size is validated below.
 
 use std::borrow::Cow;
 
@@ -186,7 +190,7 @@ const FREECELL_ICONS: &[(&str, &[u8])] = &[
 const FREECELL_BRAND: &[(&str, &[u8])] = &[
     (
         WORDMARK_ASSET,
-        include_bytes!("../../assets/brand/freecell-wordmark.svg"),
+        include_bytes!("../../assets/brand/freecell-wordmark.png"),
     ),
     (
         ICON_ASSET,
@@ -194,14 +198,30 @@ const FREECELL_BRAND: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// The FreeCell wordmark logotype asset (`brand/freecell-wordmark.svg`) — the "FreeCell" logotype
+/// The FreeCell wordmark logotype asset (`brand/freecell-wordmark.png`) — the "FreeCell" logotype
 /// with its green accent, painted via `gpui::img`. Replaces the old font-rendered wordmark on the
 /// welcome + About identity blocks.
-pub(crate) const WORDMARK_ASSET: &str = "brand/freecell-wordmark.svg";
+///
+/// **Raster, and cropped to the ink.** The delivered art is a PNG (not SVG), and it is vendored
+/// trimmed to its opaque bounds: the source export carried an asymmetric transparent margin (22 px
+/// left vs 11 px right of an 886×232 canvas), which would have rendered the mark ~21% smaller than
+/// the box it occupies and visibly off-centre inside a centred identity block. Cropping is lossless
+/// — every ink pixel is bit-identical to the export — and it makes the `img`'s box *be* the visible
+/// mark, so [`WORDMARK_ASPECT`] and the callers' target heights describe the logotype itself.
+pub(crate) const WORDMARK_ASSET: &str = "brand/freecell-wordmark.png";
 
-/// The wordmark's intrinsic aspect ratio (`width / height`, from its `338×69` viewBox). Used to
-/// size the `img` by a target height without distorting it.
-pub(crate) const WORDMARK_ASPECT: f32 = 338.0 / 69.0;
+/// The wordmark's intrinsic aspect ratio (`width / height`, from its `853×162` pixel size). Used to
+/// size the `img` by a target height without distorting it. Because the art is cropped to its ink
+/// (see [`WORDMARK_ASSET`]), this is the aspect of the *visible* logotype, and a caller's height is
+/// the logotype's rendered height. Pinned by `brand_assets_load_and_wordmark_matches_aspect`.
+pub(crate) const WORDMARK_ASPECT: f32 = 853.0 / 162.0;
+
+/// The wordmark PNG's intrinsic pixel size, as embedded. `gpui::img` rasterizes a PNG from its
+/// stored pixels, so this is also the resolution ceiling: at the ~21–25 px display heights the
+/// identity blocks use, 162 px of source height leaves ample headroom for 2–3× Retina scaling.
+/// Asserted against the file's real `IHDR` so the constant can't drift from the art.
+#[cfg(test)]
+const WORDMARK_PX: (u32, u32) = (853, 162);
 
 /// The FreeCell app icon asset (`brand/freecell-icon.svg`) — the Windows/Linux icon face (a dark
 /// rounded tile over a grayscale grid), square. Embedded independently of the cargo-packager
@@ -294,32 +314,81 @@ mod tests {
         }
     }
 
-    /// Every brand asset resolves through `AppAssets` to non-empty SVG bytes, and the wordmark /
-    /// icon path constants the views render point at real entries. These are full-color art (not
-    /// `currentColor` masks), so — unlike the icons — they are asserted to load and be valid SVG,
-    /// NOT to be tintable. The wordmark viewBox is checked so [`WORDMARK_ASPECT`] can't silently
-    /// drift from the art it is meant to describe.
+    /// Every brand asset resolves through `AppAssets` to non-empty bytes in the format the view
+    /// layer expects, and the wordmark / icon path constants the views render point at real
+    /// entries. These are full-color art (not `currentColor` masks), so — unlike the icons — they
+    /// are asserted to load and be well-formed art, NOT to be tintable. The brand set is
+    /// mixed-format: the icon is an SVG, the wordmark a PNG, so each is checked against its own
+    /// format. The wordmark's real `IHDR` size is read so [`WORDMARK_ASPECT`] can't silently drift
+    /// from the art it is meant to describe (the old SVG-viewBox check's raster equivalent).
     #[test]
-    fn brand_assets_load_as_svgs() {
+    fn brand_assets_load_and_wordmark_matches_aspect() {
         for (path, _) in FREECELL_BRAND {
             let bytes = AppAssets
                 .load(path)
                 .expect("load ok")
                 .unwrap_or_else(|| panic!("missing brand asset {path}"));
             assert!(!bytes.is_empty(), "empty brand asset {path}");
-            let svg = std::str::from_utf8(&bytes).expect("utf8 svg");
-            assert!(svg.contains("<svg"), "{path} is not an SVG");
+            if path.ends_with(".png") {
+                assert_eq!(
+                    &bytes[..8],
+                    b"\x89PNG\r\n\x1a\n",
+                    "{path} is not a PNG despite its extension"
+                );
+            } else {
+                let svg = std::str::from_utf8(&bytes).expect("utf8 svg");
+                assert!(svg.contains("<svg"), "{path} is not an SVG");
+            }
         }
         // The path constants the identity blocks pass to `img(...)` must resolve.
         assert!(AppAssets.load(WORDMARK_ASSET).expect("load ok").is_some());
         assert!(AppAssets.load(ICON_ASSET).expect("load ok").is_some());
-        // `WORDMARK_ASPECT` must match the wordmark's authored viewBox (338×69).
+
+        // `WORDMARK_ASPECT` must match the wordmark PNG's real pixel size. The IHDR chunk is
+        // always first and fixed-layout: 8-byte signature, 4-byte length, 4-byte type, then the
+        // big-endian u32 width + height.
         let wordmark = AppAssets.load(WORDMARK_ASSET).expect("load ok").unwrap();
-        let svg = std::str::from_utf8(&wordmark).expect("utf8 svg");
-        assert!(
-            svg.contains("width=\"338\"") && svg.contains("height=\"69\""),
-            "wordmark art no longer 338×69 — update WORDMARK_ASPECT"
+        assert_eq!(
+            &wordmark[12..16],
+            b"IHDR",
+            "wordmark PNG has no leading IHDR"
         );
+        let be = |at: usize| u32::from_be_bytes(wordmark[at..at + 4].try_into().unwrap());
+        let (w, h) = (be(16), be(20));
+        assert_eq!(
+            (w, h),
+            WORDMARK_PX,
+            "wordmark art is now {w}×{h} — update WORDMARK_PX and WORDMARK_ASPECT"
+        );
+        let expected = w as f32 / h as f32;
+        assert!(
+            (WORDMARK_ASPECT - expected).abs() < 1e-6,
+            "WORDMARK_ASPECT {WORDMARK_ASPECT} disagrees with the art's {w}×{h} ({expected})"
+        );
+
+        // The art must be cropped to its ink: a transparent margin would render the mark smaller
+        // than — and possibly off-centre within — the box the identity blocks size by height. A
+        // fully-transparent first/last row or column is the cheap signal for that, read straight
+        // off the decoded pixels.
+        let img = image::load_from_memory(&wordmark)
+            .expect("wordmark decodes as an image")
+            .into_rgba8();
+        let opaque_at = |x: u32, y: u32| img.get_pixel(x, y).0[3] != 0;
+        let row_has_ink = |y: u32| (0..img.width()).any(|x| opaque_at(x, y));
+        let col_has_ink = |x: u32| (0..img.height()).any(|y| opaque_at(x, y));
+        for (edge, has_ink) in [
+            ("top row", row_has_ink(0)),
+            ("bottom row", row_has_ink(img.height() - 1)),
+            ("left column", col_has_ink(0)),
+            ("right column", col_has_ink(img.width() - 1)),
+        ] {
+            assert!(
+                has_ink,
+                "wordmark's {edge} is fully transparent — the art is not cropped to its ink, so \
+                 WORDMARK_ASPECT no longer describes the visible mark (re-crop it, as the \
+                 delivered export was)"
+            );
+        }
     }
 
     /// The icon SVG's declared intrinsic size stays small (see [`ICON_ASSET`]). `gpui::img`

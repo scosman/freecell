@@ -39,15 +39,91 @@ pub use authoring::ChartInsertKind;
 pub use downsample::{
     cap_markers_for_paint, downsample_for_paint, MAX_PAINT_MARKERS, MAX_PAINT_VERTICES,
 };
-pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity};
+pub use fidelity::{normalize_3d_chart_group, source_fidelity, Fidelity, CHART_GROUP_ELEMENTS};
 pub use label::{DataLabelPosition, DataLabels};
 pub use marker::{Marker, MarkerSymbol};
-pub use numfmt::apply_number_format;
+// `renders_faithfully` is exported alongside the applier because it is the CONTRACT on it: it
+// says whether the chart is claiming to render a code exactly, which is what makes a disagreement
+// with the cell a bug rather than a disclosed approximation. `freecell-engine`'s
+// `tests/numfmt_agreement.rs` (unit F3a) asserts against exactly that boundary.
+pub use numfmt::{apply_number_format, renders_faithfully};
 pub use spec::{
     Anchor, AnchorCell, CfRange, ChartBody, ChartId, ChartSpec, Origin, SourcePart, SourceXml,
 };
 pub use stroke::LineStroke;
-pub use theme::{ChartColor, ThemePalette, ThemeSlot};
+// `rgb_to_hsl` / `hsl_to_rgb` are exported because `freecell-app`'s series-colour cycle
+// (`chart/palette.rs`) CALLS them. It used to carry a byte-identical second copy; unit F3a proved
+// the two equivalent and deleted the copy, so this export is the single definition, not a hook for
+// a guard test.
+pub use theme::{hsl_to_rgb, rgb_to_hsl, ChartColor, ThemePalette, ThemeSlot};
+
+impl ThemeSlot {
+    /// **Every** theme slot, in canonical OOXML `clrScheme` order (`dk1`, `lt1`, `dk2`, `lt2`, the
+    /// six accents, `hlink`, `folHlink`).
+    ///
+    /// It lives here, on the type, because the cross-crate guard that needs it —
+    /// `freecell-engine`'s `tests/office_palette_agreement.rs`, which asserts that every slot is
+    /// either a cell-fill swatch or a declared non-swatch — cannot enumerate the enum itself. That
+    /// test used to carry its own copy of this list, which made the "exhaustive" half of it
+    /// exhaustive only over what someone remembered to type. A **new variant must be added here**;
+    /// the compile-time trip-wire is the wildcard-free `match` in that test, which stops building
+    /// until the variant is classified, and this list is what it is then checked against.
+    pub const ALL: [ThemeSlot; 12] = [
+        ThemeSlot::Dark1,
+        ThemeSlot::Light1,
+        ThemeSlot::Dark2,
+        ThemeSlot::Light2,
+        ThemeSlot::Accent1,
+        ThemeSlot::Accent2,
+        ThemeSlot::Accent3,
+        ThemeSlot::Accent4,
+        ThemeSlot::Accent5,
+        ThemeSlot::Accent6,
+        ThemeSlot::Hyperlink,
+        ThemeSlot::FollowedHyperlink,
+    ];
+
+    /// This slot's position in [`Self::ALL`].
+    ///
+    /// The `match` is **wildcard-free**, so a new variant does not compile until it is given an
+    /// index here — and the const block below then requires `ALL` to actually *hold* it at that
+    /// index. `ALL` on its own is a fixed-size array literal: a 13th variant compiles fine beside
+    /// it and is silently never swept, which is what this pairing is for.
+    ///
+    /// **What it proves, and what it does not.** It proves `ALL` is duplicate-free, dense and in
+    /// index order, and that no variant can be added without an author editing this file. It does
+    /// **not** prove `ALL` is exhaustive: an author who adds an arm here and does not extend `ALL`
+    /// still gets a green build. Rust cannot enumerate a foreign enum without `variant_count`
+    /// (unstable) or a macro that defines the enum itself, so exhaustiveness rests on the compile
+    /// break plus this note, not on a proof (`phase_6.md` Round 4).
+    pub const fn index(self) -> usize {
+        match self {
+            ThemeSlot::Dark1 => 0,
+            ThemeSlot::Light1 => 1,
+            ThemeSlot::Dark2 => 2,
+            ThemeSlot::Light2 => 3,
+            ThemeSlot::Accent1 => 4,
+            ThemeSlot::Accent2 => 5,
+            ThemeSlot::Accent3 => 6,
+            ThemeSlot::Accent4 => 7,
+            ThemeSlot::Accent5 => 8,
+            ThemeSlot::Accent6 => 9,
+            ThemeSlot::Hyperlink => 10,
+            ThemeSlot::FollowedHyperlink => 11,
+        }
+    }
+}
+
+/// [`ThemeSlot::ALL`] is dense and ordered with respect to [`ThemeSlot::index`] — checked at
+/// **compile time**, so a reordering, a duplicate or a gap is a build failure rather than a test
+/// failure someone has to remember to run. (Verified by swapping two entries: `error[E0080]`.)
+const _: () = {
+    let mut i = 0;
+    while i < ThemeSlot::ALL.len() {
+        assert!(ThemeSlot::ALL[i].index() == i);
+        i += 1;
+    }
+};
 
 /// An sRGB color, mirroring OOXML `<a:srgbClr val="RRGGBB"/>`.
 ///
@@ -600,6 +676,11 @@ pub(crate) fn format_number(n: f64) -> String {
     while s.contains('.') && (s.ends_with('0') || s.ends_with('.')) {
         s.pop();
     }
+    // A magnitude that rounds away to zero must not keep its sign: `-0.0001` is `0`, not `-0`.
+    // (Same rule the `numfmt` applier uses — the sign belongs to the *rendered* number.)
+    if !s.chars().any(|c| c.is_ascii_digit() && c != '0') {
+        s = s.trim_start_matches('-').to_string();
+    }
     s
 }
 
@@ -622,6 +703,18 @@ mod tests {
         assert_eq!(Category::Number(2024.0).label(), "2024");
         assert_eq!(Category::Number(3.5).label(), "3.5");
         assert_eq!(Category::Number(3.250).label(), "3.25");
+    }
+
+    /// A magnitude that rounds away to nothing prints unsigned — the General/fall-back path must
+    /// not emit `-0` any more than the `numfmt` applier does.
+    #[test]
+    fn general_formatting_never_emits_negative_zero() {
+        assert_eq!(format_number(-0.0001), "0");
+        assert_eq!(format_number(-1e-9), "0");
+        assert_eq!(format_number(-0.0), "0");
+        // A value that still has a digit at three decimals keeps its sign.
+        assert_eq!(format_number(-0.001), "-0.001");
+        assert_eq!(format_number(-2.5), "-2.5");
     }
 
     #[test]

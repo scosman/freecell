@@ -68,12 +68,28 @@ IronCalc bug or missing capability, **fix it in the fork and contribute it back 
 (`ironcalc/IronCalc`) as a clean single-fix PR — do **not** add a compensating workaround in
 FreeCell. This is the standing way of working, not a one-off.
 
-- FreeCell's `app/Cargo.toml` pins `ironcalc`/`ironcalc_base` via `[patch.crates-io]` → the fork's
-  **`freecell-fixes`** branch (the sum of our not-yet-upstreamed fixes).
+- **The fork is permanent — there is no exit and we are not working toward one.** We keep it, keep
+  upstreaming fixes as clean single-fix PRs, and keep re-syncing from upstream `main`. It carries
+  more than fixes: merged cells is a whole feature upstream does not have. Upstreaming keeps the
+  carried delta small; it is not an attempt to reach zero. (`projects/ironcalc-upgrade.md`)
+- FreeCell's `app/Cargo.toml` patches `ironcalc`/`ironcalc_base` via `[patch.crates-io]` to a
+  **`rev = "<sha>"` on the fork's `freecell-fixes` branch** — pinned by SHA, never by branch, since
+  `freecell-fixes` is rebased and reverted in place (v05-cleanup-1/A1). **Bumping the fork is a
+  deliberate one-line edit of both revs + `cargo update -p ironcalc -p ironcalc_base`, in its own
+  commit, with the workspace tests run** — never a drive-by, and never left to a stray
+  `cargo update`.
 - Fork branches: `main` = clean mirror of upstream; `fix/<slug>` = one branch per fix (off `main`,
   with upstream-style tests) = one clean PR; `freecell-fixes` = integration branch FreeCell builds
   against. Sync `main` from upstream periodically (rebase `fix/*` + `freecell-fixes`); expect
-  incidental drift to reconcile on the FreeCell side.
+  incidental drift to reconcile on the FreeCell side — upstream may also *reshape* what it merged
+  (it renamed our `set_worksheet_index` to `move_sheet`), so a sync can break a FreeCell call site.
+- **Current state of the delta** (re-derived 2026-08-07 at `ecbf6226`, patch-id verified against
+  upstream): of **11** changes we authored, **8 are merged upstream** and 3 are fork-only; one more
+  (DOLLAR) was reverted as wrong. Per-fix table, upstream PR numbers, and the method to re-derive
+  it: [`specs/projects/ironcalc-upstreaming/implementation_plan.md`](specs/projects/ironcalc-upstreaming/implementation_plan.md)
+  §Status table. Don't trust a stale summary — re-run the classification, **including its
+  cross-check step**: enumerating the branch's merges alone silently under-counts, because a fix
+  stops being a fork-only merge once upstream takes it and the fork re-syncs `main`.
 - **One fix = one branch = one focused single-feature upstream PR. Never fold multiple fork fixes
   into a single `fix/` branch (or a single FreeCell phase).** Upstream wants independent,
   single-feature PRs they can review + merge in isolation; a bundled branch is not acceptable
@@ -87,7 +103,12 @@ FreeCell. This is the standing way of working, not a one-off.
   `add_repo` **upfront while the user is present** — it needs interactive approval and fails
   mid-run once they leave; if it's unavailable, the container's git-proxy already routes
   `scosman/ironcalc`, so clone/push via `http://local_proxy@127.0.0.1:<port>/git/scosman/ironcalc`
-  (port from FreeCell's `git remote -v`). The agent **can't open upstream `ironcalc/IronCalc`
+  (port from FreeCell's `git remote -v`). For **read-only** work (inventorying the fork, comparing
+  against upstream) neither is needed — a plain `git clone --bare --filter=blob:none
+  https://github.com/scosman/ironcalc` works through the outbound proxy, and upstream
+  `ironcalc/IronCalc` can be added as a second remote and fetched the same way (verified in
+  v05-cleanup-1/A4). Prefer that over `add_repo` when you only need to read.
+  The agent **can't open upstream `ironcalc/IronCalc`
   PRs** — it prepares a compare link (`.../compare/main...scosman:ironcalc:fix/<slug>`) + title +
   description for the owner to open. Before branching a `fix/*`, check the capability isn't
   **already in** `freecell-fixes` (`git merge-base --is-ancestor <sha> origin/freecell-fixes`).
@@ -134,14 +155,26 @@ FreeCell. This is the standing way of working, not a one-off.
     fixed per-session allowance; `target/` grows large (~25 GB) — deleting stale build dirs
     frees space immediately.
 
-## Render tests — agent-driven (no automatic every-push gate)
+## Render tests — off the PR path, with a weekly backstop
 
-The pixel render suite (Xvfb + Mesa **lavapipe**) is a **manual** gate: it runs only when
-the `render` workflow (`.github/workflows/render.yml`, required-check context
-`render (Xvfb + lavapipe)`) is dispatched — **not** on every push. The fast `checks` job
-compiles render-tests and runs its GPUI-free unit tests, but the actual **pixel diffs are
-not covered automatically**. So the **agent must decide when render coverage is needed and
-drive it** — there is no safety net.
+The pixel render suite (Xvfb + Mesa **lavapipe**) is **deliberately not on the PR path** —
+most PRs cannot move a pixel and the suite is far too slow to earn its cost on them. The fast
+`checks` job compiles render-tests and runs its GPUI-free unit tests, but **diffs no pixels**
+(the pixel cases self-skip without `FREECELL_RENDER`).
+
+`.github/workflows/render.yml` runs on **three** triggers (D1, 2026-07-28):
+
+| Trigger | When | What it's for |
+|---|---|---|
+| `schedule` | **weekly on `main`** | The backstop. Catches what slipped through merges, at a cadence where a regression is still cheap to bisect. |
+| `workflow_call` | **at release** | `release.yml`'s packaging jobs `needs:` it — nothing ships without a green suite. |
+| `workflow_dispatch` | on demand, any branch | **Yours.** Confirming a rendering change before merge. |
+
+**What this means for you:** dispatching is still your job when you change in-scope pixels, and
+the weekly run is a backstop, not a substitute — a regression you merge is found up to a week
+later by someone who has to bisect it. What changed is that forgetting no longer means *nobody*
+checked. It is **not** a required per-PR status check and never was one in practice: a
+dispatch-only workflow reports no context on a PR, so requiring it would just block every merge.
 
 **Scope — what the suite actually covers.** Most render cases are the real `GridView` rendered
 over an engine-driven scene: **cell / row / column / sheet rendering** (text, numbers, fonts,
@@ -171,9 +204,10 @@ cache**. Do **not** intermingle full runs in every coding phase. Instead:
   never background-and-forget it (a detached render job dies at the turn boundary and leaves
   you parked, as happened before).
 
-**1. Run it locally when a change could move *grid/cell/sheet or titlebar* pixels** —
-grid-render code / the `GridView`, fonts, layout, borders, fills, styles, the titlebar row,
-the render harness, or baselines (per the Scope above — not welcome/About/other chrome):
+**1. Run it locally when a change could move *grid/cell/sheet, titlebar or chart-render*
+pixels** — grid-render code / the `GridView`, fonts, layout, borders, fills, styles, the
+titlebar row, the chart widgets (`freecell_app::chart`), the render harness, or baselines
+(per the Scope above — not welcome/About/other chrome):
 - first time: `app/render-tests/scripts/setup_render_env.sh` (installs the capture stack)
 - subset while iterating: `app/render-tests/scripts/render_tests.sh test <prefix>`
 - full suite (only at the late validation phase): `app/render-tests/scripts/render_tests.sh
@@ -184,22 +218,27 @@ If the change **intentionally** alters rendering, regenerate + **eyeball** basel
 Never land a rendering change without either a green local run or refreshed, eyeballed
 baselines.
 
-**2. Validate in CI before merge.** The required truth is the CI `render` gate. For any
-**in-scope** change (grid/cell/sheet or titlebar — see Scope) that could regress or alter
-rendering, get a green CI render run on the branch before merge:
+**2. Validate in CI before merge.** For any **in-scope** change (grid/cell/sheet, titlebar or
+chart-render — see Scope) that could regress or alter rendering, get a green CI render run on
+the branch before merge. The weekly `main` run does not cover you here: it fires after the
+merge, on someone else's watch.
 - **Preferred — the agent triggers it:** dispatch the `render` workflow on the branch
-  (GitHub Actions MCP, or `gh workflow run render.yml --ref <branch>`), poll to completion,
-  confirm it passed. (Dispatchable once `render.yml` is on `main`.)
+  (GitHub Actions MCP `actions_run_trigger` with `workflow_id: render.yml`, or
+  `gh workflow run render.yml --ref <branch>`), poll to completion, confirm it passed.
 - **Fallback:** if the agent can't dispatch, ask the user to kick off `render` and report
   the result back.
+- A run on a **feature branch** uses that branch's `render.yml`, so a change to the workflow
+  itself is testable before merge — but only its steps/env: a dispatch exercises neither the
+  `schedule` trigger (fires only from the default branch) nor `workflow_call` (only exercised
+  by a release), so changes to those two are verifiable only after merge / at the next tag.
 
 **3. Bake it into plans as its OWN late phase.** When a plan makes **in-scope**
-(grid/cell/sheet or titlebar) rendering changes, put render validation in a **dedicated phase
-AFTER all coding + commits are done** — do **not** intermingle full runs per phase (too slow;
-breaks flow + cache). The earlier coding phases verify with the relevant **subset** only
-(`render_tests.sh test <prefix>`); the final render phase then, once: runs the **full** suite
-(with a ~10-min watchdog), refreshes + **eyeballs** baselines if the change is intentional,
-commits any baseline updates, and **dispatches the CI `render` gate** and confirms it passes.
-Decide this at planning time — don't leave render validation implicit. (Welcome/About/other-
-chrome changes are out of scope for the pixel suite — plan gpui view tests + a smoke launch
-for those instead.)
+(grid/cell/sheet, titlebar or chart-render) rendering changes, put render validation in a
+**dedicated phase AFTER all coding + commits are done** — do **not** intermingle full runs per
+phase (too slow; breaks flow + cache). The earlier coding phases verify with the relevant
+**subset** only (`render_tests.sh test <prefix>`); the final render phase then, once: runs the
+**full** suite (with a ~10-min watchdog), refreshes + **eyeballs** baselines if the change is
+intentional, commits any baseline updates, and **dispatches the CI `render` gate** and confirms
+it passes. Decide this at planning time — don't leave render validation implicit.
+(Welcome/About/other-chrome changes are out of scope for the pixel suite — plan gpui view
+tests + a smoke launch for those instead.)

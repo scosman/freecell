@@ -11,7 +11,11 @@
 //! multi-series cycle. Do NOT "simplify" this to `cx.theme().chart_N`.
 //! Beyond five series we rotate hue so additional series stay visually distinct.
 
-use freecell_chart_model::Color;
+// The HSL helpers are `freecell-chart-model`'s — this file used to carry a byte-identical second
+// copy (unit F3a found them provably equivalent), and architecture §6 prescribed deleting the copy
+// rather than pinning it with a guard test. Importing costs nothing: `freecell-app` already depends
+// on `freecell-chart-model`.
+use freecell_chart_model::{hsl_to_rgb, rgb_to_hsl, Color};
 
 /// The five base **categorical** colors — a Tableau-10-style palette of distinct hues (see
 /// the module docs for why we do NOT use gpui-component's monochrome-blue `chart_1..chart_5`).
@@ -46,53 +50,6 @@ pub fn series_color(index: usize) -> Color {
     hsl_to_rgb(h, s, l)
 }
 
-fn rgb_to_hsl(c: Color) -> (f64, f64, f64) {
-    let r = c.r as f64 / 255.0;
-    let g = c.g as f64 / 255.0;
-    let b = c.b as f64 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) / 2.0;
-    if (max - min).abs() < 1e-9 {
-        return (0.0, 0.0, l);
-    }
-    let d = max - min;
-    let s = if l > 0.5 {
-        d / (2.0 - max - min)
-    } else {
-        d / (max + min)
-    };
-    let h = if max == r {
-        ((g - b) / d) % 6.0
-    } else if max == g {
-        (b - r) / d + 2.0
-    } else {
-        (r - g) / d + 4.0
-    };
-    let h = (h * 60.0).rem_euclid(360.0);
-    (h, s, l)
-}
-
-fn hsl_to_rgb(h: f64, s: f64, l: f64) -> Color {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
-    let (r1, g1, b1) = match hp as i32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c / 2.0;
-    Color::rgb(
-        (((r1 + m) * 255.0).round()) as u8,
-        (((g1 + m) * 255.0).round()) as u8,
-        (((b1 + m) * 255.0).round()) as u8,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +70,54 @@ mod tests {
                 series_color(i + BASE.len()),
                 "series {i} and {} collided",
                 i + BASE.len()
+            );
+        }
+    }
+
+    /// **F3a — the colour the cycle actually hands the renderer, pinned.**
+    ///
+    /// This file used to carry its own `rgb_to_hsl` / `hsl_to_rgb`, and the architecture review
+    /// flagged the two copies as *drifted*: this one wrote `((g - b) / d) % 6.0` where chart-model
+    /// writes `.rem_euclid(6.0)`, read as "they disagree on negative hues". **They did not**, and
+    /// not merely on the inputs a test happened to sweep: `rgb_to_hsl` normalises its result with
+    /// `.rem_euclid(360.0)`, so it can only ever return `h ∈ [0, 360)`; `hsl_to_rgb`'s `hp = h/60`
+    /// is therefore never negative, and `%` and `rem_euclid` are identical on non-negative
+    /// dividends. The equivalence held **by construction**, for every input, not just for the eight
+    /// laps a sweep could enumerate.
+    ///
+    /// So the copy is gone (architecture §6: export from `chart-model`, delete the app copy) and
+    /// there is nothing left to pin an agreement *between*. What is worth pinning is the thing this
+    /// module owes the renderer: the concrete colour per series index. If the shared helpers, the
+    /// lap rotation, or `BASE` change, these values change and this test says so — which is
+    /// strictly more than the old equivalence test caught, since that one passed happily however
+    /// both copies moved as long as they moved together.
+    #[test]
+    fn series_color_is_pinned_for_the_first_three_laps() {
+        // Lap 0 is `BASE` verbatim; laps 1 and 2 rotate hue by 137° and 274°.
+        const EXPECTED: [(usize, u32); 15] = [
+            (0, 0x4E79A7),
+            (1, 0xF28E2B),
+            (2, 0x59A14F),
+            (3, 0xE15759),
+            (4, 0xB07AA1),
+            (5, 0xA74E60),
+            (6, 0x2BF2C6),
+            (7, 0x5C4FA1),
+            (8, 0x57E17C),
+            (9, 0x92B07A),
+            (10, 0x4EA755),
+            (11, 0xF22BE5),
+            (12, 0xA1734F),
+            (13, 0xA357E1),
+            (14, 0x7A82B0),
+        ];
+        for (index, hex) in EXPECTED {
+            assert_eq!(
+                series_color(index),
+                Color::from_hex(hex),
+                "series {index} moved to #{:06X} — the multi-series cycle changed colour, which \
+                 moves chart pixels",
+                series_color(index).to_hex(),
             );
         }
     }

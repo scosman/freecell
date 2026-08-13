@@ -1,6 +1,6 @@
 # cargo-deny configuration for the FreeCell workspace (architecture.md §9).
 #
-# CI runs `cargo deny check` with `working-directory: app` (checks.yml, pinned
+# CI runs `cargo deny --locked check` with `working-directory: app` (checks.yml, pinned
 # cargo-deny 0.19.9). The former load-bearing item — the GPL-3.0 zed tracing crates
 # (ztracing / ztracing_macro / zlog, pulled transitively via gpui/zed, tracked as zed#55470)
 # — is now RESOLVED: they are replaced at build time by permissively-licensed no-op stubs

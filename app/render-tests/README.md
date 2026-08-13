@@ -45,8 +45,13 @@ render-tests/scripts/render_tests.sh generate [--only <prefix>]
   window by size, and captures it with ImageMagick `import -window <id>`.
 - **Gating.** The pixel render runs only when `FREECELL_RENDER=1` **and** the capture tools
   are present. So a plain `cargo test --workspace` (no env var) skips the pixel cases while
-  the GPUI-free perceptual-diff unit tests (`tests/perceptual_diff.rs`) still run; CI runs
-  the real gate via `render_tests.sh` (a required step in `checks.yml`).
+  the GPUI-free perceptual-diff unit tests (`tests/perceptual_diff.rs`) still run. `checks.yml`
+  does exactly that — it **compiles** `render-tests` and runs those unit tests, but **diffs no
+  pixels**. The real gate is `.github/workflows/render.yml`, which runs `render_tests.sh`
+  under three triggers: **weekly on `main`** (the backstop), **at release** (`release.yml`
+  calls it via `workflow_call` and its packaging jobs `needs:` it, so nothing ships without a
+  green suite), and **`workflow_dispatch`** on any branch for confirming a rendering change
+  before merge. It is deliberately **not** on the PR path.
 
 ## Chart scenes (charts project, P4)
 

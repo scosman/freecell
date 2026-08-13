@@ -110,13 +110,22 @@ Calibrated thresholds + methodology are in `render-tests/src/perf.rs` and
 GitHub Actions live at the repo root (`../.github/workflows/`):
 
 - **checks** (Linux, required): fmt, clippy `-D warnings`, workspace build, workspace test,
-  the render suite (Xvfb + lavapipe), cargo-deny (licenses/advisories — see `deny.toml`).
+  cargo-deny (licenses/advisories — see `deny.toml`). It compiles `render-tests` and runs its
+  GPUI-free unit tests, but **does not diff any pixels** — the pixel cases self-skip without
+  `FREECELL_RENDER`.
+- **render** (Linux, the pixel suite — Xvfb + lavapipe): **not on the PR path.** It runs
+  **weekly on `main`** (the backstop), **at release** (`release.yml`'s packaging jobs `needs:`
+  it, so nothing ships without a green suite), and on **manual dispatch** for confirming a
+  rendering change on a branch. See `../.github/workflows/render.yml` for why it is off PRs.
 - **perf-gates** (Linux, required): the perf harness with buffered thresholds.
+- **roundtrip** (Linux, auto on `main` / PRs touching `app/**`): the external round-trip gate —
+  a FreeCell-saved chart `.xlsx` must survive being reopened + re-written by a *different* real
+  spreadsheet app (headless LibreOffice). gpui-free, so it needs no X11/Vulkan stack.
 - **macos-verify** (manual/weekly, non-required): build + test + render smoke on macOS.
-- **release** (tag `v*` / manual dispatch): package the app with `cargo-packager` for
-  macOS, Linux, and Windows (all required), uploading installers as run artifacts. The
-  Windows job Authenticode-signs the exe + installer via Azure Trusted Signing when the
-  signing secrets are set. See [`PACKAGING.md`](PACKAGING.md).
+- **release** (tag `v*` / manual dispatch): run the render gate, then package the app with
+  `cargo-packager` for macOS, Linux, and Windows (all required), uploading installers as run
+  artifacts. The Windows job Authenticode-signs the exe + installer via Azure Trusted Signing
+  when the signing secrets are set. See [`PACKAGING.md`](PACKAGING.md).
 
 ## Packaging / releases
 

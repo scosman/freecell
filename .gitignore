@@ -1,3 +1,9 @@
 .specs_skill_state/
 reviews/
 target/
+
+# Throwaway differential probes. Verifying a claim about engine-vs-chart-model behaviour means
+# compiling a scratch #[test] against the real crates, so these have to live inside a `tests/`
+# directory rather than in a scratchpad — and they are deleted as soon as they have answered
+# their question. Ignored so a stray `git add -A` can never commit one.
+zz*probe*.rs

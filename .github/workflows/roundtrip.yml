@@ -73,4 +73,4 @@ jobs:
         working-directory: app
         env:
           FREECELL_LIBREOFFICE: "1"
-        run: cargo test -p freecell-engine --test charts_roundtrip_libreoffice -- --nocapture
+        run: cargo test --locked -p freecell-engine --test charts_roundtrip_libreoffice -- --nocapture

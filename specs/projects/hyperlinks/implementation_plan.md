@@ -23,7 +23,7 @@ Phases 1–2 are fork work in `/home/user/IronCalc`; phases 3–7 are FreeCell.
   gate:** confirm theme index 10 resolves to a blue (arch §3.5) and report the answer — it
   decides three lines in Phase 3.
 
-- [ ] **Phase 2 — Fork fix: batch input emits link diffs.**
+- [x] **Phase 2 — Fork fix: batch input emits link diffs.**
   Own branch `fix/batch-set-inputs-link-diffs` off **`fix/batch-set-inputs`** (that is where
   `set_user_inputs` lives — `main` has no batch API, so the two go upstream as stacked PRs),
   upstream-style tests, then merged into `freecell-fixes` (arch §2). Without it, undo after

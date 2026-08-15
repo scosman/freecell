@@ -23,6 +23,7 @@ pub mod format_color;
 pub mod format_ui;
 pub mod functions;
 pub mod input_cap;
+pub mod link;
 pub mod merge;
 pub mod palette;
 pub mod perf;
@@ -47,6 +48,7 @@ pub use cond_fmt::{
 };
 pub use format_ui::{adjust_decimals, font_size_display, num_fmt_category, Category};
 pub use functions::is_reference_ready;
+pub use link::{CellLink, LinkTarget};
 pub use merge::{anchor_of, blocks_fill, expand_to_regions, region_at, regions_intersecting};
 pub use palette::assign_ref_colors;
 pub use publication::{CellKind, Publication, PublishedCell};

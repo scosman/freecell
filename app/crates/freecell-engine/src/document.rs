@@ -11,13 +11,15 @@
 //! on open — first paint uses the file's cached values (SP2 / `functional_spec.md §5.1`);
 //! the command/event loop, caches, and `Publication` build land in Phases 4–5.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
 use freecell_core::{
-    CellKind, CellRange, CellRef, Direction, FillAxis, Rgb, SelectionStats, SheetDims,
+    CellKind, CellLink, CellRange, CellRef, Direction, FillAxis, LinkTarget, Rgb, SelectionStats,
+    SheetDims,
 };
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
@@ -25,7 +27,7 @@ use ironcalc_base::cell::CellValue;
 use ironcalc_base::expressions::types::Area;
 use ironcalc_base::formatter::format::format_number;
 use ironcalc_base::locale::get_locale;
-use ironcalc_base::types::{Cell, CellType, Font, Style, Worksheet};
+use ironcalc_base::types::{Cell, CellType, Font, Link, Style, Worksheet};
 use ironcalc_base::Model;
 
 use crate::chart::binding::CellData; // engine-free resolved value the live-binding read produces
@@ -146,6 +148,95 @@ impl FontFlag {
             FontFlag::Underline => "font.u",
             FontFlag::Strike => "font.strike",
         }
+    }
+}
+
+/// What a [`WorkbookDocument::set_cell_link`] call actually did, so the worker can classify it
+/// (`hyperlinks/architecture.md §3.4`). The engine's `set_cell_link` returns `()` and hides two
+/// facts the worker cannot guess:
+///
+/// - it **suppresses no-ops** — writing the same link with the same label pushes no diff list, so
+///   IronCalc records **no undo entry**. The worker's touch history is 1:1 with IronCalc's undo
+///   stack, so claiming "applied" there would desync the two.
+/// - a `label` that differs from the cell's current display text **rewrites the cell's value** in
+///   the same undo step (`functional_spec.md F5.3`), which means the batch must recompute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkWrite {
+    /// Nothing changed: no engine mutation, no diff, no undo entry.
+    NoOp,
+    /// The link (and, for a brand-new link, its underline + theme-hyperlink styling) changed; the
+    /// cell's value did not, so no recompute is needed.
+    LinkOnly,
+    /// The label rewrote the cell's content too → the batch must recompute.
+    LabelChanged,
+}
+
+/// A sheet's effective hyperlinks, keyed by 0-based `(row, col)` — the shape the cache holds and
+/// the link reads/mirror pass around. Named because the bare type recurs across `document`,
+/// `cache`, and the worker.
+pub(crate) type LinkMap = HashMap<(u32, u32), CellLink>;
+
+/// Converts an IronCalc [`Link`] into the engine-free [`LinkTarget`] the UI sees — the link half
+/// of the crate's "no IronCalc type escapes" boundary, mirroring what `cond_fmt_convert` does for
+/// conditional-formatting rules.
+fn link_target_from(link: &Link) -> LinkTarget {
+    match link {
+        Link::External { target, tooltip } => LinkTarget::External {
+            target: target.clone(),
+            tooltip: tooltip.clone(),
+        },
+        Link::Internal { location, tooltip } => LinkTarget::Internal {
+            location: location.clone(),
+            tooltip: tooltip.clone(),
+        },
+    }
+}
+
+/// [`link_target_from`] by **move** — the same conversion with the `String`s taken rather than
+/// cloned. The cache rebuild owns the engine's `Link`s (`get_links_list` hands back a `Vec`), and
+/// on a sheet carrying thousands of links a second round of `String` clones is the difference
+/// between one allocation storm per rebuild and two.
+fn link_target_into(link: Link) -> LinkTarget {
+    match link {
+        Link::External { target, tooltip } => LinkTarget::External { target, tooltip },
+        Link::Internal { location, tooltip } => LinkTarget::Internal { location, tooltip },
+    }
+}
+
+/// Whether an engine [`Link`] and a cached [`LinkTarget`] denote the same link — an
+/// **allocation-free** comparison (`str` equality, no conversion), so the mirror can decide
+/// "unchanged" without materializing a single `LinkTarget`.
+fn link_matches(cached: &LinkTarget, engine: &Link) -> bool {
+    match (cached, engine) {
+        (
+            LinkTarget::External { target, tooltip },
+            Link::External {
+                target: t,
+                tooltip: tt,
+            },
+        ) => target == t && tooltip == tt,
+        (
+            LinkTarget::Internal { location, tooltip },
+            Link::Internal {
+                location: l,
+                tooltip: tt,
+            },
+        ) => location == l && tooltip == tt,
+        _ => false,
+    }
+}
+
+/// The inverse of [`link_target_from`]: the IronCalc [`Link`] to store for a UI-authored target.
+fn link_from(target: &LinkTarget) -> Link {
+    match target {
+        LinkTarget::External { target, tooltip } => Link::External {
+            target: target.clone(),
+            tooltip: tooltip.clone(),
+        },
+        LinkTarget::Internal { location, tooltip } => Link::Internal {
+            location: location.clone(),
+            tooltip: tooltip.clone(),
+        },
     }
 }
 
@@ -447,6 +538,157 @@ impl WorkbookDocument {
         self.model
             .get_cell_content(sheet, row, col)
             .map_err(CellQueryError)
+    }
+
+    /// The cell's **effective** hyperlink — the one the UI acts on — or `None`
+    /// (`hyperlinks/functional_spec.md` Vocabulary). A worksheet link wins over a `HYPERLINK()`
+    /// (dynamic) one on the same cell, matching the engine's own precedence.
+    ///
+    /// The engine offers no per-cell call covering both kinds (`get_cell_link` is worksheet-only),
+    /// so this reads the worksheet link first and only falls back to scanning the sheet's union
+    /// list — which keeps the common case a single hash lookup. The render path does **not** call
+    /// this: it reads the resident cache's link map (built from [`sheet_links`](Self::sheet_links)).
+    /// This is the direct single-cell read, and the cache-agreement contract's fresh-re-read oracle.
+    pub fn cell_link(&self, sheet: u32, cell: CellRef) -> Result<Option<CellLink>, CellQueryError> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        if let Some(link) = self
+            .model
+            .get_cell_link(sheet, row, col)
+            .map_err(CellQueryError)?
+        {
+            return Ok(Some(CellLink::worksheet(link_target_from(&link))));
+        }
+        Ok(self
+            .model
+            .get_links_list(sheet)
+            .map_err(CellQueryError)?
+            .iter()
+            .find(|view| view.row == row && view.column == col)
+            .map(|view| CellLink {
+                target: link_target_from(&view.link),
+                dynamic: view.dynamic,
+            }))
+    }
+
+    /// Every effective link on `sheet_idx`, keyed 0-based — the sheet-cache build/mirror source
+    /// (`hyperlinks/architecture.md §3.3`). This is the engine's union list (worksheet links plus
+    /// the `HYPERLINK()`-produced dynamic ones, worksheet winning on collision), which is the only
+    /// read that covers both kinds. Whole-sheet by necessity, not by choice: dynamic links are
+    /// cleared and rebuilt on **every** evaluation, so there is nothing incremental to read.
+    pub(crate) fn sheet_links(&self, sheet_idx: u32) -> Result<LinkMap, String> {
+        crate::instrument::record_engine_call();
+        Ok(self
+            .model
+            .get_links_list(sheet_idx)?
+            .into_iter()
+            .filter_map(|view| {
+                // The engine's coordinates are 1-based; a defensive floor keeps a hostile file's
+                // out-of-range entry out of the 0-based cache rather than wrapping it.
+                let row = u32::try_from(view.row - 1).ok()?;
+                let col = u32::try_from(view.column - 1).ok()?;
+                Some((
+                    (row, col),
+                    CellLink {
+                        target: link_target_into(view.link),
+                        dynamic: view.dynamic,
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// `sheet_idx`'s link map, but **only if it differs** from `cached` — `None` means "unchanged,
+    /// don't rebuild anything".
+    ///
+    /// This is the mirror's hot path, and the shape matters. The engine's only both-kinds read
+    /// (`get_links_list`) already clones every link on the sheet, and the overwhelmingly common
+    /// outcome is that nothing moved: an ordinary keystroke on a sheet that happens to carry
+    /// links. Building a fresh `HashMap` first and comparing after would pay a *second* round of
+    /// `String` clones on every such edit — on an F10.4-scale sheet (a 10 000-cell range hyperlink
+    /// import) that is tens of thousands of allocations per keystroke, on a project whose whole
+    /// thesis is huge-sheet speed. So the comparison runs **in place against the returned list**
+    /// (allocation-free, via [`link_matches`]), and the map is materialized only when it is
+    /// genuinely needed — by **move** rather than clone.
+    ///
+    /// A complete "no links anywhere, return immediately" gate — the conditional-formatting
+    /// precedent — is **not** reachable from FreeCell today: the worksheet half is free (see
+    /// [`worksheet_links_match`](Self::worksheet_links_match)), but the dynamic half lives in
+    /// `Model::links`, which is `pub(crate)` with no public accessor. Closing that needs a small
+    /// fork addition (a `has_dynamic_links` / `get_dynamic_links`), deliberately not opened here.
+    pub(crate) fn sheet_links_if_changed(
+        &self,
+        sheet_idx: u32,
+        cached: &LinkMap,
+    ) -> Result<Option<LinkMap>, String> {
+        crate::instrument::record_engine_call();
+        let list = self.model.get_links_list(sheet_idx)?;
+
+        // `get_links_list` yields one entry per cell (worksheet wins over dynamic), so counting the
+        // coordinate-convertible entries and finding each one equal in `cached` proves the two maps
+        // are equal — no allocation, no map construction.
+        let mut convertible = 0usize;
+        let mut unchanged = true;
+        for view in &list {
+            let (Ok(row), Ok(col)) = (u32::try_from(view.row - 1), u32::try_from(view.column - 1))
+            else {
+                continue; // dropped by the build below too — keep the two paths consistent
+            };
+            convertible += 1;
+            match cached.get(&(row, col)) {
+                Some(cell_link)
+                    if cell_link.dynamic == view.dynamic
+                        && link_matches(&cell_link.target, &view.link) => {}
+                _ => {
+                    unchanged = false;
+                    break;
+                }
+            }
+        }
+        if unchanged && convertible == cached.len() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            list.into_iter()
+                .filter_map(|view| {
+                    let row = u32::try_from(view.row - 1).ok()?;
+                    let col = u32::try_from(view.column - 1).ok()?;
+                    Some((
+                        (row, col),
+                        CellLink {
+                            target: link_target_into(view.link),
+                            dynamic: view.dynamic,
+                        },
+                    ))
+                })
+                .collect(),
+        ))
+    }
+
+    /// Whether `sheet_idx`'s **worksheet** links already match the non-dynamic half of `cached` —
+    /// an allocation-free check, because `Model::get_links` hands back a *reference* to the
+    /// worksheet's own map (unlike `get_links_list`, which clones).
+    ///
+    /// Only sound as a skip when no evaluation has happened since the last refresh: worksheet links
+    /// move only on an explicit edit, whereas dynamic links are rebuilt by every `evaluate()`. The
+    /// caller owns that condition (`hyperlinks/architecture.md §3.3`).
+    pub(crate) fn worksheet_links_match(&self, sheet_idx: u32, cached: &LinkMap) -> bool {
+        crate::instrument::record_engine_call();
+        let Ok(engine) = self.model.get_links(sheet_idx) else {
+            return false; // can't prove a match → fall through to the full re-read
+        };
+        if engine.len() != cached.values().filter(|l| !l.dynamic).count() {
+            return false;
+        }
+        engine.iter().all(|(&(row, col), link)| {
+            let (Ok(row), Ok(col)) = (u32::try_from(row - 1), u32::try_from(col - 1)) else {
+                return false;
+            };
+            cached
+                .get(&(row, col))
+                .is_some_and(|c| !c.dynamic && link_matches(&c.target, link))
+        })
     }
 
     /// The **evaluated** value of a cell as an engine-free [`CellData`] — the read chart live
@@ -1112,6 +1354,66 @@ impl WorkbookDocument {
             .set_area_with_border(&area_of(sheet_idx, range), &border_area)
     }
 
+    /// Attaches `target` to `cell`, replacing any link already there, and — when `label` is given
+    /// and differs from the cell's current display text — sets the cell's content to it, all as
+    /// **one** undo step (`functional_spec.md F5.3`; the engine's `set_cell_link` composes the
+    /// link, value, and style diffs into a single `push_diff_list`, so FreeCell does not).
+    ///
+    /// Creating a *brand-new* link also applies the engine's link formatting (`font.u = true`,
+    /// `font.color = Color::Theme(10, …)`) as ordinary cell formatting. That is why FreeCell adds
+    /// no styling of its own for worksheet links (F1.2) and why removing a link leaves the blue
+    /// underline behind (F1.6).
+    ///
+    /// Returns what actually happened, because the engine suppresses no-ops silently — see
+    /// [`LinkWrite`]. The conditions below mirror the engine's own (`user_model/links.rs`): a diff
+    /// is recorded iff the link differs from the existing one or the label differs from the current
+    /// display text. They must be evaluated **before** the write, since the engine reports nothing.
+    pub(crate) fn set_cell_link(
+        &mut self,
+        sheet_idx: u32,
+        cell: CellRef,
+        target: &LinkTarget,
+        label: Option<&str>,
+    ) -> Result<LinkWrite, String> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        let link = link_from(target);
+        // `as_ref()` rather than cloning `link` just to compare it against the existing one.
+        let link_changes = self.model.get_cell_link(sheet_idx, row, col)?.as_ref() != Some(&link);
+        let label_changes = match label {
+            Some(label) => label != self.model.get_formatted_cell_value(sheet_idx, row, col)?,
+            None => false,
+        };
+        self.model.set_cell_link(sheet_idx, row, col, link, label)?;
+        Ok(match (link_changes, label_changes) {
+            (_, true) => LinkWrite::LabelChanged,
+            (true, false) => LinkWrite::LinkOnly,
+            (false, false) => LinkWrite::NoOp,
+        })
+    }
+
+    /// Removes `cell`'s **worksheet** link, returning whether there was one to remove. The cell's
+    /// content and formatting are left untouched (F1.6/F6.2 — the blue underline is real
+    /// formatting the user can clear themselves).
+    ///
+    /// A cell with no worksheet link is an engine no-op that records no diff, hence the `bool`:
+    /// the worker must not push a touch entry for an op IronCalc never put on its undo stack. A
+    /// dynamic (`HYPERLINK()`) link is not removable at all — only its formula is editable — and
+    /// likewise reports `false`.
+    pub(crate) fn remove_cell_link(
+        &mut self,
+        sheet_idx: u32,
+        cell: CellRef,
+    ) -> Result<bool, String> {
+        crate::instrument::record_engine_call();
+        let (row, col) = to_engine_coords(cell);
+        if self.model.get_cell_link(sheet_idx, row, col)?.is_none() {
+            return Ok(false);
+        }
+        self.model.delete_cell_link(sheet_idx, row, col)?;
+        Ok(true)
+    }
+
     /// The workbook's **default font** `(size_pt, family_name)` — the font a truly-unstyled cell
     /// resolves to (style index 0). Read from the public workbook styles
     /// (`cell_xfs[0].font_id` → `fonts[id]`); a hostile/empty styles table falls back to
@@ -1507,11 +1809,12 @@ impl WorkbookDocument {
     /// Moves the sheet at `sheet_idx` to `to_index` (`MoveSheet`), shifting the intervening
     /// sheets so the moved sheet lands at exactly `to_index`. Undoable (rides the fork's
     /// history); the new order is preserved on xlsx save; cross-sheet references stay valid
-    /// (sheet order is a vector position, not an identity). Wraps the fork's index-based
-    /// `UserModel::set_worksheet_index` (Phase 6a). A same-index move is a fork-level no-op.
+    /// (sheet order is a vector position, not an identity). Wraps the engine's index-based
+    /// `UserModel::move_sheet` (contributed by us as `set_worksheet_index` and renamed when
+    /// upstream took it). A same-index move is an engine-level no-op.
     pub(crate) fn move_sheet(&mut self, sheet_idx: u32, to_index: u32) -> Result<(), String> {
         crate::instrument::record_engine_call();
-        self.model.set_worksheet_index(sheet_idx, to_index)
+        self.model.move_sheet(sheet_idx, to_index)
     }
 
     /// Undoes the last committed edit (engine history). Auto-evaluates unless paused.
@@ -3766,5 +4069,362 @@ mod tests {
         assert_eq!(doc.formatted_value(0, cell(1, 1)).unwrap(), "e");
         // …and nothing landed at what would have been row 3 (no `c` anywhere).
         assert_eq!(doc.formatted_value(0, cell(2, 0)).unwrap(), "");
+    }
+
+    // ---- Hyperlinks (`hyperlinks/architecture.md §3.1`) ------------------------------------
+
+    /// A cell's effective link, unwrapped for terse assertions.
+    fn link_of(doc: &WorkbookDocument, sheet: u32, r: u32, c: u32) -> Option<CellLink> {
+        doc.cell_link(sheet, cell(r, c)).unwrap()
+    }
+
+    #[test]
+    fn cell_link_reads_a_worksheet_link() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let target =
+            LinkTarget::external("https://ironcalc.com").with_tooltip(Some("The site".into()));
+        doc.set_cell_link(0, cell(0, 0), &target, Some("IronCalc"))
+            .unwrap();
+
+        let link = link_of(&doc, 0, 0, 0).expect("A1 has a link");
+        assert_eq!(link.target, target);
+        assert_eq!(link.target.tooltip(), Some("The site"));
+        assert!(!link.dynamic, "a set_cell_link link is a worksheet link");
+        // The label became the cell's content in the same call (F5.3).
+        assert_eq!(doc.cell_content(0, cell(0, 0)).unwrap(), "IronCalc");
+    }
+
+    #[test]
+    fn cell_link_is_none_on_a_plain_cell() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "just text").unwrap();
+        assert_eq!(link_of(&doc, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn cell_link_reads_a_dynamic_hyperlink() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(
+            0,
+            cell(0, 0),
+            "=HYPERLINK(\"https://x.example\",\"Friendly\")",
+        )
+        .unwrap();
+        doc.evaluate();
+
+        let link = link_of(&doc, 0, 0, 0).expect("the HYPERLINK cell has a link");
+        assert_eq!(
+            link.target,
+            LinkTarget::external("https://x.example"),
+            "a dynamic link carries no tooltip"
+        );
+        assert!(link.dynamic, "a HYPERLINK() link is dynamic");
+        // F9.1: the cell DISPLAYS the friendly name, not the target.
+        assert_eq!(doc.formatted_value(0, cell(0, 0)).unwrap(), "Friendly");
+    }
+
+    #[test]
+    fn cell_link_prefers_the_worksheet_link_over_the_dynamic_one() {
+        // Both kinds on one cell: the engine's documented precedence is worksheet-wins, and the
+        // facade must inherit it — this is the rule the whole cache is built on.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "=HYPERLINK(\"https://dynamic.example\")")
+            .unwrap();
+        doc.evaluate();
+        assert!(link_of(&doc, 0, 0, 0).unwrap().dynamic);
+
+        doc.set_cell_link(
+            0,
+            cell(0, 0),
+            &LinkTarget::external("https://worksheet.example"),
+            None,
+        )
+        .unwrap();
+        let link = link_of(&doc, 0, 0, 0).unwrap();
+        assert_eq!(
+            link.target,
+            LinkTarget::external("https://worksheet.example")
+        );
+        assert!(!link.dynamic);
+    }
+
+    #[test]
+    fn sheet_links_returns_the_worksheet_and_dynamic_union() {
+        let doc = fixtures::links();
+        let links = doc.sheet_links(0).unwrap();
+
+        // Five worksheet links (four explicit + one auto-linked) and one dynamic.
+        assert_eq!(links.len(), 6, "got {links:?}");
+        assert_eq!(
+            links[&(0, 0)].target,
+            LinkTarget::external("https://ironcalc.com")
+        );
+        assert_eq!(links[&(1, 0)].target.tooltip(), Some("The docs"));
+        assert_eq!(
+            links[&(3, 0)].target,
+            LinkTarget::internal("Sheet1!A30").with_tooltip(Some("Down the sheet".into()))
+        );
+        // F7.1: typing a bare URL auto-links it — engine behaviour FreeCell inherits.
+        assert_eq!(
+            links[&(4, 0)].target,
+            LinkTarget::external("https://auto.example.com")
+        );
+        assert_eq!(links.values().filter(|l| l.dynamic).count(), 1);
+        assert!(links[&(5, 0)].dynamic, "A6 is the HYPERLINK() cell");
+        assert!(!links.contains_key(&(0, 1)), "B1 carries no link");
+    }
+
+    #[test]
+    fn set_cell_link_with_a_label_sets_the_cell_content_in_one_undo_step() {
+        // F5.3: the link and the display text are one undoable operation, because the engine
+        // composes them into a single diff list — FreeCell must not compose two ops.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "before").unwrap();
+
+        let write = doc
+            .set_cell_link(
+                0,
+                cell(0, 0),
+                &LinkTarget::external("https://after.example"),
+                Some("after"),
+            )
+            .unwrap();
+        assert_eq!(write, LinkWrite::LabelChanged);
+        assert_eq!(doc.cell_content(0, cell(0, 0)).unwrap(), "after");
+
+        doc.undo().unwrap();
+        assert_eq!(doc.cell_content(0, cell(0, 0)).unwrap(), "before");
+        assert_eq!(link_of(&doc, 0, 0, 0), None, "one undo reverts both halves");
+    }
+
+    #[test]
+    fn set_cell_link_reports_no_op_when_nothing_changes() {
+        // The engine suppresses a no-op write, recording NO undo entry. The worker's touch history
+        // is 1:1 with IronCalc's undo stack, so the facade must report it — otherwise the two
+        // desync and a later undo is off by one.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let target = LinkTarget::external("https://same.example");
+
+        assert_eq!(
+            doc.set_cell_link(0, cell(0, 0), &target, Some("Same"))
+                .unwrap(),
+            LinkWrite::LabelChanged
+        );
+        assert!(doc.user_model().can_undo());
+        doc.undo().unwrap();
+        assert!(
+            !doc.user_model().can_undo(),
+            "exactly one entry was recorded"
+        );
+
+        doc.set_cell_link(0, cell(0, 0), &target, Some("Same"))
+            .unwrap();
+        assert_eq!(
+            doc.set_cell_link(0, cell(0, 0), &target, Some("Same"))
+                .unwrap(),
+            LinkWrite::NoOp,
+            "the identical link + label again records nothing"
+        );
+    }
+
+    #[test]
+    fn set_cell_link_reports_label_changed_only_when_the_label_differs() {
+        // Only a label rewrite changes a cell VALUE, so only it forces the batch's recompute.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_link(
+            0,
+            cell(0, 0),
+            &LinkTarget::external("https://one.example"),
+            Some("Label"),
+        )
+        .unwrap();
+
+        // Retarget, same label as the cell already shows → link changed, value untouched.
+        assert_eq!(
+            doc.set_cell_link(
+                0,
+                cell(0, 0),
+                &LinkTarget::external("https://two.example"),
+                Some("Label"),
+            )
+            .unwrap(),
+            LinkWrite::LinkOnly
+        );
+        // Retarget with no label at all → likewise link-only.
+        assert_eq!(
+            doc.set_cell_link(
+                0,
+                cell(0, 0),
+                &LinkTarget::external("https://three.example"),
+                None,
+            )
+            .unwrap(),
+            LinkWrite::LinkOnly
+        );
+        // Same target, new label → the cell's value changes.
+        assert_eq!(
+            doc.set_cell_link(
+                0,
+                cell(0, 0),
+                &LinkTarget::external("https://three.example"),
+                Some("Renamed"),
+            )
+            .unwrap(),
+            LinkWrite::LabelChanged
+        );
+        assert_eq!(doc.cell_content(0, cell(0, 0)).unwrap(), "Renamed");
+    }
+
+    #[test]
+    fn remove_cell_link_reports_whether_there_was_one() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_link(
+            0,
+            cell(0, 0),
+            &LinkTarget::external("https://gone.example"),
+            Some("Gone"),
+        )
+        .unwrap();
+
+        assert!(doc.remove_cell_link(0, cell(0, 0)).unwrap());
+        assert_eq!(link_of(&doc, 0, 0, 0), None);
+
+        // A second removal — and a removal on a never-linked cell — record no undo entry, so the
+        // worker must treat them as no-ops.
+        assert!(!doc.remove_cell_link(0, cell(0, 0)).unwrap());
+        assert!(!doc.remove_cell_link(0, cell(9, 9)).unwrap());
+    }
+
+    #[test]
+    fn remove_cell_link_cannot_remove_a_dynamic_link() {
+        // F6.3: a HYPERLINK() link isn't removable — only its formula is editable.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, cell(0, 0), "=HYPERLINK(\"https://dyn.example\")")
+            .unwrap();
+        doc.evaluate();
+
+        assert!(!doc.remove_cell_link(0, cell(0, 0)).unwrap());
+        assert!(
+            link_of(&doc, 0, 0, 0).unwrap().dynamic,
+            "the dynamic link survives a remove"
+        );
+    }
+
+    #[test]
+    fn remove_cell_link_keeps_the_content_and_the_link_formatting() {
+        // F1.6 / F6.2: the blue underline is ordinary formatting the user owns; FreeCell does not
+        // unwind it (matching Excel and upstream's documented behaviour).
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_link(
+            0,
+            cell(0, 0),
+            &LinkTarget::external("https://styled.example"),
+            Some("Styled"),
+        )
+        .unwrap();
+        let styled = doc.cell_style(0, cell(0, 0)).unwrap();
+
+        doc.remove_cell_link(0, cell(0, 0)).unwrap();
+        assert_eq!(doc.cell_content(0, cell(0, 0)).unwrap(), "Styled");
+        let after = doc.cell_style(0, cell(0, 0)).unwrap();
+        assert!(after.font.u, "the underline stays");
+        assert_eq!(after.font.color, styled.font.color, "the colour stays");
+    }
+
+    #[test]
+    fn a_reopened_hyperlink_formula_recreates_its_link() {
+        // The persistence half is `tests/roundtrip.rs`'s `roundtrip_dynamic_link_is_not_persisted`
+        // (nothing is written, and the reopened cell has no link yet). This is the other half: the
+        // first recompute brings the dynamic link back. Lives in-crate because `evaluate` is
+        // `pub(crate)`.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dynamic.xlsx");
+        fixtures::links().save(&path).unwrap();
+
+        let mut doc = WorkbookDocument::open(&path).unwrap();
+        assert_eq!(link_of(&doc, 0, 5, 0), None, "not persisted");
+        doc.evaluate();
+
+        let dynamic = link_of(&doc, 0, 5, 0).expect("evaluation re-creates it");
+        assert_eq!(
+            dynamic.target,
+            LinkTarget::external("https://dynamic.example.com")
+        );
+        assert!(dynamic.dynamic);
+    }
+
+    /// Asserts `cell`'s resolved render style carries the engine's link look: underlined, and a
+    /// font colour that really is a blue. Shared by the live and the reopened checks so the two
+    /// cannot drift.
+    fn assert_looks_like_a_link(doc: &WorkbookDocument, row: u32, col: u32) {
+        let style = doc.cell_style(0, cell(row, col)).unwrap();
+        let rs = crate::cache::render_style_from(&style, doc.workbook_theme());
+        assert!(rs.underline, "a link cell is underlined");
+        let color = rs
+            .font_color
+            .expect("a link cell has an explicit font colour");
+        assert!(
+            color.b > 128 && color.b > color.r + 48 && color.b > color.g + 48,
+            "the theme hyperlink slot must resolve to a blue, got #{:02X}{:02X}{:02X}",
+            color.r,
+            color.g,
+            color.b
+        );
+    }
+
+    #[test]
+    fn a_reopened_link_keeps_its_underline_and_blue() {
+        // The half of the formatting round-trip `tests/roundtrip.rs` cannot see: `published_style`
+        // exposes colour only, so UNDERLINE — which rides a separate `font.u` flag in the xlsx
+        // font record, and is the more fragile of the two — is asserted here, where the resolved
+        // `RenderStyle` is reachable.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("link-style.xlsx");
+        let live = fixtures::links();
+        assert_looks_like_a_link(&live, 0, 0); // before saving
+
+        live.save(&path).unwrap();
+        let reopened = WorkbookDocument::open(&path).unwrap();
+        assert_looks_like_a_link(&reopened, 0, 0); // and after reopening
+
+        // The control: an unlinked cell is neither underlined nor coloured, so the assertion above
+        // is about the link rather than about the workbook default.
+        let plain = crate::cache::render_style_from(
+            &reopened.cell_style(0, cell(0, 1)).unwrap(),
+            reopened.workbook_theme(),
+        );
+        assert!(!plain.underline);
+        assert_eq!(plain.font_color, None);
+    }
+
+    #[test]
+    fn engine_link_styling_resolves_to_blue() {
+        // The Phase-1 verification gate, pinned as a test: the engine styles a new worksheet link
+        // with `font.u` + the theme hyperlink colour, and FreeCell's existing theme resolution
+        // turns that into a BLUE `RenderStyle` with no FreeCell-side substitution (F1.2). If this
+        // ever fails, `hyperlinks/architecture.md §3.5`'s `LINK`-substitution fallback is back on.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_link(
+            0,
+            cell(0, 0),
+            &LinkTarget::external("https://blue.example"),
+            Some("Blue"),
+        )
+        .unwrap();
+
+        let style = doc.cell_style(0, cell(0, 0)).unwrap();
+        let rs = crate::cache::render_style_from(&style, doc.workbook_theme());
+        assert!(rs.underline, "a new link is underlined");
+        let color = rs
+            .font_color
+            .expect("a new link has an explicit font colour");
+        let (r, g, b) = (color.r, color.g, color.b);
+        assert!(
+            b > 128 && b > r + 48 && b > g + 48,
+            "the theme hyperlink slot must resolve to a blue, got #{:02X}{:02X}{:02X}",
+            r,
+            g,
+            b
+        );
     }
 }

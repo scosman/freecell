@@ -99,34 +99,63 @@ currently states the narrowed guarantee and must be widened again when it does.
 
 ### 3.1 `WorkbookDocument` (`freecell-engine/src/document.rs`)
 
-Three methods, following the CF/style precedent, each opening with
-`crate::instrument::record_engine_call();`:
+Following the CF/style precedent, each opening with
+`crate::instrument::record_engine_call();`. **As built** (Phase 3):
 
 ```rust
 pub fn cell_link(&self, sheet: u32, cell: CellRef)
-    -> Result<Option<LinkTarget>, CellQueryError>;          // effective link, near cell_content
-pub(crate) fn set_cell_link(&mut self, sheet: u32, cell: CellRef,
-                            target: &LinkTarget, label: Option<&str>) -> Result<(), String>;
-pub(crate) fn remove_cell_link(&mut self, sheet: u32, cell: CellRef) -> Result<(), String>;
+    -> Result<Option<CellLink>, CellQueryError>;            // effective link, near cell_content
+pub(crate) fn sheet_links(&self, sheet_idx: u32)
+    -> Result<HashMap<(u32, u32), CellLink>, String>;       // the cache build's source
+pub(crate) fn sheet_links_if_changed(&self, sheet_idx: u32,
+    cached: &HashMap<(u32, u32), CellLink>)
+    -> Result<Option<HashMap<(u32, u32), CellLink>>, String>;   // the mirror's hot path
+pub(crate) fn worksheet_links_match(&self, sheet_idx: u32,
+    cached: &HashMap<(u32, u32), CellLink>) -> bool;        // allocation-free no-eval fast path
+pub(crate) fn set_cell_link(&mut self, sheet_idx: u32, cell: CellRef,
+    target: &LinkTarget, label: Option<&str>) -> Result<LinkWrite, String>;
+pub(crate) fn remove_cell_link(&mut self, sheet_idx: u32, cell: CellRef)
+    -> Result<bool, String>;
 ```
 
 `set_cell_link` passes `label` straight through to upstream's
 `UserModel::set_cell_link(sheet, row, column, link, label)` so F5.3's "one undo step" is the
 engine's guarantee, not something FreeCell composes.
 
+**The two write methods report what happened** rather than returning `()`, because the engine
+hides two facts the worker must know (see §3.4):
+
+```rust
+pub(crate) enum LinkWrite { NoOp, LinkOnly, LabelChanged }
+```
+
+The four read methods are three shapes of one question, because the engine gives only one
+both-kinds read (`get_links_list`) and it clones: `sheet_links` builds, `sheet_links_if_changed`
+compares in place and materializes only on a real change, `worksheet_links_match` answers the
+worksheet half with **zero** allocations from a `&HashMap` the engine already owns. See §3.3.
+
 ### 3.2 `LinkTarget` — a `freecell-core` type
 
 The UI must never see `ironcalc_base::Link` (`freecell-core` has a dependency test forbidding
-it). Mirror it in `freecell-core/src/style.rs` or a new `link.rs`:
+it). Mirrored in a new `freecell-core/src/link.rs`:
 
 ```rust
 pub enum LinkTarget {
     External { target: String, tooltip: Option<String> },
     Internal { location: String, tooltip: Option<String> },
 }
+
+pub struct CellLink { pub target: LinkTarget, pub dynamic: bool }
 ```
 
 Converted at the `freecell-engine` boundary, same as `CfRuleView` already is.
+
+**`CellLink` wraps the target with the engine's `dynamic` flag** (Phase 3 deviation, accepted).
+The cache and facade carry `CellLink`, not a bare `LinkTarget`: F6.1/F6.3 gate the Remove
+affordance on the link being a *worksheet* link, and the Phase-5 dialog pre-fills **synchronously**
+from the cached snapshot — an async round-trip to the worker to ask "is this dynamic?" would be a
+regression on a dialog that must open already filled in. Phase 4's `CellPaint.link` and Phase 5's
+Remove gating both read this shape.
 
 ### 3.3 Reading the effective link
 
@@ -134,10 +163,10 @@ Upstream has **no per-cell call covering both worksheet and dynamic links** —
 `get_cell_link` is worksheet-only; `get_links_list(sheet)` is the union. So FreeCell reads the
 **union list per sheet** and caches it, exactly as upstream's own web UI does.
 
-`SheetCache` gains a **sparse map**, not a `RenderStyle` field:
+`SheetCache` gains a **sparse map**, not a `RenderStyle` field (`CellLink` per §3.2):
 
 ```rust
-pub links: HashMap<(u32, u32), LinkTarget>,   // shaped like `merges`
+links: HashMap<(u32, u32), CellLink>,   // shaped like `merges`; replaced wholesale by `set_links`
 ```
 
 `RenderStyle` is `Copy + Eq + Hash` and **interned**; adding a link field would give every
@@ -147,19 +176,65 @@ leaves interning and the style-agreement contract untouched.
 **The agreement contract needs all three paths** (`freecell-engine/src/lib.rs:20-24`) — miss one
 and you get the classic bug shape here:
 
-1. **build** — populate `links` in `build_sheet_cache` from `get_links_list`.
-2. **mirror** — refresh after each applied edit. Because dynamic links are rebuilt on *every*
-   evaluation, any `AppliedKind::Cell` must refresh the sheet's link map, not just the touched
-   cells.
+1. **build** — populate `links` in `build_sheet_cache` from `get_links_list`. This also covers
+   every full rebuild (structural edits, the CF refresh, sheet activation).
+2. **mirror** — `cache::changed_links`, driven from `Worker::refresh_cache_cells`, the one
+   chokepoint every mirror flows through (the edit batch, paste, replace, `SetFont`). Refreshes
+   **every resident sheet wholesale**, not just the touched cells and not just the touched sheet:
+   dynamic links are rebuilt on *every* evaluation, so a `HYPERLINK()` on Sheet1 can move because
+   of an edit on Sheet2.
 3. **undo/redo touch-set** — `SetCellLink`/`RemoveCellLink` map to `AppliedOp::Cells { sheet,
-   range }` like `SetStyleAttr` does, so the re-read covers them.
+   range }` like `SetStyleAttr` does, so the re-read covers them; `Undo`/`Redo` route through
+   `apply_edit_batch` → `apply_cache_refresh` → `refresh_cache_cells`, so (3) falls out of (2).
+
+`assert_cache_agrees` compares each probe cell's cached link against a fresh `cell_link` re-read,
+so every existing agreement test also proves link agreement.
+
+**Cost shaping** (the mirror runs on every keystroke, and F10.4 supports a 10 000-cell range
+hyperlink import, so a naive rebuild-then-compare would mean tens of thousands of `String`
+allocations per edit):
+
+- the comparison runs **in place** against the engine's returned list; the map is materialized
+  only when something actually changed, and then by **move** rather than clone;
+- when the batch did **not** evaluate, no dynamic link can have moved, so the check collapses to
+  the allocation-free `worksheet_links_match` (a `&HashMap` the engine owns). `evaluated: true`
+  is the conservative default — it only ever costs a full re-read;
+- updates for all resident sheets are computed under the shared read lock, then installed under
+  **one** write lock, so the lock the render thread contends on is taken once per mirror.
+
+A complete CF-style "no links anywhere, return immediately" gate is **not** reachable today: the
+worksheet half is free, but the dynamic half lives in `Model::links`, which is `pub(crate)` with
+no public accessor. Closing it needs a small fork addition (`has_dynamic_links` /
+`get_dynamic_links`) — deliberately not opened in Phase 3.
 
 ### 3.4 Commands
 
 `Command::{SetCellLink { sheet, cell, target, label }, RemoveCellLink { sheet, cell }}` in
 `worker/protocol.rs`, bucketed with the **edits** arm (they are undoable), dispatched in
-`apply_one`, returning `AppliedKind::StyleOnly` — a link never changes a value. `HYPERLINK()`
-cells are ordinary `SetCellInput` and stay `AppliedKind::Cell`.
+`apply_one`. `HYPERLINK()` cells are ordinary `SetCellInput` and stay `AppliedKind::Cell`.
+
+**The `AppliedKind` is not a constant `StyleOnly`** (Phase 3 deviation, accepted). The original
+"a link never changes a value" is true of the link itself but not of the command, because the
+engine hides two things behind a `()` return:
+
+| `LinkWrite` | when | `AppliedKind` | why |
+|---|---|---|---|
+| `NoOp` | same link **and** same label | `NoOp` | the engine suppresses the write and pushes **no diff**, so IronCalc records no undo entry. The worker's touch history is 1:1 with that stack — recording a touch here desyncs them and the next Undo is off by one. |
+| `LinkOnly` | the link (and, if new, its styling) changed | `StyleOnly` | no value moved → no recompute |
+| `LabelChanged` | `label` differs from the cell's display text | `Cell` | F5.3 makes the label the cell's **content**, so dependent formulas must recompute |
+
+`remove_cell_link` reports the same distinction as a `bool`: removing a link from a cell that has
+none (including one whose only link is dynamic — F6.3) records no diff, so it is `NoOp`.
+
+The facade evaluates these conditions **before** the write, mirroring the engine's own
+(`user_model/links.rs`), since the engine reports nothing.
+
+**Input cap.** `label` reaches `Model::set_user_input` and therefore IronCalc's *recursive*
+formula parser, so `SetCellLink` must be listed in `Worker::pre_validate` alongside
+`SetCellInput`. This is not a nicety: the parser has no depth cap and an overflow is a **SIGABRT
+that `catch_unwind` cannot catch** (verified directly — a depth-490 label aborts the process),
+which would take the user's unsaved workbook with it. Every command that can carry user text into
+`set_user_input` belongs in that gate.
 
 ### 3.5 Styling decision
 

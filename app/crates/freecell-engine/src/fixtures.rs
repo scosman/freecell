@@ -9,7 +9,7 @@
 //! Coordinates are **0-based** here (matching `freecell_core::CellRef`), converted to
 //! IronCalc's 1-based `(row, column)` inside the helpers.
 
-use freecell_core::CellRef;
+use freecell_core::{CellRef, LinkTarget};
 use ironcalc_base::expressions::types::Area;
 
 use crate::document::WorkbookDocument;
@@ -89,6 +89,68 @@ pub fn styles() -> WorkbookDocument {
     );
     set(&mut doc, 0, CellRef::new(2, 3), "8"); // D3
     style(&mut doc, 0, CellRef::new(2, 3), "alignment.vertical", "top");
+    doc
+}
+
+/// Attaches a hyperlink to a cell, optionally setting its display text in the same step. Panics
+/// on rejection for the same reason as [`set`].
+fn link(doc: &mut WorkbookDocument, sheet: u32, cell: CellRef, target: LinkTarget, label: &str) {
+    doc.set_cell_link(sheet, cell, &target, Some(label))
+        .expect("fixture link should be valid");
+}
+
+/// One sheet covering every shape a hyperlink comes in — the source for the xlsx round-trip and
+/// link-cache tests (`hyperlinks/functional_spec.md F10`):
+///
+/// | Cell | Link |
+/// |---|---|
+/// | A1 | plain external URL |
+/// | A2 | external URL with a **tooltip** (Excel ScreenTip) |
+/// | A3 | `mailto:` |
+/// | A4 | **internal** (`Sheet1!A30`) with a tooltip |
+/// | A5 | **auto-linked** — a bare URL typed as ordinary input, linked by the engine (F7.1) |
+/// | A6 | **dynamic** — a `HYPERLINK()` formula (never persisted; rebuilt by evaluation) |
+/// | B1 | no link (the negative control) |
+pub fn links() -> WorkbookDocument {
+    let mut doc = WorkbookDocument::new_empty().expect("new empty workbook");
+    link(
+        &mut doc,
+        0,
+        CellRef::new(0, 0),
+        LinkTarget::external("https://ironcalc.com"),
+        "IronCalc",
+    );
+    link(
+        &mut doc,
+        0,
+        CellRef::new(1, 0),
+        LinkTarget::external("https://example.com/docs?a=1&b=2")
+            .with_tooltip(Some("The docs".into())),
+        "Docs",
+    );
+    link(
+        &mut doc,
+        0,
+        CellRef::new(2, 0),
+        LinkTarget::external("mailto:someone@example.com"),
+        "Mail us",
+    );
+    link(
+        &mut doc,
+        0,
+        CellRef::new(3, 0),
+        LinkTarget::internal("Sheet1!A30").with_tooltip(Some("Down the sheet".into())),
+        "Jump",
+    );
+    // Typed as plain input: the ENGINE auto-links it (FreeCell reimplements no URL detection).
+    set(&mut doc, 0, CellRef::new(4, 0), "https://auto.example.com");
+    set(
+        &mut doc,
+        0,
+        CellRef::new(5, 0),
+        "=HYPERLINK(\"https://dynamic.example.com\",\"Dynamic\")",
+    );
+    set(&mut doc, 0, CellRef::new(0, 1), "no link here"); // B1
     doc
 }
 

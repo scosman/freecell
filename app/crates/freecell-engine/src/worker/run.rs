@@ -45,7 +45,7 @@ use crate::chart::binding::{
     ChartBindings, RemovedChart, SheetResolver,
 };
 use crate::chart::write::{AuthoredChart, SeriesRefs};
-use crate::document::{DocumentSource, FontFlag, SaveError, WorkbookDocument};
+use crate::document::{DocumentSource, FontFlag, LinkMap, LinkWrite, SaveError, WorkbookDocument};
 use std::path::Path;
 
 use super::charts::ChartSnapshot;
@@ -582,6 +582,11 @@ impl Worker {
                 | Command::SetStyleAttr { .. }
                 | Command::SetStylePath { .. }
                 | Command::SetBorders { .. }
+                // Link ops bucket with the style edits: both are undoable, and both are
+                // style-only unless a `SetCellLink` label rewrites the cell's content — which
+                // `apply_one` reports so the batch recomputes (`hyperlinks/architecture.md §3.4`).
+                | Command::SetCellLink { .. }
+                | Command::RemoveCellLink { .. }
                 // CF mutations bucket with the style edits: each is style-only (no recompute) and
                 // undoable, so it rides the coalesced-eval + publish + undo/redo machinery. The
                 // CF-map republish is folded into `apply_edit_batch` (§components/engine_cf.md §5).
@@ -968,7 +973,7 @@ impl Worker {
 
                 // Mirror the applied ops into the style/geometry cache (re-read touched cells) and
                 // ship `StyleCacheUpdated` deltas. Ordered after `Published` (unchanged event order).
-                self.apply_cache_refresh(refresh, rebuild, &sheets_before);
+                self.apply_cache_refresh(refresh, rebuild, &sheets_before, needs_eval);
 
                 // Value-dependent conditional formatting: a recompute can change cell values, which
                 // flips CF results (a threshold crosses, a Top-N/average cell enters or leaves the
@@ -1196,7 +1201,7 @@ impl Worker {
                     self.undo_stack
                         .push(UndoEntry::Cell(Touch::Ranges(touched.clone())));
                     self.redo_stack.clear();
-                    for s in self.refresh_cache_cells(&touched) {
+                    for s in self.refresh_cache_cells(&touched, true) {
                         self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
                     }
                     // A replace recomputes values → re-evaluate CF on the resident CF sheets
@@ -1242,7 +1247,7 @@ impl Worker {
             }));
         }
         self.redo_stack.clear();
-        for sheet in self.refresh_cache_cells(touched) {
+        for sheet in self.refresh_cache_cells(touched, true) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
         }
         // A replace recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
@@ -1581,7 +1586,7 @@ impl Worker {
         self.undo_stack
             .push(UndoEntry::Cell(Touch::Ranges(touched.clone())));
         self.redo_stack.clear();
-        for sheet in self.refresh_cache_cells(&touched) {
+        for sheet in self.refresh_cache_cells(&touched, true) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
         }
         // A paste recomputes values → re-evaluate CF on the resident CF sheets (empty-map gated).
@@ -1729,7 +1734,7 @@ impl Worker {
                     }));
                 }
                 self.redo_stack.clear();
-                for s in self.refresh_cache_cells(&[(sheet, clamped)]) {
+                for s in self.refresh_cache_cells(&[(sheet, clamped)], false) {
                     self.emit(WorkerEvent::StyleCacheUpdated { sheet: s });
                 }
             }
@@ -1819,11 +1824,15 @@ impl Worker {
     /// and emit `StyleCacheUpdated` per changed sheet. Consumes the `(refresh, rebuild)` from
     /// [`collect_edited_ranges`](Self::collect_edited_ranges). Runs after the eval + publish (styles
     /// don't depend on the recompute).
+    ///
+    /// `evaluated` is the batch's own `needs_eval`, forwarded to the link mirror — only a recompute
+    /// can move a `HYPERLINK()` link, so a style-only batch skips that work.
     fn apply_cache_refresh(
         &mut self,
         refresh: Vec<(SheetId, CellRange)>,
         mut rebuild: Vec<SheetId>,
         sheets_before: &[SheetMeta],
+        evaluated: bool,
     ) {
         // When the sheet-id SET changed (delete, or undo-of-add), drop caches for absent sheets.
         // A returning sheet (undo-of-delete) rebuilds lazily on its next activation.
@@ -1836,7 +1845,7 @@ impl Worker {
                 .retain(|id| ids_after.contains(&id));
         }
 
-        for sheet in self.refresh_cache_cells(&refresh) {
+        for sheet in self.refresh_cache_cells(&refresh, evaluated) {
             self.emit(WorkerEvent::StyleCacheUpdated { sheet });
         }
 
@@ -1899,7 +1908,15 @@ impl Worker {
     /// pathologically large one — falls back to a full (populated-cell-bounded) rebuild that reads
     /// the bands back from the engine. Non-band ranges take the cheap per-cell path, plus a
     /// row-height mirror (a value edit can auto-fit a row taller).
-    fn refresh_cache_cells(&mut self, refresh: &[(SheetId, CellRange)]) -> Vec<SheetId> {
+    ///
+    /// `evaluated` says whether this batch recomputed. It is forwarded to the link mirror, which
+    /// can take an allocation-free fast path when no evaluation could have moved a dynamic link;
+    /// `true` is always safe (see [`refresh_resident_links`](Self::refresh_resident_links)).
+    fn refresh_cache_cells(
+        &mut self,
+        refresh: &[(SheetId, CellRange)],
+        evaluated: bool,
+    ) -> Vec<SheetId> {
         let caches = Arc::clone(&self.shared.caches);
         let mut touched: Vec<SheetId> = Vec::new();
         for (sheet, range) in refresh {
@@ -1974,7 +1991,77 @@ impl Worker {
                 touched.push(*sheet);
             }
         }
+        for sheet in self.refresh_resident_links(evaluated) {
+            if !touched.contains(&sheet) {
+                touched.push(sheet);
+            }
+        }
         touched
+    }
+
+    /// Re-read the hyperlink map of **every resident sheet**, returning the sheets whose links
+    /// actually changed (`hyperlinks/architecture.md §3.3`, mirror path).
+    ///
+    /// Deliberately coarser than the per-cell style mirror on two axes, both forced by the engine:
+    /// - **whole-sheet**, because the only read covering worksheet *and* `HYPERLINK()` links is
+    ///   the per-sheet union list;
+    /// - **every resident sheet**, not just the touched ones, because dynamic links are cleared
+    ///   and rebuilt on every `evaluate()`. A `HYPERLINK()` on Sheet1 can be re-created — or
+    ///   produce a different target — because of an edit on Sheet2, so a touched-sheet-only
+    ///   refresh would leave a stale link behind.
+    ///
+    /// Called from [`refresh_cache_cells`](Self::refresh_cache_cells) — the single chokepoint every
+    /// mirror flows through (the coalesced edit batch and its undo/redo, paste, replace, and
+    /// `SetFont`), so the build/mirror/undo-touch trio all agree.
+    ///
+    /// **Cost.** This runs on every mirror, so it is shaped to do as little as possible:
+    /// - `evaluated == false` ⇒ no dynamic link can have moved, so each sheet collapses to an
+    ///   allocation-free worksheet comparison against a `&HashMap` the engine already owns. A
+    ///   style-only edit over a link-heavy sheet therefore costs no allocations at all.
+    /// - otherwise the union re-read happens, but the comparison is still in place and the map is
+    ///   built only when something actually changed (`sheet_links_if_changed`).
+    /// - every update is computed first and installed under **one** write lock, so a multi-sheet
+    ///   refresh takes the lock the render thread contends on once rather than per sheet.
+    ///
+    /// A link-free workbook pays nothing measurable either way (both maps are empty). What is
+    /// *not* yet possible is the conditional-formatting-style "no links anywhere, return
+    /// immediately" gate: the worksheet half is free, but the dynamic half lives in
+    /// `Model::links`, which the engine exposes no accessor for — see
+    /// [`WorkbookDocument::sheet_links_if_changed`].
+    fn refresh_resident_links(&mut self, evaluated: bool) -> Vec<SheetId> {
+        let caches = Arc::clone(&self.shared.caches);
+        // Compute under the READ lock: it is shared, so the render thread's own per-frame read is
+        // unaffected, and no writer is blocked while we talk to the engine.
+        let updates: Vec<(SheetId, LinkMap)> = {
+            let guard = caches.read();
+            guard
+                .resident_ids()
+                .into_iter()
+                .filter_map(|sheet| {
+                    // A sheet deleted out from under the resident snapshot resolves to `None`.
+                    let idx = self.resolve(sheet)?;
+                    let cache = guard.get(sheet)?;
+                    let links = cache::changed_links(&self.doc, idx, cache, evaluated)?;
+                    Some((sheet, links))
+                })
+                .collect()
+        };
+        if updates.is_empty() {
+            return Vec::new();
+        }
+        let mut changed = Vec::with_capacity(updates.len());
+        let mut guard = caches.write();
+        for (sheet, links) in updates {
+            // `links` is MOVED in — cloning it here would reintroduce exactly the per-link
+            // allocation storm this function is shaped to avoid.
+            if guard
+                .get_mut(sheet)
+                .is_some_and(|cache| cache.set_links(links))
+            {
+                changed.push(sheet);
+            }
+        }
+        changed
     }
 
     /// Build `sheet`'s style/geometry cache from the engine's current state and install it under
@@ -2186,6 +2273,15 @@ impl Worker {
             Command::SetCellInput { input, .. } => {
                 validate_input(input).map_err(EditRejectedReason::InputCap)
             }
+            // A link's `label` is written with `Model::set_user_input` (F5.3 — the display text is
+            // the cell's content), so it reaches the SAME recursive formula parser and needs the
+            // SAME gate: `freecell_core::input_cap` exists because IronCalc's parser has no depth
+            // cap and an overflow is a SIGABRT that `catch_unwind` CANNOT catch — it takes the
+            // process and the user's unsaved workbook with it. Every command that can carry user
+            // text into `set_user_input` must be listed here.
+            Command::SetCellLink {
+                label: Some(label), ..
+            } => validate_input(label).map_err(EditRejectedReason::InputCap),
             Command::RenameSheet { sheet, name } => {
                 let props = self.doc.sheet_properties();
                 let target = props.iter().position(|(id, _)| SheetId(*id) == *sheet);
@@ -3548,6 +3644,36 @@ fn apply_one(doc: &mut WorkbookDocument, edit: &Command) -> Result<AppliedKind, 
             // Borders never change values → no recompute.
             Ok(AppliedKind::StyleOnly)
         }
+        Command::SetCellLink {
+            sheet,
+            cell,
+            target,
+            label,
+        } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            // The engine suppresses a no-op write (no diff ⇒ no undo entry), and a `label` that
+            // differs from the cell's display text rewrites the cell's VALUE in the same undo step
+            // (F5.3) — so the three outcomes map to three different `AppliedKind`s. Claiming
+            // `StyleOnly` for all of them would both desync the touch history from IronCalc's undo
+            // stack and skip the recompute a label edit needs.
+            Ok(
+                match doc.set_cell_link(idx, *cell, target, label.as_deref())? {
+                    LinkWrite::NoOp => AppliedKind::NoOp,
+                    LinkWrite::LinkOnly => AppliedKind::StyleOnly,
+                    LinkWrite::LabelChanged => AppliedKind::Cell,
+                },
+            )
+        }
+        Command::RemoveCellLink { sheet, cell } => {
+            let idx = resolve_idx(doc, *sheet)?;
+            // A cell with no worksheet link records no diff → NoOp, so the worker doesn't push a
+            // touch entry IronCalc's undo stack has no counterpart for.
+            Ok(if doc.remove_cell_link(idx, *cell)? {
+                AppliedKind::StyleOnly
+            } else {
+                AppliedKind::NoOp
+            })
+        }
         Command::SetColumnWidths {
             sheet,
             col_start,
@@ -3846,6 +3972,16 @@ fn op_of(edit: &Command) -> AppliedOp {
                 range: *range,
             }
         }
+        // A link write touches exactly its own cell (the engine's link styling, and a label's
+        // value, both land there). The sheet's link MAP is refreshed wholesale by the mirror —
+        // this range is what makes the cell's *style* re-read, and what the undo/redo touch-set
+        // replays.
+        Command::SetCellLink { sheet, cell, .. } | Command::RemoveCellLink { sheet, cell } => {
+            AppliedOp::Cells {
+                sheet: *sheet,
+                range: CellRange::single(*cell),
+            }
+        }
         // `set_area_with_border` also fixes up the four cells adjacent to the range (heavier-wins
         // sync of the shared edge), so the mirror must re-read a one-cell ring around the target.
         // A full row/col stays band-creating after expansion → the refresh takes the full-rebuild
@@ -4000,7 +4136,7 @@ mod tests {
     use super::*;
     use crate::worker::protocol::StylePath;
     use freecell_core::input_cap::{InputRejection, MAX_INPUT_LEN, MAX_NESTING_DEPTH};
-    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, Rgb};
+    use freecell_core::{CfFormat, CfRuleSpec, CfValueOp, LinkTarget, Rgb};
 
     /// Build a headless worker over a fresh empty workbook plus the event receiver, without a
     /// spawned thread — the deterministic substrate for the coalescing / recovery tests.
@@ -9155,12 +9291,16 @@ mod tests {
     }
 
     // Verifies the FreeCell-side reconcile-of-reappeared-sheets fix end-to-end, but only passes
-    // once the engine restores CF on undo-of-delete. That engine fix is committed on the fork's
-    // `freecell-fixes` branch (base/src/user_model/undo_redo.rs `Diff::DeleteSheet` arm) but could
-    // not be pushed from this container (git-proxy 403 on push to scosman/ironcalc), so the pinned
-    // engine still drops CF on undo-of-delete. Remove this `#[ignore]` once `freecell-fixes` carries
-    // the fix and `app/Cargo.lock` is re-pinned (validated green against the fixed fork locally).
-    #[ignore = "blocked on fork CF-undo fix on freecell-fixes (push 403-denied); re-pin then un-ignore"]
+    // once the engine restores CF on undo-of-delete.
+    //
+    // NOTE (hyperlinks phase 3): this comment used to say the engine fix "is committed on the
+    // fork's `freecell-fixes` branch" and to re-pin then un-ignore. The re-pin happened (the lock
+    // now names `freecell-fixes` 195f11e6) and the test still fails, because the fix was never
+    // actually pushed — `undo_redo.rs`'s `Diff::DeleteSheet` arm still restores nine worksheet
+    // fields and neither `conditional_formatting` nor `links`. Same root cause as
+    // `undo_of_sheet_delete_drops_the_sheets_links` below; one fork fix ("undo of
+    // `Diff::DeleteSheet` restores the full worksheet") would close both.
+    #[ignore = "blocked on the fork's Diff::DeleteSheet undo restoring conditional_formatting (not yet written; see the note above)"]
     #[test]
     fn undo_of_sheet_delete_repopulates_cf_map() {
         let (mut worker, rx) = test_worker();
@@ -9508,5 +9648,523 @@ mod tests {
             "a non-CF workbook keeps the published CF map empty"
         );
         worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    // ---- Hyperlinks (`hyperlinks/architecture.md §3.3/§3.4`) --------------------------------
+
+    /// The external destination cached for `(row, col)` on `sheet`, or `None`.
+    fn cached_link(worker: &Worker, sheet: SheetId, row: u32, col: u32) -> Option<String> {
+        worker.shared.caches.read().get(sheet).and_then(|c| {
+            c.cell_link(row, col)
+                .map(|l| l.target.destination().to_string())
+        })
+    }
+
+    fn set_link(sheet: SheetId, row: u32, col: u32, url: &str, label: Option<&str>) -> Command {
+        Command::SetCellLink {
+            sheet,
+            cell: CellRef::new(row, col),
+            target: LinkTarget::external(url),
+            label: label.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn set_cell_link_command_populates_the_cache_and_styles_the_cell() {
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+
+        worker.process_batch(vec![set_link(
+            sheet,
+            1,
+            1,
+            "https://b2.example",
+            Some("B2"),
+        )]);
+
+        assert_eq!(
+            cached_link(&worker, sheet, 1, 1).as_deref(),
+            Some("https://b2.example")
+        );
+        // The engine's own link formatting arrives through the existing style mirror — FreeCell
+        // applies none of its own for a worksheet link (F1.2).
+        let styled = {
+            let caches = worker.shared.caches.read();
+            *caches.get(sheet).unwrap().render_style(1, 1).unwrap()
+        };
+        assert!(styled.underline, "a new link is underlined by the engine");
+        assert!(
+            styled.font_color.is_some(),
+            "and carries the theme link colour"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+        assert!(
+            drain_events(&rx)
+                .iter()
+                .any(|e| matches!(e, WorkerEvent::StyleCacheUpdated { sheet: s } if *s == sheet)),
+            "a link edit ships a cache delta so the grid repaints"
+        );
+    }
+
+    #[test]
+    fn remove_cell_link_command_clears_the_cache_entry() {
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![set_link(
+            sheet,
+            0,
+            0,
+            "https://gone.example",
+            Some("Gone"),
+        )]);
+        assert!(cached_link(&worker, sheet, 0, 0).is_some());
+
+        worker.process_batch(vec![Command::RemoveCellLink {
+            sheet,
+            cell: CellRef::new(0, 0),
+        }]);
+        assert_eq!(cached_link(&worker, sheet, 0, 0), None);
+        // F6.2: the content survives; only the link went.
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            "Gone"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn undo_redo_of_a_link_edit_restores_the_cache() {
+        // The third agreement path: the undo/redo touch-set re-read must move the link map too.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![set_link(
+            sheet,
+            2,
+            2,
+            "https://undo.example",
+            Some("U"),
+        )]);
+        assert!(cached_link(&worker, sheet, 2, 2).is_some());
+
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            cached_link(&worker, sheet, 2, 2),
+            None,
+            "undo drops the link"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+
+        worker.process_batch(vec![Command::Redo]);
+        assert_eq!(
+            cached_link(&worker, sheet, 2, 2).as_deref(),
+            Some("https://undo.example")
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn a_no_op_link_command_records_no_undo_entry() {
+        // The engine suppresses a no-op link write, so the worker must NOT push a touch entry for
+        // it — otherwise its history desyncs from IronCalc's undo stack and the next Undo is off
+        // by one, leaving the link behind.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let before = worker.ops_seen;
+
+        worker.process_batch(vec![set_link(
+            sheet,
+            0,
+            0,
+            "https://same.example",
+            Some("S"),
+        )]);
+        let after_first = worker.ops_seen;
+        assert_eq!(after_first, before + 1);
+
+        // The identical write again, plus a remove on a cell that has no link.
+        worker.process_batch(vec![
+            set_link(sheet, 0, 0, "https://same.example", Some("S")),
+            Command::RemoveCellLink {
+                sheet,
+                cell: CellRef::new(5, 5),
+            },
+        ]);
+        assert_eq!(
+            worker.ops_seen, after_first,
+            "no-op link writes are not committed ops"
+        );
+        assert_eq!(worker.undo_stack.len(), 1, "and push no touch entries");
+
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            cached_link(&worker, sheet, 0, 0),
+            None,
+            "one undo reaches all the way back to link-free"
+        );
+    }
+
+    #[test]
+    fn a_link_label_edit_recomputes_dependent_formulas() {
+        // A label rewrites the cell's VALUE (F5.3), so — unlike every other link write — the batch
+        // must recompute. Classifying it `StyleOnly` would leave a dependent formula stale.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 0, 0, "before"),
+            set_input(sheet, 1, 0, "=A1"),
+        ]);
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(1, 0)).unwrap(),
+            "before"
+        );
+
+        worker.process_batch(vec![set_link(
+            sheet,
+            0,
+            0,
+            "https://x.example",
+            Some("after"),
+        )]);
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(1, 0)).unwrap(),
+            "after",
+            "the dependent formula saw the label edit"
+        );
+    }
+
+    #[test]
+    fn typing_a_url_auto_links_and_undo_removes_it() {
+        // F7.1 + F7.5 end to end: the ENGINE auto-links typed URLs (FreeCell reimplements no URL
+        // detection), and the Phase-2 fork fix makes that undoable — including through FreeCell's
+        // batched write path.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+
+        worker.process_batch(vec![set_input(sheet, 0, 0, "https://typed.example")]);
+        assert_eq!(
+            cached_link(&worker, sheet, 0, 0).as_deref(),
+            Some("https://typed.example"),
+            "typing a URL auto-links the cell"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+
+        worker.process_batch(vec![Command::Undo]);
+        assert_eq!(
+            cached_link(&worker, sheet, 0, 0),
+            None,
+            "undo takes the auto-created link with it"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn a_dynamic_link_follows_a_re_evaluation_of_its_argument() {
+        // Why the link mirror is WHOLE-SHEET: A1's HYPERLINK() link is rebuilt by the evaluation
+        // an edit to A2 triggers, so a touched-cell-only refresh would leave A1's link stale.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.process_batch(vec![
+            set_input(sheet, 1, 0, "https://first.example"),
+            set_input(sheet, 0, 0, "=HYPERLINK(A2)"),
+        ]);
+        assert_eq!(
+            cached_link(&worker, sheet, 0, 0).as_deref(),
+            Some("https://first.example")
+        );
+
+        worker.process_batch(vec![set_input(sheet, 1, 0, "https://second.example")]);
+        assert_eq!(
+            cached_link(&worker, sheet, 0, 0).as_deref(),
+            Some("https://second.example"),
+            "A1's dynamic link followed an edit that never touched A1"
+        );
+    }
+
+    #[test]
+    fn a_dynamic_link_on_another_sheet_follows_a_cross_sheet_edit() {
+        // Why the link mirror covers EVERY RESIDENT SHEET, not just the touched one: the edit here
+        // lands on Sheet1 while the link that moves is on Sheet2.
+        let (mut worker, _rx) = test_worker();
+        let sheet1 = sheet0(&worker);
+        worker.process_batch(vec![Command::AddSheet]);
+        let sheet2 = worker.sheet_metas()[1].id;
+        // Activate Sheet2 in its own batch so its cache is resident (only the LAST viewport in a
+        // batch activates), then go back to Sheet1 — Sheet2's cache stays resident.
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: sheet2,
+            rows: 0..6,
+            cols: 0..6,
+        }]);
+        worker.process_batch(vec![
+            set_input(sheet2, 0, 0, "=HYPERLINK(Sheet1!A1)"),
+            set_input(sheet1, 0, 0, "https://one.example"),
+        ]);
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: sheet1,
+            rows: 0..6,
+            cols: 0..6,
+        }]);
+        assert!(
+            worker.shared.caches.read().contains(sheet2),
+            "Sheet2 must stay resident for this test to mean anything"
+        );
+        assert_eq!(
+            cached_link(&worker, sheet2, 0, 0).as_deref(),
+            Some("https://one.example")
+        );
+
+        // An edit entirely on Sheet1 changes Sheet2's dynamic link.
+        worker.process_batch(vec![set_input(sheet1, 0, 0, "https://two.example")]);
+        assert_eq!(
+            cached_link(&worker, sheet2, 0, 0).as_deref(),
+            Some("https://two.example"),
+            "a resident but untouched sheet's dynamic links are refreshed too"
+        );
+    }
+
+    #[test]
+    fn clearing_a_cell_clears_its_link() {
+        // F8.5 is engine behaviour (clearing a cell drops its link); this pins that the cache
+        // follows it — the ordinary `ClearCells` edit path, no link command involved.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![set_link(
+            sheet,
+            0,
+            0,
+            "https://cleared.example",
+            Some("C"),
+        )]);
+
+        worker.process_batch(vec![Command::ClearCells {
+            sheet,
+            range: CellRange::single(CellRef::new(0, 0)),
+        }]);
+        assert_eq!(cached_link(&worker, sheet, 0, 0), None);
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn an_internal_paste_carries_the_link_into_the_cache() {
+        // F8.3, and the reason the link mirror hangs off `refresh_cache_cells`: a paste never
+        // touches `apply_edit_batch`, so a mirror wired only into the edit batch would miss it.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![set_link(
+            sheet,
+            0,
+            0,
+            "https://copied.example",
+            Some("Copied"),
+        )]);
+        drain_events(&rx);
+
+        do_copy(
+            &mut worker,
+            &rx,
+            sheet,
+            CellRange::single(CellRef::new(0, 0)),
+            false,
+        );
+        worker.process_batch(vec![Command::PasteInternal {
+            sheet,
+            target: CellRange::single(CellRef::new(3, 3)),
+        }]);
+
+        assert_eq!(
+            cached_link(&worker, sheet, 3, 3).as_deref(),
+            Some("https://copied.example"),
+            "the pasted cell's link reached the cache"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn a_link_survives_a_row_insert_that_displaces_it() {
+        // F8.1 is engine behaviour; FreeCell's job is to not break it. A structural edit takes the
+        // full-rebuild path, so this also pins that the rebuild carries links.
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let (rows, cols) = small_probes();
+        worker.process_batch(vec![set_link(
+            sheet,
+            2,
+            0,
+            "https://moved.example",
+            Some("M"),
+        )]);
+
+        worker.process_batch(vec![Command::InsertRows {
+            sheet,
+            row: 0,
+            count: 1,
+        }]);
+        assert_eq!(cached_link(&worker, sheet, 2, 0), None);
+        assert_eq!(
+            cached_link(&worker, sheet, 3, 0).as_deref(),
+            Some("https://moved.example"),
+            "the link shifted down with its cell"
+        );
+        worker_cache_agrees(&worker, sheet, &rows, &cols);
+    }
+
+    #[test]
+    fn a_link_label_goes_through_the_input_cap_gate() {
+        // A link's `label` is written with `set_user_input`, so it reaches IronCalc's *recursive*
+        // formula parser exactly as a typed formula does, and needs the same cap. The real abort
+        // cannot be asserted here — it is a SIGABRT past the guard page, the one failure
+        // `catch_unwind` cannot contain, and it would take the test process with it — so this
+        // asserts the rejection that prevents it. That the danger is real was verified directly
+        // (a throwaway probe calling `set_cell_link` with a depth-490 label: "fatal runtime error:
+        // stack overflow, aborting", signal 6). The cap values below are the ones the gate
+        // enforces (Excel's), far under that measured ceiling.
+        //
+        // Mutation-checked by deleting the `SetCellLink` arm of `pre_validate`: the
+        // `rejects.len() == 2` assertion fails.
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+
+        let deep = format!(
+            "={}1{}",
+            "(".repeat(MAX_NESTING_DEPTH + 1),
+            ")".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        let long = format!("={}", "1".repeat(MAX_INPUT_LEN));
+        worker.process_batch(vec![
+            set_link(sheet, 0, 0, "https://deep.example", Some(&deep)),
+            set_link(sheet, 1, 0, "https://long.example", Some(&long)),
+        ]);
+
+        let rejects: Vec<InputRejection> = drain_events(&rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                WorkerEvent::EditRejected {
+                    reason: EditRejectedReason::InputCap(r),
+                } => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejects.len(), 2, "both over-cap labels are rejected");
+        assert!(matches!(rejects[0], InputRejection::TooDeeplyNested { .. }));
+        assert!(matches!(rejects[1], InputRejection::TooLong { .. }));
+        // Nothing reached the engine: no link, no content, no committed op.
+        assert_eq!(cached_link(&worker, sheet, 0, 0), None);
+        assert_eq!(cached_link(&worker, sheet, 1, 0), None);
+        assert_eq!(
+            worker.doc.formatted_value(0, CellRef::new(0, 0)).unwrap(),
+            ""
+        );
+        assert_eq!(worker.ops_seen, 0, "a capped label commits nothing");
+
+        // The gate is scoped to formulas, so an ordinary long label still applies — the cap must
+        // not become a length limit on display text.
+        let plain = "x".repeat(MAX_INPUT_LEN * 2);
+        worker.process_batch(vec![set_link(
+            sheet,
+            2,
+            0,
+            "https://plain.example",
+            Some(&plain),
+        )]);
+        assert_eq!(
+            cached_link(&worker, sheet, 2, 0).as_deref(),
+            Some("https://plain.example"),
+            "a long PLAIN label is stored, not parsed, so it is not capped"
+        );
+    }
+
+    // Undoing a sheet delete restores the worksheet's cells, bands, geometry, merges and frozen
+    // panes — but NOT its hyperlinks. `Diff::DeleteSheet` snapshots the whole worksheet into
+    // `old_data` (a `Box<Worksheet>`, so `links` is right there), and the undo arm in the fork's
+    // `base/src/user_model/undo_redo.rs` simply never copies the field back. It is a pure engine
+    // hole: FreeCell's cache faithfully mirrors a workbook that really has lost the links.
+    //
+    // This phase is what makes links something FreeCell can lose, so the hole is recorded here as
+    // an executable spec rather than prose. It is the exact twin of
+    // `undo_of_sheet_delete_repopulates_cf_map` above (same arm, same shape, sibling field), and
+    // ONE fork fix — "undo of `Diff::DeleteSheet` restores the full worksheet" — closes both. That
+    // branch is deliberately NOT opened here (a separate upstream contribution); Phase 6 carries
+    // the `GAPS.md` / `PROJECTS.md` row.
+    #[ignore = "blocked on the fork's Diff::DeleteSheet undo restoring links (candidate fix also covers conditional_formatting)"]
+    #[test]
+    fn undo_of_sheet_delete_drops_the_sheets_links() {
+        let (mut worker, _rx) = test_worker();
+        worker.process_batch(vec![Command::AddSheet]);
+        let sheet1 = worker.sheet_metas().last().unwrap().id;
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: sheet1,
+            rows: 0..6,
+            cols: 0..6,
+        }]);
+        worker.process_batch(vec![set_link(
+            sheet1,
+            0,
+            0,
+            "https://restored.example",
+            Some("Restored"),
+        )]);
+        assert_eq!(
+            cached_link(&worker, sheet1, 0, 0).as_deref(),
+            Some("https://restored.example")
+        );
+
+        worker.process_batch(vec![Command::DeleteSheet { sheet: sheet1 }]);
+        worker.process_batch(vec![Command::Undo]);
+
+        // The sheet and its content come back...
+        let restored = worker.sheet_metas().last().unwrap().id;
+        worker.process_batch(vec![Command::SetViewport {
+            sheet: restored,
+            rows: 0..6,
+            cols: 0..6,
+        }]);
+        let idx = worker.resolve(restored).expect("the sheet is back");
+        assert_eq!(
+            worker.doc.formatted_value(idx, CellRef::new(0, 0)).unwrap(),
+            "Restored",
+            "the cell content is restored (so the undo itself worked)"
+        );
+        // ...but the link does not. This is the assertion that will flip when the fork is fixed.
+        assert_eq!(
+            worker
+                .doc
+                .cell_link(idx, CellRef::new(0, 0))
+                .unwrap()
+                .map(|l| l.target.destination().to_string())
+                .as_deref(),
+            Some("https://restored.example"),
+            "undo of a sheet delete must restore the sheet's hyperlinks"
+        );
+    }
+
+    #[test]
+    fn a_degraded_worker_refuses_link_edits() {
+        // Every mutating command is degraded-gated; links bucket with the edits, so they inherit
+        // it — asserted rather than assumed (F5.9 leans on this).
+        let (mut worker, rx) = test_worker();
+        let sheet = sheet0(&worker);
+        worker.degraded = true;
+        drain_events(&rx);
+
+        worker.process_batch(vec![set_link(
+            sheet,
+            0,
+            0,
+            "https://nope.example",
+            Some("N"),
+        )]);
+        assert_eq!(cached_link(&worker, sheet, 0, 0), None);
+        assert!(drain_events(&rx).iter().any(|e| matches!(
+            e,
+            WorkerEvent::EditRejected {
+                reason: EditRejectedReason::Degraded
+            }
+        )));
     }
 }

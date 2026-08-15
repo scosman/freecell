@@ -7,7 +7,7 @@
 
 use std::fs;
 
-use freecell_core::CellRef;
+use freecell_core::{CellLink, CellRef, LinkTarget};
 use freecell_engine::{fixtures, DocumentSource, LoadError, SaveError, WorkbookDocument};
 use tempfile::tempdir;
 
@@ -28,6 +28,11 @@ fn fmt(doc: &WorkbookDocument, sheet: u32, row: u32, col: u32) -> String {
 
 fn content(doc: &WorkbookDocument, sheet: u32, row: u32, col: u32) -> String {
     doc.cell_content(sheet, CellRef::new(row, col))
+        .expect("cell in range")
+}
+
+fn link(doc: &WorkbookDocument, sheet: u32, row: u32, col: u32) -> Option<CellLink> {
+    doc.cell_link(sheet, CellRef::new(row, col))
         .expect("cell in range")
 }
 
@@ -81,6 +86,109 @@ fn roundtrip_number_formats_preserved() {
     assert_eq!(fmt(&doc, 0, 0, 0), "$1,234.50"); // currency
     assert_eq!(fmt(&doc, 0, 0, 1), "100.00%"); // percent
     assert_eq!(fmt(&doc, 0, 0, 2), "2021-01-01"); // date serial → yyyy-mm-dd
+}
+
+/// F10.1–F10.3: hyperlinks survive save → reopen — targets, ScreenTips, and internal links
+/// alike. The fixture's links were created through FreeCell's own engine facade, so this covers
+/// "a link created in FreeCell survives a round-trip" as well as the import direction.
+#[test]
+fn roundtrip_links_preserved() {
+    let (_dir, doc) = save_and_reopen(&fixtures::links(), "links.xlsx");
+
+    assert_eq!(
+        link(&doc, 0, 0, 0).unwrap().target,
+        LinkTarget::external("https://ironcalc.com")
+    );
+    // The display text is the cell's own content, not part of the link.
+    assert_eq!(fmt(&doc, 0, 0, 0), "IronCalc");
+
+    // A query string survives verbatim, and the ScreenTip with it (F10.2).
+    assert_eq!(
+        link(&doc, 0, 1, 0).unwrap().target,
+        LinkTarget::external("https://example.com/docs?a=1&b=2")
+            .with_tooltip(Some("The docs".into()))
+    );
+    assert_eq!(
+        link(&doc, 0, 2, 0).unwrap().target,
+        LinkTarget::external("mailto:someone@example.com")
+    );
+    // An internal link stays internal (it rides the `location` attribute, not a relationship).
+    assert_eq!(
+        link(&doc, 0, 3, 0).unwrap().target,
+        LinkTarget::internal("Sheet1!A30").with_tooltip(Some("Down the sheet".into()))
+    );
+    // The auto-linked cell round-trips like any other worksheet link.
+    assert_eq!(
+        link(&doc, 0, 4, 0).unwrap().target,
+        LinkTarget::external("https://auto.example.com")
+    );
+    // Every one of those is a worksheet link, and the unlinked cell stays unlinked.
+    assert!((0..=4).all(|r| !link(&doc, 0, r, 0).unwrap().dynamic));
+    assert_eq!(link(&doc, 0, 0, 1), None);
+}
+
+/// F1.2: a link's **colour** is ordinary cell formatting, so it round-trips with the cell rather
+/// than being re-derived on load — that is what lets FreeCell render an imported link blue with no
+/// styling of its own. Asserted as a **differential** (the reopened colour equals the live one,
+/// which pins preservation exactly rather than "some colour survived") plus a blue check, so a
+/// theme-resolution regression that turned links black would fail here.
+///
+/// The **underline** half of the formatting cannot be reached from an integration test —
+/// `published_style` carries colour only, and the resolved `RenderStyle` is crate-private — so it
+/// is covered in-crate by `document.rs`'s `a_reopened_link_keeps_its_underline_and_blue`.
+#[test]
+fn roundtrip_link_formatting_preserved() {
+    let live = fixtures::links();
+    let live_color = live
+        .published_style(0, CellRef::new(0, 0))
+        .expect("cell in range")
+        .1
+        .expect("a freshly created link has an explicit font colour");
+
+    let (_dir, doc) = save_and_reopen(&live, "link-style.xlsx");
+    let reopened = doc
+        .published_style(0, CellRef::new(0, 0))
+        .expect("cell in range")
+        .1
+        .expect("the reopened link cell keeps an explicit font colour");
+
+    assert_eq!(
+        reopened, live_color,
+        "the link colour survives save → reopen unchanged"
+    );
+    assert!(
+        reopened.b > 128 && reopened.b > reopened.r + 48 && reopened.b > reopened.g + 48,
+        "the reopened link colour is a blue, got {reopened:?}"
+    );
+    // The unlinked control cell has no explicit colour, so the assertion above is about the link
+    // rather than about every cell in the workbook.
+    assert_eq!(
+        doc.published_style(0, CellRef::new(0, 1))
+            .expect("cell in range")
+            .1,
+        None
+    );
+}
+
+/// A `HYPERLINK()` link is **not persisted** — nothing about it is written to the file, and the
+/// reopened workbook carries no link on that cell until an evaluation re-creates it (the
+/// re-creation half is `document.rs`'s `a_reopened_hyperlink_formula_recreates_its_link`, which
+/// can reach the crate-private `evaluate`). That asymmetry is exactly why the link cache is
+/// mirrored off evaluation rather than off the worksheet's stored links.
+#[test]
+fn roundtrip_dynamic_link_is_not_persisted() {
+    let (_dir, doc) = save_and_reopen(&fixtures::links(), "dynamic-link.xlsx");
+    assert_eq!(
+        content(&doc, 0, 5, 0),
+        "=HYPERLINK(\"https://dynamic.example.com\",\"Dynamic\")",
+        "the formula — the only thing that persists — survives"
+    );
+    assert_eq!(fmt(&doc, 0, 5, 0), "Dynamic"); // F9.1, from the file's cached value
+    assert_eq!(
+        link(&doc, 0, 5, 0),
+        None,
+        "opening does not evaluate, so the dynamic link does not exist yet"
+    );
 }
 
 #[test]

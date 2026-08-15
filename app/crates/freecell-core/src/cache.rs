@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::axis::Axis;
 use crate::border::BorderSpec;
+use crate::link::CellLink;
 use crate::refs::{CellRange, SheetId};
 use crate::style::RenderStyle;
 
@@ -114,6 +115,17 @@ pub struct SheetCache {
     /// delete **merge guard**: the UI disables a menu item whose op would displace a merge. Merged
     /// cells are otherwise unsupported (a deferred project), so the grid does not render them.
     merges: Vec<CellRange>,
+    /// The sheet's **effective** hyperlinks, keyed `(row, col)` 0-based (`hyperlinks/architecture.md
+    /// §3.3`). Sparse and separate from [`RenderStyle`] deliberately: render styles are `Copy + Eq +
+    /// Hash` and **interned**, so folding a link into one would give every distinct link its own
+    /// [`StyleId`] (10 000 links → 10 000 resolved-style rows). A sparse map leaves interning and the
+    /// style-agreement contract untouched.
+    ///
+    /// Whole-sheet, not per-cell, because that is the only shape the engine offers: its per-cell
+    /// getter covers worksheet links only, and `HYPERLINK()` (dynamic) links are rebuilt from
+    /// scratch on **every** evaluation. So the worker replaces this map wholesale
+    /// ([`set_links`](Self::set_links)) rather than mutating single entries.
+    links: HashMap<(u32, u32), CellLink>,
 }
 
 /// Builds an axis from `count` tracks at `default_px`, the sparse real-size `overrides`, and the
@@ -389,6 +401,32 @@ impl SheetCache {
         &self.merges
     }
 
+    /// The **effective** link on `(row, col)`, if the cell has one — the per-cell read the grid
+    /// makes while painting (cursor, tooltip, click target).
+    pub fn cell_link(&self, row: u32, col: u32) -> Option<&CellLink> {
+        self.links.get(&(row, col))
+    }
+
+    /// The whole sheet's link map, so a frame can snapshot it under the one cache read lock
+    /// alongside the visible styles and merges.
+    pub fn links(&self) -> &HashMap<(u32, u32), CellLink> {
+        &self.links
+    }
+
+    /// Replaces the sheet's link map wholesale — the **mirror primitive** — returning whether it
+    /// actually changed. The worker gates its `StyleCacheUpdated` on that flag, so a link-free
+    /// workbook (the common case: both maps empty) never repaints for links.
+    ///
+    /// Wholesale rather than per-cell because the engine's link reads are per-sheet unions and
+    /// dynamic links are re-created by every evaluation (see the [`links`](Self::links) field docs).
+    pub fn set_links(&mut self, links: HashMap<(u32, u32), CellLink>) -> bool {
+        if self.links == links {
+            return false;
+        }
+        self.links = links;
+        true
+    }
+
     /// Interns `style` into the resolved table (equal styles share a [`StyleId`]).
     fn intern(&mut self, style: RenderStyle) -> StyleId {
         if let Some(&id) = self.style_ids.get(&style) {
@@ -556,6 +594,7 @@ pub struct SheetCacheBuilder {
     border_specs: Vec<BorderSpec>,
     default_font_size_q: u16,
     merges: Vec<CellRange>,
+    links: HashMap<(u32, u32), CellLink>,
 }
 
 impl SheetCacheBuilder {
@@ -582,6 +621,7 @@ impl SheetCacheBuilder {
             border_specs: seed_border_specs(),
             default_font_size_q: 0,
             merges: Vec::new(),
+            links: HashMap::new(),
         }
     }
 
@@ -600,6 +640,18 @@ impl SheetCacheBuilder {
     /// Records a merged range (consuming/fluent form for hand-built fixtures/tests).
     pub fn merge(mut self, range: CellRange) -> Self {
         self.push_merge(range);
+        self
+    }
+
+    /// Records `(row, col)`'s effective hyperlink — the engine's build loop pushes one per entry
+    /// of the sheet's worksheet+dynamic link union.
+    pub fn push_link(&mut self, row: u32, col: u32, link: CellLink) {
+        self.links.insert((row, col), link);
+    }
+
+    /// Records a hyperlink (consuming/fluent form for hand-built fixtures/tests).
+    pub fn link(mut self, row: u32, col: u32, link: CellLink) -> Self {
+        self.push_link(row, col, link);
         self
     }
 
@@ -792,6 +844,7 @@ impl SheetCacheBuilder {
             border_specs: self.border_specs,
             default_font_size_q: self.default_font_size_q,
             merges: self.merges,
+            links: self.links,
         }
     }
 }
@@ -1090,6 +1143,69 @@ mod tests {
         let b = CellRange::single(CellRef::new(0, 0)); // A1
         let cache = SheetCacheBuilder::new(20, 20).merge(a).merge(b).build();
         assert_eq!(cache.merges(), &[a, b]);
+    }
+
+    #[test]
+    fn links_round_trip_through_builder() {
+        use crate::link::{CellLink, LinkTarget};
+        // A fresh cache carries no links, and an unlinked cell reads `None`.
+        let empty = SheetCacheBuilder::new(4, 4).build();
+        assert!(empty.links().is_empty());
+        assert_eq!(empty.cell_link(0, 0), None);
+
+        let site = CellLink::worksheet(
+            LinkTarget::external("https://example.com").with_tooltip(Some("Home".into())),
+        );
+        let formula = CellLink::dynamic(LinkTarget::internal("Sheet2!A1"));
+        let cache = SheetCacheBuilder::new(20, 20)
+            .link(1, 1, site.clone())
+            .link(4, 2, formula.clone())
+            .build();
+
+        assert_eq!(cache.cell_link(1, 1), Some(&site));
+        assert_eq!(cache.cell_link(4, 2), Some(&formula));
+        assert_eq!(cache.cell_link(1, 2), None);
+        assert_eq!(cache.links().len(), 2);
+    }
+
+    #[test]
+    fn set_links_reports_whether_the_map_changed() {
+        use crate::link::{CellLink, LinkTarget};
+        // The changed-flag is what gates the worker's `StyleCacheUpdated`, so every way the map
+        // can move must report `true` and only a genuinely equal map may report `false`.
+        let link = |url: &str| CellLink::worksheet(LinkTarget::external(url));
+        let map = |entries: &[((u32, u32), CellLink)]| -> HashMap<(u32, u32), CellLink> {
+            entries.iter().cloned().collect()
+        };
+
+        let mut cache = SheetCacheBuilder::new(10, 10).build();
+        assert!(
+            !cache.set_links(HashMap::new()),
+            "empty → empty is no change"
+        );
+
+        let one = map(&[((2, 3), link("https://a.example"))]);
+        assert!(cache.set_links(one.clone()), "adding a link is a change");
+        assert!(!cache.set_links(one.clone()), "an equal map is no change");
+
+        // A different target on the same cell.
+        assert!(cache.set_links(map(&[((2, 3), link("https://b.example"))])));
+        // The same target but a different origin (worksheet → dynamic) still matters: it drives
+        // whether Remove link is enabled (`functional_spec.md F6.3`).
+        assert!(cache.set_links(map(&[(
+            (2, 3),
+            CellLink::dynamic(LinkTarget::external("https://b.example"))
+        )])));
+        // Adding a second cell, then removing every link.
+        assert!(cache.set_links(map(&[
+            (
+                (2, 3),
+                CellLink::dynamic(LinkTarget::external("https://b.example"))
+            ),
+            ((5, 5), link("https://c.example")),
+        ])));
+        assert!(cache.set_links(HashMap::new()));
+        assert!(cache.links().is_empty());
     }
 
     #[test]

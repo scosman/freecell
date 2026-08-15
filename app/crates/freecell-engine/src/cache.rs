@@ -34,7 +34,7 @@ use ironcalc_base::types::{
     Border, BorderItem, BorderStyle, Color, HorizontalAlignment, Style, Theme, VerticalAlignment,
 };
 
-use crate::document::WorkbookDocument;
+use crate::document::{LinkMap, WorkbookDocument};
 
 // These mirror the pinned engine's default row/col size (`ironcalc_base/src/constants.rs`) — the
 // reference our px conversion maps onto FreeCell's own defaults, and the sentinel that marks a
@@ -412,6 +412,13 @@ pub(crate) fn build_sheet_cache(
     builder.set_frozen_rows(ws.frozen_rows.max(0) as u32);
     builder.set_frozen_cols(ws.frozen_columns.max(0) as u32);
 
+    // Hyperlinks: the sheet's effective (worksheet + dynamic) link map
+    // (`hyperlinks/architecture.md §3.3`). Whole-sheet, like the merges above and unlike the
+    // per-cell styles below — see `changed_links` for why the engine offers nothing finer.
+    for ((row, col), link) in doc.sheet_links(sheet_idx)? {
+        builder.push_link(row, col, link);
+    }
+
     // Merged regions: the resident `MergeMap` the grid renders + selects from (merged-cell-ui
     // `architecture.md §2/§3`). Read from the engine's normalized `merged_regions` (0-based) — not
     // the raw `worksheet.merge_cells` A1 strings — so it reflects post-displacement truth and
@@ -512,6 +519,69 @@ pub(crate) fn refresh_cell(
     Ok(())
 }
 
+/// Re-reads `sheet_idx`'s whole hyperlink map from the engine and installs it in `cache` —
+/// the link half of the mirror, returning whether anything changed
+/// (`hyperlinks/architecture.md §3.3`).
+///
+/// **Whole-sheet, not per-cell**, unlike [`refresh_cell`]. Two engine facts force it:
+/// - the only read covering both link kinds is the per-sheet union list (`get_links_list`);
+///   the per-cell getter sees worksheet links only.
+/// - `HYPERLINK()` (dynamic) links live in the model, not the worksheet, and are **cleared and
+///   rebuilt on every `evaluate()`** — so any recompute can move a link on a cell the edit never
+///   touched, and there is no touched-cell set that would cover them.
+///
+/// Test-only: production splits the two halves so the worker can compute every resident sheet's
+/// update before taking **one** write lock ([`changed_links`] + `SheetCache::set_links`). Kept as
+/// the combined form because it is what the mirror tests want to express.
+#[cfg(test)]
+pub(crate) fn refresh_links(
+    cache: &mut SheetCache,
+    doc: &WorkbookDocument,
+    sheet_idx: u32,
+    evaluated: bool,
+) -> bool {
+    match changed_links(doc, sheet_idx, cache, evaluated) {
+        Some(links) => cache.set_links(links),
+        None => false,
+    }
+}
+
+/// `sheet_idx`'s new link map when it differs from what `cache` holds, else `None` — the
+/// **read-only half** of [`refresh_links`], so the worker can compute every resident sheet's
+/// update before taking a single write lock to install them all
+/// (`hyperlinks/architecture.md §3.3`).
+///
+/// `evaluated` says whether an evaluation may have run since the last refresh. When it is `false`
+/// the dynamic (`HYPERLINK()`) links provably cannot have moved — only `evaluate()` rebuilds them
+/// — so the check collapses to the **allocation-free** worksheet comparison
+/// ([`WorkbookDocument::worksheet_links_match`]), and a style-only mirror over a link-heavy sheet
+/// costs nothing. `true` is the safe default: it only ever costs a full re-read.
+///
+/// A read failure (only an invalid sheet index) yields `None`, leaving the cache's links alone
+/// rather than silently emptying them; the caller resolves the index first, so it is effectively
+/// unreachable — logged rather than swallowed so a future error path is not silently stale.
+pub(crate) fn changed_links(
+    doc: &WorkbookDocument,
+    sheet_idx: u32,
+    cache: &SheetCache,
+    evaluated: bool,
+) -> Option<LinkMap> {
+    if !evaluated && doc.worksheet_links_match(sheet_idx, cache.links()) {
+        return None;
+    }
+    match doc.sheet_links_if_changed(sheet_idx, cache.links()) {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::debug!(
+                sheet = sheet_idx,
+                %error,
+                "cache: link re-read failed; keeping the previous link map"
+            );
+            None
+        }
+    }
+}
+
 /// The agreement contract's re-read helper (`components/style_cache.md §The agreement
 /// contract`): asserts `cache` equals a **fresh engine re-read** over the probe grid
 /// `rows_probe × cols_probe` — resolved `RenderStyle` (vs `get_style_for_cell`) and geometry (vs
@@ -586,6 +656,17 @@ pub(crate) fn assert_cache_agrees(
             if cached_family != engine_family {
                 return Err(format!(
                     "font_family mismatch at ({r},{c}): cache={cached_family:?} engine={engine_family:?}"
+                ));
+            }
+            // The link agreement is over the cell's EFFECTIVE link (worksheet wins over dynamic),
+            // which is exactly what `cell_link` re-reads and what the cached map holds.
+            let cached_link = cache.cell_link(r, c);
+            let engine_link = doc
+                .cell_link(sheet_idx, CellRef::new(r, c))
+                .map_err(|e| e.to_string())?;
+            if cached_link != engine_link.as_ref() {
+                return Err(format!(
+                    "link mismatch at ({r},{c}): cache={cached_link:?} engine={engine_link:?}"
                 ));
             }
         }
@@ -1229,6 +1310,231 @@ mod tests {
             .unwrap();
         refresh_one(&mut cache, &doc, CellRef::new(6, 6));
         assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
+    }
+
+    // ---- Hyperlinks (`hyperlinks/architecture.md §3.3`) ------------------------------------
+
+    /// The external target string cached at `(row, col)`, or `None`.
+    fn cached_target(cache: &SheetCache, row: u32, col: u32) -> Option<&str> {
+        cache.cell_link(row, col).map(|l| l.target.destination())
+    }
+
+    #[test]
+    fn build_sheet_cache_populates_links() {
+        let doc = crate::fixtures::links();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
+
+        assert_eq!(cached_target(&cache, 0, 0), Some("https://ironcalc.com"));
+        assert_eq!(
+            cache.cell_link(1, 0).unwrap().target.tooltip(),
+            Some("The docs"),
+            "the ScreenTip survives the conversion into the cache"
+        );
+        assert!(cache.cell_link(3, 0).unwrap().target.is_internal());
+        assert!(!cache.cell_link(0, 0).unwrap().dynamic);
+        assert!(
+            cache.cell_link(5, 0).unwrap().dynamic,
+            "the HYPERLINK() cell is flagged dynamic"
+        );
+        assert_eq!(cache.cell_link(0, 1), None, "B1 carries no link");
+
+        // A link-free workbook builds an empty map (the fast path everything else rests on).
+        let plain = build_sheet_cache(&WorkbookDocument::new_empty().unwrap(), 0, false).unwrap();
+        assert!(plain.links().is_empty());
+    }
+
+    #[test]
+    fn refresh_links_mirrors_a_new_link() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
+        assert!(cache.links().is_empty());
+
+        doc.set_cell_link(
+            0,
+            CellRef::new(1, 1),
+            &freecell_core::LinkTarget::external("https://new.example"),
+            Some("New"),
+        )
+        .unwrap();
+
+        assert!(
+            refresh_links(&mut cache, &doc, 0, false),
+            "the map changed — and the allocation-free worksheet fast path sees it, since a \
+             worksheet link needs no evaluation to move"
+        );
+        assert_eq!(cached_target(&cache, 1, 1), Some("https://new.example"));
+        assert!(
+            !refresh_links(&mut cache, &doc, 0, false),
+            "a second refresh with no engine change reports no change — this flag is what \
+             gates the worker's StyleCacheUpdated"
+        );
+    }
+
+    #[test]
+    fn refresh_links_mirrors_a_removed_link() {
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_link(
+            0,
+            CellRef::new(0, 0),
+            &freecell_core::LinkTarget::external("https://doomed.example"),
+            Some("Doomed"),
+        )
+        .unwrap();
+        let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
+        assert!(cache.cell_link(0, 0).is_some());
+
+        doc.remove_cell_link(0, CellRef::new(0, 0)).unwrap();
+        assert!(refresh_links(&mut cache, &doc, 0, false));
+        assert_eq!(cache.cell_link(0, 0), None);
+    }
+
+    #[test]
+    fn refresh_links_mirrors_a_dynamic_link_re_evaluation() {
+        // The reason the link mirror is whole-sheet: a HYPERLINK() link is rebuilt from scratch by
+        // every evaluation, so it moves without its own cell ever being edited.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "https://first.example")
+            .unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "=HYPERLINK(A2)")
+            .unwrap();
+        doc.evaluate();
+        let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
+        assert_eq!(cached_target(&cache, 0, 0), Some("https://first.example"));
+
+        // Editing A2 changes A1's dynamic link, with no edit to A1 at all.
+        doc.set_cell_input(0, CellRef::new(1, 0), "https://second.example")
+            .unwrap();
+        doc.evaluate();
+        assert!(refresh_links(&mut cache, &doc, 0, true));
+        assert_eq!(cached_target(&cache, 0, 0), Some("https://second.example"));
+    }
+
+    #[test]
+    fn the_no_eval_fast_path_still_sees_every_worksheet_link_change() {
+        // `evaluated: false` skips the union re-read for an allocation-free worksheet comparison.
+        // That is only sound if the cheap comparison catches every way a WORKSHEET link can move,
+        // so walk all four: add, retarget, tooltip-only, remove. A tooltip-only change is the one
+        // a target-only comparison would miss.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
+        let cell = CellRef::new(1, 1);
+        let set = |doc: &mut WorkbookDocument, target: freecell_core::LinkTarget| {
+            doc.set_cell_link(0, cell, &target, None).unwrap();
+        };
+
+        set(
+            &mut doc,
+            freecell_core::LinkTarget::external("https://a.example"),
+        );
+        assert!(refresh_links(&mut cache, &doc, 0, false), "add");
+        assert_eq!(cached_target(&cache, 1, 1), Some("https://a.example"));
+
+        set(
+            &mut doc,
+            freecell_core::LinkTarget::external("https://b.example"),
+        );
+        assert!(refresh_links(&mut cache, &doc, 0, false), "retarget");
+        assert_eq!(cached_target(&cache, 1, 1), Some("https://b.example"));
+
+        set(
+            &mut doc,
+            freecell_core::LinkTarget::external("https://b.example")
+                .with_tooltip(Some("Tip".into())),
+        );
+        assert!(refresh_links(&mut cache, &doc, 0, false), "tooltip only");
+        assert_eq!(cache.cell_link(1, 1).unwrap().target.tooltip(), Some("Tip"));
+
+        doc.remove_cell_link(0, cell).unwrap();
+        assert!(refresh_links(&mut cache, &doc, 0, false), "remove");
+        assert_eq!(cache.cell_link(1, 1), None);
+
+        // And a genuinely unchanged sheet still reports no change on the fast path.
+        assert!(!refresh_links(&mut cache, &doc, 0, false));
+    }
+
+    #[test]
+    fn the_no_eval_fast_path_does_not_disturb_a_cached_dynamic_link() {
+        // The fast path compares only the worksheet half, so it must leave a cached dynamic entry
+        // alone rather than treating it as a divergence and rebuilding (or dropping) it.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_input(0, CellRef::new(0, 0), "=HYPERLINK(\"https://dyn.example\")")
+            .unwrap();
+        doc.evaluate();
+        let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
+        assert!(cache.cell_link(0, 0).unwrap().dynamic);
+
+        assert!(
+            !refresh_links(&mut cache, &doc, 0, false),
+            "no worksheet link exists and none is cached → nothing to do"
+        );
+        assert_eq!(
+            cached_target(&cache, 0, 0),
+            Some("https://dyn.example"),
+            "the cached dynamic link survives the worksheet-only comparison"
+        );
+    }
+
+    #[test]
+    fn link_agreement_survives_build_and_mirror() {
+        // Links join the load-bearing agreement contract: every probe cell's cached link must
+        // match a fresh `cell_link` re-read, on both the build and the mirror path.
+        let mut doc = crate::fixtures::links();
+        let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
+        let (rows, cols) = probes();
+        assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
+
+        doc.set_cell_link(
+            0,
+            CellRef::new(0, 1),
+            &freecell_core::LinkTarget::external("https://added.example"),
+            Some("Added"),
+        )
+        .unwrap();
+        refresh_one(&mut cache, &doc, CellRef::new(0, 1));
+        refresh_links(&mut cache, &doc, 0, true);
+        assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
+    }
+
+    #[test]
+    fn negative_control_skipping_the_link_mirror_diverges() {
+        // The link comparison must have discriminating power, or it is a vacuous assertion:
+        // change the engine's links WITHOUT refreshing them, and the contract must fail.
+        let mut doc = crate::fixtures::links();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
+        let (rows, cols) = probes();
+        assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap(); // agrees before
+
+        doc.remove_cell_link(0, CellRef::new(0, 0)).unwrap();
+        assert!(
+            assert_cache_agrees(&doc, &cache, 0, &rows, &cols).is_err(),
+            "a skipped link mirror must be caught by the agreement contract"
+        );
+    }
+
+    #[test]
+    fn negative_control_skipping_the_link_mirror_catches_a_retarget() {
+        // The other half of the discrimination: same cells linked, different target. A map keyed
+        // only on presence would pass this.
+        let mut doc = WorkbookDocument::new_empty().unwrap();
+        doc.set_cell_link(
+            0,
+            CellRef::new(0, 0),
+            &freecell_core::LinkTarget::external("https://before.example"),
+            Some("Link"),
+        )
+        .unwrap();
+        let cache = build_sheet_cache(&doc, 0, false).unwrap();
+        let (rows, cols) = probes();
+        assert_cache_agrees(&doc, &cache, 0, &rows, &cols).unwrap();
+
+        doc.set_cell_link(
+            0,
+            CellRef::new(0, 0),
+            &freecell_core::LinkTarget::external("https://after.example"),
+            Some("Link"),
+        )
+        .unwrap();
+        assert!(assert_cache_agrees(&doc, &cache, 0, &rows, &cols).is_err());
     }
 
     #[test]

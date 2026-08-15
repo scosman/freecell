@@ -15,7 +15,7 @@ use freecell_chart_model::{Anchor, ChartId, ChartInsertKind, LegendPosition};
 use freecell_core::input_cap::InputRejection;
 use freecell_core::sheet_name::SheetNameError;
 use freecell_core::{
-    CellRange, CellRef, CfRuleSpec, Direction, FillAxis, Rgb, SelectionStats, SheetId,
+    CellRange, CellRef, CfRuleSpec, Direction, FillAxis, LinkTarget, Rgb, SelectionStats, SheetId,
 };
 
 use crate::document::{LoadError, SaveError};
@@ -267,6 +267,28 @@ pub enum Command {
         line: BorderLine,
         color: Option<Rgb>,
     },
+    /// Attach `target` to `cell` as a **worksheet** hyperlink, replacing any link already there
+    /// (`hyperlinks/functional_spec.md F5`). `label`, when given, also becomes the cell's content
+    /// (the link's display text) — the engine does both in **one** undo step (F5.3), so FreeCell
+    /// never composes two operations. Creating a brand-new link additionally applies the engine's
+    /// own link formatting (underline + the theme hyperlink colour) as ordinary cell formatting,
+    /// which is why FreeCell adds no styling of its own for worksheet links (F1.2).
+    ///
+    /// Style-only (no recompute) **unless** `label` rewrites the cell's content, in which case the
+    /// worker recomputes like any value edit. Writing the identical link and label again is an
+    /// engine no-op that records nothing.
+    SetCellLink {
+        sheet: SheetId,
+        cell: CellRef,
+        target: LinkTarget,
+        label: Option<String>,
+    },
+    /// Remove `cell`'s **worksheet** hyperlink (F6). Style-only and undoable; the cell's content
+    /// and formatting are untouched — the blue underline is real formatting the user can clear
+    /// themselves (F1.6/F6.2), matching Excel. A cell with no worksheet link (including one whose
+    /// only link is a `HYPERLINK()` result, which is not removable — F6.3) is a no-op that records
+    /// no undo step.
+    RemoveCellLink { sheet: SheetId, cell: CellRef },
     /// Set the width of an inclusive column run `[col_start, col_end]` (0-based) to `px`
     /// **device px** (`functional_spec.md §5.1`). Geometry-only (no evaluation): applied via
     /// `set_columns_width` (one undoable diff-list), then the active sheet's cache is rebuilt.

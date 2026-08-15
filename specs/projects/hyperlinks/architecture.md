@@ -74,13 +74,26 @@ Left alone, F7.5 breaks: paste or fill a column of URLs, hit undo, and the value
 the auto-created links and their blue-underline styling persist.
 
 This is a genuine fork fix on a capability upstream owns, so per `CLAUDE.md` it belongs on its
-own branch — **`fix/batch-set-inputs-link-diffs`**, off the freshly-synced `main`, with
-upstream-style tests — and gets prepared as its own single-purpose upstream PR. It must not be
-folded into the merge commit or into any UI phase.
+own branch — **`fix/batch-set-inputs-link-diffs`**, with upstream-style tests — and gets prepared
+as its own single-purpose upstream PR. It must not be folded into the merge commit or into any UI
+phase.
 
-> The agent cannot open upstream PRs. It prepares a compare link
-> (`.../compare/main...scosman:ironcalc:fix/batch-set-inputs-link-diffs`), title, and description
-> for the owner.
+**Branch base — off `fix/batch-set-inputs`, not `main`.** `set_user_inputs` exists only on
+`fix/batch-set-inputs`; `main` has no batch API to fix. So Phase 2 branches off that branch and
+the two go upstream as **stacked PRs** (batch API first, link diffs on top). The compare link is
+`.../compare/fix/batch-set-inputs...scosman:ironcalc:fix/batch-set-inputs-link-diffs` — a
+`main...` compare would carry the batch API itself into the diff, which is exactly the bundling
+the one-fix-one-PR rule forbids.
+
+**Scope includes the rollback path, not just diff emission.** `set_user_inputs`' mid-batch
+rollback replays its snapshot diffs, which are `Diff::SetCellValue` only — so today a failed
+batch restores values while leaving behind any link (and link styling) that `set_user_input`
+auto-created along the way, and so does a later undo. Routing the writes through
+`set_user_input_with_link_diffs` must fix both halves; the doc comment on `set_user_inputs`
+currently states the narrowed guarantee and must be widened again when it does.
+
+> The agent cannot open upstream PRs. It prepares a compare link, title, and description for the
+> owner.
 
 ## 3. Engine facade + cache
 

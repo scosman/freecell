@@ -24,11 +24,13 @@ Phases 1–2 are fork work in `/home/user/IronCalc`; phases 3–7 are FreeCell.
   decides three lines in Phase 3.
 
 - [ ] **Phase 2 — Fork fix: batch input emits link diffs.**
-  Own branch `fix/batch-set-inputs-link-diffs` off the synced `main`, upstream-style tests, then
-  merged into `freecell-fixes` (arch §2). Without it, undo after pasting a column of URLs reverts
-  the values but leaves the links and their styling (F7.5). Prepare the upstream compare link +
-  title + description for the owner — **one fix, one branch, one PR**; do not fold this into
-  Phase 1's merge.
+  Own branch `fix/batch-set-inputs-link-diffs` off **`fix/batch-set-inputs`** (that is where
+  `set_user_inputs` lives — `main` has no batch API, so the two go upstream as stacked PRs),
+  upstream-style tests, then merged into `freecell-fixes` (arch §2). Without it, undo after
+  pasting a column of URLs reverts the values but leaves the links and their styling (F7.5) —
+  and so does the batch's own mid-batch rollback, which replays `SetCellValue` diffs only. Both
+  halves are in scope. Prepare the upstream compare link + title + description for the owner —
+  **one fix, one branch, one PR**; do not fold this into Phase 1's merge.
 
 - [ ] **Phase 3 — Re-pin + engine facade + link cache.**
   Bump FreeCell's `freecell-fixes` lock; `LinkTarget` in `freecell-core`; `WorkbookDocument::{cell_link,

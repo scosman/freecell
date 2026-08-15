@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 1: Fork sync — `main` → upstream `91d343c3`, merged into `freecell-fixes`
@@ -136,9 +136,10 @@ cells are fork-only, so this interaction has no upstream home):
 `freecell-fixes`):
 
 - `mid_batch_write_failure_rolls_back_the_writes_already_made` — the rollback branch that gives
-  `6f086bb9` its name had no test. A CSE array formula cell makes `Model::set_user_input` fail
-  *mid-write* (past the up-front coordinate validation), and the values already written are
-  restored with no history entry recorded.
+  "make `set_user_inputs` atomic on mid-batch write failure" (`180192ff` on
+  `fix/batch-set-inputs`) its name had no test. A CSE array formula cell makes
+  `Model::set_user_input` fail *mid-write* (past the up-front coordinate validation), and the
+  values already written are restored with no history entry recorded.
 
 Regression coverage relied on (not newly written): the full `base` + `xlsx` suites, which include
 upstream's link tests (`base/src/test/user_model/test_links.rs`, `test_fn_hyperlink.rs`,
@@ -178,12 +179,12 @@ same loop is a reason to test, not a reason to relax.**
 ### Deviations from the plan
 
 **Deviation 1 — `freecell-fixes` was behind `fix/batch-set-inputs`, and was reconciled.**
-`freecell-fixes` merged that branch at `7d4b215e`, *before* `6f086bb9` ("make `set_user_inputs`
-atomic on mid-batch write failure") landed on it, so the integration branch had been carrying the
-older, non-atomic `set_user_inputs` — snapshotting each `old_value` mid-batch instead of before
-the first write — and was missing its two regression tests. Since `freecell-fixes` is by
-definition the sum of our fork fixes, the rebased branch tip was merged in, taking the branch side
-for every `set_user_inputs` hunk.
+`freecell-fixes` merged that branch at `7d4b215e`, *before* "make `set_user_inputs` atomic on
+mid-batch write failure" (`588f6461` as reachable from `freecell-fixes`) landed on it, so the
+integration branch had been carrying the older, non-atomic `set_user_inputs` — snapshotting each
+`old_value` mid-batch instead of before the first write — and was missing its two regression
+tests. Since `freecell-fixes` is by definition the sum of our fork fixes, the rebased branch tip
+was merged in, taking the branch side for every `set_user_inputs` hunk.
 
 Containment of the three surviving `fix/*` branches, as it stands at the end of the phase:
 

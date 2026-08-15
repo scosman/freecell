@@ -13,7 +13,7 @@ Phases 1–2 are fork work in `/home/user/IronCalc`; phases 3–7 are FreeCell.
 
 ## Phases
 
-- [ ] **Phase 1 — Fork sync.**
+- [x] **Phase 1 — Fork sync.**
   Fast-forward `main` to upstream `91d343c3`; delete the five `fix/*` branches already upstream;
   merge new `main` into `freecell-fixes` (arch §1 — 11 hunks, 8 trivial, the real work is
   `user_model/common.rs`'s `delete_rows`/`delete_columns` restructure vs our frozen-pane +

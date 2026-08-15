@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Phase 3: Re-pin + engine facade + link cache
@@ -69,14 +69,16 @@ A sparse map shaped like `merges`, **not** a `RenderStyle` field (arch §3.3: `R
 interned, so a link field would give every distinct link its own `StyleId`).
 
 ```rust
-links: HashMap<(u32, u32), CellLink>,
+links: LinkMap,   // = HashMap<(u32, u32), CellLink>, aliased in `freecell-core::link`
 ```
 
 - `SheetCache::cell_link(row, col) -> Option<&CellLink>` — the per-cell read Phase 4 uses.
-- `SheetCache::links() -> &HashMap<(u32,u32), CellLink>` — the whole map, for the
-  `resolve_frame` snapshot.
-- `SheetCache::set_links(map) -> bool` — the **mirror primitive**: replaces the map wholesale,
-  returning whether it changed (so the worker only emits `StyleCacheUpdated` on a real change).
+- `SheetCache::links() -> &LinkMap` — the whole map, for the `resolve_frame` snapshot.
+- `SheetCache::set_links(map) -> bool` — the **checked** mirror primitive: replaces the map
+  wholesale, returning whether it changed.
+- `SheetCache::replace_links(map)` — the **unchecked** install, for the worker's mirror, which has
+  already walked both maps to establish the difference; re-comparing here would be a second
+  O(links) walk for an answer it holds.
 - `SheetCacheBuilder::push_link` / `.link(...)` (non-consuming + fluent, matching `push_merge` /
   `.merge(...)`).
 
@@ -88,12 +90,18 @@ the other engine↔core conversions, then three methods (each opening with
 
 ```rust
 pub fn cell_link(&self, sheet: u32, cell: CellRef) -> Result<Option<CellLink>, CellQueryError>;
-pub(crate) fn sheet_links(&self, sheet_idx: u32)
-    -> Result<HashMap<(u32, u32), CellLink>, String>;
+pub(crate) fn sheet_links(&self, sheet_idx: u32) -> Result<LinkMap, String>;
+pub(crate) fn sheet_links_if_changed(&self, sheet_idx: u32, cached: &LinkMap)
+    -> Result<Option<LinkMap>, String>;
+pub(crate) fn worksheet_links_match(&self, sheet_idx: u32, cached: &LinkMap) -> bool;
 pub(crate) fn set_cell_link(&mut self, sheet_idx: u32, cell: CellRef,
                             target: &LinkTarget, label: Option<&str>) -> Result<LinkWrite, String>;
 pub(crate) fn remove_cell_link(&mut self, sheet_idx: u32, cell: CellRef) -> Result<bool, String>;
 ```
+
+The last two reads are the mirror's cost shaping — `sheet_links_if_changed` compares in place and
+builds only on a real change; `worksheet_links_match` answers the worksheet half without
+allocating. Both are analysed in `architecture.md §3.3`.
 
 - `cell_link` is the **effective** link (worksheet wins, else dynamic). Upstream has no per-cell
   call covering both — `get_cell_link` is worksheet-only — so it reads the worksheet link first
@@ -164,10 +172,14 @@ per-cell — `get_links_list` is a per-sheet union and dynamic links are rebuilt
    Because it runs on **every** mirror — every keystroke, paste, undo — and F10.4 supports a
    10 000-cell range hyperlink import, the shape is cost-driven: compare **in place** against the
    engine's list and materialize the map only on a real change (by move, not clone); collapse to
-   the allocation-free `worksheet_links_match` when the batch did not evaluate (no evaluation ⇒ no
-   dynamic link can have moved; `evaluated: true` is the conservative default); and compute every
-   resident sheet's update under the shared read lock before installing them all under **one**
-   write lock, rather than taking the render thread's contended lock per sheet.
+   `worksheet_links_match` when the batch did not evaluate (no evaluation ⇒ no dynamic link can
+   have moved; `evaluated: true` is the conservative default); resolve sheet ids **once per pass**
+   rather than per sheet (`Worker::resolve` rebuilds the whole sheet-properties vector per call);
+   install with the unchecked `replace_links`, since `changed_links` has already established the
+   difference; and compute every resident sheet's update under the shared read lock before
+   installing them all under **one** write lock, rather than taking the render thread's contended
+   lock per sheet. This **reduces but does not eliminate** the cost — see *Carried forward* for the
+   measured residual and what would close it.
 3. **Undo/redo touch-set** — falls out of (2): `Command::Undo`/`Redo` route through
    `apply_edit_batch` → `apply_cache_refresh` → `refresh_cache_cells`.
 
@@ -314,11 +326,86 @@ Built through the same public engine APIs the app uses, so a saved fixture is a 
   re-pin has now happened and the test still fails, because the fix was never pushed. The note is
   corrected in place to describe the verified reality and to point at the shared root cause.
 
-- **A complete "no links anywhere" fast gate needs a small fork accessor.** The CF precedent
-  short-circuits on an empty published map; the link equivalent can only do the *worksheet* half
-  for free (`Model::get_links` returns a reference). The dynamic half lives in `Model::links`,
-  which is `pub(crate)` with no public accessor, so `has_dynamic_links()` / `get_dynamic_links()`
-  is a candidate fork addition. Everything achievable without it is done (see below).
+- **The link mirror is still multi-millisecond on a link-heavy sheet — a real residual, for a
+  Phase 6 `GAPS.md` / `projects/` row.** Measured (release, this container, 10 000 worksheet links
+  on one resident sheet, the *unchanged* case, per resident sheet per mirror):
+
+  | path | p50 | tail |
+  |---|---|---|
+  | `evaluated == true` — value edits, undo, redo, paste, replace | ~2.2 ms | uncharacterised |
+  | `evaluated == false` — style-only batches and `SetFont` | ~0.53 ms | uncharacterised |
+
+  Produced by the committed `bench_link_mirror` harness, 200 samples per run after a discarded
+  warm-up. **The p50s are the reproducible figures** — 2132–2234 µs and 500–563 µs across 25 runs,
+  with the ~4× gap constant. The tail is **deliberately not quoted**: on this container the
+  `evaluated == true` p99 ranged ~2.4–5.0 ms across runs (one max of 6.1 ms), so any point or span
+  reads as a bound and gets blown through. Argue from the p50; see `architecture.md §3.3`.
+
+  (On call sites, since an earlier draft of this plan miscounted them: `refresh_cache_cells` has
+  **five** — three pass literal `true` (replace-all, `commit_replacements`, `commit_paste`), one
+  passes literal `false` (`apply_set_font`), and one threads the batch's own `needs_eval`
+  (`apply_cache_refresh`). So the edit batch is on *either* side depending on whether it
+  recomputed; the operation lists in the table are the load-bearing half, not a site count.)
+
+  So on an F10.4-scale import (a 10 000-cell range hyperlink, which the engine explicitly
+  supports) every keystroke pays ~2.2 ms of link work on the worker after the eval. The in-place
+  comparison removed the *second* round of `String` clones, but `get_links_list` still clones
+  every `Link` and sorts the whole list, and that is the dominant term. The cheaper path is
+  cheaper, **not free** — and the two senses of "free" are worth separating, since an earlier
+  draft of this plan blurred them:
+
+  - the *read* is free: `Model::get_links` hands back a `&HashMap` the engine already owns, so
+    `worksheet_links_match` clones nothing and sorts nothing;
+  - the *comparison* is not: it still walks every worksheet link — 10 000 hash lookups plus
+    string compares, ~0.53 ms.
+
+  Only a **link-free** workbook — the overwhelmingly common case — pays nothing measurable, and
+  it does so because both maps are empty, not because of any short-circuit.
+
+  **The doc claims have been corrected** to state this rather than imply the cost was eliminated:
+  `refresh_resident_links`, `changed_links`, `sheet_links_if_changed`, and `architecture.md §3.3`,
+  which is the single home for the analysis; the doc comments point at it. The measurement harness
+  is committed as the `#[ignore]`d `bench_link_mirror`, so the numbers stay auditable.
+
+  **What would close it** is analysed in full at `architecture.md §3.3` — read that, not this
+  summary. In brief, and correcting an earlier framing in this plan: a CF-style *"no links
+  anywhere, return immediately"* gate is the **wrong instrument** (it needs both halves empty, so
+  it can never fire on the very sheet that defines the residual). The fix must attack
+  `get_links_list` on the `evaluated == true` path, via a fork accessor for the dynamic links.
+  Two cautions carried in §3.3: the accessor **cannot just mirror `get_links`** (`Model::links` is
+  one workbook-wide map, not per-sheet, so it must expose the global map or an iterator), and the
+  cheaper `has_dynamic_links() -> bool` variant is **unsound without an extra condition** — it
+  must also require the cached map to hold no dynamic entry, or deleting the last `HYPERLINK()`
+  strands that link in the cache permanently. Either way the O(links) worksheet walk remains, so
+  the residual is **reducible, not removable**. Cost: somewhat more than a getter given the
+  per-sheet filtering, plus a FreeCell-side branch in `changed_links` — still small, but an
+  upstream contribution whose placement is the owner's call, so no branch was opened.
+
+  **A link-generation counter is rejected on degeneracy, not difficulty**: dynamic links are
+  rebuilt by *every* evaluation, so a sound counter must bump on every evaluation — which is
+  exactly the `evaluated` flag already implemented — and for the worksheet half FreeCell cannot
+  tell whether a command moved a link without asking the engine, so it would bump conservatively
+  on essentially every edit. It collapses onto state FreeCell already has.
+
+  Two **FreeCell-only** avenues exist and were rejected on recorded grounds (so "nothing is
+  possible without the fork" is not overclaimed). Tracking *"does this workbook contain any
+  dynamic link at all"* looks like the same ~2.2 ms → ~0.53 ms collapse with no fork change, but
+  is **rejected first as incorrect**: the flag going `true → false` is exactly the
+  dynamic-link-deleted case, and the worksheet-only comparison ignores cached dynamic entries, so
+  the shortcut would fire on the one transition it must not and strand the deleted link in the
+  cache. Repaired, it is still rejected on policy — heuristic bookkeeping shadowing
+  engine-internal state, the compensating workaround `CLAUDE.md`'s fix-the-fork rule exists to
+  prevent. Second, bounding the `evaluated == false` comparison by the touched set is real and
+  sound-looking, but needs the invariant *"no non-evaluating command moves a worksheet link
+  outside its touched cells"* argued and pinned, and only improves the already-cheaper path.
+
+- **The mirror takes two write locks per edit** (per-cell style installs in `refresh_cache_cells`,
+  then the link install in `refresh_resident_links`), so a frame can briefly observe an edit's new
+  styles with its old link map, or the reverse. Harmless today — nothing reads `links()` until
+  Phase 4 — but **arch §4 has `resolve_frame` snapshotting `visible_links` under the same single
+  read lock**, which addresses the read side only. **Phase 4 should confirm this transient cannot
+  surface as a one-frame cursor/tooltip flicker**, rather than discovering it as a bug; the fix, if
+  needed, is to fold the link install into the existing style write lock.
 
 ## Found while building
 
@@ -340,3 +427,73 @@ Built through the same public engine APIs the app uses, so a saved fixture is a 
   link). And `tests/charts_roundtrip_libreoffice.rs` fails here because the container's
   LibreOffice cannot load any `.xlsx` — reproduced by running `soffice --convert-to xlsx` on the
   committed, unmodified fixture.
+
+## Outcome
+
+Shipped as planned. FreeCell is on the fork tip carrying the upstream links engine and the Phase-2
+batch fix, and links now cross the engine seam end to end: `LinkTarget`/`CellLink`/`LinkMap` in
+`freecell-core`, the `WorkbookDocument` link surface, two undoable commands, and a sparse per-sheet
+link map on `SheetCache` in provable agreement with the engine through build, mirror, and
+undo/redo. Nothing is visible yet — that is Phase 4 — but the cache Phase 4 reads is trustworthy.
+
+Two design deviations from `architecture.md`, both accepted and both now folded back into the live
+spec: `CellLink` carries the engine's `dynamic` flag (F6.3 and the Phase-5 dialog need it
+synchronously), and `SetCellLink` maps to three different `AppliedKind`s rather than a constant
+`StyleOnly` (the engine suppresses no-ops, and a `label` rewrites the cell's value).
+
+### What review changed (five rounds)
+
+The engine plumbing was right from round 1 and never changed. **Every finding was in the layer
+around it** — a guard the design implied but the code lacked, tests that looked discriminating and
+were not, and, repeatedly, cost language that outran its evidence.
+
+1. **A real bug**: `SetCellLink`'s `label` reaches `Model::set_user_input` and so IronCalc's
+   recursive parser, but was not in `pre_validate`'s input-cap gate. Verified as an abort class,
+   not a theoretical one — a depth-490 label aborts the process (signal 6). The standing rule now
+   written down: *every command that can carry user text into `set_user_input` belongs in that
+   gate.*
+2. **Hot-path waste**: `Worker::resolve` inside the per-resident-sheet loop rebuilt the whole
+   workbook's sheet-properties vector per sheet, per mirror.
+3. **Masked tests**: two dynamic-link tests seeded `A2` with a URL, which the engine auto-links —
+   so the *worksheet* half moved too and the tests passed for the wrong reason. Both now move only
+   the dynamic half, and both carry a guard assertion so the fixture cannot silently drift back.
+   Mutation coverage for an always-wrong `evaluated` went 1 → 3 tests.
+4. **An unsound spec item**: the proposed `has_dynamic_links()` shortcut would have stranded a
+   deleted dynamic link in the cache forever, because `worksheet_links_match` ignores cached
+   dynamic entries. Caught in review before Phase 6 could implement it.
+5. **Four consecutive rounds of cost overstatement** — see the lesson below.
+
+### The standing lesson: measured claims decay faster than code
+
+Rounds 2–5 each found a surviving performance overstatement: "costs no allocations at all", then
+"costs nothing", then a p99 nothing could reproduce, then a p99 *span* that runs blew through by
+2×. The code was fine every time; the prose was not.
+
+What actually fixed it was not more careful wording but **committing the harness** and letting it
+arbitrate — `bench_link_mirror`, which forces + asserts the measured op, discards a warm-up, and
+reports a nearest-rank percentile. Once the numbers had to be regenerated rather than written,
+the p50s proved stable across 25 runs (~2.2 ms / ~0.53 ms, the 4× gap constant) and the tail
+proved to have no stable value at all (~2.4–5.0 ms) — so the tail column now says
+**uncharacterised** rather than inviting someone to budget against it.
+
+For Phases 4–7: quote p50s, commit the harness beside any number that lands in a doc, and treat
+a tail figure on a shared container as unknown until it is characterised properly.
+
+### Final state
+
+| Item | State |
+|---|---|
+| Fork pin | `freecell-fixes` `195f11e6`, `ironcalc`/`ironcalc_base` `=0.8.3` |
+| Fork branches | unchanged — **no `fix/` branch opened this phase** |
+| Tests | core 231, engine 430 + 3 `#[ignore]`d, app 619 — all green |
+| `#[ignore]`d | `undo_of_sheet_delete_repopulates_cf_map` (pre-existing), `undo_of_sheet_delete_drops_the_sheets_links` (new, records the engine hole), `bench_link_mirror` (benchmark) |
+| Known red | 2 LibreOffice chart tests — environmental, reproduced on an unmodified fixture |
+| Render suite | not run — Phase 3 changes no in-scope pixels (no grid/cell/sheet/titlebar/chart code) |
+
+### Carried to Phase 6
+
+The `## Carried forward` section above is the authoritative list; in brief, four rows to file:
+undo-of-sheet-delete dropping links (plus its CF twin — one candidate fork fix covers both), the
+link-mirror perf residual and its fork accessor, and Phase 2's
+`fix/undo-set-cell-style-clears-inherited`. **No fork branch was opened for any of them** — each
+is a separate upstream contribution whose placement is the owner's call.

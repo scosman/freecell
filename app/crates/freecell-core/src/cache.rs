@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::axis::Axis;
 use crate::border::BorderSpec;
-use crate::link::CellLink;
+use crate::link::{CellLink, LinkMap};
 use crate::refs::{CellRange, SheetId};
 use crate::style::RenderStyle;
 
@@ -124,8 +124,8 @@ pub struct SheetCache {
     /// Whole-sheet, not per-cell, because that is the only shape the engine offers: its per-cell
     /// getter covers worksheet links only, and `HYPERLINK()` (dynamic) links are rebuilt from
     /// scratch on **every** evaluation. So the worker replaces this map wholesale
-    /// ([`set_links`](Self::set_links)) rather than mutating single entries.
-    links: HashMap<(u32, u32), CellLink>,
+    /// ([`replace_links`](Self::replace_links)) rather than mutating single entries.
+    links: LinkMap,
 }
 
 /// Builds an axis from `count` tracks at `default_px`, the sparse real-size `overrides`, and the
@@ -409,22 +409,35 @@ impl SheetCache {
 
     /// The whole sheet's link map, so a frame can snapshot it under the one cache read lock
     /// alongside the visible styles and merges.
-    pub fn links(&self) -> &HashMap<(u32, u32), CellLink> {
+    pub fn links(&self) -> &LinkMap {
         &self.links
     }
 
-    /// Replaces the sheet's link map wholesale — the **mirror primitive** — returning whether it
-    /// actually changed. The worker gates its `StyleCacheUpdated` on that flag, so a link-free
-    /// workbook (the common case: both maps empty) never repaints for links.
+    /// Replaces the sheet's link map wholesale, returning whether it **actually changed** — the
+    /// checked counterpart to [`replace_links`](Self::replace_links), for a caller that has not
+    /// already established the answer.
     ///
     /// Wholesale rather than per-cell because the engine's link reads are per-sheet unions and
     /// dynamic links are re-created by every evaluation (see the [`links`](Self::links) field docs).
-    pub fn set_links(&mut self, links: HashMap<(u32, u32), CellLink>) -> bool {
+    ///
+    /// **No production caller today.** The worker's mirror computes the difference itself and
+    /// installs with `replace_links`, and [`SheetCacheBuilder`] populates its own `links` field
+    /// directly — so the only caller is the engine's test-only `refresh_links`. It is kept as the
+    /// safe public primitive (a future caller holding only "here is a map" should not have to
+    /// hand-roll the comparison), not because anything depends on it.
+    pub fn set_links(&mut self, links: LinkMap) -> bool {
         if self.links == links {
             return false;
         }
         self.links = links;
         true
+    }
+
+    /// Replaces the sheet's link map **unconditionally** — the mirror's install step, for a caller
+    /// that has already established the map differs (see [`set_links`](Self::set_links) for the
+    /// checked form).
+    pub fn replace_links(&mut self, links: LinkMap) {
+        self.links = links;
     }
 
     /// Interns `style` into the resolved table (equal styles share a [`StyleId`]).
@@ -594,7 +607,7 @@ pub struct SheetCacheBuilder {
     border_specs: Vec<BorderSpec>,
     default_font_size_q: u16,
     merges: Vec<CellRange>,
-    links: HashMap<(u32, u32), CellLink>,
+    links: LinkMap,
 }
 
 impl SheetCacheBuilder {

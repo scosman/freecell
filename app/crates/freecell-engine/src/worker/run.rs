@@ -30,8 +30,8 @@ use freecell_core::merge::blocks_fill;
 use freecell_core::sheet_name::validate_sheet_name;
 use freecell_core::tsv::{paste_fits, tsv_dims};
 use freecell_core::{
-    limits, CellKind, CellRange, CellRef, Direction, Publication, PublishedCell, SelectionStats,
-    SheetId,
+    limits, CellKind, CellRange, CellRef, Direction, LinkMap, Publication, PublishedCell,
+    SelectionStats, SheetId,
 };
 
 use freecell_chart_model::{
@@ -45,7 +45,7 @@ use crate::chart::binding::{
     ChartBindings, RemovedChart, SheetResolver,
 };
 use crate::chart::write::{AuthoredChart, SeriesRefs};
-use crate::document::{DocumentSource, FontFlag, LinkMap, LinkWrite, SaveError, WorkbookDocument};
+use crate::document::{DocumentSource, FontFlag, LinkWrite, SaveError, WorkbookDocument};
 use std::path::Path;
 
 use super::charts::ChartSnapshot;
@@ -1910,8 +1910,10 @@ impl Worker {
     /// row-height mirror (a value edit can auto-fit a row taller).
     ///
     /// `evaluated` says whether this batch recomputed. It is forwarded to the link mirror, which
-    /// can take an allocation-free fast path when no evaluation could have moved a dynamic link;
-    /// `true` is always safe (see [`refresh_resident_links`](Self::refresh_resident_links)).
+    /// takes a cheaper (allocation-free, but still O(links)) comparison when no evaluation could
+    /// have moved a dynamic link; `true` is always safe. See
+    /// [`refresh_resident_links`](Self::refresh_resident_links) for what that path does and does
+    /// not cost — it is cheaper, not free.
     fn refresh_cache_cells(
         &mut self,
         refresh: &[(SheetId, CellRange)],
@@ -2014,22 +2016,55 @@ impl Worker {
     /// mirror flows through (the coalesced edit batch and its undo/redo, paste, replace, and
     /// `SetFont`), so the build/mirror/undo-touch trio all agree.
     ///
-    /// **Cost.** This runs on every mirror, so it is shaped to do as little as possible:
-    /// - `evaluated == false` ⇒ no dynamic link can have moved, so each sheet collapses to an
-    ///   allocation-free worksheet comparison against a `&HashMap` the engine already owns. A
-    ///   style-only edit over a link-heavy sheet therefore costs no allocations at all.
-    /// - otherwise the union re-read happens, but the comparison is still in place and the map is
-    ///   built only when something actually changed (`sheet_links_if_changed`).
+    /// **Cost — reduced, not eliminated.** This runs on every mirror, so it is shaped to do as
+    /// little as it can, but the floor is set by the engine's API and is *not* negligible on a
+    /// link-heavy sheet. Measured in this container (release, 10 000 worksheet links on one
+    /// resident sheet, the **unchanged** case, per resident sheet per mirror):
+    ///
+    /// | path | p50 | tail |
+    /// |---|---|---|
+    /// | `evaluated == true` (value edits, undo, redo, paste) | ~2.2 ms | uncharacterised |
+    /// | `evaluated == false` (style-only edits, `SetFont`) | ~0.53 ms | uncharacterised |
+    ///
+    /// Produced by [`bench_link_mirror`], 200 samples per run after a discarded warm-up. **The
+    /// p50s are the reproducible figures** — 2132–2234 µs and 500–563 µs across 25 runs, with the
+    /// ~4× gap constant. The **tail is deliberately not quoted**: on this container the
+    /// `evaluated == true` p99 ranged ~2.4–5.0 ms across runs (one max of 6.1 ms), so any point
+    /// or span reads as a bound and gets blown through — four revisions of this table were
+    /// contradicted that way. Argue from the p50; characterise the tail properly if it is ever
+    /// needed.
+    ///
+    /// What the shaping does buy:
+    /// - `evaluated == false` ⇒ no dynamic link can have moved, so each sheet collapses to the
+    ///   worksheet comparison against a `&HashMap` the engine already owns — no `Link` clones and
+    ///   no sort, though still O(links) hash lookups and string compares.
+    /// - otherwise the union re-read happens, but the comparison is in place and the map is built
+    ///   only when something actually changed (`sheet_links_if_changed`), which removes the
+    ///   *second* round of `String` clones. `get_links_list`'s own clone-every-link-and-sort
+    ///   remains and is the dominant term.
     /// - every update is computed first and installed under **one** write lock, so a multi-sheet
     ///   refresh takes the lock the render thread contends on once rather than per sheet.
     ///
-    /// A link-free workbook pays nothing measurable either way (both maps are empty). What is
-    /// *not* yet possible is the conditional-formatting-style "no links anywhere, return
-    /// immediately" gate: the worksheet half is free, but the dynamic half lives in
-    /// `Model::links`, which the engine exposes no accessor for — see
-    /// [`WorkbookDocument::sheet_links_if_changed`].
+    /// A link-free workbook pays nothing measurable either way (both maps are empty), which is the
+    /// overwhelmingly common case. The residual on a link-heavy sheet is a **known gap**. The
+    /// preferred close is a fork **dynamic-links accessor**, which would let the `evaluated ==
+    /// true` path skip `get_links_list` and collapse to roughly the worksheet-comparison floor; a
+    /// link-generation counter is *rejected* (it degenerates into the `evaluated` flag this
+    /// function already takes), and a FreeCell-only alternative exists but is rejected on
+    /// correctness. `architecture.md §3.3` is the single home for that analysis — trust it over
+    /// this summary if the two ever drift.
     fn refresh_resident_links(&mut self, evaluated: bool) -> Vec<SheetId> {
         let caches = Arc::clone(&self.shared.caches);
+        // Resolve sheet ids ONCE for the whole pass. `Worker::resolve` rebuilds the workbook's
+        // entire sheet-properties vector per call (cloning every sheet's name), so calling it
+        // inside the loop below would cost 2R vectors and ~2·R·N string clones per mirror.
+        let props = self.doc.sheet_properties();
+        let index_of = |sheet: SheetId| {
+            props
+                .iter()
+                .position(|(id, _)| *id == sheet.0)
+                .map(|i| i as u32)
+        };
         // Compute under the READ lock: it is shared, so the render thread's own per-frame read is
         // unaffected, and no writer is blocked while we talk to the engine.
         let updates: Vec<(SheetId, LinkMap)> = {
@@ -2039,7 +2074,7 @@ impl Worker {
                 .into_iter()
                 .filter_map(|sheet| {
                     // A sheet deleted out from under the resident snapshot resolves to `None`.
-                    let idx = self.resolve(sheet)?;
+                    let idx = index_of(sheet)?;
                     let cache = guard.get(sheet)?;
                     let links = cache::changed_links(&self.doc, idx, cache, evaluated)?;
                     Some((sheet, links))
@@ -2053,11 +2088,11 @@ impl Worker {
         let mut guard = caches.write();
         for (sheet, links) in updates {
             // `links` is MOVED in — cloning it here would reintroduce exactly the per-link
-            // allocation storm this function is shaped to avoid.
-            if guard
-                .get_mut(sheet)
-                .is_some_and(|cache| cache.set_links(links))
-            {
+            // allocation storm this function is shaped to avoid. `changed_links` already proved
+            // the map differs and nothing can write between the two guards on this thread, so the
+            // unchecked `replace_links` is used rather than re-walking the map to re-derive that.
+            if let Some(cache) = guard.get_mut(sheet) {
+                cache.replace_links(links);
                 changed.push(sheet);
             }
         }
@@ -9865,21 +9900,44 @@ mod tests {
     fn a_dynamic_link_follows_a_re_evaluation_of_its_argument() {
         // Why the link mirror is WHOLE-SHEET: A1's HYPERLINK() link is rebuilt by the evaluation
         // an edit to A2 triggers, so a touched-cell-only refresh would leave A1's link stale.
+        //
+        // A2 holds a bare FRAGMENT that the formula concatenates, so the engine does not auto-link
+        // it and **only the dynamic half** of the map moves. Seeding A2 with a whole URL would
+        // auto-link it, moving the worksheet half too — which would let this pass even if the
+        // `evaluated` flag were wired wrong, since the cheap worksheet comparison would catch it.
         let (mut worker, _rx) = test_worker();
         let sheet = sheet0(&worker);
         worker.process_batch(vec![
-            set_input(sheet, 1, 0, "https://first.example"),
-            set_input(sheet, 0, 0, "=HYPERLINK(A2)"),
+            set_input(sheet, 1, 0, "a"),
+            set_input(sheet, 0, 0, "=HYPERLINK(\"https://x.example/\"&A2)"),
         ]);
         assert_eq!(
             cached_link(&worker, sheet, 0, 0).as_deref(),
-            Some("https://first.example")
+            Some("https://x.example/a")
+        );
+        // Self-defending: if the fixture ever drifts back to a URL in A2 the engine would
+        // auto-link it, the worksheet half would move too, and this test would silently stop
+        // discriminating the `evaluated` wiring. Assert the premise instead of trusting the
+        // comment (the cache-level twin carries the same guard).
+        assert_eq!(
+            worker
+                .shared
+                .caches
+                .read()
+                .get(sheet)
+                .unwrap()
+                .links()
+                .values()
+                .filter(|l| !l.dynamic)
+                .count(),
+            0,
+            "no worksheet link exists, so only the dynamic half can move"
         );
 
-        worker.process_batch(vec![set_input(sheet, 1, 0, "https://second.example")]);
+        worker.process_batch(vec![set_input(sheet, 1, 0, "b")]);
         assert_eq!(
             cached_link(&worker, sheet, 0, 0).as_deref(),
-            Some("https://second.example"),
+            Some("https://x.example/b"),
             "A1's dynamic link followed an edit that never touched A1"
         );
     }
@@ -10077,6 +10135,111 @@ mod tests {
             Some("https://plain.example"),
             "a long PLAIN label is stored, not parsed, so it is not capped"
         );
+    }
+
+    /// The harness behind the link-mirror p50/p99 figures quoted in
+    /// [`Worker::refresh_resident_links`], `cache::changed_links`, `architecture.md §3.3` and
+    /// `phase_plans/phase_3.md` — committed so those numbers stay auditable and reproducible
+    /// rather than being folklore.
+    ///
+    /// `#[ignore]`d because it is a benchmark, not an assertion about behaviour. Run it with:
+    ///
+    /// ```text
+    /// cargo test --release -p freecell-engine --lib -- bench_link_mirror --ignored --nocapture
+    /// ```
+    ///
+    /// **Release only** — a debug build measures `HashMap`/`String` paths that are 10–20× slower
+    /// and is not comparable. Per `CLAUDE.md`'s benchmark convention it runs foreground, and it
+    /// **forces + asserts** the measured op (the fixture really holds 10 000 cached links, and the
+    /// unchanged case really reports no change) so it can never time a no-op.
+    ///
+    /// Recorded on this container (release): see the table on
+    /// [`Worker::refresh_resident_links`] and in `architecture.md §3.3`, both regenerated from
+    /// this harness rather than hand-edited. Absolute numbers are machine-dependent — the
+    /// load-bearing facts are the ~4× gap between the two paths, and that the `evaluated == true`
+    /// path costs **milliseconds** at F10.4 scale (the `false` path is sub-millisecond, ~0.53 ms).
+    ///
+    /// **Methodology**, because earlier versions of this bench reported tails that nothing could
+    /// reproduce: it discards a warm-up iteration, takes enough samples for a percentile to mean
+    /// something, and reports the **nearest-rank** p99 rather than labelling the maximum "p99".
+    /// Min/max are printed alongside so an outlier is visible instead of hiding in the tail.
+    ///
+    /// Even so, **the p99 this prints is not a stable property of the machine** — see the table on
+    /// [`Worker::refresh_resident_links`]. Use this harness for the p50 and for A/B comparisons;
+    /// it is not sized to characterise a tail.
+    #[ignore = "benchmark, not a behavioural test; run with --release --ignored --nocapture"]
+    #[test]
+    fn bench_link_mirror() {
+        const LINKS: u32 = 10_000;
+        /// Enough samples that `p99` is a percentile rather than a synonym for `max`; the whole
+        /// run is still well under a second. (It is still far too few to pin a tail on a noisy
+        /// container — see the type-level docs.)
+        const ITERS: usize = 200;
+
+        let (mut worker, _rx) = test_worker();
+        let sheet = sheet0(&worker);
+        let idx = worker.resolve(sheet).expect("the sheet resolves");
+        for i in 0..LINKS {
+            worker
+                .doc
+                .set_cell_link(
+                    idx,
+                    CellRef::new(i, 0),
+                    &LinkTarget::external(format!("https://example.com/{i}")),
+                    None,
+                )
+                .expect("fixture link");
+        }
+        worker.build_and_store_cache(sheet);
+        assert_eq!(
+            worker
+                .shared
+                .caches
+                .read()
+                .get(sheet)
+                .expect("resident")
+                .links()
+                .len(),
+            LINKS as usize,
+            "the fixture must really be cached, or the benchmark times nothing"
+        );
+
+        // The UNCHANGED case: what every ordinary keystroke on a link-heavy sheet pays.
+        for evaluated in [true, false] {
+            // Warm-up, discarded. On the FIRST loop iteration this is the expensive one — the
+            // call right after `build_and_store_cache` faults in the fresh map and runs 35–57%
+            // slower than the steady state. On the second iteration the caches are long warm and
+            // the delta is smaller (2–26%), so there the discard is just consistency between the
+            // two arms rather than a fixture artifact. Either way, including it would let a
+            // one-off dominate the reported tail.
+            //
+            // (Measured deltas, not asserted: the two arms differ enough that a single percentage
+            // would misdescribe one of them.)
+            let warmup = Instant::now();
+            assert!(worker.refresh_resident_links(evaluated).is_empty());
+            let warmup_us = warmup.elapsed().as_micros() as u64;
+
+            let mut samples: Vec<u64> = Vec::with_capacity(ITERS);
+            for _ in 0..ITERS {
+                let started = Instant::now();
+                let changed = worker.refresh_resident_links(evaluated);
+                samples.push(started.elapsed().as_micros() as u64);
+                assert!(
+                    changed.is_empty(),
+                    "the unchanged case must report no change — otherwise this is timing a rebuild"
+                );
+            }
+            samples.sort_unstable();
+            println!(
+                "link mirror, {LINKS} links, evaluated={evaluated}: \
+                 p50={}us p99={}us min={}us max={}us (warm-up {}us, discarded; n={ITERS})",
+                samples[ITERS / 2],
+                samples[(ITERS * 99).div_ceil(100) - 1],
+                samples[0],
+                samples[ITERS - 1],
+                warmup_us,
+            );
+        }
     }
 
     // Undoing a sheet delete restores the worksheet's cells, bands, geometry, merges and frozen

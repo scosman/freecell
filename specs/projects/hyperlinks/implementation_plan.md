@@ -32,7 +32,7 @@ Phases 1–2 are fork work in `/home/user/IronCalc`; phases 3–7 are FreeCell.
   halves are in scope. Prepare the upstream compare link + title + description for the owner —
   **one fix, one branch, one PR**; do not fold this into Phase 1's merge.
 
-- [ ] **Phase 3 — Re-pin + engine facade + link cache.**
+- [x] **Phase 3 — Re-pin + engine facade + link cache.**
   Bump FreeCell's `freecell-fixes` lock; `LinkTarget` in `freecell-core`; `WorkbookDocument::{cell_link,
   set_cell_link, remove_cell_link}`; `Command::{SetCellLink, RemoveCellLink}` + bucketing +
   `apply_one` + `AppliedKind::StyleOnly`; sparse `SheetCache.links` with **all three** agreement

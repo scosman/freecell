@@ -104,19 +104,20 @@ Following the CF/style precedent, each opening with
 
 ```rust
 pub fn cell_link(&self, sheet: u32, cell: CellRef)
-    -> Result<Option<CellLink>, CellQueryError>;            // effective link, near cell_content
+    -> Result<Option<CellLink>, CellQueryError>;        // effective link, near cell_content
 pub(crate) fn sheet_links(&self, sheet_idx: u32)
-    -> Result<HashMap<(u32, u32), CellLink>, String>;       // the cache build's source
-pub(crate) fn sheet_links_if_changed(&self, sheet_idx: u32,
-    cached: &HashMap<(u32, u32), CellLink>)
-    -> Result<Option<HashMap<(u32, u32), CellLink>>, String>;   // the mirror's hot path
-pub(crate) fn worksheet_links_match(&self, sheet_idx: u32,
-    cached: &HashMap<(u32, u32), CellLink>) -> bool;        // allocation-free no-eval fast path
+    -> Result<LinkMap, String>;                         // the cache build's source
+pub(crate) fn sheet_links_if_changed(&self, sheet_idx: u32, cached: &LinkMap)
+    -> Result<Option<LinkMap>, String>;                 // the mirror's hot path
+pub(crate) fn worksheet_links_match(&self, sheet_idx: u32, cached: &LinkMap) -> bool;
 pub(crate) fn set_cell_link(&mut self, sheet_idx: u32, cell: CellRef,
     target: &LinkTarget, label: Option<&str>) -> Result<LinkWrite, String>;
 pub(crate) fn remove_cell_link(&mut self, sheet_idx: u32, cell: CellRef)
     -> Result<bool, String>;
 ```
+
+`LinkMap = HashMap<(u32, u32), CellLink>` is defined in `freecell-core::link` beside `CellLink`,
+so `SheetCache` and the engine name the shape identically.
 
 `set_cell_link` passes `label` straight through to upstream's
 `UserModel::set_cell_link(sheet, row, column, link, label)` so F5.3's "one undo step" is the
@@ -131,8 +132,9 @@ pub(crate) enum LinkWrite { NoOp, LinkOnly, LabelChanged }
 
 The four read methods are three shapes of one question, because the engine gives only one
 both-kinds read (`get_links_list`) and it clones: `sheet_links` builds, `sheet_links_if_changed`
-compares in place and materializes only on a real change, `worksheet_links_match` answers the
-worksheet half with **zero** allocations from a `&HashMap` the engine already owns. See §3.3.
+compares in place and materializes only on a real change, and `worksheet_links_match` answers the
+worksheet half without allocating — from a `&HashMap` the engine already owns — though still in
+O(links) lookups. See §3.3 for what that does and does not buy.
 
 ### 3.2 `LinkTarget` — a `freecell-core` type
 
@@ -190,22 +192,110 @@ and you get the classic bug shape here:
 `assert_cache_agrees` compares each probe cell's cached link against a fresh `cell_link` re-read,
 so every existing agreement test also proves link agreement.
 
-**Cost shaping** (the mirror runs on every keystroke, and F10.4 supports a 10 000-cell range
-hyperlink import, so a naive rebuild-then-compare would mean tens of thousands of `String`
-allocations per edit):
+**Cost — reduced, not eliminated.** This is the single home for the link-mirror cost analysis;
+the doc comments on `refresh_resident_links` and `sheet_links_if_changed` point here rather than
+restating it. The mirror runs on every keystroke, and F10.4 supports a 10 000-cell range hyperlink
+import, so the shaping matters:
 
 - the comparison runs **in place** against the engine's returned list; the map is materialized
-  only when something actually changed, and then by **move** rather than clone;
+  only when something actually changed, and then by **move** rather than clone. This removes the
+  *second* round of `String` clones a rebuild-then-compare would pay;
 - when the batch did **not** evaluate, no dynamic link can have moved, so the check collapses to
-  the allocation-free `worksheet_links_match` (a `&HashMap` the engine owns). `evaluated: true`
-  is the conservative default — it only ever costs a full re-read;
+  `worksheet_links_match`, which reads a `&HashMap` the engine already owns — no clones, no sort,
+  but still O(links) hash lookups and string compares. `evaluated: true` is the conservative
+  default — a wrong `true` costs only a full re-read, a wrong `false` would be a correctness bug;
 - updates for all resident sheets are computed under the shared read lock, then installed under
-  **one** write lock, so the lock the render thread contends on is taken once per mirror.
+  **one** write lock, so the lock the render thread contends on is taken once per mirror;
+- sheet ids are resolved **once per pass**, not per sheet — `Worker::resolve` rebuilds the whole
+  workbook's sheet-properties vector on each call.
 
-A complete CF-style "no links anywhere, return immediately" gate is **not** reachable today: the
-worksheet half is free, but the dynamic half lives in `Model::links`, which is `pub(crate)` with
-no public accessor. Closing it needs a small fork addition (`has_dynamic_links` /
-`get_dynamic_links`) — deliberately not opened in Phase 3.
+**Measured** (release, dev container, 10 000 worksheet links on one resident sheet, the
+*unchanged* case, per resident sheet per mirror):
+
+| path | p50 | tail |
+|---|---|---|
+| `evaluated == true` — value edits, undo, redo, paste | ~2.2 ms | uncharacterised |
+| `evaluated == false` — style-only edits, `SetFont` | ~0.53 ms | uncharacterised |
+
+Produced by the committed `bench_link_mirror` harness (`worker/run.rs`), 200 samples per run after
+a discarded warm-up. **The p50s are the reproducible figures** — across 25 runs they held to
+2132–2234 µs and 500–563 µs, with the ~4× gap between the paths constant.
+
+**The tail is deliberately not quoted.** On this container it is noise-dominated to the point of
+being meaningless: observed `evaluated == true` p99s ranged from ~2.4 ms to ~5.0 ms (one run
+maxing at 6.1 ms) — a 2× spread with no stable centre. Four successive revisions of this table
+each quoted a tail figure or span that the next batch of runs contradicted, so the column now
+says what is actually known. **Do not budget against a tail number here**: if Phase 6 or a perf
+gate needs one, characterise it properly (pinned CPU, many more runs, outliers analysed) rather
+than reading it off this table. Argue from the p50, and regenerate from the harness rather than
+hand-editing.
+
+So on an F10.4-scale import every keystroke still pays ~2.2 ms of link work on the worker after
+the eval. A link-free workbook (the overwhelmingly common case) pays nothing measurable either
+way.
+
+**This residual is a known gap, carried to Phase 6 for a `GAPS.md` / `projects/` row.**
+
+**What would close it.** Note first what would *not*: a CF-style "no links anywhere, return
+immediately" gate is the wrong instrument here. By construction it needs both halves empty, so it
+can never fire on the 10 000-worksheet-link sheet that *defines* the residual — it would optimise
+the link-free case, which is already free. The fix has to attack the `evaluated == true` path's
+`get_links_list` call directly.
+
+1. **A dynamic-links accessor on the fork** — the right shape, used two ways:
+   - **A borrowing read of the dynamic links** lets the `evaluated == true` path compare the
+     dynamic half **in place** and skip `get_links_list` entirely, collapsing ~2.2 ms to roughly
+     the ~0.53 ms worksheet-comparison floor. Note it *cannot* simply mirror `get_links`:
+     `Worksheet::links` is genuinely per-sheet, but `Model::links` is one workbook-wide
+     `HashMap<(u32, i32, i32), Link>` with no per-sheet sub-map to hand out. So the accessor must
+     either expose the whole global map (the caller filters by sheet — still allocation-free) or
+     return a per-sheet iterator. That is a little more than a getter, and nudges the cost
+     estimate above "ten lines".
+   - **`has_dynamic_links() -> bool`** is cheaper to add but needs care: `false` licenses the
+     worksheet-only comparison when `evaluated == true` **only if the cached map also holds no
+     dynamic entry**. Without that second condition it is *unsound* —
+     `worksheet_links_match` deliberately ignores cached dynamic entries, so deleting the last
+     `=HYPERLINK(...)` on a sheet (eval empties `Model::links` ⇒ `has_dynamic_links()` is `false`
+     ⇒ shortcut taken ⇒ worksheet halves match ⇒ `changed_links` returns `None`) would strand the
+     deleted dynamic link in the cache **forever**. With both conditions it is sound, because then
+     the union equals the worksheet half on both sides.
+
+   Either way the O(links) worksheet comparison itself remains, so this makes the residual
+   **reducible, not removable**. `Model::links` being `pub(crate)` is the only thing blocking it.
+   A separate upstream contribution; placement is the owner's call.
+
+2. **A link-generation counter** — rejected, and the decisive reason is **degeneracy, not
+   difficulty**. Any sound counter collapses onto state FreeCell already has: dynamic links are
+   rebuilt by *every* evaluation, so a sound counter must bump on every evaluation — which is
+   exactly the `evaluated` flag; and for the worksheet half FreeCell cannot tell whether a given
+   command moved a link without asking the engine, so it would have to bump conservatively on
+   essentially every edit. It buys nothing over what is already implemented.
+
+Two **FreeCell-only** avenues were considered and rejected on grounds worth recording, since
+"nothing can be done without the fork" would be too strong a claim:
+
+- **Track "does this workbook contain any dynamic link at all."** The last union read already
+  reports it, and a new dynamic link cannot appear without some FreeCell-visible batch. If the
+  answer is *no*, the `evaluated == true` path could use the worksheet-only comparison — nominally
+  the same ~2.2 ms → ~0.53 ms collapse as (1), with **no fork change**.
+
+  **Rejected first because it is wrong, not because of policy.** It inherits exactly the hole
+  described in (1): the flag going `true → false` is precisely the case where a dynamic link was
+  just *deleted*, and `worksheet_links_match` ignores cached dynamic entries — so the shortcut
+  fires on the one transition it must not, and the deleted link stays in the cache forever. It
+  would need the same "and the cached map holds no dynamic entry" guard to be sound at all.
+
+  Even repaired it stays rejected, now on policy: it is heuristic bookkeeping shadowing
+  engine-internal state (`Model::links`) — the "compensating workaround in FreeCell" that
+  `CLAUDE.md`'s fix-the-fork rule exists to prevent — and it would go silently stale the moment
+  the engine gained another way to mint a dynamic link. The accessor in (1) is the same win,
+  honestly sourced.
+- **Bound the `evaluated == false` comparison by the touched set.** A non-evaluating batch is
+  style-only or a `LinkWrite::LinkOnly` edit, both with a known touched-cell set, so a handful of
+  `get_cell_link` probes could replace the 10 000-lookup walk. Real and FreeCell-only, but it
+  needs the invariant *"no non-evaluating command moves a worksheet link outside its touched
+  cells"* argued and pinned, and it only improves the already-cheaper path (~0.53 ms). Deferred
+  as poor value until (1) has taken the expensive path down.
 
 ### 3.4 Commands
 

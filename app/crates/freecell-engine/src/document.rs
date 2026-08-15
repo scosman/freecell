@@ -11,15 +11,14 @@
 //! on open — first paint uses the file's cached values (SP2 / `functional_spec.md §5.1`);
 //! the command/event loop, caches, and `Publication` build land in Phases 4–5.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use freecell_core::format_color::{format_color_rgb, is_date_format};
 use freecell_core::{
-    CellKind, CellLink, CellRange, CellRef, Direction, FillAxis, LinkTarget, Rgb, SelectionStats,
-    SheetDims,
+    CellKind, CellLink, CellRange, CellRef, Direction, FillAxis, LinkMap, LinkTarget, Rgb,
+    SelectionStats, SheetDims,
 };
 use ironcalc::export::save_xlsx_to_writer;
 use ironcalc::import::load_from_xlsx;
@@ -170,11 +169,6 @@ pub(crate) enum LinkWrite {
     /// The label rewrote the cell's content too → the batch must recompute.
     LabelChanged,
 }
-
-/// A sheet's effective hyperlinks, keyed by 0-based `(row, col)` — the shape the cache holds and
-/// the link reads/mirror pass around. Named because the bare type recurs across `document`,
-/// `cache`, and the worker.
-pub(crate) type LinkMap = HashMap<(u32, u32), CellLink>;
 
 /// Converts an IronCalc [`Link`] into the engine-free [`LinkTarget`] the UI sees — the link half
 /// of the crate's "no IronCalc type escapes" boundary, mirroring what `cond_fmt_convert` does for
@@ -602,20 +596,16 @@ impl WorkbookDocument {
     /// don't rebuild anything".
     ///
     /// This is the mirror's hot path, and the shape matters. The engine's only both-kinds read
-    /// (`get_links_list`) already clones every link on the sheet, and the overwhelmingly common
-    /// outcome is that nothing moved: an ordinary keystroke on a sheet that happens to carry
-    /// links. Building a fresh `HashMap` first and comparing after would pay a *second* round of
-    /// `String` clones on every such edit — on an F10.4-scale sheet (a 10 000-cell range hyperlink
-    /// import) that is tens of thousands of allocations per keystroke, on a project whose whole
-    /// thesis is huge-sheet speed. So the comparison runs **in place against the returned list**
-    /// (allocation-free, via [`link_matches`]), and the map is materialized only when it is
+    /// (`get_links_list`) clones every link on the sheet **and sorts them**, and the overwhelmingly
+    /// common outcome is that nothing moved: an ordinary keystroke on a sheet that happens to carry
+    /// links. Building a fresh map first and comparing after would pay a *second* round of `String`
+    /// clones on top of that, so the comparison runs **in place against the returned list**
+    /// (allocation-free, via [`link_matches`]) and the map is materialized only when it is
     /// genuinely needed — by **move** rather than clone.
     ///
-    /// A complete "no links anywhere, return immediately" gate — the conditional-formatting
-    /// precedent — is **not** reachable from FreeCell today: the worksheet half is free (see
-    /// [`worksheet_links_match`](Self::worksheet_links_match)), but the dynamic half lives in
-    /// `Model::links`, which is `pub(crate)` with no public accessor. Closing that needs a small
-    /// fork addition (a `has_dynamic_links` / `get_dynamic_links`), deliberately not opened here.
+    /// That halves the work but does not make it cheap: `get_links_list`'s own clone-and-sort
+    /// remains and dominates (measured ~2.2 ms p50 for 10 000 links). Why it cannot currently be
+    /// skipped altogether, and what would close it, is analysed once in `architecture.md §3.3`.
     pub(crate) fn sheet_links_if_changed(
         &self,
         sheet_idx: u32,
@@ -678,17 +668,30 @@ impl WorkbookDocument {
         let Ok(engine) = self.model.get_links(sheet_idx) else {
             return false; // can't prove a match → fall through to the full re-read
         };
-        if engine.len() != cached.values().filter(|l| !l.dynamic).count() {
-            return false;
-        }
-        engine.iter().all(|(&(row, col), link)| {
+        let cached_worksheet_links = cached.values().filter(|l| !l.dynamic).count();
+        let mut convertible = 0usize;
+        for (&(row, col), link) in engine {
+            // A non-convertible coordinate is **skipped**, not treated as a mismatch: the build
+            // paths drop such an entry, so the cache legitimately never contains it. Bailing here
+            // instead would disable this fast path forever on a hostile file carrying one, and the
+            // two sides could never converge.
+            //
+            // UNREACHABLE today (verified against the pinned fork: `check_valid_cell` gates
+            // `set_cell_link`, and the xlsx importer rejects a non-positive ref), so there is no
+            // test for it — it is defence-in-depth against a future import path, kept only because
+            // silently mis-keying a link into the 0-based cache would be worse than skipping it.
             let (Ok(row), Ok(col)) = (u32::try_from(row - 1), u32::try_from(col - 1)) else {
-                return false;
+                continue;
             };
-            cached
+            convertible += 1;
+            if !cached
                 .get(&(row, col))
                 .is_some_and(|c| !c.dynamic && link_matches(&c.target, link))
-        })
+            {
+                return false;
+            }
+        }
+        convertible == cached_worksheet_links
     }
 
     /// The **evaluated** value of a cell as an engine-free [`CellData`] — the read chart live

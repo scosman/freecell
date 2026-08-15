@@ -6,6 +6,8 @@
 //! [`LinkTarget`] mirrors it and `freecell-engine` converts at its boundary — exactly as
 //! [`CfRuleView`](crate::CfRuleView) already does for conditional-formatting rules.
 
+use std::collections::HashMap;
+
 /// Where a hyperlink points.
 ///
 /// [`External`](Self::External) covers URLs, `mailto:`, and file paths — a target that points
@@ -94,6 +96,12 @@ pub struct CellLink {
     pub target: LinkTarget,
     pub dynamic: bool,
 }
+
+/// A sheet's effective hyperlinks, keyed by 0-based `(row, col)` — what
+/// [`SheetCache`](crate::SheetCache) holds and what the engine's link reads and mirror pass
+/// around. Named here, beside [`CellLink`], so the cache and the engine spell the shape the same
+/// way.
+pub type LinkMap = HashMap<(u32, u32), CellLink>;
 
 impl CellLink {
     /// A worksheet (editable, persisted) link.

@@ -28,13 +28,14 @@
 
 use freecell_core::cache::{DEFAULT_CELL_FONT_PX, DEFAULT_COL_WIDTH_PX, DEFAULT_ROW_HEIGHT_PX};
 use freecell_core::{
-    limits, BorderSpec, CellRef, Edge, LinePattern, RenderStyle, Rgb, SheetCache, SheetCacheBuilder,
+    limits, BorderSpec, CellRef, Edge, LinePattern, LinkMap, RenderStyle, Rgb, SheetCache,
+    SheetCacheBuilder,
 };
 use ironcalc_base::types::{
     Border, BorderItem, BorderStyle, Color, HorizontalAlignment, Style, Theme, VerticalAlignment,
 };
 
-use crate::document::{LinkMap, WorkbookDocument};
+use crate::document::WorkbookDocument;
 
 // These mirror the pinned engine's default row/col size (`ironcalc_base/src/constants.rs`) — the
 // reference our px conversion maps onto FreeCell's own defaults, and the sentinel that marks a
@@ -531,8 +532,8 @@ pub(crate) fn refresh_cell(
 ///   touched, and there is no touched-cell set that would cover them.
 ///
 /// Test-only: production splits the two halves so the worker can compute every resident sheet's
-/// update before taking **one** write lock ([`changed_links`] + `SheetCache::set_links`). Kept as
-/// the combined form because it is what the mirror tests want to express.
+/// update before taking **one** write lock ([`changed_links`] + `SheetCache::replace_links`).
+/// Kept as the combined form because it is what the mirror tests want to express.
 #[cfg(test)]
 pub(crate) fn refresh_links(
     cache: &mut SheetCache,
@@ -553,9 +554,22 @@ pub(crate) fn refresh_links(
 ///
 /// `evaluated` says whether an evaluation may have run since the last refresh. When it is `false`
 /// the dynamic (`HYPERLINK()`) links provably cannot have moved — only `evaluate()` rebuilds them
-/// — so the check collapses to the **allocation-free** worksheet comparison
-/// ([`WorkbookDocument::worksheet_links_match`]), and a style-only mirror over a link-heavy sheet
-/// costs nothing. `true` is the safe default: it only ever costs a full re-read.
+/// — so the check *can* collapse to the worksheet comparison
+/// ([`WorkbookDocument::worksheet_links_match`]): no `Link` clones and no sort, though **still
+/// O(links) hash lookups and string compares** (~0.53 ms p50 for 10 000 links — cheaper, not
+/// free; see `architecture.md §3.3`).
+///
+/// "Collapses" only when that comparison **matches**. On a mismatch it is not a substitute but an
+/// added cost: the fall-through still runs the full `sheet_links_if_changed`, so the cheap path's
+/// mismatch case costs **both**. At 10 000 links that is **at least** ~2.7 ms — the sum of the two
+/// measured *unchanged*-case p50s, which is a **lower bound, not a worst case**: a mismatch is by
+/// definition the changed case, where `sheet_links_if_changed` also materializes a fresh
+/// 10 000-entry `LinkMap` that the unchanged measurement never pays for. Not separately
+/// benchmarked. The trade is still right — a mismatch means real work is needed anyway — but this
+/// is not a free probe.
+///
+/// `true` is the safe default: a wrong `true` only ever costs a full re-read, whereas a wrong
+/// `false` would be a correctness bug.
 ///
 /// A read failure (only an invalid sheet index) yields `None`, leaving the cache's links alone
 /// rather than silently emptying them; the caller resolves the index first, so it is effectively
@@ -1392,21 +1406,34 @@ mod tests {
     fn refresh_links_mirrors_a_dynamic_link_re_evaluation() {
         // The reason the link mirror is whole-sheet: a HYPERLINK() link is rebuilt from scratch by
         // every evaluation, so it moves without its own cell ever being edited.
+        //
+        // A2 holds a bare FRAGMENT (`"a"`, not a URL) and the formula concatenates it, so the
+        // engine does NOT auto-link A2 — only the DYNAMIC half of the map moves. Seeding A2 with a
+        // whole URL instead would auto-link it, which would move the worksheet half too and let
+        // this test pass for the wrong reason (it would then also be caught by the cheap
+        // worksheet comparison, masking whether the dynamic path works at all).
         let mut doc = WorkbookDocument::new_empty().unwrap();
-        doc.set_cell_input(0, CellRef::new(1, 0), "https://first.example")
-            .unwrap();
-        doc.set_cell_input(0, CellRef::new(0, 0), "=HYPERLINK(A2)")
-            .unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "a").unwrap();
+        doc.set_cell_input(
+            0,
+            CellRef::new(0, 0),
+            "=HYPERLINK(\"https://x.example/\"&A2)",
+        )
+        .unwrap();
         doc.evaluate();
         let mut cache = build_sheet_cache(&doc, 0, false).unwrap();
-        assert_eq!(cached_target(&cache, 0, 0), Some("https://first.example"));
+        assert_eq!(cached_target(&cache, 0, 0), Some("https://x.example/a"));
+        assert_eq!(
+            cache.links().values().filter(|l| !l.dynamic).count(),
+            0,
+            "no worksheet link exists, so only the dynamic half can move"
+        );
 
         // Editing A2 changes A1's dynamic link, with no edit to A1 at all.
-        doc.set_cell_input(0, CellRef::new(1, 0), "https://second.example")
-            .unwrap();
+        doc.set_cell_input(0, CellRef::new(1, 0), "b").unwrap();
         doc.evaluate();
         assert!(refresh_links(&mut cache, &doc, 0, true));
-        assert_eq!(cached_target(&cache, 0, 0), Some("https://second.example"));
+        assert_eq!(cached_target(&cache, 0, 0), Some("https://x.example/b"));
     }
 
     #[test]

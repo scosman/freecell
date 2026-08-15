@@ -185,12 +185,16 @@ the first write — and was missing its two regression tests. Since `freecell-fi
 definition the sum of our fork fixes, the rebased branch tip was merged in, taking the branch side
 for every `set_user_inputs` hunk.
 
-The other two surviving `fix/*` branches are **content-contained** in `freecell-fixes` but, being
-rebased, are not ancestors of it, and `git cherry` reports both as `+`. The checks that actually
-establish containment: `fix/paste-fill-relative-refs` — `git merge-tree` against `freecell-fixes`
-produces an identical tree for every file the branch touches; `fix/structural-edits-adjust-frozen-
-pane` — each of its hunks located in `freecell-fixes` by hand (`git diff <branch> freecell-fixes
--- <file>` shows only `freecell-fixes`' own additions).
+Containment of the three surviving `fix/*` branches, as it stands at the end of the phase:
+
+- `fix/batch-set-inputs` and `fix/paste-fill-relative-refs` are **ancestors** of `freecell-fixes`
+  — each was merged into it during this phase (the reconciliation above, and the fill/link fix).
+  `git merge-base --is-ancestor <branch> freecell-fixes` succeeds and `git cherry freecell-fixes
+  <branch>` is empty for both.
+- `fix/structural-edits-adjust-frozen-pane` was only rebased, never merged, so it is **not** an
+  ancestor and `git cherry` reports it as `+`. It is nonetheless content-contained, established
+  by hand: every one of its hunks was located in `freecell-fixes` (`git diff <branch>
+  freecell-fixes -- <file>` shows only `freecell-fixes`' own additions).
 
 **Deviation 2 — the five obsolete remote branches could not be deleted by the agent.** Both
 `git push --delete` and the GitHub REST `DELETE …/git/refs/heads/*` are refused by the container's
@@ -213,9 +217,9 @@ off `fix/batch-set-inputs`, not `main` (which has no batch API), as stacked upst
 | Ref | Commit |
 |---|---|
 | `main` | `91d343c3` (fast-forwarded to upstream) |
-| `freecell-fixes` | `a6b635ef` |
+| `freecell-fixes` | `1c8b87aa` |
 | `fix/paste-fill-relative-refs` | `a040dbbb` (rebased + fill/link fix) |
-| `fix/batch-set-inputs` | `588f6461` (rebased + rollback doc/test) |
+| `fix/batch-set-inputs` | `180192ff` (rebased + rollback doc/test) |
 | `fix/structural-edits-adjust-frozen-pane` | `274d173c` (rebased) |
 
 `cargo build`, `cargo test`, `cargo fmt --all --check` and `cargo clippy --workspace

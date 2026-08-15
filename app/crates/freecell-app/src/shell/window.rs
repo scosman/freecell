@@ -23,9 +23,13 @@ use gpui::{
     PathPromptOptions, WeakEntity, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Root, WindowExt as _};
 
 use freecell_chart_model::{ChartColor, ChartId, ChartInsertKind};
-use freecell_core::{limits, CellRange, CellRef, Rgb, SelectionModel, SheetId};
+use freecell_core::{
+    decide_open, limits, parse_internal_location, CellRange, CellRef, InternalTarget, LinkTarget,
+    OpenDecision, Rgb, SelectionModel, SheetId,
+};
 use freecell_engine::{
     Command, DataLabelToggles, DocumentClient, DocumentSource, EditRejectedReason, PasteError,
     SheetMeta, StyleAttr, WorkerEvent, WorkerEventReceiver,
@@ -108,6 +112,10 @@ enum ActiveModal {
     /// `functional_spec.md F3`, opened from [`WorkerEvent::MergeNeedsConfirm`]). **Merge**
     /// re-sends `MergeCells { area, confirmed: true }`; **Cancel** dismisses with no change.
     Confirm { sheet: SheetId, area: CellRange },
+    /// A `file:` hyperlink awaiting confirmation before it is launched (`hyperlinks/functional_spec.md
+    /// F3.2`): following it reaches the local filesystem on the say-so of a downloaded document, so
+    /// the path is named and **Cancel is the default**.
+    ConfirmFileLink { url: String },
 }
 
 /// A document window's shell state + lifecycle.
@@ -243,9 +251,12 @@ impl WorkbookWindow {
         });
 
         // The grid needs the chrome handle and vice-versa; resolve both after construction via
-        // one-shot slots the sinks read.
+        // one-shot slots the sinks read. The window's own handle is available immediately (this IS
+        // its `cx.new`), and the grid sink needs it for `OpenLink`: following a link ends in a
+        // modal, a notification, or a selection move — all window-owned.
         let grid_slot: Rc<OnceCell<WeakEntity<GridView>>> = Rc::new(OnceCell::new());
         let chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>> = Rc::new(OnceCell::new());
+        let window_handle = cx.weak_entity();
 
         // The grid renders from the client's shared read-surfaces (zero engine calls per frame).
         let sources = GridDataSources {
@@ -255,6 +266,7 @@ impl WorkbookWindow {
         let grid_sink = make_grid_sink(
             chrome_slot.clone(),
             grid_slot.clone(),
+            window_handle,
             client.clone(),
             sink_shared.clone(),
         );
@@ -928,6 +940,120 @@ impl WorkbookWindow {
         cx.notify();
     }
 
+    // ---- Following a hyperlink (`hyperlinks/architecture.md §6–7`) --------------------------
+
+    /// Follows a cell's hyperlink after the grid decided the click was a follow (F2.1).
+    ///
+    /// The window owns this rather than the grid sink because everything the outcomes need lives
+    /// here: the degraded flag, the modal slot, and the sheet list. Three routes:
+    /// - an **internal** target never reaches the open policy (F4.4) — it navigates;
+    /// - an **external** target goes through `decide_open`, the pure allowlist that stands between
+    ///   an untrusted workbook and `App::open_url` (F3);
+    /// - **degraded mode** follows nothing (F2.2). The flag lives here, so the grid's click
+    ///   decision stays purely gestural instead of mirroring it.
+    fn open_link(&mut self, target: &LinkTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if self.degraded.is_some() {
+            return;
+        }
+        if let LinkTarget::Internal { location, .. } = target {
+            self.navigate_internal(location, window, cx);
+            return;
+        }
+        match decide_open(target) {
+            OpenDecision::Open(url) => cx.open_url(&url),
+            OpenDecision::ConfirmFile(url) => {
+                self.modal = Some(ActiveModal::ConfirmFileLink { url });
+                cx.notify();
+            }
+            // Non-blocking (F3.3): the link stays in the document, renders, and round-trips
+            // (F3.4) — FreeCell just will not launch it, and says which scheme it refused.
+            OpenDecision::Refuse { scheme } => {
+                let detail = if scheme.is_empty() {
+                    format!(
+                        "This link isn't a web address FreeCell can open: {}",
+                        target.destination()
+                    )
+                } else {
+                    format!("FreeCell doesn't open {scheme}: links.")
+                };
+                window.push_notification(detail, cx);
+            }
+        }
+    }
+
+    /// The `file:` confirm's **Open File** click (F3.2): dismiss, then launch.
+    fn confirm_file_link(&mut self, url: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        self.modal = None;
+        cx.open_url(url);
+        cx.notify();
+    }
+
+    /// Moves the selection to an internal link's target (F4.2), switching the active sheet first
+    /// when the target names another one. An unresolvable target navigates nowhere and says so
+    /// (F4.3): an unknown sheet name, a malformed reference, or a defined name (which FreeCell does
+    /// not model at all — see `GAPS.md`).
+    ///
+    /// The grid work is **deferred**: this runs from the grid sink, i.e. from inside the grid's own
+    /// `update`, so touching it synchronously would re-enter a leased entity (the `FocusGrid` /
+    /// `SelectAndReveal` precedent).
+    fn navigate_internal(&mut self, location: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let unresolvable = |window: &mut Window, cx: &mut Context<Self>| {
+            window.push_notification(format!("Can't find {location} in this workbook."), cx);
+        };
+        let Some(InternalTarget::Cell { sheet, cell }) = parse_internal_location(location) else {
+            unresolvable(window, cx);
+            return;
+        };
+        let target_sheet = match sheet {
+            // Excel sheet names are case-insensitive, so a link written `sheet1!A1` still lands.
+            Some(name) => {
+                match self
+                    .sheets
+                    .iter()
+                    .find(|meta| meta.name.eq_ignore_ascii_case(&name))
+                {
+                    Some(meta) => meta.id,
+                    None => {
+                        unresolvable(window, cx);
+                        return;
+                    }
+                }
+            }
+            None => self.sink_shared.active_sheet.get(),
+        };
+
+        let grid = self.grid.downgrade();
+        let chrome = self.chrome.downgrade();
+        let client = self.client.clone();
+        let shared = self.sink_shared.clone();
+        window.defer(cx, move |window, cx| {
+            let Some(grid) = grid.upgrade() else {
+                return;
+            };
+            if shared.active_sheet.get() != target_sheet {
+                switch_grid_to_sheet(
+                    &grid,
+                    Some(&chrome),
+                    &client,
+                    &shared,
+                    target_sheet,
+                    window,
+                    cx,
+                );
+            }
+            // Select + scroll into view, then mirror the new selection exactly as the find bar's
+            // `SelectAndReveal` does, so the ref box / action row / shared state stay in step.
+            let sel = grid.update(cx, |g, cx| {
+                g.select_and_reveal(cell, window, cx);
+                *g.selection()
+            });
+            shared.last_selection.set(sel);
+            if let Some(chrome) = chrome.upgrade() {
+                chrome.update(cx, |c, cx| c.commit_then_adopt_selection(sel, window, cx));
+            }
+        });
+    }
+
     // ---- Save flow (silent strip — no fidelity warning, functional_spec §5.2) --------------
 
     /// Runs the save flow (`components/app_shell.md §Save flow`). `Save` on an untitled
@@ -1203,6 +1329,45 @@ impl WorkbookWindow {
         self.grid.clone()
     }
 
+    /// Test seam: follow a hyperlink through the real [`open_link`](Self::open_link) policy — the
+    /// same call the grid sink makes on a `GridEvent::OpenLink`.
+    #[cfg(test)]
+    pub(crate) fn open_link_for_test(
+        &mut self,
+        target: &LinkTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_link(target, window, cx);
+    }
+
+    /// Test seam: the `file:` link awaiting confirmation, if that modal is up.
+    #[cfg(test)]
+    pub(crate) fn pending_file_link(&self) -> Option<&str> {
+        match &self.modal {
+            Some(ActiveModal::ConfirmFileLink { url }) => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Test seam: put the window into degraded mode without a live worker.
+    #[cfg(test)]
+    pub(crate) fn set_degraded_for_test(&mut self, reason: &str) {
+        self.degraded = Some(reason.to_string());
+    }
+
+    /// Test seam: the `file:` confirm's **Open File** click.
+    #[cfg(test)]
+    pub(crate) fn confirm_file_link_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ActiveModal::ConfirmFileLink { url }) = self.modal.clone() {
+            self.confirm_file_link(&url, window, cx);
+        }
+    }
+
     /// Test seam: the window's worker client, so a test can publish a `ChartSnapshot` into the seam
     /// (via `DocumentClient::set_chart_snapshot`) and then drive `sync_charts` through an injected
     /// `Published` event.
@@ -1309,7 +1474,7 @@ impl Focusable for WorkbookWindow {
 }
 
 impl Render for WorkbookWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("workbook-window")
             .track_focus(&self.focus_handle)
@@ -1372,6 +1537,10 @@ impl Render for WorkbookWindow {
             )
             .child(self.render_body(cx))
             .children(self.render_modal(cx))
+            // The notification layer (`gpui_component::Root` owns the list; the app's root view has
+            // to render it). Empty until something pushes — today the hyperlink open policy's
+            // non-blocking refusals and unresolvable internal targets (F3.3 / F4.3).
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 
@@ -1453,6 +1622,32 @@ impl WorkbookWindow {
                         })),
                 ],
             ),
+            // A `file:` link (F3.2). Cancel is first AND the default: the workbook is untrusted
+            // input, so opening a local path is the deliberate choice, not the easy one.
+            ActiveModal::ConfirmFileLink { url } => {
+                let url = url.clone();
+                dialog_card(
+                    "Open this file?",
+                    &format!(
+                        "This link opens a file on your computer:\n{url}\n\nOnly open it if you \
+                         trust this workbook."
+                    ),
+                    vec![
+                        Button::new("cancel")
+                            .label("Cancel")
+                            .ghost()
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.dismiss_modal(window, cx)
+                            })),
+                        Button::new("open-file-link")
+                            .label("Open File")
+                            .primary()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.confirm_file_link(&url, window, cx)
+                            })),
+                    ],
+                )
+            }
         };
         Some(
             div()
@@ -1661,6 +1856,7 @@ fn chart_color_rgb(c: &ChartColor) -> Option<Rgb> {
 fn make_grid_sink(
     chrome_slot: Rc<OnceCell<WeakEntity<ChromeView>>>,
     grid_slot: Rc<OnceCell<WeakEntity<GridView>>>,
+    window_handle: WeakEntity<WorkbookWindow>,
     client: Rc<DocumentClient>,
     shared: Rc<SinkShared>,
 ) -> GridEventSink {
@@ -1957,6 +2153,15 @@ fn make_grid_sink(
                 chrome.update(cx, |c, cx| {
                     c.insert_reference(&a1, replace_pending, window, cx)
                 });
+            }
+        }
+        // Following a hyperlink (`hyperlinks/architecture.md §5`): a UI-side event that never
+        // reaches the worker. Routed to the window, which owns the open policy's three outcomes
+        // (launch / confirm / refuse) and the internal-link navigation.
+        GridEvent::OpenLink { target } => {
+            if let Some(this) = window_handle.upgrade() {
+                let target = target.clone();
+                this.update(cx, |this, cx| this.open_link(&target, window, cx));
             }
         }
     })

@@ -2550,4 +2550,233 @@ mod tests {
             "the fallback must never yield a zero-area window"
         );
     }
+
+    // ---- Following a hyperlink (`hyperlinks/functional_spec.md F2–F4`) ----------------------
+
+    /// Follows `target` through the window's real open policy.
+    fn follow_link(
+        cx: &mut TestAppContext,
+        handle: &AnyWindowHandle,
+        entity: &Entity<WorkbookWindow>,
+        target: &freecell_core::LinkTarget,
+    ) {
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.open_link_for_test(target, window, ctx));
+            })
+            .unwrap();
+    }
+
+    /// The count of live notifications in the window's `Root` — how a non-blocking message is
+    /// observed (the app renders `Root::render_notification_layer`).
+    fn notification_count(cx: &mut TestAppContext, handle: &AnyWindowHandle) -> usize {
+        handle
+            .update(cx, |_root, window, appcx| {
+                gpui_component::Root::read(window, appcx)
+                    .notification
+                    .read(appcx)
+                    .notifications()
+                    .len()
+            })
+            .unwrap()
+    }
+
+    /// F3.1 / F3.3: an allowed scheme reaches the platform opener; a hostile one launches nothing
+    /// and says so in a **non-blocking** message rather than a dialog.
+    #[gpui::test]
+    fn an_http_link_opens_and_a_javascript_link_does_not(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(0, "Sheet1", false)]);
+
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::external("https://example.com/docs"),
+        );
+        assert_eq!(
+            cx.opened_url(),
+            Some("https://example.com/docs".to_string()),
+            "an https link is handed to the platform opener"
+        );
+        assert_eq!(
+            notification_count(cx, &handle),
+            0,
+            "an allowed link says nothing"
+        );
+
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::external("javascript:alert(1)"),
+        );
+        assert_eq!(
+            cx.opened_url(),
+            Some("https://example.com/docs".to_string()),
+            "the refused link launched nothing — the last opened url is still the https one"
+        );
+        assert_eq!(
+            notification_count(cx, &handle),
+            1,
+            "the refusal surfaced as a message (F3.3)"
+        );
+        assert!(
+            cx.update(|cx| entity.read(cx).pending_file_link().is_none()
+                && !entity.read(cx).has_error_modal()),
+            "…and it is non-blocking: no dialog"
+        );
+    }
+
+    /// F3.2: a `file:` link asks first, naming the path, and launches only once confirmed.
+    #[gpui::test]
+    fn a_file_link_asks_before_opening(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(0, "Sheet1", false)]);
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::external("file:///tmp/report.pdf"),
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).pending_file_link().map(str::to_string)),
+            Some("file:///tmp/report.pdf".to_string()),
+            "the confirm names the path"
+        );
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "nothing is launched before confirming"
+        );
+
+        // Cancel launches nothing…
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.dismiss_modal_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(cx.opened_url(), None);
+        assert!(cx.update(|cx| entity.read(cx).pending_file_link().is_none()));
+
+        // …and confirming does.
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::external("file:///tmp/report.pdf"),
+        );
+        handle
+            .update(cx, |_root, window, appcx| {
+                entity.update(appcx, |w, ctx| w.confirm_file_link_for_test(window, ctx));
+            })
+            .unwrap();
+        assert_eq!(cx.opened_url(), Some("file:///tmp/report.pdf".to_string()));
+        assert!(cx.update(|cx| entity.read(cx).pending_file_link().is_none()));
+    }
+
+    /// F2.2: a degraded window follows nothing — not even an otherwise-allowed scheme.
+    #[gpui::test]
+    fn a_degraded_window_opens_nothing(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(0, "Sheet1", false)]);
+        cx.update(|cx| entity.update(cx, |w, _| w.set_degraded_for_test("engine panicked")));
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::external("https://example.com"),
+        );
+        assert_eq!(cx.opened_url(), None);
+        assert!(cx.update(|cx| entity.read(cx).pending_file_link().is_none()));
+    }
+
+    /// F4.2: an internal link moves the selection, switching the active sheet when the target names
+    /// another one — and never reaches the open policy (F4.4).
+    #[gpui::test]
+    fn an_internal_link_moves_the_selection_and_switches_sheets(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(
+            cx,
+            vec![sheet_meta(3, "Data", false), sheet_meta(5, "Notes", false)],
+        );
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+
+        // Same sheet: just a selection move.
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::internal("B7"),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| grid.read(cx).selection().active),
+            CellRef::new(6, 1)
+        );
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).active_sheet_for_test()),
+            SheetId(3)
+        );
+
+        // Another sheet, quoted + case-insensitively named: switch, then land.
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::internal("'notes'!C3"),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| entity.read(cx).active_sheet_for_test()),
+            SheetId(5),
+            "the link switched the active sheet"
+        );
+        assert_eq!(
+            cx.update(|cx| grid.read(cx).selection().active),
+            CellRef::new(2, 2)
+        );
+        assert_eq!(cx.opened_url(), None, "an internal link launches nothing");
+    }
+
+    /// F4.3 (+ the defined-name hole): an unresolvable internal target navigates nowhere.
+    #[gpui::test]
+    fn an_unresolvable_internal_link_navigates_nowhere(cx: &mut TestAppContext) {
+        boot(cx);
+        let (handle, entity) = loaded_window(cx, vec![sheet_meta(3, "Data", false)]);
+        let grid = cx.update(|cx| entity.read(cx).grid_for_test());
+        follow_link(
+            cx,
+            &handle,
+            &entity,
+            &freecell_core::LinkTarget::internal("Data!B7"),
+        );
+        cx.run_until_parked();
+        let landed = cx.update(|cx| grid.read(cx).selection().active);
+        assert_eq!(
+            landed,
+            CellRef::new(6, 1),
+            "the resolvable control DID move"
+        );
+
+        for target in ["Missing!A1", "MyDefinedName", "Data!not-a-ref"] {
+            follow_link(
+                cx,
+                &handle,
+                &entity,
+                &freecell_core::LinkTarget::internal(target),
+            );
+            cx.run_until_parked();
+            assert_eq!(
+                cx.update(|cx| grid.read(cx).selection().active),
+                landed,
+                "{target} must not move the selection"
+            );
+        }
+        assert_eq!(cx.opened_url(), None);
+        assert!(
+            notification_count(cx, &handle) > 0,
+            "each unresolvable target says so (F4.3)"
+        );
+    }
 }

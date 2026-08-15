@@ -15,22 +15,21 @@ use gpui::{
     div, img, prelude::*, px, rgb, App, ClickEvent, Context, FocusHandle, Focusable, Window,
 };
 
+use crate::grid::LINK;
+
 use super::assets::{ICON_ASSET, WORDMARK_ASPECT, WORDMARK_ASSET};
 use super::fonts::{LINK_FAMILY, TAGLINE_FAMILY};
 use super::{titlebar, CloseWindow};
 
 // Shared chrome/titlebar palette tokens (`ui_design.md §0`) — mirrored here as the established
-// pattern (titlebar.rs / chrome/view.rs / welcome.rs carry the same values); no new hexes beyond
-// the one LINK accent below.
+// pattern (titlebar.rs / chrome/view.rs / welcome.rs carry the same values). The one link accent
+// is NOT mirrored: it is the shared `grid::LINK`, since the grid now paints link cells with the
+// same token (`hyperlinks/architecture.md §4`).
 const CHROME_BG: u32 = 0xF3F3F3; // window background (matches the mockup's light card)
 const HAIRLINE: u32 = 0xD9D9D9;
 const MUTED_TEXT: u32 = 0x555555;
 /// Tertiary text (the faint version line) — a step lighter than [`MUTED_TEXT`] (`ui_design.md §6`).
 const FAINT_TEXT: u32 = 0x9A9A9A;
-/// The one link/accent token (`ui_design.md §6`): our design system has no link color and
-/// gpui-component's theme exposes none at the pinned rev, so a single blue constant serves every
-/// link (not the mockup's exact hex, and not per-link colors).
-const LINK: u32 = 0x2563EB;
 
 /// The app icon's rendered edge (`img`, square) — the app-icon face stacked above the wordmark.
 const ICON_SIZE: f32 = 48.0;

@@ -28,7 +28,8 @@ use arc_swap::ArcSwap;
 use freecell_app::grid::GridDataSources;
 use freecell_core::cache::SheetCaches;
 use freecell_core::{
-    Align, BorderSpec, CellRange, CellRef, CfRuleSpec, RenderStyle, Rgb, SheetId, VAlign,
+    Align, BorderSpec, CellRange, CellRef, CfRuleSpec, LinkTarget, RenderStyle, Rgb, SheetId,
+    VAlign,
 };
 use freecell_engine::{Command, DocumentClient, DocumentSource, StyleAttr, WorkerEvent};
 
@@ -76,6 +77,15 @@ pub struct Scene {
     /// the grid renders as one box. `confirmed: true` (the covered cells in these fixtures are
     /// empty, so no data-loss round-trip).
     merges: Vec<CellRange>,
+    /// Worksheet hyperlinks created via a **real** `Command::SetCellLink` (`hyperlinks/architecture.md
+    /// §10`) rather than an [`Inject`], so the scene exercises the engine's own link styling
+    /// (underline + the theme hyperlink colour, applied as ordinary cell formatting — F1.2) and the
+    /// real cache mirror, not a hand-placed approximation of them. A **dynamic** link needs nothing
+    /// here: it is just a `=HYPERLINK(...)` [`input`](Scene::input).
+    links: Vec<(CellRef, LinkTarget)>,
+    /// Cells whose worksheet link is removed again after being set — the F1.6 fixture (removing a
+    /// link leaves its formatting behind, matching Excel).
+    unlinks: Vec<CellRef>,
     publish_rows: Range<u32>,
     publish_cols: Range<u32>,
 }
@@ -101,6 +111,8 @@ impl Scene {
             frozen_cols: None,
             cond_fmt: Vec::new(),
             merges: Vec::new(),
+            links: Vec::new(),
+            unlinks: Vec::new(),
             publish_rows: 0..80,
             publish_cols: 0..48,
         }
@@ -132,6 +144,22 @@ impl Scene {
     /// Toggles underline on a cell — a real `SetStyleAttr` worker edit.
     pub fn underline(self, row: u32, col: u32) -> Self {
         self.style(CellRef::new(row, col), StyleAttr::Underline)
+    }
+
+    /// Attaches a worksheet hyperlink to a cell — a real `Command::SetCellLink` worker edit, so
+    /// the engine applies its own link formatting exactly as it would for a user's ⌘K.
+    pub fn link(mut self, row: u32, col: u32, target: &str) -> Self {
+        self.links
+            .push((CellRef::new(row, col), LinkTarget::external(target)));
+        self
+    }
+
+    /// Attaches a worksheet hyperlink and then removes it again — the F1.6 fixture: the blue
+    /// underline is real formatting and deliberately survives the removal.
+    pub fn link_removed(mut self, row: u32, col: u32, target: &str) -> Self {
+        self = self.link(row, col, target);
+        self.unlinks.push(CellRef::new(row, col));
+        self
     }
 
     /// Toggles strikethrough on a cell — a real `SetStyleAttr` worker edit.
@@ -366,6 +394,20 @@ pub fn build_sources(scene: &Scene) -> Result<GridDataSources> {
             rows: scene.frozen_rows,
             cols: scene.frozen_cols,
         });
+    }
+    // Hyperlinks through the real worker path (`Command::SetCellLink`), after the values so a
+    // linked cell already has its content; the engine's own link formatting rides along, and the
+    // cache mirror carries the link map the grid reads.
+    for (cell, target) in &scene.links {
+        client.send(Command::SetCellLink {
+            sheet,
+            cell: *cell,
+            target: target.clone(),
+            label: None,
+        });
+    }
+    for cell in &scene.unlinks {
+        client.send(Command::RemoveCellLink { sheet, cell: *cell });
     }
     client.send(Command::SetViewport {
         sheet,

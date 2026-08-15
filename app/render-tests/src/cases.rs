@@ -1775,6 +1775,69 @@ pub fn all() -> Vec<RenderCase> {
             GRID_VP,
         )
         .reveal(12, 0),
+        // ---- Hyperlinks (`hyperlinks/functional_spec.md F1`, `architecture.md §10`) -----------
+        // Every worksheet link here is created through the REAL `Command::SetCellLink`
+        // (`Scene::link`), so what these baselines show is the ENGINE's own link formatting —
+        // underline plus the theme hyperlink colour, applied as ordinary cell formatting (F1.2).
+        // FreeCell adds no styling of its own for them; only `link_dynamic` is FreeCell-synthesized.
+        //
+        // The plain case: a linked cell reads as a link (blue + underline) with no FreeCell styling.
+        cell(
+            "link_plain",
+            at(Scene::new()).link(1, 1, "https://example.com"),
+        ),
+        // A `HYPERLINK()` cell (F1.3): the engine attaches NO formatting to these, so this baseline
+        // is the one that proves FreeCell synthesizes the same appearance at render time. It must
+        // look like `link_plain`'s cell modulo the different display text.
+        cell(
+            "link_dynamic",
+            Scene::new().input(1, 1, "=HYPERLINK(\"https://example.com\",\"Sample\")"),
+        ),
+        // A long URL is *the* spill case (F1.5): the link appearance must survive into the spilled
+        // run, not stop at the origin cell's right edge. Deliberately a `HYPERLINK()` cell — a
+        // worksheet link's appearance rides its ordinary `RenderStyle`, which the spill path already
+        // carried before links existed, so it is the SYNTHESIZED half that can regress here.
+        cell(
+            "link_spill",
+            Scene::new().input(
+                1,
+                1,
+                "=HYPERLINK(\"https://example.com/a/very/long/path/that/spills\")",
+            ),
+        ),
+        // The anchor of a merged region (F1.5's other half): the box is painted by a different code
+        // path than a 1×1 cell, and must resolve the anchor's link identically.
+        RenderCase::new(
+            "link_in_merged_region",
+            Scene::new()
+                .input(1, 1, "Merged link")
+                .link(1, 1, "https://example.com")
+                .merge(CellRange::new(CellRef::new(1, 1), CellRef::new(2, 3))),
+            GRID_VP,
+        ),
+        // A link over a fill: the link colour is text-only, so the fill shows through unchanged.
+        cell(
+            "link_over_fill",
+            at(Scene::new())
+                .fill(1, 1, 0xFFEB3B)
+                .link(1, 1, "https://example.com"),
+        ),
+        // F1.4 precedence, on a `HYPERLINK()` cell — the only half FreeCell owns. The synthesized
+        // blue applies *only* where the cell has no colour of its own, so this cell renders red and
+        // still underlined. (For a worksheet link the same precedence is the engine's: the link
+        // colour IS the cell's font colour, and a later user colour simply overwrites it.)
+        cell(
+            "link_with_explicit_font_color",
+            Scene::new()
+                .input(1, 1, "=HYPERLINK(\"https://example.com\",\"Sample\")")
+                .font_color(1, 1, 0xD32F2F),
+        ),
+        // F1.6: removing a link does NOT remove its formatting (upstream's documented behaviour, and
+        // Excel's) — the cell still renders blue + underlined with no link attached.
+        cell(
+            "link_removed",
+            at(Scene::new()).link_removed(1, 1, "https://example.com"),
+        ),
     ];
 
     // A stable order is nice for the changed/unchanged summary; keep table order.

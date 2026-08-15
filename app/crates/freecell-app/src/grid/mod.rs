@@ -24,7 +24,7 @@ use gpui::{App, Window};
 
 use freecell_chart_model::{Anchor, ChartId};
 use freecell_core::selection::Direction;
-use freecell_core::{CellRange, CellRef, FillAxis, SelectionModel};
+use freecell_core::{CellRange, CellRef, FillAxis, LinkTarget, SelectionModel};
 
 pub(crate) use view::caret_intent_modifiers;
 pub use view::{GridDataSources, GridView};
@@ -50,6 +50,13 @@ pub const HEADER_SELECTED_BG: u32 = 0xE4E4E4;
 /// theme's `primary` token is *neutral*, not blue (see DECISIONS_TO_REVIEW), so the
 /// spreadsheet selection blue is pinned to the theme's blue ramp instead.
 pub const ACCENT: u32 = 0x2563EB;
+/// The one link/accent token (`hyperlinks/architecture.md §4`, `ui_design.md §6`): our design
+/// system has no link colour and gpui-component's theme exposes none at the pinned rev, so a
+/// single blue serves every link — the About window's clickable lines and the grid's synthesized
+/// appearance for a `HYPERLINK()` cell (`hyperlinks/functional_spec.md F1.3`). A **worksheet**
+/// link never uses it: the engine styles those itself with the theme's hyperlink colour, as real
+/// cell formatting (F1.2).
+pub const LINK: u32 = 0x2563EB;
 /// Range-fill overlay opacity (accent at ~10%).
 pub const SELECTION_FILL_ALPHA: f32 = 0.10;
 /// Overlay-scrollbar thumb colour (semi-transparent grey).
@@ -248,6 +255,11 @@ pub enum GridEvent {
     /// (`architecture.md §3.2/§5`). Emitted **instead of** [`GridEvent::SelectionChanged`], so the
     /// grid selection is untouched.
     InsertReference { a1: String, replace_pending: bool },
+    /// A plain single left click landed on a cell with an effective hyperlink
+    /// (`hyperlinks/functional_spec.md F2.1`, `architecture.md §5`): follow it. Purely a UI-side
+    /// event — it never reaches the worker. The window applies the open policy (`decide_open`) for
+    /// an external target, or navigates the selection for an internal one.
+    OpenLink { target: LinkTarget },
 }
 
 /// The owner's [`GridEvent`] handler — invoked with full `Window`/`App` access so it can

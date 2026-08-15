@@ -17,12 +17,13 @@ use parking_lot::RwLock;
 
 use gpui::{
     canvas, deferred, div, font, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Context,
-    Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyDownEvent, LineFragment, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Rgba, SharedString, TextRun,
-    Window,
+    ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyDownEvent, LineFragment,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Rgba,
+    SharedString, TextRun, Window,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::spinner::Spinner;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Sizable as _};
 
 use freecell_chart_model::{ChartId, ChartSpec};
@@ -34,9 +35,10 @@ use freecell_core::refs::{column_label, SheetId};
 use freecell_core::selection::{Direction, Motion};
 use freecell_core::{
     apply_motion, effective_edge, effective_range, expand_to_regions, is_full_column_selection,
-    is_full_row_selection, region_at, regions_intersecting, snap_cell, spans_all_cols,
-    spans_all_rows, Align, Axis, BorderSpec, CellRange, CellRef, Edge, FillAxis, LinePattern,
-    RenderStyle, SelectionModel, SheetDims, VAlign,
+    is_full_row_selection, link_click_opens, link_tooltip_text, region_at, regions_intersecting,
+    snap_cell, spans_all_cols, spans_all_rows, Align, Axis, BorderSpec, CellLink, CellRange,
+    CellRef, Edge, FillAxis, LinePattern, LinkClick, LinkTarget, RenderStyle, SelectionModel,
+    SheetDims, VAlign,
 };
 
 use crate::chrome::AutocompleteDisplay;
@@ -50,7 +52,8 @@ use super::{
     GridEvent, GridEventSink, RowOrCol, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX,
     CELL_H_PAD, CELL_TEXT, EDGE_AUTOSCROLL_HOTZONE_PX, EDGE_AUTOSCROLL_STEP_PX, FREEZE_DIVIDER,
     FREEZE_DIVIDER_PX, GRIDLINE, GRID_FONT_FAMILY, HEADER_BG, HEADER_FONT_PX, HEADER_HAIRLINE,
-    HEADER_SELECTED_BG, HEADER_TEXT, SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA, SELECTION_FILL_ALPHA,
+    HEADER_SELECTED_BG, HEADER_TEXT, LINK, SCROLLBAR_FADE_SECS, SCROLLBAR_RGBA,
+    SELECTION_FILL_ALPHA,
 };
 
 /// Half-width (px) of a divider resize hotspot (`ui_design.md §3`: a 6 px zone centered on the
@@ -71,6 +74,12 @@ const AUTOFIT_PADDING_PX: f32 = 2.0 * CELL_H_PAD + 3.0;
 const AUTOFIT_MIN_WIDTH_PX: f32 = 24.0;
 /// Cap (device px) for an autofit column so a single very long value can't produce a runaway width.
 const AUTOFIT_MAX_WIDTH_PX: f32 = 800.0;
+
+/// How far (grid-local px) the pointer may travel between a link cell's press and release and
+/// still count as a click rather than a drag (`hyperlinks/functional_spec.md F2.2`). Non-zero
+/// because a real click always jitters a pixel or two; small enough that any deliberate sweep
+/// clears it.
+const LINK_CLICK_SLOP_PX: f32 = 3.0;
 
 /// gpui's default text line-height multiple — the golden ratio `phi` (`gpui::geometry::phi` =
 /// `relative(1.618034)`, applied as `Style::line_height`). The wrap auto-grow measurement uses the
@@ -328,6 +337,14 @@ pub struct GridView {
     /// visible_range)`. Keyed on the visible range (not the anchors) so a region whose anchor
     /// scrolled off-screen is still present; the region-box pass draws each entry as one span.
     visible_merges: Vec<CellRange>,
+    /// Reused per-frame snapshot of the visible cells' **effective** hyperlinks
+    /// (`hyperlinks/architecture.md §4`) — the sparse `SheetCache::links()` map narrowed to the
+    /// quadrant union plus each visible region's anchor, taken inside the SAME read guard as
+    /// [`visible_styles`](Self::visible_styles) and [`visible_merges`](Self::visible_merges) so a
+    /// frame's three snapshots are mutually consistent. Drives the synthesized appearance of a
+    /// `HYPERLINK()` cell (F1.3), the pointer cursor + tooltip (F2.4/F2.5), and the click target
+    /// (F2.1). Empty for the overwhelmingly common link-free workbook, which pays one `is_empty()`.
+    visible_links: HashMap<(u32, u32), CellLink>,
     /// The grid element's real laid-out bounds, captured during paint (a `canvas` probe).
     /// `None` until the first paint. Used instead of `window.viewport_size()` so the grid's
     /// virtualization + hit-testing are correct once chrome wraps it (the grid is no longer
@@ -401,6 +418,10 @@ pub struct GridView {
     /// branch when a reference-ready / pending grid click points; drives the live preview rect + the
     /// per-cell `InsertReference` re-emits as the range grows.
     point_drag: Option<PointDrag>,
+    /// The link a mouse-down landed on, awaiting its mouse-up (`hyperlinks/architecture.md §5`;
+    /// `None` = the press was not on a link cell). Putting the open decision on **release** is what
+    /// lets a drag-to-select start from a link cell (F2.2); the press only remembers.
+    pending_link: Option<PendingLinkClick>,
     /// The open right-click "Delete chart" context menu, if any.
     chart_menu: Option<ChartMenu>,
     /// The open cell-area right-click context menu, if any (`functional_spec.md §2`).
@@ -543,6 +564,10 @@ enum QuadKind {
 /// top-left): `qx = col_offset(c) - qorigin_x`, `qy = row_offset(r) - qorigin_y`.
 #[derive(Debug, Clone)]
 struct Quadrant {
+    /// Which quadrant this is. Load-bearing beyond documentation: it seeds the per-cell element ids
+    /// a link cell needs, and a merged region straddling the freeze divider is painted **once per
+    /// quadrant**, so the tag is what keeps those two elements' ids distinct.
+    kind: QuadKind,
     rows: Range<u32>,
     cols: Range<u32>,
     /// Grid-local destination rect `(x0, y0, w, h)` for the clip div.
@@ -732,10 +757,36 @@ struct CellPaint {
     text: String,
     text_color: Rgba,
     kind: CellKind,
-    /// The cell's own resolved style (`None` for a mirror/pending or unstyled cell).
+    /// The cell's own resolved style (`None` for a mirror/pending or unstyled cell), already
+    /// carrying a dynamic link's synthesized underline (`hyperlinks/functional_spec.md F1.3`).
     style: Option<RenderStyle>,
     font_family: Option<SharedString>,
     fill: Rgba,
+    /// The cell's effective hyperlink, if any — drives the pointer cursor + tooltip. Resolved here
+    /// (not just in the per-cell loop) so a merged region's box decorates from its anchor's link,
+    /// exactly as a 1×1 cell does (F1.5).
+    link: Option<CellLink>,
+}
+
+/// The link affordances one painted cell carries (`hyperlinks/functional_spec.md F2.4/F2.5`):
+/// a pointer cursor and a hover tooltip. `id` is required because gpui's `tooltip` is a
+/// `StatefulInteractiveElement` method — only link cells pay for one, so an ordinary cell keeps
+/// today's id-free element.
+struct LinkDecoration {
+    id: ElementId,
+    tooltip: SharedString,
+}
+
+/// A mouse-down that landed on a cell with an effective link, waiting for its release
+/// (`hyperlinks/architecture.md §5`).
+#[derive(Debug, Clone)]
+struct PendingLinkClick {
+    /// The pressed cell, merge-snapped — the release must land on the same one.
+    cell: CellRef,
+    /// The link to open, captured at press time from the frame's `visible_links` snapshot.
+    target: LinkTarget,
+    /// The grid-local press position, so the release can tell a click from a drag.
+    press: (f32, f32),
 }
 
 impl GridView {
@@ -772,6 +823,7 @@ impl GridView {
             visible_font_families: Vec::new(),
             visible_border_specs: Vec::new(),
             visible_merges: Vec::new(),
+            visible_links: HashMap::new(),
             bounds: None,
             mirror: None,
             incell_open: None,
@@ -789,6 +841,7 @@ impl GridView {
             chart_drag: None,
             fill_drag: None,
             point_drag: None,
+            pending_link: None,
             chart_menu: None,
             cell_menu: None,
             wrap_cells: Vec::new(),
@@ -1034,16 +1087,20 @@ impl GridView {
             .and_then(|s| s.fill)
             .map(to_rgba)
             .unwrap_or_else(|| rgb(CELL_BG));
-        let (text, text_color, kind, attr_style) = match self.mirror_text_for(cell) {
+        // A pending edit mirrors raw text in the default style and offers no link affordances
+        // (`hyperlinks/functional_spec.md F1.7`), so the link is resolved only for a committed cell.
+        let mirrored = self.mirror_text_for(cell);
+        let link = mirrored
+            .is_none()
+            .then(|| self.visible_links.get(&(cell.row, cell.col)))
+            .flatten();
+        let (text, text_color, kind, attr_style) = match mirrored {
             Some(raw) => (raw.to_string(), rgb(CELL_TEXT), CellKind::Text, None),
             None => match self.cell_index.get(&(cell.row, cell.col)) {
                 Some(&idx) => {
                     let pc = &publication.cells[idx];
-                    let color = pc
-                        .text_color
-                        .or(style.and_then(|s| s.font_color))
-                        .map(to_rgba)
-                        .unwrap_or_else(|| rgb(CELL_TEXT));
+                    let own_color = pc.text_color.or(style.and_then(|s| s.font_color));
+                    let (style, color) = link_appearance(link, style, own_color);
                     (pc.display_text.clone(), color, pc.kind, style)
                 }
                 None => (String::new(), rgb(CELL_TEXT), CellKind::Text, style),
@@ -1063,6 +1120,7 @@ impl GridView {
             style: attr_style,
             font_family,
             fill,
+            link: link.cloned(),
         }
     }
 
@@ -1372,6 +1430,28 @@ impl GridView {
                 }
             }
         }
+        // Snapshot the visible cells' effective hyperlinks over the same quadrant union, inside
+        // this same read guard (`hyperlinks/architecture.md §4`) so styles, merges, and links are
+        // mutually consistent WITHIN a frame. A link-free workbook — nearly all of them — pays one
+        // `is_empty()` and skips the walk entirely.
+        //
+        // On the worker's two write locks per edit (styles installed under one, links under a
+        // later one, so the CACHE can transiently hold new styles with an old link map): analysed
+        // and settled in `hyperlinks/phase_plans/phase_4.md` D4. It cannot flicker — both installs
+        // move monotonically to the new state and the `StyleCacheUpdated` repaint follows both — so
+        // the worst case is a self-healing ≤1-frame lag of one channel behind the other, which the
+        // tooltip's hover delay makes unobservable and which does not affect worksheet links at all
+        // (their appearance rides the style half). Don't "fix" it here without re-reading D4.
+        self.visible_links.clear();
+        if !cache.links().is_empty() {
+            for r in (0..m).chain(rows.clone()) {
+                for c in (0..k).chain(cols.clone()) {
+                    if let Some(link) = cache.cell_link(r, c) {
+                        self.visible_links.insert((r, c), link.clone());
+                    }
+                }
+            }
+        }
         // Snapshot the font-family side table too (cheap — a handful of `Arc<str>` → `SharedString`),
         // so a cell's `font_family` index resolves to a name after the lock is dropped.
         self.visible_font_families = cache
@@ -1400,12 +1480,19 @@ impl GridView {
         self.visible_merges = regions_intersecting(cache.merges(), visible_range);
         // Also snapshot each region anchor's resolved style, even when the anchor is off-screen, so
         // the region-box pass can style a box whose anchor is scrolled out of the visible range.
+        // Same for each anchor's link, so a region whose anchor is off-screen still paints, hovers,
+        // and clicks as a link (`hyperlinks/functional_spec.md F1.5`).
         for region in &self.visible_merges {
             let anchor = region.start;
             if let Some(style) = cache.render_style(anchor.row, anchor.col) {
                 self.visible_styles
                     .entry((anchor.row, anchor.col))
                     .or_insert(*style);
+            }
+            if let Some(link) = cache.cell_link(anchor.row, anchor.col) {
+                self.visible_links
+                    .entry((anchor.row, anchor.col))
+                    .or_insert_with(|| link.clone());
             }
         }
         drop(caches);
@@ -1419,6 +1506,7 @@ impl GridView {
         let non_empty = |r: &Range<u32>| r.start < r.end;
         if m > 0 && k > 0 && frozen_w > 0.0 && frozen_h > 0.0 {
             quadrants[QuadKind::Corner as usize] = Some(Quadrant {
+                kind: QuadKind::Corner,
                 rows: 0..m,
                 cols: 0..k,
                 dest: (row_header_w, COL_HEADER_H, frozen_w as f32, frozen_h as f32),
@@ -1428,6 +1516,7 @@ impl GridView {
         }
         if m > 0 && frozen_h > 0.0 && non_empty(&cols) && body_w > 0.0 {
             quadrants[QuadKind::TopBand as usize] = Some(Quadrant {
+                kind: QuadKind::TopBand,
                 rows: 0..m,
                 cols: cols.clone(),
                 dest: (
@@ -1442,6 +1531,7 @@ impl GridView {
         }
         if k > 0 && frozen_w > 0.0 && non_empty(&rows) && body_h > 0.0 {
             quadrants[QuadKind::LeftBand as usize] = Some(Quadrant {
+                kind: QuadKind::LeftBand,
                 rows: rows.clone(),
                 cols: 0..k,
                 dest: (
@@ -1456,6 +1546,7 @@ impl GridView {
         }
         if non_empty(&rows) && non_empty(&cols) && body_w > 0.0 && body_h > 0.0 {
             quadrants[QuadKind::Body as usize] = Some(Quadrant {
+                kind: QuadKind::Body,
                 rows: rows.clone(),
                 cols: cols.clone(),
                 dest: (
@@ -1714,9 +1805,12 @@ impl GridView {
             return;
         }
         // Any new mouse-down ends a frozen resize preview (e.g. after a degraded-mode no-op) and
-        // closes an open chart context menu.
+        // closes an open chart context menu. It also drops any link click left pending by an
+        // earlier press: only `mouse_down_cell` re-arms one, so a press on a chart / fill handle /
+        // header / corner can never inherit the previous press's link.
         self.resize_preview = None;
         self.chart_menu = None;
+        self.pending_link = None;
 
         // Focus the grid so arrow keys route here (the window arranges focus after commits).
         let handle = self.focus_handle.clone();
@@ -1937,6 +2031,24 @@ impl GridView {
         // Snap the clicked cell to its region anchor: a click on any cell of a merge selects the
         // whole region (`functional_spec.md F4`), and the anchor is the valid edit target.
         let cell = self.with_sheet_merges(|m| snap_cell(m, CellRef::new(row, col)));
+        // Remember a press on a link cell (`hyperlinks/architecture.md §5`). Deliberately AFTER the
+        // point-mode branch above returns, so a reference-ready formula edit never arms one (F2.2);
+        // the decision to actually open waits for the release, which is what lets a drag-to-select
+        // start here. The snapped `cell` is the lookup key, so a press anywhere in a merged region
+        // uses the anchor's link (F1.5).
+        //
+        // Shift is excluded structurally, like point mode: a shift-click means "extend the range to
+        // here", which is not a click on that cell at all — so there is no gesture for the release
+        // to weigh. (The primary modifier IS weighed at release: it is F2.2's explicit
+        // select-without-following affordance on an otherwise ordinary click.)
+        self.pending_link = (!event.modifiers.shift)
+            .then(|| self.visible_links.get(&(cell.row, cell.col)))
+            .flatten()
+            .map(|link| PendingLinkClick {
+                cell,
+                target: link.target.clone(),
+                press: self.event_local(event.position),
+            });
         let selection = if event.modifiers.shift {
             // Shift-click extends the range from the existing anchor.
             SelectionModel {
@@ -2102,13 +2214,19 @@ impl GridView {
     }
 
     /// Mouse up: commit a live resize, or end the selection drag (stopping any auto-scroll loop via
-    /// the epoch) and let the scrollbars fade if a drag-scroll had shown them.
+    /// the epoch) and let the scrollbars fade if a drag-scroll had shown them — then, last, decide
+    /// whether the release follows a link the press landed on (`hyperlinks/architecture.md §5`).
     fn handle_mouse_up(
         &mut self,
-        _event: &MouseUpEvent,
+        event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Take any pending link click on EVERY release so it can never leak into a later gesture.
+        // It is acted on at the very end, after the drags that own the pointer have had their say
+        // — a release that commits a chart/resize/fill/point drag is not a link click, and the
+        // ordinary selection-drag arm below must still run either way.
+        let pending_link = self.pending_link.take();
         if let Some(drag) = self.chart_drag.take() {
             self.commit_chart_drag(drag, window, cx);
             return;
@@ -2140,6 +2258,65 @@ impl GridView {
             if self.scrollbars_visible {
                 self.mark_scrollbars_active(cx); // schedule the fade-out
             }
+        }
+        if let Some(pending) = pending_link {
+            self.resolve_pending_link(pending, event, window, cx);
+        }
+    }
+
+    /// Decides whether the release that just happened follows the link the press landed on
+    /// (`hyperlinks/architecture.md §5`, F2.1–F2.2), and emits [`GridEvent::OpenLink`] if it does.
+    ///
+    /// The decision itself is the pure `link_click_opens`; this only measures the gesture. Anything
+    /// that is not a plain, single, un-dragged click on the same cell simply falls through and the
+    /// interaction stays an ordinary selection.
+    fn resolve_pending_link(
+        &self,
+        pending: PendingLinkClick,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (release_x, release_y) = self.event_local(event.position);
+        let dragged = (release_x - pending.press.0).abs() > LINK_CLICK_SLOP_PX
+            || (release_y - pending.press.1).abs() > LINK_CLICK_SLOP_PX;
+        let click = LinkClick {
+            same_cell: self.cell_at_local(release_x, release_y, window) == Some(pending.cell),
+            dragged,
+            // `secondary()` = Cmd on macOS, Ctrl elsewhere — the platform's "select, don't follow".
+            primary_modifier: event.modifiers.secondary(),
+            click_count: event.click_count,
+        };
+        if link_click_opens(click) {
+            self.events.emit(
+                &GridEvent::OpenLink {
+                    target: pending.target,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The merge-snapped cell under a grid-local point — the release-side counterpart of
+    /// [`handle_mouse_down`](Self::handle_mouse_down)'s hit test, using the same freeze-aware pane
+    /// geometry. `None` when the point is over a header/corner, or the sheet has no resident cache.
+    fn cell_at_local(&self, local_x: f32, local_y: f32, window: &Window) -> Option<CellRef> {
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let (scroll_x, scroll_y) = self.scroll_of(self.active_sheet);
+        let hit = {
+            let caches = self.sources.caches.read();
+            let cache = caches.get(self.active_sheet)?;
+            let (row_axis, col_axis) = cache.axes();
+            let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+            pane.hit_test(local_x, local_y, &row_axis, &col_axis)
+        };
+        match hit {
+            GridHit::Cell { row, col } => {
+                Some(self.with_sheet_merges(|m| snap_cell(m, CellRef::new(row, col))))
+            }
+            _ => None,
         }
     }
 
@@ -2179,6 +2356,7 @@ impl GridView {
         };
         self.resize_preview = None;
         self.drag = None; // a resize is never also a selection drag
+        self.pending_link = None; // …nor a link click (this path bypasses `handle_mouse_down`)
         self.resize_drag = Some(ResizeDrag {
             axis,
             index,
@@ -3470,28 +3648,34 @@ impl GridView {
                 let skip_bottom_gridline = same_fill(r + 1, c);
                 // A pending edit mirrors its raw text here in the grid's default style, left-
                 // aligned, over the committed value (`functional_spec.md §1.2`). The cell's fill is
-                // kept (no flash), but text attributes / alignment fall back to default (`None`).
-                let (text, text_color, kind, attr_style) =
-                    match self.mirror_text_for(CellRef::new(r, c)) {
-                        Some(raw) => (raw.to_string(), rgb(CELL_TEXT), CellKind::Text, None),
-                        None => match self.cell_index.get(&(r, c)) {
-                            Some(&idx) => {
-                                let pc = &publication.cells[idx];
-                                // `pc.text_color` is already fully resolved (explicit non-black font
-                                // colour → number-format colour), so the `.or(font_color)` fallback is
-                                // redundant here — kept as a harmless minimal-diff belt-and-braces
-                                // (both use the same black-filter, so they agree). See DECISIONS §4.
-                                let color = pc
-                                    .text_color
-                                    .or(style.and_then(|s| s.font_color))
-                                    .map(to_rgba)
-                                    .unwrap_or_else(|| rgb(CELL_TEXT));
-                                (pc.display_text.clone(), color, pc.kind, style)
-                            }
-                            // Empty cells carry no text, so their kind never drives alignment.
-                            None => (String::new(), rgb(CELL_TEXT), CellKind::Text, style),
-                        },
-                    };
+                // kept (no flash), but text attributes / alignment fall back to default (`None`) —
+                // and the cell's link contributes neither appearance nor affordances while it is
+                // being edited (`hyperlinks/functional_spec.md F1.7`).
+                let mirrored = self.mirror_text_for(CellRef::new(r, c));
+                let is_mirrored = mirrored.is_some();
+                let link = (!is_mirrored)
+                    .then(|| self.visible_links.get(&(r, c)))
+                    .flatten();
+                let (text, text_color, kind, attr_style) = match mirrored {
+                    Some(raw) => (raw.to_string(), rgb(CELL_TEXT), CellKind::Text, None),
+                    None => match self.cell_index.get(&(r, c)) {
+                        Some(&idx) => {
+                            let pc = &publication.cells[idx];
+                            // `pc.text_color` is already fully resolved (explicit non-black font
+                            // colour → number-format colour), so the `.or(font_color)` fallback is
+                            // redundant here — kept as a harmless minimal-diff belt-and-braces
+                            // (both use the same black-filter, so they agree). See DECISIONS §4.
+                            let own_color = pc.text_color.or(style.and_then(|s| s.font_color));
+                            let (style, color) = link_appearance(link, style, own_color);
+                            (pc.display_text.clone(), color, pc.kind, style)
+                        }
+                        // Empty cells carry no text, so their kind never drives alignment — and
+                        // there is nothing for a link to colour or underline either (an empty cell
+                        // CAN carry a link; its cursor + tooltip come from `decoration` below).
+                        None => (String::new(), rgb(CELL_TEXT), CellKind::Text, style),
+                    },
+                };
+                let decoration = link.map(|l| link_decoration(quad.kind, r, c, &l.target));
                 // Resolve the cell's font family name from the snapshot (index 0 / mirror = default).
                 let font_family = attr_style.and_then(|s| {
                     let idx = s.font_family as usize;
@@ -3531,7 +3715,7 @@ impl GridView {
                     && kind == CellKind::Text
                     && !text.is_empty()
                     && attr_style.is_none_or(|s| !s.wrap)
-                    && self.mirror_text_for(CellRef::new(r, c)).is_none()
+                    && !is_mirrored
                 {
                     let align = attr_style
                         .and_then(|s| s.h_align)
@@ -3570,6 +3754,7 @@ impl GridView {
                             font_family.clone(),
                             skip_right_gridline,
                             skip_bottom_gridline,
+                            decoration,
                         ));
                         spill_plans.push(SpillPlan {
                             row: r,
@@ -3594,6 +3779,7 @@ impl GridView {
                         font_family,
                         skip_right_gridline,
                         skip_bottom_gridline,
+                        decoration,
                     )),
                 }
             }
@@ -3623,6 +3809,12 @@ impl GridView {
                 quad,
             );
             let paint = self.resolve_cell_paint(anchor, publication);
+            // The anchor's link decorates the whole box (F1.5): hovering or clicking anywhere in the
+            // region follows the anchor's link, matching how the region already paints as one cell.
+            let decoration = paint
+                .link
+                .as_ref()
+                .map(|l| link_decoration(quad.kind, anchor.row, anchor.col, &l.target));
             // The box draws its own outer right/bottom gridlines (no same-fill suppression — a merge
             // always reads as one solid box, `ui_design.md §3`).
             content_children.push(cell_element(
@@ -3638,6 +3830,7 @@ impl GridView {
                 paint.font_family,
                 false,
                 false,
+                decoration,
             ));
             // The anchor's explicit borders at the box outer edge (per-cell stored styles only, no
             // unified-border synthesis — `architecture.md §6`). Interior covered edges were dropped
@@ -5348,7 +5541,8 @@ fn push_horizontal_edge(out: &mut Vec<AnyElement>, x: f32, boundary_y: f32, w: f
     }
 }
 
-/// Builds one data cell element (fill, gridlines, text with resolved style attributes).
+/// Builds one data cell element (fill, gridlines, text with resolved style attributes, and — for a
+/// cell with an effective hyperlink — a pointer cursor + hover tooltip).
 #[allow(clippy::too_many_arguments)]
 fn cell_element(
     x: f32,
@@ -5363,6 +5557,7 @@ fn cell_element(
     font_family: Option<SharedString>,
     skip_right_gridline: bool,
     skip_bottom_gridline: bool,
+    link: Option<LinkDecoration>,
 ) -> AnyElement {
     let mut el = div()
         .absolute()
@@ -5443,30 +5638,96 @@ fn cell_element(
         el = el.font_family(name);
     }
 
-    if text.is_empty() {
-        el.into_any_element()
-    } else if style.map(|s| s.wrap).unwrap_or(false) {
-        // Wrapped text needs a width-bounded box to flow into: a flex row's direct text child is
-        // sized to its (unwrapped) content, so `whitespace_normal` only breaks lines once the text
-        // has a definite width. Wrap it in a full-width content box (which sets `whitespace_normal`,
-        // overriding the cell's base `whitespace_nowrap`) so gpui wraps at the column width.
-        // Horizontal placement moves from the flex's justify-content to the box's text-align; the
-        // outer flex's `items_*` still positions the whole block vertically. The row now auto-grows
-        // to fit the wrapped lines (`functional_spec.md §3`, the render-thread measurement pass), so
-        // `overflow_hidden` only clips content beyond the auto-grow cap `MAX_AUTO_ROW_HEIGHT_PX` (or
-        // a manually-shrunk row).
-        let h_align = style
-            .and_then(|s| s.h_align)
-            .unwrap_or_else(|| kind.default_align());
-        let content = div().w_full().whitespace_normal();
-        let content = match h_align {
-            Align::Left => content.text_left(),
-            Align::Center => content.text_center(),
-            Align::Right => content.text_right(),
+    if !text.is_empty() {
+        el = if style.map(|s| s.wrap).unwrap_or(false) {
+            // Wrapped text needs a width-bounded box to flow into: a flex row's direct text child is
+            // sized to its (unwrapped) content, so `whitespace_normal` only breaks lines once the text
+            // has a definite width. Wrap it in a full-width content box (which sets `whitespace_normal`,
+            // overriding the cell's base `whitespace_nowrap`) so gpui wraps at the column width.
+            // Horizontal placement moves from the flex's justify-content to the box's text-align; the
+            // outer flex's `items_*` still positions the whole block vertically. The row now auto-grows
+            // to fit the wrapped lines (`functional_spec.md §3`, the render-thread measurement pass), so
+            // `overflow_hidden` only clips content beyond the auto-grow cap `MAX_AUTO_ROW_HEIGHT_PX` (or
+            // a manually-shrunk row).
+            let h_align = style
+                .and_then(|s| s.h_align)
+                .unwrap_or_else(|| kind.default_align());
+            let content = div().w_full().whitespace_normal();
+            let content = match h_align {
+                Align::Left => content.text_left(),
+                Align::Center => content.text_center(),
+                Align::Right => content.text_right(),
+            };
+            el.child(content.child(text))
+        } else {
+            el.child(text)
         };
-        el.child(content.child(text)).into_any_element()
+    }
+
+    // Link affordances last, because `.id()` changes the element's type: a pointer cursor (F2.5)
+    // and a hover tooltip carrying the ScreenTip + target (F2.4). Both are declarative — no hover
+    // state, no per-move repaint — and an unlinked cell keeps today's id-free element.
+    match link {
+        Some(LinkDecoration { id, tooltip }) => el
+            .cursor_pointer()
+            .id(id)
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .into_any_element(),
+        None => el.into_any_element(),
+    }
+}
+
+/// The appearance a cell's **effective** link contributes (`hyperlinks/functional_spec.md
+/// F1.3/F1.4`), returned as the style + text colour the cell should actually paint with.
+///
+/// A **worksheet** link contributes nothing: the engine already applied `font.u = true` and the
+/// theme's hyperlink colour as ordinary cell formatting (F1.2), so it is in the resolved
+/// [`RenderStyle`] like any other formatting — which is exactly what makes "explicit user
+/// formatting wins" fall out for free. A **dynamic** (`HYPERLINK()`) link carries no engine
+/// styling at all, so FreeCell synthesizes the same look here: underline always, link blue only
+/// where the cell has no colour of its own (F1.4).
+///
+/// `own_color` is the cell's fully-resolved own text colour (the published colour, else the
+/// style's font colour); `None` means "the grid default".
+///
+/// Called by every site that paints cell text — the per-cell loop (whose result the spill plan
+/// inherits) and [`GridView::resolve_cell_paint`] for merged-region anchors — so the three cannot
+/// drift (F1.5).
+fn link_appearance(
+    link: Option<&CellLink>,
+    style: Option<RenderStyle>,
+    own_color: Option<Rgb>,
+) -> (Option<RenderStyle>, Rgba) {
+    let synthesize = link.is_some_and(|l| l.dynamic);
+    let text_color = match own_color {
+        Some(color) => to_rgba(color),
+        None if synthesize => rgb(LINK),
+        None => rgb(CELL_TEXT),
+    };
+    let style = if synthesize {
+        // A local copy — NOT interned. `RenderStyle` is the style cache's interning key, so
+        // synthesizing into the cache would mint a `StyleId` per link (`architecture.md §3.3`).
+        Some(RenderStyle {
+            underline: true,
+            ..style.unwrap_or_default()
+        })
     } else {
-        el.child(text).into_any_element()
+        style
+    };
+    (style, text_color)
+}
+
+/// The pointer cursor + tooltip a link cell carries (F2.4/F2.5).
+///
+/// The element id must be unique among the frame's painted elements: `quad` is part of the key
+/// because a merged region straddling the freeze divider is painted once **per quadrant**, and two
+/// elements sharing an id would share tooltip state. Rows fit in 21 bits and columns in 14, so the
+/// packed key is exact, not a hash.
+fn link_decoration(quad: QuadKind, row: u32, col: u32, target: &LinkTarget) -> LinkDecoration {
+    let key = ((quad as u64) << 40) | ((row as u64) << 16) | col as u64;
+    LinkDecoration {
+        id: ElementId::named_usize("cell-link", key as usize),
+        tooltip: link_tooltip_text(target).into(),
     }
 }
 
@@ -6570,6 +6831,30 @@ impl GridView {
     #[cfg(test)]
     pub(crate) fn emit_incell_cancel_for_test(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.events.emit(&GridEvent::InCellCancel, window, cx);
+    }
+
+    /// Test seam: the grid-local centre of `cell` on an **unfrozen** sheet at the current scroll —
+    /// the inverse of [`cell_at_local`](Self::cell_at_local), so a link test can click a specific
+    /// cell instead of hard-coding pixels. Asserted against `cell_at_local` by its first caller.
+    #[cfg(test)]
+    pub(crate) fn cell_center_for_test(&self, cell: CellRef, window: &Window) -> (f32, f32) {
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let content_h = (viewport_h - COL_HEADER_H as f64).max(0.0);
+        let (scroll_x, scroll_y) = self.scroll_of(self.active_sheet);
+        let caches = self.sources.caches.read();
+        let cache = caches.get(self.active_sheet).expect("resident cache");
+        assert_eq!(
+            (cache.frozen_rows(), cache.frozen_cols()),
+            (0, 0),
+            "cell_center_for_test does not model the frozen bands"
+        );
+        let (row_axis, col_axis) = cache.axes();
+        let pane = Self::input_pane_geometry(cache, viewport_w, content_h, scroll_x, scroll_y);
+        let x = pane.row_header_w as f64 + col_axis.offset_of(cell.col) - scroll_x
+            + col_axis.size_of(cell.col) as f64 / 2.0;
+        let y = COL_HEADER_H as f64 + row_axis.offset_of(cell.row) - scroll_y
+            + row_axis.size_of(cell.row) as f64 / 2.0;
+        (x as f32, y as f32)
     }
 }
 
@@ -10623,5 +10908,535 @@ mod tests {
             "a press on the menu padding dispatches no structure command: {:?}",
             events.borrow()
         );
+    }
+
+    // ---- Hyperlinks (`hyperlinks/functional_spec.md F1–F2`, `architecture.md §4–5`) ----------
+
+    /// Sources with links on a small sheet: B2 carries a **worksheet** link (the engine would have
+    /// styled it, so the fixture bakes that styling in), C4 a **dynamic** `HYPERLINK()` link with no
+    /// styling of its own, D6 a dynamic link that also carries an explicit red font colour, and
+    /// E8:F9 a merged region whose **anchor** carries a link. B10 is linked but has no content.
+    /// G2 is a plain unlinked control.
+    fn link_sources() -> (GridDataSources, SheetId) {
+        use freecell_core::cache::{SheetCacheBuilder, SheetCaches};
+        use freecell_core::publication::{CellKind, Publication, PublishedCell};
+        let sheet = SheetId(0);
+        let cell = |row, col, text: &str, text_color: Option<Rgb>| PublishedCell {
+            row,
+            col,
+            display_text: text.to_string(),
+            kind: CellKind::Text,
+            text_color,
+        };
+        // What the engine's own link formatting looks like once resolved (F1.2): underline + the
+        // theme hyperlink blue as an ordinary style. FreeCell adds nothing on top of this.
+        let engine_link_style = RenderStyle {
+            underline: true,
+            font_color: Some(Rgb::from_hex(ENGINE_LINK_BLUE)),
+            ..RenderStyle::default()
+        };
+        let red = RenderStyle {
+            font_color: Some(Rgb::from_hex(EXPLICIT_RED)),
+            ..RenderStyle::default()
+        };
+        let worksheet = CellLink::worksheet(LinkTarget::external(WORKSHEET_URL));
+        let dynamic = CellLink::dynamic(LinkTarget::external(DYNAMIC_URL));
+        let cache = SheetCacheBuilder::new(
+            freecell_core::limits::MAX_ROWS,
+            freecell_core::limits::MAX_COLS,
+        )
+        .cell_style(1, 1, engine_link_style)
+        .cell_style(5, 3, red)
+        .link(1, 1, worksheet.clone())
+        .link(3, 2, dynamic.clone())
+        .link(5, 3, dynamic.clone())
+        .link(7, 4, CellLink::worksheet(LinkTarget::internal("Sheet2!A1")))
+        .link(9, 1, worksheet.clone())
+        .merge(CellRange::new(CellRef::new(7, 4), CellRef::new(8, 5)))
+        .build();
+        let mut caches = SheetCaches::new();
+        caches.insert(sheet, cache);
+        let publication = Publication {
+            sheet,
+            rows: 0..40,
+            cols: 0..20,
+            frozen_rows: 0,
+            frozen_cols: 0,
+            generation: 1,
+            cells: vec![
+                cell(1, 1, WORKSHEET_URL, Some(Rgb::from_hex(ENGINE_LINK_BLUE))),
+                cell(3, 2, "Dynamic", None),
+                cell(5, 3, "Red dynamic", Some(Rgb::from_hex(EXPLICIT_RED))),
+                cell(7, 4, "Merged link", None),
+                cell(1, 6, "plain", None),
+            ],
+        };
+        (
+            GridDataSources {
+                publication: Arc::new(ArcSwap::from_pointee(publication)),
+                caches: Arc::new(RwLock::new(caches)),
+            },
+            sheet,
+        )
+    }
+
+    const WORKSHEET_URL: &str = "https://example.com/worksheet";
+    const DYNAMIC_URL: &str = "https://example.com/dynamic";
+    /// The theme hyperlink colour the engine resolves (Office theme slot 10) — what a worksheet
+    /// link's `RenderStyle::font_color` actually carries (Phase 1's verification gate).
+    const ENGINE_LINK_BLUE: u32 = 0x0563C1;
+    const EXPLICIT_RED: u32 = 0xD32F2F;
+
+    const LINK_CELL: CellRef = CellRef::new(1, 1);
+    const PLAIN_CELL: CellRef = CellRef::new(1, 6);
+    const MERGE_ANCHOR: CellRef = CellRef::new(7, 4);
+
+    /// A recording grid over [`link_sources`] with one frame already resolved, so `visible_links`
+    /// (and the rest of the per-frame snapshot) is populated exactly as a paint would leave it.
+    #[allow(clippy::type_complexity)]
+    fn link_grid(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<GridView>,
+        gpui::WindowHandle<Root>,
+        Rc<RefCell<Vec<GridEvent>>>,
+    ) {
+        let (sources, _sheet) = link_sources();
+        let (g, window, events) = recording_over(cx, sources);
+        g.update(cx, |grid, _cx| {
+            grid.resolve_frame(1200.0, 800.0).expect("a frame resolves");
+        });
+        (g, window, events)
+    }
+
+    /// A left mouse-up at grid-local `(x, y)` with the given modifiers + click count.
+    fn up_at(x: f32, y: f32, modifiers: Modifiers, click_count: usize) -> MouseUpEvent {
+        MouseUpEvent {
+            button: MouseButton::Left,
+            position: gpui::point(px(x), px(y)),
+            modifiers,
+            click_count,
+        }
+    }
+
+    /// A left mouse-down at grid-local `(x, y)` with the given modifiers + click count.
+    fn down_at(x: f32, y: f32, modifiers: Modifiers, click_count: usize) -> MouseDownEvent {
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position: gpui::point(px(x), px(y)),
+            modifiers,
+            click_count,
+            first_mouse: false,
+        }
+    }
+
+    fn secondary_held() -> Modifiers {
+        let mut m = Modifiers::default();
+        if cfg!(target_os = "macos") {
+            m.platform = true;
+        } else {
+            m.control = true;
+        }
+        m
+    }
+
+    /// `resolve_frame` snapshots the visible cells' links under the same read guard as the styles
+    /// and merges — including a merged region's anchor, and NOT cells outside the viewport.
+    #[gpui::test]
+    fn visible_links_snapshots_the_viewport_and_merge_anchors(cx: &mut TestAppContext) {
+        let (g, _window, _events) = link_grid(cx);
+        g.update(cx, |grid, _cx| {
+            let links = &grid.visible_links;
+            assert_eq!(
+                links.get(&(1, 1)).map(|l| l.target.destination()),
+                Some(WORKSHEET_URL),
+                "an in-viewport worksheet link is snapshotted"
+            );
+            assert!(links[&(3, 2)].dynamic, "the dynamic flag rides along");
+            assert!(
+                links.contains_key(&(7, 4)),
+                "a merged region's anchor link is snapshotted"
+            );
+            assert!(
+                !links.contains_key(&(1, 6)),
+                "an unlinked cell has no entry"
+            );
+            // A link far below/right of the viewport is not carried — the snapshot is viewport-
+            // scoped, not a clone of the whole sheet map.
+            assert!(!links.contains_key(&(9_999, 9_999)));
+        });
+
+        // Scrolling far away empties the snapshot: nothing linked is visible any more (the merge
+        // anchor top-up only covers regions the viewport still intersects).
+        g.update(cx, |grid, _cx| {
+            grid.scroll.insert(grid.active_sheet, (0.0, 20_000.0));
+            grid.resolve_frame(1200.0, 800.0).expect("a frame resolves");
+            assert!(
+                grid.visible_links.is_empty(),
+                "no visible link → an empty snapshot: {:?}",
+                grid.visible_links
+            );
+        });
+    }
+
+    /// F1.3 + F1.4: a dynamic link synthesizes the link appearance, an explicit font colour beats
+    /// the synthesized blue (the underline still applies), and a **worksheet** link synthesizes
+    /// nothing — its blue+underline is the engine's ordinary formatting (F1.2).
+    #[gpui::test]
+    fn a_dynamic_link_synthesizes_blue_underline_and_an_explicit_colour_wins(
+        cx: &mut TestAppContext,
+    ) {
+        let (g, _window, _events) = link_grid(cx);
+        g.update(cx, |grid, _cx| {
+            let publication = grid.sources.publication.load_full();
+
+            let dynamic = grid.resolve_cell_paint(CellRef::new(3, 2), &publication);
+            assert_eq!(
+                dynamic.text_color,
+                rgb(LINK),
+                "a dynamic link with no colour of its own paints link blue"
+            );
+            assert!(
+                dynamic.style.expect("synthesized style").underline,
+                "a dynamic link is underlined"
+            );
+
+            let red_dynamic = grid.resolve_cell_paint(CellRef::new(5, 3), &publication);
+            assert_eq!(
+                red_dynamic.text_color,
+                to_rgba(Rgb::from_hex(EXPLICIT_RED)),
+                "an explicit font colour wins over the synthesized blue (F1.4)"
+            );
+            assert!(
+                red_dynamic.style.expect("style").underline,
+                "…and the cell is still underlined"
+            );
+
+            // A worksheet link: FreeCell contributes nothing. The colour is the ENGINE's theme blue
+            // (not FreeCell's `LINK`), which is what proves no substitution happened.
+            let worksheet = grid.resolve_cell_paint(LINK_CELL, &publication);
+            assert_eq!(
+                worksheet.text_color,
+                to_rgba(Rgb::from_hex(ENGINE_LINK_BLUE))
+            );
+            assert_ne!(worksheet.text_color, rgb(LINK));
+
+            // An unlinked cell is untouched.
+            let plain = grid.resolve_cell_paint(PLAIN_CELL, &publication);
+            assert_eq!(plain.text_color, rgb(CELL_TEXT));
+            assert!(plain.link.is_none());
+        });
+    }
+
+    /// F1.7 / landmine #4: while a pending edit mirrors a link cell, the cell renders in the default
+    /// style with no link appearance and no link affordances — the mirror must not resurrect them.
+    #[gpui::test]
+    fn a_pending_edit_suppresses_link_appearance(cx: &mut TestAppContext) {
+        let (g, _window, _events) = link_grid(cx);
+        g.update(cx, |grid, cx| {
+            let sheet = grid.active_sheet;
+            let dynamic = CellRef::new(3, 2);
+            grid.set_edit_state(
+                Some((sheet, dynamic, "typing".into())),
+                None,
+                None,
+                false,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+                cx,
+            );
+            let publication = grid.sources.publication.load_full();
+            let paint = grid.resolve_cell_paint(dynamic, &publication);
+            assert_eq!(paint.text, "typing");
+            assert_eq!(
+                paint.text_color,
+                rgb(CELL_TEXT),
+                "an edit in flight renders in the default colour, not link blue"
+            );
+            assert!(paint.style.is_none(), "…and in the default style");
+            assert!(
+                paint.link.is_none(),
+                "…and offers no cursor/tooltip while editing"
+            );
+        });
+    }
+
+    /// The in-cell editor never inherits link appearance (F1.7). The discriminating pair: the same
+    /// dynamic-link cell paints underlined, while the editor — which resolves from `visible_styles`
+    /// alone — sees no style at all, because the synthesis is a paint-time local that deliberately
+    /// never enters the style snapshot (nor the interned cache behind it).
+    #[gpui::test]
+    fn the_in_cell_editor_does_not_inherit_link_appearance(cx: &mut TestAppContext) {
+        let (g, _window, _events) = link_grid(cx);
+        g.update(cx, |grid, _cx| {
+            let dynamic = CellRef::new(3, 2);
+            let publication = grid.sources.publication.load_full();
+            assert!(
+                grid.resolve_cell_paint(dynamic, &publication)
+                    .style
+                    .expect("the painted cell has a synthesized style")
+                    .underline,
+                "the painted cell is underlined (F1.3)"
+            );
+            let own_style = grid
+                .visible_styles
+                .get(&(dynamic.row, dynamic.col))
+                .copied();
+            assert!(
+                own_style.is_none(),
+                "the synthesized style never enters the style snapshot"
+            );
+            assert!(
+                !resolve_incell_font(own_style, &grid.visible_font_families).underline,
+                "so editing the cell shows normal edit text (F1.7)"
+            );
+        });
+    }
+
+    /// F2.1: a plain single click on a link cell emits `OpenLink` with that cell's target.
+    #[gpui::test]
+    fn a_plain_click_on_a_link_cell_emits_open_link(cx: &mut TestAppContext) {
+        let (g, window, events) = link_grid(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let (x, y) = grid.cell_center_for_test(LINK_CELL, window);
+                    // The centre really is that cell — pins the helper against the hit test.
+                    assert_eq!(grid.cell_at_local(x, y, window), Some(LINK_CELL));
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, Modifiers::default(), 1), window, cx);
+                    grid.handle_mouse_up(&up_at(x, y, Modifiers::default(), 1), window, cx);
+                    assert_eq!(
+                        opened_links(&events),
+                        vec![WORKSHEET_URL.to_string()],
+                        "a plain click follows the link"
+                    );
+                    assert!(
+                        grid.pending_link.is_none(),
+                        "the pending click is consumed by its release"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// F2.2: the four gestures that must NOT open — a drag, the primary modifier, a double click,
+    /// and a release that lands on another cell — each of which is still an ordinary selection.
+    #[gpui::test]
+    fn the_gestures_that_do_not_open_a_link(cx: &mut TestAppContext) {
+        let (g, window, events) = link_grid(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let (x, y) = grid.cell_center_for_test(LINK_CELL, window);
+                    let (ox, oy) = grid.cell_center_for_test(CellRef::new(4, 1), window);
+
+                    // A drag: press on the link, sweep away, release elsewhere.
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, Modifiers::default(), 1), window, cx);
+                    grid.handle_mouse_up(&up_at(ox, oy, Modifiers::default(), 1), window, cx);
+                    assert!(opened_links(&events).is_empty(), "a drag does not open");
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::SelectionChanged(_))),
+                        "…it is an ordinary selection instead"
+                    );
+
+                    // A press and release on the same cell, but the pointer moved past the slop.
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, Modifiers::default(), 1), window, cx);
+                    grid.handle_mouse_up(
+                        &up_at(x + LINK_CLICK_SLOP_PX + 1.0, y, Modifiers::default(), 1),
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        opened_links(&events).is_empty(),
+                        "a same-cell sweep past the slop reads as a drag"
+                    );
+
+                    // ⌘/Ctrl-click — the deliberate "select without following".
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, secondary_held(), 1), window, cx);
+                    grid.handle_mouse_up(&up_at(x, y, secondary_held(), 1), window, cx);
+                    assert!(
+                        opened_links(&events).is_empty(),
+                        "the primary modifier suppresses the open"
+                    );
+
+                    // Shift-click means "extend the range to here", never "follow this link".
+                    let shift = Modifiers {
+                        shift: true,
+                        ..Modifiers::default()
+                    };
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, shift, 1), window, cx);
+                    assert!(
+                        grid.pending_link.is_none(),
+                        "a shift-press never arms a link click"
+                    );
+                    grid.handle_mouse_up(&up_at(x, y, shift, 1), window, cx);
+                    assert!(opened_links(&events).is_empty());
+
+                    // The second press/release of a double click opens the editor, not the link.
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, Modifiers::default(), 2), window, cx);
+                    grid.handle_mouse_up(&up_at(x, y, Modifiers::default(), 2), window, cx);
+                    assert!(
+                        opened_links(&events).is_empty(),
+                        "a double click does not open"
+                    );
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::OpenInCellEditor(_))),
+                        "…it opens the in-cell editor"
+                    );
+
+                    // A click on a cell with no link opens nothing at all.
+                    events.borrow_mut().clear();
+                    let (px_, py) = grid.cell_center_for_test(PLAIN_CELL, window);
+                    grid.handle_mouse_down(&down_at(px_, py, Modifiers::default(), 1), window, cx);
+                    grid.handle_mouse_up(&up_at(px_, py, Modifiers::default(), 1), window, cx);
+                    assert!(opened_links(&events).is_empty());
+                });
+            })
+            .unwrap();
+    }
+
+    /// Landmine #10: while a formula edit is reference-ready, a grid click is point mode — it
+    /// inserts a reference and must never arm (let alone follow) the cell's link.
+    #[gpui::test]
+    fn point_mode_click_on_a_link_cell_inserts_a_reference_and_does_not_open_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (g, window, events) = link_grid(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    grid.set_edit_state(
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        /* reference_ready */ true,
+                        false,
+                        Vec::new(),
+                        cx,
+                    );
+                    let (x, y) = grid.cell_center_for_test(LINK_CELL, window);
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, Modifiers::default(), 1), window, cx);
+                    assert!(
+                        grid.pending_link.is_none(),
+                        "point mode returns before the link is armed"
+                    );
+                    grid.handle_mouse_up(&up_at(x, y, Modifiers::default(), 1), window, cx);
+                    assert!(opened_links(&events).is_empty(), "no link is followed");
+                    assert!(
+                        events
+                            .borrow()
+                            .iter()
+                            .any(|e| matches!(e, GridEvent::InsertReference { .. })),
+                        "the click inserted a reference instead"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// F1.5's click half: a click anywhere inside a merged region follows the **anchor's** link.
+    #[gpui::test]
+    fn a_click_on_a_merged_region_opens_the_anchors_link(cx: &mut TestAppContext) {
+        let (g, window, events) = link_grid(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    // A covered cell of the E8:F9 region, not the anchor.
+                    let covered = CellRef::new(MERGE_ANCHOR.row + 1, MERGE_ANCHOR.col + 1);
+                    let (x, y) = grid.cell_center_for_test(covered, window);
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_down(&down_at(x, y, Modifiers::default(), 1), window, cx);
+                    grid.handle_mouse_up(&up_at(x, y, Modifiers::default(), 1), window, cx);
+                    assert_eq!(
+                        opened_links(&events),
+                        vec!["Sheet2!A1".to_string()],
+                        "the covered cell follows the anchor's link"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// A press that lands on a link but is then claimed by another gesture must not leave a pending
+    /// click behind for a later, unrelated release to pick up.
+    #[gpui::test]
+    fn a_pending_link_never_survives_the_press_that_armed_it(cx: &mut TestAppContext) {
+        let (g, window, events) = link_grid(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                g.update(cx, |grid, cx| {
+                    let (x, y) = grid.cell_center_for_test(LINK_CELL, window);
+                    grid.handle_mouse_down(&down_at(x, y, Modifiers::default(), 1), window, cx);
+                    assert!(grid.pending_link.is_some());
+                    // A second press on a header (no link) clears it…
+                    grid.handle_mouse_down(&down_at(x, 10.0, Modifiers::default(), 1), window, cx);
+                    assert!(grid.pending_link.is_none());
+                    events.borrow_mut().clear();
+                    grid.handle_mouse_up(&up_at(x, y, Modifiers::default(), 1), window, cx);
+                    assert!(
+                        opened_links(&events).is_empty(),
+                        "a release after an unrelated press opens nothing"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Every painted link cell gets a pointer cursor + a tooltip, and their element ids are unique
+    /// per (quadrant, cell) — a merged region straddling the freeze divider is painted once per
+    /// quadrant, and two elements sharing an id would share tooltip state.
+    #[test]
+    fn link_decorations_are_unique_and_carry_the_tooltip() {
+        let target = LinkTarget::external("https://example.com").with_tooltip(Some("Docs".into()));
+        let body = link_decoration(QuadKind::Body, 7, 4, &target);
+        assert_eq!(
+            body.tooltip.as_ref(),
+            "Docs\nhttps://example.com",
+            "the tooltip shows the ScreenTip above the target (F2.4)"
+        );
+        // Same cell, different quadrant → different id.
+        assert_ne!(
+            body.id,
+            link_decoration(QuadKind::TopBand, 7, 4, &target).id
+        );
+        // Same quadrant, different cells → different ids, including the row/column packing edges.
+        assert_ne!(body.id, link_decoration(QuadKind::Body, 7, 5, &target).id);
+        assert_ne!(body.id, link_decoration(QuadKind::Body, 8, 4, &target).id);
+        assert_ne!(
+            link_decoration(QuadKind::Body, 0, 16_383, &target).id,
+            link_decoration(QuadKind::Body, 1, 0, &target).id,
+            "the packed key must not overflow the column field into the row field"
+        );
+    }
+
+    /// The `OpenLink` targets recorded so far, in order.
+    fn opened_links(events: &Rc<RefCell<Vec<GridEvent>>>) -> Vec<String> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                GridEvent::OpenLink { target } => Some(target.destination().to_string()),
+                _ => None,
+            })
+            .collect()
     }
 }

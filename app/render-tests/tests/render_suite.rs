@@ -325,6 +325,12 @@ render_cases! {
     // straddling the divider (split box + per-quadrant active outline), and a bordered merge whose
     // anchor sits above the body quadrant (the border-ownership underflow guard).
     merge_in_frozen_band, merge_straddles_freeze_divider, merge_bordered_anchor_above_body,
+    // Hyperlinks (`hyperlinks` P4): a worksheet link (the ENGINE's own blue+underline formatting),
+    // a `HYPERLINK()` cell (FreeCell's synthesized appearance), that synthesis surviving a spill and
+    // a merged-region box, a link over a fill, an explicit font colour beating the synthesized blue,
+    // and a removed link whose formatting deliberately stays behind.
+    link_plain, link_dynamic, link_spill, link_in_merged_region, link_over_fill,
+    link_with_explicit_font_color, link_removed,
 }
 
 /// The `#[test]` name list must stay in lockstep with the case table — a new case added to

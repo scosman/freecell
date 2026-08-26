@@ -160,14 +160,20 @@ registry: each entry is a short description plus a pointer to a design note unde
   engine-render guard test (`freecell-engine` `every_num_fmt_preset_code_renders_without_parse_error`)
   now covers the whole inventory so a re-add can't regress. → [`projects/fraction-number-format.md`](projects/fraction-number-format.md)
 
-- **Shared Remote Compile Cache (sccache + Cloudflare R2)** — *Implemented (2026-07-24),
-  dev containers only.* Fresh dev containers no longer recompile the pinned dep tree
-  (gpui/zed, gpui-component, ironcalc fork) from scratch: sccache (`RUSTC_WRAPPER`)
-  backed by the shared `freecell-dev` R2 bucket serves rustc outputs across sessions,
-  auto-activated per session by a `SessionStart` hook and degrading gracefully to
-  uncached builds when the R2 secrets are absent. **CI is deliberately untouched**
-  (keeps Swatinem/rust-cache). Design, limits, and R2 token rotation:
-  → [`projects/build-cache.md`](projects/build-cache.md)
+- **Dev-container Build Cache (baked VM image + startup script)** — *Implemented
+  (2026-08-26), dev containers only. Supersedes the sccache + Cloudflare R2 design.*
+  Everything expensive about a fresh dev container — the pinned 1.95.0 toolchain, the
+  ~630 MB of `~/.cargo/git`, the GPUI/render apt stack, and a warm compile cache for the
+  pinned dep tree (gpui/zed, gpui-component, ironcalc fork) — is baked into the cloud
+  **environment image** by `.config/utils/setup_env.sh`, and each session is prepared in
+  ~1 s by `.config/utils/setup_startup.sh` (run from the committed `SessionStart` hook).
+  The compile cache is **sccache against a local disk directory** under
+  `/opt/freecell-vm-setup`, so there is **no bucket and no credential** — the R2 token is
+  revoked. A warm `target/` hardlink was considered and **rejected** (cargo writes through
+  hardlinks; fingerprints embed absolute paths; ~25 GB against ~29 GB of disk).
+  **CI is deliberately untouched** (keeps Swatinem/rust-cache). Design + the rejected
+  alternative: → [`projects/build-cache.md`](projects/build-cache.md); cloud-UI operator
+  steps: → [`.config/utils/claude_cloud_setup.md`](.config/utils/claude_cloud_setup.md)
 
 - **Adopt gpui-component menus app-wide (native flyout submenus)** — *Future (deferred from
   `gaps_closing_7_12` Phase 10.4, 2026-07-13).* The whole chrome uses **seven** hand-rolled

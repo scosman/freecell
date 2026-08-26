@@ -105,12 +105,14 @@ FreeCell. This is the standing way of working, not a one-off.
   second icon set.
 - **Commit + push regularly** — the working container is ephemeral.
 - **Build/check efficiency — scope the work; don't full-workspace everything.** Fresh web
-  containers are **cache-ready automatically**: a SessionStart hook runs
-  `app/scripts/setup_sccache.sh`, wiring sccache to a shared Cloudflare R2 bucket so rustc
-  outputs (including the huge pinned dep tree — gpui/zed, gpui-component, ironcalc fork) are
-  served from the remote cache instead of recompiled (design:
-  `projects/build-cache.md`; without the R2 secrets it no-ops → old cold-build timings apply).
-  That takes the worst "cold container rebuilds the world" pain away, but full-workspace runs
+  containers are **cache-ready automatically**: the cloud environment **image** is baked with
+  the pinned toolchain, the dependency sources, the GPUI/render apt stack, and an sccache
+  disk cache holding the huge pinned dep tree (gpui/zed, gpui-component, ironcalc fork); a
+  committed SessionStart hook then runs `.config/utils/setup_startup.sh` (~1 s) to verify the
+  toolchain, wire `RUSTC_WRAPPER=sccache`, and `cargo fetch --locked`. Design + the cloud-UI
+  setup steps: `projects/build-cache.md` and `.config/utils/claude_cloud_setup.md`; on a
+  machine whose image wasn't built, the hook says so and old cold-build timings apply. That
+  takes the worst "cold container rebuilds the world" pain away, but full-workspace runs
   are **still not free** — linking, build scripts, and cargo orchestration aren't cached, first
   compiles of *changed* code always run for real, and the pixel suite is slower still — so
   keep matching the check to the change instead of rebuilding the world each iteration:

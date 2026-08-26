@@ -1,69 +1,154 @@
-# Shared Remote Compile Cache (sccache + Cloudflare R2)
+# Dev-container Build Cache (baked VM image + per-session startup script)
 
-**Status:** Implemented (2026-07-24) — dev containers only.
+**Status:** Implemented (2026-08-26) — dev containers only. Supersedes the sccache +
+Cloudflare R2 design (implemented 2026-07-24, removed here).
 
 ## Problem
 
-Every fresh dev container recompiles the FreeCell workspace's huge pinned dependency
-tree — gpui/zed, gpui-component, the ironcalc fork — from scratch (~15–25 min for a
-full build). Container-local caches die with the container, so nothing carries over
-between sessions.
+Every fresh dev container starts from a stock image and pays for the same four things
+before it can do any work:
+
+1. **The toolchain.** rustup's default is a stock `stable`; `app/rust-toolchain.toml`
+   pins `1.95.0`, so the first `cargo` call under `app/` downloads a whole toolchain.
+2. **Dependency sources.** `~/.cargo/git` alone is ~630 MB once the pinned zed and
+   IronCalc-fork checkouts land.
+3. **rustc outputs.** The pinned dependency tree — gpui/zed, gpui-component, the
+   IronCalc fork — is ~15–25 min of compilation.
+4. **System packages.** `app/render-tests/scripts/setup_render_env.sh` is a heavy apt
+   install (X11/Wayland/xkb, Vulkan + lavapipe, fontconfig/freetype, gbm, ALSA, Xvfb,
+   ImageMagick, DejaVu Serif).
+
+Container-local caches die with the container, so nothing carried over.
 
 ## Design
 
-[sccache](https://github.com/mozilla/sccache) (v0.8.2, prebuilt musl binary) as a
-`RUSTC_WRAPPER`, backed by a shared **Cloudflare R2** bucket via sccache's S3 backend.
-rustc outputs are content-addressed uploads: the first container to compile a given
-(rustc, flags, source) tuple pays the cost; every later container — any session, any
-day — downloads the object instead of recompiling.
+Two scripts, two lifetimes. Everything expensive moves into the **environment image**,
+which is built once and snapshotted; the per-session script only does what genuinely
+depends on the checkout.
 
-Wiring (all in [`app/scripts/setup_sccache.sh`](../app/scripts/setup_sccache.sh)):
+```
+environment build (once, then the disk is snapshotted)
+  cloud UI "Setup script" field
+    └─ .config/utils/claude_code_vm_setup.sh   (pasted; a fetcher, not a copy)
+         └─ curl raw.githubusercontent.com/.../main/.config/utils/setup_env.sh
+              └─ bash setup_env.sh --upgrade-tools --best-effort --warm-cache
+                   ├─ pinned toolchain 1.95.0 + rustfmt + clippy
+                   ├─ prebuilt sccache + cargo-deny (pinned versions)
+                   ├─ system packages, via the repo's own setup_render_env.sh
+                   ├─ throwaway clone → cargo fetch --locked → cargo build --workspace
+                   │    (fills ~/.cargo/{registry,git} and the sccache disk cache,
+                   │     then the clone and its target/ are deleted)
+                   └─ /opt/freecell-vm-setup/.setup_for_freecell_repo_v1  (marker)
 
-- **Bucket/endpoint:** `SCCACHE_BUCKET=freecell-dev`,
-  `SCCACHE_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com`,
-  `SCCACHE_REGION=auto` (R2 requires `auto`). Env vars override the baked-in defaults.
-- **Credentials:** the container provides `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`
-  as secrets; the script maps them to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-  (the standard AWS cred chain sccache reads). This mapping deliberately **overrides
-  the placeholder `AWS_ACCESS_KEY_ID=proxy-injected`** that the agent proxy sets.
-  Secrets are persisted to the session env file **by reference** (`"${R2_ACCESS_KEY_ID}"`),
-  never by value, and the script never prints them.
-- **Auto-activation:** a `SessionStart` hook
-  ([`.claude/hooks/session-start.sh`](../.claude/hooks/session-start.sh), registered in
-  [`.claude/settings.json`](../.claude/settings.json)) runs the setup script in every
-  fresh web container, so sessions are cache-ready with no manual step. Local checkouts
-  opt in with `source app/scripts/setup_sccache.sh`.
-- **Graceful degradation:** without the `R2_*` secrets the script leaves
-  `RUSTC_WRAPPER` unset and exits 0 — contributors without creds build exactly as
-  before, just uncached. Same for install/download failures.
+every session (fresh checkout, snapshot-restored disk)
+  SessionStart hook  (.claude/settings.json → .claude/hooks/session-start.sh)
+    └─ .config/utils/setup_startup.sh
+         ├─ containers only; identity-check the checkout; check the marker
+         ├─ verify the pinned toolchain + version floors
+         ├─ wire sccache to /opt/freecell-vm-setup/sccache
+         ├─ cargo fetch --locked
+         └─ one "Ready." line   (~1 s)
+```
+
+`/opt/freecell-vm-setup/` is machine-global state deliberately outside every checkout, so
+it survives the snapshot. Its paths are a **documented interface between the two scripts**,
+duplicated in both with a "keep in sync" comment — they cannot share code, because
+`setup_env.sh` is fetched and run standalone before any checkout exists.
+
+The `_v1` in the marker filename is a **contract version**: bump it in both scripts when
+what the image provides changes incompatibly, so machines built by the older script report
+as unprovisioned rather than as ready.
+
+Full operator documentation — the cloud UI steps, the allowed-domain list, and a repair
+line for every message the scripts emit — is
+[`.config/utils/claude_cloud_setup.md`](../.config/utils/claude_cloud_setup.md).
+
+## Warm-cache strategy: local-disk sccache
+
+`RUSTC_WRAPPER=sccache` with `SCCACHE_DIR=/opt/freecell-vm-setup/sccache`, filled at image
+build time and capped by `SCCACHE_CACHE_SIZE` (default `8G`, `FREECELL_SCCACHE_CACHE_SIZE`
+to override). Content-addressed and immutable, so sharing one directory across every
+session is safe by construction; local disk, so a hit is a read rather than an HTTPS round
+trip through the sandbox proxy; and path-independent, so it does not care that the image
+was warmed in `/opt/.../throwaway-clone` and used from `/home/user/freecell`.
+
+### Why not a warm `target/` hardlinked into the checkout
+
+This is the obvious bigger win, and it was **rejected deliberately**:
+
+- **Cargo writes through hardlinks.** `cp -al`-style seeding means a write through one path
+  is a write to the other, and cargo rewrites `.fingerprint/*/lib-*.json`, `.cargo-lock`,
+  and dep-info files scattered deep in the tree. The npm equivalent works because npm
+  mutates exactly one top-level file, which can be un-shared afterwards; there is no
+  equivalent short list for cargo, so a pristine warm tree would degrade silently across
+  sessions.
+- **Fingerprints embed absolute paths.** A `target/` built anywhere but the session's own
+  checkout path is largely not reused anyway.
+- **Disk.** `target/` runs ~25 GB against ~29 GB of session disk allowance.
+
+To revisit it, the thing to measure is what a same-absolute-path prebuild actually saves
+over the sccache route, against the cost of un-sharing every path cargo mutates in place.
+Capture that as its own `projects/*.md` note rather than reopening this one.
+
+### What is still paid per session
+
+sccache caches **rustc invocations** — not linking, not build scripts, not cargo's own
+orchestration — and it refuses to cache incremental compilations. In cargo's dev profile
+that means workspace crates are never served from the cache and the pinned dependency tree
+always is. The dependency tree is the entire point; a "fully cached" cold build still pays
+for linking.
+
+Two consequences worth knowing:
+
+- The image is warmed with the **same cargo profile a session uses**. Warming with CI's
+  trims (`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=line-tables-only`) would change
+  the rustc command lines that sccache keys on and produce a cache that misses on every
+  session build — a slow machine that looks provisioned.
+- The cache key includes the exact rustc version, so a `rust-toolchain.toml` bump naturally
+  starts a fresh keyspace and the old objects age out under the size cap.
+
+## What the per-session script does *not* do
+
+No `cargo build`. A full workspace build at session start would cost minutes even fully
+cached, and the agent's first real build pays that anyway. `cargo fetch --locked` against
+the image's warm registry/git caches is ~1 s, and `--locked` turns "this branch changed its
+dependencies" into a clear message naming `cargo update` rather than a silent lockfile
+rewrite.
+
+There is also no background pre-fetch. The previous design detached a `cargo fetch` at
+session start, which raced the agent's first build every time; a warm image makes it
+unnecessary.
 
 ## Scope: dev containers ONLY — CI deliberately untouched
 
-GitHub CI keeps `Swatinem/rust-cache`, which already works well there (persistent
-Actions cache, no secret distribution to fork PRs, no egress dependency). No workflow
-file references sccache; keep it that way unless a separate project revisits CI
-caching on its own merits.
+GitHub CI keeps `Swatinem/rust-cache`, which works well there (persistent Actions cache, no
+secret distribution to fork PRs, no egress dependency). No workflow file references
+sccache; keep it that way unless a separate project revisits CI caching on its own merits.
 
-## Limits / notes
+Local machines are untouched too, by two independent guards: `setup_startup.sh` refuses to
+run outside a container, and `setup_env.sh --human` writes nothing under `/opt` and never
+edits a contributor's Claude Code settings.
 
-- sccache caches **rustc invocations**, not the link step or build scripts' execution,
-  so a "fully cached" cold build still pays linking + `cargo` orchestration — big
-  savings, not zero-cost.
-- The cache key includes the exact rustc version: a toolchain bump
-  (`rust-toolchain.toml`) naturally starts a fresh keyspace; stale objects just age out.
-- The proxy-injected placeholder AWS creds mean **anything else** in a dev session
-  that reads the AWS cred chain now sees the R2 token instead of the placeholder;
-  nothing in this repo does today.
-- Seeding: the bucket warms organically as containers build. A deliberate one-off
-  full-workspace build in a throwaway session is the fastest way to seed it.
+## Migration from the R2 design (2026-07-24 → 2026-08-26)
 
-## Rotating the R2 token
+Removed: `app/scripts/setup_sccache.sh`, the R2 bucket backend, and the
+`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` environment secrets. Rotation is no longer a
+thing that exists — there is no credential.
 
-1. Cloudflare dashboard → R2 → **Manage R2 API Tokens** → create a new token scoped
-   **Object Read & Write** on the `freecell-dev` bucket only.
-2. Update the `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` secrets in the Claude Code
-   **environment settings** (where the container env vars are configured).
-3. Revoke the old token. Fresh sessions pick the new values up automatically; running
-   sessions keep the old env until restarted.
+**The R2 API token should be revoked** in the Cloudflare dashboard (R2 → *Manage R2 API
+Tokens*), and the two variables deleted from the cloud environment's settings. A secret
+written onto a snapshotted disk outlives its own rotation, which is the general reason
+nothing in these scripts touches secrets at all.
 
-No FreeCell code change is needed for rotation — the script only ever reads the env.
+`setup_startup.sh` unsets `SCCACHE_BUCKET` / `SCCACHE_ENDPOINT` / `SCCACHE_REGION` before
+starting the cache server, so a container that still carries the old variables gets the
+disk backend regardless.
+
+## Tests
+
+`bash .config/utils/test_setup_scripts.sh` covers the parts that took real reasoning: the
+container gate's falsy-value handling, the marker's effect on whether an unattributable
+cache directory is trusted, the marker's carry-forward rules across a repair run, the
+throwaway-clone lifecycle, and every rule of the optional user-`settings.json` merge — run
+through both the jq and python3 implementations and asserted to agree. It writes only to
+scratch directories, and proves it.

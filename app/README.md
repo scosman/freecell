@@ -36,22 +36,29 @@ so they build and test headless in Linux CI.
   (`xrefresh`), `imagemagick`.
 - **macOS:** the standard Xcode command-line tools (Metal stack).
 
-## Compile cache (sccache + Cloudflare R2) — dev only
+## Compile cache — dev containers only
 
-Dev builds can use [sccache](https://github.com/mozilla/sccache) backed by a shared
-Cloudflare R2 bucket, so fresh dev containers don't recompile the pinned dep tree
-(gpui/zed, gpui-component, ironcalc fork) from scratch:
+Cloud dev containers boot from an environment **image** that already carries the pinned
+toolchain, the dependency sources, the system packages above, and an
+[sccache](https://github.com/mozilla/sccache) disk cache holding the compiled pinned dep
+tree (gpui/zed, gpui-component, ironcalc fork). A committed `SessionStart` hook
+(`.claude/settings.json` → `.claude/hooks/session-start.sh`) runs
+[`../.config/utils/setup_startup.sh`](../.config/utils/setup_startup.sh) in about a second
+to verify the toolchain, wire `RUSTC_WRAPPER=sccache`, and `cargo fetch --locked`.
+
+There is no bucket and no credential — the cache is a directory on the machine's own disk.
+CI is deliberately untouched (it uses `Swatinem/rust-cache`). Design, the rejected warm-
+`target/` alternative, and what is still paid per session:
+[`../projects/build-cache.md`](../projects/build-cache.md). Cloud-UI setup steps:
+[`../.config/utils/claude_cloud_setup.md`](../.config/utils/claude_cloud_setup.md).
+
+**On your own machine**, none of that applies (the startup script refuses to run outside a
+container). To install the pinned toolchain, warm `~/.cargo`, and optionally install the
+system packages listed under Prerequisites:
 
 ```sh
-source scripts/setup_sccache.sh   # installs sccache if missing + exports the env
+bash ../.config/utils/setup_env.sh --human
 ```
-
-Web dev sessions run this automatically via the repo's `SessionStart` hook
-(`.claude/hooks/session-start.sh`). The script needs the `R2_ACCESS_KEY_ID` /
-`R2_SECRET_ACCESS_KEY` secrets in the environment; **without them it no-ops** (leaves
-`RUSTC_WRAPPER` unset) and builds work as before, just uncached. CI is deliberately
-untouched (it uses Swatinem/rust-cache). Design + token rotation:
-[`../projects/build-cache.md`](../projects/build-cache.md).
 
 ## Build / run / test
 

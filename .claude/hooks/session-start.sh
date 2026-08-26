@@ -1,29 +1,43 @@
-#!/bin/bash
-# SessionStart hook — make fresh web dev containers cache-ready.
+#!/usr/bin/env bash
+# Claude Code SessionStart hook — registered in .claude/settings.json.
 #
-# Runs the sccache + Cloudflare R2 compile-cache setup (app/scripts/setup_sccache.sh)
-# so cargo builds in this session hit the shared remote cache with no manual step,
-# then kicks off a background pre-fetch of the dependency SOURCE cache (see below).
-# The setup script no-ops gracefully when the R2_* credential env vars are absent,
-# so sessions without creds still build (just uncached). Dev-only: CI is untouched.
-set -euo pipefail
+# This is a shim, not the logic: it finds .config/utils/setup_startup.sh and runs it. The
+# work lives there so the same preparation can be run by hand ("re-run
+# .config/utils/setup_startup.sh") and so setup_env.sh can install an equivalent
+# machine-global shim on a VM that does not trust project hooks.
+#
+# KEEP IN SYNC with the shim heredoc in .config/utils/setup_env.sh (write_startup_shim).
+set -u
 
-# Web/remote sessions only — local checkouts opt in manually by sourcing the script.
-if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
-  exit 0
+# CLAUDE_PROJECT_DIR is set for SessionStart hooks, and is the session's working directory
+# — not necessarily the root of the checkout, hence the walk upward. Resolved to an
+# absolute path first, so a relative one walks the real tree. The walk stops when a
+# directory is its own parent ("/" and "."), so it cannot spin.
+dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+dir="$(cd "$dir" 2>/dev/null && pwd)" || dir="$PWD"
+while [ ! -f "$dir/.config/utils/setup_startup.sh" ]; do
+  parent="$(dirname "$dir")"
+  [ "$parent" = "$dir" ] && exit 0
+  dir="$parent"
+done
+script="$dir/.config/utils/setup_startup.sh"
+
+# A SessionStart hook's stdout becomes context for the session and its stderr does not, so
+# both streams are captured and printed together: a failure the agent never sees is worse
+# than no hook at all. Always exit 0 — this must never be the reason a session fails to
+# start. stdin is the hook's event JSON; nothing here reads it.
+#
+# Capped, because this text is spent from the session's context window: the normal run is
+# ~15 lines, but a failing resolution or build can be enormous, and the tail of such
+# output is where the reason is.
+output="$(bash "$script" 2>&1 </dev/null)"
+status=$?
+if [ "${#output}" -gt 4000 ]; then
+  output="$(printf '%s' "$output" | head -c 1500)
+[...trimmed. Re-run .config/utils/setup_startup.sh to see all of it...]
+$(printf '%s' "$output" | tail -c 2000)"
 fi
-
-"$CLAUDE_PROJECT_DIR/app/scripts/setup_sccache.sh"
-
-# Pre-warm the dependency SOURCE cache in the background: download the crates.io
-# tarballs + git checkouts pinned in Cargo.lock into ~/.cargo so the session's first
-# `cargo build` skips the registry/git fetch phase (~100s of "Updating git repository
-# …/Downloaded …") before compilation even starts. This is the source cache — separate
-# from, and complementary to, the sccache compile cache above (dependency *sources* vs.
-# compiled *rustc outputs*, which are pulled from R2 during the build itself). It never
-# compiles, so it can't fail on in-progress code and is a fast no-op once warm. Scoped
-# to this container's target to skip the Windows/macOS-only crates an unscoped fetch
-# would pull. Detached via setsid + `&` so it never delays session start; a failed or
-# killed fetch is harmless (the first build just fetches whatever is still missing).
-setsid bash -c "cd '$CLAUDE_PROJECT_DIR/app' && exec cargo fetch --locked --target x86_64-unknown-linux-gnu" \
-  </dev/null >/tmp/freecell-prewarm-fetch.log 2>&1 &
+[ -n "$output" ] && printf '%s\n' "$output"
+[ "$status" -ne 0 ] &&
+  printf '%s\n' "($script exited $status. Fix the above before building or testing.)"
+exit 0

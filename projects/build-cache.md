@@ -147,9 +147,15 @@ Deleting `export RUSTC_WRAPPER` from the env-file block turns three of those red
 is sensitive to the wiring it claims to cover rather than to a re-implementation of it.
 
 The env file is load-bearing for the same reason: `export RUSTC_WRAPPER=sccache` inside the
-hook reaches the hook's own process and nothing else. When `CLAUDE_ENV_FILE` is unset,
-`setup_startup.sh` says so and degrades its status line to `(THIS PROCESS ONLY …)` rather than
-reporting a cache the session will never use.
+hook reaches the hook's own process and nothing else. When `CLAUDE_ENV_FILE` is unset — or is
+set to a path the write fails on — `setup_startup.sh` says so and degrades its status line to
+`(THIS PROCESS ONLY …)` rather than reporting a cache the session will never use.
+
+The same rule governs the build-time script's closing line. `setup_env.sh` counts its own
+warnings and closes with `WITH WARNINGS` when there were any, because that log is an
+operator's only view of an image build and an unqualified "complete." after three degradations
+is a success signal that outruns what was done. Invariant 1 forbids *exiting* non-zero; it
+does not forbid saying so.
 
 ## What the per-session script does *not* do
 

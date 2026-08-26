@@ -41,11 +41,13 @@ WARM_CACHE=false             # --warm-cache
 HUMAN=false                  # --human
 
 # --- Constants --------------------------------------------------------------------
-# $HOME is referenced below (~/.local/bin, ~/.cargo/bin) and `set -u` makes
-# an unset one a fatal error at line-read time — before argument parsing has even seen
-# --best-effort. As the script the pasted cloud wrapper runs, that would be precisely the
-# never-exit-non-zero failure the whole best-effort design exists to prevent, so HOME is
-# normalized here rather than defended at each site.
+# $HOME is referenced below — install_prebuilt_binary's `$HOME/.local/bin` fallback and the
+# post-rustup-install `export PATH="$HOME/.cargo/bin:$PATH"`. Under `set -u` an unset HOME
+# does not fail when those lines are PARSED; it kills the shell outright WHEN THEY EXECUTE,
+# mid-run, bypassing finish() and exiting non-zero no matter what --best-effort says. As the
+# script the pasted cloud wrapper runs, that is precisely the never-exit-non-zero failure the
+# whole best-effort design exists to prevent — so HOME is normalized once here rather than
+# defended at each site.
 if [ -z "${HOME:-}" ]; then
   HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
   [ -n "$HOME" ] || HOME="/root"
@@ -114,11 +116,19 @@ CARGO_DENY_URL="https://github.com/EmbarkStudios/cargo-deny/releases/download/${
 
 # --- Reporting --------------------------------------------------------------------
 FAILED=0
+# Every note() is a DEGRADATION: something this script was supposed to provide is not there
+# (no compile cache, no cargo-deny, no render stack), or was deliberately skipped. They are
+# counted because the closing line is the operator's only view of an image build, and an
+# unqualified "complete." after three of them is a success signal that outruns what was
+# actually done. Invariant 1 forbids exiting non-zero; it does not forbid saying so — the
+# same trade setup_startup.sh makes with its "Ready, with warnings above." line.
+NOTED=0
 fail() { echo "error: $*" >&2; FAILED=1; }
-note() { echo "  ! $*" >&2; }
+note() { echo "  ! $*" >&2; NOTED=1; }
 step() { echo "==> $*"; }
 
 finish() {
+  local closing="${1:-Environment setup complete.}"
   if [ "$FAILED" -ne 0 ]; then
     if [ "$BEST_EFFORT" = true ]; then
       echo "setup_env.sh: finished with errors (best effort, exiting 0)." >&2
@@ -126,7 +136,13 @@ finish() {
     fi
     exit 1
   fi
-  echo "${1:-Environment setup complete.}"
+  if [ "$NOTED" -ne 0 ]; then
+    echo "$closing"
+    echo "  ! WITH WARNINGS — every '!' line above is something this machine does not have."
+    echo "    Read them before treating this image as provisioned."
+    exit 0
+  fi
+  echo "$closing"
   exit 0
 }
 
@@ -662,10 +678,10 @@ write_marker() {
   local sccache_present=false sccache_populated=false warm_commit warmed max_size
   if [ -d "$SCCACHE_DISK_DIR" ]; then
     sccache_present=true
-    # `-type f`, the SAME rule sccache_disk_has_objects() and setup_startup.sh apply. With a
-    # looser "any entry" test, a directory holding nothing but empty subdirectories carried a
-    # previous sccache_warmed=true forward — reinstating the lie this check exists to catch.
-    [ -n "$(find "$SCCACHE_DISK_DIR" -mindepth 1 -type f -print -quit 2>/dev/null)" ] && sccache_populated=true
+    # The same predicate the warm build gates on, called rather than restated: a directory
+    # holding nothing but empty subdirectories must not carry a previous sccache_warmed=true
+    # forward, and two copies of that rule is how one of them drifts.
+    sccache_disk_has_objects && sccache_populated=true
   fi
 
   # Describe the cache that is on disk NOW, not what this run did. Repairing an
@@ -752,6 +768,25 @@ fi
 
 # --- (i) Close ---------------------------------------------------------------------
 echo ""
+# The no-checkout case comes FIRST for --human, because almost nothing repo-local happened:
+# ~/.cargo was never warmed, the render-package offer was never made, and the toolchain
+# installed above is this script's fallback pin rather than the one the repo pins. Closing
+# with "Local setup complete. Build with: cd app && ..." would name a directory that does not
+# exist. README.md and app/README.md both point contributors at this command, so getting the
+# wrong-directory case right is not a corner.
+if [ "$HUMAN" = true ] && [ -z "$PROJECT_ROOT" ]; then
+  echo "  The toolchain above was installed, but nothing repo-local was done: no checkout was" >&2
+  echo "  found from $PWD, so the dependency sources were not warmed, the system-package offer" >&2
+  echo "  was not made, and the pin used was this script's fallback ($RUST_TOOLCHAIN_FALLBACK_PIN)," >&2
+  echo "  not app/rust-toolchain.toml's." >&2
+  echo "" >&2
+  echo "  Re-run from inside a FreeCell checkout:" >&2
+  echo "      git clone $REPO_URL && cd freecell && bash .config/utils/setup_env.sh --human" >&2
+  echo "" >&2
+  fail "no FreeCell checkout found from $PWD; local setup is incomplete."
+  finish
+fi
+
 if [ "$HUMAN" = true ]; then
   finish "Local setup complete. Build with: cd app && cargo build --workspace"
 fi

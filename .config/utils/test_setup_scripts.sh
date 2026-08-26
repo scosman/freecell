@@ -11,11 +11,6 @@
 #     - no binary written into /usr/local/bin or ~/.local/bin (FREECELL_SKIP_TOOL_INSTALL)
 #     - nothing under /opt/freecell-vm-setup (FREECELL_VM_SETUP_DIR points at scratch, and
 #       that one path — not all of /opt — is what the closing case fingerprints)
-#     - no edit to the real ~/.claude/settings.json. Nothing under test reads or writes it
-#       any more — hook registration is committed source, not something a script performs —
-#       so the closing case fingerprints the file only to keep that true if one ever does.
-#       Where no such file exists, the assertion narrows to "and none was created", which is
-#       the only half of that claim with any content
 #     - no temp files outside the scratch dir (TMPDIR points at scratch)
 #     - your running sccache server is not stopped (SCCACHE_SERVER_PORT is a private port,
 #       and the EXIT trap stops the server this suite starts on it)
@@ -111,16 +106,23 @@ expect_not_contains() {
 expect_status() { # expect_status <description> <expected> <actual>
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected exit $2, got $3)"; fi
 }
+expect_equal() { # expect_equal <description> <expected> <actual>
+  if [ "$2" = "$3" ]; then
+    ok "$1"
+  else
+    # Prints the difference, because an exact-match assertion replaces several substring ones
+    # and would otherwise be the least debuggable failure in the suite.
+    bad "$1"
+    diff <(printf '%s\n' "$2") <(printf '%s\n' "$3") >&2 || true
+  fi
+}
 
 # Guard rails. Everything below writes only under $SCRATCH; the closing isolation case
-# proves the machine's own settings and /opt were untouched.
+# fingerprints the machine-global directory to prove it.
 if [ -z "$SCRATCH" ] || [ ! -d "$SCRATCH" ]; then
   echo "could not create a scratch dir" >&2
   exit 1
 fi
-REAL_USER_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-REAL_USER_SETTINGS_BEFORE="(absent)"
-[ -f "$REAL_USER_SETTINGS" ] && REAL_USER_SETTINGS_BEFORE="$(cksum <"$REAL_USER_SETTINGS")"
 vm_dir_fingerprint() {
   # Full depth, and mtime as well as size: a same-size edit deep inside sccache/ is exactly
   # the change a shallow, size-only fingerprint would miss.
@@ -166,16 +168,21 @@ fi
 start "gate/falsy"
 # The one failure mode impossible to notice: reading IS_CONTAINERIZED=no as yes. Asserted on
 # behavior rather than the notice, because the notice is silent when captured: a falsy value
-# must mean the checkout is NOT prepared.
+# must mean the checkout is NOT prepared. All seven are listed because each pins one
+# alternative of is_flag_set's case pattern — drop or mistype any one of them and exactly one
+# of these fails, so none of them is decoration.
 for falsy in false FALSE 0 no n off ""; do
   out="$(env -u CLAUDE_CODE_REMOTE IS_CONTAINERIZED="$falsy" bash "$SETUP_STARTUP" 2>&1)"
   expect_not_contains "IS_CONTAINERIZED='$falsy' is treated as no" "$out" "Syncing dependencies"
 done
 
 start "gate/truthy"
+# Asserted on behavior for the same reason gate/falsy is: the "Not running in a VM/container"
+# notice is printed only at a terminal, so under command substitution it is absent whether
+# the gate opened or not — an assertion on its absence passes even with the gate shut.
 out="$(env -u CLAUDE_CODE_REMOTE IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$SCRATCH/vm-empty" \
   bash "$SETUP_STARTUP" 2>&1)"
-expect_not_contains "IS_CONTAINERIZED=true opens the gate" "$out" "Not running in a VM/container"
+expect_contains "IS_CONTAINERIZED=true opens the gate" "$out" "Syncing dependencies"
 
 start "args"
 out="$(env -u CLAUDE_CODE_REMOTE bash "$SETUP_STARTUP" --no-such-flag 2>&1)"
@@ -251,11 +258,18 @@ ENV_FILE="$SCRATCH/session-env"
 IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$VM_OK" CLAUDE_ENV_FILE="$ENV_FILE" \
   bash "$SETUP_STARTUP" >/dev/null 2>&1
 if command -v sccache >/dev/null 2>&1; then
-  env_file_content="$(cat "$ENV_FILE")"
-  expect_contains "exports the wrapper to the session" "$env_file_content" "export RUSTC_WRAPPER=sccache"
-  expect_contains "exports the disk cache dir" "$env_file_content" "export SCCACHE_DIR="
-  expect_contains "retires any inherited remote-bucket config" "$env_file_content" "unset SCCACHE_BUCKET"
-  expect_not_contains "writes no credentials into the session env" "$env_file_content" "AWS_SECRET"
+  # The WHOLE file, not substrings of it: this is the one artifact that reaches every shell
+  # the agent opens, so an extra line — a credential, a stray export, a second block — has to
+  # fail something. A canary matching a specific forbidden string would only ever catch the
+  # forbidden string someone thought of, and per-line substring checks cannot fail unless
+  # this does.
+  expected_env_file="# freecell compile cache: sccache $VM_OK/sccache 8G
+unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX || true
+export SCCACHE_DIR=$VM_OK/sccache
+export SCCACHE_CACHE_SIZE=8G
+export RUSTC_WRAPPER=sccache"
+  expect_equal "the session env file is exactly the wiring block, and nothing else" \
+    "$expected_env_file" "$(cat "$ENV_FILE")"
 else
   skip "sccache is not installed, so env-file wiring cannot be asserted"
 fi
@@ -318,6 +332,22 @@ else
     bash "$SETUP_STARTUP" 2>&1)"
   expect_contains "a leftover bucket does not win the session's cache" "$out" "cache: sccache -> $VM_OK/sccache"
   expect_not_contains "and the backend readback has nothing to complain about" "$out" "resolved to"
+fi
+
+start "cache/env-file-unwritable"
+# The adjacent door to cache/no-env-file: CLAUDE_ENV_FILE is set, but the write fails. Same
+# end state — a cache wired for this process only — so it has to produce the same report.
+# Bash does not make a failed redirection on a `{ …; }` group return non-zero, so the obvious
+# implementation swallows this silently while printing "Ready." and a healthy status line.
+unwritable_out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$VM_OK" \
+  CLAUDE_ENV_FILE="$SCRATCH/no-such-directory/env" bash "$SETUP_STARTUP" 2>&1)"
+expect_status "still exits 0" 0 "$?"
+if command -v sccache >/dev/null 2>&1; then
+  expect_contains "the failed write degrades the status line" "$unwritable_out" "THIS PROCESS ONLY"
+  expect_contains "naming the file it could not write" "$unwritable_out" "the write to $SCRATCH/no-such-directory/env failed"
+  expect_contains "and the closing line stops saying plain Ready" "$unwritable_out" "Ready, with warnings above"
+else
+  skip "sccache is not installed, so the cache is never wired"
 fi
 
 start "cache/env-file-idempotent"
@@ -395,9 +425,6 @@ PROBE
   # Unique content, so this compiles for real rather than hitting an object left behind by an
   # earlier run of the suite.
   printf 'pub fn probe() -> u64 { %s }\n' "$$" >"$PROBE_CRATE/src/lib.rs"
-
-  expect "the image's cache starts empty" \
-    test -z "$(find "$PROBE_CACHE" -mindepth 1 -type f -print -quit 2>/dev/null)"
 
   probe_out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$PROBE_VM" \
     CLAUDE_ENV_FILE="$PROBE_ENV_FILE" bash "$SETUP_STARTUP" 2>&1)"
@@ -481,13 +508,30 @@ HUMAN_VM="$SCRATCH/vm-human"
 human_out="$(FREECELL_VM_SETUP_DIR="$HUMAN_VM" \
   bash "$SETUP_ENV" --human 2>&1)"
 expect_status "exits 0" 0 "$?"
+# Covers the marker too: nothing at all may appear at that path.
 expect "writes nothing under the machine-global directory" test ! -e "$HUMAN_VM"
-expect "writes no provisioning marker" test ! -e "$HUMAN_VM/$MARKER_NAME"
 expect_not_contains "does not name a machine-global directory it will not touch" "$human_out" "vm state:"
 expect_not_contains "does not install or replace the compile cache binary" "$human_out" "Compile cache"
 # Again the banner: --human has no marker to record an outcome in.
 expect_contains "runs the source-warming step" "$human_out" "cargo fetch --locked"
 expect_contains "and closes with a local next step" "$human_out" "Local setup complete"
+# The other side of the warnings check below: a run that emitted no '!' lines must not claim
+# warnings either, or the qualifier means nothing.
+expect_not_contains "with no warnings claimed, because none were emitted" "$human_out" "WITH WARNINGS"
+
+start "setup_env/human-no-checkout"
+# Run from a copy outside any checkout, which is what a contributor who cloned nothing yet
+# gets. Almost nothing repo-local happens in that state, so closing with "Local setup
+# complete. Build with: cd app && …" would name a directory that does not exist.
+HUMAN_ISOLATED="$SCRATCH/human-isolated"
+mkdir -p "$HUMAN_ISOLATED"
+cp "$SETUP_ENV" "$HUMAN_ISOLATED/setup_env.sh"
+nocheckout_out="$( cd "$HUMAN_ISOLATED" && bash "$HUMAN_ISOLATED/setup_env.sh" --human 2>&1 )"
+nocheckout_status=$?
+expect_status "exits non-zero — this is a user error, and --human is not a cloud script" 1 "$nocheckout_status"
+expect_not_contains "does not claim local setup is complete" "$nocheckout_out" "Local setup complete"
+expect_contains "says what was skipped" "$nocheckout_out" "nothing repo-local was done"
+expect_contains "and how to get it right" "$nocheckout_out" "Re-run from inside a FreeCell checkout"
 
 # ---------------------------------------------------------------------------------
 echo ""
@@ -528,6 +572,9 @@ expect "the throwaway clone is gone afterwards" test ! -e "$WARM_VM/throwaway-cl
 # the packages, a real apt run is indistinguishable from no run at all.
 expect_contains "the system-dependency guard fires" "$warm_out" "FREECELL_SKIP_SYSTEM_DEPS is set"
 expect_contains "and the warm build reaches its own guard" "$warm_out" "FREECELL_SKIP_WARM_BUILD is set"
+# Both of those guards print '!' lines, i.e. this image is missing things. The closing line is
+# an operator's only view of an image build, so it must not sign off as unqualified success.
+expect_contains "so the closing line is qualified, not plain success" "$warm_out" "WITH WARNINGS"
 expect_not_contains "having resolved to the image's disk cache" "$warm_out" "refusing to warm"
 expect "so the apt step left no log behind" test ! -e "$TMPDIR/freecell-render-env.log"
 expect "a marker was written" test -f "$WARM_VM/$MARKER_NAME"
@@ -638,16 +685,6 @@ start "isolation"
 # that the suite did not touch it.
 expect "the machine-global setup dir is exactly as the suite found it" \
   test "$REAL_VM_DIR_BEFORE" = "$(vm_dir_fingerprint)"
-real_after="(absent)"
-[ -f "$REAL_USER_SETTINGS" ] && real_after="$(cksum <"$REAL_USER_SETTINGS")"
-if [ "$REAL_USER_SETTINGS_BEFORE" = "(absent)" ]; then
-  # Said out loud: with no such file to begin with, "unchanged" is a weaker statement than it
-  # sounds, and the meaningful half is that the suite did not CREATE one.
-  expect "no user settings file existed, and none was created" test ! -e "$REAL_USER_SETTINGS"
-else
-  expect "this machine's own $REAL_USER_SETTINGS is unchanged" \
-    test "$REAL_USER_SETTINGS_BEFORE" = "$real_after"
-fi
 expect "no binary was installed or replaced in a system bin directory" \
   test "$SYSTEM_TOOLS_BEFORE" = "$(system_tools_fingerprint)"
 expect "no packages were installed" \

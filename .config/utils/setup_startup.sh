@@ -339,17 +339,19 @@ enable_compile_cache() {
 # `export X=Y` lines into it — so `unset` works there too. `|| true` keeps a consumer running
 # under `set -e` from tripping on it. Nothing written here is a secret; that is the point of
 # a local disk cache.
+# Without a usable env file, `export RUSTC_WRAPPER=sccache` reaches this process and nothing
+# else: every build the agent runs would be uncached while the closing line claimed a working
+# cache. There are two ways to get there — no env file named, or a named one that cannot be
+# written — and they degrade identically, so they share this.
+cache_reaches_this_process_only() { # $1 = what went wrong, as a clause
+  [ "$CACHE_ENABLED" = true ] || return 0
+  CACHE_STATUS="$CACHE_STATUS (THIS PROCESS ONLY — $1)"
+  warn "$1, so the compile-cache wiring cannot reach the session's shells; builds will be uncached. Fix: run this from the SessionStart hook, or export RUSTC_WRAPPER=sccache SCCACHE_DIR=$SCCACHE_DISK_DIR yourself."
+}
+
 persist_cache_env() {
   if [ -z "${CLAUDE_ENV_FILE:-}" ]; then
-    # Without the env file, `export RUSTC_WRAPPER=sccache` above reaches this process and
-    # nothing else: every build the agent runs would be uncached while the closing line
-    # claimed a working cache. That is the same defect — a success line asserting something
-    # it never checked — this whole script exists to avoid, so the status is degraded to
-    # what is actually true.
-    if [ "$CACHE_ENABLED" = true ]; then
-      CACHE_STATUS="$CACHE_STATUS (THIS PROCESS ONLY — CLAUDE_ENV_FILE is unset)"
-      warn "CLAUDE_ENV_FILE is unset, so the compile-cache wiring cannot reach the session's shells; builds will be uncached. Fix: run this from the SessionStart hook, or export RUSTC_WRAPPER=sccache SCCACHE_DIR=$SCCACHE_DISK_DIR yourself."
-    fi
+    cache_reaches_this_process_only "CLAUDE_ENV_FILE is unset"
     return 0
   fi
   local signature sentinel
@@ -359,22 +361,35 @@ persist_cache_env() {
     signature="off"
   fi
   sentinel="# freecell compile cache: $signature"
-  # SessionStart fires on startup, resume AND fork, so this can run several times in one
-  # container; without the sentinel the env file grows an identical block every time.
+  # SessionStart fires more than once per container — startup and resume at minimum, and the
+  # matcher in .claude/settings.json also lists `fork`, which the documented source list does
+  # not mention and may well be inert. Either way this runs several times, and without the
+  # sentinel the env file grows an identical block each time.
   if [ -f "$CLAUDE_ENV_FILE" ] && grep -qxF -- "$sentinel" "$CLAUDE_ENV_FILE" 2>/dev/null; then
     return 0
   fi
-  {
-    printf '%s\n' "$sentinel"
-    printf 'unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX || true\n'
-    if [ "$CACHE_ENABLED" = true ]; then
-      printf 'export SCCACHE_DIR=%q\n' "$SCCACHE_DISK_DIR"
-      printf 'export SCCACHE_CACHE_SIZE=%q\n' "$SCCACHE_MAX_SIZE"
-      printf 'export RUSTC_WRAPPER=sccache\n'
-    else
-      printf 'unset RUSTC_WRAPPER || true\n'
-    fi
-  } >>"$CLAUDE_ENV_FILE"
+  # Assembled first, then written by ONE simple command, because the append's status has to be
+  # checked: an unwritable or missing path reaches the identical end state as an unset
+  # CLAUDE_ENV_FILE — a cache wired for this process only — and bash's own "No such file or
+  # directory" on stderr is not a report anything acts on. The simple-command form is load
+  # bearing: a redirection failure on a `{ …; }` GROUP does not make the group return
+  # non-zero (measured on bash 5.2), so the obvious shape here silently swallows it.
+  local block
+  block="$sentinel
+unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX || true"
+  if [ "$CACHE_ENABLED" = true ]; then
+    block="$block
+$(printf 'export SCCACHE_DIR=%q' "$SCCACHE_DISK_DIR")
+$(printf 'export SCCACHE_CACHE_SIZE=%q' "$SCCACHE_MAX_SIZE")
+export RUSTC_WRAPPER=sccache"
+  else
+    block="$block
+unset RUSTC_WRAPPER || true"
+  fi
+  if ! printf '%s\n' "$block" >>"$CLAUDE_ENV_FILE" 2>/dev/null; then
+    cache_reaches_this_process_only "the write to $CLAUDE_ENV_FILE failed"
+    return 0
+  fi
 }
 
 CACHE_ENABLED=false

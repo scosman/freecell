@@ -116,13 +116,31 @@ neither is taken on faith:
   backend. A cloud environment build inherits the environment's variables, so a leftover
   bucket would send the whole warm build to a remote store (or, with its token revoked,
   nowhere) while the image's directory stayed empty. Both scripts clear the remote-backend
-  variables machine-wide, and `setup_env.sh` additionally reads back the *running server's*
-  `Cache location` before building and refuses to warm if it is not the image's directory.
+  variables at script scope — for their own process, not machine-wide; nothing about the
+  clearing survives into the image — and `setup_env.sh` additionally reads back the *running
+  server's* `Cache location` before building, refusing to warm if it is not the image's
+  directory. `setup_startup.sh` writes the same `unset` into the session environment file on
+  **every** path, since its own `unset` dies with the process while the agent's later shells
+  inherit whatever the container started with; when the cache ends up off it drops an
+  inherited `RUSTC_WRAPPER` too, so "off" cannot quietly mean "sccache against the old
+  bucket".
 - **A green build is not a warm cache.** `sccache_warmed=true` is written only after the
-  cache directory is confirmed to hold objects, and `setup_startup.sh` re-checks emptiness
-  every session — reporting a cold cache, and calling out the contradiction when the marker
-  claims otherwise. Existence, provenance and writability all pass on an image that warmed
-  the wrong store; only the contents distinguish it.
+  cache directory is confirmed to hold at least one **file**, and the marker's carry-forward
+  path applies the identical rule, so a directory of empty subdirectories cannot resurrect a
+  stale `true`. `setup_startup.sh` re-checks the same thing every session — reporting a cold
+  cache, and calling out the contradiction when the marker claims otherwise. Existence,
+  provenance and writability all pass on an image that warmed the wrong store; only the
+  contents distinguish it.
+
+The change of meaning is why the marker's contract version moved from `_v1` to `_v2`: in
+`_v1`, `sccache_warmed=true` meant "the warm build exited 0". Retrofitting the stricter
+reading onto images built by the older script would have made the marker say something those
+images never checked, so the filename moved instead and a `v1` machine now reports as
+unprovisioned — a warning and a slow session, never a wrong answer.
+
+The suite proves the underlying behaviour rather than only the messages: one case wires
+sccache exactly as `enable_compile_cache` does, compiles a scratch crate through it, and
+asserts the disk cache goes from empty to holding an object.
 
 ## What the per-session script does *not* do
 

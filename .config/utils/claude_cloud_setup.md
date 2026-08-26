@@ -12,7 +12,7 @@ ready before the agent reads anything.
 | [`claude_code_vm_setup.sh`](claude_code_vm_setup.sh) | The **only** thing you paste into the cloud UI. It fetches `setup_env.sh` from `main` and runs it. |
 | [`setup_env.sh`](setup_env.sh) | **Builds a machine.** Runs once, at environment-build time, before any repo is checked out. Also the "set up my laptop" script (`--human`). |
 | [`setup_startup.sh`](setup_startup.sh) | **Prepares a checkout.** Runs every session, via the repo's SessionStart hook. |
-| [`test_setup_scripts.sh`](test_setup_scripts.sh) | Tests for all of the above. Runs no `apt-get`, writes no binary into a system `bin` directory, touches nothing under `/opt` or your `~/.claude`, and uses a private sccache port so it cannot stop your running cache server — all asserted at the end, not assumed. It *does* install the toolchain pinned by `app/rust-toolchain.toml` and warm `~/.cargo` if those are cold, which is what your first `cargo build` here would do anyway. The file's header comment is the full contract. |
+| [`test_setup_scripts.sh`](test_setup_scripts.sh) | Tests for all of the above. Runs no `apt-get`, writes no binary into a system `bin` directory, touches nothing under `/opt/freecell-vm-setup` or your `~/.claude`, and uses a private sccache port so it cannot stop your running cache server — all asserted at the end, not assumed. It *does* install the toolchain pinned by `app/rust-toolchain.toml` and warm `~/.cargo` if those are cold, which is what your first `cargo build` here would do anyway. The file's header comment is the full contract. |
 
 The hook itself is committed: [`.claude/settings.json`](../../.claude/settings.json) points
 at [`.claude/hooks/session-start.sh`](../../.claude/hooks/session-start.sh), which is a shim
@@ -79,9 +79,13 @@ revoke the token:
 - `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` — delete from the environment variables, then
   revoke the API token in the Cloudflare dashboard (R2 → *Manage R2 API Tokens*). A secret on
   a snapshotted disk outlives its own rotation, so revoking is the part that matters.
-- `SCCACHE_BUCKET`, `SCCACHE_ENDPOINT`, `SCCACHE_REGION` — delete if present. `setup_startup.sh`
-  unsets them anyway before starting the cache server (a running sccache server's backend is
-  fixed at start), but leaving them configured is confusing for the next reader.
+- `SCCACHE_BUCKET`, `SCCACHE_ENDPOINT`, `SCCACHE_REGION` — delete if present. Both scripts
+  clear them for their own process before starting a cache server, and `setup_startup.sh`
+  writes the same `unset` into the session's environment file on every path — including when
+  the cache ends up off, where it drops an inherited `RUSTC_WRAPPER` too. That is a safety
+  net, not a substitute: they are inherited by the environment *build*, so a leftover bucket
+  is still what stops an image from being warmed (see the row below), and leaving them
+  configured is confusing for the next reader.
 
 **Setup script:** paste the *entire contents* of
 [`.config/utils/claude_code_vm_setup.sh`](claude_code_vm_setup.sh).
@@ -129,7 +133,7 @@ If it says `Ready, with warnings above`, or does not appear at all, find your li
 | `! native deps missing (…) — freecell-app and render-tests will not build.` | The apt step did not run or did not finish. `freecell-core` and `freecell-engine` still build. | `bash app/render-tests/scripts/setup_render_env.sh` |
 | `! cargo-deny is not installed; …` | Same cause as the sccache row. `cargo deny check` (a CI gate) cannot run locally. | `bash .config/utils/setup_env.sh --upgrade-tools` |
 | `! … is empty (marker: sccache_warmed=false)` | The image was built, but its warm build never ran or never finished. Everything works; the pinned dependency tree just compiles from cold. | Rebuild the environment image (edit the Setup script field to force it), or `bash .config/utils/setup_env.sh --upgrade-tools --warm-cache` |
-| `! … is EMPTY although the VM marker claims it was warmed` | The image build reported success but its objects went somewhere else — nearly always a leftover `SCCACHE_BUCKET` in the environment variables. | Delete `SCCACHE_BUCKET`/`SCCACHE_ENDPOINT`/`SCCACHE_REGION` from the environment settings, then force a snapshot rebuild. |
+| `! … is EMPTY although the VM marker claims it was warmed` | The cache's objects were removed after the image was built (disk pressure, a manual clean). A leftover `SCCACHE_BUCKET` cannot produce this any more — since the warm build reads the server's backend back before building, that case records `sccache_warmed=false` and shows the row above instead. | Force a snapshot rebuild. |
 | `! rustfmt is missing from …` / `! clippy is missing from …` | The pinned toolchain was installed without its components. Both are CI gates. | `rustup component add rustfmt --toolchain <pin>` (same for `clippy`) |
 | `✗ cargo fetch --locked failed` | `Cargo.lock` does not match the `Cargo.toml`s on this branch. | `cd app && cargo update` |
 | `✗ cargo in …/app resolves to 1.94.x, below the required 1.95.0 (app/rust-toolchain.toml pins '…')` | The pinned toolchain is not installed, so a stale default is being used. gpui needs `std::hint::cold_path()` (stable since 1.95.0). | `rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy` |
@@ -164,6 +168,12 @@ If it says `Ready, with warnings above`, or does not appear at all, find your li
 - **The cache directory is capped** (`FREECELL_SCCACHE_CACHE_SIZE`, default `8G`) because it
   is baked into the image and comes out of the same disk allowance a session's `target/`
   (which can reach ~25 GB) has to fit into.
+- **The marker's `_vN` is a contract version, and `v1` images are not `v2` images.** In `v1`,
+  `sccache_warmed=true` meant "the warm build exited 0"; in `v2` it means "the cache directory
+  was confirmed to hold objects". A `v1` image can carry a `true` that is not true in the `v2`
+  sense, so the filename moved rather than the new check being retrofitted onto images that
+  never ran it. A machine built by an older script therefore reports as *unprovisioned* — a
+  warning and a slow session, never a wrong answer. Rebuild the environment image to clear it.
 - **`$HOME` at build time is not `$HOME` at session time on this image** (`/root` versus the
   checkout under `/home/user`). That is exactly why the SessionStart hook is committed to the
   repo rather than registered in a user `settings.json`. If you ever do use

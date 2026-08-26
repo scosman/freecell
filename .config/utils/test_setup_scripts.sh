@@ -9,10 +9,14 @@
 #   Never, and asserted at the end rather than assumed:
 #     - no apt (FREECELL_SKIP_SYSTEM_DEPS; the render-env log's absence is checked too)
 #     - no binary written into /usr/local/bin or ~/.local/bin (FREECELL_SKIP_TOOL_INSTALL)
-#     - nothing under /opt (FREECELL_VM_SETUP_DIR points at scratch; /opt is fingerprinted)
-#     - no edit to the real ~/.claude/settings.json (CLAUDE_CONFIG_DIR points at scratch)
+#     - nothing under /opt/freecell-vm-setup (FREECELL_VM_SETUP_DIR points at scratch, and
+#       that one path — not all of /opt — is what the closing case fingerprints)
+#     - no edit to the real ~/.claude/settings.json (CLAUDE_CONFIG_DIR points at scratch).
+#       Where no such file exists, the assertion narrows to "and none was created", which is
+#       the only half of that claim with any content
 #     - no temp files outside the scratch dir (TMPDIR points at scratch)
-#     - your running sccache server is not stopped (SCCACHE_SERVER_PORT is a private port)
+#     - your running sccache server is not stopped (SCCACHE_SERVER_PORT is a private port,
+#       and the EXIT trap stops the server this suite starts on it)
 #
 #   DOES happen, as an unavoidable side effect of testing the real scripts:
 #     - `rustup toolchain install` for the pin in app/rust-toolchain.toml, which DOWNLOADS a
@@ -24,6 +28,10 @@
 # Both of the latter are exactly what your first `cargo build` in this repo would do anyway,
 # which is why they are documented rather than guarded — but they are not nothing, and this
 # comment is the contract.
+#
+# A case that cannot run here (no jq, no sccache, running as root) reports `skip` and is
+# counted separately, so a green run on a machine that has none of the tools cannot be
+# mistaken for a green run that proved anything.
 #
 # The cases are the ones that took real reasoning to get right: the container gate's
 # falsy-value handling, the provisioning marker's effect on whether an unattributable
@@ -40,8 +48,23 @@ PROJECT_ROOT="$(cd "$UTILS_DIR/../.." && pwd)"
 SETUP_ENV="$UTILS_DIR/setup_env.sh"
 SETUP_STARTUP="$UTILS_DIR/setup_startup.sh"
 
+# Read from the scripts under test rather than hardcoded, so bumping the marker contract or
+# the toolchain pin does not break this suite for reasons that have nothing to do with it.
+# shellcheck disable=SC2016  # $VM_SETUP_DIR is literal text being matched in the source.
+MARKER_NAME="$(sed -n 's|^VM_SETUP_MARKER="$VM_SETUP_DIR/\(.*\)"$|\1|p' "$SETUP_STARTUP" | head -1)"
+# shellcheck disable=SC2016  # as above.
+MARKER_NAME_ENV="$(sed -n 's|^VM_SETUP_MARKER="$VM_SETUP_DIR/\(.*\)"$|\1|p' "$SETUP_ENV" | head -1)"
+TOOLCHAIN_PIN="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$PROJECT_ROOT/app/rust-toolchain.toml" | head -1)"
+
 SCRATCH="$(mktemp -d)"
-trap 'rm -rf "$SCRATCH"' EXIT
+# The sccache server this suite starts on its private port is stopped structurally here, not
+# as a side effect of whichever case happens to run last.
+cleanup() {
+  command -v sccache >/dev/null 2>&1 && sccache --stop-server >/dev/null 2>&1
+  rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
 
 # Inherited by every setup_env.sh invocation below. Without these the merge cases would
 # curl binaries into /usr/local/bin, and the --warm-cache case (which produces a real
@@ -60,11 +83,15 @@ export SCCACHE_SERVER_PORT="${FREECELL_TEST_SCCACHE_PORT:-14227}"
 
 PASSED=0
 FAILED=0
+SKIPPED=0
 CURRENT=""
 
 start() { CURRENT="$1"; }
 ok() { PASSED=$((PASSED + 1)); echo "  ok   $CURRENT — $1"; }
 bad() { FAILED=$((FAILED + 1)); echo "  FAIL $CURRENT — $1" >&2; }
+# Counted separately and reported in the summary. A case that cannot run on this machine
+# printing "ok" is how a green run stops meaning anything.
+skip() { SKIPPED=$((SKIPPED + 1)); echo "  skip $CURRENT — $1"; }
 expect() { # expect <description> <condition...>
   local description="$1"; shift
   if "$@"; then ok "$description"; else bad "$description"; fi
@@ -131,7 +158,7 @@ if command -v script >/dev/null 2>&1; then
   expect_contains "says it is not running in a container" "$out" "Not running in a VM/container"
   expect_contains "names the local repair" "$out" "setup_env.sh --human"
 else
-  ok "skipped — 'script' is not installed, so no pty is available"
+  skip "'script' is not installed, so no pty is available"
 fi
 
 start "gate/falsy"
@@ -178,17 +205,17 @@ mkdir -p "$VM_OK/sccache"
 # has to look healthy.
 printf 'object\n' >"$VM_OK/sccache/some-cached-object"
 printf 'setup_version=1\nsccache_warmed=true\nsccache_warm_commit=abc123\n' \
-  >"$VM_OK/.setup_for_freecell_repo_v1"
+  >"$VM_OK/$MARKER_NAME"
 PROVISIONED_OUT="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$VM_OK" \
   bash "$SETUP_STARTUP" 2>&1)"
 PROVISIONED_STATUS=$?
 expect_status "exits 0" 0 "$PROVISIONED_STATUS"
 expect_not_contains "does not warn about the marker" "$PROVISIONED_OUT" "was not set up for FreeCell"
-expect_contains "reports the pinned toolchain" "$PROVISIONED_OUT" "pin 1.95.0"
+expect_contains "reports the pinned toolchain" "$PROVISIONED_OUT" "pin $TOOLCHAIN_PIN"
 if command -v sccache >/dev/null 2>&1; then
   expect_contains "wires sccache to the image's disk cache" "$PROVISIONED_OUT" "cache: sccache -> $VM_OK/sccache"
 else
-  ok "sccache absent on this machine; cache wiring not asserted"
+  skip "sccache is not installed, so cache wiring cannot be asserted"
 fi
 expect "the output stays short enough to spend on context" \
   test "$(printf '%s\n' "$PROVISIONED_OUT" | wc -l)" -le 20
@@ -199,7 +226,7 @@ start "provisioned/cold-cache"
 # distinguish a warm image from a cold one.
 COLD_VM="$SCRATCH/vm-cold"
 mkdir -p "$COLD_VM/sccache"
-printf 'setup_version=1\nsccache_warmed=false\n' >"$COLD_VM/.setup_for_freecell_repo_v1"
+printf 'setup_version=1\nsccache_warmed=false\n' >"$COLD_VM/$MARKER_NAME"
 out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$COLD_VM" bash "$SETUP_STARTUP" 2>&1)"
 expect_status "still exits 0 — a cold cache is slow, not broken" 0 "$?"
 expect_contains "an empty cache is reported" "$out" "is empty (marker: sccache_warmed=false)"
@@ -211,7 +238,7 @@ start "provisioned/lying-marker"
 LIAR_VM="$SCRATCH/vm-liar"
 mkdir -p "$LIAR_VM/sccache"
 printf 'setup_version=1\nsccache_warmed=true\nsccache_warm_commit=deadbeef\n' \
-  >"$LIAR_VM/.setup_for_freecell_repo_v1"
+  >"$LIAR_VM/$MARKER_NAME"
 out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$LIAR_VM" bash "$SETUP_STARTUP" 2>&1)"
 expect_contains "the contradiction is called out, not the claim believed" "$out" "EMPTY although the VM marker claims it was warmed"
 expect_contains "naming the commit the marker claims" "$out" "deadbeef"
@@ -228,18 +255,86 @@ if command -v sccache >/dev/null 2>&1; then
   expect_contains "retires any inherited remote-bucket config" "$env_file_content" "unset SCCACHE_BUCKET"
   expect_not_contains "writes no credentials into the session env" "$env_file_content" "AWS_SECRET"
 else
-  ok "sccache absent on this machine; env-file wiring not asserted"
+  skip "sccache is not installed, so env-file wiring cannot be asserted"
 fi
+
+start "cache/retirement-on-every-path"
+# The critical regression: the remote-backend retirement used to sit behind four gates, so an
+# unprovisioned machine kept SCCACHE_BUCKET and an inherited RUSTC_WRAPPER — every rustc call
+# went to the old bucket while the status line said "cache: off". "No marker" is exactly the
+# state between merging this and rebuilding the image, so it is the first state a user hits.
+RETIRE_ENV="$SCRATCH/retire-env"
+: >"$RETIRE_ENV"
+retire_out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$SCRATCH/vm-nonexistent" \
+  CLAUDE_ENV_FILE="$RETIRE_ENV" \
+  SCCACHE_BUCKET=a-bucket-that-must-not-survive SCCACHE_REGION=auto \
+  SCCACHE_ENDPOINT=https://example.invalid RUSTC_WRAPPER=sccache \
+  bash "$SETUP_STARTUP" 2>&1)"
+expect_status "an unprovisioned session still exits 0" 0 "$?"
+expect_contains "and reports the cache as off" "$retire_out" "cache: off"
+retire_content="$(cat "$RETIRE_ENV")"
+expect_contains "the bucket is retired for the session's later shells" "$retire_content" "unset SCCACHE_BUCKET"
+expect_contains "and an inherited wrapper goes with it, so off means off" "$retire_content" "unset RUSTC_WRAPPER"
+expect_not_contains "no wrapper is exported when there is no cache" "$retire_content" "export RUSTC_WRAPPER"
+
+start "cache/cap-comes-from-the-image"
+# The cap is a property of the image. Re-deriving the default here would have the first
+# session prune a 20G-baked cache back to 8G, evicting exactly what the image was built to
+# carry. An explicit override in this session's environment still wins over both.
+CAP_VM="$SCRATCH/vm-cap"
+mkdir -p "$CAP_VM/sccache"
+printf 'object\n' >"$CAP_VM/sccache/some-cached-object"
+printf 'setup_version=1\nsccache_warmed=true\nsccache_max_size=20G\n' >"$CAP_VM/$MARKER_NAME"
+CAP_ENV="$SCRATCH/cap-env"
+: >"$CAP_ENV"
+IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$CAP_VM" CLAUDE_ENV_FILE="$CAP_ENV" \
+  bash "$SETUP_STARTUP" >/dev/null 2>&1
+if command -v sccache >/dev/null 2>&1; then
+  expect_contains "the marker's cap is honoured, not the default" "$(cat "$CAP_ENV")" "SCCACHE_CACHE_SIZE=20G"
+else
+  skip "sccache is not installed, so the cache is never wired"
+fi
+: >"$CAP_ENV"
+IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$CAP_VM" CLAUDE_ENV_FILE="$CAP_ENV" \
+  FREECELL_SCCACHE_CACHE_SIZE=3G bash "$SETUP_STARTUP" >/dev/null 2>&1
+if command -v sccache >/dev/null 2>&1; then
+  expect_contains "an explicit override still wins" "$(cat "$CAP_ENV")" "SCCACHE_CACHE_SIZE=3G"
+else
+  skip "sccache is not installed, so the cache is never wired"
+fi
+
+start "cache/leftover-bucket-loses"
+# The in-process half of the same fix. SCCACHE_BUCKET beats SCCACHE_DIR, so with the script-
+# scope unset removed the server this script starts would come up on the remote backend and
+# the wiring would be refused — observable right here in the status line.
+if ! command -v sccache >/dev/null 2>&1; then
+  skip "sccache is not installed"
+else
+  out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$VM_OK" \
+    SCCACHE_BUCKET=a-bucket-that-must-not-win SCCACHE_REGION=auto \
+    SCCACHE_ENDPOINT=https://example.invalid \
+    bash "$SETUP_STARTUP" 2>&1)"
+  expect_contains "a leftover bucket does not win the session's cache" "$out" "cache: sccache -> $VM_OK/sccache"
+  expect_not_contains "and the backend readback has nothing to complain about" "$out" "resolved to"
+fi
+
+start "cache/env-file-idempotent"
+# SessionStart fires on startup, resume and fork; without a guard one container accumulates
+# a duplicate block per event.
+IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$SCRATCH/vm-nonexistent" \
+  CLAUDE_ENV_FILE="$RETIRE_ENV" bash "$SETUP_STARTUP" >/dev/null 2>&1
+expect "a second run appends nothing" \
+  test "$(grep -c 'unset SCCACHE_BUCKET' "$RETIRE_ENV")" -eq 1
 
 start "cache/unwritable"
 # The image builds as root and a session may run as someone else; a cache directory the
 # session cannot write is a cache that silently stores nothing.
 if [ "$(id -u)" -eq 0 ]; then
-  ok "skipped — root bypasses the permission check this case exercises"
+  skip "root bypasses the permission check this case exercises"
 else
   RO_VM="$SCRATCH/vm-readonly"
   mkdir -p "$RO_VM/sccache"
-  printf 'setup_version=1\n' >"$RO_VM/.setup_for_freecell_repo_v1"
+  printf 'setup_version=1\n' >"$RO_VM/$MARKER_NAME"
   chmod 555 "$RO_VM/sccache"
   out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$RO_VM" bash "$SETUP_STARTUP" 2>&1)"
   chmod 755 "$RO_VM/sccache"
@@ -261,6 +356,66 @@ expect_contains "and says what it looked for" "$out" "freecell-engine"
 
 # ---------------------------------------------------------------------------------
 echo ""
+echo "The marker contract, and a cache that really caches"
+# ---------------------------------------------------------------------------------
+start "contract/version"
+# The marker path is the interface between two scripts that cannot share code, and the _vN
+# in it is a contract version. Drifting halves would mean setup_env.sh provisions a machine
+# setup_startup.sh reports as unprovisioned, forever.
+expect "the marker name is non-empty" test -n "$MARKER_NAME"
+expect "both scripts name the same marker" test "$MARKER_NAME" = "$MARKER_NAME_ENV"
+
+start "cache/really-caches"
+# Everything else about the cache is asserted from fixtures and messages. This is the one
+# case that proves the actual behaviour the whole design rests on: wire sccache exactly the
+# way enable_compile_cache does, compile something through it, and watch the disk cache go
+# from empty to holding an object. A two-line crate, so it costs about a second.
+if ! command -v sccache >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+  skip "needs both cargo and sccache"
+else
+  PROBE_CACHE="$SCRATCH/probe-cache"
+  PROBE_CRATE="$SCRATCH/probe-crate"
+  mkdir -p "$PROBE_CACHE" "$PROBE_CRATE/src"
+  cat >"$PROBE_CRATE/Cargo.toml" <<'PROBE'
+[package]
+name = "freecell-cache-probe"
+version = "0.0.0"
+edition = "2021"
+PROBE
+  # Unique content, so this compiles for real rather than hitting an object left by an
+  # earlier run of the suite.
+  printf 'pub fn probe() -> u64 { %s }\n' "$$" >"$PROBE_CRATE/src/lib.rs"
+
+  expect "the probe cache starts empty" \
+    test -z "$(find "$PROBE_CACHE" -mindepth 1 -type f -print -quit 2>/dev/null)"
+
+  # Same environment enable_compile_cache builds: remote-backend variables cleared, disk dir
+  # exported, server restarted so it picks them up.
+  probe_env() {
+    env -u SCCACHE_BUCKET -u SCCACHE_ENDPOINT -u SCCACHE_REGION -u SCCACHE_S3_KEY_PREFIX \
+      SCCACHE_DIR="$PROBE_CACHE" SCCACHE_CACHE_SIZE=1G "$@"
+  }
+  probe_env sccache --stop-server >/dev/null 2>&1
+  probe_env sccache --start-server >/dev/null 2>&1
+  probe_location="$(probe_env sccache --show-stats 2>/dev/null | sed -n 's/^Cache location[[:space:]]*//p')"
+  expect "sccache resolved to the probe's disk cache" \
+    test "$probe_location" = "Local disk: \"$PROBE_CACHE\""
+
+  # CARGO_INCREMENTAL=0 because sccache refuses to cache incremental compilations — the same
+  # reason workspace crates are never served from the image's cache and the dependency tree
+  # always is.
+  ( cd "$PROBE_CRATE" && probe_env env RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 \
+      CARGO_TARGET_DIR="$SCRATCH/probe-target" cargo build --quiet ) >"$TMPDIR/probe-build.log" 2>&1
+  expect_status "the probe crate builds through the wrapper" 0 "$?"
+  expect "and an object landed in the disk cache" \
+    test -n "$(find "$PROBE_CACHE" -mindepth 1 -type f -print -quit 2>/dev/null)"
+  probe_stats="$(probe_env sccache --show-stats 2>/dev/null)"
+  expect_contains "sccache recorded a compile request" "$probe_stats" "Compile requests"
+  probe_env sccache --stop-server >/dev/null 2>&1
+fi
+
+# ---------------------------------------------------------------------------------
+echo ""
 echo "setup_env.sh — flags and exit codes"
 # ---------------------------------------------------------------------------------
 start "setup_env/help"
@@ -277,6 +432,21 @@ start "setup_env/best-effort"
 # exit non-zero, whatever went wrong.
 bash "$SETUP_ENV" --no-such-flag --best-effort >/dev/null 2>&1
 expect_status "--best-effort owns the exit code even for a bad flag" 0 "$?"
+
+start "setup_env/human"
+# README.md and app/README.md now point every contributor at --human, and its whole contract
+# is what it does NOT do.
+HUMAN_VM="$SCRATCH/vm-human"
+human_out="$(FREECELL_VM_SETUP_DIR="$HUMAN_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-human" \
+  bash "$SETUP_ENV" --human 2>&1)"
+expect_status "exits 0" 0 "$?"
+expect "writes nothing under the machine-global directory" test ! -e "$HUMAN_VM"
+expect "writes no provisioning marker" test ! -e "$HUMAN_VM/$MARKER_NAME"
+expect "creates no Claude Code settings" test ! -e "$SCRATCH/cfg-human/settings.json"
+expect_not_contains "does not name a machine-global directory it will not touch" "$human_out" "vm state:"
+expect_not_contains "does not install or replace the compile cache binary" "$human_out" "Compile cache"
+expect_contains "does warm the dependency sources" "$human_out" "cargo fetch --locked"
+expect_contains "and closes with a local next step" "$human_out" "Local setup complete"
 
 # ---------------------------------------------------------------------------------
 echo ""
@@ -316,33 +486,53 @@ expect_contains "the system-dependency guard fires" "$warm_out" "FREECELL_SKIP_S
 expect_contains "and the warm build reaches its own guard" "$warm_out" "FREECELL_SKIP_WARM_BUILD is set"
 expect_not_contains "having resolved to the image's disk cache" "$warm_out" "refusing to warm"
 expect "so the apt step left no log behind" test ! -e "$TMPDIR/freecell-render-env.log"
-expect "a marker was written" test -f "$WARM_VM/.setup_for_freecell_repo_v1"
-marker="$(cat "$WARM_VM/.setup_for_freecell_repo_v1")"
+expect "a marker was written" test -f "$WARM_VM/$MARKER_NAME"
+marker="$(cat "$WARM_VM/$MARKER_NAME")"
 expect_contains "recording the source-cache warm" "$marker" "cargo_sources_warmed=true"
-expect_contains "and the pinned toolchain's cargo, not the default one" "$marker" "cargo_version=1.95"
+expect_contains "and the pinned toolchain's cargo, not the default one" "$marker" "cargo_version=${TOOLCHAIN_PIN%%-*}"
 
 start "marker/carry-forward"
 # Repairing an environment means re-running WITHOUT --warm-cache. The marker must keep
 # describing the cache that is on disk, not be rewritten to claim it has no provenance.
 CARRY_VM="$SCRATCH/vm-carry"
+# A real object, not just a subdirectory: "warmed" means files on disk everywhere it is
+# tested, and a fixture that is only a directory would bake the looser rule into the suite.
 mkdir -p "$CARRY_VM/sccache/x"
-cat >"$CARRY_VM/.setup_for_freecell_repo_v1" <<'MARKER'
+printf 'object\n' >"$CARRY_VM/sccache/x/cached-object"
+cat >"$CARRY_VM/$MARKER_NAME" <<'MARKER'
 setup_version=1
 sccache_warmed=true
 sccache_warm_commit=deadbeefcafe
 MARKER
 ( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CARRY_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-carry" \
     bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
-marker="$(cat "$CARRY_VM/.setup_for_freecell_repo_v1")"
+marker="$(cat "$CARRY_VM/$MARKER_NAME")"
 expect_contains "the warm flag survives a repair run" "$marker" "sccache_warmed=true"
 expect_contains "so does the commit the cache came from" "$marker" "sccache_warm_commit=deadbeefcafe"
+
+start "marker/carry-forward-needs-objects"
+# The same "real objects" rule the other two call sites use. With a looser "any entry" test, a
+# directory holding nothing but empty subdirectories carried a stale sccache_warmed=true
+# forward — reinstating exactly the lie the round-3 checks exist to catch.
+HOLLOW_VM="$SCRATCH/vm-hollow"
+mkdir -p "$HOLLOW_VM/sccache/empty-subdir"
+cat >"$HOLLOW_VM/$MARKER_NAME" <<'MARKER'
+setup_version=1
+sccache_warmed=true
+sccache_warm_commit=cafef00d
+MARKER
+( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$HOLLOW_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-hollow" \
+    bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
+marker="$(cat "$HOLLOW_VM/$MARKER_NAME")"
+expect_contains "a directory with no files does not carry 'warmed' forward" "$marker" "sccache_warmed=false"
+expect_not_contains "nor the commit it claimed" "$marker" "cafef00d"
 
 start "marker/empty-cache"
 # The opposite trap: a directory this run merely created is not a cache of unknown origin.
 EMPTY_VM="$SCRATCH/vm-empty-cache"
 ( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$EMPTY_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-empty" \
     bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
-marker="$(cat "$EMPTY_VM/.setup_for_freecell_repo_v1" 2>/dev/null)"
+marker="$(cat "$EMPTY_VM/$MARKER_NAME" 2>/dev/null)"
 expect_contains "an empty cache dir reports as not warmed" "$marker" "sccache_warmed=false"
 expect_contains "with no commit claimed" "$marker" "sccache_warm_commit=none"
 
@@ -372,7 +562,8 @@ entry_count() { # entry_count <settings-file>
 
 for tool in jq python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "  skip $tool merge cases ($tool is not installed)"
+    start "merge[$tool]"
+    skip "$tool is not installed"
     continue
   fi
 
@@ -552,8 +743,14 @@ expect "the machine-global setup dir is exactly as the suite found it" \
   test "$REAL_VM_DIR_BEFORE" = "$(vm_dir_fingerprint)"
 real_after="(absent)"
 [ -f "$REAL_USER_SETTINGS" ] && real_after="$(cksum <"$REAL_USER_SETTINGS")"
-expect "this machine's own $REAL_USER_SETTINGS is unchanged" \
-  test "$REAL_USER_SETTINGS_BEFORE" = "$real_after"
+if [ "$REAL_USER_SETTINGS_BEFORE" = "(absent)" ]; then
+  # Said out loud: with no such file to begin with, "unchanged" is a weaker statement than it
+  # sounds, and the meaningful half is that the suite did not CREATE one.
+  expect "no user settings file existed, and none was created" test ! -e "$REAL_USER_SETTINGS"
+else
+  expect "this machine's own $REAL_USER_SETTINGS is unchanged" \
+    test "$REAL_USER_SETTINGS_BEFORE" = "$real_after"
+fi
 expect "no binary was installed or replaced in a system bin directory" \
   test "$SYSTEM_TOOLS_BEFORE" = "$(system_tools_fingerprint)"
 expect "no packages were installed" \
@@ -561,5 +758,9 @@ expect "no packages were installed" \
 expect "the render-env apt script was never invoked" test ! -e "$TMPDIR/freecell-render-env.log"
 
 echo ""
-echo "$PASSED passed, $FAILED failed."
+if [ "$SKIPPED" -gt 0 ]; then
+  echo "$PASSED passed, $FAILED failed, $SKIPPED skipped (a skip means this machine could not run that case)."
+else
+  echo "$PASSED passed, $FAILED failed."
+fi
 [ "$FAILED" -eq 0 ]

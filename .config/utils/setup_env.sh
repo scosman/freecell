@@ -62,10 +62,16 @@ REPO_REF="${FREECELL_SETUP_REF:-main}"
 # scripts cannot share code (this one gets fetched and run standalone), so these paths
 # are a duplicated, documented interface between them.
 VM_SETUP_DIR="${FREECELL_VM_SETUP_DIR:-/opt/freecell-vm-setup}"
-# The _v1 is a CONTRACT VERSION, not decoration: when what this script provides changes
+# The _v2 is a CONTRACT VERSION, not decoration: when what this script provides changes
 # incompatibly, bump it here and in setup_startup.sh, so machines provisioned by the
 # older script report as not-set-up rather than ready.
-VM_SETUP_MARKER="$VM_SETUP_DIR/.setup_for_freecell_repo_v1"
+#
+# v1 -> v2: `sccache_warmed=true` used to mean "the warm build exited 0". It now means "the
+# cache directory was confirmed to hold objects". A v1 image can therefore carry a
+# sccache_warmed=true that is not true in the v2 sense — which is exactly the ambiguity a
+# contract version exists to remove, so the version moved rather than the check being
+# quietly retrofitted onto images that never ran it.
+VM_SETUP_MARKER="$VM_SETUP_DIR/.setup_for_freecell_repo_v2"
 SCCACHE_DISK_DIR="$VM_SETUP_DIR/sccache"
 STARTUP_HOOK_SHIM="$VM_SETUP_DIR/freecell_session_start_hook.sh"
 # CLAUDE_CONFIG_DIR is what Claude Code itself honors; respecting it is both correct and
@@ -560,15 +566,14 @@ warm_sccache() {
   # wrong store — and before the skip knob, so this stays a real check rather than one that
   # only ever runs on the expensive path. The caller started the server with the disk
   # settings; if it did not land on the disk backend, something here still overrides them.
+  # Exact string, not a substring: `*"$SCCACHE_DISK_DIR"*` would also accept
+  # `Local disk: "…/sccache-old"`, which is precisely the kind of near-miss this checks for.
   location="$(sccache_cache_location)"
-  case "$location" in
-    *"$SCCACHE_DISK_DIR"*) ;;
-    *)
-      note "sccache resolved to '${location:-server not running}', not $SCCACHE_DISK_DIR; refusing to warm."
-      note "something in this environment still selects a different backend (SCCACHE_BUCKET?). Not building."
-      return 1
-      ;;
-  esac
+  if [ "$location" != "Local disk: \"$SCCACHE_DISK_DIR\"" ]; then
+    note "sccache resolved to '${location:-server not running}', not $SCCACHE_DISK_DIR; refusing to warm."
+    note "something in this environment still selects a different backend (SCCACHE_BUCKET?). Not building."
+    return 1
+  fi
 
   # Re-provisioning a machine whose sccache is already full does not need the build again,
   # and the test suite exercises the clone/fetch/marker path without paying for it.
@@ -923,9 +928,10 @@ write_marker() {
   local sccache_present=false sccache_populated=false warm_commit warmed
   if [ -d "$SCCACHE_DISK_DIR" ]; then
     sccache_present=true
-    # An empty directory this run merely created is not a warm cache, and reporting it as
-    # one of unknown provenance would send a reader looking for a problem that is not there.
-    [ -n "$(find "$SCCACHE_DISK_DIR" -mindepth 1 -print -quit 2>/dev/null)" ] && sccache_populated=true
+    # `-type f`, the SAME rule sccache_disk_has_objects() and setup_startup.sh apply. With a
+    # looser "any entry" test, a directory holding nothing but empty subdirectories carried a
+    # previous sccache_warmed=true forward — reinstating the lie this check exists to catch.
+    [ -n "$(find "$SCCACHE_DISK_DIR" -mindepth 1 -type f -print -quit 2>/dev/null)" ] && sccache_populated=true
   fi
 
   # Describe the cache that is on disk NOW, not what this run did. Repairing an

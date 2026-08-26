@@ -16,7 +16,8 @@ ready before the agent reads anything.
 
 The hook itself is committed: [`.claude/settings.json`](../../.claude/settings.json) points
 at [`.claude/hooks/session-start.sh`](../../.claude/hooks/session-start.sh), which is a shim
-that finds and runs `setup_startup.sh`. Nothing needs registering by hand.
+that finds and runs `setup_startup.sh`. Version control registers it; no script does, and
+none of these scripts has a flag that would.
 
 ## 1. Connect GitHub
 
@@ -176,9 +177,15 @@ If it says `Ready, with warnings above`, or does not appear at all, find your li
   never ran it. A machine built by an older script therefore reports as *unprovisioned* — a
   warning and a slow session, never a wrong answer. Rebuild the environment image to clear it.
 - **`$HOME` at build time is not `$HOME` at session time on this image** (`/root` versus the
-  checkout under `/home/user`). That is exactly why the SessionStart hook is committed to the
-  repo rather than registered in a user `settings.json`. If you ever do use
-  `setup_env.sh --create-startup-script`, set `CLAUDE_CONFIG_DIR` explicitly.
+  checkout under `/home/user`). That is one reason the SessionStart hook is committed to the
+  repo rather than written into a user `settings.json` by a script: `$HOME` resolves when the
+  image is built, so such a script would register the hook in the wrong home and nothing would
+  notice.
+- **If a machine does not honor project hooks**, add the entry by hand rather than looking for
+  a flag that does it: put a `SessionStart` group in `~/.claude/settings.json` with
+  `"matcher": "startup|resume|fork"` and a `command` of
+  `<checkout>/.claude/hooks/session-start.sh`. That file is the same shim the project hook
+  runs, and it finds the checkout by walking up from the session's directory.
 
 ## 8. Testing a change to the setup
 

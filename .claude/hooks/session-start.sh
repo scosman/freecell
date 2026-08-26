@@ -2,11 +2,11 @@
 # Claude Code SessionStart hook — registered in .claude/settings.json.
 #
 # This is a shim, not the logic: it finds .config/utils/setup_startup.sh and runs it. The
-# work lives there so the same preparation can be run by hand ("re-run
-# .config/utils/setup_startup.sh") and so setup_env.sh can install an equivalent
-# machine-global shim on a VM that does not trust project hooks.
+# work lives there so the same preparation can be run by hand — "re-run
+# .config/utils/setup_startup.sh" is the repair line half of that script prints.
 #
-# KEEP IN SYNC with the shim heredoc in .config/utils/setup_env.sh (write_startup_shim).
+# The walk upward means this file is also what you point at from ~/.claude/settings.json on
+# a machine that does not honor project hooks; nothing generates a second copy of it.
 set -u
 
 # CLAUDE_PROJECT_DIR is set for SessionStart hooks, and is the session's working directory

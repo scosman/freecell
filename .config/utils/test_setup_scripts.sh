@@ -11,7 +11,9 @@
 #     - no binary written into /usr/local/bin or ~/.local/bin (FREECELL_SKIP_TOOL_INSTALL)
 #     - nothing under /opt/freecell-vm-setup (FREECELL_VM_SETUP_DIR points at scratch, and
 #       that one path — not all of /opt — is what the closing case fingerprints)
-#     - no edit to the real ~/.claude/settings.json (CLAUDE_CONFIG_DIR points at scratch).
+#     - no edit to the real ~/.claude/settings.json. Nothing under test reads or writes it
+#       any more — hook registration is committed source, not something a script performs —
+#       so the closing case fingerprints the file only to keep that true if one ever does.
 #       Where no such file exists, the assertion narrows to "and none was created", which is
 #       the only half of that claim with any content
 #     - no temp files outside the scratch dir (TMPDIR points at scratch)
@@ -35,7 +37,7 @@
 #
 # The cases are the ones that took real reasoning to get right: the container gate's
 # falsy-value handling, the provisioning marker's effect on whether an unattributable
-# cache is trusted, and every rule of the settings.json merge.
+# cache is trusted, and the compile cache actually caching.
 if [ -z "${BASH_VERSION:-}" ]; then
   if [ -r "$0" ]; then exec bash "$0" "$@"; fi
   echo "error: this test suite requires bash." >&2
@@ -66,9 +68,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Inherited by every setup_env.sh invocation below. Without these the merge cases would
-# curl binaries into /usr/local/bin, and the --warm-cache case (which produces a real
-# reference tree) would run a ~20-package apt install on whatever box the suite is on.
+# Inherited by every setup_env.sh invocation below. Without these, any of them could curl a
+# binary into /usr/local/bin, and the --warm-cache case (which produces a real reference
+# tree) would run a ~20-package apt install on whatever box the suite is on.
 export FREECELL_SKIP_TOOL_INSTALL=1
 export FREECELL_SKIP_SYSTEM_DEPS=1
 # Temp files the scripts write (build logs, the render-env log, mktemp scratch) land under
@@ -476,12 +478,11 @@ start "setup_env/human"
 # README.md and app/README.md now point every contributor at --human, and its whole contract
 # is what it does NOT do.
 HUMAN_VM="$SCRATCH/vm-human"
-human_out="$(FREECELL_VM_SETUP_DIR="$HUMAN_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-human" \
+human_out="$(FREECELL_VM_SETUP_DIR="$HUMAN_VM" \
   bash "$SETUP_ENV" --human 2>&1)"
 expect_status "exits 0" 0 "$?"
 expect "writes nothing under the machine-global directory" test ! -e "$HUMAN_VM"
 expect "writes no provisioning marker" test ! -e "$HUMAN_VM/$MARKER_NAME"
-expect "creates no Claude Code settings" test ! -e "$SCRATCH/cfg-human/settings.json"
 expect_not_contains "does not name a machine-global directory it will not touch" "$human_out" "vm state:"
 expect_not_contains "does not install or replace the compile cache binary" "$human_out" "Compile cache"
 # Again the banner: --human has no marker to record an outcome in.
@@ -511,7 +512,7 @@ warm_branch="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null)"
 warm_out="$( cd "$WARM_ISOLATED" &&
   FREECELL_VM_SETUP_DIR="$WARM_VM" FREECELL_REPO_URL="$PROJECT_ROOT" \
     FREECELL_SETUP_REF="${warm_branch:-main}" FREECELL_SKIP_WARM_BUILD=1 \
-    CLAUDE_CONFIG_DIR="$SCRATCH/cfg-warm" \
+    \
     SCCACHE_BUCKET=a-bucket-that-must-not-win SCCACHE_REGION=auto \
     SCCACHE_ENDPOINT=https://example.invalid \
     bash "$WARM_ISOLATED/setup_env.sh" --warm-cache --best-effort 2>&1 )"
@@ -547,7 +548,7 @@ setup_version=2
 sccache_warmed=true
 sccache_warm_commit=deadbeefcafe
 MARKER
-( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CARRY_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-carry" \
+( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CARRY_VM" \
     bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
 marker="$(cat "$CARRY_VM/$MARKER_NAME")"
 expect_contains "the warm flag survives a repair run" "$marker" "sccache_warmed=true"
@@ -561,10 +562,10 @@ start "marker/cap-carry-forward"
 CAPW_VM="$SCRATCH/vm-cap-write"
 mkdir -p "$CAPW_VM/sccache"
 printf 'object\n' >"$CAPW_VM/sccache/some-cached-object"
-( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CAPW_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-capw" \
+( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CAPW_VM" \
     FREECELL_SCCACHE_CACHE_SIZE=20G bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
 expect_contains "the baked cap is recorded" "$(cat "$CAPW_VM/$MARKER_NAME")" "sccache_max_size=20G"
-( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CAPW_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-capw" \
+( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CAPW_VM" \
     bash "$WARM_ISOLATED/setup_env.sh" --upgrade-tools --best-effort ) >/dev/null 2>&1
 expect_contains "and a repair run carries it forward, not the default" \
   "$(cat "$CAPW_VM/$MARKER_NAME")" "sccache_max_size=20G"
@@ -580,7 +581,7 @@ setup_version=2
 sccache_warmed=true
 sccache_warm_commit=cafef00d
 MARKER
-( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$HOLLOW_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-hollow" \
+( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$HOLLOW_VM" \
     bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
 marker="$(cat "$HOLLOW_VM/$MARKER_NAME")"
 expect_contains "a directory with no files does not carry 'warmed' forward" "$marker" "sccache_warmed=false"
@@ -589,157 +590,11 @@ expect_not_contains "nor the commit it claimed" "$marker" "cafef00d"
 start "marker/empty-cache"
 # The opposite trap: a directory this run merely created is not a cache of unknown origin.
 EMPTY_VM="$SCRATCH/vm-empty-cache"
-( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$EMPTY_VM" CLAUDE_CONFIG_DIR="$SCRATCH/cfg-empty" \
+( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$EMPTY_VM" \
     bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
 marker="$(cat "$EMPTY_VM/$MARKER_NAME" 2>/dev/null)"
 expect_contains "an empty cache dir reports as not warmed" "$marker" "sccache_warmed=false"
 expect_contains "with no commit claimed" "$marker" "sccache_warm_commit=none"
-
-# ---------------------------------------------------------------------------------
-echo ""
-echo "setup_env.sh --create-startup-script — the settings.json merge"
-# ---------------------------------------------------------------------------------
-# Run from a copy outside any checkout, so PROJECT_ROOT is empty and setup_env skips its
-# repo-specific steps (system deps, cargo fetch). This isolates the hook registration.
-ISOLATED="$SCRATCH/isolated"
-mkdir -p "$ISOLATED"
-cp "$SETUP_ENV" "$ISOLATED/setup_env.sh"
-
-run_register() { # run_register <config-dir> <vm-dir> [merge-tool]
-  ( cd "$ISOLATED" &&
-    CLAUDE_CONFIG_DIR="$1" FREECELL_VM_SETUP_DIR="$2" \
-      FREECELL_SETTINGS_MERGE_TOOL="${3:-auto}" \
-      bash "$ISOLATED/setup_env.sh" --create-startup-script --best-effort 2>&1 )
-}
-entry_count() { # entry_count <settings-file>
-  # grep -c prints 0 AND exits 1 when nothing matches, so a `|| echo 0` fallback would
-  # emit two lines and break every numeric comparison downstream.
-  local n
-  n="$(grep -c 'freecell_session_start_hook.sh' "$1" 2>/dev/null)"
-  printf '%s' "${n:-0}"
-}
-
-for tool in jq python3; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    start "merge[$tool]"
-    skip "$tool is not installed"
-    continue
-  fi
-
-  start "merge[$tool]/fresh"
-  CFG="$SCRATCH/cfg-$tool-fresh"
-  VM="$SCRATCH/vm-$tool-fresh"
-  run_register "$CFG" "$VM" "$tool" >/dev/null
-  expect "creates the settings file" test -f "$CFG/settings.json"
-  expect "the result is valid JSON" python3 -c "import json,sys; json.load(open('$CFG/settings.json'))"
-  expect "registers exactly one entry" test "$(entry_count "$CFG/settings.json")" -eq 1
-  registered="$(cat "$CFG/settings.json")"
-  expect_contains "with the context-preserving matcher" "$registered" '"matcher": "startup|resume|fork"'
-  expect_contains "and a generous timeout" "$registered" '"timeout": 600'
-  expect "the shim is executable" test -x "$VM/freecell_session_start_hook.sh"
-
-  start "merge[$tool]/idempotent"
-  before="$(cat "$CFG/settings.json")"
-  out="$(run_register "$CFG" "$VM" "$tool")"
-  after="$(cat "$CFG/settings.json")"
-  expect "a second run leaves the file byte-identical" test "$before" = "$after"
-  expect_contains "and says so" "$out" "already registered"
-
-  start "merge[$tool]/coexists"
-  CFG2="$SCRATCH/cfg-$tool-other"
-  mkdir -p "$CFG2"
-  cat >"$CFG2/settings.json" <<'JSON'
-{
-  "model": "opusmagnum",
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          { "type": "command", "command": "/usr/local/bin/somebody-elses-hook.sh" }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "/usr/local/bin/audit.sh" }]
-      }
-    ]
-  },
-  "note": "ünïcode stays raw"
-}
-JSON
-  run_register "$CFG2" "$VM" "$tool" >/dev/null
-  merged="$(cat "$CFG2/settings.json")"
-  expect_contains "another SessionStart hook survives" "$merged" "somebody-elses-hook.sh"
-  expect_contains "an unrelated hook group survives" "$merged" "audit.sh"
-  expect_contains "unrelated settings survive" "$merged" "opusmagnum"
-  expect_contains "non-ASCII is not re-escaped" "$merged" "ünïcode"
-  expect "our entry is added once" test "$(entry_count "$CFG2/settings.json")" -eq 1
-
-  start "merge[$tool]/moved"
-  # A moved VM_SETUP_DIR must REPLACE the old entry, not add a second one, and the group
-  # left empty by that removal goes with it.
-  VM_MOVED="$SCRATCH/vm-$tool-moved"
-  run_register "$CFG2" "$VM_MOVED" "$tool" >/dev/null
-  expect "still exactly one entry after the move" test "$(entry_count "$CFG2/settings.json")" -eq 1
-  moved="$(cat "$CFG2/settings.json")"
-  expect_contains "pointing at the new location" "$moved" "$VM_MOVED/freecell_session_start_hook.sh"
-  expect_not_contains "and not the old one" "$moved" "$VM/freecell_session_start_hook.sh"
-  expect_contains "the unrelated SessionStart hook is still there" "$moved" "somebody-elses-hook.sh"
-
-  start "merge[$tool]/malformed"
-  CFG3="$SCRATCH/cfg-$tool-bad"
-  mkdir -p "$CFG3"
-  printf '{ this is not json\n' >"$CFG3/settings.json"
-  before="$(cat "$CFG3/settings.json")"
-  out="$(run_register "$CFG3" "$VM" "$tool")"
-  expect "malformed settings are left exactly as they were" test "$before" = "$(cat "$CFG3/settings.json")"
-  expect_contains "and the refusal is reported" "$out" "refusing to modify"
-
-  start "merge[$tool]/wrong-shape"
-  CFG4="$SCRATCH/cfg-$tool-shape"
-  mkdir -p "$CFG4"
-  printf '{"hooks": {"SessionStart": "not-an-array"}}\n' >"$CFG4/settings.json"
-  before="$(cat "$CFG4/settings.json")"
-  run_register "$CFG4" "$VM" "$tool" >/dev/null
-  expect "a non-array hooks.SessionStart is refused, not rewritten" \
-    test "$before" = "$(cat "$CFG4/settings.json")"
-
-  start "merge[$tool]/empty-file"
-  CFG5="$SCRATCH/cfg-$tool-empty"
-  mkdir -p "$CFG5"
-  : >"$CFG5/settings.json"
-  run_register "$CFG5" "$VM" "$tool" >/dev/null
-  expect "an empty settings file gets the entry" test "$(entry_count "$CFG5/settings.json")" -eq 1
-done
-
-if command -v jq >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-  start "merge/agreement"
-  # Two implementations of one contract only stay in agreement if something checks.
-  A="$SCRATCH/cfg-agree-jq"; B="$SCRATCH/cfg-agree-py"
-  mkdir -p "$A" "$B"
-  cat >"$A/settings.json" <<'JSON'
-{
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "/opt/old/freecell_session_start_hook.sh" }] },
-      { "hooks": [{ "type": "command", "command": "/usr/local/bin/keep-me.sh" }] }
-    ]
-  }
-}
-JSON
-  cp "$A/settings.json" "$B/settings.json"
-  VM_AGREE="$SCRATCH/vm-agree"
-  run_register "$A" "$VM_AGREE" jq >/dev/null
-  run_register "$B" "$VM_AGREE" python3 >/dev/null
-  expect "jq and python3 produce identical output" \
-    test "$(cat "$A/settings.json")" = "$(cat "$B/settings.json")"
-  expect_contains "both drop the group they emptied and keep the other" \
-    "$(cat "$A/settings.json")" "keep-me.sh"
-  expect_not_contains "neither keeps the stale shim path" \
-    "$(cat "$A/settings.json")" "/opt/old/freecell_session_start_hook.sh"
-fi
 
 # ---------------------------------------------------------------------------------
 echo ""
@@ -773,23 +628,6 @@ shim_out="$(CLAUDE_PROJECT_DIR="$SCRATCH/unrelated" \
   bash "$PROJECT_ROOT/.claude/hooks/session-start.sh" 2>&1)"
 expect_status "a session in an unrelated tree is untouched" 0 "$?"
 expect "and says nothing at all" test -z "$shim_out"
-
-start "shim/parity"
-# .claude/hooks/session-start.sh and the heredoc in setup_env.sh must not drift: they are
-# the same hook in two homes, and only one of them is exercised on any given machine.
-generated="$SCRATCH/shim-generated.sh"
-sed -n "/^  cat >\"\$staged\" <<'SHIM'\$/,/^SHIM\$/p" "$SETUP_ENV" | sed '1d;$d' >"$generated"
-expect "the generated shim is non-empty" test -s "$generated"
-# The shebang is kept, not stripped as a comment: a generated shim that lost it would
-# otherwise pass parity and then be run by whatever shell happened to pick it up.
-shim_signature() {
-  head -1 "$1"
-  tail -n +2 "$1" | grep -v '^#' | grep -v '^$'
-}
-expect "both shims share one implementation" \
-  test "$(shim_signature "$generated")" = "$(shim_signature "$PROJECT_ROOT/.claude/hooks/session-start.sh")"
-expect "and the generated one keeps its shebang" \
-  test "$(head -1 "$generated")" = "#!/usr/bin/env bash"
 
 # ---------------------------------------------------------------------------------
 echo ""

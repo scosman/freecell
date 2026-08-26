@@ -55,11 +55,9 @@ fi
 # caches from main — the one combination guaranteed to mislead.
 export FREECELL_SETUP_REF="$REF"
 
-# --create-startup-script is deliberately NOT passed. In this repo the SessionStart hook
-# is committed source (.claude/settings.json + .claude/hooks/session-start.sh), so it needs
-# no machine-global registration and cannot drift from the checkout. setup_env.sh still
-# implements the flag as belt-and-braces for a machine where the project hook is not
-# trusted; see .config/utils/claude_cloud_setup.md.
+# Nothing here registers a SessionStart hook, and setup_env.sh has no flag that does. In this
+# repo the hook is committed source (.claude/settings.json + .claude/hooks/session-start.sh),
+# so version control registers it and it cannot drift from the checkout.
 bash "$script" \
   --upgrade-tools \
   --best-effort \

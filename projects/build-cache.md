@@ -163,6 +163,25 @@ There is also no background pre-fetch. The previous design detached a `cargo fet
 session start, which raced the agent's first build every time; a warm image makes it
 unnecessary.
 
+## Hook registration is version control's job, not a script's
+
+`.claude/settings.json` and `.claude/hooks/session-start.sh` are **committed source** here, so
+the SessionStart hook is registered by checking the repo out. Nothing in `.config/utils/`
+writes to `~/.claude`.
+
+This is worth stating because the design brief this work came from specifies a
+`--create-startup-script` flag that writes a machine-global copy of the hook and merges an
+entry into the user's `settings.json`. That flag was carried over from a repo where `.claude/`
+is *generated and gitignored*, so a script is the only thing that can register the hook. It
+was implemented here, then deleted: keeping it meant maintaining two implementations of one
+JSON-merge contract (jq and python3), plus a duplicated copy of the committed hook kept in
+agreement by roughly 150 lines of tests — none of it on any path this repo actually uses.
+
+On a machine that does not honor project hooks, add the entry by hand: a `SessionStart` group
+in `~/.claude/settings.json` with `"matcher": "startup|resume|fork"` whose `command` is
+`<checkout>/.claude/hooks/session-start.sh`. That file walks up to find the checkout, so it
+works from anywhere.
+
 ## Scope: dev containers ONLY — CI deliberately untouched
 
 GitHub CI keeps `Swatinem/rust-cache`, which works well there (persistent Actions cache, no
@@ -193,13 +212,12 @@ disk backend regardless.
 `bash .config/utils/test_setup_scripts.sh` covers the parts that took real reasoning: the
 container gate's falsy-value handling, the marker's effect on whether an unattributable
 cache directory is trusted, the marker's carry-forward rules across a repair run, the
-throwaway-clone lifecycle, and every rule of the optional user-`settings.json` merge — run
-through both the jq and python3 implementations and asserted to agree.
+throwaway-clone lifecycle, and the compile cache actually caching.
 
 What it will not do to the machine it runs on, asserted in its closing cases rather than
 assumed: no `apt-get` (`FREECELL_SKIP_SYSTEM_DEPS`, plus the absence of the render-env log),
 no binary written into a system `bin` directory (`FREECELL_SKIP_TOOL_INSTALL`), nothing under
-`/opt`, no edit to the real `~/.claude/settings.json`, no temp files outside its scratch dir,
+`/opt/freecell-vm-setup`, no temp files outside its scratch dir,
 and no interference with a running sccache server (it uses a private `SCCACHE_SERVER_PORT`).
 
 What it *does* do, because it runs the real scripts: `rustup toolchain install` for the pin,

@@ -38,11 +38,10 @@ set -uo pipefail
 UPGRADE_TOOLS=false          # --upgrade-tools
 BEST_EFFORT=false            # --best-effort
 WARM_CACHE=false             # --warm-cache
-CREATE_STARTUP_SCRIPT=false  # --create-startup-script
 HUMAN=false                  # --human
 
 # --- Constants --------------------------------------------------------------------
-# $HOME is referenced below (user settings, ~/.local/bin, ~/.cargo/bin) and `set -u` makes
+# $HOME is referenced below (~/.local/bin, ~/.cargo/bin) and `set -u` makes
 # an unset one a fatal error at line-read time — before argument parsing has even seen
 # --best-effort. As the script the pasted cloud wrapper runs, that would be precisely the
 # never-exit-non-zero failure the whole best-effort design exists to prevent, so HOME is
@@ -73,10 +72,6 @@ VM_SETUP_DIR="${FREECELL_VM_SETUP_DIR:-/opt/freecell-vm-setup}"
 # quietly retrofitted onto images that never ran it.
 VM_SETUP_MARKER="$VM_SETUP_DIR/.setup_for_freecell_repo_v2"
 SCCACHE_DISK_DIR="$VM_SETUP_DIR/sccache"
-STARTUP_HOOK_SHIM="$VM_SETUP_DIR/freecell_session_start_hook.sh"
-# CLAUDE_CONFIG_DIR is what Claude Code itself honors; respecting it is both correct and
-# what makes hook registration testable without touching a real ~/.claude.
-CLAUDE_USER_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 
 # sccache's disk cache is content-addressed and immutable, so sharing one directory
 # across every session on this machine is safe by construction, and it is
@@ -151,11 +146,6 @@ Options:
                             clone the repo to a throwaway directory first. Fills
                             ~/.cargo/{registry,git} and the sccache disk cache, then
                             deletes the clone (its target/ included).
-  --create-startup-script   Write a SessionStart hook shim under the machine-global
-                            directory and register it in Claude Code's USER settings.
-                            OFF by default, and not used by the cloud wrapper: this repo
-                            ships a committed project-level hook instead. Belt-and-braces
-                            for a machine where the project hook is not trusted.
   --human                   Contributor mode for a personal machine: install the pinned
                             toolchain and warm the dependency sources, offer the optional
                             render-test system dependencies, and write nothing outside
@@ -175,9 +165,12 @@ over the network):
                                directory (sccache, cargo-deny)
   FREECELL_SKIP_SYSTEM_DEPS    set to never run the apt install in
                                app/render-tests/scripts/setup_render_env.sh
-  CLAUDE_CONFIG_DIR            default $HOME/.claude
-  FREECELL_SETTINGS_MERGE_TOOL jq | python3 | auto (default) — which implementation
-                               merges the user settings.json for --create-startup-script
+
+This script does NOT register a SessionStart hook. FreeCell's hook is committed source
+(.claude/settings.json -> .claude/hooks/session-start.sh), so version control registers it.
+On a machine that does not honor project hooks, add an entry to ~/.claude/settings.json by
+hand: a SessionStart group with "matcher": "startup|resume|fork" whose command is
+<checkout>/.claude/hooks/session-start.sh.
 USAGE
 }
 
@@ -190,7 +183,6 @@ while [ $# -gt 0 ]; do
     --upgrade-tools) UPGRADE_TOOLS=true ;;
     --best-effort) BEST_EFFORT=true ;;
     --warm-cache) WARM_CACHE=true ;;
-    --create-startup-script) CREATE_STARTUP_SCRIPT=true ;;
     --human) HUMAN=true ;;
     -h | --help) usage; exit 0 ;;
     *) UNKNOWN_ARGS+=("$1") ;;
@@ -206,7 +198,6 @@ fi
 # --human is a personal machine: nothing machine-global, nothing snapshot-shaped.
 if [ "$HUMAN" = true ]; then
   WARM_CACHE=false
-  CREATE_STARTUP_SCRIPT=false
 fi
 
 # --- Helpers ----------------------------------------------------------------------
@@ -661,264 +652,7 @@ if [ -n "$THROWAWAY_CLONE" ]; then
   REFERENCE_TREE=""
 fi
 
-# --- (h) Optional: a user-level SessionStart hook ---------------------------------
-# Off by default and unused by the cloud wrapper. This repo's SessionStart hook is
-# COMMITTED (.claude/settings.json + .claude/hooks/session-start.sh), which is strictly
-# better here: it is version-controlled with the script it runs, it cannot hit the "a shim
-# on disk is not a registered hook" trap, and it is immune to an image that builds as one
-# user and runs sessions as another ($HOME resolves at build time; on this image HOME is
-# /root while the checkout lives under /home/user).
-#
-# The flag exists for a machine where the project hook is not trusted or not present.
-STARTUP_HOOK_REGISTERED=false
-
-write_startup_shim() {
-  mkdir -p "$VM_SETUP_DIR" || { note "could not create $VM_SETUP_DIR; not writing the hook shim."; return 1; }
-  local staged="$STARTUP_HOOK_SHIM.$$"
-  # Staged and renamed: a session starting mid-write would otherwise run half a shell
-  # script. KEEP IN SYNC with .claude/hooks/session-start.sh — same behavior, different
-  # home (that one lives in the checkout, this one has to find a checkout).
-  cat >"$staged" <<'SHIM'
-#!/usr/bin/env bash
-# Claude Code SessionStart hook. Written by .config/utils/setup_env.sh
-# --create-startup-script and registered in the user settings.json.
-#
-# The hook fires at the start of every session on this machine, whatever repo the session
-# is for, so this does nothing unless it can find a FreeCell checkout.
-set -u
-
-# CLAUDE_PROJECT_DIR is set for SessionStart hooks, and is the session's working directory
-# — not necessarily the root of the checkout, hence the walk upward. Resolved to an
-# absolute path first, so a relative one walks the real tree. The walk stops when a
-# directory is its own parent ("/" and "."), so it cannot spin.
-dir="${CLAUDE_PROJECT_DIR:-$PWD}"
-dir="$(cd "$dir" 2>/dev/null && pwd)" || dir="$PWD"
-while [ ! -f "$dir/.config/utils/setup_startup.sh" ]; do
-  parent="$(dirname "$dir")"
-  [ "$parent" = "$dir" ] && exit 0
-  dir="$parent"
-done
-script="$dir/.config/utils/setup_startup.sh"
-
-# A SessionStart hook's stdout becomes context for the session and its stderr does not, so
-# both streams are captured and printed together: a failure the agent never sees is worse
-# than no hook at all. Always exit 0 — this must never be the reason a session fails to
-# start. stdin is the hook's event JSON; nothing here reads it.
-#
-# Capped, because this text is spent from the session's context window: the normal run is
-# ~15 lines, but a failing resolution or build can be enormous, and the tail of such
-# output is where the reason is.
-output="$(bash "$script" 2>&1 </dev/null)"
-status=$?
-# Substring expansion rather than `head -c`/`tail -c`: those count bytes while ${#output}
-# counts characters, and a byte cut lands mid-sequence on the multibyte glyphs these
-# scripts emit (✗, !, em-dashes) — garbling the very text a human is squinting at.
-if [ "${#output}" -gt 4000 ]; then
-  output="${output:0:1500}
-[...trimmed. Re-run .config/utils/setup_startup.sh to see all of it...]
-${output: -2000}"
-fi
-[ -n "$output" ] && printf '%s\n' "$output"
-[ "$status" -ne 0 ] &&
-  printf '%s\n' "($script exited $status. Fix the above before building or testing.)"
-exit 0
-SHIM
-  chmod 755 "$staged" || { rm -f "$staged"; return 1; }
-  mv -f "$staged" "$STARTUP_HOOK_SHIM" || { rm -f "$staged"; return 1; }
-  return 0
-}
-
-# Merge our one entry into the user's settings.json. NEVER overwrite, never with sed: that
-# file holds machine-wide settings, and replacing it disables them silently.
-register_startup_hook() {
-  local shim_base merged current settings_dir staged
-  shim_base="$(basename "$STARTUP_HOOK_SHIM")"
-  settings_dir="$(dirname "$CLAUDE_USER_SETTINGS")"
-  mkdir -p "$settings_dir" || { note "could not create $settings_dir; hook not registered."; return 1; }
-  current='{}'
-  if [ -e "$CLAUDE_USER_SETTINGS" ]; then
-    if [ ! -r "$CLAUDE_USER_SETTINGS" ]; then
-      note "$CLAUDE_USER_SETTINGS is not readable; refusing to touch it. Hook not registered."
-      return 1
-    fi
-    current="$(cat "$CLAUDE_USER_SETTINGS")"
-    # An empty file is not valid JSON, and feeding jq an empty stream yields an empty
-    # result with exit 0 — which would read as "already registered" and install nothing.
-    [ -n "$(printf '%s' "$current" | tr -d '[:space:]')" ] || current='{}'
-  fi
-
-  if ! merged="$(printf '%s' "$current" | merge_hook_entry "$STARTUP_HOOK_SHIM" "$shim_base")"; then
-    # Repairing someone's malformed settings is not this script's business, and
-    # truncating them is worse than not installing the hook.
-    note "refusing to modify $CLAUDE_USER_SETTINGS (see the reason above). Hook not registered."
-    return 1
-  fi
-
-  if [ "$merged" = "$current" ]; then
-    echo "    already registered in $CLAUDE_USER_SETTINGS"
-    return 0
-  fi
-
-  # Staged sibling + rename, preserving the original mode. A redirect onto the file itself
-  # truncates before it writes, so a failed write would leave the machine's settings empty.
-  staged="$(mktemp "$settings_dir/settings.json.XXXXXX")" || return 1
-  printf '%s\n' "$merged" >"$staged" || { rm -f "$staged"; return 1; }
-  if [ -f "$CLAUDE_USER_SETTINGS" ]; then
-    chmod --reference="$CLAUDE_USER_SETTINGS" "$staged" 2>/dev/null || chmod 644 "$staged"
-  else
-    chmod 644 "$staged"
-  fi
-  mv -f "$staged" "$CLAUDE_USER_SETTINGS" || { rm -f "$staged"; return 1; }
-  echo "    registered in $CLAUDE_USER_SETTINGS"
-  return 0
-}
-
-# The python3 implementation of the settings merge (see merge_hook_entry below for the
-# rules it enforces). Held in a variable so it can be handed to `python3 -c`.
-# `read -d ''` always ends at EOF, so it returns 1 even on success; `|| true` keeps that
-# from looking like a failure to anyone reading with `set -x`.
-read -r -d '' MERGE_SETTINGS_PY <<'PY' || true
-import json, os, sys
-
-entry = json.loads(os.environ["FREECELL_HOOK_ENTRY"])
-base = os.environ["FREECELL_HOOK_BASE"]
-raw = sys.stdin.read()
-
-try:
-    settings = json.loads(raw)
-except Exception as exc:
-    print("%s is not valid JSON: %s" % ("settings.json", exc), file=sys.stderr)
-    sys.exit(1)
-if not isinstance(settings, dict):
-    print("settings root is not a JSON object", file=sys.stderr)
-    sys.exit(1)
-hooks = settings.get("hooks", {})
-if not isinstance(hooks, dict):
-    print('"hooks" is not an object', file=sys.stderr)
-    sys.exit(1)
-groups = hooks.get("SessionStart", [])
-if not isinstance(groups, list):
-    print('"hooks.SessionStart" is not an array', file=sys.stderr)
-    sys.exit(1)
-
-kept_groups = []
-for group in groups:
-    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
-        kept_groups.append(group)
-        continue
-    kept = [h for h in group["hooks"]
-            if base not in str(h.get("command", "") if isinstance(h, dict) else "")]
-    if len(kept) == len(group["hooks"]):
-        kept_groups.append(group)
-    elif kept:
-        group["hooks"] = kept
-        kept_groups.append(group)
-    # else: a group we emptied goes with our entry.
-kept_groups.append(entry)
-
-hooks["SessionStart"] = kept_groups
-settings["hooks"] = hooks
-# ensure_ascii=False: the contract is that this touches nothing but our entry, and the
-# default would rewrite every non-ASCII character in someone else's setting as an escape.
-sys.stdout.write(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-PY
-
-# Reads settings JSON on stdin, writes the merged JSON on stdout, exits non-zero (with a
-# reason on stderr) rather than emitting anything when the input is not something we are
-# willing to edit. jq preferred; python3 as the fallback; neither present is a skip.
-#
-# The rules, all of which matter:
-#   - Identify our own entry by the shim's repo-specific BASENAME appearing in the command
-#     string, so re-running is idempotent and a moved VM_SETUP_DIR replaces its old entry
-#     rather than adding a second one.
-#   - Drop our entry wherever it is, then append exactly one.
-#   - A group WE emptied goes with it; a group holding other hooks keeps them; a group
-#     that was already empty is left alone (we touch nothing but our own entry).
-#   - Key order is preserved and non-ASCII is emitted raw, so the diff is our entry only.
-merge_hook_entry() {
-  local shim="$1" base="$2"
-  # FREECELL_SETTINGS_MERGE_TOOL forces one implementation. Both are maintained, and an
-  # untested fallback is a liability, so .config/utils/test_setup_scripts.sh runs the same
-  # cases through each and asserts they agree.
-  local merge_tool="${FREECELL_SETTINGS_MERGE_TOOL:-auto}"
-  local entry command_json
-  if [ "$merge_tool" != python3 ] && have jq; then
-    command_json="$(printf '%s' "$shim" | jq -Rs .)"
-  else
-    command_json="$(printf '%s' "$shim" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
-  fi
-  # matcher deliberately excludes "clear" and "compact": SessionStart fires on those too,
-  # and this hook's output is spent from the context window — re-running it on every
-  # compaction of a long session re-injects it for no gain, since the checkout is already
-  # prepared. "fork" is included because a forked session can start on a filesystem this
-  # has not run on. The generous timeout covers a VM with a cold cache.
-  entry="$(printf '{"matcher":"startup|resume|fork","hooks":[{"type":"command","command":%s,"timeout":600,"statusMessage":"Preparing the FreeCell checkout"}]}' "$command_json")"
-
-  if [ "$merge_tool" != python3 ] && have jq; then
-    local jq_err
-    jq_err="$(mktemp)" || return 1
-    jq --argjson entry "$entry" --arg base "$base" '
-      if type != "object" then error("settings root is not a JSON object")
-      elif (has("hooks") and (.hooks | type) != "object") then error("\"hooks\" is not an object")
-      elif ((.hooks // {}) | has("SessionStart")) and ((.hooks.SessionStart | type) != "array")
-        then error("\"hooks.SessionStart\" is not an array")
-      else
-        (.hooks //= {})
-        | (.hooks.SessionStart //= [])
-        | .hooks.SessionStart = ([
-            .hooks.SessionStart[]
-            | . as $group
-            | (if (($group | type) == "object") and (($group.hooks | type) == "array")
-               then [ $group.hooks[] | select(((.command? // "") | tostring | contains($base)) | not) ]
-               else null end) as $kept
-            | if $kept == null then $group
-              elif ($kept | length) == ($group.hooks | length) then $group
-              elif ($kept | length) == 0 then empty
-              else $group | .hooks = $kept
-              end
-          ] + [$entry])
-      end
-    ' 2>"$jq_err"
-    local status=$? reason
-    if [ "$status" -ne 0 ]; then
-      reason="$(head -2 "$jq_err" 2>/dev/null)"
-      note "${reason:-jq could not parse $CLAUDE_USER_SETTINGS}"
-      rm -f "$jq_err"
-      return 1
-    fi
-    rm -f "$jq_err"
-    return 0
-  fi
-
-  if [ "$merge_tool" != jq ] && have python3; then
-    # `python3 - <<'PY'` would redirect stdin to the heredoc, so the settings JSON piped
-    # into this function would never reach sys.stdin — the program has to arrive by -c.
-    FREECELL_HOOK_ENTRY="$entry" FREECELL_HOOK_BASE="$base" python3 -c "$MERGE_SETTINGS_PY"
-    return $?
-  fi
-
-  if [ "$merge_tool" != auto ]; then
-    note "FREECELL_SETTINGS_MERGE_TOOL=$merge_tool, but $merge_tool is not installed; cannot merge JSON settings."
-  else
-    note "neither jq nor python3 is available; cannot safely merge JSON settings."
-  fi
-  return 1
-}
-
-if [ "$CREATE_STARTUP_SCRIPT" = true ]; then
-  step "SessionStart hook shim"
-  if write_startup_shim; then
-    echo "    wrote $STARTUP_HOOK_SHIM"
-    # A shim on disk is NOT a hook. Only flag it installed once registration succeeded —
-    # the marker reports this flag, and naming the shim on a VM where registration was
-    # refused sends whoever is debugging to the wrong file.
-    register_startup_hook && STARTUP_HOOK_REGISTERED=true
-  else
-    note "could not write $STARTUP_HOOK_SHIM."
-  fi
-fi
-
-# --- (i) The provisioning marker, written last ------------------------------------
+# --- (h) The provisioning marker, written last ------------------------------------
 # It is for a human reading a broken VM, not for parsing. Its PRESENCE is what
 # setup_startup.sh checks; its contents are what a person needs when that check fires.
 write_marker() {
@@ -1002,7 +736,7 @@ sccache_warm_commit=${warm_commit:-none}
 cargo_sources_warmed=$CARGO_CACHE_WARMED
 cargo_deny_version=$cargo_deny_v
 render_env_installed=$RENDER_ENV_INSTALLED
-session_start_hook=$([ "$STARTUP_HOOK_REGISTERED" = true ] && echo "$STARTUP_HOOK_SHIM" || echo "(project-level .claude/hooks/session-start.sh)")
+session_start_hook=(committed: .claude/settings.json -> .claude/hooks/session-start.sh)
 MARKER
 )"
   write_atomic "$VM_SETUP_MARKER" "$content
@@ -1016,7 +750,7 @@ if [ "$HUMAN" = false ]; then
   write_marker
 fi
 
-# --- (j) Close ---------------------------------------------------------------------
+# --- (i) Close ---------------------------------------------------------------------
 echo ""
 if [ "$HUMAN" = true ]; then
   finish "Local setup complete. Build with: cd app && cargo build --workspace"

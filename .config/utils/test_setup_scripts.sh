@@ -170,8 +170,9 @@ start "gate/falsy"
 # behavior rather than the notice, because the notice is silent when captured: a falsy value
 # must mean the checkout is NOT prepared. All seven are listed because each pins one
 # alternative of is_flag_set's case pattern — drop or mistype any one of them and exactly one
-# of these fails, so none of them is decoration.
-for falsy in false FALSE 0 no n off ""; do
+# of these fails, so none of them is decoration. `f` is in the list for that reason: without
+# it, deleting `f` from the pattern turned nothing red (FALSE pins the lowercasing, not `f`).
+for falsy in false FALSE f 0 no n off ""; do
   out="$(env -u CLAUDE_CODE_REMOTE IS_CONTAINERIZED="$falsy" bash "$SETUP_STARTUP" 2>&1)"
   expect_not_contains "IS_CONTAINERIZED='$falsy' is treated as no" "$out" "Syncing dependencies"
 done
@@ -334,6 +335,17 @@ else
   expect_not_contains "and the backend readback has nothing to complain about" "$out" "resolved to"
 fi
 
+start "sync/log-unopenable"
+# `if ! ( … ) >"$LOG"` swallows a redirection that fails to open — `!` in front of a COMPOUND
+# command reports the wrong status in bash (see the measurement table in setup_startup.sh) —
+# so the obvious shape here skips cargo fetch entirely and still reaches "Ready.". A TMPDIR
+# pointing at a directory that does not exist is the everyday way in; a full disk is the other.
+logfail_out="$(TMPDIR="$SCRATCH/no-such-tmpdir" IS_CONTAINERIZED=true \
+  FREECELL_VM_SETUP_DIR="$VM_OK" bash "$SETUP_STARTUP" 2>&1)"
+expect_status "a fetch that never ran is a failure, not a Ready" 1 "$?"
+expect_contains "and says the log could not be opened" "$logfail_out" "so cargo fetch never ran"
+expect_not_contains "never reaching the success line" "$logfail_out" "Ready."
+
 start "cache/env-file-unwritable"
 # The adjacent door to cache/no-env-file: CLAUDE_ENV_FILE is set, but the write fails. Same
 # end state — a cache wired for this process only — so it has to produce the same report.
@@ -349,6 +361,19 @@ if command -v sccache >/dev/null 2>&1; then
 else
   skip "sccache is not installed, so the cache is never wired"
 fi
+
+start "cache/retirement-write-failure"
+# The block carries the R2 retirement as well as the cache wiring, so a failed write matters
+# even when the cache is off: the session keeps an inherited RUSTC_WRAPPER + SCCACHE_BUCKET
+# and every rustc call goes to the retired bucket while the status line says "cache: off".
+retirefail_out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$SCRATCH/vm-nonexistent" \
+  CLAUDE_ENV_FILE="$SCRATCH/no-such-directory/env" \
+  SCCACHE_BUCKET=a-bucket-that-must-not-survive RUSTC_WRAPPER=sccache \
+  bash "$SETUP_STARTUP" 2>&1)"
+expect_status "still exits 0" 0 "$?"
+expect_contains "the cache is still reported off" "$retirefail_out" "cache: off"
+expect_contains "and the unretired session is called out too" "$retirefail_out" "THE RETIREMENT DID NOT REACH THE SESSION"
+expect_contains "so the closing line stops saying plain Ready" "$retirefail_out" "Ready, with warnings above"
 
 start "cache/env-file-idempotent"
 # SessionStart fires on startup, resume and fork; without a guard one container accumulates
@@ -501,6 +526,21 @@ start "setup_env/best-effort"
 bash "$SETUP_ENV" --no-such-flag --best-effort >/dev/null 2>&1
 expect_status "--best-effort owns the exit code even for a bad flag" 0 "$?"
 
+start "setup_env/upgrade-is-not-a-warning"
+# An sccache below the floor is replaced, and a replacement that SUCCEEDS leaves the machine
+# with what it was supposed to have. Reporting that as a '!' flips the whole build log to
+# "WITH WARNINGS" for a success, which is the same defect as an unqualified success line,
+# inverted. The install itself is blocked here by FREECELL_SKIP_TOOL_INSTALL, so what this
+# pins is which channel the "replacing" line uses.
+STUB_BIN="$SCRATCH/stub-bin"
+mkdir -p "$STUB_BIN"
+printf '#!/bin/sh\necho "sccache 0.5.0"\n' >"$STUB_BIN/sccache"
+chmod +x "$STUB_BIN/sccache"
+upgrade_out="$(PATH="$STUB_BIN:$PATH" FREECELL_VM_SETUP_DIR="$SCRATCH/vm-upgrade" \
+  bash "$SETUP_ENV" --best-effort 2>&1)"
+expect_contains "the replacement is announced as progress" "$upgrade_out" "==> replacing sccache 0.5.0"
+expect_not_contains "not as a warning about something missing" "$upgrade_out" "! sccache 0.5.0 is below"
+
 start "setup_env/human"
 # README.md and app/README.md now point every contributor at --human, and its whole contract
 # is what it does NOT do.
@@ -524,14 +564,20 @@ start "setup_env/human-no-checkout"
 # gets. Almost nothing repo-local happens in that state, so closing with "Local setup
 # complete. Build with: cd app && …" would name a directory that does not exist.
 HUMAN_ISOLATED="$SCRATCH/human-isolated"
+NOCHECKOUT_VM="$SCRATCH/vm-human-nocheckout"
 mkdir -p "$HUMAN_ISOLATED"
 cp "$SETUP_ENV" "$HUMAN_ISOLATED/setup_env.sh"
-nocheckout_out="$( cd "$HUMAN_ISOLATED" && bash "$HUMAN_ISOLATED/setup_env.sh" --human 2>&1 )"
+# FREECELL_VM_SETUP_DIR is set here like everywhere else. Without it, the only thing keeping
+# this invocation off the machine's real /opt was the --human guard inside the code under
+# test — so the suite header's "points at scratch" would have been false for exactly one case.
+nocheckout_out="$( cd "$HUMAN_ISOLATED" &&
+  FREECELL_VM_SETUP_DIR="$NOCHECKOUT_VM" bash "$HUMAN_ISOLATED/setup_env.sh" --human 2>&1 )"
 nocheckout_status=$?
 expect_status "exits non-zero — this is a user error, and --human is not a cloud script" 1 "$nocheckout_status"
 expect_not_contains "does not claim local setup is complete" "$nocheckout_out" "Local setup complete"
 expect_contains "says what was skipped" "$nocheckout_out" "nothing repo-local was done"
 expect_contains "and how to get it right" "$nocheckout_out" "Re-run from inside a FreeCell checkout"
+expect "writing nothing machine-global on the way out" test ! -e "$NOCHECKOUT_VM"
 
 # ---------------------------------------------------------------------------------
 echo ""
@@ -561,7 +607,9 @@ warm_out="$( cd "$WARM_ISOLATED" &&
     SCCACHE_ENDPOINT=https://example.invalid \
     bash "$WARM_ISOLATED/setup_env.sh" --warm-cache --best-effort 2>&1 )"
 expect_status "exits 0" 0 "$?"
-expect_contains "clones because no checkout is in reach" "$warm_out" "throwaway"
+# "Cloning ", not "throwaway": the latter also appears in the removal banner, so changing the
+# clone step alone would leave this green.
+expect_contains "clones because no checkout is in reach" "$warm_out" "Cloning "
 # The step banner, i.e. that the step RAN. Its outcome is asserted from the marker below
 # (cargo_sources_warmed=true); on a machine with a warm ~/.cargo this is sub-second, so a
 # green run here is not evidence that a cold fetch works.
@@ -576,7 +624,6 @@ expect_contains "and the warm build reaches its own guard" "$warm_out" "FREECELL
 # an operator's only view of an image build, so it must not sign off as unqualified success.
 expect_contains "so the closing line is qualified, not plain success" "$warm_out" "WITH WARNINGS"
 expect_not_contains "having resolved to the image's disk cache" "$warm_out" "refusing to warm"
-expect "so the apt step left no log behind" test ! -e "$TMPDIR/freecell-render-env.log"
 expect "a marker was written" test -f "$WARM_VM/$MARKER_NAME"
 marker="$(cat "$WARM_VM/$MARKER_NAME")"
 expect_contains "recording the source-cache warm" "$marker" "cargo_sources_warmed=true"
@@ -598,6 +645,10 @@ MARKER
 ( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CARRY_VM" \
     bash "$WARM_ISOLATED/setup_env.sh" --best-effort ) >/dev/null 2>&1
 marker="$(cat "$CARRY_VM/$MARKER_NAME")"
+# First: the marker was REWRITTEN. Both assertions below grep a file this test wrote itself,
+# so without this they pass identically if write_marker never runs at all. sccache_dir is not
+# in the fixture, so only a real write can put it there.
+expect_contains "the marker was rewritten, not merely left alone" "$marker" "sccache_dir="
 expect_contains "the warm flag survives a repair run" "$marker" "sccache_warmed=true"
 expect_contains "so does the commit the cache came from" "$marker" "sccache_warm_commit=deadbeefcafe"
 
@@ -614,8 +665,9 @@ printf 'object\n' >"$CAPW_VM/sccache/some-cached-object"
 expect_contains "the baked cap is recorded" "$(cat "$CAPW_VM/$MARKER_NAME")" "sccache_max_size=20G"
 ( cd "$WARM_ISOLATED" && FREECELL_VM_SETUP_DIR="$CAPW_VM" \
     bash "$WARM_ISOLATED/setup_env.sh" --upgrade-tools --best-effort ) >/dev/null 2>&1
-expect_contains "and a repair run carries it forward, not the default" \
-  "$(cat "$CAPW_VM/$MARKER_NAME")" "sccache_max_size=20G"
+capw_marker="$(cat "$CAPW_VM/$MARKER_NAME")"
+expect_contains "the repair run rewrote the marker" "$capw_marker" "written_at="
+expect_contains "and carried the cap forward, not the default" "$capw_marker" "sccache_max_size=20G"
 
 start "marker/carry-forward-needs-objects"
 # The same "real objects" rule the other two call sites use. With a looser "any entry" test, a

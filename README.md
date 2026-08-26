@@ -56,9 +56,11 @@ cargo run -p freecell-app
 ```
 
 To set up a machine from scratch — the pinned Rust toolchain, the dependency sources, and
-(optionally) the Linux system packages the GPU renderer needs:
+(optionally) the Linux system packages the GPU renderer needs — run this **from the repository
+root**, not from `app/` (it refuses to do anything useful outside a checkout, and says so):
 
 ```sh
+cd /path/to/freecell
 bash .config/utils/setup_env.sh --human
 ```
 

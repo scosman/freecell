@@ -339,19 +339,28 @@ enable_compile_cache() {
 # `export X=Y` lines into it — so `unset` works there too. `|| true` keeps a consumer running
 # under `set -e` from tripping on it. Nothing written here is a secret; that is the point of
 # a local disk cache.
-# Without a usable env file, `export RUSTC_WRAPPER=sccache` reaches this process and nothing
-# else: every build the agent runs would be uncached while the closing line claimed a working
-# cache. There are two ways to get there — no env file named, or a named one that cannot be
-# written — and they degrade identically, so they share this.
-cache_reaches_this_process_only() { # $1 = what went wrong, as a clause
-  [ "$CACHE_ENABLED" = true ] || return 0
-  CACHE_STATUS="$CACHE_STATUS (THIS PROCESS ONLY — $1)"
-  warn "$1, so the compile-cache wiring cannot reach the session's shells; builds will be uncached. Fix: run this from the SessionStart hook, or export RUSTC_WRAPPER=sccache SCCACHE_DIR=$SCCACHE_DISK_DIR yourself."
+# Everything this script does for the session's LATER shells travels through the env file, so
+# not writing it has consequences whether the cache is on or off — and they are different
+# consequences, which is why both are reported. There are two ways to get here: no env file
+# named, or a named one that cannot be written.
+session_env_not_written() { # $1 = what went wrong, as a clause
+  if [ "$CACHE_ENABLED" = true ]; then
+    CACHE_STATUS="$CACHE_STATUS (THIS PROCESS ONLY — $1)"
+    warn "$1, so the compile-cache wiring cannot reach the session's shells; builds will be uncached. Fix: run this from the SessionStart hook, or export RUSTC_WRAPPER=sccache SCCACHE_DIR=$SCCACHE_DISK_DIR yourself."
+  else
+    # The block is not only cache wiring: it also carries the remote-backend retirement. With
+    # the cache off and the block unwritten, an inherited RUSTC_WRAPPER + SCCACHE_BUCKET stay
+    # live in the session, so every rustc call goes to the retired bucket while this script's
+    # status line says the cache is off — verbatim the regression the script-scope unset was
+    # added to close, reached through the other door.
+    CACHE_STATUS="$CACHE_STATUS; THE RETIREMENT DID NOT REACH THE SESSION — $1"
+    warn "$1, so the remote-backend retirement cannot reach the session's shells: an inherited RUSTC_WRAPPER/SCCACHE_BUCKET stays live and rustc calls will go to it even though the cache reports off. Fix: unset RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX yourself."
+  fi
 }
 
 persist_cache_env() {
   if [ -z "${CLAUDE_ENV_FILE:-}" ]; then
-    cache_reaches_this_process_only "CLAUDE_ENV_FILE is unset"
+    session_env_not_written "CLAUDE_ENV_FILE is unset"
     return 0
   fi
   local signature sentinel
@@ -371,9 +380,23 @@ persist_cache_env() {
   # Assembled first, then written by ONE simple command, because the append's status has to be
   # checked: an unwritable or missing path reaches the identical end state as an unset
   # CLAUDE_ENV_FILE — a cache wired for this process only — and bash's own "No such file or
-  # directory" on stderr is not a report anything acts on. The simple-command form is load
-  # bearing: a redirection failure on a `{ …; }` GROUP does not make the group return
-  # non-zero (measured on bash 5.2), so the obvious shape here silently swallows it.
+  # directory" on stderr is not a report anything acts on.
+  #
+  # The simple-command form is load bearing, and the reason is narrower than it looks.
+  # Measured on bash 5.2.21, for a redirection that fails to open:
+  #
+  #     { echo a; } >>/bad          -> $? is 1                       (detected)
+  #     if { echo a; } >>/bad       -> else branch                   (detected)
+  #     { echo a; } >>/bad || …     -> fires                         (detected)
+  #     if ! { echo a; } >>/bad     -> then branch NOT taken         (SWALLOWED)
+  #     if ! ( echo a ) >>/bad      -> then branch NOT taken         (SWALLOWED)
+  #     if ! printf x >>/bad        -> then branch taken             (detected)
+  #     if ! some_function >>/bad   -> then branch taken             (detected)
+  #
+  # So the anomaly is `!` applied to a COMPOUND command — a group or a subshell — not groups
+  # in general. `!` in front of a simple command or a function call reports correctly, and so
+  # does every form without `!`. Anywhere a compound command's redirection must be checked,
+  # run it bare and test `$?` (see the cargo fetch below and warm_sccache in setup_env.sh).
   local block
   block="$sentinel
 unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX || true"
@@ -386,8 +409,11 @@ export RUSTC_WRAPPER=sccache"
     block="$block
 unset RUSTC_WRAPPER || true"
   fi
-  if ! printf '%s\n' "$block" >>"$CLAUDE_ENV_FILE" 2>/dev/null; then
-    cache_reaches_this_process_only "the write to $CLAUDE_ENV_FILE failed"
+  # No `2>/dev/null` here: redirections are applied left to right, so `>>` fails before the
+  # stderr redirection is installed and bash's own message lands regardless. Suppressing it
+  # would only look like it worked, and the message names the path, which is useful.
+  if ! printf '%s\n' "$block" >>"$CLAUDE_ENV_FILE"; then
+    session_env_not_written "the write to $CLAUDE_ENV_FILE failed"
     return 0
   fi
 }
@@ -421,9 +447,23 @@ FETCH_LOG="${TMPDIR:-/tmp}/freecell-cargo-fetch.log"
 # unreachable bucket, a dead server — surfaces here as a fetch failure whose single named
 # repair would be `cargo update`. Handing an autonomous agent a lockfile-rewriting command
 # for a compile-cache fault is worse than no repair line at all.
-if ! ( cd "$CARGO_DIR" && RUSTC_WRAPPER='' cargo fetch --locked ${HOST_TRIPLE:+--target "$HOST_TRIPLE"} ) \
-  >"$FETCH_LOG" 2>&1; then
-  tail -15 "$FETCH_LOG" >&2
+#
+# Run bare with $? captured, NOT as `if ! ( … ) >"$FETCH_LOG"`: per the measurements above,
+# `!` in front of a subshell swallows a redirection that fails to open, so a TMPDIR pointing
+# at a directory that does not exist (or a full disk — target/ runs ~25 GB against ~29 GB
+# here) would skip the fetch entirely and still reach the "Ready." line.
+( cd "$CARGO_DIR" && RUSTC_WRAPPER='' cargo fetch --locked ${HOST_TRIPLE:+--target "$HOST_TRIPLE"} ) \
+  >"$FETCH_LOG" 2>&1
+FETCH_STATUS=$?
+if [ "$FETCH_STATUS" -ne 0 ]; then
+  tail -15 "$FETCH_LOG" 2>/dev/null >&2
+  # A log that could not be opened is its own failure, and a different one: nothing ran, so
+  # neither of the repairs below applies.
+  if [ ! -f "$FETCH_LOG" ]; then
+    bad_environment \
+      "could not open $FETCH_LOG, so cargo fetch never ran." \
+      "unset TMPDIR (or point it at a directory that exists), then re-run: bash .config/utils/setup_startup.sh"
+  fi
   # Belt and braces: if the cache still managed to be the cause, say so rather than blaming
   # the lockfile.
   if grep -qiE 'sccache|RUSTC_WRAPPER|cache storage' "$FETCH_LOG"; then

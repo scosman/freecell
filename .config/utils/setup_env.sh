@@ -136,13 +136,11 @@ finish() {
     fi
     exit 1
   fi
+  echo "$closing"
   if [ "$NOTED" -ne 0 ]; then
-    echo "$closing"
     echo "  ! WITH WARNINGS — every '!' line above is something this machine does not have."
     echo "    Read them before treating this image as provisioned."
-    exit 0
   fi
-  echo "$closing"
   exit 0
 }
 
@@ -459,8 +457,12 @@ if [ "$HUMAN" = false ]; then
   if have sccache; then
     sccache_version="$(version_of sccache --version)"
     if [ -n "$sccache_version" ] && ! version_ge "$sccache_version" "$SCCACHE_PIN"; then
-      note "sccache $sccache_version is below $SCCACHE_PIN; replacing it."
-      install_prebuilt_binary "$SCCACHE_URL" sccache || note "leaving sccache $sccache_version in place."
+      # `step`, not `note`: an upgrade that then SUCCEEDS leaves the machine with what it
+      # was supposed to have, and counting it as a warning flips the whole build log to
+      # "WITH WARNINGS" for a success. Only the failure below is a degradation.
+      step "replacing sccache $sccache_version (below the $SCCACHE_PIN floor)"
+      install_prebuilt_binary "$SCCACHE_URL" sccache ||
+        note "could not replace sccache $sccache_version; leaving it in place (below the $SCCACHE_PIN floor)."
     fi
   elif ! install_prebuilt_binary "$SCCACHE_URL" sccache; then
     note "no sccache on this machine; builds will work, just uncached."
@@ -671,8 +673,9 @@ fi
 # --- (h) The provisioning marker, written last ------------------------------------
 # It is for a human reading a broken VM, not for parsing. Its PRESENCE is what
 # setup_startup.sh checks; its contents are what a person needs when that check fires.
+# Called only from the non---human path (see its one call site): --human writes nothing
+# machine-global, and the call site owns that decision because it also owns the step banner.
 write_marker() {
-  [ "$HUMAN" = true ] && return 0
   mkdir -p "$VM_SETUP_DIR" || { note "could not create $VM_SETUP_DIR; no marker written."; return 1; }
 
   local sccache_present=false sccache_populated=false warm_commit warmed max_size

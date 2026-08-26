@@ -151,6 +151,29 @@ hook reaches the hook's own process and nothing else. When `CLAUDE_ENV_FILE` is 
 set to a path the write fails on — `setup_startup.sh` says so and degrades its status line to
 `(THIS PROCESS ONLY …)` rather than reporting a cache the session will never use.
 
+### One bash trap both scripts now depend on
+
+Checking that a redirection actually opened is not as simple as it looks. Measured on bash
+5.2.21, for `>>`/`>` to a path that cannot be opened:
+
+| form | result |
+|---|---|
+| `{ echo a; } >>/bad` (bare) | `$?` is 1 — **detected** |
+| `if { echo a; } >>/bad; then` | else branch — **detected** |
+| `{ echo a; } >>/bad \|\| …` | fires — **detected** |
+| `if ! { echo a; } >>/bad; then` | **SWALLOWED** |
+| `if ! ( echo a ) >>/bad; then` | **SWALLOWED** |
+| `if ! printf x >>/bad; then` | detected |
+| `if ! some_function >>/bad; then` | detected |
+
+The anomaly is **`!` applied to a compound command** — a group or a subshell — not groups in
+general: without `!`, every form reports correctly, and `!` in front of a simple command or a
+function call is fine too. So anywhere a compound command's redirection must be checked, these
+scripts run it bare and test `$?` (`warm_sccache` in `setup_env.sh`, the `cargo fetch` in
+`setup_startup.sh`), and where a single write is enough they use a simple command
+(`persist_cache_env`). Note also that `2>/dev/null` does not suppress the message: redirections
+are applied left to right, so `>>` fails before the stderr redirection is installed.
+
 The same rule governs the build-time script's closing line. `setup_env.sh` counts its own
 warnings and closes with `WITH WARNINGS` when there were any, because that log is an
 operator's only view of an image build and an unqualified "complete." after three degradations

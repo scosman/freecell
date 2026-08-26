@@ -344,7 +344,30 @@ logfail_out="$(TMPDIR="$SCRATCH/no-such-tmpdir" IS_CONTAINERIZED=true \
   FREECELL_VM_SETUP_DIR="$VM_OK" bash "$SETUP_STARTUP" 2>&1)"
 expect_status "a fetch that never ran is a failure, not a Ready" 1 "$?"
 expect_contains "and says the log could not be opened" "$logfail_out" "so cargo fetch never ran"
-expect_not_contains "never reaching the success line" "$logfail_out" "Ready."
+# "Ready", not "Ready.": with the bug present the script prints "Ready, with warnings above",
+# which does not contain the literal "Ready." — so the dot made this pass with the bug.
+expect_not_contains "never reaching the success line" "$logfail_out" "Ready"
+
+start "sync/failure-excerpt"
+# A `✗` line and a log PATH is not a diagnosis. `tail -15 "$LOG" 2>/dev/null >&2` discards the
+# excerpt entirely — redirections apply left to right, so fd 2 goes to /dev/null and then fd 1
+# is duped from it — and no assertion covered the excerpt, which is why that stayed green.
+FAKE_CARGO_BIN="$SCRATCH/fake-cargo-bin"
+mkdir -p "$FAKE_CARGO_BIN"
+cat >"$FAKE_CARGO_BIN/cargo" <<'FAKE_CARGO'
+#!/bin/sh
+case "$1" in
+  fetch) echo "SENTINEL_WHY_THE_FETCH_FAILED"; exit 101 ;;
+  *) exec "$REAL_CARGO" "$@" ;;
+esac
+FAKE_CARGO
+chmod +x "$FAKE_CARGO_BIN/cargo"
+excerpt_out="$(REAL_CARGO="$(command -v cargo)" PATH="$FAKE_CARGO_BIN:$PATH" \
+  IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$VM_OK" bash "$SETUP_STARTUP" 2>&1)"
+expect_status "a failing fetch fails the session" 1 "$?"
+expect_contains "and the log excerpt reaches the agent, not just the log path" \
+  "$excerpt_out" "SENTINEL_WHY_THE_FETCH_FAILED"
+expect_contains "alongside the repair" "$excerpt_out" "cargo update"
 
 start "cache/env-file-unwritable"
 # The adjacent door to cache/no-env-file: CLAUDE_ENV_FILE is set, but the write fails. Same
@@ -374,6 +397,32 @@ expect_status "still exits 0" 0 "$?"
 expect_contains "the cache is still reported off" "$retirefail_out" "cache: off"
 expect_contains "and the unretired session is called out too" "$retirefail_out" "THE RETIREMENT DID NOT REACH THE SESSION"
 expect_contains "so the closing line stops saying plain Ready" "$retirefail_out" "Ready, with warnings above"
+
+start "cache/retirement-write-failure-with-cache-on"
+# The two hazards are independent: with the cache ON and the block unwritten, an inherited
+# bucket is equally live. An if/else made them exclusive, and this branch then described the
+# builds as "uncached" when they would in fact be cached against a dead bucket.
+bothfail_out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$VM_OK" \
+  CLAUDE_ENV_FILE="$SCRATCH/no-such-directory/env" \
+  SCCACHE_BUCKET=a-bucket-that-must-not-survive RUSTC_WRAPPER=sccache \
+  bash "$SETUP_STARTUP" 2>&1)"
+if command -v sccache >/dev/null 2>&1; then
+  expect_contains "the cache half is reported" "$bothfail_out" "THIS PROCESS ONLY"
+  expect_contains "and the retirement half too, not instead" "$bothfail_out" "THE RETIREMENT DID NOT REACH THE SESSION"
+else
+  skip "sccache is not installed, so the cache is never wired"
+fi
+
+start "cache/retirement-quiet-when-nothing-inherited"
+# The mirror of the case above. With no remote-backend variables in the environment there is
+# nothing to retire, so warning about one names five no-op unsets and drags a healthy
+# machine's closing line down to "Ready, with warnings above".
+quiet_out="$(env -u RUSTC_WRAPPER -u SCCACHE_BUCKET -u SCCACHE_ENDPOINT -u SCCACHE_REGION \
+  -u SCCACHE_S3_KEY_PREFIX -u CLAUDE_ENV_FILE \
+  IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$SCRATCH/vm-nonexistent" \
+  bash "$SETUP_STARTUP" 2>&1)"
+expect_not_contains "nothing inherited means nothing to retire" "$quiet_out" "THE RETIREMENT DID NOT REACH"
+expect_contains "and the closing line stays clean" "$quiet_out" "Ready. "
 
 start "cache/env-file-idempotent"
 # SessionStart fires on startup, resume and fork; without a guard one container accumulates

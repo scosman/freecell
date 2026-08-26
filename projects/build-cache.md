@@ -163,12 +163,16 @@ Checking that a redirection actually opened is not as simple as it looks. Measur
 | `{ echo a; } >>/bad \|\| …` | fires — **detected** |
 | `if ! { echo a; } >>/bad; then` | **SWALLOWED** |
 | `if ! ( echo a ) >>/bad; then` | **SWALLOWED** |
+| `if ! if …; fi >>/bad; then` | **SWALLOWED** |
+| `if ! while …; done >>/bad; then` | **SWALLOWED** |
 | `if ! printf x >>/bad; then` | detected |
 | `if ! some_function >>/bad; then` | detected |
 
-The anomaly is **`!` applied to a compound command** — a group or a subshell — not groups in
-general: without `!`, every form reports correctly, and `!` in front of a simple command or a
-function call is fine too. So anywhere a compound command's redirection must be checked, these
+The anomaly is **`!` applied to any compound command** — group, subshell, `if`, `while`,
+`for`, `case` — not groups in particular: without `!`, every form reports correctly, and `!`
+in front of a simple command or a function call is fine too. The narrow reading ("groups") is
+what let the subshell form survive a sweep once, so the rule is stated by what it covers
+rather than by the two examples that prompted it. So anywhere a compound command's redirection must be checked, these
 scripts run it bare and test `$?` (`warm_sccache` in `setup_env.sh`, the `cargo fetch` in
 `setup_startup.sh`), and where a single write is enough they use a simple command
 (`persist_cache_env`). Note also that `2>/dev/null` does not suppress the message: redirections

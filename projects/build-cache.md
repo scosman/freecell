@@ -38,7 +38,7 @@ environment build (once, then the disk is snapshotted)
                    ├─ throwaway clone → cargo fetch --locked → cargo build --workspace
                    │    (fills ~/.cargo/{registry,git} and the sccache disk cache,
                    │     then the clone and its target/ are deleted)
-                   └─ /opt/freecell-vm-setup/.setup_for_freecell_repo_v1  (marker)
+                   └─ /opt/freecell-vm-setup/.setup_for_freecell_repo_v2  (marker)
 
 every session (fresh checkout, snapshot-restored disk)
   SessionStart hook  (.claude/settings.json → .claude/hooks/session-start.sh)
@@ -55,7 +55,7 @@ it survives the snapshot. Its paths are a **documented interface between the two
 duplicated in both with a "keep in sync" comment — they cannot share code, because
 `setup_env.sh` is fetched and run standalone before any checkout exists.
 
-The `_v1` in the marker filename is a **contract version**: bump it in both scripts when
+The `_vN` in the marker filename is a **contract version** (currently `_v2`): bump it in both scripts when
 what the image provides changes incompatibly, so machines built by the older script report
 as unprovisioned rather than as ready.
 
@@ -138,9 +138,18 @@ reading onto images built by the older script would have made the marker say som
 images never checked, so the filename moved instead and a `v1` machine now reports as
 unprovisioned — a warning and a slow session, never a wrong answer.
 
-The suite proves the underlying behaviour rather than only the messages: one case wires
-sccache exactly as `enable_compile_cache` does, compiles a scratch crate through it, and
-asserts the disk cache goes from empty to holding an object.
+The suite proves the underlying behaviour rather than only the messages, and proves it end to
+end: one case runs `setup_startup.sh` for real against an empty cache fixture, then has a
+*later shell* — one given no cache environment of its own, exactly like the agent's — source
+the generated `CLAUDE_ENV_FILE` and compile a scratch crate. It asserts the wrapper arrived,
+an object landed in the image's cache directory, and sccache's compile-request *count* rose.
+Deleting `export RUSTC_WRAPPER` from the env-file block turns three of those red, so the case
+is sensitive to the wiring it claims to cover rather than to a re-implementation of it.
+
+The env file is load-bearing for the same reason: `export RUSTC_WRAPPER=sccache` inside the
+hook reaches the hook's own process and nothing else. When `CLAUDE_ENV_FILE` is unset,
+`setup_startup.sh` says so and degrades its status line to `(THIS PROCESS ONLY …)` rather than
+reporting a cache the session will never use.
 
 ## What the per-session script does *not* do
 

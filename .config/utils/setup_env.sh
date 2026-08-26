@@ -925,7 +925,7 @@ write_marker() {
   [ "$HUMAN" = true ] && return 0
   mkdir -p "$VM_SETUP_DIR" || { note "could not create $VM_SETUP_DIR; no marker written."; return 1; }
 
-  local sccache_present=false sccache_populated=false warm_commit warmed
+  local sccache_present=false sccache_populated=false warm_commit warmed max_size
   if [ -d "$SCCACHE_DISK_DIR" ]; then
     sccache_present=true
     # `-type f`, the SAME rule sccache_disk_has_objects() and setup_startup.sh apply. With a
@@ -952,6 +952,19 @@ write_marker() {
     warm_commit=none
   fi
 
+  # Same reasoning, same interface, other half: the cap belongs to the cache that is on disk.
+  # `setup_startup.sh` reads this key precisely so an image baked with a bigger cap is not
+  # pruned back to the default by its own first session — and re-deriving it here would
+  # reintroduce that through a plain `setup_env.sh --upgrade-tools`, which is the repair line
+  # this script and four rows of claude_cloud_setup.md tell people to run. An explicit
+  # override in this run's environment still wins.
+  max_size="$SCCACHE_MAX_SIZE"
+  if [ -z "${FREECELL_SCCACHE_CACHE_SIZE:-}" ] && [ "$sccache_populated" = true ]; then
+    local previous_max_size
+    previous_max_size="$(marker_value sccache_max_size 2>/dev/null)"
+    [ -n "$previous_max_size" ] && max_size="$previous_max_size"
+  fi
+
   # Tool versions are probed live rather than carried forward: what is on PATH now is the
   # whole truth, and a re-run must not report a tool that was uninstalled since.
   #
@@ -973,7 +986,7 @@ write_marker() {
 # Written by .config/utils/setup_env.sh. Its presence means this machine was provisioned
 # for the FreeCell repo (github.com/scosman/freecell). Delete it to force setup to be
 # re-run, or to make setup_startup.sh report this VM as unprovisioned.
-setup_version=1
+setup_version=2
 written_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 repo=$REPO_URL
 ref=$REPO_REF
@@ -983,7 +996,7 @@ cargo_version=$pinned_cargo_version
 sccache_version=$sccache_v
 sccache_dir=$SCCACHE_DISK_DIR
 sccache_dir_present=$sccache_present
-sccache_max_size=$SCCACHE_MAX_SIZE
+sccache_max_size=$max_size
 sccache_warmed=$warmed
 sccache_warm_commit=${warm_commit:-none}
 cargo_sources_warmed=$CARGO_CACHE_WARMED

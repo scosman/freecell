@@ -340,7 +340,18 @@ enable_compile_cache() {
 # under `set -e` from tripping on it. Nothing written here is a secret; that is the point of
 # a local disk cache.
 persist_cache_env() {
-  [ -n "${CLAUDE_ENV_FILE:-}" ] || return 0
+  if [ -z "${CLAUDE_ENV_FILE:-}" ]; then
+    # Without the env file, `export RUSTC_WRAPPER=sccache` above reaches this process and
+    # nothing else: every build the agent runs would be uncached while the closing line
+    # claimed a working cache. That is the same defect — a success line asserting something
+    # it never checked — this whole script exists to avoid, so the status is degraded to
+    # what is actually true.
+    if [ "$CACHE_ENABLED" = true ]; then
+      CACHE_STATUS="$CACHE_STATUS (THIS PROCESS ONLY — CLAUDE_ENV_FILE is unset)"
+      warn "CLAUDE_ENV_FILE is unset, so the compile-cache wiring cannot reach the session's shells; builds will be uncached. Fix: run this from the SessionStart hook, or export RUSTC_WRAPPER=sccache SCCACHE_DIR=$SCCACHE_DISK_DIR yourself."
+    fi
+    return 0
+  fi
   local signature sentinel
   if [ "$CACHE_ENABLED" = true ]; then
     signature="sccache $SCCACHE_DISK_DIR $SCCACHE_MAX_SIZE"

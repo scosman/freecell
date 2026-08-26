@@ -79,6 +79,16 @@ CLAUDE_USER_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 # fixed disk allowance a session's target/ (up to ~25 GB) has to fit in.
 SCCACHE_MAX_SIZE="${FREECELL_SCCACHE_CACHE_SIZE:-8G}"
 
+# SCCACHE_BUCKET BEATS SCCACHE_DIR — setting the directory does not select the disk backend,
+# it only says where the disk backend would live. A cloud environment build inherits the
+# environment's variables, so an operator who upgrades without deleting a leftover
+# SCCACHE_BUCKET would otherwise spend tens of minutes warming a remote bucket (or, with its
+# token already revoked, warming nothing) while $SCCACHE_DISK_DIR stays empty — and every
+# session for the next week would report a healthy local cache and compile from cold.
+# Cleared here, once, for everything this script runs. setup_startup.sh clears the same list
+# for the same reason; keep the two in sync.
+unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX
+
 # Version floors. Each one is a thing that silently breaks below it, so each is checked
 # BEFORE the step it would break.
 #   rustc/cargo 1.95.0 — gpui calls std::hint::cold_path(), stabilized in 1.95.0, so
@@ -252,7 +262,13 @@ install_prebuilt_binary() {
     return 1
   fi
   install_dir="/usr/local/bin"
-  [ -w "$install_dir" ] || install_dir="$HOME/.local/bin"
+  if [ ! -w "$install_dir" ]; then
+    install_dir="$HOME/.local/bin"
+    # Worth saying out loud: this process gets the directory on its PATH, but a later
+    # session does not inherit that, so the marker can record a version of a tool no
+    # session will find.
+    note "/usr/local/bin is not writable; installing $binary into $install_dir instead — add it to PATH or sessions will not see it."
+  fi
   mkdir -p "$install_dir" || { rm -rf "$tmp"; return 1; }
   existing=""
   [ -e "$install_dir/$binary" ] && existing=" (replacing the one already there)"
@@ -474,7 +490,8 @@ install_render_env() {
     return 1
   fi
   [ -f "$script" ] || { note "$RENDER_ENV_SCRIPT_REL not found in the reference tree; skipping system deps."; return 1; }
-  mkdir -p "$VM_SETUP_DIR" 2>/dev/null
+  # No mkdir of VM_SETUP_DIR here: the log goes to TMPDIR, and this path is reachable under
+  # --human (on a "yes" answer), which promises to write nothing under /opt.
   log="${TMPDIR:-/tmp}/freecell-render-env.log"
   step "System dependencies ($RENDER_ENV_SCRIPT_REL)"
   if bash "$script" >"$log" 2>&1; then
@@ -523,8 +540,36 @@ warm_cargo_sources() {
   ( cd "$REFERENCE_TREE/app" && cargo fetch --locked ${host:+--target "$host"} ) >/dev/null 2>&1
 }
 
+# Echoes the backend the RUNNING sccache server resolved to. The server decides this once,
+# at start, from its own environment — so this is the only way to know what a build actually
+# wrote to, as opposed to what the environment asked for.
+sccache_cache_location() {
+  SCCACHE_DIR="$SCCACHE_DISK_DIR" SCCACHE_CACHE_SIZE="$SCCACHE_MAX_SIZE" \
+    sccache --show-stats 2>/dev/null | sed -n 's/^Cache location[[:space:]]*//p'
+}
+
+# Non-empty when the cache directory holds at least one file. The artifact, not the claim:
+# an exit code from a build says the build succeeded, not that anything landed here.
+sccache_disk_has_objects() {
+  [ -n "$(find "$SCCACHE_DISK_DIR" -mindepth 1 -type f -print -quit 2>/dev/null)" ]
+}
+
 warm_sccache() {
-  local log avail_gb
+  local log avail_gb location
+  # Checked BEFORE the build, not after — the point is not to spend half an hour filling the
+  # wrong store — and before the skip knob, so this stays a real check rather than one that
+  # only ever runs on the expensive path. The caller started the server with the disk
+  # settings; if it did not land on the disk backend, something here still overrides them.
+  location="$(sccache_cache_location)"
+  case "$location" in
+    *"$SCCACHE_DISK_DIR"*) ;;
+    *)
+      note "sccache resolved to '${location:-server not running}', not $SCCACHE_DISK_DIR; refusing to warm."
+      note "something in this environment still selects a different backend (SCCACHE_BUCKET?). Not building."
+      return 1
+      ;;
+  esac
+
   # Re-provisioning a machine whose sccache is already full does not need the build again,
   # and the test suite exercises the clone/fetch/marker path without paying for it.
   if [ -n "${FREECELL_SKIP_WARM_BUILD:-}" ]; then
@@ -559,6 +604,13 @@ warm_sccache() {
     tail -10 "$log" >&2
     return 1
   fi
+  # A green build is not evidence of a warm cache. Check the directory itself, so a machine
+  # can never be recorded as warmed while holding nothing.
+  if ! sccache_disk_has_objects; then
+    note "the build succeeded but $SCCACHE_DISK_DIR is still empty; not recording this machine as warmed."
+    note "sccache reports: $(sccache_cache_location)"
+    return 1
+  fi
   return 0
 }
 
@@ -572,14 +624,19 @@ if [ "$WARM_CACHE" = true ] && [ -n "$REFERENCE_TREE" ]; then
       note "cargo fetch --locked failed; the first build in a session will fetch instead."
     fi
     if have sccache && [ -d "$SCCACHE_DISK_DIR" ]; then
-      # Stop any server started with different settings (an inherited remote-bucket
-      # config, say): a running sccache server's backend is fixed at start, so the env
-      # below only takes effect for a server this call starts.
+      # A running sccache server's backend is fixed at start, so any server already up with
+      # different settings has to go before this one comes up. Started explicitly rather
+      # than left to the first client call, so warm_sccache's backend check below is asking
+      # about a server this block configured.
       SCCACHE_DIR="$SCCACHE_DISK_DIR" sccache --stop-server >/dev/null 2>&1
+      SCCACHE_DIR="$SCCACHE_DISK_DIR" SCCACHE_CACHE_SIZE="$SCCACHE_MAX_SIZE" \
+        SCCACHE_ERROR_LOG="${TMPDIR:-/tmp}/sccache.log" sccache --start-server >/dev/null 2>&1
       if warm_sccache; then
         SCCACHE_WARMED_THIS_RUN=true
+        # Cache location included deliberately: it is the line that reveals a warm build
+        # that filled somewhere other than this image's disk.
         SCCACHE_DIR="$SCCACHE_DISK_DIR" sccache --show-stats 2>/dev/null |
-          grep -E '^(Compile requests|Cache hits|Cache misses|Cache size)' | sed 's/^/    /'
+          grep -E '^(Cache location|Compile requests|Cache hits|Cache misses|Cache size)' | sed 's/^/    /'
       fi
       SCCACHE_DIR="$SCCACHE_DISK_DIR" sccache --stop-server >/dev/null 2>&1
     fi

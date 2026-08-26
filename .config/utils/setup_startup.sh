@@ -64,9 +64,16 @@ is_flag_set() {
   esac
 }
 if ! is_flag_set "${CLAUDE_CODE_REMOTE:-}" && ! is_flag_set "${IS_CONTAINERIZED:-}"; then
-  echo "Not running in a VM/container, will not run custom setup."
-  echo "  To set up or repair this environment: bash .config/utils/setup_env.sh --human"
-  echo "  Set IS_CONTAINERIZED=true to run this script here anyway."
+  # The notice is advice for a person, but this script's stdout is a SessionStart hook's
+  # output — context spent from the window of every contributor who ever opens this repo
+  # locally. So it is printed when someone is watching a terminal, and the no-op is silent
+  # when it is being captured by the hook. (Piping a manual run therefore silences it too;
+  # that is the trade, and `--help` says the same thing either way.)
+  if [ -t 1 ]; then
+    echo "Not running in a VM/container, will not run custom setup."
+    echo "  To set up or repair this environment: bash .config/utils/setup_env.sh --human"
+    echo "  Set IS_CONTAINERIZED=true to run this script here anyway."
+  fi
   exit 0
 fi
 
@@ -82,6 +89,13 @@ SCCACHE_MAX_SIZE="${FREECELL_SCCACHE_CACHE_SIZE:-8G}"
 
 REPAIR_SETUP="bash .config/utils/setup_env.sh --upgrade-tools"
 RENDER_ENV_SCRIPT="app/render-tests/scripts/setup_render_env.sh"
+
+# Extract a key from the provisioning marker written by setup_env.sh. KEEP IN SYNC with
+# marker_value() there — same file, same format.
+marker_value() {
+  [ -f "$VM_SETUP_MARKER" ] || return 1
+  sed -n "s/^$1=//p" "$VM_SETUP_MARKER" | tail -1
+}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 version_ge() {
@@ -278,6 +292,21 @@ enable_compile_cache() {
       return 1
       ;;
   esac
+
+  # Existence, provenance and writability were all checked above and would all pass on an
+  # image whose warm build filled a remote bucket instead of this directory. The directory's
+  # CONTENTS are the only thing that distinguishes a warm image from a cold one, and a cache
+  # that reports healthy while doing nothing is the exact failure this whole design exists
+  # to prevent — so it is checked here, every session, rather than trusted from the marker.
+  if [ -z "$(find "$SCCACHE_DISK_DIR" -mindepth 1 -type f -print -quit 2>/dev/null)" ]; then
+    local claimed
+    claimed="$(marker_value sccache_warmed 2>/dev/null)"
+    if [ "$claimed" = true ]; then
+      warn "$SCCACHE_DISK_DIR is EMPTY although the VM marker claims it was warmed (commit $(marker_value sccache_warm_commit)) — the image build filled something else. Fix: rebuild the environment image (see .config/utils/claude_cloud_setup.md)."
+    else
+      warn "$SCCACHE_DISK_DIR is empty (marker: sccache_warmed=${claimed:-unknown}), so the pinned dep tree will compile from cold this session. Fix: rebuild the environment image, or run: $REPAIR_SETUP --warm-cache"
+    fi
+  fi
 
   export RUSTC_WRAPPER=sccache
   # Persist to the session so every later shell — and every cargo call the agent makes —

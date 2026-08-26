@@ -3,12 +3,27 @@
 #
 #     bash .config/utils/test_setup_scripts.sh
 #
-# Everything runs against a scratch directory. The tests set FREECELL_VM_SETUP_DIR and
-# CLAUDE_CONFIG_DIR, and export FREECELL_SKIP_TOOL_INSTALL + FREECELL_SKIP_SYSTEM_DEPS so
-# that setup_env.sh's two machine-mutating steps — downloading binaries into /usr/local/bin
-# and apt-installing the GPUI/render stack — cannot fire. All four are asserted at the end,
-# not assumed: a test that silently apt-installed twenty packages while proving that local
-# machines are left alone would be the worst possible outcome.
+# What this suite does and does not do to the machine it runs on — stated precisely, because
+# an isolation claim that is broader than its guards is worse than no claim:
+#
+#   Never, and asserted at the end rather than assumed:
+#     - no apt (FREECELL_SKIP_SYSTEM_DEPS; the render-env log's absence is checked too)
+#     - no binary written into /usr/local/bin or ~/.local/bin (FREECELL_SKIP_TOOL_INSTALL)
+#     - nothing under /opt (FREECELL_VM_SETUP_DIR points at scratch; /opt is fingerprinted)
+#     - no edit to the real ~/.claude/settings.json (CLAUDE_CONFIG_DIR points at scratch)
+#     - no temp files outside the scratch dir (TMPDIR points at scratch)
+#     - your running sccache server is not stopped (SCCACHE_SERVER_PORT is a private port)
+#
+#   DOES happen, as an unavoidable side effect of testing the real scripts:
+#     - `rustup toolchain install` for the pin in app/rust-toolchain.toml, which DOWNLOADS a
+#       full toolchain into ~/.rustup if you do not already have it
+#     - `cargo fetch --locked`, which populates ~/.cargo/registry and ~/.cargo/git (~1 GB for
+#       this workspace) if they are cold
+#     - an sccache server started and stopped on the private port above
+#
+# Both of the latter are exactly what your first `cargo build` in this repo would do anyway,
+# which is why they are documented rather than guarded — but they are not nothing, and this
+# comment is the contract.
 #
 # The cases are the ones that took real reasoning to get right: the container gate's
 # falsy-value handling, the provisioning marker's effect on whether an unattributable
@@ -38,6 +53,10 @@ export FREECELL_SKIP_SYSTEM_DEPS=1
 # absence of its log rather than by a package listing that is unchanged either way.
 export TMPDIR="$SCRATCH/tmp"
 mkdir -p "$TMPDIR"
+# sccache has one server per port, and both scripts stop and start it. Without a private
+# port the suite would kill the compile cache out from under a contributor's concurrent
+# build; with one, it starts and stops a daemon of its own.
+export SCCACHE_SERVER_PORT="${FREECELL_TEST_SCCACHE_PORT:-14227}"
 
 PASSED=0
 FAILED=0
@@ -74,7 +93,9 @@ REAL_USER_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 REAL_USER_SETTINGS_BEFORE="(absent)"
 [ -f "$REAL_USER_SETTINGS" ] && REAL_USER_SETTINGS_BEFORE="$(cksum <"$REAL_USER_SETTINGS")"
 vm_dir_fingerprint() {
-  find /opt/freecell-vm-setup -maxdepth 2 -printf '%p %s\n' 2>&1 | sort | cksum
+  # Full depth, and mtime as well as size: a same-size edit deep inside sccache/ is exactly
+  # the change a shallow, size-only fingerprint would miss.
+  find /opt/freecell-vm-setup -printf '%p %s %T@\n' 2>&1 | sort | cksum
 }
 REAL_VM_DIR_BEFORE="$(vm_dir_fingerprint)"
 
@@ -99,14 +120,27 @@ echo "setup_startup.sh — the container gate"
 start "gate/absent"
 out="$(env -u CLAUDE_CODE_REMOTE -u IS_CONTAINERIZED bash "$SETUP_STARTUP" 2>&1)"
 expect_status "exits 0 outside a container" 0 "$?"
-expect_contains "says it is not running in a container" "$out" "Not running in a VM/container"
-expect_contains "names the local repair" "$out" "setup_env.sh --human"
+# Captured (which is how the SessionStart hook runs it), the no-op must cost a local
+# contributor's session nothing at all.
+expect "says nothing when its output is being captured" test -z "$out"
+
+start "gate/absent-tty"
+if command -v script >/dev/null 2>&1; then
+  # At a terminal the same no-op is advice for a person, so it does speak.
+  out="$(script -qec "env -u CLAUDE_CODE_REMOTE -u IS_CONTAINERIZED bash '$SETUP_STARTUP'" /dev/null 2>&1)"
+  expect_contains "says it is not running in a container" "$out" "Not running in a VM/container"
+  expect_contains "names the local repair" "$out" "setup_env.sh --human"
+else
+  ok "skipped — 'script' is not installed, so no pty is available"
+fi
 
 start "gate/falsy"
-# The one failure mode impossible to notice: reading IS_CONTAINERIZED=no as yes.
+# The one failure mode impossible to notice: reading IS_CONTAINERIZED=no as yes. Asserted on
+# behavior rather than the notice, because the notice is silent when captured: a falsy value
+# must mean the checkout is NOT prepared.
 for falsy in false FALSE 0 no n off ""; do
   out="$(env -u CLAUDE_CODE_REMOTE IS_CONTAINERIZED="$falsy" bash "$SETUP_STARTUP" 2>&1)"
-  expect_contains "IS_CONTAINERIZED='$falsy' is treated as no" "$out" "Not running in a VM/container"
+  expect_not_contains "IS_CONTAINERIZED='$falsy' is treated as no" "$out" "Syncing dependencies"
 done
 
 start "gate/truthy"
@@ -140,7 +174,11 @@ echo "setup_startup.sh — a provisioned VM"
 start "provisioned"
 VM_OK="$SCRATCH/vm-ok"
 mkdir -p "$VM_OK/sccache"
-printf 'setup_version=1\n' >"$VM_OK/.setup_for_freecell_repo_v1"
+# A non-empty cache: emptiness is now itself a reported condition, so the "healthy" fixture
+# has to look healthy.
+printf 'object\n' >"$VM_OK/sccache/some-cached-object"
+printf 'setup_version=1\nsccache_warmed=true\nsccache_warm_commit=abc123\n' \
+  >"$VM_OK/.setup_for_freecell_repo_v1"
 PROVISIONED_OUT="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$VM_OK" \
   bash "$SETUP_STARTUP" 2>&1)"
 PROVISIONED_STATUS=$?
@@ -154,6 +192,29 @@ else
 fi
 expect "the output stays short enough to spend on context" \
   test "$(printf '%s\n' "$PROVISIONED_OUT" | wc -l)" -le 20
+
+start "provisioned/cold-cache"
+# The failure this whole design exists to prevent: a cache that reports healthy while
+# holding nothing. Existence, provenance and writability all pass here — only the contents
+# distinguish a warm image from a cold one.
+COLD_VM="$SCRATCH/vm-cold"
+mkdir -p "$COLD_VM/sccache"
+printf 'setup_version=1\nsccache_warmed=false\n' >"$COLD_VM/.setup_for_freecell_repo_v1"
+out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$COLD_VM" bash "$SETUP_STARTUP" 2>&1)"
+expect_status "still exits 0 — a cold cache is slow, not broken" 0 "$?"
+expect_contains "an empty cache is reported" "$out" "is empty (marker: sccache_warmed=false)"
+expect_contains "with the repair that fills it" "$out" "--warm-cache"
+
+start "provisioned/lying-marker"
+# The nastier variant: the image build reported success, so the marker says warmed, but the
+# objects went somewhere else (a leftover SCCACHE_BUCKET). The directory is the evidence.
+LIAR_VM="$SCRATCH/vm-liar"
+mkdir -p "$LIAR_VM/sccache"
+printf 'setup_version=1\nsccache_warmed=true\nsccache_warm_commit=deadbeef\n' \
+  >"$LIAR_VM/.setup_for_freecell_repo_v1"
+out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$LIAR_VM" bash "$SETUP_STARTUP" 2>&1)"
+expect_contains "the contradiction is called out, not the claim believed" "$out" "EMPTY although the VM marker claims it was warmed"
+expect_contains "naming the commit the marker claims" "$out" "deadbeef"
 
 start "provisioned/env-file"
 ENV_FILE="$SCRATCH/session-env"
@@ -231,10 +292,18 @@ WARM_ISOLATED="$SCRATCH/warm-isolated"
 mkdir -p "$WARM_ISOLATED"
 cp "$SETUP_ENV" "$WARM_ISOLATED/setup_env.sh"
 warm_branch="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null)"
+# SCCACHE_BUCKET is set deliberately: SCCACHE_BUCKET beats SCCACHE_DIR, a cloud environment
+# build inherits the environment's variables, and an operator who upgrades without deleting
+# a leftover bucket would otherwise warm the bucket while the image's disk cache stayed
+# empty — and the marker would record it as warmed. setup_env.sh clears the list machine-
+# wide; if that ever stops happening, warm_sccache's backend check refuses and the
+# assertions below flip.
 warm_out="$( cd "$WARM_ISOLATED" &&
   FREECELL_VM_SETUP_DIR="$WARM_VM" FREECELL_REPO_URL="$PROJECT_ROOT" \
     FREECELL_SETUP_REF="${warm_branch:-main}" FREECELL_SKIP_WARM_BUILD=1 \
     CLAUDE_CONFIG_DIR="$SCRATCH/cfg-warm" \
+    SCCACHE_BUCKET=a-bucket-that-must-not-win SCCACHE_REGION=auto \
+    SCCACHE_ENDPOINT=https://example.invalid \
     bash "$WARM_ISOLATED/setup_env.sh" --warm-cache --best-effort 2>&1 )"
 expect_status "exits 0" 0 "$?"
 expect_contains "clones because no checkout is in reach" "$warm_out" "throwaway"
@@ -244,6 +313,8 @@ expect "the throwaway clone is gone afterwards" test ! -e "$WARM_VM/throwaway-cl
 # the guard fired, not just that the outcome looked unchanged: on a box that already has
 # the packages, a real apt run is indistinguishable from no run at all.
 expect_contains "the system-dependency guard fires" "$warm_out" "FREECELL_SKIP_SYSTEM_DEPS is set"
+expect_contains "and the warm build reaches its own guard" "$warm_out" "FREECELL_SKIP_WARM_BUILD is set"
+expect_not_contains "having resolved to the image's disk cache" "$warm_out" "refusing to warm"
 expect "so the apt step left no log behind" test ! -e "$TMPDIR/freecell-render-env.log"
 expect "a marker was written" test -f "$WARM_VM/.setup_for_freecell_repo_v1"
 marker="$(cat "$WARM_VM/.setup_for_freecell_repo_v1")"
@@ -459,9 +530,16 @@ start "shim/parity"
 generated="$SCRATCH/shim-generated.sh"
 sed -n "/^  cat >\"\$staged\" <<'SHIM'\$/,/^SHIM\$/p" "$SETUP_ENV" | sed '1d;$d' >"$generated"
 expect "the generated shim is non-empty" test -s "$generated"
+# The shebang is kept, not stripped as a comment: a generated shim that lost it would
+# otherwise pass parity and then be run by whatever shell happened to pick it up.
+shim_signature() {
+  head -1 "$1"
+  tail -n +2 "$1" | grep -v '^#' | grep -v '^$'
+}
 expect "both shims share one implementation" \
-  test "$(grep -v '^#' "$generated" | grep -v '^$')" = \
-       "$(grep -v '^#' "$PROJECT_ROOT/.claude/hooks/session-start.sh" | grep -v '^$')"
+  test "$(shim_signature "$generated")" = "$(shim_signature "$PROJECT_ROOT/.claude/hooks/session-start.sh")"
+expect "and the generated one keeps its shebang" \
+  test "$(head -1 "$generated")" = "#!/usr/bin/env bash"
 
 # ---------------------------------------------------------------------------------
 echo ""

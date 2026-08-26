@@ -107,6 +107,23 @@ Two consequences worth knowing:
 - The cache key includes the exact rustc version, so a `rust-toolchain.toml` bump naturally
   starts a fresh keyspace and the old objects age out under the size cap.
 
+## Verifying the cache rather than trusting it
+
+Two claims could each make a machine report a healthy cache while holding nothing, so
+neither is taken on faith:
+
+- **`SCCACHE_BUCKET` beats `SCCACHE_DIR`.** Setting the directory does not select the disk
+  backend. A cloud environment build inherits the environment's variables, so a leftover
+  bucket would send the whole warm build to a remote store (or, with its token revoked,
+  nowhere) while the image's directory stayed empty. Both scripts clear the remote-backend
+  variables machine-wide, and `setup_env.sh` additionally reads back the *running server's*
+  `Cache location` before building and refuses to warm if it is not the image's directory.
+- **A green build is not a warm cache.** `sccache_warmed=true` is written only after the
+  cache directory is confirmed to hold objects, and `setup_startup.sh` re-checks emptiness
+  every session — reporting a cold cache, and calling out the contradiction when the marker
+  claims otherwise. Existence, provenance and writability all pass on an image that warmed
+  the wrong store; only the contents distinguish it.
+
 ## What the per-session script does *not* do
 
 No `cargo build`. A full workspace build at session start would cost minutes even fully
@@ -152,9 +169,14 @@ cache directory is trusted, the marker's carry-forward rules across a repair run
 throwaway-clone lifecycle, and every rule of the optional user-`settings.json` merge — run
 through both the jq and python3 implementations and asserted to agree.
 
-It is safe to run on a personal machine: it works in scratch directories and sets
-`FREECELL_SKIP_TOOL_INSTALL` + `FREECELL_SKIP_SYSTEM_DEPS` so `setup_env.sh`'s two
-machine-mutating steps (downloading binaries into a system `bin` directory, and the
-`setup_render_env.sh` apt install) cannot fire. Its closing cases assert that — `/opt`, the
-user's `~/.claude/settings.json`, the installed tool binaries, and the dpkg package list are
-all fingerprinted before and after.
+What it will not do to the machine it runs on, asserted in its closing cases rather than
+assumed: no `apt-get` (`FREECELL_SKIP_SYSTEM_DEPS`, plus the absence of the render-env log),
+no binary written into a system `bin` directory (`FREECELL_SKIP_TOOL_INSTALL`), nothing under
+`/opt`, no edit to the real `~/.claude/settings.json`, no temp files outside its scratch dir,
+and no interference with a running sccache server (it uses a private `SCCACHE_SERVER_PORT`).
+
+What it *does* do, because it runs the real scripts: `rustup toolchain install` for the pin,
+and `cargo fetch --locked` — so on a cold machine it downloads a toolchain into `~/.rustup`
+and populates `~/.cargo` (~1 GB here). That is what a first `cargo build` in this repo would
+do anyway, which is why it is documented rather than guarded. The suite's header comment is
+the authoritative version of this list.

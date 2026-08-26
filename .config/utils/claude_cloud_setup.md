@@ -12,7 +12,7 @@ ready before the agent reads anything.
 | [`claude_code_vm_setup.sh`](claude_code_vm_setup.sh) | The **only** thing you paste into the cloud UI. It fetches `setup_env.sh` from `main` and runs it. |
 | [`setup_env.sh`](setup_env.sh) | **Builds a machine.** Runs once, at environment-build time, before any repo is checked out. Also the "set up my laptop" script (`--human`). |
 | [`setup_startup.sh`](setup_startup.sh) | **Prepares a checkout.** Runs every session, via the repo's SessionStart hook. |
-| [`test_setup_scripts.sh`](test_setup_scripts.sh) | Tests for all of the above. Safe to run on your own machine: it works in scratch directories and disables the two machine-mutating steps (no `apt-get`, no writes into a system `bin` directory), then asserts at the end that `/opt`, your `~/.claude`, your installed tools, and your package list are all unchanged. |
+| [`test_setup_scripts.sh`](test_setup_scripts.sh) | Tests for all of the above. Runs no `apt-get`, writes no binary into a system `bin` directory, touches nothing under `/opt` or your `~/.claude`, and uses a private sccache port so it cannot stop your running cache server — all asserted at the end, not assumed. It *does* install the toolchain pinned by `app/rust-toolchain.toml` and warm `~/.cargo` if those are cold, which is what your first `cargo build` here would do anyway. The file's header comment is the full contract. |
 
 The hook itself is committed: [`.claude/settings.json`](../../.claude/settings.json) points
 at [`.claude/hooks/session-start.sh`](../../.claude/hooks/session-start.sh), which is a shim
@@ -128,10 +128,18 @@ If it says `Ready, with warnings above`, or does not appear at all, find your li
 | `cache: off (… is not writable by <user>; …)` | The image was built as one user and the session runs as another. | `chmod 1777 /opt/freecell-vm-setup/sccache` |
 | `! native deps missing (…) — freecell-app and render-tests will not build.` | The apt step did not run or did not finish. `freecell-core` and `freecell-engine` still build. | `bash app/render-tests/scripts/setup_render_env.sh` |
 | `! cargo-deny is not installed; …` | Same cause as the sccache row. `cargo deny check` (a CI gate) cannot run locally. | `bash .config/utils/setup_env.sh --upgrade-tools` |
+| `! … is empty (marker: sccache_warmed=false)` | The image was built, but its warm build never ran or never finished. Everything works; the pinned dependency tree just compiles from cold. | Rebuild the environment image (edit the Setup script field to force it), or `bash .config/utils/setup_env.sh --upgrade-tools --warm-cache` |
+| `! … is EMPTY although the VM marker claims it was warmed` | The image build reported success but its objects went somewhere else — nearly always a leftover `SCCACHE_BUCKET` in the environment variables. | Delete `SCCACHE_BUCKET`/`SCCACHE_ENDPOINT`/`SCCACHE_REGION` from the environment settings, then force a snapshot rebuild. |
+| `! rustfmt is missing from …` / `! clippy is missing from …` | The pinned toolchain was installed without its components. Both are CI gates. | `rustup component add rustfmt --toolchain <pin>` (same for `clippy`) |
 | `✗ cargo fetch --locked failed` | `Cargo.lock` does not match the `Cargo.toml`s on this branch. | `cd app && cargo update` |
-| `✗ cargo in …/app resolves to 1.94.x, below the pinned 1.95.0` | The pinned toolchain is not installed, so a stale default is being used. gpui needs `std::hint::cold_path()` (stable since 1.95.0). | `rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy` |
+| `✗ cargo in …/app resolves to 1.94.x, below the required 1.95.0 (app/rust-toolchain.toml pins '…')` | The pinned toolchain is not installed, so a stale default is being used. gpui needs `std::hint::cold_path()` (stable since 1.95.0). | `rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy` |
+| `✗ git is not installed.` | The base image has no git. Nothing repo-shaped can work. | `apt-get install -y git`, then `bash .config/utils/setup_env.sh --upgrade-tools` |
+| `✗ rustup is not installed, …` | The base image has no rustup, so the pin cannot be selected. The repair cannot be `setup_env.sh` — it needs rustup itself. | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| `✗ rustup X is below 1.28.0, …` | Too old to read `rust-toolchain.toml`, so it silently leaves a stale default active. | `rustup self update` |
+| `✗ Toolchain … is not installed and could not be installed.` | Usually `static.rust-lang.org` missing from the allowlist. | Add the domain and force a snapshot rebuild, or run the `rustup toolchain install` line it prints. |
+| `✗ app/rust-toolchain.toml has no [toolchain] channel` | The pin file is truncated or edited badly on this branch. | `git checkout -- app/rust-toolchain.toml` |
 | `✗ No FreeCell checkout found` | The hook fired somewhere that is not a FreeCell checkout. | `cd` into the checkout and re-run `bash .config/utils/setup_startup.sh` |
-| Nothing at all | The hook did not fire. | Check `.claude/settings.json` is present on the branch you are on. |
+| Nothing at all | Expected on a **local** checkout: the startup script is a silent no-op outside a container so it costs a contributor's session nothing. In a cloud session it means the hook did not fire. | Check `.claude/settings.json` is present on the branch you are on. |
 
 ## 7. Things to know
 
@@ -147,6 +155,12 @@ If it says `Ready, with warnings above`, or does not appear at all, find your li
   and hardlinking a shared tree in would let builds write through into it. The reasoning, and
   what would have to change to revisit it, is in
   [`projects/build-cache.md`](../../projects/build-cache.md).
+- **The cache directory is world-writable (`1777`), deliberately.** The image is built as
+  root and a session may run as another user, and a cache only root can write is a cache
+  that silently stores nothing. The trade-off is real and worth naming: any local user can
+  put objects into a content-addressed rustc-output cache that later builds link against.
+  That is acceptable for a single-tenant sandbox, and would not be on a shared host — there,
+  own the directory to the session user and drop the mode to `0755`.
 - **The cache directory is capped** (`FREECELL_SCCACHE_CACHE_SIZE`, default `8G`) because it
   is baked into the image and comes out of the same disk allowance a session's `target/`
   (which can reach ~25 GB) has to fit into.
@@ -177,8 +191,9 @@ To exercise the scripts without a cloud environment at all:
 bash .config/utils/test_setup_scripts.sh
 ```
 
-That is safe to run anywhere — see the table at the top of this document for what it does
-and does not touch.
+Run it anywhere, including your own machine — but read the exact contract first: the table
+at the top of this document says what it will never touch, and what it *will* do (install the
+pinned toolchain and warm `~/.cargo` if those are cold).
 
 ## Local machines
 

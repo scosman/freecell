@@ -32,10 +32,13 @@ script="$dir/.config/utils/setup_startup.sh"
 # output is where the reason is.
 output="$(bash "$script" 2>&1 </dev/null)"
 status=$?
+# Substring expansion rather than `head -c`/`tail -c`: those count bytes while ${#output}
+# counts characters, and a byte cut lands mid-sequence on the multibyte glyphs these
+# scripts emit (✗, !, em-dashes) — garbling the very text a human is squinting at.
 if [ "${#output}" -gt 4000 ]; then
-  output="$(printf '%s' "$output" | head -c 1500)
+  output="${output:0:1500}
 [...trimmed. Re-run .config/utils/setup_startup.sh to see all of it...]
-$(printf '%s' "$output" | tail -c 2000)"
+${output: -2000}"
 fi
 [ -n "$output" ] && printf '%s\n' "$output"
 [ "$status" -ne 0 ] &&

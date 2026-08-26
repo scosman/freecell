@@ -39,11 +39,15 @@ USAGE
 }
 
 # Parsed rather than ignored, so a mistyped flag is not silently swallowed into a full sync.
+# Every branch happens to exit today; the `shift` is what keeps that from being the only
+# reason the loop terminates, so adding a non-exiting flag later cannot hang session start.
 while [ $# -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
     *) usage >&2; echo "" >&2; echo "error: unrecognized option: $1" >&2; exit 2 ;;
   esac
+  # shellcheck disable=SC2317  # unreachable only because every branch above exits today.
+  shift
 done
 
 # --- (a) Containers only -----------------------------------------------------------
@@ -199,18 +203,28 @@ fi
 
 CARGO_VERSION="$( cd "$CARGO_DIR" && version_of cargo --version )"
 RUSTC_VERSION="$( cd "$CARGO_DIR" && version_of rustc --version )"
-# The floor IS the pin. gpui calls std::hint::cold_path(), stabilized in 1.95.0, so a
-# toolchain below the pin cannot build this workspace at all — and cargo below 1.78 would
-# rewrite the version-4 Cargo.lock rather than read it. Checked here, before the fetch, so
-# an old cargo cannot do the damage the check exists to prevent.
+# gpui calls std::hint::cold_path(), stabilized in 1.95.0, so a toolchain below that cannot
+# build this workspace at all — and cargo below 1.78 would rewrite the version-4 Cargo.lock
+# rather than read it. Checked here, before the fetch, so an old cargo cannot do the damage
+# the check exists to prevent.
+#
+# The floor is the PIN only when the pin is a version number. rust-toolchain.toml's channel
+# is a free-form string, and a perfectly valid one — "stable", "nightly-2026-01-01", a
+# host-suffixed pin — is not comparable with sort -V: it would sort below any release and
+# fail every session start with a repair line that cannot help. So a non-numeric channel
+# falls back to the hardcoded floor, which is the constraint that actually matters.
+RUST_FLOOR="1.95.0"
+if printf '%s' "$TOOLCHAIN_PIN" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+  RUST_FLOOR="$TOOLCHAIN_PIN"
+fi
 if [ -z "$CARGO_VERSION" ]; then
   bad_environment \
     "cargo is not runnable from $CARGO_DIR." \
     "rustup toolchain install $TOOLCHAIN_PIN --profile minimal -c rustfmt -c clippy"
 fi
-if ! version_ge "$CARGO_VERSION" "$TOOLCHAIN_PIN"; then
+if ! version_ge "$CARGO_VERSION" "$RUST_FLOOR"; then
   bad_environment \
-    "cargo in $CARGO_DIR resolves to $CARGO_VERSION, below the pinned $TOOLCHAIN_PIN. gpui needs std::hint::cold_path() (stable since 1.95.0), so the workspace will not build." \
+    "cargo in $CARGO_DIR resolves to $CARGO_VERSION, below the required $RUST_FLOOR (app/rust-toolchain.toml pins '$TOOLCHAIN_PIN'). gpui needs std::hint::cold_path() (stable since 1.95.0), so the workspace will not build." \
     "rustup toolchain install $TOOLCHAIN_PIN --profile minimal -c rustfmt -c clippy"
 fi
 ( cd "$CARGO_DIR" && cargo fmt --version ) >/dev/null 2>&1 ||
@@ -235,6 +249,13 @@ enable_compile_cache() {
   fi
   [ -d "$SCCACHE_DISK_DIR" ] || {
     CACHE_STATUS="off ($SCCACHE_DISK_DIR is missing; run $REPAIR_SETUP)"
+    return 1
+  }
+  # The image is built as root and a session may run as someone else, in which case sccache
+  # would start, read happily, and silently store nothing. Better to say so than to report
+  # a cache that only half works.
+  [ -w "$SCCACHE_DISK_DIR" ] || {
+    CACHE_STATUS="off ($SCCACHE_DISK_DIR is not writable by $(id -un); run: chmod 1777 $SCCACHE_DISK_DIR)"
     return 1
   }
 
@@ -262,9 +283,13 @@ enable_compile_cache() {
   # Persist to the session so every later shell — and every cargo call the agent makes —
   # sees the same wrapper. Written by value; nothing here is a secret, which is the point
   # of a local disk cache.
+  # The env file is sourced as shell — the previous, proven implementation of this wiring
+  # wrote `export X=Y` lines into it — so `unset` works there too. `|| true` keeps a
+  # consumer running under `set -e` from tripping on it. The variable list is the same one
+  # unset live above; letting the two drift is how a stale bucket comes back.
   if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
     {
-      printf 'unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION\n'
+      printf 'unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX || true\n'
       printf 'export SCCACHE_DIR=%q\n' "$SCCACHE_DISK_DIR"
       printf 'export SCCACHE_CACHE_SIZE=%q\n' "$SCCACHE_MAX_SIZE"
       printf 'export RUSTC_WRAPPER=sccache\n'
@@ -312,7 +337,7 @@ fi
 if [ -n "$MISSING_NATIVE" ]; then
   # A warning, not a failure: freecell-core and freecell-engine are GPUI-free and build
   # without any of this. Only freecell-app and render-tests need it.
-  warn "native deps missing ($(echo "$MISSING_NATIVE" | tr -s ' ')) — freecell-app and render-tests will not build. Fix: bash $RENDER_ENV_SCRIPT"
+  warn "native deps missing (${MISSING_NATIVE# }) — freecell-app and render-tests will not build. Fix: bash $RENDER_ENV_SCRIPT"
 fi
 
 if ! have cargo-deny; then

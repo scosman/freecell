@@ -42,6 +42,18 @@ CREATE_STARTUP_SCRIPT=false  # --create-startup-script
 HUMAN=false                  # --human
 
 # --- Constants --------------------------------------------------------------------
+# $HOME is referenced below (user settings, ~/.local/bin, ~/.cargo/bin) and `set -u` makes
+# an unset one a fatal error at line-read time — before argument parsing has even seen
+# --best-effort. As the script the pasted cloud wrapper runs, that would be precisely the
+# never-exit-non-zero failure the whole best-effort design exists to prevent, so HOME is
+# normalized here rather than defended at each site.
+if [ -z "${HOME:-}" ]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+  [ -n "$HOME" ] || HOME="/root"
+  export HOME
+  echo "warning: HOME was unset; using $HOME." >&2
+fi
+
 REPO_URL="${FREECELL_REPO_URL:-https://github.com/scosman/freecell}"
 REPO_REF="${FREECELL_SETUP_REF:-main}"
 
@@ -137,11 +149,16 @@ Options:
 Environment overrides (all exist so this is testable without writing to /opt or cloning
 over the network):
   FREECELL_VM_SETUP_DIR        default /opt/freecell-vm-setup
-  FREECELL_SETUP_REF           ref to clone for --warm-cache (default main)
+  FREECELL_SETUP_REF           branch or tag to clone for --warm-cache (default main).
+                               Not a commit SHA — a depth-1 clone cannot target one.
   FREECELL_REPO_URL            default https://github.com/scosman/freecell
   FREECELL_SCCACHE_CACHE_SIZE  default 8G
   FREECELL_SKIP_WARM_BUILD     set to skip --warm-cache's workspace build (the dependency
                                source caches are still warmed)
+  FREECELL_SKIP_TOOL_INSTALL   set to never download or replace a binary in a system bin
+                               directory (sccache, cargo-deny)
+  FREECELL_SKIP_SYSTEM_DEPS    set to never run the apt install in
+                               app/render-tests/scripts/setup_render_env.sh
   CLAUDE_CONFIG_DIR            default $HOME/.claude
   FREECELL_SETTINGS_MERGE_TOOL jq | python3 | auto (default) — which implementation
                                merges the user settings.json for --create-startup-script
@@ -210,7 +227,13 @@ marker_value() {
 # Download $1, unpack it, and install the single binary named $2 into a writable bin dir.
 # Prebuilt binaries only — never compile a tool we are installing to make compiles faster.
 install_prebuilt_binary() {
-  local url="$1" binary="$2" tmp install_dir found
+  local url="$1" binary="$2" tmp install_dir found existing
+  # One choke point for every write into a system bin directory, so a caller that must not
+  # mutate the machine (the test suite, a dry run) can opt out in one place.
+  if [ -n "${FREECELL_SKIP_TOOL_INSTALL:-}" ]; then
+    note "FREECELL_SKIP_TOOL_INSTALL is set; not installing $binary."
+    return 1
+  fi
   if [ "$(uname -sm)" != "Linux x86_64" ]; then
     note "no prebuilt $binary for $(uname -sm); skipping."
     return 1
@@ -231,8 +254,13 @@ install_prebuilt_binary() {
   install_dir="/usr/local/bin"
   [ -w "$install_dir" ] || install_dir="$HOME/.local/bin"
   mkdir -p "$install_dir" || { rm -rf "$tmp"; return 1; }
+  existing=""
+  [ -e "$install_dir/$binary" ] && existing=" (replacing the one already there)"
   install -m 755 "$found" "$install_dir/$binary" || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
+  # Announced, not silent: overwriting a binary in a system directory is not something to
+  # discover later from a version string.
+  echo "    installed $binary -> $install_dir/$binary$existing"
   case ":$PATH:" in
     *":$install_dir:"*) ;;
     *) export PATH="$install_dir:$PATH" ;;
@@ -297,6 +325,9 @@ make_throwaway_clone() {
   local clone="$VM_SETUP_DIR/throwaway-clone"
   mkdir -p "$VM_SETUP_DIR" || return 1
   rm -rf "$clone"
+  # --branch accepts a branch or a tag, not a commit SHA; a depth-1 clone of an arbitrary
+  # SHA needs a fetch-by-object instead. Documented as "branch or tag" rather than
+  # supported, because nothing in this design needs to warm from a detached commit.
   git clone --quiet --depth 1 --branch "$REPO_REF" "$REPO_URL" "$clone" || return 1
   is_freecell_root "$clone" || { rm -rf "$clone"; return 1; }
   THROWAWAY_CLONE="$clone"
@@ -391,19 +422,32 @@ fi
 # Local disk, NOT a remote object store. Every hit off a remote bucket is an HTTPS round
 # trip through the sandbox proxy; a directory baked into the image is a local read, needs
 # no credentials, and cannot leave a long-lived secret on a snapshotted disk.
-step "Compile cache (sccache $SCCACHE_PIN, local disk)"
-if have sccache; then
-  sccache_version="$(version_of sccache --version)"
-  if [ -n "$sccache_version" ] && ! version_ge "$sccache_version" "$SCCACHE_PIN"; then
-    note "sccache $sccache_version is below $SCCACHE_PIN; replacing it."
-    install_prebuilt_binary "$SCCACHE_URL" sccache || note "leaving sccache $sccache_version in place."
+# Skipped entirely under --human: that mode promises to write nothing outside the checkout
+# and ~/.cargo, and the install would be pointless anyway — nothing in --human sets
+# RUSTC_WRAPPER, and setup_startup.sh (which would) refuses to run outside a container.
+if [ "$HUMAN" = false ]; then
+  step "Compile cache (sccache $SCCACHE_PIN, local disk)"
+  if have sccache; then
+    sccache_version="$(version_of sccache --version)"
+    if [ -n "$sccache_version" ] && ! version_ge "$sccache_version" "$SCCACHE_PIN"; then
+      note "sccache $sccache_version is below $SCCACHE_PIN; replacing it."
+      install_prebuilt_binary "$SCCACHE_URL" sccache || note "leaving sccache $sccache_version in place."
+    fi
+  elif ! install_prebuilt_binary "$SCCACHE_URL" sccache; then
+    note "no sccache on this machine; builds will work, just uncached."
   fi
-elif ! install_prebuilt_binary "$SCCACHE_URL" sccache; then
-  note "no sccache on this machine; builds will work, just uncached."
-fi
 
-if [ "$HUMAN" = false ] && have sccache; then
-  mkdir -p "$SCCACHE_DISK_DIR" || note "could not create $SCCACHE_DISK_DIR; sccache will fall back to its per-user cache."
+  if have sccache; then
+    # 1777, not the default 0755: this image builds as root while sessions may run as
+    # another user (see claude_cloud_setup.md), and a cache only root can write is a cache
+    # that silently does nothing. Sticky, so one session cannot delete another's entries.
+    if mkdir -p "$SCCACHE_DISK_DIR"; then
+      chmod 1777 "$SCCACHE_DISK_DIR" 2>/dev/null ||
+        note "could not make $SCCACHE_DISK_DIR world-writable; sessions running as another user will not be able to use it."
+    else
+      note "could not create $SCCACHE_DISK_DIR; sccache will fall back to its per-user cache."
+    fi
+  fi
 fi
 
 # --- cargo-deny: the licenses/advisories gate -------------------------------------
@@ -425,6 +469,10 @@ RENDER_ENV_INSTALLED=false
 RENDER_ENV_SCRIPT_REL="app/render-tests/scripts/setup_render_env.sh"
 install_render_env() {
   local script="$REFERENCE_TREE/$RENDER_ENV_SCRIPT_REL" log
+  if [ -n "${FREECELL_SKIP_SYSTEM_DEPS:-}" ]; then
+    note "FREECELL_SKIP_SYSTEM_DEPS is set; not running $RENDER_ENV_SCRIPT_REL."
+    return 1
+  fi
   [ -f "$script" ] || { note "$RENDER_ENV_SCRIPT_REL not found in the reference tree; skipping system deps."; return 1; }
   mkdir -p "$VM_SETUP_DIR" 2>/dev/null
   log="${TMPDIR:-/tmp}/freecell-render-env.log"
@@ -600,10 +648,13 @@ script="$dir/.config/utils/setup_startup.sh"
 # output is where the reason is.
 output="$(bash "$script" 2>&1 </dev/null)"
 status=$?
+# Substring expansion rather than `head -c`/`tail -c`: those count bytes while ${#output}
+# counts characters, and a byte cut lands mid-sequence on the multibyte glyphs these
+# scripts emit (✗, !, em-dashes) — garbling the very text a human is squinting at.
 if [ "${#output}" -gt 4000 ]; then
-  output="$(printf '%s' "$output" | head -c 1500)
+  output="${output:0:1500}
 [...trimmed. Re-run .config/utils/setup_startup.sh to see all of it...]
-$(printf '%s' "$output" | tail -c 2000)"
+${output: -2000}"
 fi
 [ -n "$output" ] && printf '%s\n' "$output"
 [ "$status" -ne 0 ] &&
@@ -784,7 +835,11 @@ merge_hook_entry() {
     return $?
   fi
 
-  note "neither jq nor python3 is available; cannot safely merge JSON settings."
+  if [ "$merge_tool" != auto ]; then
+    note "FREECELL_SETTINGS_MERGE_TOOL=$merge_tool, but $merge_tool is not installed; cannot merge JSON settings."
+  else
+    note "neither jq nor python3 is available; cannot safely merge JSON settings."
+  fi
   return 1
 }
 
@@ -842,9 +897,14 @@ write_marker() {
   # version) is the kind of half-truth that sends a reader down the wrong path. Note also
   # that everything inside the heredoc below is literal — a shell comment placed in there
   # lands in the marker file.
-  local content pinned_cargo_version
+  local content pinned_cargo_version rustup_v sccache_v cargo_deny_v
   pinned_cargo_version="$(version_of rustup run "$TOOLCHAIN_PIN" cargo --version)"
   [ -n "$pinned_cargo_version" ] || pinned_cargo_version="(toolchain $TOOLCHAIN_PIN not installed)"
+  # A blank value is the least useful thing to show the one reader this file has: someone
+  # staring at a VM where a tool is missing is exactly the case it exists for.
+  rustup_v="$(version_of rustup --version)"; [ -n "$rustup_v" ] || rustup_v="(not installed)"
+  sccache_v="$(version_of sccache --version)"; [ -n "$sccache_v" ] || sccache_v="(not installed)"
+  cargo_deny_v="$(version_of cargo-deny --version)"; [ -n "$cargo_deny_v" ] || cargo_deny_v="(not installed)"
 
   content="$(cat <<MARKER
 # Written by .config/utils/setup_env.sh. Its presence means this machine was provisioned
@@ -855,16 +915,16 @@ written_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 repo=$REPO_URL
 ref=$REPO_REF
 toolchain_pin=$TOOLCHAIN_PIN
-rustup_version=$(version_of rustup --version)
+rustup_version=$rustup_v
 cargo_version=$pinned_cargo_version
-sccache_version=$(version_of sccache --version)
+sccache_version=$sccache_v
 sccache_dir=$SCCACHE_DISK_DIR
 sccache_dir_present=$sccache_present
 sccache_max_size=$SCCACHE_MAX_SIZE
 sccache_warmed=$warmed
 sccache_warm_commit=${warm_commit:-none}
 cargo_sources_warmed=$CARGO_CACHE_WARMED
-cargo_deny_version=$(version_of cargo-deny --version)
+cargo_deny_version=$cargo_deny_v
 render_env_installed=$RENDER_ENV_INSTALLED
 session_start_hook=$([ "$STARTUP_HOOK_REGISTERED" = true ] && echo "$STARTUP_HOOK_SHIM" || echo "(project-level .claude/hooks/session-start.sh)")
 MARKER

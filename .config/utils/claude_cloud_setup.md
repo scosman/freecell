@@ -12,7 +12,7 @@ ready before the agent reads anything.
 | [`claude_code_vm_setup.sh`](claude_code_vm_setup.sh) | The **only** thing you paste into the cloud UI. It fetches `setup_env.sh` from `main` and runs it. |
 | [`setup_env.sh`](setup_env.sh) | **Builds a machine.** Runs once, at environment-build time, before any repo is checked out. Also the "set up my laptop" script (`--human`). |
 | [`setup_startup.sh`](setup_startup.sh) | **Prepares a checkout.** Runs every session, via the repo's SessionStart hook. |
-| [`test_setup_scripts.sh`](test_setup_scripts.sh) | Tests for all of the above. Runs against scratch directories; touches neither `/opt` nor your `~/.claude`. |
+| [`test_setup_scripts.sh`](test_setup_scripts.sh) | Tests for all of the above. Safe to run on your own machine: it works in scratch directories and disables the two machine-mutating steps (no `apt-get`, no writes into a system `bin` directory), then asserts at the end that `/opt`, your `~/.claude`, your installed tools, and your package list are all unchanged. |
 
 The hook itself is committed: [`.claude/settings.json`](../../.claude/settings.json) points
 at [`.claude/hooks/session-start.sh`](../../.claude/hooks/session-start.sh), which is a shim
@@ -124,6 +124,8 @@ If it says `Ready, with warnings above`, or does not appear at all, find your li
 | `cache: off (sccache not installed; …)` | The `sccache` download failed at build time — almost always `objects.githubusercontent.com` missing from the allowlist. | Add the domain, then force a snapshot rebuild. |
 | `cache: off (no provisioning marker; …)` | Same cause as the first row. The cache directory is deliberately not trusted without the marker that says this repo's setup script put it there. | As above. |
 | `cache: off (… is missing; …)` | The machine was provisioned but the cache directory is gone. | `bash .config/utils/setup_env.sh --upgrade-tools` |
+| `cache: off (sccache resolved to '…', not …)` | The cache server came up on a different backend — usually an sccache server left running from an earlier configuration, or leftover `SCCACHE_BUCKET`/`SCCACHE_ENDPOINT` variables. | `sccache --stop-server`, delete those variables from the environment settings, then start a new session. |
+| `cache: off (… is not writable by <user>; …)` | The image was built as one user and the session runs as another. | `chmod 1777 /opt/freecell-vm-setup/sccache` |
 | `! native deps missing (…) — freecell-app and render-tests will not build.` | The apt step did not run or did not finish. `freecell-core` and `freecell-engine` still build. | `bash app/render-tests/scripts/setup_render_env.sh` |
 | `! cargo-deny is not installed; …` | Same cause as the sccache row. `cargo deny check` (a CI gate) cannot run locally. | `bash .config/utils/setup_env.sh --upgrade-tools` |
 | `✗ cargo fetch --locked failed` | `Cargo.lock` does not match the `Cargo.toml`s on this branch. | `cd app && cargo update` |
@@ -165,14 +167,18 @@ Two reasons it has to go there. The wrapper reads it before any session environm
 and editing the setup script is *also* what forces the snapshot to rebuild — which is what
 makes the new setup actually run. An environment variable would do neither.
 
-The ref is passed through to `setup_env.sh`, so the throwaway clone it warms from is the same
-branch it was fetched from.
+A **branch or a tag**, not a commit SHA — the throwaway clone `setup_env.sh` makes is a
+depth-1 clone, which cannot target one. The value is passed through to `setup_env.sh`, so the
+clone it warms from is the same branch the wrapper fetched from.
 
 To exercise the scripts without a cloud environment at all:
 
 ```bash
 bash .config/utils/test_setup_scripts.sh
 ```
+
+That is safe to run anywhere — see the table at the top of this document for what it does
+and does not touch.
 
 ## Local machines
 

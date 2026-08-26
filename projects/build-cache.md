@@ -150,5 +150,11 @@ disk backend regardless.
 container gate's falsy-value handling, the marker's effect on whether an unattributable
 cache directory is trusted, the marker's carry-forward rules across a repair run, the
 throwaway-clone lifecycle, and every rule of the optional user-`settings.json` merge — run
-through both the jq and python3 implementations and asserted to agree. It writes only to
-scratch directories, and proves it.
+through both the jq and python3 implementations and asserted to agree.
+
+It is safe to run on a personal machine: it works in scratch directories and sets
+`FREECELL_SKIP_TOOL_INSTALL` + `FREECELL_SKIP_SYSTEM_DEPS` so `setup_env.sh`'s two
+machine-mutating steps (downloading binaries into a system `bin` directory, and the
+`setup_render_env.sh` apt install) cannot fire. Its closing cases assert that — `/opt`, the
+user's `~/.claude/settings.json`, the installed tool binaries, and the dpkg package list are
+all fingerprinted before and after.

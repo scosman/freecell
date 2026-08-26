@@ -10,7 +10,8 @@
 # It runs at environment-build time, before any repo is checked out, so it cannot read
 # anything from the repo — hence fetching over HTTPS rather than a path.
 #
-# FREECELL_SETUP_REF overrides the ref, to try a branch's setup_env.sh without merging
+# FREECELL_SETUP_REF overrides the branch (or tag — not a commit SHA; the depth-1 clone
+# setup_env.sh makes cannot target one), to try a branch's setup_env.sh without merging
 # it. Set it by editing the line below IN THE PASTED SCRIPT, not in the environment
 # variables: editing the setup script is also what forces the environment snapshot to
 # rebuild, which is what makes the new setup actually run.

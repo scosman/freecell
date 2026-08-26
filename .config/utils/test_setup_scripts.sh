@@ -3,10 +3,12 @@
 #
 #     bash .config/utils/test_setup_scripts.sh
 #
-# Everything runs against a scratch directory: the tests set FREECELL_VM_SETUP_DIR and
-# CLAUDE_CONFIG_DIR, so nothing here touches /opt or a real ~/.claude. That is asserted,
-# not assumed — a test that silently rewrote the machine's settings while proving that
-# settings are safe would be the worst possible outcome.
+# Everything runs against a scratch directory. The tests set FREECELL_VM_SETUP_DIR and
+# CLAUDE_CONFIG_DIR, and export FREECELL_SKIP_TOOL_INSTALL + FREECELL_SKIP_SYSTEM_DEPS so
+# that setup_env.sh's two machine-mutating steps — downloading binaries into /usr/local/bin
+# and apt-installing the GPUI/render stack — cannot fire. All four are asserted at the end,
+# not assumed: a test that silently apt-installed twenty packages while proving that local
+# machines are left alone would be the worst possible outcome.
 #
 # The cases are the ones that took real reasoning to get right: the container gate's
 # falsy-value handling, the provisioning marker's effect on whether an unattributable
@@ -25,6 +27,17 @@ SETUP_STARTUP="$UTILS_DIR/setup_startup.sh"
 
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
+
+# Inherited by every setup_env.sh invocation below. Without these the merge cases would
+# curl binaries into /usr/local/bin, and the --warm-cache case (which produces a real
+# reference tree) would run a ~20-package apt install on whatever box the suite is on.
+export FREECELL_SKIP_TOOL_INSTALL=1
+export FREECELL_SKIP_SYSTEM_DEPS=1
+# Temp files the scripts write (build logs, the render-env log, mktemp scratch) land under
+# the scratch dir too — which is also what makes "the apt step never ran" provable by the
+# absence of its log rather than by a package listing that is unchanged either way.
+export TMPDIR="$SCRATCH/tmp"
+mkdir -p "$TMPDIR"
 
 PASSED=0
 FAILED=0
@@ -64,6 +77,18 @@ vm_dir_fingerprint() {
   find /opt/freecell-vm-setup -maxdepth 2 -printf '%p %s\n' 2>&1 | sort | cksum
 }
 REAL_VM_DIR_BEFORE="$(vm_dir_fingerprint)"
+
+# The machine's own tools and packages. Size + mtime catches a re-install even when the
+# replacement bytes are identical, which is exactly the case that looks like a no-op.
+system_tools_fingerprint() {
+  stat -c '%n %s %Y' /usr/local/bin/sccache /usr/local/bin/cargo-deny "$HOME/.local/bin/sccache" \
+    "$HOME/.local/bin/cargo-deny" 2>&1 | sort | cksum
+}
+apt_state_fingerprint() {
+  dpkg --get-selections 2>/dev/null | cksum
+}
+SYSTEM_TOOLS_BEFORE="$(system_tools_fingerprint)"
+APT_STATE_BEFORE="$(apt_state_fingerprint)"
 
 echo "Scratch: $SCRATCH"
 echo ""
@@ -145,6 +170,22 @@ else
   ok "sccache absent on this machine; env-file wiring not asserted"
 fi
 
+start "cache/unwritable"
+# The image builds as root and a session may run as someone else; a cache directory the
+# session cannot write is a cache that silently stores nothing.
+if [ "$(id -u)" -eq 0 ]; then
+  ok "skipped — root bypasses the permission check this case exercises"
+else
+  RO_VM="$SCRATCH/vm-readonly"
+  mkdir -p "$RO_VM/sccache"
+  printf 'setup_version=1\n' >"$RO_VM/.setup_for_freecell_repo_v1"
+  chmod 555 "$RO_VM/sccache"
+  out="$(IS_CONTAINERIZED=true FREECELL_VM_SETUP_DIR="$RO_VM" bash "$SETUP_STARTUP" 2>&1)"
+  chmod 755 "$RO_VM/sccache"
+  expect_contains "an unwritable cache is reported, not used" "$out" "is not writable by"
+  expect_contains "with the repair that fixes it" "$out" "chmod 1777"
+fi
+
 start "repo-identity"
 # A directory that is not this repo must not be mistaken for it.
 mkdir -p "$SCRATCH/not-freecell/app/crates/other"
@@ -199,6 +240,11 @@ expect_status "exits 0" 0 "$?"
 expect_contains "clones because no checkout is in reach" "$warm_out" "throwaway"
 expect_contains "warms the cargo source caches from the clone" "$warm_out" "cargo fetch --locked"
 expect "the throwaway clone is gone afterwards" test ! -e "$WARM_VM/throwaway-clone"
+# The reference tree exists here, so this is the one case that WOULD apt-install. Assert
+# the guard fired, not just that the outcome looked unchanged: on a box that already has
+# the packages, a real apt run is indistinguishable from no run at all.
+expect_contains "the system-dependency guard fires" "$warm_out" "FREECELL_SKIP_SYSTEM_DEPS is set"
+expect "so the apt step left no log behind" test ! -e "$TMPDIR/freecell-render-env.log"
 expect "a marker was written" test -f "$WARM_VM/.setup_for_freecell_repo_v1"
 marker="$(cat "$WARM_VM/.setup_for_freecell_repo_v1")"
 expect_contains "recording the source-cache warm" "$marker" "cargo_sources_warmed=true"
@@ -430,6 +476,11 @@ real_after="(absent)"
 [ -f "$REAL_USER_SETTINGS" ] && real_after="$(cksum <"$REAL_USER_SETTINGS")"
 expect "this machine's own $REAL_USER_SETTINGS is unchanged" \
   test "$REAL_USER_SETTINGS_BEFORE" = "$real_after"
+expect "no binary was installed or replaced in a system bin directory" \
+  test "$SYSTEM_TOOLS_BEFORE" = "$(system_tools_fingerprint)"
+expect "no packages were installed" \
+  test "$APT_STATE_BEFORE" = "$(apt_state_fingerprint)"
+expect "the render-env apt script was never invoked" test ! -e "$TMPDIR/freecell-render-env.log"
 
 echo ""
 echo "$PASSED passed, $FAILED failed."

@@ -331,7 +331,7 @@ enable_compile_cache() {
     if [ "$claimed" = true ]; then
       warn "$SCCACHE_DISK_DIR is EMPTY although the VM marker claims it was warmed (commit $(marker_value sccache_warm_commit)) — its objects were removed after the image was built. Fix: rebuild the environment image (see .config/utils/claude_cloud_setup.md)."
     else
-      warn "$SCCACHE_DISK_DIR is empty (marker: sccache_warmed=${claimed:-unknown}), so the pinned dep tree will compile from cold this session. Fix: rebuild the environment image, or run: $REPAIR_SETUP --warm-cache"
+      warn "$SCCACHE_DISK_DIR is empty (marker: sccache_warmed=${claimed:-unknown}), so the pinned dep tree will compile from cold this session. Fix: rebuild the environment image, or run: $REPAIR_SETUP --warm-cache (15-25 min — it compiles the dependency tree from scratch, whatever this checkout has already built)"
     fi
   fi
 

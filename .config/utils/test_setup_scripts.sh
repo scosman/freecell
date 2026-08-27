@@ -678,6 +678,99 @@ marker="$(cat "$WARM_VM/$MARKER_NAME")"
 expect_contains "recording the source-cache warm" "$marker" "cargo_sources_warmed=true"
 expect_contains "and the pinned toolchain's cargo, not the default one" "$marker" "cargo_version=${TOOLCHAIN_PIN%%-*}"
 
+start "warm-cache/from-scratch"
+# The defect this case exists for: with a checkout in reach, $REFERENCE_TREE is that
+# checkout, and a checkout whose app/target is already built gives cargo almost nothing to
+# compile — so almost no rustc call reaches sccache and the machine is recorded as warmed
+# while holding a few percent of the dependency tree (measured: 18 objects against 612
+# rlibs). sccache_disk_has_objects() cannot see that; it is a non-emptiness test. What the
+# fix guarantees, and what these assertions are about, is WHERE the build wrote.
+#
+# A miniature checkout, not this repo's: it satisfies is_freecell_root(), and it compiles in
+# about a second where the real workspace takes 20 minutes. incremental=false because
+# sccache refuses to cache incremental compilations and every crate here is a workspace
+# crate — the real dependency tree is non-incremental for free, this fixture is not.
+if ! command -v sccache >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+  skip "needs both cargo and sccache"
+else
+  FS_ROOT="$SCRATCH/fake-warm-checkout"
+  FS_VM="$SCRATCH/vm-from-scratch"
+  mkdir -p "$FS_ROOT/app/crates/freecell-engine/src" "$FS_ROOT/.config/utils"
+  cat >"$FS_ROOT/app/Cargo.toml" <<'FIXTURE_TOML'
+[workspace]
+members = ["crates/freecell-engine"]
+resolver = "2"
+
+[profile.dev]
+incremental = false
+FIXTURE_TOML
+  cat >"$FS_ROOT/app/crates/freecell-engine/Cargo.toml" <<'FIXTURE_TOML'
+[package]
+name = "freecell-engine-fixture"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+FIXTURE_TOML
+  echo 'pub fn warm() -> u8 { 1 }' >"$FS_ROOT/app/crates/freecell-engine/src/lib.rs"
+  # The real pin, so the fixture builds with the toolchain the script selects rather than
+  # whatever this machine's default happens to be.
+  cp "$PROJECT_ROOT/app/rust-toolchain.toml" "$FS_ROOT/app/rust-toolchain.toml"
+  # Copied into the fixture, because find_freecell_root() resolves the script's own location
+  # first — run from this repo's copy it would warm THIS workspace, for twenty minutes.
+  cp "$SETUP_ENV" "$FS_ROOT/.config/utils/setup_env.sh"
+  ( cd "$FS_ROOT/app" && cargo generate-lockfile --offline ) >/dev/null 2>&1
+  # An already-built checkout is the whole precondition. A sentinel file is enough: what is
+  # asserted is that the warm build put no build output here, not what a real target/ holds.
+  mkdir -p "$FS_ROOT/app/target"
+  printf 'sentinel\n' >"$FS_ROOT/app/target/do-not-touch"
+  # Directories, not "any new entry": the source-warming step's `cargo fetch` legitimately
+  # drops target/.rustc_info.json (cargo's own rustc-version cache, ~1 KB) into the checkout,
+  # and only the BUILD is under test here. Every profile a build could use — debug/, release/ —
+  # is a directory, so this catches the defect without failing on the fetch's metadata file.
+  fs_target_dirs() { find "$FS_ROOT/app/target" -mindepth 1 -type d 2>/dev/null | sort; }
+  # The disk guard is pinned low rather than left to whatever this machine has free, so this
+  # case tests the build and `warm-cache/disk-guard` below tests the guard.
+  fs_out="$( cd "$FS_ROOT" &&
+    FREECELL_VM_SETUP_DIR="$FS_VM" FREECELL_MIN_WARM_BUILD_GB=1 \
+      bash "$FS_ROOT/.config/utils/setup_env.sh" --warm-cache --best-effort 2>&1 )"
+  expect_status "exits 0" 0 "$?"
+  # Without this, the two "nothing was written there" assertions below would both pass on a
+  # run that compiled nothing at all.
+  expect_contains "the warm build runs" "$fs_out" "Filling the sccache disk cache"
+  expect_equal "and puts no build output in the checkout's own target/" "" "$(fs_target_dirs)"
+  expect "having built into a throwaway target/ that is gone afterwards" \
+    test ! -e "$FS_VM/warm-build-target"
+  expect "the cache it filled holds objects" \
+    test -n "$(find "$FS_VM/sccache" -mindepth 1 -type f -print -quit 2>/dev/null)"
+  expect_contains "so the machine records as warmed" "$(cat "$FS_VM/$MARKER_NAME")" "sccache_warmed=true"
+fi
+
+start "warm-cache/disk-guard"
+# The guard now stands between a guaranteed-from-scratch build and a full disk, so it needs a
+# case: a threshold that always fires and one that never does look identical from outside.
+if [ ! -d "${FS_ROOT:-/nonexistent}" ]; then
+  skip "needs the miniature checkout the previous case builds"
+else
+  GUARD_VM="$SCRATCH/vm-disk-guard"
+  # What a run killed with SIGKILL (or an OOM killer) leaves behind: the EXIT trap never ran,
+  # so a multi-GB tree is stranded at the fixed path the next run will use. It must be swept
+  # even on this path, where no build happens — otherwise it sits on the image forever and is
+  # counted against the very guard that is firing.
+  mkdir -p "$GUARD_VM/sccache" "$GUARD_VM/warm-build-target/stale"
+  guard_out="$( cd "$FS_ROOT" &&
+    FREECELL_VM_SETUP_DIR="$GUARD_VM" FREECELL_MIN_WARM_BUILD_GB=999999 \
+      bash "$FS_ROOT/.config/utils/setup_env.sh" --warm-cache --best-effort 2>&1 )"
+  expect_status "a disk too full is a note, not a failure" 0 "$?"
+  expect_contains "the guard fires" "$guard_out" "skipping the warm build"
+  expect_not_contains "so no build is started" "$guard_out" "Filling the sccache disk cache"
+  expect "and a stranded throwaway target from a killed run is swept anyway" \
+    test ! -e "$GUARD_VM/warm-build-target"
+  expect_contains "the machine is not recorded as warmed" \
+    "$(cat "$GUARD_VM/$MARKER_NAME")" "sccache_warmed=false"
+fi
+
 start "marker/carry-forward"
 # Repairing an environment means re-running WITHOUT --warm-cache. The marker must keep
 # describing the cache that is on disk, not be rewritten to claim it has no provenance.

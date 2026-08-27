@@ -158,8 +158,10 @@ Options:
                             failing setup script stops sessions from ever starting.
   --warm-cache              Populate this machine's caches. With no checkout in reach,
                             clone the repo to a throwaway directory first. Fills
-                            ~/.cargo/{registry,git} and the sccache disk cache, then
-                            deletes the clone (its target/ included).
+                            ~/.cargo/{registry,git} and the sccache disk cache, building
+                            into a throwaway target/ so an already-built checkout cannot
+                            turn the build into a no-op, then deletes both. Expect 15-25
+                            minutes: it compiles the dependency tree from scratch.
   --human                   Contributor mode for a personal machine: install the pinned
                             toolchain and warm the dependency sources, offer the optional
                             render-test system dependencies, and write nothing outside
@@ -175,6 +177,8 @@ over the network):
   FREECELL_SCCACHE_CACHE_SIZE  default 8G
   FREECELL_SKIP_WARM_BUILD     set to skip --warm-cache's workspace build (the dependency
                                source caches are still warmed)
+  FREECELL_MIN_WARM_BUILD_GB   free space (GB) --warm-cache requires before it will build
+                               (default 15)
   FREECELL_SKIP_TOOL_INSTALL   set to never download or replace a binary in a system bin
                                directory (sccache, cargo-deny)
   FREECELL_SKIP_SYSTEM_DEPS    set to never run the apt install in
@@ -337,11 +341,21 @@ read_toolchain_pin() {
 # device as everything else sized for it, and makes the clone trivially removable with the
 # rest of the machine-global state.
 THROWAWAY_CLONE=""
+# The warm build's own target/, set by warm_sccache (see there for why the build cannot use
+# the reference tree's). Same directory tree, same reason, and the same lifetime rule: it is
+# multi-GB, it is disposable, and it must never be left behind on a snapshotted image.
+WARM_BUILD_TARGET_DIR=""
 # shellcheck disable=SC2317  # invoked indirectly, by the EXIT trap below.
 cleanup_throwaway() {
   [ -n "$THROWAWAY_CLONE" ] && rm -rf "$THROWAWAY_CLONE"
+  [ -n "$WARM_BUILD_TARGET_DIR" ] && rm -rf "$WARM_BUILD_TARGET_DIR"
   return 0
 }
+# Verified on this base image's bash: the EXIT trap also runs when the shell is terminated by
+# SIGINT or SIGTERM while a foreground build is running, so failure and interrupt are both
+# covered without trapping the signals individually (which would change the exit status this
+# script's --best-effort invariant owns). SIGKILL cannot be trapped by anything, so
+# warm_sccache additionally sweeps a leftover directory before it builds.
 trap cleanup_throwaway EXIT
 
 # Sets THROWAWAY_CLONE on success. Deliberately NOT a function that echoes the path: a
@@ -590,12 +604,40 @@ warm_sccache() {
     note "FREECELL_SKIP_WARM_BUILD is set; not building. The sccache disk cache is unchanged."
     return 1
   fi
-  # A full workspace build needs room for target/ on top of everything already on this
-  # disk. Better to skip the build and keep the (already large) source-cache win than to
-  # fill the image's filesystem during its own construction.
+  # THE BUILD MUST COMPILE FROM SCRATCH, so it gets a throwaway target/ of its own rather
+  # than the reference tree's. On the repair path ($REFERENCE_TREE is the checkout this
+  # script was run from — the path setup_startup.sh's cold-cache warning tells people to
+  # run) that tree's app/target is usually already built, cargo then has almost nothing to
+  # compile, and almost no rustc call reaches sccache: measured 3m27s, 18 objects, 97 MiB,
+  # against 612 rlibs in the dependency tree — a machine recorded as warmed while holding 3%
+  # of it. sccache_disk_has_objects() cannot catch that; it is a non-emptiness test, and 18
+  # objects is not empty. The cache is the artifact worth keeping, the tree is not.
+  #
+  # Scoped to this one build: CARGO_TARGET_DIR is passed to the build's own environment, so a
+  # session's builds and a contributor's target/ are untouched.
+  WARM_BUILD_TARGET_DIR="$VM_SETUP_DIR/warm-build-target"
+  # Swept before the df reading, not just after the build: a run killed with SIGKILL (or by
+  # an OOM killer) skips even the EXIT trap, and a stranded tree from that run would
+  # otherwise both waste the space and be counted against the guard below forever.
+  rm -rf "$WARM_BUILD_TARGET_DIR"
+
+  # This build now always pays for a whole target/ tree, on the repair path as well as the
+  # image path, so the guard is sized from what it actually costs rather than from the old
+  # assumption that an existing tree might absorb most of it. Measured on this workspace: a
+  # complete `cargo build --workspace` dev tree is ~8 GB (612 rlibs), the sccache objects it
+  # writes are a few GB of compressed rlibs, and the image path adds a ~1 GB throwaway clone
+  # — call it 12 GB, and 15 GB leaves a quarter again on top.
+  #
+  # Both directions of getting this wrong are real. Too low fills the filesystem during the
+  # image's own construction. Too high silently disables the repair path on exactly the
+  # machines that need it: a container with an 8 GB target/ already on disk reports ~20 GB
+  # free, so a 25 GB floor would refuse to repair every one of them, forever.
+  #
+  # Overridable so the guard itself is testable in both directions.
   avail_gb="$(df -BG --output=avail "$VM_SETUP_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')"
-  if [ -n "$avail_gb" ] && [ "$avail_gb" -lt 20 ]; then
+  if [ -n "$avail_gb" ] && [ "$avail_gb" -lt "${FREECELL_MIN_WARM_BUILD_GB:-15}" ]; then
     note "only ${avail_gb}G free; skipping the warm build. Dependency sources are still cached."
+    WARM_BUILD_TARGET_DIR=""
     return 1
   fi
 
@@ -610,9 +652,16 @@ warm_sccache() {
   # gpui-component, the ironcalc fork) is built non-incrementally and is what this fills.
   # That tree is also the entire reason this cache exists.
   ( cd "$REFERENCE_TREE/app" &&
-    SCCACHE_DIR="$SCCACHE_DISK_DIR" SCCACHE_CACHE_SIZE="$SCCACHE_MAX_SIZE" \
+    CARGO_TARGET_DIR="$WARM_BUILD_TARGET_DIR" \
+      SCCACHE_DIR="$SCCACHE_DISK_DIR" SCCACHE_CACHE_SIZE="$SCCACHE_MAX_SIZE" \
       RUSTC_WRAPPER=sccache cargo build --workspace --locked ) >"$log" 2>&1
   local status=$?
+  # Dropped here rather than left to the EXIT trap, on the failure path as well as the
+  # success one: this is the larger half of what the build wrote, and the marker write, the
+  # caller's stats dump and any later step all run after it. Clearing the variable makes the
+  # trap a no-op and leaves every return below with nothing to remember.
+  rm -rf "$WARM_BUILD_TARGET_DIR"
+  WARM_BUILD_TARGET_DIR=""
   if [ "$status" -ne 0 ]; then
     note "the warm build failed (exit $status); last lines of $log:"
     tail -10 "$log" >&2

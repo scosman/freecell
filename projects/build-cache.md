@@ -36,8 +36,9 @@ environment build (once, then the disk is snapshotted)
                    ├─ prebuilt sccache + cargo-deny (pinned versions)
                    ├─ system packages, via the repo's own setup_render_env.sh
                    ├─ throwaway clone → cargo fetch --locked → cargo build --workspace
-                   │    (fills ~/.cargo/{registry,git} and the sccache disk cache,
-                   │     then the clone and its target/ are deleted)
+                   │    (fills ~/.cargo/{registry,git} and the sccache disk cache;
+                   │     the build gets a throwaway CARGO_TARGET_DIR, and clone and
+                   │     target/ are both deleted afterwards)
                    └─ /opt/freecell-vm-setup/.setup_for_freecell_repo_v2  (marker)
 
 every session (fresh checkout, snapshot-restored disk)
@@ -124,6 +125,17 @@ neither is taken on faith:
   inherit whatever the container started with; when the cache ends up off it drops an
   inherited `RUSTC_WRAPPER` too, so "off" cannot quietly mean "sccache against the old
   bucket".
+- **A build that compiles nothing is not a warm build.** `--warm-cache` builds into a
+  throwaway `CARGO_TARGET_DIR` under `/opt/freecell-vm-setup`, deleted as soon as the build
+  ends. Without it, the *repair* path — `setup_env.sh --warm-cache` run on a machine that
+  already has a checkout, which is exactly what `setup_startup.sh`'s cold-cache warning
+  tells you to run — builds in that checkout's `app/target`. On a machine that has built
+  once, cargo then has almost nothing to compile and almost no rustc call reaches sccache:
+  measured, 3m27s and 18 objects (97 MiB) against 612 rlibs in the dependency tree, with the
+  marker recording the machine as warmed. The non-emptiness check below cannot catch it —
+  18 objects is not empty — so the build is forced to be a real one instead. The build tree
+  is disposable; the cache is the artifact. The cost is that the repair line is a genuine
+  15-25 minute build rather than a 3-minute no-op.
 - **A green build is not a warm cache.** `sccache_warmed=true` is written only after the
   cache directory is confirmed to hold at least one **file**, and the marker's carry-forward
   path applies the identical rule, so a directory of empty subdirectories cannot resurrect a

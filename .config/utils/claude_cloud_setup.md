@@ -107,6 +107,14 @@ The first session builds the environment — toolchain, system packages, a throw
 snapshots the disk. That is a long first run (tens of minutes; the workspace pins gpui/zed,
 gpui-component and the IronCalc fork). Every session after that starts from the snapshot.
 
+That build always compiles from scratch: it uses a throwaway `CARGO_TARGET_DIR` under
+`/opt/freecell-vm-setup`, deleted as soon as it finishes. It has to, because the same
+`--warm-cache` line is the repair for a cold cache (§6) and is then run on a machine whose
+checkout is already built — where reusing that `target/` would leave cargo with nothing to
+compile, fill a few percent of the cache, and record the machine as warmed. It also needs
+room: with less than 15 GB free the build is skipped with a `!` line and only the dependency
+*sources* are cached.
+
 Setup re-runs, and the snapshot is rebuilt, when you **change the setup script or the
 allowed-domain list**, and when the snapshot **expires after about 7 days**.
 
@@ -135,7 +143,7 @@ If it says `Ready, with warnings above`, or does not appear at all, find your li
 | `! cargo-deny is not installed; …` | Same cause as the sccache row. `cargo deny check` (a CI gate) cannot run locally. | `bash .config/utils/setup_env.sh --upgrade-tools` |
 | `cache: … ; THE RETIREMENT DID NOT REACH THE SESSION — …` | This container still had `SCCACHE_BUCKET`/`RUSTC_WRAPPER` in its environment, and the session env file could not be written — so those stay live in the session's shells and rustc calls go to the retired bucket, whatever the cache half of the line says. | Delete those variables from the environment settings (see §3), or `unset RUSTC_WRAPPER SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX` in the session. |
 | `cache: sccache -> … (THIS PROCESS ONLY — …)` | The cache is wired, but only inside the script's own process. `CLAUDE_ENV_FILE` is how the wiring reaches the session's shells; the message says whether it was **unset** or whether the **write to it failed**. Every build the agent runs would be uncached. | Expected when you run `setup_startup.sh` by hand; in a session it means the hook environment is wrong. Export `RUSTC_WRAPPER=sccache` and `SCCACHE_DIR=/opt/freecell-vm-setup/sccache` yourself, or start a new session. |
-| `! … is empty (marker: sccache_warmed=false)` | The image was built, but its warm build never ran or never finished. Everything works; the pinned dependency tree just compiles from cold. | Rebuild the environment image (edit the Setup script field to force it), or `bash .config/utils/setup_env.sh --upgrade-tools --warm-cache` |
+| `! … is empty (marker: sccache_warmed=false)` | The image was built, but its warm build never ran or never finished. Everything works; the pinned dependency tree just compiles from cold. | Rebuild the environment image (edit the Setup script field to force it), or `bash .config/utils/setup_env.sh --upgrade-tools --warm-cache` — **15-25 minutes**: it compiles the dependency tree from scratch, into a throwaway target directory, whatever this checkout has already built |
 | `! … is EMPTY although the VM marker claims it was warmed` | The cache's objects were removed after the image was built (disk pressure, a manual clean). A leftover `SCCACHE_BUCKET` cannot produce this any more — since the warm build reads the server's backend back before building, that case records `sccache_warmed=false` and shows the row above instead. | Force a snapshot rebuild. |
 | `! rustfmt is missing from …` / `! clippy is missing from …` | The pinned toolchain was installed without its components. Both are CI gates. | `rustup component add rustfmt --toolchain <pin>` (same for `clippy`) |
 | `✗ could not open …, so cargo fetch never ran.` | The log the fetch writes to could not be created, so nothing ran. `TMPDIR` points at a directory that does not exist, or the disk is full. | `unset TMPDIR` (or point it somewhere that exists), free space if that is the cause, then re-run `bash .config/utils/setup_startup.sh` |

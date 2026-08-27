@@ -160,8 +160,10 @@ Options:
                             clone the repo to a throwaway directory first. Fills
                             ~/.cargo/{registry,git} and the sccache disk cache, building
                             into a throwaway target/ so an already-built checkout cannot
-                            turn the build into a no-op, then deletes both. Expect 15-25
-                            minutes: it compiles the dependency tree from scratch.
+                            turn the build into a no-op, then deletes both. It compiles
+                            the dependency tree from scratch: 4m31s measured on a 4-core
+                            container with a warm ~/.cargo, plus the clone and the source
+                            fetch when those are cold (unmeasured).
   --human                   Contributor mode for a personal machine: install the pinned
                             toolchain and warm the dependency sources, offer the optional
                             render-test system dependencies, and write nothing outside

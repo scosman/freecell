@@ -13,7 +13,12 @@ before it can do any work:
 2. **Dependency sources.** `~/.cargo/git` alone is ~630 MB once the pinned zed and
    IronCalc-fork checkouts land.
 3. **rustc outputs.** The pinned dependency tree — gpui/zed, gpui-component, the
-   IronCalc fork — is ~15–25 min of compilation.
+   IronCalc fork — compiles from cold in **4m14s measured** (2026-08-27, 4-core
+   container, `~/.cargo` already warm so no download time is in that figure; 618
+   `Compiling` lines, 610 rustc invocations). This note originally said ~15–25 min, with
+   no recorded conditions and no measurement behind it. A container that also starts with
+   an empty `~/.cargo` pays the zed clone and the ~1 GB registry fetch on top of the
+   4m14s — that part has not been measured.
 4. **System packages.** `app/render-tests/scripts/setup_render_env.sh` is a heavy apt
    install (X11/Wayland/xkb, Vulkan + lavapipe, fontconfig/freetype, gbm, ALSA, Xvfb,
    ImageMagick, DejaVu Serif).
@@ -135,7 +140,11 @@ neither is taken on faith:
   marker recording the machine as warmed. The non-emptiness check below cannot catch it —
   18 objects is not empty — so the build is forced to be a real one instead. The build tree
   is disposable; the cache is the artifact. The cost is that the repair line is a genuine
-  15-25 minute build rather than a 3-minute no-op.
+  build rather than a 3m27s no-op: **4m14s compiling, 4m31s for the whole script**, filling
+  the cache with 700 objects (653 MiB) on 610 Rust cache misses — measured 2026-08-27 on a
+  4-core container whose `~/.cargo` was already warm, so no source download is in that
+  figure. A cold image build additionally pays the throwaway clone and the registry fetch,
+  which has not been measured; do not read the 4m31s as the image-build time.
 - **A green build is not a warm cache.** `sccache_warmed=true` is written only after the
   cache directory is confirmed to hold at least one **file**, and the marker's carry-forward
   path applies the identical rule, so a directory of empty subdirectories cannot resurrect a

@@ -15,6 +15,12 @@
 [![Download for macOS](https://img.shields.io/badge/Download_for_macOS-1d1d1f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/scosman/FreeCell/releases) [![Download for macOS](https://img.shields.io/badge/Download_for_Windows-1d1d1f?style=for-the-badge&logo=pcgamingwiki&logoColor=white)](https://github.com/scosman/FreeCell/releases) [![Download for macOS](https://img.shields.io/badge/Download_for_Linux-1d1d1f?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/scosman/FreeCell/releases)
 </div>
 
+
+
+https://github.com/user-attachments/assets/60883eeb-9f90-460a-b26c-13b3c844f856
+
+
+
 ### Features
 
 It’s a spreadsheet. It has the most of the features you’d come to expect including:
